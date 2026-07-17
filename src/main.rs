@@ -349,8 +349,21 @@ fn render_sync(output: &caravan::sync::SyncOutput) -> String {
             advancement.merged_predecessor, advancement.new_head
         );
     }
+    for observation in &output.ci {
+        let _ = writeln!(
+            text,
+            "  CI #{}: {:?} ({} checks, {} failed runs)",
+            observation.pr,
+            observation.disposition,
+            observation.checks.len(),
+            observation.failed_runs.len()
+        );
+    }
     for step in &output.receipt.completed_steps {
         let _ = writeln!(text, "  {:?} {:?}: {}", step.kind, step.state, step.summary);
+    }
+    if !output.events.is_empty() {
+        let _ = writeln!(text, "  audit events: {}", output.events.len());
     }
     text
 }

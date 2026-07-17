@@ -161,6 +161,10 @@ pub struct CreatePullRequestInput {
 pub struct WorkflowRunSnapshot {
     /// GitHub Actions database identifier.
     pub database_id: u64,
+    /// PRs GitHub associates with this run. Empty for list projections that do
+    /// not expose association; the exact rerun read always populates it.
+    #[serde(default)]
+    pub pull_requests: Vec<PrNumber>,
     /// Exact head commit for the run.
     pub head_sha: String,
     /// Provider execution status, preserved verbatim.
@@ -218,6 +222,24 @@ pub enum MutationError {
         /// Permission reported by GitHub.
         actual: String,
     },
+    /// A branch moved after an exact compatibility proof.
+    BranchHeadMismatch {
+        /// Branch name that moved.
+        branch: String,
+        /// Exact revision used by the caller's proof.
+        expected: CommitOid,
+        /// Fresh provider revision.
+        actual: CommitOid,
+    },
+    /// A requested Actions run is not associated with the selected PR.
+    RunPullRequestMismatch {
+        /// Workflow run ID.
+        run_id: u64,
+        /// Selected PR that must own the run.
+        expected_pr: PrNumber,
+        /// PR numbers reported by GitHub for the run.
+        actual_prs: Vec<PrNumber>,
+    },
     /// A requested Actions run belongs to another commit.
     RunHeadMismatch {
         /// Workflow run ID.
@@ -252,6 +274,22 @@ impl std::fmt::Display for MutationError {
             Self::PermissionDenied { required, actual } => write!(
                 formatter,
                 "repository permission `{actual}` cannot perform admin merge; `{required}` required"
+            ),
+            Self::BranchHeadMismatch {
+                branch,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "branch `{branch}` moved from {expected} to {actual} after preflight"
+            ),
+            Self::RunPullRequestMismatch {
+                run_id,
+                expected_pr,
+                actual_prs,
+            } => write!(
+                formatter,
+                "workflow run {run_id} belongs to PRs {actual_prs:?}, expected PR {expected_pr}"
             ),
             Self::RunHeadMismatch {
                 run_id,
@@ -296,6 +334,26 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
     #[must_use]
     pub const fn new(runner: R) -> Self {
         Self { runner }
+    }
+
+    /// Verify that a branch still points at an exact preflight revision.
+    pub fn verify_branch_head(
+        &self,
+        repository: &RepositoryId,
+        branch: &str,
+        expected: &CommitOid,
+    ) -> Result<(), MutationError> {
+        let reference: GitRefJson =
+            self.json(default_branch_command(&repository.slug(), branch))?;
+        let actual = CommitOid(reference.object.sha);
+        if &actual != expected {
+            return Err(MutationError::BranchHeadMismatch {
+                branch: branch.to_owned(),
+                expected: expected.clone(),
+                actual,
+            });
+        }
+        Ok(())
     }
 
     /// Whether GitHub reports protection on a repository branch.
@@ -479,9 +537,16 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
         run_id: u64,
     ) -> Result<GitHubMutationReceipt, MutationError> {
         let run: WorkflowRunSnapshot = self
-            .json::<WorkflowRunJson>(workflow_run_command(repository, run_id))?
+            .json::<WorkflowRunDetailsJson>(workflow_run_command(repository, run_id))?
             .into();
         let before = self.verify_precondition(repository, expected)?;
+        if !run.pull_requests.contains(&expected.number) {
+            return Err(MutationError::RunPullRequestMismatch {
+                run_id,
+                expected_pr: expected.number,
+                actual_prs: run.pull_requests,
+            });
+        }
         if run.head_sha != before.head.oid.0 {
             return Err(MutationError::RunHeadMismatch {
                 run_id,
@@ -953,13 +1018,8 @@ fn failed_runs_command(repository: &RepositoryId, head_oid: &str) -> CommandSpec
 
 fn workflow_run_command(repository: &RepositoryId, run_id: u64) -> CommandSpec {
     CommandSpec::new("gh").args([
-        "run".to_owned(),
-        "view".to_owned(),
-        run_id.to_string(),
-        "--repo".to_owned(),
-        repository.slug(),
-        "--json".to_owned(),
-        WORKFLOW_RUN_JSON_FIELDS.to_owned(),
+        "api".to_owned(),
+        format!("repos/{}/actions/runs/{run_id}", repository.slug()),
     ])
 }
 
@@ -1136,6 +1196,7 @@ impl From<WorkflowRunJson> for WorkflowRunSnapshot {
     fn from(run: WorkflowRunJson) -> Self {
         Self {
             database_id: run.database_id,
+            pull_requests: Vec::new(),
             head_sha: run.head_sha,
             status: run.status,
             conclusion: run.conclusion,
@@ -1143,6 +1204,44 @@ impl From<WorkflowRunJson> for WorkflowRunSnapshot {
             name: run.name,
             workflow_name: run.workflow_name,
             url: run.url,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkflowRunDetailsJson {
+    id: u64,
+    head_sha: String,
+    status: String,
+    conclusion: Option<String>,
+    event: String,
+    name: String,
+    html_url: String,
+    #[serde(default)]
+    pull_requests: Vec<WorkflowRunPullRequestJson>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkflowRunPullRequestJson {
+    number: u64,
+}
+
+impl From<WorkflowRunDetailsJson> for WorkflowRunSnapshot {
+    fn from(run: WorkflowRunDetailsJson) -> Self {
+        Self {
+            database_id: run.id,
+            pull_requests: run
+                .pull_requests
+                .into_iter()
+                .map(|pull_request| PrNumber(pull_request.number))
+                .collect(),
+            head_sha: run.head_sha,
+            status: run.status,
+            conclusion: run.conclusion.unwrap_or_default(),
+            event: run.event,
+            workflow_name: run.name.clone(),
+            name: run.name,
+            url: run.html_url,
         }
     }
 }
@@ -1682,7 +1781,7 @@ mod tests {
             (
                 workflow_run_command(&repository, 99),
                 CommandOutput::success(
-                    r#"{"databaseId":99,"headSha":"head-12","status":"completed","conclusion":"failure","event":"pull_request","name":"CI","workflowName":"CI","url":"https://example.test/run/99"}"#,
+                    r#"{"id":99,"head_sha":"head-12","status":"completed","conclusion":"failure","event":"pull_request","name":"CI","html_url":"https://example.test/run/99","pull_requests":[{"number":12}]}"#,
                 ),
             ),
             (
@@ -1707,6 +1806,39 @@ mod tests {
         assert_eq!(receipt.kind, MutationKind::RerunChecks);
         assert_eq!(receipt.before.unwrap().number, PrNumber(12));
         assert_eq!(receipt.after.number, PrNumber(12));
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn rerun_failed_run_rejects_another_pull_requests_run() {
+        let repository = repository();
+        let expected = precondition(12);
+        let runner = FakeRunner::new(vec![
+            (
+                workflow_run_command(&repository, 99),
+                CommandOutput::success(
+                    r#"{"id":99,"head_sha":"head-12","status":"completed","conclusion":"failure","event":"pull_request","name":"CI","html_url":"https://example.test/run/99","pull_requests":[{"number":7}]}"#,
+                ),
+            ),
+            (
+                pull_request_command(&repository, "12"),
+                CommandOutput::success(pr_object_json(12, "feature/widget", "acme/widgets")),
+            ),
+        ]);
+        let adapter = GitHubMutationAdapter::new(runner);
+
+        let error = adapter
+            .rerun_failed_run(&repository, &expected, 99)
+            .expect_err("another PR's run must not rerun");
+
+        assert!(matches!(
+            error,
+            MutationError::RunPullRequestMismatch {
+                run_id: 99,
+                expected_pr: PrNumber(12),
+                actual_prs,
+            } if actual_prs == vec![PrNumber(7)]
+        ));
         adapter.runner.assert_exhausted();
     }
 
@@ -1801,6 +1933,31 @@ mod tests {
                 "--squash",
             ])
         );
+    }
+
+    #[test]
+    fn exact_branch_head_verification_fails_closed_on_movement() {
+        let runner = FakeRunner::new(vec![(
+            default_branch_command("acme/widgets", "main"),
+            CommandOutput::success(r#"{"object":{"sha":"new-main"}}"#),
+        )]);
+        let adapter = GitHubMutationAdapter::new(runner);
+
+        let error = adapter
+            .verify_branch_head(&repository(), "main", &CommitOid("old-main".to_owned()))
+            .expect_err("moved branch is stale");
+
+        assert!(matches!(
+            error,
+            MutationError::BranchHeadMismatch {
+                branch,
+                expected,
+                actual,
+            } if branch == "main"
+                && expected == CommitOid("old-main".to_owned())
+                && actual == CommitOid("new-main".to_owned())
+        ));
+        adapter.runner.assert_exhausted();
     }
 
     #[test]

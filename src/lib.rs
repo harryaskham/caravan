@@ -44,8 +44,9 @@ Safe operating loop:
 2. Use `cara check`, `new`, or `join` to validate a proposed queue change.
 3. Run `cara sync` (or `sync --all`) until it either converges or returns one
    typed decision point.
-4. At a decision point, repair and push the affected PR, or use `cara evict`,
-   `split`, `renew`, or `rejoin`; then rerun the same sync.
+4. At a CI decision, optionally use `cara sync --rerun-failed` to rerun only
+   exact failed workflow runs. Otherwise repair/push, evict, split, renew, or
+   rejoin; then rerun the same sync.
 
 Caravan does not routinely rebase branches. A link means the child PR targets
 its predecessor branch and is mechanically merge-compatible with it. Only a
@@ -237,6 +238,11 @@ pub struct SyncInput {
     #[arg(long)]
     #[serde(default)]
     pub all: bool,
+
+    /// Rerun only the exact failed workflow runs identified by the first CI decision.
+    #[arg(long)]
+    #[serde(default)]
+    pub rerun_failed: bool,
 }
 
 /// Input for `cara evict`.
@@ -393,7 +399,7 @@ pub fn build_router() -> ToolRouter<AppContext> {
     );
     router.add_typed_tool_with_output_schema(
         "sync",
-        "Idempotently synchronize one or all caravans. Stops at the first agent decision point with evidence and recovery actions.",
+        "Idempotently synchronize one or all caravans. Stops at the first decision with exact CI/run evidence; rerun_failed reruns only listed failed workflow runs.",
         |context: &AppContext, input: SyncInput| sync::sync(context, &input),
     );
     router.add_typed_tool_with_output_schema(

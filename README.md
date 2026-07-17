@@ -15,8 +15,12 @@ The normative behavior is in [`SPEC.md`](SPEC.md).
 - Every member has the `caravan` label.
 - Only the head has squash auto-merge enabled.
 - The current head PR number is the caravan ID.
-- `cara sync` is idempotent: it converges mechanically or stops with evidence
-  and recovery actions for a user or external agent.
+- `cara sync` is idempotent: pending CI waits, failed CI returns exact check/run
+  evidence, and `--rerun-failed` reruns only verified runs for the selected PR
+  and head SHA.
+- `caravan-force` keeps a known acceptable failure in-chain. A forced head is
+  admin-squashed only when repository policy permits it, the exact head/default
+  compatibility proof is still current, and GitHub reports admin permission.
 
 ## Foundation status
 
@@ -45,7 +49,7 @@ cara new [--create-pr]
 cara join [--tail-pr N | --head-pr N] [--create-pr]
 cara renew | cara rejoin
 cara show | cara next | cara prev
-cara sync [--all] | cara loop
+cara sync [--all] [--rerun-failed] | cara loop
 cara evict [--pr N] --reason TEXT
 cara split [--pr N]
 cara van list | cara van next | cara van prev
