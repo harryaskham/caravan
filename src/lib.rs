@@ -6,6 +6,9 @@
 
 use std::path::PathBuf;
 
+pub mod compatibility;
+pub mod operation_lock;
+
 use clap::Args;
 use feedback_cli::{FeedbackConfig, Reporter};
 use mcp_cli::{ErrorCategory, StructuredError, ToolRouter};
@@ -52,6 +55,20 @@ pub struct AppError {
 }
 
 impl AppError {
+    pub(crate) fn structured(
+        category: ErrorCategory,
+        code: impl Into<String>,
+        message: impl Into<String>,
+        details: Option<Value>,
+    ) -> Self {
+        Self {
+            category,
+            code: code.into(),
+            message: message.into(),
+            details,
+        }
+    }
+
     /// Construct a validation error.
     #[must_use]
     pub fn validation(code: &str, message: impl Into<String>) -> Self {
