@@ -108,6 +108,7 @@ dependencies = [
  "ctrlc",
  "feedback-cli",
  "mcp-cli",
+ "rustix",
  "schemars",
  "serde",
  "serde_json",

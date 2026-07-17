@@ -484,27 +484,32 @@ fn lock_age_secs(metadata: &fs::Metadata, owner: &OperationLockOwner) -> u64 {
 
 #[cfg(unix)]
 fn process_is_alive(pid: u32) -> Result<bool, AppError> {
-    let request = CommandSpec::new("ps").args(["-p", &pid.to_string(), "-o", "pid="]);
-    let output = ProcessRunner::new()
-        .with_timeout(Duration::from_secs(5))
-        .run(&request)
-        .map_err(|error| lock_command_error(&error, Path::new(".")))?;
-    match output.code {
-        Some(0) => Ok(output
-            .stdout
-            .split_whitespace()
-            .any(|value| value == pid.to_string())),
-        Some(1) => Ok(false),
-        _ => Err(AppError::structured(
+    let raw_pid = i32::try_from(pid).map_err(|_| {
+        AppError::structured(
+            ErrorCategory::Validation,
+            "operation_lock_pid_invalid",
+            "the operation lock owner PID is outside the platform range",
+            Some(json!({ "pid": pid })),
+        )
+    })?;
+    let pid = rustix::process::Pid::from_raw(raw_pid).ok_or_else(|| {
+        AppError::structured(
+            ErrorCategory::Validation,
+            "operation_lock_pid_invalid",
+            "the operation lock owner PID must be positive",
+            Some(json!({ "pid": pid })),
+        )
+    })?;
+    // POSIX kill(pid, 0) returns EPERM when the process exists but the
+    // caller lacks permission. Existence is all recovery needs to refuse.
+    match rustix::process::test_kill_process(pid) {
+        Ok(()) | Err(rustix::io::Errno::PERM) => Ok(true),
+        Err(rustix::io::Errno::SRCH) => Ok(false),
+        Err(error) => Err(AppError::structured(
             ErrorCategory::ExecutionFailure,
             "operation_lock_process_probe_failed",
-            "could not determine whether the operation lock owner PID is alive",
-            Some(json!({
-                "pid": pid,
-                "exit_code": output.code,
-                "stdout": bounded_text(&output.stdout),
-                "stderr": bounded_text(&output.stderr),
-            })),
+            format!("could not determine whether operation lock owner PID exists: {error}"),
+            Some(json!({ "pid": pid.as_raw_nonzero().get() })),
         )),
     }
 }
