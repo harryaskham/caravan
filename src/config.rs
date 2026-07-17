@@ -1,0 +1,357 @@
+//! Strict repository-local `.caravan/config.yaml` parsing and validation.
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use mcp_cli::{ErrorCategory, StructuredError};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+use crate::model::EventKind;
+
+/// Supported config schema version.
+pub const CONFIG_VERSION: u32 = 1;
+/// Default repository-relative config path.
+pub const DEFAULT_CONFIG_PATH: &str = ".caravan/config.yaml";
+const MAX_INTERVAL_SECS: u64 = 86_400;
+const MAX_HOOK_TIMEOUT_SECS: u64 = 86_400;
+
+fn config_version() -> u32 {
+    CONFIG_VERSION
+}
+
+fn default_loop_interval_secs() -> u64 {
+    60
+}
+
+fn default_hook_timeout_secs() -> u64 {
+    30
+}
+
+/// Foreground `cara loop` policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct LoopConfig {
+    pub interval_secs: u64,
+}
+
+impl Default for LoopConfig {
+    fn default() -> Self {
+        Self {
+            interval_secs: default_loop_interval_secs(),
+        }
+    }
+}
+
+/// One shell hook policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct HookConfig {
+    /// Command executed by the platform shell with event JSON on stdin.
+    pub command: String,
+    /// Hard execution timeout.
+    pub timeout_secs: u64,
+    /// Whether hook failure makes the invoking Caravan operation fail.
+    pub blocking: bool,
+}
+
+impl Default for HookConfig {
+    fn default() -> Self {
+        Self {
+            command: String::new(),
+            timeout_secs: default_hook_timeout_secs(),
+            blocking: false,
+        }
+    }
+}
+
+/// Strict repository policy. Unknown fields are rejected at every level.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct CaravanConfig {
+    pub version: u32,
+    pub force_merge: bool,
+    #[serde(rename = "loop")]
+    pub loop_config: LoopConfig,
+    pub hooks: BTreeMap<EventKind, HookConfig>,
+}
+
+impl Default for CaravanConfig {
+    fn default() -> Self {
+        Self {
+            version: config_version(),
+            force_merge: false,
+            loop_config: LoopConfig::default(),
+            hooks: BTreeMap::new(),
+        }
+    }
+}
+
+impl CaravanConfig {
+    /// Parse YAML and validate the complete policy.
+    pub fn parse(yaml: &str) -> Result<Self, ConfigError> {
+        let config: Self = serde_yaml::from_str(yaml).map_err(|error| ConfigError::Parse {
+            path: None,
+            message: error.to_string(),
+        })?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Read an explicit config file. Missing files are errors.
+    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        let content = fs::read_to_string(path).map_err(|error| ConfigError::Read {
+            path: path.to_path_buf(),
+            message: error.to_string(),
+        })?;
+        let config = Self::parse(&content).map_err(|error| error.with_path(path))?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Resolve an override or the repository default. An absent default file
+    /// means default policy; an explicitly supplied missing path is an error.
+    pub fn load_or_default(path: Option<&Path>) -> Result<LoadedConfig, ConfigError> {
+        let resolved = path.map_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH), Path::to_path_buf);
+        if !resolved.exists() {
+            if path.is_some() {
+                return Err(ConfigError::Read {
+                    path: resolved,
+                    message: "configured path does not exist".to_owned(),
+                });
+            }
+            return Ok(LoadedConfig {
+                path: resolved,
+                existed: false,
+                config: Self::default(),
+            });
+        }
+        Ok(LoadedConfig {
+            config: Self::load(&resolved)?,
+            path: resolved,
+            existed: true,
+        })
+    }
+
+    /// Validate cross-field bounds after deserialization.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.version != CONFIG_VERSION {
+            return Err(ConfigError::UnsupportedVersion {
+                found: self.version,
+                supported: CONFIG_VERSION,
+            });
+        }
+        if !(1..=MAX_INTERVAL_SECS).contains(&self.loop_config.interval_secs) {
+            return Err(ConfigError::Validation(format!(
+                "loop.interval_secs must be between 1 and {MAX_INTERVAL_SECS}"
+            )));
+        }
+        for (event, hook) in &self.hooks {
+            if hook.command.trim().is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "hooks.{event:?}.command must not be empty"
+                )));
+            }
+            if !(1..=MAX_HOOK_TIMEOUT_SECS).contains(&hook.timeout_secs) {
+                return Err(ConfigError::Validation(format!(
+                    "hooks.{event:?}.timeout_secs must be between 1 and {MAX_HOOK_TIMEOUT_SECS}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn hook(&self, event: EventKind) -> Option<&HookConfig> {
+        self.hooks.get(&event)
+    }
+}
+
+/// Resolved config plus source metadata useful in status output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedConfig {
+    pub path: PathBuf,
+    pub existed: bool,
+    pub config: CaravanConfig,
+}
+
+/// Config discovery, parsing, and validation errors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigError {
+    Read {
+        path: PathBuf,
+        message: String,
+    },
+    Parse {
+        path: Option<PathBuf>,
+        message: String,
+    },
+    UnsupportedVersion {
+        found: u32,
+        supported: u32,
+    },
+    Validation(String),
+}
+
+impl ConfigError {
+    fn with_path(self, path: &Path) -> Self {
+        match self {
+            Self::Parse { message, .. } => Self::Parse {
+                path: Some(path.to_path_buf()),
+                message,
+            },
+            other => other,
+        }
+    }
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Read { path, message } => {
+                write!(formatter, "read {}: {message}", path.display())
+            }
+            Self::Parse { path, message } => match path {
+                Some(path) => write!(formatter, "parse {}: {message}", path.display()),
+                None => write!(formatter, "parse caravan config: {message}"),
+            },
+            Self::UnsupportedVersion { found, supported } => write!(
+                formatter,
+                "unsupported caravan config version {found}; supported version is {supported}"
+            ),
+            Self::Validation(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
+impl StructuredError for ConfigError {
+    fn category(&self) -> ErrorCategory {
+        ErrorCategory::ConfigError
+    }
+
+    fn code(&self) -> String {
+        match self {
+            Self::Read { .. } => "config_read_failed",
+            Self::Parse { .. } => "config_parse_failed",
+            Self::UnsupportedVersion { .. } => "unsupported_config_version",
+            Self::Validation(_) => "invalid_config",
+        }
+        .to_owned()
+    }
+
+    fn message(&self) -> String {
+        self.to_string()
+    }
+
+    fn details(&self) -> Option<Value> {
+        match self {
+            Self::Read { path, .. } => Some(json!({ "path": path })),
+            Self::Parse { path, .. } => path.as_ref().map(|path| json!({ "path": path })),
+            Self::UnsupportedVersion { found, supported } => {
+                Some(json!({ "found": found, "supported": supported }))
+            }
+            Self::Validation(_) => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_document_uses_safe_defaults() {
+        let config = CaravanConfig::parse("{}\n").expect("defaults parse");
+        assert_eq!(config.version, 1);
+        assert!(!config.force_merge);
+        assert_eq!(config.loop_config.interval_secs, 60);
+        assert!(config.hooks.is_empty());
+    }
+
+    #[test]
+    fn repository_example_parses_strictly() {
+        let config = CaravanConfig::parse(
+            r"
+version: 1
+force_merge: true
+loop:
+  interval_secs: 10
+hooks:
+  sync_failed:
+    command: ./scripts/on-sync-failed
+    timeout_secs: 45
+    blocking: false
+",
+        )
+        .expect("example config");
+        assert!(config.force_merge);
+        let hook = config.hook(EventKind::SyncFailed).expect("hook");
+        assert_eq!(hook.command, "./scripts/on-sync-failed");
+        assert_eq!(hook.timeout_secs, 45);
+        assert!(!hook.blocking);
+    }
+
+    #[test]
+    fn unknown_fields_are_rejected_at_every_level() {
+        let top = CaravanConfig::parse("version: 1\nsurprise: true\n").unwrap_err();
+        assert_eq!(top.code(), "config_parse_failed");
+        let nested =
+            CaravanConfig::parse("version: 1\nloop:\n  interval_secs: 10\n  surprise: true\n")
+                .unwrap_err();
+        assert_eq!(nested.code(), "config_parse_failed");
+        let hook = CaravanConfig::parse(
+            "version: 1\nhooks:\n  sync_failed:\n    command: echo hi\n    surprise: true\n",
+        )
+        .unwrap_err();
+        assert_eq!(hook.code(), "config_parse_failed");
+    }
+
+    #[test]
+    fn versions_intervals_and_hooks_are_validated() {
+        assert_eq!(
+            CaravanConfig::parse("version: 2\n").unwrap_err().code(),
+            "unsupported_config_version"
+        );
+        assert_eq!(
+            CaravanConfig::parse("version: 1\nloop:\n  interval_secs: 0\n")
+                .unwrap_err()
+                .code(),
+            "invalid_config"
+        );
+        assert_eq!(
+            CaravanConfig::parse("version: 1\nhooks:\n  sync_failed:\n    command: '  '\n")
+                .unwrap_err()
+                .code(),
+            "invalid_config"
+        );
+    }
+
+    #[test]
+    fn absent_default_is_safe_but_missing_override_is_an_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(temp.path()).unwrap();
+        let loaded = CaravanConfig::load_or_default(None).expect("missing default is safe");
+        std::env::set_current_dir(previous).unwrap();
+        assert!(!loaded.existed);
+        assert_eq!(loaded.path, PathBuf::from(DEFAULT_CONFIG_PATH));
+
+        let error =
+            CaravanConfig::load_or_default(Some(&temp.path().join("missing.yaml"))).unwrap_err();
+        assert_eq!(error.code(), "config_read_failed");
+    }
+
+    #[test]
+    fn explicit_file_load_records_parse_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.yaml");
+        fs::write(&path, "unknown: true\n").unwrap();
+        let error = CaravanConfig::load(&path).unwrap_err();
+        assert_eq!(error.code(), "config_parse_failed");
+        assert_eq!(error.details().unwrap()["path"], json!(path));
+    }
+}

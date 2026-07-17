@@ -13,6 +13,11 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::config::{CaravanConfig, ConfigError};
+
+pub mod config;
+pub mod model;
+
 /// GitHub release repository used by `updatable-cli`.
 pub const UPDATE_REPO_SLUG: &str = "harryaskham/caravan";
 /// Installed binary name.
@@ -104,10 +109,36 @@ impl StructuredError for AppError {
 }
 
 /// Context shared by MCP tools.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct AppContext {
-    /// Optional `.caravan/config.yaml` override supplied when the server starts.
-    pub config_path: Option<PathBuf>,
+    /// Resolved `.caravan/config.yaml` path (or explicit override).
+    pub config_path: PathBuf,
+    /// Whether the resolved file existed; absent defaults remain visible.
+    pub config_existed: bool,
+    /// Validated repository policy shared by every tool call.
+    pub config: CaravanConfig,
+}
+
+impl AppContext {
+    /// Resolve and validate repository configuration once for an MCP session.
+    pub fn load(path: Option<&std::path::Path>) -> Result<Self, ConfigError> {
+        let loaded = CaravanConfig::load_or_default(path)?;
+        Ok(Self {
+            config_path: loaded.path,
+            config_existed: loaded.existed,
+            config: loaded.config,
+        })
+    }
+}
+
+impl Default for AppContext {
+    fn default() -> Self {
+        Self {
+            config_path: PathBuf::from(config::DEFAULT_CONFIG_PATH),
+            config_existed: false,
+            config: CaravanConfig::default(),
+        }
+    }
 }
 
 /// Empty input for parameterless commands.

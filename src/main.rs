@@ -206,7 +206,7 @@ fn run(cli: &Cli) -> Result<(), i32> {
             VanCommand::Prev => run_domain(cli.json, "van prev", &EmptyInput::default()),
         },
         Command::Help => run_help(cli.json),
-        Command::Mcp(command) => run_mcp(command, cli.config.clone()),
+        Command::Mcp(command) => run_mcp(command, cli.config.as_deref()),
         Command::SelfUpdate(command) => run_self_update(cli.json, command),
         Command::Feedback(command) => run_feedback(cli.json, command),
     }
@@ -224,7 +224,7 @@ fn run_help(json: bool) -> Result<(), i32> {
     Ok(())
 }
 
-fn run_mcp(command: &McpCommand, config_path: Option<PathBuf>) -> Result<(), i32> {
+fn run_mcp(command: &McpCommand, config_path: Option<&std::path::Path>) -> Result<(), i32> {
     let server = McpServer::new(
         StdioServerConfig {
             server_name: TOOL_NAME.to_owned(),
@@ -232,7 +232,10 @@ fn run_mcp(command: &McpCommand, config_path: Option<PathBuf>) -> Result<(), i32
         },
         build_router(),
     );
-    let context = AppContext { config_path };
+    let context = AppContext::load(config_path).map_err(|error| {
+        eprintln!("cara: {error}");
+        2
+    })?;
     match command {
         McpCommand::Tools => {
             serde_json::to_writer_pretty(io::stdout().lock(), &server.tool_metadata())
