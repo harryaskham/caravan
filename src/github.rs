@@ -3,7 +3,7 @@
 //! This module deliberately stops at faithful provider conversion. Graph policy
 //! and every GitHub mutation live in downstream lanes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -296,6 +296,35 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
     #[must_use]
     pub const fn new(runner: R) -> Self {
         Self { runner }
+    }
+
+    /// Whether GitHub reports protection on a repository branch.
+    pub fn branch_is_protected(
+        &self,
+        repository: &RepositoryId,
+        branch: &str,
+    ) -> Result<bool, MutationError> {
+        let branch: BranchSettingsJson = self.json(branch_settings_command(repository, branch))?;
+        Ok(branch.protected)
+    }
+
+    /// Whether repository settings permit GitHub auto-merge.
+    pub fn repository_allows_auto_merge(
+        &self,
+        repository: &RepositoryId,
+    ) -> Result<bool, MutationError> {
+        let settings: RepositorySettingsJson =
+            self.json(repository_settings_command(repository))?;
+        Ok(settings.allow_auto_merge && settings.allow_squash_merge)
+    }
+
+    /// List repository label names for mutation preflight.
+    pub fn repository_labels(
+        &self,
+        repository: &RepositoryId,
+    ) -> Result<BTreeSet<String>, MutationError> {
+        let labels: Vec<LabelJson> = self.json(repository_labels_command(repository))?;
+        Ok(labels.into_iter().map(|label| label.name).collect())
     }
 
     /// Refetch one PR by number without applying policy.
@@ -945,6 +974,34 @@ fn rerun_failed_command(repository: &RepositoryId, run_id: u64) -> CommandSpec {
     ])
 }
 
+fn branch_settings_command(repository: &RepositoryId, branch: &str) -> CommandSpec {
+    CommandSpec::new("gh").args([
+        "api".to_owned(),
+        format!(
+            "repos/{}/branches/{}",
+            repository.slug(),
+            encode_path_segment(branch)
+        ),
+    ])
+}
+
+fn repository_settings_command(repository: &RepositoryId) -> CommandSpec {
+    CommandSpec::new("gh").args(["api".to_owned(), format!("repos/{}", repository.slug())])
+}
+
+fn repository_labels_command(repository: &RepositoryId) -> CommandSpec {
+    CommandSpec::new("gh").args([
+        "label".to_owned(),
+        "list".to_owned(),
+        "--repo".to_owned(),
+        repository.slug(),
+        "--limit".to_owned(),
+        "1000".to_owned(),
+        "--json".to_owned(),
+        "name".to_owned(),
+    ])
+}
+
 fn repository_permission_command(repository: &RepositoryId) -> CommandSpec {
     CommandSpec::new("gh").args([
         "repo".to_owned(),
@@ -1043,6 +1100,17 @@ struct GitRefJson {
 #[derive(Debug, Deserialize)]
 struct GitObjectJson {
     sha: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BranchSettingsJson {
+    protected: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct RepositorySettingsJson {
+    allow_auto_merge: bool,
+    allow_squash_merge: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1224,11 +1292,10 @@ struct CheckJson {
 
 impl CheckJson {
     fn into_snapshot(self) -> model::CheckSnapshot {
-        let provider_state = self
-            .conclusion
-            .or(self.state)
-            .or(self.status)
-            .filter(|state| !state.is_empty());
+        let provider_state = [self.conclusion, self.state, self.status]
+            .into_iter()
+            .flatten()
+            .find(|state| !state.is_empty());
         model::CheckSnapshot {
             name: self
                 .name
@@ -1399,6 +1466,27 @@ mod tests {
 
         assert_eq!(check.state, CheckState::Unknown);
         assert_eq!(check.provider_state.as_deref(), Some("WOBBLY"));
+        discovery.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn empty_check_conclusion_falls_back_to_nonempty_status() {
+        let open_prs = pr_list_json(12, "feature/widget", "acme/widgets", false)
+            .replace("\"status\":\"COMPLETED\"", "\"status\":\"QUEUED\"")
+            .replace("\"conclusion\":\"SUCCESS\"", "\"conclusion\":\"\"");
+        let runner = FakeRunner::new(successful_discovery_calls(&open_prs));
+        let discovery = GitHubDiscovery::new(runner);
+
+        let snapshot = discovery.discover().expect("discovery succeeds");
+        let check = &snapshot
+            .pull_requests
+            .iter()
+            .find(|pull_request| pull_request.number == PrNumber(12))
+            .expect("open PR is present")
+            .checks[0];
+
+        assert_eq!(check.state, CheckState::Queued);
+        assert_eq!(check.provider_state.as_deref(), Some("QUEUED"));
         discovery.runner.assert_exhausted();
     }
 

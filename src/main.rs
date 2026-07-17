@@ -190,10 +190,18 @@ fn run(cli: &Cli) -> Result<(), i32> {
     match &cli.command {
         Command::Status => run_status(cli),
         Command::Check(input) => run_check(cli, input),
-        Command::New(input) => run_domain(cli.json, "new", input),
-        Command::Renew(input) => run_domain(cli.json, "renew", input),
-        Command::Join(input) => run_domain(cli.json, "join", input),
-        Command::Rejoin(input) => run_domain(cli.json, "rejoin", input),
+        Command::New(input) => {
+            run_membership(cli, |context| caravan::membership::new(context, input))
+        }
+        Command::Renew(input) => {
+            run_membership(cli, |context| caravan::membership::renew(context, input))
+        }
+        Command::Join(input) => {
+            run_membership(cli, |context| caravan::membership::join(context, input))
+        }
+        Command::Rejoin(input) => {
+            run_membership(cli, |context| caravan::membership::rejoin(context, input))
+        }
         Command::Show => run_show(cli),
         Command::Next => run_navigation(
             cli,
@@ -279,6 +287,42 @@ fn run_show(cli: &Cli) -> Result<(), i32> {
         }
         Err(error) => emit_human_error(error),
     }
+}
+
+fn run_membership(
+    cli: &Cli,
+    execute: impl FnOnce(&AppContext) -> Result<caravan::membership::MembershipOutput, AppError>,
+) -> Result<(), i32> {
+    let context = load_context(cli)?;
+    let result = execute(&context);
+    if cli.json {
+        return emit_result(true, result);
+    }
+    match result {
+        Ok(output) => {
+            print!("{}", render_membership(&output));
+            Ok(())
+        }
+        Err(error) => emit_human_error(error),
+    }
+}
+
+fn render_membership(output: &caravan::membership::MembershipOutput) -> String {
+    let mut text = format!(
+        "{}: PR #{} in caravan #{} ({})\n",
+        output.receipt.operation,
+        output.pull_request.number,
+        output.caravan_id,
+        if output.receipt.changed {
+            "changed"
+        } else {
+            "already satisfied"
+        }
+    );
+    for step in &output.receipt.completed_steps {
+        let _ = writeln!(text, "  {:?} {:?}: {}", step.kind, step.state, step.summary);
+    }
+    text
 }
 
 fn render_status(output: &caravan::read::StatusOutput) -> String {

@@ -10,6 +10,7 @@ pub mod command;
 pub mod compatibility;
 pub mod github;
 pub mod graph;
+pub mod membership;
 pub mod navigation;
 pub mod operation_lock;
 pub mod read;
@@ -306,6 +307,7 @@ pub fn scaffold_operation<T>(operation: &str, _input: &T) -> Result<OperationOut
     Err(AppError::not_implemented(operation))
 }
 
+#[cfg(test)]
 fn validate_target(tail_pr: Option<u64>, head_pr: Option<u64>) -> Result<(), AppError> {
     if tail_pr.is_some() && head_pr.is_some() {
         return Err(AppError::validation(
@@ -314,11 +316,6 @@ fn validate_target(tail_pr: Option<u64>, head_pr: Option<u64>) -> Result<(), App
         ));
     }
     Ok(())
-}
-
-fn join(operation: &str, input: &JoinInput) -> Result<OperationOutput, AppError> {
-    validate_target(input.tail_pr, input.head_pr)?;
-    scaffold_operation(operation, input)
 }
 
 /// Build the complete MCP command router.
@@ -348,22 +345,22 @@ pub fn build_router() -> ToolRouter<AppContext> {
     router.add_typed_tool_with_output_schema(
         "new",
         "Create a one-PR caravan from the current branch after full graph and cross-caravan compatibility checks.",
-        |_context: &AppContext, input: CreateInput| scaffold_operation("new", &input),
+        |context: &AppContext, input: CreateInput| membership::new(context, &input),
     );
     router.add_typed_tool_with_output_schema(
         "renew",
         "Reevaluate an evicted current PR as a new caravan, removing caravan-evicted only after preflight succeeds.",
-        |_context: &AppContext, input: CreateInput| scaffold_operation("renew", &input),
+        |context: &AppContext, input: CreateInput| membership::renew(context, &input),
     );
     router.add_typed_tool_with_output_schema(
         "join",
         "Append the current PR after a caravan tail. On ambiguity, supply tail_pr or head_pr; returns typed decision errors without guessing.",
-        |_context: &AppContext, input: JoinInput| join("join", &input),
+        |context: &AppContext, input: JoinInput| membership::join(context, &input),
     );
     router.add_typed_tool_with_output_schema(
         "rejoin",
         "Reevaluate an evicted PR and append it after a valid tail; removes caravan-evicted only after preflight succeeds.",
-        |_context: &AppContext, input: JoinInput| join("rejoin", &input),
+        |context: &AppContext, input: JoinInput| membership::rejoin(context, &input),
     );
     router.add_typed_tool_with_output_schema(
         "show",
