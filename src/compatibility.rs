@@ -438,7 +438,7 @@ mod tests {
             );
         }
 
-        fn branch(&self, name: &str, oid: &str) -> BranchSnapshot {
+        fn branch(name: &str, oid: &str) -> BranchSnapshot {
             BranchSnapshot {
                 repository: RepositoryId {
                     owner: "harryaskham".to_owned(),
@@ -464,8 +464,8 @@ mod tests {
         let report = check_adjacent(
             repository.path(),
             "fixture",
-            &repository.branch("child", &child),
-            &repository.branch("predecessor", &predecessor),
+            &TestRepo::branch("child", &child),
+            &TestRepo::branch("predecessor", &predecessor),
         )
         .expect("clean compatibility report");
 
@@ -495,8 +495,8 @@ mod tests {
         let report = check_head_to_default(
             repository.path(),
             "fixture",
-            &repository.branch("feature", &head),
-            &repository.branch("main", &default),
+            &TestRepo::branch("feature", &head),
+            &TestRepo::branch("main", &default),
         )
         .expect("conflict is canonical evidence, not an execution error");
 
@@ -524,8 +524,8 @@ mod tests {
         let report = check_cross_caravan(
             repository.path(),
             "fixture",
-            &repository.branch("other-head", &head),
-            &repository.branch("tail", &tail),
+            &TestRepo::branch("other-head", &head),
+            &TestRepo::branch("tail", &tail),
         )
         .expect("ordered cross-caravan report");
 
@@ -550,9 +550,12 @@ mod tests {
         );
         let refs_before = git_stdout(consumer.path(), ["show-ref"]);
 
-        let resolved =
-            resolve_branch_snapshot(consumer.path(), "source", &source.branch("main", &expected))
-                .expect("fetch exact remote revision");
+        let resolved = resolve_branch_snapshot(
+            consumer.path(),
+            "source",
+            &TestRepo::branch("main", &expected),
+        )
+        .expect("fetch exact remote revision");
 
         assert_eq!(resolved, CommitOid(expected));
         assert_eq!(git_stdout(consumer.path(), ["show-ref"]), refs_before);
@@ -579,7 +582,7 @@ mod tests {
         };
 
         let error =
-            resolve_branch_snapshot(consumer.path(), "source", &source.branch("main", &wrong))
+            resolve_branch_snapshot(consumer.path(), "source", &TestRepo::branch("main", &wrong))
                 .expect_err("stale discovery must not validate a different remote head");
 
         assert_eq!(error.code(), "stale_remote_revision");
