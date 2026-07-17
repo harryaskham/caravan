@@ -3,6 +3,8 @@
 use std::fmt::Write as _;
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use caravan::{
     AGENT_HELP, AppContext, AppError, CheckInput, CreateInput, EvictInput, JoinInput,
@@ -40,6 +42,8 @@ struct Cli {
 enum Command {
     /// Discover the current PR, all caravans, invalid fragments, and decisions.
     Status,
+    /// Read the bounded repository event journal, optionally following new records.
+    Log(LogCommand),
     /// Validate current or proposed caravan state without mutation.
     Check(CheckInput),
     /// Create a one-PR caravan from the current branch.
@@ -81,6 +85,15 @@ enum Command {
     /// Inspect or emit structured feedback through feedback-cli.
     #[command(subcommand)]
     Feedback(FeedbackCommand),
+}
+
+#[derive(Debug, Args)]
+struct LogCommand {
+    #[command(flatten)]
+    input: caravan::journal::LogInput,
+    /// Keep streaming new records until interrupted (CLI-only).
+    #[arg(short = 'f', long)]
+    follow: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -200,6 +213,7 @@ fn main() {
 fn run(cli: &Cli) -> Result<(), i32> {
     match &cli.command {
         Command::Status => run_status(cli),
+        Command::Log(command) => run_log(cli, command),
         Command::Check(input) => run_check(cli, input),
         Command::New(input) => {
             run_membership(cli, |context| caravan::membership::new(context, input))
@@ -259,6 +273,77 @@ fn load_context(cli: &Cli) -> Result<AppContext, i32> {
             2
         }
     })
+}
+
+fn run_log(cli: &Cli, command: &LogCommand) -> Result<(), i32> {
+    let context = load_context(cli)?;
+    if !command.follow {
+        let result = caravan::journal::snapshot(&context, &command.input);
+        if cli.json {
+            return emit_result(true, result);
+        }
+        return match result {
+            Ok(output) => {
+                for record in &output.records {
+                    println!("{}", render_journal_record(record));
+                }
+                Ok(())
+            }
+            Err(error) => emit_human_error(error),
+        };
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let signal_stop = Arc::clone(&stop);
+    ctrlc::set_handler(move || signal_stop.store(true, Ordering::SeqCst)).map_err(|error| {
+        eprintln!("cara: could not install log signal handler: {error}");
+        1
+    })?;
+    caravan::journal::follow(&context, &command.input, &stop, |record| {
+        if cli.json {
+            if serde_json::to_writer(io::stdout().lock(), record).is_ok() {
+                println!();
+            }
+        } else {
+            println!("{}", render_journal_record(record));
+        }
+    })
+    .map_err(|error| {
+        let _ = emit_human_error(error);
+        1
+    })
+}
+
+fn render_journal_record(record: &caravan::journal::JournalRecord) -> String {
+    match record {
+        caravan::journal::JournalRecord::Event { event, .. } => format!(
+            "{} {:?} event={} operation={} prs={}",
+            event.timestamp,
+            event.kind,
+            event.event_id.0,
+            event.operation_id.0,
+            event
+                .prs
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        caravan::journal::JournalRecord::HookDelivery {
+            timestamp,
+            event_id,
+            kind,
+            delivery,
+            ..
+        } => format!(
+            "{timestamp} {kind:?} hook={:?} event={} exit={:?} stdout_bytes={} stderr_bytes={}",
+            delivery.state,
+            event_id.0,
+            delivery.exit_code,
+            delivery.stdout_bytes,
+            delivery.stderr_bytes
+        ),
+    }
 }
 
 fn run_status(cli: &Cli) -> Result<(), i32> {

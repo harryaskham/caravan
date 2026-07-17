@@ -227,11 +227,16 @@ pub fn dispatch_events(
     events: &[CaravanEvent],
 ) -> Result<Vec<HookDelivery>, AppError> {
     let mut deliveries = Vec::new();
+    let mut journaled = BTreeSet::new();
     for event in events {
+        if journaled.insert(event.event_id.clone()) {
+            crate::journal::append_event(context, event)?;
+        }
         let Some(hook) = context.config.hook(event.kind) else {
             continue;
         };
         let delivery = dispatch_event(&context.repository_path, hook, event)?;
+        crate::journal::append_delivery(context, event, &delivery)?;
         let failed = delivery.state != HookDeliveryState::Succeeded;
         deliveries.push(delivery.clone());
         if failed && hook.blocking {
@@ -414,6 +419,12 @@ mod tests {
     }
 
     fn context(repository: &Path, hook: HookConfig) -> AppContext {
+        let status = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(repository)
+            .status()
+            .expect("git init runs");
+        assert!(status.success());
         let mut config = CaravanConfig::default();
         config.hooks.insert(EventKind::SyncFailed, hook);
         AppContext {

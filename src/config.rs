@@ -35,6 +35,33 @@ fn default_hook_timeout_secs() -> u64 {
     30
 }
 
+fn default_journal_max_bytes() -> u64 {
+    8 * 1024 * 1024
+}
+
+fn default_journal_max_archives() -> u32 {
+    3
+}
+
+/// Bounded repository event-journal retention policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct JournalConfig {
+    /// Rotate the active JSONL file before it grows beyond this size.
+    pub max_bytes: u64,
+    /// Number of rotated JSONL files retained alongside the active file.
+    pub max_archives: u32,
+}
+
+impl Default for JournalConfig {
+    fn default() -> Self {
+        Self {
+            max_bytes: default_journal_max_bytes(),
+            max_archives: default_journal_max_archives(),
+        }
+    }
+}
+
 /// Foreground `cara loop` policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
@@ -82,6 +109,7 @@ pub struct CaravanConfig {
     pub command_timeout_secs: u64,
     #[serde(rename = "loop")]
     pub loop_config: LoopConfig,
+    pub journal: JournalConfig,
     pub hooks: BTreeMap<EventKind, HookConfig>,
 }
 
@@ -92,6 +120,7 @@ impl Default for CaravanConfig {
             force_merge: false,
             command_timeout_secs: default_command_timeout_secs(),
             loop_config: LoopConfig::default(),
+            journal: JournalConfig::default(),
             hooks: BTreeMap::new(),
         }
     }
@@ -160,6 +189,16 @@ impl CaravanConfig {
             return Err(ConfigError::Validation(format!(
                 "loop.interval_secs must be between 1 and {MAX_INTERVAL_SECS}"
             )));
+        }
+        if !(1024..=1024 * 1024 * 1024).contains(&self.journal.max_bytes) {
+            return Err(ConfigError::Validation(
+                "journal.max_bytes must be between 1024 and 1073741824".to_owned(),
+            ));
+        }
+        if self.journal.max_archives > 100 {
+            return Err(ConfigError::Validation(
+                "journal.max_archives must be between 0 and 100".to_owned(),
+            ));
         }
         for (event, hook) in &self.hooks {
             if hook.command.trim().is_empty() {

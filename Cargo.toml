@@ -31,6 +31,7 @@ uuid = { version = "1", features = ["v7"] }
 mcp-cli = { git = "https://github.com/harryaskham/mcp-cli", branch = "main" }
 updatable-cli = { git = "https://github.com/harryaskham/updatable-cli", branch = "main" }
 feedback-cli = { git = "https://github.com/harryaskham/feedback-cli", branch = "main" }
+fs2 = "0.4"
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["process"] }

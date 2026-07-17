@@ -124,6 +124,9 @@ force_merge: false
 command_timeout_secs: 30
 loop:
   interval_secs: 60
+journal:
+  max_bytes: 8388608
+  max_archives: 3
 hooks:
   sync_failed:
     command: ./scripts/on-caravan-sync-failed
@@ -141,6 +144,24 @@ Hooks receive one versioned `CaravanEvent` JSON object on stdin plus non-secret
 state/exit/byte counts, never hook output content. Best-effort failures remain in
 the command output; blocking failures return typed `hook_failure` and never roll
 back provider mutations already recorded by the event.
+
+Every canonical event is first appended under the repository's common Git
+metadata (`caravan/events-v1.jsonl`), so linked worktrees share one journal.
+Secret-free hook delivery receipts are appended afterward; hook stdout/stderr
+content is never stored. Appends and reads use a repository lock, exact event IDs
+are deduplicated, torn final records recover safely, and the configured size and
+archive count bound retention.
+
+```sh
+cara log                         # newest 100 event/delivery records
+cara log --kind ci_failed --pr 42 --limit 20
+cara log --json                  # stable bounded JSON envelope
+cara log -f                      # existing tail, then new records until signal
+cara log --json -f               # newline-delimited streaming records
+```
+
+Only the bounded `log` snapshot is exposed over MCP; follow is deliberately
+CLI-only and creates no queue cursor or authority.
 
 Caravan intentionally owns no cross-process hook dedupe. A long-running hook can
 use an external lock and return success while that lock exists; repeated ticks

@@ -9,6 +9,7 @@ is required or used.
 | SPEC operation | Human CLI | `--json` | MCP tool | Checked behavior |
 |---|---|---|---|---|
 | repository inspection | `cara status` | envelope | `status` | live discovery, graph, PR/check facts |
+| event journal | `cara log` / `cara log -f` | bounded envelope / NDJSON follow | bounded `log` only | common-Git storage, filters, exact IDs, hook receipts, locking, rotation, torn-tail recovery |
 | eligibility | `cara check [--tail-pr N\|--head-pr N]` | envelope | `check` | active/new/join modes; target forms exclusive |
 | create caravan | `cara new [--create-pr]` | envelope | `new` | live preflight, label/base, squash auto-merge |
 | renew evicted | `cara renew [--create-pr]` | envelope | `renew` | evicted/force labels removed only after preflight |

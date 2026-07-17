@@ -3,4 +3,7 @@ force_merge: false
 command_timeout_secs: 30
 loop:
   interval_secs: 60
+journal:
+  max_bytes: 8388608
+  max_archives: 3
 hooks: {}
