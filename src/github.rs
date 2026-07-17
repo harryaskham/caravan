@@ -5,15 +5,18 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, de::DeserializeOwned};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use crate::command::{CommandRunError, CommandRunner, CommandSpec, ProcessRunner};
+use crate::command::{CommandOutput, CommandRunError, CommandRunner, CommandSpec, ProcessRunner};
 use crate::model::{
-    self, AutoMergeState, BranchSnapshot, CheckState, CommitOid, MergeMethod, PrNumber,
-    RepositoryId,
+    self, AutoMergeState, BranchSnapshot, CheckState, CommitOid, MergeMethod, MutationKind,
+    PrNumber, PullRequestPrecondition, RepositoryId,
 };
 
 const PR_JSON_FIELDS: &str = "number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository,baseRefName,baseRefOid,labels,autoMergeRequest,statusCheckRollup,mergedAt,url,updatedAt";
+const WORKFLOW_RUN_JSON_FIELDS: &str =
+    "databaseId,headSha,status,conclusion,event,name,workflowName,url";
 
 /// Limits and label used by one discovery pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,6 +142,447 @@ impl From<CommandRunError> for DiscoveryError {
     fn from(error: CommandRunError) -> Self {
         Self::Runner(error)
     }
+}
+
+/// Non-interactive inputs for `gh pr create --fill`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CreatePullRequestInput {
+    /// Head branch, optionally in `owner:branch` form.
+    pub head: String,
+    /// Base branch in the selected repository.
+    pub base: String,
+    /// Whether to open the PR as a draft.
+    #[serde(default)]
+    pub draft: bool,
+}
+
+/// Provider workflow-run facts used to select an exact failed run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WorkflowRunSnapshot {
+    /// GitHub Actions database identifier.
+    pub database_id: u64,
+    /// Exact head commit for the run.
+    pub head_sha: String,
+    /// Provider execution status, preserved verbatim.
+    pub status: String,
+    /// Provider conclusion, preserved verbatim.
+    pub conclusion: String,
+    /// Trigger event.
+    pub event: String,
+    /// Run name.
+    pub name: String,
+    /// Workflow name.
+    pub workflow_name: String,
+    /// Canonical browser URL.
+    pub url: String,
+}
+
+/// Exact provider receipt for one primitive PR mutation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GitHubMutationReceipt {
+    /// Primitive provider operation performed.
+    pub kind: MutationKind,
+    /// Exact PR facts immediately before mutation; absent only for creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<model::PullRequestSnapshot>,
+    /// Exact PR facts refetched after the provider command completed.
+    pub after: model::PullRequestSnapshot,
+    /// Trimmed non-secret provider output, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_output: Option<String>,
+}
+
+/// Typed failure from an optimistic provider primitive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MutationError {
+    /// Command execution, JSON conversion, or provider failure.
+    Provider(DiscoveryError),
+    /// Exact PR facts no longer match the caller's precondition.
+    StalePrecondition {
+        /// Facts supplied by the caller.
+        expected: Box<PullRequestPrecondition>,
+        /// Fresh facts observed immediately before mutation.
+        actual: Box<PullRequestPrecondition>,
+        /// Stable field names that changed.
+        changed_fields: Vec<String>,
+    },
+    /// `gh pr create` succeeded without identifying the created PR.
+    MissingCreatedPullRequest {
+        /// Trimmed provider output.
+        provider_output: String,
+    },
+    /// The authenticated actor cannot perform an administrator merge.
+    PermissionDenied {
+        /// Required repository permission.
+        required: String,
+        /// Permission reported by GitHub.
+        actual: String,
+    },
+    /// A requested Actions run belongs to another commit.
+    RunHeadMismatch {
+        /// Workflow run ID.
+        run_id: u64,
+        /// PR head expected by the caller.
+        expected_head: String,
+        /// Head observed on the run.
+        actual_head: String,
+    },
+    /// A requested Actions run is not currently failed.
+    RunNotFailed {
+        /// Workflow run ID.
+        run_id: u64,
+        /// Provider conclusion.
+        conclusion: String,
+    },
+}
+
+impl std::fmt::Display for MutationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Provider(error) => error.fmt(formatter),
+            Self::StalePrecondition { changed_fields, .. } => write!(
+                formatter,
+                "pull-request precondition changed: {}",
+                changed_fields.join(", ")
+            ),
+            Self::MissingCreatedPullRequest { provider_output } => write!(
+                formatter,
+                "gh created a pull request but returned no PR URL: {provider_output}"
+            ),
+            Self::PermissionDenied { required, actual } => write!(
+                formatter,
+                "repository permission `{actual}` cannot perform admin merge; `{required}` required"
+            ),
+            Self::RunHeadMismatch {
+                run_id,
+                expected_head,
+                actual_head,
+            } => write!(
+                formatter,
+                "workflow run {run_id} belongs to {actual_head}, expected {expected_head}"
+            ),
+            Self::RunNotFailed { run_id, conclusion } => write!(
+                formatter,
+                "workflow run {run_id} is not failed (conclusion: {conclusion})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MutationError {}
+
+impl From<DiscoveryError> for MutationError {
+    fn from(error: DiscoveryError) -> Self {
+        Self::Provider(error)
+    }
+}
+
+/// Policy-free optimistic mutation primitives over authenticated `gh`.
+#[derive(Debug, Clone)]
+pub struct GitHubMutationAdapter<R> {
+    runner: R,
+}
+
+impl GitHubMutationAdapter<ProcessRunner> {
+    /// Execute provider commands from the process's current repository.
+    #[must_use]
+    pub fn current_directory() -> Self {
+        Self::new(ProcessRunner::new())
+    }
+}
+
+impl<R: CommandRunner> GitHubMutationAdapter<R> {
+    /// Construct an adapter over an injected command runner.
+    #[must_use]
+    pub const fn new(runner: R) -> Self {
+        Self { runner }
+    }
+
+    /// Refetch one PR by number without applying policy.
+    pub fn refetch_pull_request(
+        &self,
+        repository: &RepositoryId,
+        number: PrNumber,
+    ) -> Result<model::PullRequestSnapshot, MutationError> {
+        self.refetch_selector(repository, &number.to_string())
+    }
+
+    /// Refetch and compare every mutation-sensitive fact.
+    pub fn verify_precondition(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+    ) -> Result<model::PullRequestSnapshot, MutationError> {
+        let actual_snapshot = self.refetch_pull_request(repository, expected.number)?;
+        let actual = PullRequestPrecondition::from(&actual_snapshot);
+        let changed_fields = changed_precondition_fields(expected, &actual);
+        if changed_fields.is_empty() {
+            Ok(actual_snapshot)
+        } else {
+            Err(MutationError::StalePrecondition {
+                expected: Box::new(expected.clone()),
+                actual: Box::new(actual),
+                changed_fields,
+            })
+        }
+    }
+
+    /// Create a PR non-interactively with commit-derived title/body and refetch it.
+    pub fn create_pull_request(
+        &self,
+        repository: &RepositoryId,
+        input: &CreatePullRequestInput,
+    ) -> Result<GitHubMutationReceipt, MutationError> {
+        let command = create_pull_request_command(repository, input);
+        let output = self.checked(command)?;
+        let Some(url) = output
+            .stdout
+            .split_whitespace()
+            .find(|token| token.starts_with("https://"))
+        else {
+            return Err(MutationError::MissingCreatedPullRequest {
+                provider_output: output.stdout.trim().to_owned(),
+            });
+        };
+        let after = self.refetch_selector(repository, url)?;
+        Ok(GitHubMutationReceipt {
+            kind: MutationKind::CreatePullRequest,
+            before: None,
+            after,
+            provider_output: trimmed_provider_output(&output),
+        })
+    }
+
+    /// Change a PR's base branch after exact precondition verification.
+    pub fn set_base(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+        base: &str,
+    ) -> Result<GitHubMutationReceipt, MutationError> {
+        self.mutate_pull_request(
+            repository,
+            expected,
+            MutationKind::SetBase,
+            edit_pull_request_command(repository, expected.number, "--base", base),
+        )
+    }
+
+    /// Add one label after exact precondition verification.
+    pub fn add_label(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+        label: &str,
+    ) -> Result<GitHubMutationReceipt, MutationError> {
+        self.mutate_pull_request(
+            repository,
+            expected,
+            MutationKind::AddLabel,
+            edit_pull_request_command(repository, expected.number, "--add-label", label),
+        )
+    }
+
+    /// Remove one label after exact precondition verification.
+    pub fn remove_label(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+        label: &str,
+    ) -> Result<GitHubMutationReceipt, MutationError> {
+        self.mutate_pull_request(
+            repository,
+            expected,
+            MutationKind::RemoveLabel,
+            edit_pull_request_command(repository, expected.number, "--remove-label", label),
+        )
+    }
+
+    /// Enable squash auto-merge after exact precondition verification.
+    pub fn enable_squash_auto_merge(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+    ) -> Result<GitHubMutationReceipt, MutationError> {
+        self.mutate_pull_request(
+            repository,
+            expected,
+            MutationKind::EnableAutoMerge,
+            auto_merge_command(repository, expected.number, false),
+        )
+    }
+
+    /// Disable auto-merge after exact precondition verification.
+    pub fn disable_auto_merge(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+    ) -> Result<GitHubMutationReceipt, MutationError> {
+        self.mutate_pull_request(
+            repository,
+            expected,
+            MutationKind::DisableAutoMerge,
+            auto_merge_command(repository, expected.number, true),
+        )
+    }
+
+    /// List failed Actions runs for the exact PR head after verification.
+    pub fn failed_runs_for_pull_request(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+    ) -> Result<Vec<WorkflowRunSnapshot>, MutationError> {
+        let before = self.verify_precondition(repository, expected)?;
+        let runs: Vec<WorkflowRunJson> =
+            self.json(failed_runs_command(repository, before.head.oid.0.as_str()))?;
+        Ok(runs
+            .into_iter()
+            .map(Into::into)
+            .filter(|run: &WorkflowRunSnapshot| run.head_sha == before.head.oid.0)
+            .collect())
+    }
+
+    /// Rerun failed jobs for one exact Actions run after PR verification.
+    pub fn rerun_failed_run(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+        run_id: u64,
+    ) -> Result<GitHubMutationReceipt, MutationError> {
+        let run: WorkflowRunSnapshot = self
+            .json::<WorkflowRunJson>(workflow_run_command(repository, run_id))?
+            .into();
+        let before = self.verify_precondition(repository, expected)?;
+        if run.head_sha != before.head.oid.0 {
+            return Err(MutationError::RunHeadMismatch {
+                run_id,
+                expected_head: before.head.oid.0,
+                actual_head: run.head_sha,
+            });
+        }
+        if !run.conclusion.eq_ignore_ascii_case("failure") {
+            return Err(MutationError::RunNotFailed {
+                run_id,
+                conclusion: run.conclusion,
+            });
+        }
+        let output = self.checked(rerun_failed_command(repository, run_id))?;
+        let after = self.refetch_pull_request(repository, expected.number)?;
+        Ok(GitHubMutationReceipt {
+            kind: MutationKind::RerunChecks,
+            before: Some(before),
+            after,
+            provider_output: trimmed_provider_output(&output),
+        })
+    }
+
+    /// Force-squash one PR only when GitHub reports administrator permission.
+    pub fn admin_squash_merge(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+    ) -> Result<GitHubMutationReceipt, MutationError> {
+        let permission: RepositoryPermissionJson =
+            self.json(repository_permission_command(repository))?;
+        if permission.viewer_permission != "ADMIN" {
+            return Err(MutationError::PermissionDenied {
+                required: "ADMIN".to_owned(),
+                actual: permission.viewer_permission,
+            });
+        }
+        self.mutate_pull_request(
+            repository,
+            expected,
+            MutationKind::SquashMerge,
+            admin_squash_merge_command(repository, expected.number),
+        )
+    }
+
+    fn mutate_pull_request(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+        kind: MutationKind,
+        command: CommandSpec,
+    ) -> Result<GitHubMutationReceipt, MutationError> {
+        let before = self.verify_precondition(repository, expected)?;
+        let output = self.checked(command)?;
+        let after = self.refetch_pull_request(repository, expected.number)?;
+        Ok(GitHubMutationReceipt {
+            kind,
+            before: Some(before),
+            after,
+            provider_output: trimmed_provider_output(&output),
+        })
+    }
+
+    fn refetch_selector(
+        &self,
+        repository: &RepositoryId,
+        selector: &str,
+    ) -> Result<model::PullRequestSnapshot, MutationError> {
+        let pull_request: PullRequestJson =
+            self.json(pull_request_command(repository, selector))?;
+        pull_request.into_snapshot(repository).map_err(Into::into)
+    }
+
+    fn checked(&self, command: CommandSpec) -> Result<CommandOutput, MutationError> {
+        let output = self.runner.run(&command).map_err(DiscoveryError::from)?;
+        if output.is_success() {
+            Ok(output)
+        } else {
+            Err(DiscoveryError::CommandFailed {
+                command,
+                code: output.code,
+                stderr: output.stderr.trim().to_owned(),
+            }
+            .into())
+        }
+    }
+
+    fn json<T: DeserializeOwned>(&self, command: CommandSpec) -> Result<T, MutationError> {
+        let output = self.checked(command.clone())?;
+        serde_json::from_str(&output.stdout)
+            .map_err(|error| DiscoveryError::InvalidJson {
+                command,
+                message: error.to_string(),
+            })
+            .map_err(Into::into)
+    }
+}
+
+fn changed_precondition_fields(
+    expected: &PullRequestPrecondition,
+    actual: &PullRequestPrecondition,
+) -> Vec<String> {
+    let mut changed = Vec::new();
+    if expected.number != actual.number {
+        changed.push("number".to_owned());
+    }
+    if expected.state != actual.state {
+        changed.push("state".to_owned());
+    }
+    if expected.head_oid != actual.head_oid {
+        changed.push("head_oid".to_owned());
+    }
+    if expected.base_ref != actual.base_ref {
+        changed.push("base_ref".to_owned());
+    }
+    if expected.base_oid != actual.base_oid {
+        changed.push("base_oid".to_owned());
+    }
+    if expected.labels != actual.labels {
+        changed.push("labels".to_owned());
+    }
+    if expected.auto_merge != actual.auto_merge {
+        changed.push("auto_merge".to_owned());
+    }
+    changed
+}
+
+fn trimmed_provider_output(output: &CommandOutput) -> Option<String> {
+    let value = output.stdout.trim();
+    (!value.is_empty()).then(|| value.to_owned())
 }
 
 /// Read-only adapter over authenticated `gh` and local `git`.
@@ -373,6 +817,133 @@ fn current_pr_command(repository: &str, branch: &str) -> CommandSpec {
     ])
 }
 
+fn pull_request_command(repository: &RepositoryId, selector: &str) -> CommandSpec {
+    CommandSpec::new("gh").args([
+        "pr",
+        "view",
+        selector,
+        "--repo",
+        repository.slug().as_str(),
+        "--json",
+        PR_JSON_FIELDS,
+    ])
+}
+
+fn create_pull_request_command(
+    repository: &RepositoryId,
+    input: &CreatePullRequestInput,
+) -> CommandSpec {
+    let mut command = CommandSpec::new("gh").args([
+        "pr".to_owned(),
+        "create".to_owned(),
+        "--repo".to_owned(),
+        repository.slug(),
+        "--head".to_owned(),
+        input.head.clone(),
+        "--base".to_owned(),
+        input.base.clone(),
+        "--fill".to_owned(),
+    ]);
+    if input.draft {
+        command = command.arg("--draft");
+    }
+    command
+}
+
+fn edit_pull_request_command(
+    repository: &RepositoryId,
+    number: PrNumber,
+    flag: &str,
+    value: &str,
+) -> CommandSpec {
+    CommandSpec::new("gh").args([
+        "pr".to_owned(),
+        "edit".to_owned(),
+        number.to_string(),
+        "--repo".to_owned(),
+        repository.slug(),
+        flag.to_owned(),
+        value.to_owned(),
+    ])
+}
+
+fn auto_merge_command(repository: &RepositoryId, number: PrNumber, disable: bool) -> CommandSpec {
+    let command = CommandSpec::new("gh").args([
+        "pr".to_owned(),
+        "merge".to_owned(),
+        number.to_string(),
+        "--repo".to_owned(),
+        repository.slug(),
+    ]);
+    if disable {
+        command.arg("--disable-auto")
+    } else {
+        command.args(["--auto", "--squash"])
+    }
+}
+
+fn failed_runs_command(repository: &RepositoryId, head_oid: &str) -> CommandSpec {
+    CommandSpec::new("gh").args([
+        "run".to_owned(),
+        "list".to_owned(),
+        "--repo".to_owned(),
+        repository.slug(),
+        "--commit".to_owned(),
+        head_oid.to_owned(),
+        "--status".to_owned(),
+        "failure".to_owned(),
+        "--limit".to_owned(),
+        "100".to_owned(),
+        "--json".to_owned(),
+        WORKFLOW_RUN_JSON_FIELDS.to_owned(),
+    ])
+}
+
+fn workflow_run_command(repository: &RepositoryId, run_id: u64) -> CommandSpec {
+    CommandSpec::new("gh").args([
+        "run".to_owned(),
+        "view".to_owned(),
+        run_id.to_string(),
+        "--repo".to_owned(),
+        repository.slug(),
+        "--json".to_owned(),
+        WORKFLOW_RUN_JSON_FIELDS.to_owned(),
+    ])
+}
+
+fn rerun_failed_command(repository: &RepositoryId, run_id: u64) -> CommandSpec {
+    CommandSpec::new("gh").args([
+        "run".to_owned(),
+        "rerun".to_owned(),
+        run_id.to_string(),
+        "--repo".to_owned(),
+        repository.slug(),
+        "--failed".to_owned(),
+    ])
+}
+
+fn repository_permission_command(repository: &RepositoryId) -> CommandSpec {
+    CommandSpec::new("gh").args([
+        "repo".to_owned(),
+        "view".to_owned(),
+        repository.slug(),
+        "--json".to_owned(),
+        "viewerPermission".to_owned(),
+    ])
+}
+
+fn admin_squash_merge_command(repository: &RepositoryId, number: PrNumber) -> CommandSpec {
+    CommandSpec::new("gh").args([
+        "pr".to_owned(),
+        "merge".to_owned(),
+        number.to_string(),
+        "--repo".to_owned(),
+        repository.slug(),
+        "--admin".to_owned(),
+        "--squash".to_owned(),
+    ])
+}
+
 fn labeled_pr_command(
     repository: &str,
     state: &str,
@@ -449,6 +1020,40 @@ struct GitRefJson {
 #[derive(Debug, Deserialize)]
 struct GitObjectJson {
     sha: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RepositoryPermissionJson {
+    viewer_permission: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkflowRunJson {
+    database_id: u64,
+    head_sha: String,
+    status: String,
+    conclusion: String,
+    event: String,
+    name: String,
+    workflow_name: String,
+    url: String,
+}
+
+impl From<WorkflowRunJson> for WorkflowRunSnapshot {
+    fn from(run: WorkflowRunJson) -> Self {
+        Self {
+            database_id: run.database_id,
+            head_sha: run.head_sha,
+            status: run.status,
+            conclusion: run.conclusion,
+            event: run.event,
+            name: run.name,
+            workflow_name: run.workflow_name,
+            url: run.url,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -692,6 +1297,30 @@ mod tests {
         r#"[{"number":9,"title":"Merged queue change","state":"MERGED","isDraft":false,"headRefName":"old-head","headRefOid":"head-9","headRepository":{"name":"widgets","nameWithOwner":"acme/widgets"},"headRepositoryOwner":{"login":"acme"},"isCrossRepository":false,"baseRefName":"main","baseRefOid":"base-9","labels":[{"name":"caravan"}],"autoMergeRequest":null,"statusCheckRollup":[{"__typename":"StatusContext","name":null,"context":"legacy-ci","status":null,"conclusion":null,"state":"SUCCESS","workflowName":null,"detailsUrl":null,"targetUrl":"https://example.test/status"}],"mergedAt":"2026-07-17T09:00:00Z","url":"https://example.test/pr/9","updatedAt":"2026-07-17T09:00:00Z"}]"#
     }
 
+    fn pr_object_json(number: u64, branch: &str, repository: &str) -> String {
+        let list = pr_list_json(number, branch, repository, false);
+        list[1..list.len() - 1].to_owned()
+    }
+
+    fn repository() -> RepositoryId {
+        RepositoryId {
+            owner: "acme".to_owned(),
+            name: "widgets".to_owned(),
+        }
+    }
+
+    fn precondition(number: u64) -> PullRequestPrecondition {
+        PullRequestPrecondition {
+            number: PrNumber(number),
+            state: model::PullRequestState::Open,
+            head_oid: CommitOid(format!("head-{number}")),
+            base_ref: "main".to_owned(),
+            base_oid: CommitOid(format!("base-{number}")),
+            labels: std::collections::BTreeSet::from(["caravan".to_owned()]),
+            auto_merge: AutoMergeState::squash(),
+        }
+    }
+
     #[test]
     fn discovers_canonical_repository_and_pull_request_snapshots() {
         let open_prs = pr_list_json(12, "feature/widget", "acme/widgets", false);
@@ -797,6 +1426,259 @@ mod tests {
         assert_eq!(snapshot.current_branch, None);
         assert_eq!(snapshot.current_pr, None);
         discovery.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn stale_precondition_stops_before_provider_mutation() {
+        let repository = repository();
+        let expected = precondition(12);
+        let actual =
+            pr_object_json(12, "feature/widget", "acme/widgets").replace("head-12", "changed-head");
+        let runner = FakeRunner::new(vec![(
+            pull_request_command(&repository, "12"),
+            CommandOutput::success(actual),
+        )]);
+        let adapter = GitHubMutationAdapter::new(runner);
+
+        let error = adapter
+            .set_base(&repository, &expected, "develop")
+            .expect_err("stale PR must not be edited");
+
+        assert!(matches!(
+            error,
+            MutationError::StalePrecondition { changed_fields, .. }
+                if changed_fields == ["head_oid"]
+        ));
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn base_edit_refetches_exact_before_and_after_facts() {
+        let repository = repository();
+        let expected = precondition(12);
+        let before = pr_object_json(12, "feature/widget", "acme/widgets");
+        let after = before
+            .replace("\"baseRefName\":\"main\"", "\"baseRefName\":\"develop\"")
+            .replace(
+                "\"baseRefOid\":\"base-12\"",
+                "\"baseRefOid\":\"develop-oid\"",
+            );
+        let runner = FakeRunner::new(vec![
+            (
+                pull_request_command(&repository, "12"),
+                CommandOutput::success(before),
+            ),
+            (
+                edit_pull_request_command(&repository, PrNumber(12), "--base", "develop"),
+                CommandOutput::success("https://example.test/pr/12\n"),
+            ),
+            (
+                pull_request_command(&repository, "12"),
+                CommandOutput::success(after),
+            ),
+        ]);
+        let adapter = GitHubMutationAdapter::new(runner);
+
+        let receipt = adapter
+            .set_base(&repository, &expected, "develop")
+            .expect("base edit succeeds");
+
+        assert_eq!(receipt.kind, MutationKind::SetBase);
+        assert_eq!(receipt.before.as_ref().unwrap().base.name, "main");
+        assert_eq!(receipt.after.base.name, "develop");
+        assert_eq!(receipt.after.base.oid, CommitOid("develop-oid".to_owned()));
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn create_pull_request_uses_fill_and_refetches_returned_url() {
+        let repository = repository();
+        let input = CreatePullRequestInput {
+            head: "feature/widget".to_owned(),
+            base: "main".to_owned(),
+            draft: true,
+        };
+        let url = "https://example.test/pr/12";
+        let runner = FakeRunner::new(vec![
+            (
+                create_pull_request_command(&repository, &input),
+                CommandOutput::success(format!("{url}\n")),
+            ),
+            (
+                pull_request_command(&repository, url),
+                CommandOutput::success(pr_object_json(12, "feature/widget", "acme/widgets")),
+            ),
+        ]);
+        let adapter = GitHubMutationAdapter::new(runner);
+
+        let receipt = adapter
+            .create_pull_request(&repository, &input)
+            .expect("PR creation succeeds");
+
+        assert_eq!(receipt.kind, MutationKind::CreatePullRequest);
+        assert_eq!(receipt.before, None);
+        assert_eq!(receipt.after.number, PrNumber(12));
+        assert_eq!(receipt.provider_output.as_deref(), Some(url));
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn failed_workflow_runs_preserve_provider_state_and_exact_head() {
+        let repository = repository();
+        let expected = precondition(12);
+        let runner = FakeRunner::new(vec![
+            (
+                pull_request_command(&repository, "12"),
+                CommandOutput::success(pr_object_json(12, "feature/widget", "acme/widgets")),
+            ),
+            (
+                failed_runs_command(&repository, "head-12"),
+                CommandOutput::success(
+                    r#"[{"databaseId":99,"headSha":"head-12","status":"completed","conclusion":"failure","event":"pull_request","name":"CI","workflowName":"CI","url":"https://example.test/run/99"}]"#,
+                ),
+            ),
+        ]);
+        let adapter = GitHubMutationAdapter::new(runner);
+
+        let runs = adapter
+            .failed_runs_for_pull_request(&repository, &expected)
+            .expect("failed runs are discovered");
+
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].database_id, 99);
+        assert_eq!(runs[0].status, "completed");
+        assert_eq!(runs[0].conclusion, "failure");
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn rerun_failed_run_verifies_run_and_pr_before_mutation() {
+        let repository = repository();
+        let expected = precondition(12);
+        let pull_request = pr_object_json(12, "feature/widget", "acme/widgets");
+        let runner = FakeRunner::new(vec![
+            (
+                workflow_run_command(&repository, 99),
+                CommandOutput::success(
+                    r#"{"databaseId":99,"headSha":"head-12","status":"completed","conclusion":"failure","event":"pull_request","name":"CI","workflowName":"CI","url":"https://example.test/run/99"}"#,
+                ),
+            ),
+            (
+                pull_request_command(&repository, "12"),
+                CommandOutput::success(pull_request.clone()),
+            ),
+            (
+                rerun_failed_command(&repository, 99),
+                CommandOutput::success(""),
+            ),
+            (
+                pull_request_command(&repository, "12"),
+                CommandOutput::success(pull_request),
+            ),
+        ]);
+        let adapter = GitHubMutationAdapter::new(runner);
+
+        let receipt = adapter
+            .rerun_failed_run(&repository, &expected, 99)
+            .expect("failed run reruns");
+
+        assert_eq!(receipt.kind, MutationKind::RerunChecks);
+        assert_eq!(receipt.before.unwrap().number, PrNumber(12));
+        assert_eq!(receipt.after.number, PrNumber(12));
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn admin_merge_fails_closed_without_admin_permission() {
+        let repository = repository();
+        let expected = precondition(12);
+        let runner = FakeRunner::new(vec![(
+            repository_permission_command(&repository),
+            CommandOutput::success(r#"{"viewerPermission":"WRITE"}"#),
+        )]);
+        let adapter = GitHubMutationAdapter::new(runner);
+
+        let error = adapter
+            .admin_squash_merge(&repository, &expected)
+            .expect_err("non-admin merge is rejected");
+
+        assert_eq!(
+            error,
+            MutationError::PermissionDenied {
+                required: "ADMIN".to_owned(),
+                actual: "WRITE".to_owned(),
+            }
+        );
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn mutation_command_builders_keep_user_values_as_separate_arguments() {
+        let repository = repository();
+        assert_eq!(
+            edit_pull_request_command(&repository, PrNumber(12), "--add-label", "caravan queue"),
+            CommandSpec::new("gh").args([
+                "pr",
+                "edit",
+                "12",
+                "--repo",
+                "acme/widgets",
+                "--add-label",
+                "caravan queue",
+            ])
+        );
+        assert_eq!(
+            edit_pull_request_command(
+                &repository,
+                PrNumber(12),
+                "--remove-label",
+                "caravan-evicted"
+            ),
+            CommandSpec::new("gh").args([
+                "pr",
+                "edit",
+                "12",
+                "--repo",
+                "acme/widgets",
+                "--remove-label",
+                "caravan-evicted",
+            ])
+        );
+        assert_eq!(
+            auto_merge_command(&repository, PrNumber(12), false),
+            CommandSpec::new("gh").args([
+                "pr",
+                "merge",
+                "12",
+                "--repo",
+                "acme/widgets",
+                "--auto",
+                "--squash",
+            ])
+        );
+        assert_eq!(
+            auto_merge_command(&repository, PrNumber(12), true),
+            CommandSpec::new("gh").args([
+                "pr",
+                "merge",
+                "12",
+                "--repo",
+                "acme/widgets",
+                "--disable-auto",
+            ])
+        );
+        assert_eq!(
+            admin_squash_merge_command(&repository, PrNumber(12)),
+            CommandSpec::new("gh").args([
+                "pr",
+                "merge",
+                "12",
+                "--repo",
+                "acme/widgets",
+                "--admin",
+                "--squash",
+            ])
+        );
     }
 
     #[test]
