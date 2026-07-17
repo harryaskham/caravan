@@ -211,9 +211,7 @@ impl Drop for OperationLock {
         if self.released {
             return;
         }
-        let owned = read_owner(&self.path)
-            .map(|owner| owner.token == self.owner.token)
-            .unwrap_or(false);
+        let owned = read_owner(&self.path).is_ok_and(|owner| owner.token == self.owner.token);
         drop(self.file.take());
         if owned {
             let _ = fs::remove_file(&self.path);
