@@ -86,6 +86,7 @@
           doCheck = true;
 
           nativeBuildInputs = [ pkgs.pkg-config ];
+          nativeCheckInputs = [ pkgs.gitMinimal ];
           buildInputs = darwinLibs;
 
           meta = {
