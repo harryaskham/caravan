@@ -3,7 +3,7 @@
 //! The provider adapter owns exact optimistic commands. This module owns only
 //! operation ordering, complete preflight, idempotent resume, and receipts.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use mcp_cli::ErrorCategory;
 use schemars::JsonSchema;
@@ -16,10 +16,11 @@ use crate::github::{
     MutationError,
 };
 use crate::graph::{CompatibilityChecker, GitCompatibilityChecker};
+use crate::hooks::{self, HookDelivery};
 use crate::model::{
-    Caravan, MergeMethod, MutationKind, MutationStep, MutationStepState, OperationId,
-    OperationReceipt, PrNumber, PullRequestPrecondition, PullRequestSnapshot, PullRequestState,
-    RepositoryId,
+    Caravan, CaravanEvent, EventKind, MergeMethod, MutationKind, MutationStep, MutationStepState,
+    OperationId, OperationReceipt, PrNumber, PullRequestPrecondition, PullRequestSnapshot,
+    PullRequestState, RepositoryId,
 };
 use crate::operation_lock::OperationLock;
 use crate::read::{self, CheckOutput, StatusOutput};
@@ -77,6 +78,12 @@ pub struct MembershipOutput {
     pub provider_receipts: Vec<GitHubMutationReceipt>,
     pub pull_request: PullRequestSnapshot,
     pub caravan_id: PrNumber,
+    /// Canonical events emitted after the complete membership operation.
+    #[serde(default)]
+    pub events: Vec<CaravanEvent>,
+    /// Bounded status for configured hooks which consumed `events`.
+    #[serde(default)]
+    pub hook_deliveries: Vec<HookDelivery>,
 }
 
 /// Provider operations required by membership policy.
@@ -276,7 +283,26 @@ fn execute_live(
     let provider = GitHubMutationAdapter::new(
         crate::command::ProcessRunner::in_directory(&context.repository_path).with_timeout(timeout),
     );
-    execute(status, &checker, &provider, request)
+    let repository = status.repository.clone();
+    let mut output = execute(status, &checker, &provider, request)?;
+    let kind = if request.operation.is_join() {
+        EventKind::PrJoined
+    } else {
+        EventKind::CaravanCreated
+    };
+    let event = hooks::event(
+        kind,
+        output.receipt.operation_id.clone(),
+        repository,
+        Some(output.caravan_id),
+        vec![output.pull_request.number],
+        None,
+        None,
+        BTreeMap::from([("receipt".to_owned(), json!(output.receipt))]),
+    );
+    output.events.push(event);
+    output.hook_deliveries = hooks::dispatch_events(context, &output.events)?;
+    Ok(output)
 }
 
 fn execute(
@@ -384,6 +410,8 @@ fn execute(
         provider_receipts: state.provider_receipts,
         pull_request,
         caravan_id,
+        events: Vec::new(),
+        hook_deliveries: Vec::new(),
     })
 }
 

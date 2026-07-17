@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use mcp_cli::ErrorCategory;
+use mcp_cli::{ErrorCategory, StructuredError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -18,6 +18,7 @@ use crate::github::{
     DiscoveryError, GitHubMutationAdapter, GitHubMutationReceipt, MutationError,
     WorkflowRunSnapshot,
 };
+use crate::hooks::{self, HookDelivery};
 use crate::model::{
     Caravan, CaravanEvent, CheckSnapshot, CheckState, CompatibilityOutcome, DecisionKind,
     DecisionPoint, EventId, EventKind, GraphProblem, GraphProblemKind, MergeMethod, MutationKind,
@@ -75,9 +76,12 @@ pub struct SyncOutput {
     /// CI policy facts in deterministic head-to-tail order.
     #[serde(default)]
     pub ci: Vec<CiObservation>,
-    /// Canonical auditable events. Hook dispatch is a separate policy-free layer.
+    /// Canonical auditable events consumed by configured hooks.
     #[serde(default)]
     pub events: Vec<CaravanEvent>,
+    /// Bounded status for configured hooks which consumed `events`.
+    #[serde(default)]
+    pub hook_deliveries: Vec<HookDelivery>,
     /// Fresh post-mutation discovery rather than a locally predicted graph.
     pub status: StatusOutput,
 }
@@ -217,13 +221,53 @@ impl<R: crate::command::CommandRunner> SyncProvider for GitHubMutationAdapter<R>
     }
 }
 
-/// Synchronize the current caravan or every caravan.
+/// Synchronize the current caravan or every caravan and dispatch its canonical events.
 pub fn sync(context: &AppContext, input: &SyncInput) -> Result<SyncOutput, AppError> {
+    match sync_without_hooks(context, input) {
+        Ok(mut output) => {
+            output.hook_deliveries = hooks::dispatch_events(context, &output.events)?;
+            Ok(output)
+        }
+        Err(error) => {
+            let mut events = hooks::events_from_error(&error);
+            if events.is_empty() {
+                if let Some(event) = sync_failed_event(&error) {
+                    events.push(event);
+                }
+            }
+            let deliveries = hooks::dispatch_events(context, &events)?;
+            Err(hooks::attach_deliveries(error, &deliveries))
+        }
+    }
+}
+
+fn sync_failed_event(error: &AppError) -> Option<CaravanEvent> {
+    let details = error.details()?;
+    let decision =
+        serde_json::from_value::<DecisionPoint>(details.get("decision")?.clone()).ok()?;
+    let fleet = decision
+        .evidence
+        .get("fleet")
+        .and_then(|value| serde_json::from_value(value.clone()).ok());
+    Some(hooks::event(
+        EventKind::SyncFailed,
+        decision.operation_id,
+        decision.repository,
+        decision.caravan_id,
+        decision.affected_prs,
+        fleet,
+        Some(decision.message),
+        BTreeMap::from([("error_code".to_owned(), json!(error.code()))]),
+    ))
+}
+
+fn sync_without_hooks(context: &AppContext, input: &SyncInput) -> Result<SyncOutput, AppError> {
     let _lock = OperationLock::acquire(&context.repository_path, "sync")?;
+    let timeout = std::time::Duration::from_secs(context.config.command_timeout_secs);
     let status = read::status(context)?;
-    let provider = GitHubMutationAdapter::new(crate::command::ProcessRunner::in_directory(
-        &context.repository_path,
-    ));
+    let provider = GitHubMutationAdapter::new(
+        crate::command::ProcessRunner::in_directory(&context.repository_path).with_timeout(timeout),
+    );
     let progress = execute(
         &status,
         &provider,
@@ -262,6 +306,7 @@ pub fn sync(context: &AppContext, input: &SyncInput) -> Result<SyncOutput, AppEr
         head_advancements: progress.head_advancements,
         ci: progress.ci,
         events: progress.events,
+        hook_deliveries: Vec::new(),
         status: final_status,
     })
 }

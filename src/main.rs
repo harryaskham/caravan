@@ -6,8 +6,8 @@ use std::path::PathBuf;
 
 use caravan::{
     AGENT_HELP, AppContext, AppError, CheckInput, CreateInput, EvictInput, JoinInput, LoopInput,
-    OperationOutput, SplitInput, SyncInput, TOOL_NAME, build_router, feedback_config,
-    feedback_destination, scaffold_operation, updater_config,
+    SplitInput, SyncInput, TOOL_NAME, build_router, feedback_config, feedback_destination,
+    updater_config,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use feedback_cli::{FeedbackEvent, FeedbackKind, Reporter, Severity};
@@ -216,7 +216,7 @@ fn run(cli: &Cli) -> Result<(), i32> {
         Command::Sync(input) => run_sync(cli, input),
         Command::Evict(input) => run_evict(cli, input),
         Command::Split(input) => run_split(cli, input),
-        Command::Loop(input) => run_domain(cli.json, "loop", input),
+        Command::Loop(input) => run_loop(cli, input),
         Command::Van(command) => match command {
             VanCommand::List => run_van_list(cli),
             VanCommand::Next => run_navigation(
@@ -322,6 +322,43 @@ fn run_sync(cli: &Cli, input: &SyncInput) -> Result<(), i32> {
     }
 }
 
+fn run_loop(cli: &Cli, input: &LoopInput) -> Result<(), i32> {
+    if cli.json && !input.once {
+        return emit_result::<serde_json::Value, _>(
+            true,
+            Err(AppError::validation(
+                "unbounded_json_loop_unsupported",
+                "use `cara loop --once --json`; the unbounded foreground loop streams human progress only",
+            )),
+        );
+    }
+    let context = load_context(cli)?;
+    if cli.json {
+        return emit_result(true, caravan::loop_runner::run(&context, input, |_| {}));
+    }
+    match caravan::loop_runner::run(&context, input, |tick| {
+        print!("{}", render_loop_tick(tick));
+    }) {
+        Ok(output) => {
+            if output.stopped_by_signal {
+                println!("loop stopped after {} tick(s)", output.ticks);
+            }
+            Ok(())
+        }
+        Err(error) => emit_human_error(error),
+    }
+}
+
+fn render_loop_tick(output: &caravan::loop_runner::LoopTickOutput) -> String {
+    let mut text = render_sync(&output.sync);
+    let ready_deliveries = output
+        .hook_deliveries
+        .get(output.sync.hook_deliveries.len()..)
+        .unwrap_or_default();
+    append_hook_deliveries(&mut text, ready_deliveries);
+    text
+}
+
 fn render_sync(output: &caravan::sync::SyncOutput) -> String {
     let caravans = output
         .synchronized_caravans
@@ -365,6 +402,7 @@ fn render_sync(output: &caravan::sync::SyncOutput) -> String {
     if !output.events.is_empty() {
         let _ = writeln!(text, "  audit events: {}", output.events.len());
     }
+    append_hook_deliveries(&mut text, &output.hook_deliveries);
     text
 }
 
@@ -383,7 +421,18 @@ fn render_membership(output: &caravan::membership::MembershipOutput) -> String {
     for step in &output.receipt.completed_steps {
         let _ = writeln!(text, "  {:?} {:?}: {}", step.kind, step.state, step.summary);
     }
+    append_hook_deliveries(&mut text, &output.hook_deliveries);
     text
+}
+
+fn append_hook_deliveries(text: &mut String, deliveries: &[caravan::hooks::HookDelivery]) {
+    for delivery in deliveries {
+        let _ = writeln!(
+            text,
+            "  hook {:?} {:?} (blocking={})",
+            delivery.kind, delivery.state, delivery.blocking
+        );
+    }
 }
 
 fn render_status(output: &caravan::read::StatusOutput) -> String {
@@ -508,6 +557,9 @@ fn run_evict(cli: &Cli, input: &EvictInput) -> Result<(), i32> {
                 "evicted PR #{}; affected {:?}; changed={}",
                 output.pr, output.affected_prs, output.receipt.changed
             );
+            let mut hooks = String::new();
+            append_hook_deliveries(&mut hooks, &output.hook_deliveries);
+            print!("{hooks}");
             Ok(())
         }
         Err(error) => emit_human_error(error),
@@ -528,6 +580,9 @@ fn run_split(cli: &Cli, input: &SplitInput) -> Result<(), i32> {
                 output.resulting_fleet.caravans.len(),
                 output.receipt.changed
             );
+            let mut hooks = String::new();
+            append_hook_deliveries(&mut hooks, &output.hook_deliveries);
+            print!("{hooks}");
             Ok(())
         }
         Err(error) => emit_human_error(error),
@@ -581,10 +636,6 @@ fn run_van_list(cli: &Cli) -> Result<(), i32> {
         }
         Err(error) => emit_human_error(error),
     }
-}
-
-fn run_domain<T>(json: bool, operation: &str, input: &T) -> Result<(), i32> {
-    emit_result(json, scaffold_operation::<T>(operation, input))
 }
 
 fn run_help(json: bool) -> Result<(), i32> {
@@ -710,9 +761,6 @@ where
         }
     }
 }
-
-#[allow(dead_code)]
-fn _operation_output_type_anchor(_output: OperationOutput) {}
 
 #[cfg(test)]
 mod tests {

@@ -9,11 +9,12 @@ use serde_json::json;
 
 use crate::github::{GitHubMutationAdapter, GitHubMutationReceipt, MutationError};
 use crate::graph::{CompatibilityChecker, GitCompatibilityChecker, analyze};
+use crate::hooks::{self, HookDelivery};
 use crate::membership::MembershipProvider;
 use crate::model::{
-    AutoMergeState, BranchSnapshot, CaravanFleet, MergeMethod, MutationKind, MutationStep,
-    MutationStepState, OperationId, OperationReceipt, PrNumber, PullRequestPrecondition,
-    PullRequestSnapshot, PullRequestState, RepositorySnapshot,
+    AutoMergeState, BranchSnapshot, CaravanEvent, CaravanFleet, EventKind, MergeMethod,
+    MutationKind, MutationStep, MutationStepState, OperationId, OperationReceipt, PrNumber,
+    PullRequestPrecondition, PullRequestSnapshot, PullRequestState, RepositorySnapshot,
 };
 use crate::operation_lock::OperationLock;
 use crate::read::{self, StatusOutput};
@@ -54,6 +55,12 @@ pub struct ReshapeOutput {
     pub affected_prs: Vec<PrNumber>,
     /// Fleet expected after every recorded provider step completes.
     pub resulting_fleet: CaravanFleet,
+    /// Canonical events emitted after the complete reshape operation.
+    #[serde(default)]
+    pub events: Vec<CaravanEvent>,
+    /// Bounded status for configured hooks which consumed `events`.
+    #[serde(default)]
+    pub hook_deliveries: Vec<HookDelivery>,
 }
 
 /// Evict a PR selected explicitly or from the current branch.
@@ -89,12 +96,35 @@ fn execute_live(
     reason: Option<String>,
 ) -> Result<ReshapeOutput, AppError> {
     let _lock = OperationLock::acquire(&context.repository_path, operation.name())?;
+    let timeout = std::time::Duration::from_secs(context.config.command_timeout_secs);
     let status = read::status(context)?;
-    let checker = GitCompatibilityChecker::new(&context.repository_path, "origin");
-    let provider = GitHubMutationAdapter::new(crate::command::ProcessRunner::in_directory(
-        &context.repository_path,
-    ));
-    execute(status, &checker, &provider, operation, selected, reason)
+    let repository = status.repository.clone();
+    let checker =
+        GitCompatibilityChecker::new(&context.repository_path, "origin").with_timeout(timeout);
+    let provider = GitHubMutationAdapter::new(
+        crate::command::ProcessRunner::in_directory(&context.repository_path).with_timeout(timeout),
+    );
+    let mut output = execute(status, &checker, &provider, operation, selected, reason)?;
+    let kind = match operation {
+        ReshapeOperation::Evict => EventKind::Evicted,
+        ReshapeOperation::Split => EventKind::Split,
+    };
+    let event = hooks::event(
+        kind,
+        output.receipt.operation_id.clone(),
+        repository,
+        output
+            .resulting_fleet
+            .containing(output.pr)
+            .map(|caravan| caravan.id),
+        output.affected_prs.clone(),
+        Some(output.resulting_fleet.clone()),
+        output.reason.clone(),
+        BTreeMap::from([("receipt".to_owned(), json!(output.receipt))]),
+    );
+    output.events.push(event);
+    output.hook_deliveries = hooks::dispatch_events(context, &output.events)?;
+    Ok(output)
 }
 
 // Owning one immutable discovery snapshot prevents a multi-step operation from
@@ -175,6 +205,8 @@ fn execute(
         provider_receipts: state.provider_receipts,
         affected_prs: plan.affected_prs,
         resulting_fleet: virtual_status.analysis.fleet,
+        events: Vec::new(),
+        hook_deliveries: Vec::new(),
     })
 }
 

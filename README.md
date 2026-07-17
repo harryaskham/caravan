@@ -22,13 +22,14 @@ The normative behavior is in [`SPEC.md`](SPEC.md).
   admin-squashed only when repository policy permits it, the exact head/default
   compatibility proof is still current, and GitHub reports admin permission.
 
-## Foundation status
+## Implementation status
 
-This initial slice establishes the command tree and ecosystem plumbing. Queue
-operations deliberately return a structured `not_implemented` error until their
-domain beads land; they never claim to have changed GitHub.
+The core read, membership, navigation, reshape, and synchronization commands are
+implemented and exercised against live disposable PRs on this repository. CI
+failure/force handling, hooks, loop behavior, and final parity continue to use
+the same typed command contracts while their acceptance lanes land.
 
-Working surfaces:
+Development surfaces:
 
 ```sh
 nix develop
@@ -40,7 +41,7 @@ cargo run -- self-update status
 cargo run -- feedback status
 ```
 
-Planned domain surface:
+Domain surface:
 
 ```text
 cara status
@@ -125,5 +126,22 @@ hooks:
 timeouts terminate and reap the child process group and return a structured,
 resumable error with the command stage and bounded output evidence.
 
-Hooks receive versioned JSON on stdin. Long-running coordinators own external
-deduplication/locking; repeated sync ticks remain safe and observable.
+Hooks receive one versioned `CaravanEvent` JSON object on stdin plus non-secret
+`CARA_EVENT`, `CARA_EVENT_ID`, `CARA_OPERATION_ID`, `CARA_REPOSITORY`,
+`CARA_CARAVAN_ID`, and `CARA_PRS` context. Delivery output reports only bounded
+state/exit/byte counts, never hook output content. Best-effort failures remain in
+the command output; blocking failures return typed `hook_failure` and never roll
+back provider mutations already recorded by the event.
+
+Caravan intentionally owns no cross-process hook dedupe. A long-running hook can
+use an external lock and return success while that lock exists; repeated ticks
+then become visible no-ops rather than duplicate coordination.
+
+```sh
+cara loop --once --json     # one bounded sync --all tick for agents/schedulers
+cara loop                   # foreground human stream until SIGINT/SIGTERM
+```
+
+The unbounded loop is deliberately not an MCP tool. Every tick starts from fresh
+GitHub state, and a decision-point/error tick fires its configured hook and stops
+instead of inventing an agent decision.

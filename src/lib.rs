@@ -10,6 +10,8 @@ pub mod command;
 pub mod compatibility;
 pub mod github;
 pub mod graph;
+pub mod hooks;
+pub mod loop_runner;
 pub mod membership;
 pub mod navigation;
 pub mod operation_lock;
@@ -509,6 +511,10 @@ mod tests {
             .into_iter()
             .map(|tool| tool.name)
             .collect();
+        assert!(
+            !names.iter().any(|name| name == "loop"),
+            "the unbounded foreground loop must not be exposed over MCP"
+        );
         for expected in [
             "help",
             "status",

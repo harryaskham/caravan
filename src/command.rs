@@ -4,7 +4,8 @@
 //! hermetic while production still uses the installed, authenticated `git` and
 //! `gh` binaries.
 
-use std::io::Read;
+use std::collections::BTreeMap;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -16,6 +17,12 @@ const TERMINATION_GRACE: Duration = Duration::from_millis(250);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_CAPTURE_BYTES: usize = 64 * 1024;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CommandIo {
+    env: BTreeMap<String, String>,
+    stdin: Option<String>,
+}
+
 /// A subprocess request with arguments kept separate from shell parsing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandSpec {
@@ -23,6 +30,8 @@ pub struct CommandSpec {
     pub program: String,
     /// Exact argument vector.
     pub args: Vec<String>,
+    /// Optional I/O additions stay boxed so ordinary command/error values remain small.
+    io: Option<Box<CommandIo>>,
 }
 
 impl CommandSpec {
@@ -32,6 +41,7 @@ impl CommandSpec {
         Self {
             program: program.into(),
             args: Vec::new(),
+            io: None,
         }
     }
 
@@ -50,6 +60,25 @@ impl CommandSpec {
         S: Into<String>,
     {
         self.args.extend(arguments.into_iter().map(Into::into));
+        self
+    }
+
+    /// Add one explicit environment value without exposing it in diagnostics.
+    #[must_use]
+    pub fn env(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.io
+            .get_or_insert_with(|| Box::new(CommandIo::default()))
+            .env
+            .insert(name.into(), value.into());
+        self
+    }
+
+    /// Provide a UTF-8 stdin payload.
+    #[must_use]
+    pub fn stdin(mut self, input: impl Into<String>) -> Self {
+        self.io
+            .get_or_insert_with(|| Box::new(CommandIo::default()))
+            .stdin = Some(input.into());
         self
     }
 
@@ -233,6 +262,12 @@ impl CommandRunner for ProcessRunner {
             .args(&request.args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some(io) = &request.io {
+            command.envs(&io.env);
+            if io.stdin.is_some() {
+                command.stdin(Stdio::piped());
+            }
+        }
         if let Some(cwd) = &self.cwd {
             command.current_dir(cwd);
         }
@@ -246,6 +281,15 @@ impl CommandRunner for ProcessRunner {
             command: request.clone(),
             message: error.to_string(),
         })?;
+        let stdin_writer = request
+            .io
+            .as_ref()
+            .and_then(|io| io.stdin.as_ref())
+            .map(|input| {
+                let mut stdin = child.stdin.take().expect("piped stdin");
+                let input = input.clone();
+                thread::spawn(move || stdin.write_all(input.as_bytes()))
+            });
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         let stdout_reader = thread::spawn(move || capture(stdout));
@@ -266,6 +310,9 @@ impl CommandRunner for ProcessRunner {
                 Ok(None) => thread::sleep(POLL_INTERVAL),
                 Err(error) => {
                     let _ = terminate_and_reap(&mut child);
+                    if let Some(writer) = stdin_writer {
+                        let _ = writer.join();
+                    }
                     let _ = stdout_reader.join();
                     let _ = stderr_reader.join();
                     return Err(CommandRunError::Spawn {
@@ -275,6 +322,18 @@ impl CommandRunner for ProcessRunner {
                 }
             }
         };
+        if let Some(writer) = stdin_writer {
+            writer
+                .join()
+                .map_err(|_| CommandRunError::Spawn {
+                    command: request.clone(),
+                    message: "stdin writer thread panicked".to_owned(),
+                })?
+                .map_err(|error| CommandRunError::Spawn {
+                    command: request.clone(),
+                    message: format!("could not write stdin: {error}"),
+                })?;
+        }
         let stdout = join_capture(stdout_reader, request, "stdout")?;
         let stderr = join_capture(stderr_reader, request, "stderr")?;
         if timed_out {
@@ -385,6 +444,20 @@ mod tests {
     fn diagnostic_rendering_quotes_shell_metacharacters_without_using_a_shell() {
         let command = CommandSpec::new("gh").args(["pr", "list", "--label", "caravan queue"]);
         assert_eq!(command.display(), "gh pr list --label 'caravan queue'");
+    }
+
+    #[test]
+    fn explicit_environment_and_stdin_reach_the_child() {
+        let output = ProcessRunner::new()
+            .run(
+                &CommandSpec::new("sh")
+                    .args(["-c", "printf '%s:' \"$CARA_EVENT\"; cat"])
+                    .env("CARA_EVENT", "sync_failed")
+                    .stdin("payload"),
+            )
+            .expect("child succeeds");
+
+        assert_eq!(output.stdout, "sync_failed:payload");
     }
 
     #[test]

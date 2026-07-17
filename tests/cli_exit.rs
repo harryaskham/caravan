@@ -9,22 +9,22 @@ fn cara(arguments: &[&str]) -> Output {
 
 #[test]
 fn json_domain_error_keeps_envelope_and_exits_nonzero() {
-    let output = cara(&["--json", "loop", "--once"]);
+    let output = cara(&["--json", "evict", "--reason", ""]);
 
     assert!(!output.status.success());
     let envelope: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("JSON error envelope");
     assert_eq!(envelope["status"], "error");
-    assert_eq!(envelope["error"]["code"], "not_implemented");
+    assert_eq!(envelope["error"]["code"], "eviction_reason_required");
 }
 
 #[test]
 fn human_domain_error_exits_nonzero() {
-    let output = cara(&["loop", "--once"]);
+    let output = cara(&["evict", "--reason", ""]);
 
     assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("not_implemented"),
+        String::from_utf8_lossy(&output.stderr).contains("eviction_reason_required"),
         "stderr should retain the structured error code"
     );
 }
