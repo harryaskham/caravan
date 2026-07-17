@@ -317,7 +317,9 @@ where
     E: StructuredError + std::fmt::Display,
 {
     if json {
-        return write_json_result(io::stdout().lock(), result).map_err(|_| 1);
+        let failed = result.is_err();
+        write_json_result(io::stdout().lock(), result).map_err(|_| 1)?;
+        return if failed { Err(1) } else { Ok(()) };
     }
     match result {
         Ok(output) => {
