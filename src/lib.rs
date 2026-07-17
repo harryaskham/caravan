@@ -15,6 +15,7 @@ pub mod navigation;
 pub mod operation_lock;
 pub mod read;
 pub mod reshape;
+pub mod sync;
 
 use clap::Args;
 use feedback_cli::{FeedbackConfig, Reporter};
@@ -393,7 +394,7 @@ pub fn build_router() -> ToolRouter<AppContext> {
     router.add_typed_tool_with_output_schema(
         "sync",
         "Idempotently synchronize one or all caravans. Stops at the first agent decision point with evidence and recovery actions.",
-        |_context: &AppContext, input: SyncInput| scaffold_operation("sync", &input),
+        |context: &AppContext, input: SyncInput| sync::sync(context, &input),
     );
     router.add_typed_tool_with_output_schema(
         "evict",

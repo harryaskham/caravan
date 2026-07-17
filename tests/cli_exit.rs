@@ -9,7 +9,7 @@ fn cara(arguments: &[&str]) -> Output {
 
 #[test]
 fn json_domain_error_keeps_envelope_and_exits_nonzero() {
-    let output = cara(&["--json", "sync"]);
+    let output = cara(&["--json", "loop", "--once"]);
 
     assert!(!output.status.success());
     let envelope: serde_json::Value =
@@ -20,7 +20,7 @@ fn json_domain_error_keeps_envelope_and_exits_nonzero() {
 
 #[test]
 fn human_domain_error_exits_nonzero() {
-    let output = cara(&["sync"]);
+    let output = cara(&["loop", "--once"]);
 
     assert!(!output.status.success());
     assert!(

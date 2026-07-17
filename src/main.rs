@@ -213,7 +213,7 @@ fn run(cli: &Cli) -> Result<(), i32> {
             caravan::navigation::Scope::Caravan,
             caravan::navigation::Direction::Previous,
         ),
-        Command::Sync(input) => run_domain(cli.json, "sync", input),
+        Command::Sync(input) => run_sync(cli, input),
         Command::Evict(input) => run_evict(cli, input),
         Command::Split(input) => run_split(cli, input),
         Command::Loop(input) => run_domain(cli.json, "loop", input),
@@ -305,6 +305,54 @@ fn run_membership(
         }
         Err(error) => emit_human_error(error),
     }
+}
+
+fn run_sync(cli: &Cli, input: &SyncInput) -> Result<(), i32> {
+    let context = load_context(cli)?;
+    let result = caravan::sync::sync(&context, input);
+    if cli.json {
+        return emit_result(true, result);
+    }
+    match result {
+        Ok(output) => {
+            print!("{}", render_sync(&output));
+            Ok(())
+        }
+        Err(error) => emit_human_error(error),
+    }
+}
+
+fn render_sync(output: &caravan::sync::SyncOutput) -> String {
+    let caravans = output
+        .synchronized_caravans
+        .iter()
+        .map(|number| format!("#{number}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut text = format!(
+        "sync: {} — {}\n",
+        if output.receipt.changed {
+            "changed"
+        } else {
+            "already converged"
+        },
+        if caravans.is_empty() {
+            "no caravans".to_owned()
+        } else {
+            format!("caravans {caravans}")
+        }
+    );
+    for advancement in &output.head_advancements {
+        let _ = writeln!(
+            text,
+            "  head advanced: #{} -> #{}",
+            advancement.merged_predecessor, advancement.new_head
+        );
+    }
+    for step in &output.receipt.completed_steps {
+        let _ = writeln!(text, "  {:?} {:?}: {}", step.kind, step.state, step.summary);
+    }
+    text
 }
 
 fn render_membership(output: &caravan::membership::MembershipOutput) -> String {
