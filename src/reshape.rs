@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use mcp_cli::ErrorCategory;
+use mcp_cli::{ErrorCategory, StructuredError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -99,12 +99,28 @@ fn execute_live(
     let timeout = std::time::Duration::from_secs(context.config.command_timeout_secs);
     let status = read::status(context)?;
     let repository = status.repository.clone();
+    let failure_status = status.clone();
     let checker =
         GitCompatibilityChecker::new(&context.repository_path, "origin").with_timeout(timeout);
     let provider = GitHubMutationAdapter::new(
         crate::command::ProcessRunner::in_directory(&context.repository_path).with_timeout(timeout),
     );
-    let mut output = execute(status, &checker, &provider, operation, selected, reason)?;
+    let requested_reason = reason.clone();
+    let mut output = match execute(status, &checker, &provider, operation, selected, reason) {
+        Ok(output) => output,
+        Err(error) if operation == ReshapeOperation::Evict => {
+            let event = eviction_failed_event(
+                &failure_status,
+                selected,
+                requested_reason.as_deref(),
+                &error,
+            );
+            let error = hooks::attach_events(error, std::slice::from_ref(&event));
+            let deliveries = hooks::dispatch_events(context, std::slice::from_ref(&event))?;
+            return Err(hooks::attach_deliveries(error, &deliveries));
+        }
+        Err(error) => return Err(error),
+    };
     let kind = match operation {
         ReshapeOperation::Evict => EventKind::Evicted,
         ReshapeOperation::Split => EventKind::Split,
@@ -125,6 +141,32 @@ fn execute_live(
     output.events.push(event);
     output.hook_deliveries = hooks::dispatch_events(context, &output.events)?;
     Ok(output)
+}
+
+fn eviction_failed_event(
+    status: &StatusOutput,
+    selected: Option<PrNumber>,
+    requested_reason: Option<&str>,
+    error: &AppError,
+) -> CaravanEvent {
+    let number = selected.or(status.current_pr);
+    let caravan_id = number
+        .and_then(|number| status.analysis.fleet.containing(number))
+        .map(|caravan| caravan.id);
+    let mut metadata = BTreeMap::from([("error_code".to_owned(), json!(error.code()))]);
+    if let Some(reason) = requested_reason {
+        metadata.insert("requested_reason".to_owned(), json!(reason));
+    }
+    hooks::event(
+        EventKind::EvictionFailed,
+        hooks::operation_id_from_error(error),
+        status.repository.clone(),
+        caravan_id,
+        number.into_iter().collect(),
+        Some(status.analysis.fleet.clone()),
+        Some(error.to_string()),
+        metadata,
+    )
 }
 
 // Owning one immutable discovery snapshot prevents a multi-step operation from
@@ -836,6 +878,22 @@ mod tests {
                 diagnostic: None,
             })
         }
+    }
+
+    #[test]
+    fn eviction_failure_event_carries_selected_pr_fleet_and_reason() {
+        let status = status(vec![pull_request(1, "main"), pull_request(2, "pr-1")]);
+        let error = AppError::validation("eviction_rejected", "cannot evict");
+
+        let event =
+            eviction_failed_event(&status, Some(PrNumber(2)), Some("known breakage"), &error);
+
+        assert_eq!(event.kind, EventKind::EvictionFailed);
+        assert_eq!(event.caravan_id, Some(PrNumber(1)));
+        assert_eq!(event.prs, vec![PrNumber(2)]);
+        assert_eq!(event.fleet, Some(status.analysis.fleet));
+        assert_eq!(event.metadata["error_code"], "eviction_rejected");
+        assert_eq!(event.metadata["requested_reason"], "known breakage");
     }
 
     #[test]

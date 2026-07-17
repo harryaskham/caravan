@@ -22,12 +22,13 @@ The normative behavior is in [`SPEC.md`](SPEC.md).
   admin-squashed only when repository policy permits it, the exact head/default
   compatibility proof is still current, and GitHub reports admin permission.
 
-## Implementation status
+## V1 command surface
 
-The core read, membership, navigation, reshape, and synchronization commands are
-implemented and exercised against live disposable PRs on this repository. CI
-failure/force handling, hooks, loop behavior, and final parity continue to use
-the same typed command contracts while their acceptance lanes land.
+Every bounded queue operation is implemented by one shared typed library path
+used by the human CLI, stable `--json` envelopes, and MCP. The foreground loop
+is intentionally CLI-only; MCP coordinators schedule bounded `sync --all`
+calls instead. See [`docs/v1-parity.md`](docs/v1-parity.md) for the checked
+SPEC-to-surface matrix.
 
 Development surfaces:
 
@@ -50,10 +51,14 @@ cara new [--create-pr]
 cara join [--tail-pr N | --head-pr N] [--create-pr]
 cara renew | cara rejoin
 cara show | cara next | cara prev
-cara sync [--all] [--rerun-failed] | cara loop
+cara sync [--all] [--rerun-failed] | cara loop [--once]
 cara evict [--pr N] --reason TEXT
 cara split [--pr N]
 cara van list | cara van next | cara van prev
+cara lock status | cara lock recover --token TOKEN --confirm
+cara mcp tools | cara mcp stdio
+cara self-update status | check | run
+cara feedback status | report
 ```
 
 `cara van next` on the default branch enters the first caravan head; ordinary

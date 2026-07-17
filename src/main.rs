@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use caravan::{
     AGENT_HELP, AppContext, AppError, CheckInput, CreateInput, EvictInput, JoinInput,
     LockRecoverInput, LockStatusInput, LoopInput, SplitInput, SyncInput, TOOL_NAME, build_router,
-    feedback_config, feedback_destination, updater_config,
+    feedback_config, updater_config,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use feedback_cli::{FeedbackEvent, FeedbackKind, Reporter, Severity};
@@ -251,8 +251,13 @@ fn run(cli: &Cli) -> Result<(), i32> {
 
 fn load_context(cli: &Cli) -> Result<AppContext, i32> {
     AppContext::load(cli.config.as_deref()).map_err(|error| {
-        eprintln!("cara: {error}");
-        2
+        if cli.json {
+            emit_result::<serde_json::Value, _>(true, Err(error))
+                .expect_err("an error envelope returns a nonzero exit code")
+        } else {
+            eprintln!("cara: {error}");
+            2
+        }
     })
 }
 
@@ -738,13 +743,7 @@ fn run_self_update(json: bool, command: &SelfUpdateCommand) -> Result<(), i32> {
 
 fn run_feedback(json: bool, command: &FeedbackCommand) -> Result<(), i32> {
     match command {
-        FeedbackCommand::Status => {
-            let output = serde_json::json!({
-                "enabled": true,
-                "destination": feedback_destination(),
-            });
-            emit_result::<_, AppError>(json, Ok(output))
-        }
+        FeedbackCommand::Status => emit_result::<_, AppError>(json, Ok(caravan::feedback_status())),
         FeedbackCommand::Report(args) => {
             let mut event = FeedbackEvent::new(
                 args.kind.into(),
@@ -762,12 +761,12 @@ fn run_feedback(json: bool, command: &FeedbackCommand) -> Result<(), i32> {
             let reporter = Reporter::from_config(&feedback_config());
             emit_result(
                 json,
-                reporter.report(&event).map(|()| {
-                    serde_json::json!({
-                        "reported": true,
-                        "destination": reporter.destination(),
-                    })
-                }),
+                reporter
+                    .report(&event)
+                    .map(|()| feedback_cli::ReportReceipt {
+                        reported: reporter.is_enabled(),
+                        destination: reporter.destination(),
+                    }),
             )
         }
     }

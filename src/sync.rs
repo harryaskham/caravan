@@ -229,6 +229,7 @@ pub fn sync(context: &AppContext, input: &SyncInput) -> Result<SyncOutput, AppEr
             Ok(output)
         }
         Err(error) => {
+            let error = checkout_for_decision(context, error);
             let mut events = hooks::events_from_error(&error);
             if events.is_empty() {
                 if let Some(event) = sync_failed_event(&error) {
@@ -238,6 +239,61 @@ pub fn sync(context: &AppContext, input: &SyncInput) -> Result<SyncOutput, AppEr
             let deliveries = hooks::dispatch_events(context, &events)?;
             Err(hooks::attach_deliveries(error, &deliveries))
         }
+    }
+}
+
+fn checkout_for_decision(context: &AppContext, error: AppError) -> AppError {
+    let Some(details) = error.details() else {
+        return error;
+    };
+    let Some(decision_value) = details.get("decision") else {
+        return error;
+    };
+    let Ok(decision) = serde_json::from_value::<DecisionPoint>(decision_value.clone()) else {
+        return error;
+    };
+    let target = decision_checkout_target(&decision);
+    let Some(target) = target else {
+        return error;
+    };
+    let checkout = match crate::navigation::checkout_decision_pr(context, target) {
+        Ok(pull_request) => json!({
+            "state": "completed",
+            "pr": target,
+            "branch": pull_request.head.name,
+            "oid": pull_request.head.oid,
+        }),
+        Err(checkout_error) => json!({
+            "state": "skipped",
+            "pr": target,
+            "error": {
+                "category": checkout_error.category(),
+                "code": checkout_error.code(),
+                "message": checkout_error.message(),
+                "details": checkout_error.details(),
+            },
+            "next": "make the local worktree safe, then check out the affected PR before repairing the decision",
+        }),
+    };
+    let mut details = details;
+    if let Some(object) = details.as_object_mut() {
+        object.insert("checkout".to_owned(), checkout);
+    }
+    AppError::structured(
+        error.category(),
+        error.code(),
+        error.message(),
+        Some(details),
+    )
+}
+
+fn decision_checkout_target(decision: &DecisionPoint) -> Option<PrNumber> {
+    match decision.kind {
+        DecisionKind::HeadConflict | DecisionKind::CiFailure => {
+            decision.affected_prs.first().copied()
+        }
+        DecisionKind::LinkConflict => decision.affected_prs.last().copied(),
+        _ => None,
     }
 }
 
@@ -1983,6 +2039,81 @@ mod tests {
         assert_eq!(
             progress.events[0].operation_id,
             progress.events[1].operation_id
+        );
+    }
+
+    #[test]
+    fn decision_checkout_targets_the_repair_pr_only_when_unambiguous() {
+        let decision = |kind, affected_prs| DecisionPoint {
+            kind,
+            operation_id: OperationId::new(),
+            repository: repository(),
+            caravan_id: Some(PrNumber(1)),
+            affected_prs,
+            message: "repair".to_owned(),
+            evidence: BTreeMap::new(),
+            completed_steps: Vec::new(),
+            resumable: true,
+            suggested_actions: Vec::new(),
+        };
+
+        assert_eq!(
+            decision_checkout_target(&decision(DecisionKind::HeadConflict, vec![PrNumber(1)])),
+            Some(PrNumber(1))
+        );
+        assert_eq!(
+            decision_checkout_target(&decision(
+                DecisionKind::LinkConflict,
+                vec![PrNumber(1), PrNumber(2)]
+            )),
+            Some(PrNumber(2))
+        );
+        assert_eq!(
+            decision_checkout_target(&decision(
+                DecisionKind::CrossCaravanConflict,
+                vec![PrNumber(1), PrNumber(4)]
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn unsafe_decision_checkout_preserves_the_original_decision_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let context = AppContext {
+            repository_path: temp.path().to_path_buf(),
+            config_path: temp.path().join("config.yaml"),
+            config_existed: false,
+            config: crate::config::CaravanConfig::default(),
+        };
+        let decision = DecisionPoint {
+            kind: DecisionKind::CiFailure,
+            operation_id: OperationId::new(),
+            repository: repository(),
+            caravan_id: Some(PrNumber(1)),
+            affected_prs: vec![PrNumber(1)],
+            message: "repair".to_owned(),
+            evidence: BTreeMap::new(),
+            completed_steps: Vec::new(),
+            resumable: true,
+            suggested_actions: Vec::new(),
+        };
+        let error = AppError::structured(
+            ErrorCategory::Validation,
+            "ci_failure",
+            "repair",
+            Some(json!({ "decision": decision })),
+        );
+
+        let error = checkout_for_decision(&context, error);
+
+        assert_eq!(error.code(), "ci_failure");
+        let details = error.details().unwrap();
+        assert_eq!(details["checkout"]["state"], "skipped");
+        assert_eq!(details["checkout"]["pr"], 1);
+        assert_eq!(
+            details["checkout"]["error"]["code"],
+            "git_repository_not_found"
         );
     }
 

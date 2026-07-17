@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use mcp_cli::ErrorCategory;
+use mcp_cli::{ErrorCategory, StructuredError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -284,7 +284,17 @@ fn execute_live(
         crate::command::ProcessRunner::in_directory(&context.repository_path).with_timeout(timeout),
     );
     let repository = status.repository.clone();
-    let mut output = execute(status, &checker, &provider, request)?;
+    let failure_status = status.clone();
+    let mut output = match execute(status, &checker, &provider, request) {
+        Ok(output) => output,
+        Err(error) if request.operation.is_join() => {
+            let event = join_failed_event(&failure_status, &request, &error);
+            let error = hooks::attach_events(error, std::slice::from_ref(&event));
+            let deliveries = hooks::dispatch_events(context, std::slice::from_ref(&event))?;
+            return Err(hooks::attach_deliveries(error, &deliveries));
+        }
+        Err(error) => return Err(error),
+    };
     let kind = if request.operation.is_join() {
         EventKind::PrJoined
     } else {
@@ -303,6 +313,34 @@ fn execute_live(
     output.events.push(event);
     output.hook_deliveries = hooks::dispatch_events(context, &output.events)?;
     Ok(output)
+}
+
+fn join_failed_event(
+    status: &StatusOutput,
+    request: &MembershipRequest,
+    error: &AppError,
+) -> CaravanEvent {
+    let mut prs = BTreeSet::new();
+    prs.extend(status.current_pr);
+    prs.extend(request.tail_pr.map(PrNumber));
+    prs.extend(request.head_pr.map(PrNumber));
+    let caravan_id = request.head_pr.map(PrNumber).or_else(|| {
+        request
+            .tail_pr
+            .map(PrNumber)
+            .and_then(|tail| status.analysis.fleet.containing(tail))
+            .map(|caravan| caravan.id)
+    });
+    hooks::event(
+        EventKind::JoinFailed,
+        hooks::operation_id_from_error(error),
+        status.repository.clone(),
+        caravan_id,
+        prs.into_iter().collect(),
+        Some(status.analysis.fleet.clone()),
+        Some(error.to_string()),
+        BTreeMap::from([("error_code".to_owned(), json!(error.code()))]),
+    )
 }
 
 fn execute(
@@ -1108,6 +1146,28 @@ mod tests {
             conflicting_paths: Vec::new(),
             diagnostic: None,
         })
+    }
+
+    #[test]
+    fn join_failure_event_carries_target_fleet_and_error_code() {
+        let head = pull_request(1, "one", "main", &[ACTIVE_LABEL]);
+        let candidate = pull_request(2, "two", "main", &[]);
+        let status = status(candidate, vec![head]);
+        let request = MembershipRequest {
+            operation: MembershipOperation::Join,
+            create_pr: false,
+            tail_pr: Some(1),
+            head_pr: None,
+        };
+        let error = AppError::validation("candidate_rejected", "cannot join");
+
+        let event = join_failed_event(&status, &request, &error);
+
+        assert_eq!(event.kind, EventKind::JoinFailed);
+        assert_eq!(event.caravan_id, Some(PrNumber(1)));
+        assert_eq!(event.prs, vec![PrNumber(1), PrNumber(2)]);
+        assert_eq!(event.fleet, Some(status.analysis.fleet));
+        assert_eq!(event.metadata["error_code"], "candidate_rejected");
     }
 
     #[test]

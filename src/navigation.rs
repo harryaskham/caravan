@@ -58,6 +58,32 @@ pub fn list(context: &AppContext) -> Result<VanListOutput, AppError> {
     })
 }
 
+/// Check out one exact discovered PR head for a sync decision.
+///
+/// This is deliberately separate from directional browsing: sync already chose
+/// the affected PR and only needs the same clean-worktree and exact-OID safety
+/// transaction.
+pub fn checkout_decision_pr(
+    context: &AppContext,
+    number: PrNumber,
+) -> Result<PullRequestSnapshot, AppError> {
+    let lock = OperationLock::acquire(&context.repository_path, "sync_decision_checkout")?;
+    let runner = ProcessRunner::in_directory(&context.repository_path).with_timeout(
+        std::time::Duration::from_secs(context.config.command_timeout_secs),
+    );
+    ensure_safe_worktree(&context.repository_path, &runner)?;
+    let status = read::status(context)?;
+    let pull_request = status
+        .analysis
+        .pull_requests
+        .get(&number)
+        .cloned()
+        .ok_or_else(|| missing_pr(number))?;
+    checkout_exact(&context.repository_path, "origin", &runner, &pull_request)?;
+    lock.release()?;
+    Ok(pull_request)
+}
+
 /// Navigate and check out an exact PR head in the live repository.
 pub fn navigate(
     context: &AppContext,

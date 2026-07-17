@@ -113,6 +113,52 @@ pub fn event(
     }
 }
 
+/// Attach canonical events to an existing typed domain error so JSON/MCP
+/// callers can correlate the exact objects delivered to failure hooks.
+#[must_use]
+pub fn attach_events(error: AppError, events: &[CaravanEvent]) -> AppError {
+    if events.is_empty() {
+        return error;
+    }
+    let mut details = error.details().unwrap_or_else(|| json!({}));
+    if let Some(object) = details.as_object_mut() {
+        object.insert("events".to_owned(), json!(events));
+    } else {
+        details = json!({
+            "original_details": details,
+            "events": events,
+        });
+    }
+    AppError::structured(
+        error.category(),
+        error.code(),
+        error.message(),
+        Some(details),
+    )
+}
+
+/// Reuse an operation ID already carried by a domain error, or allocate one
+/// for a preflight failure that occurred before domain execution state existed.
+#[must_use]
+pub fn operation_id_from_error(error: &AppError) -> OperationId {
+    let Some(details) = error.details() else {
+        return OperationId::new();
+    };
+    [
+        details.get("operation_id"),
+        details
+            .get("operation_receipt")
+            .and_then(|receipt| receipt.get("operation_id")),
+        details
+            .get("decision")
+            .and_then(|decision| decision.get("operation_id")),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|value| serde_json::from_value::<OperationId>(value.clone()).ok())
+    .unwrap_or_else(OperationId::new)
+}
+
 /// Attach best-effort hook status to an existing typed domain error.
 #[must_use]
 pub fn attach_deliveries(error: AppError, deliveries: &[HookDelivery]) -> AppError {
@@ -449,6 +495,25 @@ mod tests {
         assert_eq!(
             fs::read_to_string(event_path).unwrap(),
             format!("ci_failed|{}|{}\n", event.event_id.0, event.operation_id.0)
+        );
+    }
+
+    #[test]
+    fn failure_event_attachment_and_operation_identity_are_machine_visible() {
+        let operation_id = OperationId::new();
+        let original = AppError::structured(
+            ErrorCategory::Validation,
+            "join_rejected",
+            "failed",
+            Some(json!({ "operation_id": operation_id })),
+        );
+        let event = event(EventKind::JoinFailed);
+
+        assert_eq!(operation_id_from_error(&original), operation_id);
+        let attached = attach_events(original, std::slice::from_ref(&event));
+        assert_eq!(
+            attached.details().expect("details")["events"][0]["event_id"],
+            json!(event.event_id)
         );
     }
 

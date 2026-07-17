@@ -1,8 +1,7 @@
 //! Shared typed command contracts for the `cara` CLI and MCP server.
 //!
-//! This foundation intentionally exposes the complete command shape while queue
-//! operations return structured `not_implemented` errors. Follow-up beads replace
-//! each stub with the GitHub-backed behavior specified in `SPEC.md`.
+//! Every bounded v1 domain tool is backed by the same GitHub-facing operation
+//! used by the human and JSON CLI surfaces.
 
 use std::path::PathBuf;
 
@@ -24,7 +23,7 @@ use feedback_cli::{FeedbackConfig, Reporter};
 use mcp_cli::{ErrorCategory, StructuredError, ToolRouter};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::config::{CaravanConfig, ConfigError};
 
@@ -88,24 +87,6 @@ impl AppError {
             code: code.to_owned(),
             message: message.into(),
             details: None,
-        }
-    }
-
-    /// Mark a specified operation as not implemented by the foundation slice.
-    #[must_use]
-    pub fn not_implemented(operation: &str) -> Self {
-        Self {
-            category: ErrorCategory::UnsupportedCapability,
-            code: "not_implemented".to_owned(),
-            message: format!(
-                "`cara {operation}` is specified but not implemented in the initial skeleton"
-            ),
-            details: Some(json!({
-                "operation": operation,
-                "spec": SPEC_PATH,
-                "resumable": false,
-                "next": "implement the corresponding domain bead; do not treat this as queue success"
-            })),
         }
     }
 }
@@ -320,17 +301,6 @@ pub struct LockRecoverInput {
     pub confirm: bool,
 }
 
-/// Placeholder success shape for domain operations.
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-pub struct OperationOutput {
-    /// Stable operation name.
-    pub operation: String,
-    /// False for the initial scaffold; real implementations return true.
-    pub implemented: bool,
-    /// Agent-facing outcome.
-    pub message: String,
-}
-
 /// Output of the real `cara help` command/tool.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct HelpOutput {
@@ -347,11 +317,6 @@ pub fn help() -> HelpOutput {
         instructions: AGENT_HELP.to_owned(),
         spec: SPEC_PATH.to_owned(),
     }
-}
-
-/// Honest placeholder for a specified domain operation.
-pub fn scaffold_operation<T>(operation: &str, _input: &T) -> Result<OperationOutput, AppError> {
-    Err(AppError::not_implemented(operation))
 }
 
 #[cfg(test)]
@@ -391,22 +356,22 @@ pub fn build_router() -> ToolRouter<AppContext> {
     );
     router.add_typed_tool_with_output_schema(
         "new",
-        "Create a one-PR caravan from the current branch after full graph and cross-caravan compatibility checks.",
+        "After complete repository/graph/compatibility preflight, label and retarget the current open PR as a one-PR caravan and enable squash auto-merge. Exact stale facts abort; rediscover and rerun to resume partial receipts.",
         |context: &AppContext, input: CreateInput| membership::new(context, &input),
     );
     router.add_typed_tool_with_output_schema(
         "renew",
-        "Reevaluate an evicted current PR as a new caravan, removing caravan-evicted only after preflight succeeds.",
+        "After complete preflight, reevaluate an evicted current PR as a new caravan; remove eviction/force labels only when safe and enable head auto-merge. On typed failure repair the evidence and rerun.",
         |context: &AppContext, input: CreateInput| membership::renew(context, &input),
     );
     router.add_typed_tool_with_output_schema(
         "join",
-        "Append the current PR after a caravan tail. On ambiguity, supply tail_pr or head_pr; returns typed decision errors without guessing.",
+        "After complete compatibility preflight, retarget and label the current PR after a selected or uniquely inferred tail with auto-merge off. On ambiguity or stale facts, follow the typed candidates/evidence and rerun without guessing.",
         |context: &AppContext, input: JoinInput| membership::join(context, &input),
     );
     router.add_typed_tool_with_output_schema(
         "rejoin",
-        "Reevaluate an evicted PR and append it after a valid tail; removes caravan-evicted only after preflight succeeds.",
+        "After complete compatibility preflight, append an evicted PR after a valid tail and remove eviction/force labels. Typed partial receipts are resumable by rediscovery and the same rejoin call.",
         |context: &AppContext, input: JoinInput| membership::rejoin(context, &input),
     );
     router.add_typed_tool_with_output_schema(
@@ -416,7 +381,7 @@ pub fn build_router() -> ToolRouter<AppContext> {
     );
     router.add_typed_tool_with_output_schema(
         "next",
-        "Safely check out the next PR toward the current caravan tail; refuses dirty or ambiguous repositories.",
+        "Check out the next PR toward the current caravan tail. Local worktrees must be clean and unambiguous; clean or finish Git state before retrying an unsafe_checkout error.",
         |context: &AppContext, _input: EmptyInput| {
             navigation::navigate(
                 context,
@@ -427,7 +392,7 @@ pub fn build_router() -> ToolRouter<AppContext> {
     );
     router.add_typed_tool_with_output_schema(
         "prev",
-        "Safely check out the previous PR toward the current caravan head; refuses dirty or ambiguous repositories.",
+        "Check out the previous PR toward the current caravan head. Local worktrees must be clean and unambiguous; clean or finish Git state before retrying an unsafe_checkout error.",
         |context: &AppContext, _input: EmptyInput| {
             navigation::navigate(
                 context,
@@ -438,17 +403,17 @@ pub fn build_router() -> ToolRouter<AppContext> {
     );
     router.add_typed_tool_with_output_schema(
         "sync",
-        "Idempotently synchronize one or all caravans. Stops at the first decision with exact CI/run evidence; rerun_failed reruns only listed failed workflow runs.",
+        "Idempotently synchronize one or all caravans under optimistic preconditions. Stops at the first typed decision with completed steps and recovery actions; rerun_failed reruns only exact PR/head-verified failed runs.",
         |context: &AppContext, input: SyncInput| sync::sync(context, &input),
     );
     router.add_typed_tool_with_output_schema(
         "evict",
-        "Evict a PR and safely close the graph gap when compatible; requires a reason and never bypasses textual conflicts.",
+        "After full fleet preflight, evict a PR, remove active/force state, and close its graph gap when compatible. Requires a reason, never bypasses conflicts, and returns resumable exact receipts on partial failure.",
         |context: &AppContext, input: EvictInput| reshape::evict(context, &input),
     );
     router.add_typed_tool_with_output_schema(
         "split",
-        "Split a caravan before the selected PR, which becomes a new head only if fleet invariants remain valid.",
+        "After full fleet preflight, split before a selected non-head and enable it as a new head only if both resulting caravans remain compatible. Repair typed evidence before retrying a rejected split.",
         |context: &AppContext, input: SplitInput| reshape::split(context, &input),
     );
     router.add_typed_tool_with_output_schema(
@@ -458,7 +423,7 @@ pub fn build_router() -> ToolRouter<AppContext> {
     );
     router.add_typed_tool_with_output_schema(
         "van_next",
-        "Safely check out the next caravan head in deterministic fleet browsing order.",
+        "Check out the next caravan head in deterministic PR-number browsing order; refuses dirty/unsafe local Git state, which must be repaired before retry.",
         |context: &AppContext, _input: EmptyInput| {
             navigation::navigate(
                 context,
@@ -469,7 +434,7 @@ pub fn build_router() -> ToolRouter<AppContext> {
     );
     router.add_typed_tool_with_output_schema(
         "van_prev",
-        "Safely check out the previous caravan head in deterministic fleet browsing order.",
+        "Check out the previous caravan head in deterministic PR-number browsing order; refuses dirty/unsafe local Git state, which must be repaired before retry.",
         |context: &AppContext, _input: EmptyInput| {
             navigation::navigate(
                 context,
@@ -506,9 +471,86 @@ pub fn build_router() -> ToolRouter<AppContext> {
         },
     );
 
-    updatable_cli::register_update_tool(&mut router, |_context: &AppContext| updater_config());
-    feedback_cli::register_feedback_tools(&mut router, |_context: &AppContext| feedback_config());
+    register_self_update_tools(&mut router);
+    register_feedback_tools(&mut router);
     router
+}
+
+fn register_self_update_tools(router: &mut ToolRouter<AppContext>) {
+    router.add_typed_tool_with_output_schema(
+        "self_update_status",
+        "Report installed and staged binary paths without network access. Read-only; repair a reported staged-path problem before running an update.",
+        |_context: &AppContext, _input: updatable_cli::EmptyArgs| {
+            updatable_cli::Updater::new(updater_config())
+                .current_status()
+                .map_err(updatable_cli::UpdateError::from)
+        },
+    );
+    router.add_typed_tool_with_output_schema(
+        "self_update_check",
+        "Check the GitHub releases feed for a newer cara version without installing it. Network failures are typed and safe to retry.",
+        |_context: &AppContext, _input: updatable_cli::EmptyArgs| {
+            updatable_cli::Updater::new(updater_config())
+                .check_latest()
+                .map_err(updatable_cli::UpdateError::from)
+        },
+    );
+    router.add_typed_tool_with_output_schema(
+        "self_update_run",
+        "Download, verify, stage, and atomically promote the latest cara release. On failure inspect the typed updater error before retrying; never treats a partial stage as success.",
+        |_context: &AppContext, _input: updatable_cli::EmptyArgs| {
+            updatable_cli::Updater::new(updater_config())
+                .run_update()
+                .map_err(updatable_cli::UpdateError::from)
+        },
+    );
+}
+
+fn feedback_strategy_name(strategy: &feedback_cli::ReportStrategy) -> &'static str {
+    match strategy {
+        feedback_cli::ReportStrategy::Disabled => "disabled",
+        feedback_cli::ReportStrategy::Stderr => "stderr",
+        feedback_cli::ReportStrategy::Webhook(_) => "webhook",
+        feedback_cli::ReportStrategy::CacoCli(_) => "caco_cli",
+        feedback_cli::ReportStrategy::File(_) => "file",
+    }
+}
+
+/// Resolve the same secret-free feedback status returned by CLI and MCP.
+#[must_use]
+pub fn feedback_status() -> feedback_cli::FeedbackStatus {
+    let config = feedback_config();
+    let reporter = Reporter::from_config(&config);
+    feedback_cli::FeedbackStatus {
+        enabled: config.enabled,
+        strategy: feedback_strategy_name(&config.strategy).to_owned(),
+        destination: reporter.destination(),
+        component: config.component,
+        project: config.project,
+    }
+}
+
+fn register_feedback_tools(router: &mut ToolRouter<AppContext>) {
+    router.add_typed_tool_with_output_schema(
+        "feedback_report",
+        "Report one structured feedback/error/performance event through the configured strategy. Returns a secret-free delivery receipt; retry only after inspecting a typed delivery error.",
+        |_context: &AppContext, input: feedback_cli::ReportArgs| {
+            let reporter = Reporter::from_config(&feedback_config());
+            let destination = reporter.destination();
+            reporter.report(&input.into_event())?;
+            Ok::<_, feedback_cli::FeedbackError>(feedback_cli::ReportReceipt {
+                reported: reporter.is_enabled(),
+                destination,
+            })
+        },
+    );
+    router.add_typed_tool_with_output_schema(
+        "feedback_status",
+        "Return the resolved secret-free feedback strategy, destination, component, and project without sending an event.",
+        |_context: &AppContext, _input: feedback_cli::EmptyArgs| {
+            Ok::<_, feedback_cli::FeedbackError>(feedback_status())
+        },
+    );
 }
 
 /// Self-update configuration for GitHub release assets.
@@ -560,15 +602,6 @@ mod tests {
     }
 
     #[test]
-    fn domain_stub_is_structured_and_honest() {
-        let error = scaffold_operation("status", &EmptyInput::default())
-            .expect_err("the foundation must not pretend discovery exists");
-        assert_eq!(error.category(), ErrorCategory::UnsupportedCapability);
-        assert_eq!(error.code(), "not_implemented");
-        assert_eq!(error.details().expect("details")["operation"], "status");
-    }
-
-    #[test]
     fn router_exposes_domain_and_ecosystem_tools() {
         let names: Vec<String> = build_router()
             .tool_metadata()
@@ -596,6 +629,8 @@ mod tests {
             "van_list",
             "van_next",
             "van_prev",
+            "lock_status",
+            "lock_recover",
             "self_update_status",
             "self_update_check",
             "self_update_run",
@@ -611,7 +646,8 @@ mod tests {
 
     #[test]
     fn help_tool_returns_a_success_envelope() {
-        let envelope = build_router().call_tool(&AppContext::default(), "help", json!({}));
+        let envelope =
+            build_router().call_tool(&AppContext::default(), "help", serde_json::json!({}));
         let value = serde_json::to_value(envelope).expect("envelope serializes");
         assert_eq!(value["status"], "success");
         assert!(
