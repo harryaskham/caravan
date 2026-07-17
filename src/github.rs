@@ -39,6 +39,13 @@ impl Default for DiscoveryOptions {
     }
 }
 
+/// Bounded, separately captured evidence from a provider JSON decode failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsonDecodeEvidence {
+    pub stdout: String,
+    pub stderr: String,
+}
+
 /// Typed failure from repository discovery.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiscoveryError {
@@ -59,6 +66,8 @@ pub enum DiscoveryError {
         command: CommandSpec,
         /// Serde diagnostic.
         message: String,
+        /// Boxed to keep the frequently returned discovery error compact.
+        evidence: Box<JsonDecodeEvidence>,
     },
     /// `gh repo view` reported no default branch.
     MissingDefaultBranch,
@@ -103,13 +112,13 @@ impl std::fmt::Display for DiscoveryError {
                 command.display(),
                 code.map_or_else(|| "signal".to_owned(), |code| code.to_string())
             ),
-            Self::InvalidJson { command, message } => {
-                write!(
-                    formatter,
-                    "`{}` returned invalid JSON: {message}",
-                    command.display()
-                )
-            }
+            Self::InvalidJson {
+                command, message, ..
+            } => write!(
+                formatter,
+                "`{}` returned invalid JSON: {message}",
+                command.display()
+            ),
             Self::MissingDefaultBranch => write!(formatter, "repository has no default branch"),
             Self::InvalidRepositorySlug(slug) => {
                 write!(formatter, "repository slug `{slug}` is not owner/name")
@@ -640,6 +649,10 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
             .map_err(|error| DiscoveryError::InvalidJson {
                 command,
                 message: error.to_string(),
+                evidence: Box::new(JsonDecodeEvidence {
+                    stdout: diagnostic_excerpt(&output.stdout),
+                    stderr: diagnostic_excerpt(&output.stderr),
+                }),
             })
             .map_err(Into::into)
     }
@@ -677,6 +690,27 @@ fn changed_precondition_fields(
 fn trimmed_provider_output(output: &CommandOutput) -> Option<String> {
     let value = output.stdout.trim();
     (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn diagnostic_excerpt(value: &str) -> String {
+    const EDGE_BYTES: usize = 4 * 1024;
+    if value.len() <= EDGE_BYTES * 2 {
+        return value.to_owned();
+    }
+    let mut prefix_end = EDGE_BYTES;
+    while !value.is_char_boundary(prefix_end) {
+        prefix_end -= 1;
+    }
+    let mut suffix_start = value.len() - EDGE_BYTES;
+    while !value.is_char_boundary(suffix_start) {
+        suffix_start += 1;
+    }
+    format!(
+        "{}\n...[{} bytes omitted]...\n{}",
+        &value[..prefix_end],
+        suffix_start.saturating_sub(prefix_end),
+        &value[suffix_start..]
+    )
 }
 
 /// Read-only adapter over authenticated `gh` and local `git`.
@@ -851,6 +885,10 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
         serde_json::from_str(&output.stdout).map_err(|error| DiscoveryError::InvalidJson {
             command,
             message: error.to_string(),
+            evidence: Box::new(JsonDecodeEvidence {
+                stdout: diagnostic_excerpt(&output.stdout),
+                stderr: diagnostic_excerpt(&output.stderr),
+            }),
         })
     }
 }
@@ -1933,6 +1971,76 @@ mod tests {
                 "--squash",
             ])
         );
+    }
+
+    #[test]
+    fn json_decoder_uses_only_stdout_and_preserves_stderr_on_failure() {
+        let valid_command = CommandSpec::new("gh").args(["fixture", "valid"]);
+        let valid_runner = FakeRunner::new(vec![(
+            valid_command.clone(),
+            CommandOutput {
+                code: Some(0),
+                stdout: r#"{"value":7}"#.to_owned(),
+                stderr: "\u{1b}[33mwrapper notice\u{1b}[0m\u{1}".to_owned(),
+            },
+        )]);
+        let valid_adapter = GitHubMutationAdapter::new(valid_runner);
+        let value: serde_json::Value = valid_adapter
+            .json(valid_command)
+            .expect("stderr cannot contaminate JSON stdout");
+        assert_eq!(value["value"], 7);
+        valid_adapter.runner.assert_exhausted();
+
+        let malformed_command = CommandSpec::new("gh").args(["fixture", "malformed"]);
+        let malformed_runner = FakeRunner::new(vec![(
+            malformed_command.clone(),
+            CommandOutput {
+                code: Some(0),
+                stdout: "{\"value\":\u{1}}".to_owned(),
+                stderr: "wrapper diagnostic".to_owned(),
+            },
+        )]);
+        let malformed_adapter = GitHubMutationAdapter::new(malformed_runner);
+        let error = malformed_adapter
+            .json::<serde_json::Value>(malformed_command)
+            .expect_err("control-contaminated stdout must fail closed");
+        assert!(matches!(
+            error,
+            MutationError::Provider(DiscoveryError::InvalidJson {
+                evidence,
+                ..
+            }) if evidence.stdout.contains('\u{1}')
+                && evidence.stderr == "wrapper diagnostic"
+        ));
+        malformed_adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn json_decoder_reports_nonzero_stderr_without_parsing_stdout() {
+        let command = CommandSpec::new("gh").args(["fixture", "failed"]);
+        let runner = FakeRunner::new(vec![(
+            command.clone(),
+            CommandOutput {
+                code: Some(23),
+                stdout: r#"{"would":"parse"}"#.to_owned(),
+                stderr: "provider failed".to_owned(),
+            },
+        )]);
+        let adapter = GitHubMutationAdapter::new(runner);
+
+        let error = adapter
+            .json::<serde_json::Value>(command)
+            .expect_err("nonzero command must fail before JSON decode");
+
+        assert!(matches!(
+            error,
+            MutationError::Provider(DiscoveryError::CommandFailed {
+                code: Some(23),
+                stderr,
+                ..
+            }) if stderr == "provider failed"
+        ));
+        adapter.runner.assert_exhausted();
     }
 
     #[test]

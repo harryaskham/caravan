@@ -15,7 +15,11 @@ use std::time::{Duration, Instant};
 pub const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const TERMINATION_GRACE: Duration = Duration::from_millis(250);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
-const MAX_CAPTURE_BYTES: usize = 64 * 1024;
+// Provider JSON for repositories with hundreds of PRs routinely exceeds the
+// diagnostic cap. Keep stdout large enough for bounded GitHub list queries,
+// while stderr remains a small evidence stream.
+const MAX_STDOUT_CAPTURE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_STDERR_CAPTURE_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct CommandIo {
@@ -292,8 +296,8 @@ impl CommandRunner for ProcessRunner {
             });
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
-        let stdout_reader = thread::spawn(move || capture(stdout));
-        let stderr_reader = thread::spawn(move || capture(stderr));
+        let stdout_reader = thread::spawn(move || capture(stdout, MAX_STDOUT_CAPTURE_BYTES));
+        let stderr_reader = thread::spawn(move || capture(stderr, MAX_STDERR_CAPTURE_BYTES));
         let deadline = Instant::now() + self.timeout;
 
         let (status, timed_out) = loop {
@@ -363,7 +367,7 @@ impl CommandRunner for ProcessRunner {
     }
 }
 
-fn capture(mut stream: impl Read) -> std::io::Result<Vec<u8>> {
+fn capture(mut stream: impl Read, limit: usize) -> std::io::Result<Vec<u8>> {
     let mut captured = Vec::new();
     let mut buffer = [0_u8; 8 * 1024];
     let mut truncated = false;
@@ -372,7 +376,7 @@ fn capture(mut stream: impl Read) -> std::io::Result<Vec<u8>> {
         if count == 0 {
             break;
         }
-        let remaining = MAX_CAPTURE_BYTES.saturating_sub(captured.len());
+        let remaining = limit.saturating_sub(captured.len());
         let retained = remaining.min(count);
         captured.extend_from_slice(&buffer[..retained]);
         truncated |= retained < count;
@@ -458,6 +462,24 @@ mod tests {
             .expect("child succeeds");
 
         assert_eq!(output.stdout, "sync_failed:payload");
+    }
+
+    #[test]
+    fn large_stdout_remains_complete_and_separate_from_control_stderr() {
+        let output = ProcessRunner::new()
+            .run(&CommandSpec::new("sh").args([
+                "-c",
+                "printf '\"'; i=0; while [ $i -lt 20000 ]; do printf abcdefgh; i=$((i+1)); done; printf '\"'; printf 'wrapper diagnostic\\001' >&2",
+            ]))
+            .expect("large child output succeeds");
+
+        assert!(output.is_success());
+        assert!(output.stdout.len() > 64 * 1024);
+        let decoded: String = serde_json::from_str(&output.stdout).expect("complete JSON stdout");
+        assert_eq!(decoded.len(), 160_000);
+        assert!(output.stderr.contains("wrapper diagnostic"));
+        assert!(output.stderr.contains('\u{1}'));
+        assert!(!output.stdout.contains("wrapper diagnostic"));
     }
 
     #[test]

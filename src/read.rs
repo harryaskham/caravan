@@ -417,6 +417,28 @@ fn discovery_error(error: &DiscoveryError) -> AppError {
             })),
         );
     }
+    if let DiscoveryError::InvalidJson {
+        command,
+        message,
+        evidence,
+    } = error
+    {
+        return AppError::structured(
+            ErrorCategory::ExecutionFailure,
+            "github_discovery_failed",
+            error.to_string(),
+            Some(json!({
+                "stage": "github_json_decode",
+                "command": command.display(),
+                "message": message,
+                "stdout": evidence.stdout,
+                "stderr": evidence.stderr,
+                "streams_combined": false,
+                "resumable": true,
+                "next": "inspect the separate stdout/stderr excerpts, repair malformed provider stdout, and retry",
+            })),
+        );
+    }
     let category = match error {
         DiscoveryError::AmbiguousCurrentPullRequest { .. }
         | DiscoveryError::ForkOnlyHead { .. }
@@ -620,6 +642,28 @@ mod tests {
             .expect_err("drafts are not ready");
         let details = mcp_cli::StructuredError::details(&error).unwrap();
         assert_eq!(details["eligible"], false);
+    }
+
+    #[test]
+    fn invalid_provider_json_preserves_separate_stream_evidence() {
+        let error = discovery_error(&DiscoveryError::InvalidJson {
+            command: crate::command::CommandSpec::new("gh").args(["pr", "list"]),
+            message: "control character at line 1".to_owned(),
+            evidence: Box::new(crate::github::JsonDecodeEvidence {
+                stdout: "{\"bad\":\"\u{1}\"}".to_owned(),
+                stderr: "wrapper diagnostic\u{1}".to_owned(),
+            }),
+        });
+
+        assert_eq!(
+            mcp_cli::StructuredError::code(&error),
+            "github_discovery_failed"
+        );
+        let details = mcp_cli::StructuredError::details(&error).unwrap();
+        assert_eq!(details["stage"], "github_json_decode");
+        assert_eq!(details["streams_combined"], false);
+        assert_eq!(details["stderr"], "wrapper diagnostic\u{1}");
+        assert!(details["stdout"].as_str().unwrap().contains("bad"));
     }
 
     #[test]
