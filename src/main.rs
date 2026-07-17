@@ -5,8 +5,8 @@ use std::io;
 use std::path::PathBuf;
 
 use caravan::{
-    AGENT_HELP, AppContext, AppError, CheckInput, CreateInput, EmptyInput, EvictInput, JoinInput,
-    LoopInput, OperationOutput, SplitInput, SyncInput, TOOL_NAME, build_router, feedback_config,
+    AGENT_HELP, AppContext, AppError, CheckInput, CreateInput, EvictInput, JoinInput, LoopInput,
+    OperationOutput, SplitInput, SyncInput, TOOL_NAME, build_router, feedback_config,
     feedback_destination, scaffold_operation, updater_config,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -195,16 +195,32 @@ fn run(cli: &Cli) -> Result<(), i32> {
         Command::Join(input) => run_domain(cli.json, "join", input),
         Command::Rejoin(input) => run_domain(cli.json, "rejoin", input),
         Command::Show => run_show(cli),
-        Command::Next => run_domain(cli.json, "next", &EmptyInput::default()),
-        Command::Prev => run_domain(cli.json, "prev", &EmptyInput::default()),
+        Command::Next => run_navigation(
+            cli,
+            caravan::navigation::Scope::Caravan,
+            caravan::navigation::Direction::Next,
+        ),
+        Command::Prev => run_navigation(
+            cli,
+            caravan::navigation::Scope::Caravan,
+            caravan::navigation::Direction::Previous,
+        ),
         Command::Sync(input) => run_domain(cli.json, "sync", input),
         Command::Evict(input) => run_domain(cli.json, "evict", input),
         Command::Split(input) => run_domain(cli.json, "split", input),
         Command::Loop(input) => run_domain(cli.json, "loop", input),
         Command::Van(command) => match command {
-            VanCommand::List => run_domain(cli.json, "van list", &EmptyInput::default()),
-            VanCommand::Next => run_domain(cli.json, "van next", &EmptyInput::default()),
-            VanCommand::Prev => run_domain(cli.json, "van prev", &EmptyInput::default()),
+            VanCommand::List => run_van_list(cli),
+            VanCommand::Next => run_navigation(
+                cli,
+                caravan::navigation::Scope::Fleet,
+                caravan::navigation::Direction::Next,
+            ),
+            VanCommand::Prev => run_navigation(
+                cli,
+                caravan::navigation::Scope::Fleet,
+                caravan::navigation::Direction::Previous,
+            ),
         },
         Command::Help => run_help(cli.json),
         Command::Mcp(command) => run_mcp(command, cli.config.as_deref()),
@@ -373,6 +389,55 @@ where
     E: StructuredError + std::fmt::Display,
 {
     emit_result::<serde_json::Value, E>(false, Err(error))
+}
+
+fn run_navigation(
+    cli: &Cli,
+    scope: caravan::navigation::Scope,
+    direction: caravan::navigation::Direction,
+) -> Result<(), i32> {
+    let context = load_context(cli)?;
+    let result = caravan::navigation::navigate(&context, scope, direction);
+    if cli.json {
+        return emit_result(true, result);
+    }
+    match result {
+        Ok(output) => {
+            println!(
+                "checked out PR #{} on `{}` ({})",
+                output.to_pr, output.branch, output.oid
+            );
+            Ok(())
+        }
+        Err(error) => emit_human_error(error),
+    }
+}
+
+fn run_van_list(cli: &Cli) -> Result<(), i32> {
+    let context = load_context(cli)?;
+    let result = caravan::navigation::list(&context);
+    if cli.json {
+        return emit_result(true, result);
+    }
+    match result {
+        Ok(output) => {
+            if output.caravans.is_empty() {
+                println!("no caravans");
+            } else {
+                for caravan in output.caravans {
+                    let chain = caravan
+                        .members
+                        .iter()
+                        .map(|number| format!("#{number}"))
+                        .collect::<Vec<_>>()
+                        .join(" -> ");
+                    println!("#{}: {chain}", caravan.id);
+                }
+            }
+            Ok(())
+        }
+        Err(error) => emit_human_error(error),
+    }
 }
 
 fn run_domain<T>(json: bool, operation: &str, input: &T) -> Result<(), i32> {

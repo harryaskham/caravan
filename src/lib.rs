@@ -10,6 +10,7 @@ pub mod command;
 pub mod compatibility;
 pub mod github;
 pub mod graph;
+pub mod navigation;
 pub mod operation_lock;
 pub mod read;
 
@@ -321,6 +322,10 @@ fn join(operation: &str, input: &JoinInput) -> Result<OperationOutput, AppError>
 }
 
 /// Build the complete MCP command router.
+///
+/// Keeping the manifest registrations together makes CLI/MCP surface drift
+/// reviewable in one place despite the deliberately broad v1 command set.
+#[allow(clippy::too_many_lines)]
 #[must_use]
 pub fn build_router() -> ToolRouter<AppContext> {
     let mut router = ToolRouter::new();
@@ -368,12 +373,24 @@ pub fn build_router() -> ToolRouter<AppContext> {
     router.add_typed_tool_with_output_schema(
         "next",
         "Safely check out the next PR toward the current caravan tail; refuses dirty or ambiguous repositories.",
-        |_context: &AppContext, input: EmptyInput| scaffold_operation("next", &input),
+        |context: &AppContext, _input: EmptyInput| {
+            navigation::navigate(
+                context,
+                navigation::Scope::Caravan,
+                navigation::Direction::Next,
+            )
+        }
     );
     router.add_typed_tool_with_output_schema(
         "prev",
         "Safely check out the previous PR toward the current caravan head; refuses dirty or ambiguous repositories.",
-        |_context: &AppContext, input: EmptyInput| scaffold_operation("prev", &input),
+        |context: &AppContext, _input: EmptyInput| {
+            navigation::navigate(
+                context,
+                navigation::Scope::Caravan,
+                navigation::Direction::Previous,
+            )
+        }
     );
     router.add_typed_tool_with_output_schema(
         "sync",
@@ -393,17 +410,29 @@ pub fn build_router() -> ToolRouter<AppContext> {
     router.add_typed_tool_with_output_schema(
         "van_list",
         "List every caravan in deterministic fleet navigation order. Read-only.",
-        |_context: &AppContext, input: EmptyInput| scaffold_operation("van list", &input),
+        |context: &AppContext, _input: EmptyInput| navigation::list(context),
     );
     router.add_typed_tool_with_output_schema(
         "van_next",
         "Safely check out the next caravan head in deterministic fleet browsing order.",
-        |_context: &AppContext, input: EmptyInput| scaffold_operation("van next", &input),
+        |context: &AppContext, _input: EmptyInput| {
+            navigation::navigate(
+                context,
+                navigation::Scope::Fleet,
+                navigation::Direction::Next,
+            )
+        },
     );
     router.add_typed_tool_with_output_schema(
         "van_prev",
         "Safely check out the previous caravan head in deterministic fleet browsing order.",
-        |_context: &AppContext, input: EmptyInput| scaffold_operation("van prev", &input),
+        |context: &AppContext, _input: EmptyInput| {
+            navigation::navigate(
+                context,
+                navigation::Scope::Fleet,
+                navigation::Direction::Previous,
+            )
+        },
     );
 
     updatable_cli::register_update_tool(&mut router, |_context: &AppContext| updater_config());
