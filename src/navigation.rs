@@ -35,7 +35,8 @@ pub struct NavigationOutput {
     pub repository: RepositoryId,
     pub scope: Scope,
     pub direction: Direction,
-    pub from_pr: PrNumber,
+    /// Source PR, or `None` when fleet navigation enters from the default branch.
+    pub from_pr: Option<PrNumber>,
     pub to_pr: PrNumber,
     pub branch: String,
     pub oid: CommitOid,
@@ -94,13 +95,50 @@ pub fn select_destination(
     status: &StatusOutput,
     scope: Scope,
     direction: Direction,
-) -> Result<(PrNumber, PrNumber), AppError> {
-    let current = status.current_pr.ok_or_else(|| {
-        AppError::validation(
-            "current_pr_not_found",
-            "the current branch has no unique open GitHub pull request",
-        )
-    })?;
+) -> Result<(Option<PrNumber>, PrNumber), AppError> {
+    let Some(current) = status.current_pr else {
+        if scope != Scope::Fleet
+            || status.current_branch.as_deref() != Some(status.default_branch.as_str())
+        {
+            return Err(AppError::validation(
+                "current_pr_not_found",
+                "the current branch has no unique open GitHub pull request",
+            ));
+        }
+        if direction == Direction::Previous {
+            return Err(AppError::structured(
+                ErrorCategory::TargetNotFound,
+                "navigation_boundary",
+                "the default branch is already before the first caravan in fleet order",
+                Some(json!({
+                    "current_pr": null,
+                    "current_branch": status.default_branch,
+                    "scope": scope,
+                    "direction": direction,
+                })),
+            ));
+        }
+        let destination = status
+            .analysis
+            .fleet
+            .caravans
+            .first()
+            .and_then(Caravan::head)
+            .ok_or_else(|| {
+                AppError::structured(
+                    ErrorCategory::TargetNotFound,
+                    "navigation_boundary",
+                    "there are no caravan heads to navigate to",
+                    Some(json!({
+                        "current_pr": null,
+                        "current_branch": status.default_branch,
+                        "scope": scope,
+                        "direction": direction,
+                    })),
+                )
+            })?;
+        return Ok((None, destination));
+    };
     let current_caravan = status.analysis.fleet.containing(current).ok_or_else(|| {
         AppError::validation(
             "current_pr_not_in_caravan",
@@ -157,7 +195,7 @@ pub fn select_destination(
                 })),
             ))
         },
-        |destination| Ok((current, destination)),
+        |destination| Ok((Some(current), destination)),
     )
 }
 
@@ -558,15 +596,52 @@ mod tests {
         let first_status = status(1);
         assert_eq!(
             select_destination(&first_status, Scope::Caravan, Direction::Next).unwrap(),
-            (PrNumber(1), PrNumber(2))
+            (Some(PrNumber(1)), PrNumber(2))
         );
         assert_eq!(
             select_destination(&first_status, Scope::Fleet, Direction::Next).unwrap(),
-            (PrNumber(1), PrNumber(3))
+            (Some(PrNumber(1)), PrNumber(3))
         );
         assert!(select_destination(&first_status, Scope::Caravan, Direction::Previous).is_err());
         let tail = status(2);
         assert!(select_destination(&tail, Scope::Caravan, Direction::Next).is_err());
+    }
+
+    #[test]
+    fn fleet_next_enters_first_caravan_from_default_branch() {
+        let mut default_branch = status(1);
+        default_branch.current_branch = Some("main".to_owned());
+        default_branch.current_pr = None;
+
+        assert_eq!(
+            select_destination(&default_branch, Scope::Fleet, Direction::Next).unwrap(),
+            (None, PrNumber(1))
+        );
+        let previous =
+            select_destination(&default_branch, Scope::Fleet, Direction::Previous).unwrap_err();
+        assert_eq!(
+            mcp_cli::StructuredError::code(&previous),
+            "navigation_boundary"
+        );
+        let caravan =
+            select_destination(&default_branch, Scope::Caravan, Direction::Next).unwrap_err();
+        assert_eq!(
+            mcp_cli::StructuredError::code(&caravan),
+            "current_pr_not_found"
+        );
+    }
+
+    #[test]
+    fn non_default_branch_without_pr_cannot_enter_fleet_navigation() {
+        let mut feature_branch = status(1);
+        feature_branch.current_branch = Some("local-work".to_owned());
+        feature_branch.current_pr = None;
+
+        let error = select_destination(&feature_branch, Scope::Fleet, Direction::Next).unwrap_err();
+        assert_eq!(
+            mcp_cli::StructuredError::code(&error),
+            "current_pr_not_found"
+        );
     }
 
     #[test]

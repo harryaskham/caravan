@@ -97,6 +97,8 @@ Navigation refuses dirty worktrees, in-progress Git operations, ambiguous PR map
 - `cara van list` — list caravans.
 - `cara van next` / `cara van prev` — check out the next/previous caravan head in deterministic status order.
 
+From the repository's default branch, where there is no current PR, `cara van next` enters the first caravan head and `cara van prev` reports the lower navigation boundary. Chain-level `cara next`/`prev` and fleet navigation from any other non-PR branch still require a current caravan member.
+
 Fleet navigation is browsing, not queue priority. V1 orders heads by PR number until a separate configurable fleet-priority policy is specified.
 
 ### Reshaping

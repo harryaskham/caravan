@@ -56,6 +56,10 @@ cara split [--pr N]
 cara van list | cara van next | cara van prev
 ```
 
+`cara van next` on the default branch enters the first caravan head; ordinary
+`cara next` remains chain-local and requires the current branch to map to an
+open caravan PR.
+
 Use `cara help` for the agent operating loop and recovery rules. Use `--json`
 for stable `mcp-cli` envelopes.
 
