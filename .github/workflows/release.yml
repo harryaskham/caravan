@@ -1,0 +1,193 @@
+name: release
+
+# Tag-only release lane for updatable-cli compatible cara assets. All source
+# dependencies are public and fetched anonymously over HTTPS; no SSH secret is
+# required. Linux binaries use the system Rust toolchain, while the Darwin
+# binary builds in the pinned Nix dev shell so libiconv is available.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing vX.Y.Z tag to build and publish"
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ github.ref }}-${{ inputs.tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  resolve:
+    name: resolve release context
+    runs-on: [self-hosted, azure-ephemeral]
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.context.outputs.tag }}
+      version: ${{ steps.context.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: context
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          version="${tag#v}"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "release tag must be vX.Y.Z, got: $tag" >&2
+            exit 2
+          }
+          git rev-parse --verify "refs/tags/$tag^{commit}" >/dev/null
+          cargo_version="$(git show "${tag}:Cargo.toml" | awk -F '"' '/^version = "/ { print $2; exit }')"
+          [ "$version" = "$cargo_version" ] || {
+            echo "tag $tag does not match tagged Cargo.toml version $cargo_version" >&2
+            exit 2
+          }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: release contract
+    needs: resolve
+    runs-on: [self-hosted, azure-ephemeral]
+    timeout-minutes: 30
+    steps:
+      - name: Reset persistent-runner Git URL rewrites
+        shell: bash
+        run: git config --global --unset-all url."ssh://git@github.com/".insteadOf 2>/dev/null || true
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
+          fetch-depth: 0
+      - name: Use anonymous HTTPS for public source inputs
+        shell: bash
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - name: Run the full suite in the pinned development shell
+        shell: bash
+        run: nix develop --command cargo test --all
+      - name: Exercise asset and self-update status contracts offline
+        shell: bash
+        run: |
+          nix develop --command cargo build --bin cara
+          nix develop --command ./tests/release_contract.sh target/debug/cara
+
+  build:
+    name: build ${{ matrix.target }}
+    needs:
+      - resolve
+      - test
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-linux
+            runner: [self-hosted, azure-ephemeral]
+            cargo_target: ""
+          - target: aarch64-linux
+            runner: [self-hosted, azure-ephemeral]
+            cargo_target: aarch64-unknown-linux-gnu
+          - target: aarch64-darwin
+            runner: [self-hosted, aarch64-darwin]
+            cargo_target: ""
+    steps:
+      - name: Reset persistent-runner Git URL rewrites
+        shell: bash
+        run: git config --global --unset-all url."ssh://git@github.com/".insteadOf 2>/dev/null || true
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
+          fetch-depth: 0
+      - name: Use anonymous HTTPS for public source inputs
+        shell: bash
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+
+      - name: Surface system toolchains
+        shell: bash
+        run: |
+          for directory in /usr/bin /bin /usr/local/bin /opt/homebrew/bin "$HOME/.cargo/bin"; do
+            if [ -d "$directory" ]; then echo "$directory" >> "$GITHUB_PATH"; fi
+          done
+          exit 0
+
+      - name: Install Rust toolchain on Linux
+        if: matrix.target != 'aarch64-darwin'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux C and cross toolchains
+        if: matrix.target != 'aarch64-darwin'
+        shell: bash
+        env:
+          CARGO_TARGET: ${{ matrix.cargo_target }}
+        run: |
+          set -euo pipefail
+          if command -v apt-get >/dev/null 2>&1; then
+            sudo_command=""
+            if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then sudo_command="sudo"; fi
+            $sudo_command apt-get update -qq
+            $sudo_command apt-get install -y --no-install-recommends build-essential
+            if [ -n "$CARGO_TARGET" ]; then
+              $sudo_command apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+            fi
+          fi
+
+      - name: Build release binary
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          CARGO_TARGET: ${{ matrix.cargo_target }}
+        run: |
+          set -euo pipefail
+          if [ "$TARGET" = "aarch64-darwin" ]; then
+            nix develop '.#devShells.aarch64-darwin.default' --builders '' \
+              --command ./scripts/build-darwin-release.sh
+          elif [ -n "$CARGO_TARGET" ]; then
+            rustup target add "$CARGO_TARGET"
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+            cargo build --release --bin cara --target "$CARGO_TARGET"
+          else
+            cargo build --release --bin cara
+          fi
+
+      - name: Package update-compatible asset
+        shell: bash
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          CARGO_TARGET: ${{ matrix.cargo_target }}
+        run: |
+          set -euo pipefail
+          binary="${CARGO_TARGET_DIR:-target}${CARGO_TARGET:+/$CARGO_TARGET}/release/cara"
+          ./scripts/package-release.sh "$VERSION" "$TARGET" "$binary" dist
+
+      - name: Smoke packaged native binary
+        if: matrix.cargo_target == ''
+        shell: bash
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          root="cara-$VERSION-$TARGET"
+          rm -rf smoke
+          mkdir smoke
+          tar -xzf "dist/$root.tar.gz" -C smoke
+          "smoke/$root/cara" --version
+
+      - name: Upload assets to the GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.resolve.outputs.tag }}
+          name: ${{ needs.resolve.outputs.tag }}
+          generate_release_notes: true
+          files: dist/*
+          fail_on_unmatched_files: true

@@ -54,6 +54,36 @@ cara van list | cara van next | cara van prev
 Use `cara help` for the agent operating loop and recovery rules. Use `--json`
 for stable `mcp-cli` envelopes.
 
+## Releases and self-update
+
+Version tags publish update-compatible `cara` binaries for `x86_64-linux`,
+`aarch64-linux`, and `aarch64-darwin`. Each target produces:
+
+```text
+cara-<version>-<target>.tar.gz
+cara-<version>-<target>.sha256
+```
+
+The archive contains `cara-<version>-<target>/cara`, matching
+`updatable-cli`'s default asset strategy. The release workflow tests the tagged
+source, packages each binary, verifies native archives by executing `--version`,
+and uploads both assets to the GitHub Release. Public ecosystem source inputs
+are fetched anonymously over HTTPS; the workflow needs no SSH deploy secret.
+
+Use the bounded helper to keep `Cargo.toml`, `Cargo.lock`, and `flake.nix`
+aligned and create the tag:
+
+```sh
+./scripts/release.sh patch --dry-run   # inspect the next version
+./scripts/release.sh patch --no-push   # commit + tag for local review
+./scripts/release.sh patch             # atomically push branch + tag
+```
+
+An explicit version such as `./scripts/release.sh 0.2.0` is also accepted.
+Run `./tests/release_contract.sh target/debug/cara` after building to exercise
+the asset/checksum layout and `cara self-update status` with an isolated home;
+it never stages or installs an update over the developer binary.
+
 ## Ecosystem
 
 The binary uses:

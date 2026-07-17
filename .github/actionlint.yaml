@@ -1,0 +1,6 @@
+self-hosted-runner:
+  labels:
+    - azure-ephemeral
+    - aarch64-darwin
+
+config-variables: null
