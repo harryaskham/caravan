@@ -107,6 +107,7 @@ Repository policy and hooks will live at `.caravan/config.yaml`:
 ```yaml
 version: 1
 force_merge: false
+command_timeout_secs: 30
 loop:
   interval_secs: 60
 hooks:
@@ -115,6 +116,10 @@ hooks:
     timeout_secs: 30
     blocking: false
 ```
+
+`command_timeout_secs` is the hard deadline for each `git` or `gh` child;
+timeouts terminate and reap the child process group and return a structured,
+resumable error with the command stage and bounded output evidence.
 
 Hooks receive versioned JSON on stdin. Long-running coordinators own external
 deduplication/locking; repeated sync ticks remain safe and observable.

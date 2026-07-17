@@ -220,6 +220,7 @@ Minimal config shape:
 ```yaml
 version: 1
 force_merge: false
+command_timeout_secs: 30
 loop:
   interval_secs: 60
 hooks:

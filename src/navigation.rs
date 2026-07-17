@@ -65,7 +65,9 @@ pub fn navigate(
 ) -> Result<NavigationOutput, AppError> {
     let operation = format!("navigate_{scope:?}_{direction:?}").to_ascii_lowercase();
     let lock = OperationLock::acquire(&context.repository_path, &operation)?;
-    let runner = ProcessRunner::in_directory(&context.repository_path);
+    let runner = ProcessRunner::in_directory(&context.repository_path).with_timeout(
+        std::time::Duration::from_secs(context.config.command_timeout_secs),
+    );
     ensure_safe_worktree(&context.repository_path, &runner)?;
     let status = read::status(context)?;
     let (from_pr, to_pr) = select_destination(&status, scope, direction)?;
@@ -281,9 +283,10 @@ pub fn checkout_exact(
         return Err(stale_head(pull_request, advertised_oid));
     }
 
+    let local_commit = format!("{reference}^{{commit}}");
     let local = run(
         runner,
-        CommandSpec::new("git").args(["show-ref", "--verify", "--hash", reference.as_str()]),
+        CommandSpec::new("git").args(["rev-parse", "--verify", "--quiet", local_commit.as_str()]),
     )?;
     match local.code {
         Some(0) => {
@@ -330,7 +333,7 @@ pub fn checkout_exact(
 
     let verify = run(
         runner,
-        CommandSpec::new("git").args(["show-ref", "--verify", "--hash", reference.as_str()]),
+        CommandSpec::new("git").args(["rev-parse", "--verify", "--quiet", local_commit.as_str()]),
     )?;
     require_success(
         "local_branch_inspection_failed",
@@ -373,6 +376,28 @@ fn run(runner: &impl CommandRunner, command: CommandSpec) -> Result<CommandOutpu
 }
 
 fn command_run_error(error: &CommandRunError) -> AppError {
+    if let CommandRunError::Timeout {
+        command,
+        timeout_ms,
+        stdout,
+        stderr,
+    } = error
+    {
+        return AppError::structured(
+            ErrorCategory::Timeout,
+            "navigation_command_timeout",
+            error.to_string(),
+            Some(json!({
+                "stage": "navigation",
+                "command": command.display(),
+                "timeout_ms": timeout_ms,
+                "stdout": stdout,
+                "stderr": stderr,
+                "resumable": true,
+                "next": "retry navigation after restoring Git/GitHub transport health",
+            })),
+        );
+    }
     AppError::structured(
         ErrorCategory::ExecutionFailure,
         "navigation_command_failed",
@@ -577,6 +602,132 @@ mod tests {
             mcp_cli::StructuredError::code(&error),
             "git_operation_in_progress"
         );
+    }
+
+    #[test]
+    fn navigation_timeout_preserves_timeout_category_and_evidence() {
+        let error = command_run_error(&CommandRunError::Timeout {
+            command: CommandSpec::new("git").args(["ls-remote", "origin"]),
+            timeout_ms: 750,
+            stdout: "partial".to_owned(),
+            stderr: "stalled".to_owned(),
+        });
+
+        assert_eq!(
+            mcp_cli::StructuredError::category(&error),
+            ErrorCategory::Timeout
+        );
+        assert_eq!(
+            mcp_cli::StructuredError::code(&error),
+            "navigation_command_timeout"
+        );
+        let details = mcp_cli::StructuredError::details(&error).unwrap();
+        assert_eq!(details["stage"], "navigation");
+        assert_eq!(details["timeout_ms"], 750);
+    }
+
+    #[test]
+    fn checkout_creates_an_exact_local_branch_from_a_clean_clone() {
+        let source = tempfile::tempdir().unwrap();
+        git(source.path(), ["init", "--quiet", "--initial-branch=main"]);
+        git(source.path(), ["config", "user.name", "Caravan Test"]);
+        git(
+            source.path(),
+            ["config", "user.email", "caravan@example.invalid"],
+        );
+        fs::write(source.path().join("base.txt"), "base\n").unwrap();
+        git(source.path(), ["add", "base.txt"]);
+        git(source.path(), ["commit", "--quiet", "--message", "base"]);
+        let base_oid = git_stdout(source.path(), ["rev-parse", "HEAD"]);
+        let branch_name = "dogfood/remote-only";
+        git(
+            source.path(),
+            ["switch", "--quiet", "--create", branch_name],
+        );
+        fs::write(source.path().join("fixture.txt"), "fixture\n").unwrap();
+        git(source.path(), ["add", "fixture.txt"]);
+        git(source.path(), ["commit", "--quiet", "--message", "fixture"]);
+        let head_oid = git_stdout(source.path(), ["rev-parse", "HEAD"]);
+        git(source.path(), ["switch", "--quiet", "main"]);
+
+        let clone_parent = tempfile::tempdir().unwrap();
+        let checkout = clone_parent.path().join("checkout");
+        let clone = Command::new("git")
+            .args([
+                "clone",
+                "--quiet",
+                source.path().to_str().unwrap(),
+                checkout.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            clone.status.success(),
+            "git clone failed: {}",
+            String::from_utf8_lossy(&clone.stderr)
+        );
+        let missing = Command::new("git")
+            .current_dir(&checkout)
+            .args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch_name}^{{commit}}"),
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(missing.status.code(), Some(1));
+
+        let pull_request = PullRequestSnapshot {
+            number: PrNumber(2),
+            title: "Remote-only fixture".to_owned(),
+            url: "https://example.invalid/2".to_owned(),
+            state: PullRequestState::Open,
+            draft: false,
+            head: BranchSnapshot {
+                repository: repository(),
+                name: branch_name.to_owned(),
+                oid: CommitOid(head_oid.clone()),
+            },
+            base: BranchSnapshot {
+                repository: repository(),
+                name: "main".to_owned(),
+                oid: CommitOid(base_oid),
+            },
+            cross_repository: false,
+            labels: BTreeSet::from(["caravan".to_owned()]),
+            auto_merge: AutoMergeState::disabled(),
+            checks: Vec::new(),
+            merged_at: None,
+            updated_at: None,
+        };
+        let runner = ProcessRunner::in_directory(&checkout);
+
+        checkout_exact(&checkout, "origin", &runner, &pull_request).unwrap();
+
+        assert_eq!(
+            git_stdout(&checkout, ["branch", "--show-current"]),
+            branch_name
+        );
+        assert_eq!(git_stdout(&checkout, ["rev-parse", "HEAD"]), head_oid);
+    }
+
+    fn git_stdout<I, S>(repository: &Path, arguments: I) -> String
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        let output = Command::new("git")
+            .current_dir(repository)
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
     }
 
     fn git<I, S>(repository: &Path, arguments: I)

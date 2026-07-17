@@ -8,7 +8,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -18,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::AppError;
+use crate::command::{CommandRunError, CommandRunner, CommandSpec, ProcessRunner};
 
 /// Default age at which an abandoned owner file is reported as stale.
 pub const DEFAULT_STALE_AFTER: Duration = Duration::from_secs(30 * 60);
@@ -221,19 +221,12 @@ impl Drop for OperationLock {
 }
 
 fn lock_path(repository: &Path) -> Result<PathBuf, AppError> {
-    let output = Command::new("git")
-        .current_dir(repository)
-        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
-        .output()
-        .map_err(|error| {
-            AppError::structured(
-                ErrorCategory::ExecutionFailure,
-                "git_spawn_failed",
-                format!("could not execute Git while locating lock metadata: {error}"),
-                Some(json!({ "repository": repository })),
-            )
-        })?;
-    if !output.status.success() {
+    let request =
+        CommandSpec::new("git").args(["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+    let output = ProcessRunner::in_directory(repository)
+        .run(&request)
+        .map_err(|error| lock_command_error(&error, repository))?;
+    if !output.is_success() {
         return Err(AppError::structured(
             ErrorCategory::TargetNotFound,
             "git_repository_not_found",
@@ -244,7 +237,7 @@ fn lock_path(repository: &Path) -> Result<PathBuf, AppError> {
             })),
         ));
     }
-    let common_dir = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let common_dir = output.stdout.trim().to_owned();
     if common_dir.is_empty() {
         return Err(AppError::structured(
             ErrorCategory::ExecutionFailure,
@@ -256,6 +249,36 @@ fn lock_path(repository: &Path) -> Result<PathBuf, AppError> {
     Ok(PathBuf::from(common_dir)
         .join(LOCK_DIRECTORY)
         .join(LOCK_FILE))
+}
+
+fn lock_command_error(error: &CommandRunError, repository: &Path) -> AppError {
+    if let CommandRunError::Timeout {
+        command,
+        timeout_ms,
+        stdout,
+        stderr,
+    } = error
+    {
+        return AppError::structured(
+            ErrorCategory::Timeout,
+            "operation_lock_command_timeout",
+            error.to_string(),
+            Some(json!({
+                "stage": "operation_lock",
+                "command": command.display(),
+                "timeout_ms": timeout_ms,
+                "stdout": stdout,
+                "stderr": stderr,
+                "repository": repository,
+            })),
+        );
+    }
+    AppError::structured(
+        ErrorCategory::ExecutionFailure,
+        "git_spawn_failed",
+        format!("could not execute Git while locating lock metadata: {error}"),
+        Some(json!({ "repository": repository })),
+    )
 }
 
 fn new_owner(operation: &str) -> OperationLockOwner {
@@ -331,14 +354,16 @@ fn lock_io_error(code: &str, message: &str, path: &Path, error: &io::Error) -> A
     )
 }
 
-fn bounded_text(bytes: &[u8]) -> String {
+fn bounded_text(text: &str) -> String {
     const MAX_BYTES: usize = 4_096;
-    let end = bytes.len().min(MAX_BYTES);
-    let mut text = String::from_utf8_lossy(&bytes[..end]).into_owned();
-    if bytes.len() > MAX_BYTES {
-        text.push_str("…[truncated]");
+    if text.len() <= MAX_BYTES {
+        return text.to_owned();
     }
-    text
+    let mut end = MAX_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…[truncated]", &text[..end])
 }
 
 #[cfg(test)]

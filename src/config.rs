@@ -16,6 +16,7 @@ pub const CONFIG_VERSION: u32 = 1;
 /// Default repository-relative config path.
 pub const DEFAULT_CONFIG_PATH: &str = ".caravan/config.yaml";
 const MAX_INTERVAL_SECS: u64 = 86_400;
+const MAX_COMMAND_TIMEOUT_SECS: u64 = 3_600;
 const MAX_HOOK_TIMEOUT_SECS: u64 = 86_400;
 
 fn config_version() -> u32 {
@@ -24,6 +25,10 @@ fn config_version() -> u32 {
 
 fn default_loop_interval_secs() -> u64 {
     60
+}
+
+fn default_command_timeout_secs() -> u64 {
+    30
 }
 
 fn default_hook_timeout_secs() -> u64 {
@@ -73,6 +78,8 @@ impl Default for HookConfig {
 pub struct CaravanConfig {
     pub version: u32,
     pub force_merge: bool,
+    /// Hard deadline for each Git or GitHub CLI subprocess.
+    pub command_timeout_secs: u64,
     #[serde(rename = "loop")]
     pub loop_config: LoopConfig,
     pub hooks: BTreeMap<EventKind, HookConfig>,
@@ -83,6 +90,7 @@ impl Default for CaravanConfig {
         Self {
             version: config_version(),
             force_merge: false,
+            command_timeout_secs: default_command_timeout_secs(),
             loop_config: LoopConfig::default(),
             hooks: BTreeMap::new(),
         }
@@ -142,6 +150,11 @@ impl CaravanConfig {
                 found: self.version,
                 supported: CONFIG_VERSION,
             });
+        }
+        if !(1..=MAX_COMMAND_TIMEOUT_SECS).contains(&self.command_timeout_secs) {
+            return Err(ConfigError::Validation(format!(
+                "command_timeout_secs must be between 1 and {MAX_COMMAND_TIMEOUT_SECS}"
+            )));
         }
         if !(1..=MAX_INTERVAL_SECS).contains(&self.loop_config.interval_secs) {
             return Err(ConfigError::Validation(format!(
@@ -268,6 +281,7 @@ mod tests {
         let config = CaravanConfig::parse("{}\n").expect("defaults parse");
         assert_eq!(config.version, 1);
         assert!(!config.force_merge);
+        assert_eq!(config.command_timeout_secs, 30);
         assert_eq!(config.loop_config.interval_secs, 60);
         assert!(config.hooks.is_empty());
     }
@@ -278,6 +292,7 @@ mod tests {
             r"
 version: 1
 force_merge: true
+command_timeout_secs: 45
 loop:
   interval_secs: 10
 hooks:
@@ -289,6 +304,7 @@ hooks:
         )
         .expect("example config");
         assert!(config.force_merge);
+        assert_eq!(config.command_timeout_secs, 45);
         let hook = config.hook(EventKind::SyncFailed).expect("hook");
         assert_eq!(hook.command, "./scripts/on-sync-failed");
         assert_eq!(hook.timeout_secs, 45);
@@ -315,6 +331,12 @@ hooks:
         assert_eq!(
             CaravanConfig::parse("version: 2\n").unwrap_err().code(),
             "unsupported_config_version"
+        );
+        assert_eq!(
+            CaravanConfig::parse("version: 1\ncommand_timeout_secs: 0\n")
+                .unwrap_err()
+                .code(),
+            "invalid_config"
         );
         assert_eq!(
             CaravanConfig::parse("version: 1\nloop:\n  interval_secs: 0\n")

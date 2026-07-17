@@ -10,8 +10,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::command::CommandRunError;
 use crate::github::{
-    CreatePullRequestInput, GitHubMutationAdapter, GitHubMutationReceipt, MutationError,
+    CreatePullRequestInput, DiscoveryError, GitHubMutationAdapter, GitHubMutationReceipt,
+    MutationError,
 };
 use crate::graph::{CompatibilityChecker, GitCompatibilityChecker};
 use crate::model::{
@@ -267,11 +269,13 @@ fn execute_live(
     request: MembershipRequest,
 ) -> Result<MembershipOutput, AppError> {
     let _lock = OperationLock::acquire(&context.repository_path, request.operation.name())?;
+    let timeout = std::time::Duration::from_secs(context.config.command_timeout_secs);
     let status = read::status(context)?;
-    let checker = GitCompatibilityChecker::new(&context.repository_path, "origin");
-    let provider = GitHubMutationAdapter::new(crate::command::ProcessRunner::in_directory(
-        &context.repository_path,
-    ));
+    let checker =
+        GitCompatibilityChecker::new(&context.repository_path, "origin").with_timeout(timeout);
+    let provider = GitHubMutationAdapter::new(
+        crate::command::ProcessRunner::in_directory(&context.repository_path).with_timeout(timeout),
+    );
     execute(status, &checker, &provider, request)
 }
 
@@ -796,6 +800,31 @@ impl ExecutionState {
 }
 
 fn mutation_error(error: &MutationError, state: &ExecutionState) -> AppError {
+    if let MutationError::Provider(DiscoveryError::Runner(CommandRunError::Timeout {
+        command,
+        timeout_ms,
+        stdout,
+        stderr,
+    })) = error
+    {
+        return AppError::structured(
+            ErrorCategory::Timeout,
+            "github_mutation_timeout",
+            error.to_string(),
+            Some(json!({
+                "stage": "github_mutation",
+                "command": command.display(),
+                "timeout_ms": timeout_ms,
+                "stdout": stdout,
+                "stderr": stderr,
+                "operation_id": state.operation_id,
+                "completed_steps": state.steps,
+                "provider_receipts": state.provider_receipts,
+                "resumable": true,
+                "next": format!("rediscover and rerun `cara {}`", state.operation.name()),
+            })),
+        );
+    }
     let (category, code) = if matches!(error, MutationError::StalePrecondition { .. }) {
         (ErrorCategory::Validation, "stale_precondition")
     } else {
@@ -1228,6 +1257,39 @@ mod tests {
             .clone();
         let output = execute(status(partial, Vec::new()), &clean, &provider, request).unwrap();
         assert_eq!(output.pull_request.auto_merge, AutoMergeState::squash());
+    }
+
+    #[test]
+    fn mutation_timeout_preserves_timeout_category_and_partial_receipts() {
+        let mut state = ExecutionState::new(MembershipOperation::Join);
+        state.steps.push(MutationStep {
+            kind: MutationKind::AddLabel,
+            state: MutationStepState::Completed,
+            pr: Some(PrNumber(2)),
+            summary: "label added".to_owned(),
+        });
+        let error = mutation_error(
+            &MutationError::Provider(DiscoveryError::Runner(CommandRunError::Timeout {
+                command: crate::command::CommandSpec::new("gh").args(["pr", "edit"]),
+                timeout_ms: 900,
+                stdout: "partial".to_owned(),
+                stderr: "stalled".to_owned(),
+            })),
+            &state,
+        );
+
+        assert_eq!(
+            mcp_cli::StructuredError::category(&error),
+            ErrorCategory::Timeout
+        );
+        assert_eq!(
+            mcp_cli::StructuredError::code(&error),
+            "github_mutation_timeout"
+        );
+        let details = mcp_cli::StructuredError::details(&error).unwrap();
+        assert_eq!(details["stage"], "github_mutation");
+        assert_eq!(details["timeout_ms"], 900);
+        assert_eq!(details["completed_steps"][0]["summary"], "label added");
     }
 
     #[test]

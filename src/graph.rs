@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -60,6 +61,7 @@ where
 pub struct GitCompatibilityChecker {
     repository: PathBuf,
     remote: String,
+    timeout: Duration,
 }
 
 impl GitCompatibilityChecker {
@@ -68,7 +70,15 @@ impl GitCompatibilityChecker {
         Self {
             repository: repository.as_ref().to_path_buf(),
             remote: remote.into(),
+            timeout: crate::command::DEFAULT_COMMAND_TIMEOUT,
         }
+    }
+
+    /// Override the hard deadline for each exact-revision Git subprocess.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 }
 
@@ -78,7 +88,13 @@ impl CompatibilityChecker for GitCompatibilityChecker {
         candidate: &BranchSnapshot,
         target: &BranchSnapshot,
     ) -> Result<CompatibilityReport, AppError> {
-        compatibility::check_compatibility(&self.repository, &self.remote, candidate, target)
+        compatibility::check_compatibility_with_timeout(
+            &self.repository,
+            &self.remote,
+            candidate,
+            target,
+            self.timeout,
+        )
     }
 }
 

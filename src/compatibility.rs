@@ -5,12 +5,16 @@
 //! construct merge evidence without checking out or rewriting either branch.
 
 use std::path::Path;
-use std::process::{Command, Output};
+use std::time::Duration;
 
 use mcp_cli::ErrorCategory;
 use serde_json::json;
 
 use crate::AppError;
+use crate::command::{
+    CommandOutput, CommandRunError, CommandRunner, CommandSpec, DEFAULT_COMMAND_TIMEOUT,
+    ProcessRunner,
+};
 use crate::model::{BranchSnapshot, CommitOid, CompatibilityOutcome, CompatibilityReport};
 
 /// Check a child PR against its declared predecessor.
@@ -50,6 +54,33 @@ pub fn check_compatibility(
     candidate: &BranchSnapshot,
     target: &BranchSnapshot,
 ) -> Result<CompatibilityReport, AppError> {
+    check_compatibility_with_timeout(
+        repository,
+        remote,
+        candidate,
+        target,
+        DEFAULT_COMMAND_TIMEOUT,
+    )
+}
+
+/// Run the compatibility primitive with an explicit per-command hard deadline.
+pub fn check_compatibility_with_timeout(
+    repository: impl AsRef<Path>,
+    remote: &str,
+    candidate: &BranchSnapshot,
+    target: &BranchSnapshot,
+    timeout: Duration,
+) -> Result<CompatibilityReport, AppError> {
+    let runner = ProcessRunner::in_directory(repository).with_timeout(timeout);
+    check_compatibility_with_runner(&runner, remote, candidate, target)
+}
+
+fn check_compatibility_with_runner(
+    runner: &impl CommandRunner,
+    remote: &str,
+    candidate: &BranchSnapshot,
+    target: &BranchSnapshot,
+) -> Result<CompatibilityReport, AppError> {
     if candidate.repository != target.repository {
         return Err(AppError::validation(
             "cross_repository_compatibility_unsupported",
@@ -57,11 +88,10 @@ pub fn check_compatibility(
         ));
     }
 
-    let repository = repository.as_ref();
-    let target_oid = resolve_branch_snapshot(repository, remote, target)?;
-    let candidate_oid = resolve_branch_snapshot(repository, remote, candidate)?;
+    let target_oid = resolve_branch_snapshot_with_runner(runner, remote, target)?;
+    let candidate_oid = resolve_branch_snapshot_with_runner(runner, remote, candidate)?;
     let output = git_output(
-        repository,
+        runner,
         [
             "merge-tree",
             "--write-tree",
@@ -72,7 +102,7 @@ pub fn check_compatibility(
             candidate_oid.0.as_str(),
         ],
     )?;
-    let outcome = match output.status.code() {
+    let outcome = match output.code {
         Some(0) => CompatibilityOutcome::Clean,
         Some(1) => CompatibilityOutcome::Conflict,
         code => {
@@ -85,7 +115,7 @@ pub fn check_compatibility(
         }
     };
 
-    let mut fields = output.stdout.split(|byte| *byte == 0);
+    let mut fields = output.stdout.as_bytes().split(|byte| *byte == 0);
     let merge_tree_oid = fields
         .next()
         .filter(|field| !field.is_empty())
@@ -132,14 +162,32 @@ pub fn resolve_branch_snapshot(
     remote: &str,
     snapshot: &BranchSnapshot,
 ) -> Result<CommitOid, AppError> {
-    let repository = repository.as_ref();
+    resolve_branch_snapshot_with_timeout(repository, remote, snapshot, DEFAULT_COMMAND_TIMEOUT)
+}
+
+/// Resolve a branch snapshot with an explicit per-command hard deadline.
+pub fn resolve_branch_snapshot_with_timeout(
+    repository: impl AsRef<Path>,
+    remote: &str,
+    snapshot: &BranchSnapshot,
+    timeout: Duration,
+) -> Result<CommitOid, AppError> {
+    let runner = ProcessRunner::in_directory(repository).with_timeout(timeout);
+    resolve_branch_snapshot_with_runner(&runner, remote, snapshot)
+}
+
+fn resolve_branch_snapshot_with_runner(
+    runner: &impl CommandRunner,
+    remote: &str,
+    snapshot: &BranchSnapshot,
+) -> Result<CommitOid, AppError> {
     validate_remote(remote)?;
     validate_expected_oid(&snapshot.oid.0)?;
-    let reference = branch_reference(repository, &snapshot.name)?;
-    require_advertised_oid(repository, remote, &reference, &snapshot.oid.0)?;
+    let reference = branch_reference(runner, &snapshot.name)?;
+    require_advertised_oid(runner, remote, &reference, &snapshot.oid.0)?;
 
     let fetch = git_output(
-        repository,
+        runner,
         [
             "fetch",
             "--quiet",
@@ -150,19 +198,19 @@ pub fn resolve_branch_snapshot(
             reference.as_str(),
         ],
     )?;
-    if !fetch.status.success() {
+    if !fetch.is_success() {
         return Err(git_failure(
             "git_fetch_failed",
             "Git could not fetch the requested exact remote ref",
-            fetch.status.code(),
+            fetch.code,
             &fetch,
         ));
     }
 
     // A branch may move between discovery and fetch. Rechecking prevents a
     // caller from silently validating a newer remote head than it requested.
-    require_advertised_oid(repository, remote, &reference, &snapshot.oid.0)?;
-    resolve_local_commit(repository, &snapshot.oid.0)
+    require_advertised_oid(runner, remote, &reference, &snapshot.oid.0)?;
+    resolve_local_commit(runner, &snapshot.oid.0)
 }
 
 fn validate_remote(remote: &str) -> Result<(), AppError> {
@@ -185,7 +233,7 @@ fn validate_expected_oid(expected_oid: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-fn branch_reference(repository: &Path, branch: &str) -> Result<String, AppError> {
+fn branch_reference(runner: &impl CommandRunner, branch: &str) -> Result<String, AppError> {
     if branch.trim().is_empty() || contains_line_break(branch) {
         return Err(AppError::validation(
             "invalid_branch_name",
@@ -193,8 +241,8 @@ fn branch_reference(repository: &Path, branch: &str) -> Result<String, AppError>
         ));
     }
     let reference = format!("refs/heads/{branch}");
-    let output = git_output(repository, ["check-ref-format", reference.as_str()])?;
-    if !output.status.success() {
+    let output = git_output(runner, ["check-ref-format", reference.as_str()])?;
+    if !output.is_success() {
         return Err(AppError::validation(
             "invalid_branch_name",
             format!("`{branch}` is not a valid Git branch name"),
@@ -204,16 +252,16 @@ fn branch_reference(repository: &Path, branch: &str) -> Result<String, AppError>
 }
 
 fn require_advertised_oid(
-    repository: &Path,
+    runner: &impl CommandRunner,
     remote: &str,
     reference: &str,
     expected_oid: &str,
 ) -> Result<(), AppError> {
     let output = git_output(
-        repository,
+        runner,
         ["ls-remote", "--refs", "--exit-code", remote, reference],
     )?;
-    if !output.status.success() {
+    if !output.is_success() {
         return Err(AppError::structured(
             ErrorCategory::TargetNotFound,
             "remote_ref_not_found",
@@ -226,7 +274,8 @@ fn require_advertised_oid(
         ));
     }
 
-    let advertised = String::from_utf8_lossy(&output.stdout)
+    let advertised = output
+        .stdout
         .lines()
         .filter_map(|line| line.split_once('\t'))
         .find_map(|(oid, found_ref)| (found_ref == reference).then(|| oid.to_owned()))
@@ -255,10 +304,13 @@ fn require_advertised_oid(
     Ok(())
 }
 
-fn resolve_local_commit(repository: &Path, expected_oid: &str) -> Result<CommitOid, AppError> {
+fn resolve_local_commit(
+    runner: &impl CommandRunner,
+    expected_oid: &str,
+) -> Result<CommitOid, AppError> {
     let commit_expression = format!("{expected_oid}^{{commit}}");
     let output = git_output(
-        repository,
+        runner,
         [
             "rev-parse",
             "--verify",
@@ -266,7 +318,7 @@ fn resolve_local_commit(repository: &Path, expected_oid: &str) -> Result<CommitO
             commit_expression.as_str(),
         ],
     )?;
-    if !output.status.success() {
+    if !output.is_success() {
         return Err(AppError::structured(
             ErrorCategory::TargetNotFound,
             "revision_not_found",
@@ -292,27 +344,50 @@ fn resolve_local_commit(repository: &Path, expected_oid: &str) -> Result<CommitO
     Ok(CommitOid(oid))
 }
 
-fn git_output<I, S>(repository: &Path, arguments: I) -> Result<Output, AppError>
+fn git_output<I, S>(runner: &impl CommandRunner, arguments: I) -> Result<CommandOutput, AppError>
 where
     I: IntoIterator<Item = S>,
-    S: AsRef<std::ffi::OsStr>,
+    S: Into<String>,
 {
-    Command::new("git")
-        .current_dir(repository)
-        .args(arguments)
-        .output()
-        .map_err(|error| {
-            AppError::structured(
-                ErrorCategory::ExecutionFailure,
-                "git_spawn_failed",
-                format!("could not execute Git: {error}"),
-                Some(json!({ "repository": repository })),
-            )
-        })
+    runner
+        .run(&CommandSpec::new("git").args(arguments))
+        .map_err(|error| command_run_error(&error))
 }
 
-fn parse_single_oid(command: &str, output: &Output) -> Result<String, AppError> {
-    let oid = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+fn command_run_error(error: &CommandRunError) -> AppError {
+    if let CommandRunError::Timeout {
+        command,
+        timeout_ms,
+        stdout,
+        stderr,
+    } = error
+    {
+        let subcommand = command.args.first().map_or("unknown", String::as_str);
+        return AppError::structured(
+            ErrorCategory::Timeout,
+            "git_compatibility_timeout",
+            error.to_string(),
+            Some(json!({
+                "stage": format!("git_compatibility:{subcommand}"),
+                "command": command.display(),
+                "timeout_ms": timeout_ms,
+                "stdout": stdout,
+                "stderr": stderr,
+                "resumable": true,
+                "next": "restore Git transport health, rediscover exact revisions, and retry",
+            })),
+        );
+    }
+    AppError::structured(
+        ErrorCategory::ExecutionFailure,
+        "git_command_failed",
+        error.to_string(),
+        Some(json!({ "error": format!("{error:?}") })),
+    )
+}
+
+fn parse_single_oid(command: &str, output: &CommandOutput) -> Result<String, AppError> {
+    let oid = output.stdout.trim().to_owned();
     if valid_full_oid(&oid) {
         Ok(oid)
     } else {
@@ -336,7 +411,7 @@ fn git_failure(
     code: &str,
     message: impl Into<String>,
     exit_code: Option<i32>,
-    output: &Output,
+    output: &CommandOutput,
 ) -> AppError {
     AppError::structured(
         ErrorCategory::ExecutionFailure,
@@ -350,7 +425,11 @@ fn git_failure(
     )
 }
 
-fn malformed_git_output(code: &str, message: impl Into<String>, output: &Output) -> AppError {
+fn malformed_git_output(
+    code: &str,
+    message: impl Into<String>,
+    output: &CommandOutput,
+) -> AppError {
     AppError::structured(
         ErrorCategory::ExecutionFailure,
         code,
@@ -362,14 +441,16 @@ fn malformed_git_output(code: &str, message: impl Into<String>, output: &Output)
     )
 }
 
-fn bounded_text(bytes: &[u8]) -> String {
+fn bounded_text(text: &str) -> String {
     const MAX_BYTES: usize = 4_096;
-    let end = bytes.len().min(MAX_BYTES);
-    let mut text = String::from_utf8_lossy(&bytes[..end]).into_owned();
-    if bytes.len() > MAX_BYTES {
-        text.push_str("…[truncated]");
+    if text.len() <= MAX_BYTES {
+        return text.to_owned();
     }
-    text
+    let mut end = MAX_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…[truncated]", &text[..end])
 }
 
 fn bytes_to_text(bytes: &[u8]) -> String {
@@ -588,6 +669,37 @@ mod tests {
         assert_eq!(error.code(), "stale_remote_revision");
         let details = error.details().expect("stale details");
         assert_eq!(details["advertised_oid"], actual);
+    }
+
+    struct TimeoutRunner;
+
+    impl CommandRunner for TimeoutRunner {
+        fn run(&self, command: &CommandSpec) -> Result<CommandOutput, CommandRunError> {
+            Err(CommandRunError::Timeout {
+                command: command.clone(),
+                timeout_ms: 250,
+                stdout: "partial".to_owned(),
+                stderr: "transport stalled".to_owned(),
+            })
+        }
+    }
+
+    #[test]
+    fn direct_git_timeout_is_structured_with_stage_and_evidence() {
+        let error = resolve_branch_snapshot_with_runner(
+            &TimeoutRunner,
+            "origin",
+            &TestRepo::branch("main", &"a".repeat(40)),
+        )
+        .expect_err("direct Git timeout must not become a generic execution error");
+
+        assert_eq!(error.category(), ErrorCategory::Timeout);
+        assert_eq!(error.code(), "git_compatibility_timeout");
+        let details = error.details().expect("timeout details");
+        assert_eq!(details["stage"], "git_compatibility:check-ref-format");
+        assert_eq!(details["timeout_ms"], 250);
+        assert_eq!(details["stdout"], "partial");
+        assert_eq!(details["stderr"], "transport stalled");
     }
 
     fn git<I, S>(repository: &Path, arguments: I)

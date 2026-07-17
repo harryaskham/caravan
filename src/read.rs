@@ -7,6 +7,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::command::CommandRunError;
 use crate::github::{DiscoveryError, GitHubDiscovery};
 use crate::graph::{CompatibilityChecker, GitCompatibilityChecker, GraphAnalysis, analyze};
 use crate::model::{
@@ -69,13 +70,15 @@ pub struct CheckOutput {
 
 /// Discover and validate the real current repository without mutation.
 pub fn status(context: &AppContext) -> Result<StatusOutput, AppError> {
-    let discovery = GitHubDiscovery::new(crate::command::ProcessRunner::in_directory(
-        &context.repository_path,
-    ));
+    let timeout = std::time::Duration::from_secs(context.config.command_timeout_secs);
+    let discovery = GitHubDiscovery::new(
+        crate::command::ProcessRunner::in_directory(&context.repository_path).with_timeout(timeout),
+    );
     let snapshot = discovery
         .discover()
         .map_err(|error| discovery_error(&error))?;
-    let checker = GitCompatibilityChecker::new(&context.repository_path, "origin");
+    let checker =
+        GitCompatibilityChecker::new(&context.repository_path, "origin").with_timeout(timeout);
     let analysis = analyze(&snapshot, &checker)?;
     Ok(StatusOutput {
         repository: snapshot.repository,
@@ -135,7 +138,9 @@ pub fn check(context: &AppContext, input: &CheckInput) -> Result<CheckOutput, Ap
         ));
     }
     let status = status(context)?;
-    let checker = GitCompatibilityChecker::new(&context.repository_path, "origin");
+    let checker = GitCompatibilityChecker::new(&context.repository_path, "origin").with_timeout(
+        std::time::Duration::from_secs(context.config.command_timeout_secs),
+    );
     check_analysis(&status, input, &checker)
 }
 
@@ -390,6 +395,28 @@ fn eligible_or_error(output: CheckOutput) -> Result<CheckOutput, AppError> {
 }
 
 fn discovery_error(error: &DiscoveryError) -> AppError {
+    if let DiscoveryError::Runner(CommandRunError::Timeout {
+        command,
+        timeout_ms,
+        stdout,
+        stderr,
+    }) = error
+    {
+        return AppError::structured(
+            ErrorCategory::Timeout,
+            "github_discovery_timeout",
+            error.to_string(),
+            Some(json!({
+                "stage": "github_discovery",
+                "command": command.display(),
+                "timeout_ms": timeout_ms,
+                "stdout": stdout,
+                "stderr": stderr,
+                "resumable": true,
+                "next": "retry the read operation after restoring Git/GitHub transport health",
+            })),
+        );
+    }
     let category = match error {
         DiscoveryError::AmbiguousCurrentPullRequest { .. }
         | DiscoveryError::ForkOnlyHead { .. }
@@ -593,6 +620,29 @@ mod tests {
             .expect_err("drafts are not ready");
         let details = mcp_cli::StructuredError::details(&error).unwrap();
         assert_eq!(details["eligible"], false);
+    }
+
+    #[test]
+    fn discovery_timeout_preserves_timeout_category_and_evidence() {
+        let error = discovery_error(&DiscoveryError::Runner(CommandRunError::Timeout {
+            command: crate::command::CommandSpec::new("gh").args(["pr", "list"]),
+            timeout_ms: 500,
+            stdout: "partial".to_owned(),
+            stderr: "stalled".to_owned(),
+        }));
+
+        assert_eq!(
+            mcp_cli::StructuredError::category(&error),
+            ErrorCategory::Timeout
+        );
+        assert_eq!(
+            mcp_cli::StructuredError::code(&error),
+            "github_discovery_timeout"
+        );
+        let details = mcp_cli::StructuredError::details(&error).unwrap();
+        assert_eq!(details["stage"], "github_discovery");
+        assert_eq!(details["timeout_ms"], 500);
+        assert_eq!(details["stdout"], "partial");
     }
 
     #[test]
