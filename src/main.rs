@@ -214,8 +214,8 @@ fn run(cli: &Cli) -> Result<(), i32> {
             caravan::navigation::Direction::Previous,
         ),
         Command::Sync(input) => run_domain(cli.json, "sync", input),
-        Command::Evict(input) => run_domain(cli.json, "evict", input),
-        Command::Split(input) => run_domain(cli.json, "split", input),
+        Command::Evict(input) => run_evict(cli, input),
+        Command::Split(input) => run_split(cli, input),
         Command::Loop(input) => run_domain(cli.json, "loop", input),
         Command::Van(command) => match command {
             VanCommand::List => run_van_list(cli),
@@ -433,6 +433,44 @@ where
     E: StructuredError + std::fmt::Display,
 {
     emit_result::<serde_json::Value, E>(false, Err(error))
+}
+
+fn run_evict(cli: &Cli, input: &EvictInput) -> Result<(), i32> {
+    let context = load_context(cli)?;
+    let result = caravan::reshape::evict(&context, input);
+    if cli.json {
+        return emit_result(true, result);
+    }
+    match result {
+        Ok(output) => {
+            println!(
+                "evicted PR #{}; affected {:?}; changed={}",
+                output.pr, output.affected_prs, output.receipt.changed
+            );
+            Ok(())
+        }
+        Err(error) => emit_human_error(error),
+    }
+}
+
+fn run_split(cli: &Cli, input: &SplitInput) -> Result<(), i32> {
+    let context = load_context(cli)?;
+    let result = caravan::reshape::split(&context, input);
+    if cli.json {
+        return emit_result(true, result);
+    }
+    match result {
+        Ok(output) => {
+            println!(
+                "split at PR #{}; caravans={}; changed={}",
+                output.pr,
+                output.resulting_fleet.caravans.len(),
+                output.receipt.changed
+            );
+            Ok(())
+        }
+        Err(error) => emit_human_error(error),
+    }
 }
 
 fn run_navigation(

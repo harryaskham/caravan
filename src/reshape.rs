@@ -1,0 +1,943 @@
+//! Safe, resumable caravan eviction and splitting policy.
+
+use std::collections::BTreeMap;
+
+use mcp_cli::ErrorCategory;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+
+use crate::github::{GitHubMutationAdapter, GitHubMutationReceipt, MutationError};
+use crate::graph::{CompatibilityChecker, GitCompatibilityChecker, analyze};
+use crate::membership::MembershipProvider;
+use crate::model::{
+    AutoMergeState, BranchSnapshot, CaravanFleet, MergeMethod, MutationKind, MutationStep,
+    MutationStepState, OperationId, OperationReceipt, PrNumber, PullRequestPrecondition,
+    PullRequestSnapshot, PullRequestState, RepositorySnapshot,
+};
+use crate::operation_lock::OperationLock;
+use crate::read::{self, StatusOutput};
+use crate::{AppContext, AppError, EvictInput, SplitInput};
+
+const ACTIVE_LABEL: &str = "caravan";
+const EVICTED_LABEL: &str = "caravan-evicted";
+const FORCE_LABEL: &str = "caravan-force";
+
+/// Reshape operation kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReshapeOperation {
+    Evict,
+    Split,
+}
+
+impl ReshapeOperation {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Evict => "evict",
+            Self::Split => "split",
+        }
+    }
+}
+
+/// Successful reshape receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReshapeOutput {
+    pub operation: ReshapeOperation,
+    pub pr: PrNumber,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub receipt: OperationReceipt,
+    #[serde(default)]
+    pub provider_receipts: Vec<GitHubMutationReceipt>,
+    #[serde(default)]
+    pub affected_prs: Vec<PrNumber>,
+    /// Fleet expected after every recorded provider step completes.
+    pub resulting_fleet: CaravanFleet,
+}
+
+/// Evict a PR selected explicitly or from the current branch.
+pub fn evict(context: &AppContext, input: &EvictInput) -> Result<ReshapeOutput, AppError> {
+    if input.reason.trim().is_empty() {
+        return Err(AppError::validation(
+            "eviction_reason_required",
+            "--reason must contain a non-empty eviction rationale",
+        ));
+    }
+    execute_live(
+        context,
+        ReshapeOperation::Evict,
+        input.pr.map(PrNumber),
+        Some(input.reason.clone()),
+    )
+}
+
+/// Split before a non-head PR selected explicitly or from the current branch.
+pub fn split(context: &AppContext, input: &SplitInput) -> Result<ReshapeOutput, AppError> {
+    execute_live(
+        context,
+        ReshapeOperation::Split,
+        input.pr.map(PrNumber),
+        None,
+    )
+}
+
+fn execute_live(
+    context: &AppContext,
+    operation: ReshapeOperation,
+    selected: Option<PrNumber>,
+    reason: Option<String>,
+) -> Result<ReshapeOutput, AppError> {
+    let _lock = OperationLock::acquire(&context.repository_path, operation.name())?;
+    let status = read::status(context)?;
+    let checker = GitCompatibilityChecker::new(&context.repository_path, "origin");
+    let provider = GitHubMutationAdapter::new(crate::command::ProcessRunner::in_directory(
+        &context.repository_path,
+    ));
+    execute(status, &checker, &provider, operation, selected, reason)
+}
+
+// Owning one immutable discovery snapshot prevents a multi-step operation from
+// accidentally swapping in partially refreshed facts mid-transaction.
+#[allow(clippy::needless_pass_by_value)]
+fn execute(
+    status: StatusOutput,
+    checker: &impl CompatibilityChecker,
+    provider: &impl MembershipProvider,
+    operation: ReshapeOperation,
+    selected: Option<PrNumber>,
+    reason: Option<String>,
+) -> Result<ReshapeOutput, AppError> {
+    let number = selected.or(status.current_pr).ok_or_else(|| {
+        AppError::validation(
+            "reshape_pr_not_selected",
+            "select a PR with --pr or run from a branch with one unique open PR",
+        )
+    })?;
+    let target = status
+        .analysis
+        .pull_requests
+        .get(&number)
+        .cloned()
+        .ok_or_else(|| missing_pr(number))?;
+    if target.state != PullRequestState::Open {
+        return Err(AppError::validation(
+            "reshape_pr_not_open",
+            format!("PR #{number} is not open"),
+        ));
+    }
+
+    let (virtual_status, plan) = match operation {
+        ReshapeOperation::Evict => plan_eviction(&status, &target)?,
+        ReshapeOperation::Split => plan_split(&status, &target)?,
+    };
+    preflight_result(&virtual_status, checker)?;
+    if plan.creates_head {
+        preflight_new_head(provider, &status)?;
+    }
+
+    let mut state = ReshapeState::new(operation, status.analysis.pull_requests.clone());
+    match operation {
+        ReshapeOperation::Evict => {
+            state.ensure_auto_merge_disabled(provider, &status.repository, number)?;
+            state.ensure_label_absent(provider, &status.repository, number, FORCE_LABEL)?;
+            state.ensure_label_absent(provider, &status.repository, number, ACTIVE_LABEL)?;
+            state.ensure_label_present(provider, &status.repository, number, EVICTED_LABEL)?;
+            if let Some(child) = plan.child {
+                let desired = plan
+                    .child_base
+                    .as_ref()
+                    .expect("an eviction child has a desired base");
+                state.ensure_base(provider, &status.repository, child, desired)?;
+                if plan.creates_head {
+                    state.ensure_squash_auto_merge(provider, &status.repository, child)?;
+                } else {
+                    state.ensure_auto_merge_disabled(provider, &status.repository, child)?;
+                }
+            }
+        }
+        ReshapeOperation::Split => {
+            state.ensure_base(
+                provider,
+                &status.repository,
+                number,
+                &status.analysis.fleet.default_branch,
+            )?;
+            state.ensure_squash_auto_merge(provider, &status.repository, number)?;
+        }
+    }
+
+    Ok(ReshapeOutput {
+        operation,
+        pr: number,
+        reason,
+        receipt: state.receipt(),
+        provider_receipts: state.provider_receipts,
+        affected_prs: plan.affected_prs,
+        resulting_fleet: virtual_status.analysis.fleet,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct ReshapePlan {
+    child: Option<PrNumber>,
+    child_base: Option<BranchSnapshot>,
+    creates_head: bool,
+    affected_prs: Vec<PrNumber>,
+}
+
+fn plan_eviction(
+    status: &StatusOutput,
+    target: &PullRequestSnapshot,
+) -> Result<(StatusOutput, ReshapePlan), AppError> {
+    let active_caravan = status.analysis.fleet.containing(target.number);
+    let already_evicted = target.has_label(EVICTED_LABEL) && !target.has_label(ACTIVE_LABEL);
+    if active_caravan.is_none() && !already_evicted {
+        return Err(AppError::validation(
+            "eviction_pr_not_active",
+            format!(
+                "PR #{} is neither active nor a resumable evicted PR",
+                target.number
+            ),
+        ));
+    }
+
+    let (parent, child) = if let Some(caravan) = active_caravan {
+        let position = caravan
+            .position(target.number)
+            .expect("containing caravan has target");
+        (
+            position
+                .checked_sub(1)
+                .and_then(|index| caravan.members.get(index).copied()),
+            caravan.members.get(position + 1).copied(),
+        )
+    } else {
+        let parent = status
+            .analysis
+            .pull_requests
+            .values()
+            .find(|pull_request| pull_request.head.name == target.base.name)
+            .map(|pull_request| pull_request.number);
+        let child = status
+            .analysis
+            .pull_requests
+            .values()
+            .find(|pull_request| {
+                pull_request.is_active_caravan_member()
+                    && pull_request.base.name == target.head.name
+            })
+            .map(|pull_request| pull_request.number);
+        (parent, child)
+    };
+
+    let child_base = child.map(|_| {
+        parent.map_or_else(
+            || status.analysis.fleet.default_branch.clone(),
+            |parent| {
+                status
+                    .analysis
+                    .pull_requests
+                    .get(&parent)
+                    .expect("eviction parent has a snapshot")
+                    .head
+                    .clone()
+            },
+        )
+    });
+    let creates_head = child.is_some() && parent.is_none();
+    let mut pull_requests = status.analysis.pull_requests.clone();
+    let virtual_target = pull_requests
+        .get_mut(&target.number)
+        .expect("target is present");
+    virtual_target.auto_merge = AutoMergeState::disabled();
+    virtual_target.labels.remove(ACTIVE_LABEL);
+    virtual_target.labels.remove(FORCE_LABEL);
+    virtual_target.labels.insert(EVICTED_LABEL.to_owned());
+    if let (Some(child), Some(base)) = (child, &child_base) {
+        let virtual_child = pull_requests.get_mut(&child).expect("child is present");
+        virtual_child.base = base.clone();
+        virtual_child.auto_merge = if creates_head {
+            AutoMergeState::squash()
+        } else {
+            AutoMergeState::disabled()
+        };
+    }
+    let virtual_status = virtual_status(status, pull_requests);
+    let mut affected_prs = vec![target.number];
+    if let Some(child) = child {
+        affected_prs.push(child);
+    }
+    Ok((
+        virtual_status,
+        ReshapePlan {
+            child,
+            child_base,
+            creates_head,
+            affected_prs,
+        },
+    ))
+}
+
+fn plan_split(
+    status: &StatusOutput,
+    target: &PullRequestSnapshot,
+) -> Result<(StatusOutput, ReshapePlan), AppError> {
+    if !target.is_active_caravan_member() {
+        return Err(AppError::validation(
+            "split_pr_not_active",
+            format!("PR #{} is not an active caravan member", target.number),
+        ));
+    }
+    let caravan = status
+        .analysis
+        .fleet
+        .containing(target.number)
+        .expect("active target has a caravan");
+    let position = caravan
+        .position(target.number)
+        .expect("containing caravan has target");
+    if position == 0
+        && target.auto_merge.enabled
+        && target.auto_merge.merge_method == Some(MergeMethod::Squash)
+    {
+        return Err(AppError::validation(
+            "split_pr_is_head",
+            format!("PR #{} is already a caravan head", target.number),
+        ));
+    }
+    // A head missing squash auto-merge is treated as a resumable partial split:
+    // its base step already landed and only the second provider step remains.
+
+    let mut pull_requests = status.analysis.pull_requests.clone();
+    let virtual_target = pull_requests
+        .get_mut(&target.number)
+        .expect("target is present");
+    virtual_target.base = status.analysis.fleet.default_branch.clone();
+    virtual_target.auto_merge = AutoMergeState::squash();
+    Ok((
+        virtual_status(status, pull_requests),
+        ReshapePlan {
+            child: None,
+            child_base: None,
+            creates_head: true,
+            affected_prs: vec![target.number],
+        },
+    ))
+}
+
+fn virtual_status(
+    status: &StatusOutput,
+    pull_requests: BTreeMap<PrNumber, PullRequestSnapshot>,
+) -> StatusOutput {
+    let snapshot = RepositorySnapshot {
+        repository: status.repository.clone(),
+        default_branch: status.analysis.fleet.default_branch.clone(),
+        current_branch: status.current_branch.clone(),
+        current_pr: status.current_pr,
+        pull_requests: pull_requests.into_values().collect(),
+        observed_at: None,
+    };
+    StatusOutput {
+        repository: status.repository.clone(),
+        default_branch: status.default_branch.clone(),
+        current_branch: status.current_branch.clone(),
+        current_pr: status.current_pr,
+        healthy: false,
+        analysis: crate::graph::derive(&snapshot),
+    }
+}
+
+fn preflight_result(
+    status: &StatusOutput,
+    checker: &impl CompatibilityChecker,
+) -> Result<(), AppError> {
+    let snapshot = RepositorySnapshot {
+        repository: status.repository.clone(),
+        default_branch: status.analysis.fleet.default_branch.clone(),
+        current_branch: status.current_branch.clone(),
+        current_pr: status.current_pr,
+        pull_requests: status.analysis.pull_requests.values().cloned().collect(),
+        observed_at: None,
+    };
+    let analysis = analyze(&snapshot, checker)?;
+    if analysis.healthy() {
+        Ok(())
+    } else {
+        Err(AppError::structured(
+            ErrorCategory::Validation,
+            "reshape_would_break_fleet",
+            "the proposed reshape does not satisfy Caravan graph/compatibility invariants",
+            Some(json!({ "problems": analysis.fleet.problems })),
+        ))
+    }
+}
+
+fn preflight_new_head(
+    provider: &impl MembershipProvider,
+    status: &StatusOutput,
+) -> Result<(), AppError> {
+    if !provider
+        .repository_allows_auto_merge(&status.repository)
+        .map_err(|error| provider_error(&error, None))?
+    {
+        return Err(AppError::validation(
+            "auto_merge_not_enabled",
+            "repository settings do not permit auto-merge for the new head",
+        ));
+    }
+    if !provider
+        .branch_is_protected(&status.repository, &status.default_branch)
+        .map_err(|error| provider_error(&error, None))?
+    {
+        return Err(AppError::validation(
+            "default_branch_not_protected",
+            "the default branch must be protected before creating a new head",
+        ));
+    }
+    Ok(())
+}
+
+struct ReshapeState {
+    operation_id: OperationId,
+    operation: ReshapeOperation,
+    steps: Vec<MutationStep>,
+    provider_receipts: Vec<GitHubMutationReceipt>,
+    pull_requests: BTreeMap<PrNumber, PullRequestSnapshot>,
+}
+
+impl ReshapeState {
+    fn new(
+        operation: ReshapeOperation,
+        pull_requests: BTreeMap<PrNumber, PullRequestSnapshot>,
+    ) -> Self {
+        Self {
+            operation_id: OperationId::new(),
+            operation,
+            steps: Vec::new(),
+            provider_receipts: Vec::new(),
+            pull_requests,
+        }
+    }
+
+    fn receipt(&self) -> OperationReceipt {
+        OperationReceipt {
+            operation_id: self.operation_id.clone(),
+            operation: self.operation.name().to_owned(),
+            changed: self
+                .steps
+                .iter()
+                .any(|step| step.state == MutationStepState::Completed),
+            completed_steps: self.steps.clone(),
+        }
+    }
+
+    fn current(&self, number: PrNumber) -> &PullRequestSnapshot {
+        self.pull_requests
+            .get(&number)
+            .expect("reshape target is present")
+    }
+
+    fn precondition(&self, number: PrNumber) -> PullRequestPrecondition {
+        PullRequestPrecondition::from(self.current(number))
+    }
+
+    fn record(&mut self, receipt: GitHubMutationReceipt, summary: &str) {
+        let number = receipt.after.number;
+        self.pull_requests.insert(number, receipt.after.clone());
+        self.steps.push(MutationStep {
+            kind: receipt.kind,
+            state: MutationStepState::Completed,
+            pr: Some(number),
+            summary: summary.to_owned(),
+        });
+        self.provider_receipts.push(receipt);
+    }
+
+    fn already(&mut self, kind: MutationKind, number: PrNumber, summary: &str) {
+        self.steps.push(MutationStep {
+            kind,
+            state: MutationStepState::AlreadySatisfied,
+            pr: Some(number),
+            summary: summary.to_owned(),
+        });
+    }
+
+    fn ensure_base(
+        &mut self,
+        provider: &impl MembershipProvider,
+        repository: &crate::model::RepositoryId,
+        number: PrNumber,
+        base: &BranchSnapshot,
+    ) -> Result<(), AppError> {
+        if self.current(number).base.name == base.name {
+            self.already(MutationKind::SetBase, number, "required base already set");
+            return Ok(());
+        }
+        let receipt = provider
+            .set_base(repository, &self.precondition(number), &base.name)
+            .map_err(|error| provider_error(&error, Some(self)))?;
+        self.record(receipt, "changed PR base during reshape");
+        Ok(())
+    }
+
+    fn ensure_label_present(
+        &mut self,
+        provider: &impl MembershipProvider,
+        repository: &crate::model::RepositoryId,
+        number: PrNumber,
+        label: &str,
+    ) -> Result<(), AppError> {
+        if self.current(number).has_label(label) {
+            self.already(
+                MutationKind::AddLabel,
+                number,
+                "required label already present",
+            );
+            return Ok(());
+        }
+        let receipt = provider
+            .add_label(repository, &self.precondition(number), label)
+            .map_err(|error| provider_error(&error, Some(self)))?;
+        self.record(receipt, &format!("added label `{label}`"));
+        Ok(())
+    }
+
+    fn ensure_label_absent(
+        &mut self,
+        provider: &impl MembershipProvider,
+        repository: &crate::model::RepositoryId,
+        number: PrNumber,
+        label: &str,
+    ) -> Result<(), AppError> {
+        if !self.current(number).has_label(label) {
+            self.already(MutationKind::RemoveLabel, number, "label already absent");
+            return Ok(());
+        }
+        let receipt = provider
+            .remove_label(repository, &self.precondition(number), label)
+            .map_err(|error| provider_error(&error, Some(self)))?;
+        self.record(receipt, &format!("removed label `{label}`"));
+        Ok(())
+    }
+
+    fn ensure_squash_auto_merge(
+        &mut self,
+        provider: &impl MembershipProvider,
+        repository: &crate::model::RepositoryId,
+        number: PrNumber,
+    ) -> Result<(), AppError> {
+        let current = self.current(number);
+        if current.auto_merge.enabled
+            && current.auto_merge.merge_method == Some(MergeMethod::Squash)
+        {
+            self.already(
+                MutationKind::EnableAutoMerge,
+                number,
+                "squash auto-merge already enabled",
+            );
+            return Ok(());
+        }
+        let receipt = provider
+            .enable_squash_auto_merge(repository, &self.precondition(number))
+            .map_err(|error| provider_error(&error, Some(self)))?;
+        self.record(receipt, "enabled squash auto-merge on new head");
+        Ok(())
+    }
+
+    fn ensure_auto_merge_disabled(
+        &mut self,
+        provider: &impl MembershipProvider,
+        repository: &crate::model::RepositoryId,
+        number: PrNumber,
+    ) -> Result<(), AppError> {
+        if !self.current(number).auto_merge.enabled {
+            self.already(
+                MutationKind::DisableAutoMerge,
+                number,
+                "auto-merge already disabled",
+            );
+            return Ok(());
+        }
+        let receipt = provider
+            .disable_auto_merge(repository, &self.precondition(number))
+            .map_err(|error| provider_error(&error, Some(self)))?;
+        self.record(receipt, "disabled auto-merge during reshape");
+        Ok(())
+    }
+}
+
+fn provider_error(error: &MutationError, state: Option<&ReshapeState>) -> AppError {
+    let (category, code) = if matches!(error, MutationError::StalePrecondition { .. }) {
+        (ErrorCategory::Validation, "stale_precondition")
+    } else {
+        (ErrorCategory::ExecutionFailure, "github_mutation_failed")
+    };
+    AppError::structured(
+        category,
+        code,
+        error.to_string(),
+        Some(json!({
+            "error": format!("{error:?}"),
+            "operation_id": state.map(|state| &state.operation_id),
+            "completed_steps": state.map(|state| &state.steps),
+            "provider_receipts": state.map(|state| &state.provider_receipts),
+            "resumable": true,
+        })),
+    )
+}
+
+fn missing_pr(number: PrNumber) -> AppError {
+    AppError::structured(
+        ErrorCategory::TargetNotFound,
+        "reshape_pr_not_found",
+        format!("PR #{number} is missing from discovery"),
+        None,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::collections::BTreeSet;
+
+    use super::*;
+    use crate::graph::CompatibilityChecker;
+    use crate::model::{CommitOid, CompatibilityOutcome, CompatibilityReport, RepositoryId};
+
+    struct FakeProvider {
+        pull_requests: RefCell<BTreeMap<PrNumber, PullRequestSnapshot>>,
+    }
+
+    impl FakeProvider {
+        fn new(pull_requests: &[PullRequestSnapshot]) -> Self {
+            Self {
+                pull_requests: RefCell::new(
+                    pull_requests
+                        .iter()
+                        .cloned()
+                        .map(|pull_request| (pull_request.number, pull_request))
+                        .collect(),
+                ),
+            }
+        }
+
+        #[allow(clippy::unnecessary_wraps)]
+        fn mutate(
+            &self,
+            expected: &PullRequestPrecondition,
+            kind: MutationKind,
+            update: impl FnOnce(&mut PullRequestSnapshot),
+        ) -> Result<GitHubMutationReceipt, MutationError> {
+            let mut pulls = self.pull_requests.borrow_mut();
+            let current = pulls.get_mut(&expected.number).expect("fake PR");
+            assert_eq!(PullRequestPrecondition::from(&*current), *expected);
+            let before = current.clone();
+            update(current);
+            Ok(GitHubMutationReceipt {
+                kind,
+                before: Some(before),
+                after: current.clone(),
+                provider_output: None,
+            })
+        }
+    }
+
+    impl MembershipProvider for FakeProvider {
+        fn branch_is_protected(
+            &self,
+            _repository: &RepositoryId,
+            _branch: &str,
+        ) -> Result<bool, MutationError> {
+            Ok(true)
+        }
+
+        fn repository_allows_auto_merge(
+            &self,
+            _repository: &RepositoryId,
+        ) -> Result<bool, MutationError> {
+            Ok(true)
+        }
+
+        fn repository_labels(
+            &self,
+            _repository: &RepositoryId,
+        ) -> Result<BTreeSet<String>, MutationError> {
+            Ok([ACTIVE_LABEL, EVICTED_LABEL, FORCE_LABEL]
+                .into_iter()
+                .map(str::to_owned)
+                .collect())
+        }
+
+        fn create_pull_request(
+            &self,
+            _repository: &RepositoryId,
+            _input: &crate::github::CreatePullRequestInput,
+        ) -> Result<GitHubMutationReceipt, MutationError> {
+            unreachable!()
+        }
+
+        fn set_base(
+            &self,
+            _repository: &RepositoryId,
+            expected: &PullRequestPrecondition,
+            base: &str,
+        ) -> Result<GitHubMutationReceipt, MutationError> {
+            self.mutate(expected, MutationKind::SetBase, |pull_request| {
+                pull_request.base = branch(base, 99);
+            })
+        }
+
+        fn add_label(
+            &self,
+            _repository: &RepositoryId,
+            expected: &PullRequestPrecondition,
+            label: &str,
+        ) -> Result<GitHubMutationReceipt, MutationError> {
+            self.mutate(expected, MutationKind::AddLabel, |pull_request| {
+                pull_request.labels.insert(label.to_owned());
+            })
+        }
+
+        fn remove_label(
+            &self,
+            _repository: &RepositoryId,
+            expected: &PullRequestPrecondition,
+            label: &str,
+        ) -> Result<GitHubMutationReceipt, MutationError> {
+            self.mutate(expected, MutationKind::RemoveLabel, |pull_request| {
+                pull_request.labels.remove(label);
+            })
+        }
+
+        fn enable_squash_auto_merge(
+            &self,
+            _repository: &RepositoryId,
+            expected: &PullRequestPrecondition,
+        ) -> Result<GitHubMutationReceipt, MutationError> {
+            self.mutate(expected, MutationKind::EnableAutoMerge, |pull_request| {
+                pull_request.auto_merge = AutoMergeState::squash();
+            })
+        }
+
+        fn disable_auto_merge(
+            &self,
+            _repository: &RepositoryId,
+            expected: &PullRequestPrecondition,
+        ) -> Result<GitHubMutationReceipt, MutationError> {
+            self.mutate(expected, MutationKind::DisableAutoMerge, |pull_request| {
+                pull_request.auto_merge = AutoMergeState::disabled();
+            })
+        }
+    }
+
+    fn repository() -> RepositoryId {
+        RepositoryId {
+            owner: "harryaskham".to_owned(),
+            name: "caravan".to_owned(),
+        }
+    }
+
+    fn branch(name: &str, number: u64) -> BranchSnapshot {
+        BranchSnapshot {
+            repository: repository(),
+            name: name.to_owned(),
+            oid: CommitOid(format!("{number:040x}")),
+        }
+    }
+
+    fn pull_request(number: u64, base: &str) -> PullRequestSnapshot {
+        PullRequestSnapshot {
+            number: PrNumber(number),
+            title: format!("PR {number}"),
+            url: format!("https://example.invalid/{number}"),
+            state: PullRequestState::Open,
+            draft: false,
+            head: branch(&format!("pr-{number}"), number),
+            base: branch(base, 99),
+            cross_repository: false,
+            labels: BTreeSet::from([ACTIVE_LABEL.to_owned()]),
+            auto_merge: if base == "main" {
+                AutoMergeState::squash()
+            } else {
+                AutoMergeState::disabled()
+            },
+            checks: Vec::new(),
+            merged_at: None,
+            updated_at: None,
+        }
+    }
+
+    fn status(pulls: Vec<PullRequestSnapshot>) -> StatusOutput {
+        let snapshot = RepositorySnapshot {
+            repository: repository(),
+            default_branch: branch("main", 99),
+            current_branch: Some("fixture".to_owned()),
+            current_pr: pulls.first().map(|pull_request| pull_request.number),
+            pull_requests: pulls,
+            observed_at: None,
+        };
+        let analysis = crate::graph::analyze(&snapshot, &Clean).unwrap();
+        StatusOutput {
+            repository: repository(),
+            default_branch: "main".to_owned(),
+            current_branch: snapshot.current_branch,
+            current_pr: snapshot.current_pr,
+            healthy: analysis.healthy(),
+            analysis,
+        }
+    }
+
+    struct Clean;
+
+    impl CompatibilityChecker for Clean {
+        fn check(
+            &self,
+            candidate: &BranchSnapshot,
+            target: &BranchSnapshot,
+        ) -> Result<CompatibilityReport, AppError> {
+            Ok(CompatibilityReport {
+                candidate: candidate.clone(),
+                target: target.clone(),
+                outcome: CompatibilityOutcome::Clean,
+                conflicting_paths: Vec::new(),
+                diagnostic: None,
+            })
+        }
+    }
+
+    #[test]
+    fn evict_middle_retargets_child_and_marks_target() {
+        let pulls = vec![
+            pull_request(1, "main"),
+            pull_request(2, "pr-1"),
+            pull_request(3, "pr-2"),
+        ];
+        let provider = FakeProvider::new(&pulls);
+        let output = execute(
+            status(pulls),
+            &Clean,
+            &provider,
+            ReshapeOperation::Evict,
+            Some(PrNumber(2)),
+            Some("broken".to_owned()),
+        )
+        .unwrap();
+        let state = provider.pull_requests.borrow();
+        assert!(state[&PrNumber(2)].has_label(EVICTED_LABEL));
+        assert!(!state[&PrNumber(2)].has_label(ACTIVE_LABEL));
+        assert_eq!(state[&PrNumber(3)].base.name, "pr-1");
+        assert!(!state[&PrNumber(3)].auto_merge.enabled);
+        assert_eq!(output.affected_prs, vec![PrNumber(2), PrNumber(3)]);
+    }
+
+    #[test]
+    fn evict_head_promotes_child_with_squash_auto_merge() {
+        let pulls = vec![pull_request(1, "main"), pull_request(2, "pr-1")];
+        let provider = FakeProvider::new(&pulls);
+        execute(
+            status(pulls),
+            &Clean,
+            &provider,
+            ReshapeOperation::Evict,
+            Some(PrNumber(1)),
+            Some("head failed".to_owned()),
+        )
+        .unwrap();
+        let state = provider.pull_requests.borrow();
+        assert_eq!(state[&PrNumber(2)].base.name, "main");
+        assert_eq!(state[&PrNumber(2)].auto_merge, AutoMergeState::squash());
+    }
+
+    #[test]
+    fn evict_tail_needs_no_child_retarget() {
+        let pulls = vec![pull_request(1, "main"), pull_request(2, "pr-1")];
+        let provider = FakeProvider::new(&pulls);
+        let output = execute(
+            status(pulls),
+            &Clean,
+            &provider,
+            ReshapeOperation::Evict,
+            Some(PrNumber(2)),
+            Some("tail failed".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(output.affected_prs, vec![PrNumber(2)]);
+    }
+
+    #[test]
+    fn split_existing_healthy_head_is_rejected() {
+        let pulls = vec![pull_request(1, "main"), pull_request(2, "pr-1")];
+        let provider = FakeProvider::new(&pulls);
+        let error = execute(
+            status(pulls),
+            &Clean,
+            &provider,
+            ReshapeOperation::Split,
+            Some(PrNumber(1)),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(mcp_cli::StructuredError::code(&error), "split_pr_is_head");
+    }
+
+    #[test]
+    fn split_non_head_creates_second_healthy_caravan() {
+        let pulls = vec![
+            pull_request(1, "main"),
+            pull_request(2, "pr-1"),
+            pull_request(3, "pr-2"),
+        ];
+        let provider = FakeProvider::new(&pulls);
+        let output = execute(
+            status(pulls),
+            &Clean,
+            &provider,
+            ReshapeOperation::Split,
+            Some(PrNumber(2)),
+            None,
+        )
+        .unwrap();
+        let state = provider.pull_requests.borrow();
+        assert_eq!(state[&PrNumber(2)].base.name, "main");
+        assert_eq!(state[&PrNumber(2)].auto_merge, AutoMergeState::squash());
+        assert_eq!(output.resulting_fleet.caravans.len(), 2);
+    }
+
+    #[test]
+    fn incompatible_final_fleet_fails_before_provider_mutation() {
+        struct Conflict;
+        impl CompatibilityChecker for Conflict {
+            fn check(
+                &self,
+                candidate: &BranchSnapshot,
+                target: &BranchSnapshot,
+            ) -> Result<CompatibilityReport, AppError> {
+                Ok(CompatibilityReport {
+                    candidate: candidate.clone(),
+                    target: target.clone(),
+                    outcome: CompatibilityOutcome::Conflict,
+                    conflicting_paths: vec!["src/lib.rs".to_owned()],
+                    diagnostic: None,
+                })
+            }
+        }
+        let pulls = vec![pull_request(1, "main"), pull_request(2, "pr-1")];
+        let provider = FakeProvider::new(&pulls);
+        let error = execute(
+            status(pulls.clone()),
+            &Conflict,
+            &provider,
+            ReshapeOperation::Split,
+            Some(PrNumber(2)),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            mcp_cli::StructuredError::code(&error),
+            "reshape_would_break_fleet"
+        );
+        let state = provider.pull_requests.borrow();
+        assert_eq!(state[&PrNumber(2)].base.name, "pr-1");
+    }
+}

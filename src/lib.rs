@@ -14,6 +14,7 @@ pub mod membership;
 pub mod navigation;
 pub mod operation_lock;
 pub mod read;
+pub mod reshape;
 
 use clap::Args;
 use feedback_cli::{FeedbackConfig, Reporter};
@@ -397,12 +398,12 @@ pub fn build_router() -> ToolRouter<AppContext> {
     router.add_typed_tool_with_output_schema(
         "evict",
         "Evict a PR and safely close the graph gap when compatible; requires a reason and never bypasses textual conflicts.",
-        |_context: &AppContext, input: EvictInput| scaffold_operation("evict", &input),
+        |context: &AppContext, input: EvictInput| reshape::evict(context, &input),
     );
     router.add_typed_tool_with_output_schema(
         "split",
         "Split a caravan before the selected PR, which becomes a new head only if fleet invariants remain valid.",
-        |_context: &AppContext, input: SplitInput| scaffold_operation("split", &input),
+        |context: &AppContext, input: SplitInput| reshape::split(context, &input),
     );
     router.add_typed_tool_with_output_schema(
         "van_list",
