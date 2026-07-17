@@ -1,0 +1,42 @@
+[package]
+name = "caravan"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Agent-in-the-loop GitHub merge queue"
+repository = "https://github.com/harryaskham/caravan"
+readme = "README.md"
+publish = false
+
+[lib]
+name = "caravan"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cara"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+schemars = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# Ecosystem crates are public git dependencies. The flake pins the same repositories
+# as source inputs and rewrites these dependencies to exact local paths for Nix builds.
+mcp-cli = { git = "https://github.com/harryaskham/mcp-cli", branch = "main" }
+updatable-cli = { git = "https://github.com/harryaskham/updatable-cli", branch = "main" }
+feedback-cli = { git = "https://github.com/harryaskham/feedback-cli", branch = "main" }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+similar_names = "allow"

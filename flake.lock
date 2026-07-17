@@ -1,0 +1,115 @@
+{
+  "nodes": {
+    "feedback-cli": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1783002780,
+        "narHash": "sha256-Jy1IE1Kz9IGwW+FJP3ozKp5IaYr07AJOz/ErhRVuu18=",
+        "ref": "main",
+        "rev": "4991906eedade43006c92d14b8f746c4f40f5452",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/harryaskham/feedback-cli"
+      },
+      "original": {
+        "ref": "main",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/harryaskham/feedback-cli"
+      }
+    },
+    "flake-utils": {
+      "inputs": {
+        "systems": "systems"
+      },
+      "locked": {
+        "lastModified": 1731533236,
+        "narHash": "sha256-l0KFg5HjrsfsO/JpG+r7fRrqm12kzFHyUHqHCVpMMbI=",
+        "owner": "numtide",
+        "repo": "flake-utils",
+        "rev": "11707dc2f618dd54ca8739b309ec4fc024de578b",
+        "type": "github"
+      },
+      "original": {
+        "owner": "numtide",
+        "repo": "flake-utils",
+        "rev": "11707dc2f618dd54ca8739b309ec4fc024de578b",
+        "type": "github"
+      }
+    },
+    "mcp-cli": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1782762432,
+        "narHash": "sha256-xhzRIfhtbmQ7ZIcmD2bGFH0IaVnD4wMRpa8VzDjmlWU=",
+        "ref": "main",
+        "rev": "2e4efc172ed61cd861c228e99195c055ea7ff693",
+        "revCount": 25,
+        "type": "git",
+        "url": "https://github.com/harryaskham/mcp-cli"
+      },
+      "original": {
+        "ref": "main",
+        "type": "git",
+        "url": "https://github.com/harryaskham/mcp-cli"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1782767157,
+        "narHash": "sha256-db/8NgfehQlPNt8rMY0J1gvwzTaURU/foM7y/AQimIM=",
+        "rev": "1d4e0f865d68258aada31e68e6d79c8c463f3b34",
+        "revCount": 914302,
+        "type": "tarball",
+        "url": "https://api.flakehub.com/f/pinned/NixOS/nixpkgs/0.2511.914302%2Brev-1d4e0f865d68258aada31e68e6d79c8c463f3b34/019f1c78-b5ab-7af2-8516-c0d5406b0646/source.tar.gz"
+      },
+      "original": {
+        "type": "tarball",
+        "url": "https://api.flakehub.com/f/pinned/NixOS/nixpkgs/0.2511.914302%2Brev-1d4e0f865d68258aada31e68e6d79c8c463f3b34/019f1c78-b5ab-7af2-8516-c0d5406b0646/source.tar.gz"
+      }
+    },
+    "root": {
+      "inputs": {
+        "feedback-cli": "feedback-cli",
+        "flake-utils": "flake-utils",
+        "mcp-cli": "mcp-cli",
+        "nixpkgs": "nixpkgs",
+        "updatable-cli": "updatable-cli"
+      }
+    },
+    "systems": {
+      "locked": {
+        "lastModified": 1681028828,
+        "narHash": "sha256-Vy1rq5AaRuLzOxct8nz4T6wlgyUR7zLU309k9mBC768=",
+        "owner": "nix-systems",
+        "repo": "default",
+        "rev": "da67096a3b9bf56a91d16901293e51ba5b49a27e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nix-systems",
+        "repo": "default",
+        "type": "github"
+      }
+    },
+    "updatable-cli": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1783936292,
+        "narHash": "sha256-mvfK2m4+lw9M2nTEKSRJSAvTT3Yw/6GLNS7XisSJ70g=",
+        "ref": "main",
+        "rev": "98f35cdc07c085155746bf0d0981bb52930f8c90",
+        "revCount": 25,
+        "type": "git",
+        "url": "https://github.com/harryaskham/updatable-cli"
+      },
+      "original": {
+        "ref": "main",
+        "type": "git",
+        "url": "https://github.com/harryaskham/updatable-cli"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

@@ -1,0 +1,4 @@
+/target
+/.direnv
+/.caravan/*.local.yaml
+.DS_Store

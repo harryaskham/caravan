@@ -1,0 +1,5 @@
+version: 1
+force_merge: false
+loop:
+  interval_secs: 60
+hooks: {}
