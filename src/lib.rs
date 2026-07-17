@@ -283,6 +283,43 @@ pub struct LoopInput {
     pub once: bool,
 }
 
+fn default_lock_stale_after_secs() -> u64 {
+    operation_lock::DEFAULT_STALE_AFTER.as_secs()
+}
+
+/// Input for read-only operation-lock inspection.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Args)]
+pub struct LockStatusInput {
+    /// Age threshold used to classify a lock as stale.
+    #[arg(long, default_value_t = default_lock_stale_after_secs())]
+    #[serde(default = "default_lock_stale_after_secs")]
+    pub stale_after_secs: u64,
+}
+
+impl Default for LockStatusInput {
+    fn default() -> Self {
+        Self {
+            stale_after_secs: default_lock_stale_after_secs(),
+        }
+    }
+}
+
+/// Input for guarded stale operation-lock recovery.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Args)]
+pub struct LockRecoverInput {
+    /// Exact owner token copied from `cara lock status`.
+    #[arg(long)]
+    pub token: String,
+    /// Minimum lock age required before recovery.
+    #[arg(long, default_value_t = default_lock_stale_after_secs())]
+    #[serde(default = "default_lock_stale_after_secs")]
+    pub stale_after_secs: u64,
+    /// Explicit acknowledgement that this operation removes canonical lock state.
+    #[arg(long)]
+    #[serde(default)]
+    pub confirm: bool,
+}
+
 /// Placeholder success shape for domain operations.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct OperationOutput {
@@ -438,6 +475,33 @@ pub fn build_router() -> ToolRouter<AppContext> {
                 context,
                 navigation::Scope::Fleet,
                 navigation::Direction::Previous,
+            )
+        },
+    );
+    router.add_typed_tool_with_output_schema(
+        "lock_status",
+        "Inspect Caravan's repository operation lock, including age, owner token, stale classification, and verified PID liveness. Read-only.",
+        |context: &AppContext, input: LockStatusInput| {
+            operation_lock::inspect_lock(
+                &context.repository_path,
+                std::time::Duration::from_secs(input.stale_after_secs),
+            )
+        },
+    );
+    router.add_typed_tool_with_output_schema(
+        "lock_recover",
+        "Remove one verified-stale Caravan operation lock only after explicit confirmation, minimum age, dead-owner proof, and exact token revalidation.",
+        |context: &AppContext, input: LockRecoverInput| {
+            if !input.confirm {
+                return Err(AppError::validation(
+                    "operation_lock_recovery_confirmation_required",
+                    "set confirm=true only after reviewing lock_status evidence",
+                ));
+            }
+            operation_lock::recover_stale_lock(
+                &context.repository_path,
+                std::time::Duration::from_secs(input.stale_after_secs),
+                &input.token,
             )
         },
     );

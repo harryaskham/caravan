@@ -484,6 +484,9 @@ mod tests {
         assert_eq!(command.program, "sh");
         assert_eq!(timeout_ms, 100);
         assert_eq!(stdout, "started");
-        assert_eq!(stderr, "diagnostic");
+        assert!(
+            stderr.starts_with("diagnostic"),
+            "the child's diagnostic must be preserved before any platform shell termination text: {stderr:?}"
+        );
     }
 }

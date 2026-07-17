@@ -41,6 +41,31 @@ pub struct OperationLockOwner {
     pub token: String,
 }
 
+/// Read-only lock inspection returned by CLI and MCP.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct OperationLockStatus {
+    pub path: String,
+    pub present: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<OperationLockOwner>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_alive: Option<bool>,
+    pub stale_after_secs: u64,
+    pub stale: bool,
+}
+
+/// Receipt from guarded stale-lock recovery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct OperationLockRecovery {
+    pub path: String,
+    pub removed_owner: OperationLockOwner,
+    pub age_secs: u64,
+    pub owner_alive: bool,
+    pub token_verified: bool,
+}
+
 /// Guard for one repository's mutating Caravan operation.
 #[derive(Debug)]
 pub struct OperationLock {
@@ -220,6 +245,153 @@ impl Drop for OperationLock {
     }
 }
 
+/// Inspect the repository operation lock and verify whether its owner PID is alive.
+pub fn inspect_lock(
+    repository: impl AsRef<Path>,
+    stale_after: Duration,
+) -> Result<OperationLockStatus, AppError> {
+    let path = lock_path(repository.as_ref())?;
+    let stale_after_secs = stale_after.as_secs();
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(OperationLockStatus {
+                path: path.display().to_string(),
+                present: false,
+                owner: None,
+                age_secs: None,
+                owner_alive: None,
+                stale_after_secs,
+                stale: false,
+            });
+        }
+        Err(error) => {
+            return Err(lock_io_error(
+                "operation_lock_inspection_failed",
+                "could not inspect the operation lock",
+                &path,
+                &error,
+            ));
+        }
+    };
+    let owner = read_owner(&path).map_err(|error| {
+        lock_io_error(
+            "operation_lock_owner_invalid",
+            "could not read operation lock owner evidence",
+            &path,
+            &error,
+        )
+    })?;
+    let age_secs = lock_age_secs(&metadata, &owner);
+    let owner_alive = process_is_alive(owner.pid)?;
+    Ok(OperationLockStatus {
+        path: path.display().to_string(),
+        present: true,
+        owner: Some(owner),
+        age_secs: Some(age_secs),
+        owner_alive: Some(owner_alive),
+        stale_after_secs,
+        stale: age_secs >= stale_after_secs,
+    })
+}
+
+/// Remove one operation lock only after age, dead-owner, and exact-token checks.
+pub fn recover_stale_lock(
+    repository: impl AsRef<Path>,
+    stale_after: Duration,
+    expected_token: &str,
+) -> Result<OperationLockRecovery, AppError> {
+    if expected_token.trim().is_empty() {
+        return Err(AppError::validation(
+            "operation_lock_token_required",
+            "recovery requires the exact token returned by `cara lock status`",
+        ));
+    }
+    let repository = repository.as_ref();
+    let status = inspect_lock(repository, stale_after)?;
+    if !status.present {
+        return Err(AppError::structured(
+            ErrorCategory::TargetNotFound,
+            "operation_lock_not_found",
+            "there is no Caravan operation lock to recover",
+            Some(json!({ "path": status.path })),
+        ));
+    }
+    let owner = status.owner.expect("present lock has owner evidence");
+    let age_secs = status.age_secs.expect("present lock has age");
+    if owner.token != expected_token {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "operation_lock_token_mismatch",
+            "the supplied recovery token does not match the current lock owner",
+            Some(json!({ "expected_token": expected_token, "actual_owner": owner })),
+        ));
+    }
+    if !status.stale {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "operation_lock_not_stale",
+            "the operation lock has not reached the required recovery age",
+            Some(json!({
+                "age_secs": age_secs,
+                "stale_after_secs": stale_after.as_secs(),
+                "owner": owner,
+            })),
+        ));
+    }
+    if status.owner_alive == Some(true) {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "operation_lock_owner_alive",
+            "refusing to recover an operation lock whose recorded PID is alive",
+            Some(json!({ "owner": owner })),
+        ));
+    }
+
+    // Re-read immediately before unlinking. A changed owner/token means another
+    // recovery or operation won the race; fail closed and delete nothing.
+    let path = lock_path(repository)?;
+    let latest = read_owner(&path).map_err(|error| {
+        lock_io_error(
+            "operation_lock_recovery_inspection_failed",
+            "could not re-read owner evidence before recovery",
+            &path,
+            &error,
+        )
+    })?;
+    if latest != owner || latest.token != expected_token {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "operation_lock_owner_changed",
+            "operation lock ownership changed during recovery; refusing removal",
+            Some(json!({ "inspected_owner": owner, "latest_owner": latest })),
+        ));
+    }
+    if process_is_alive(latest.pid)? {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "operation_lock_owner_alive",
+            "the recorded PID became live during recovery; refusing removal",
+            Some(json!({ "owner": latest })),
+        ));
+    }
+    fs::remove_file(&path).map_err(|error| {
+        lock_io_error(
+            "operation_lock_recovery_failed",
+            "could not remove the verified-stale operation lock",
+            &path,
+            &error,
+        )
+    })?;
+    Ok(OperationLockRecovery {
+        path: path.display().to_string(),
+        removed_owner: latest,
+        age_secs,
+        owner_alive: false,
+        token_verified: true,
+    })
+}
+
 fn lock_path(repository: &Path) -> Result<PathBuf, AppError> {
     let request =
         CommandSpec::new("git").args(["rev-parse", "--path-format=absolute", "--git-common-dir"]);
@@ -293,6 +465,67 @@ fn new_owner(operation: &str) -> OperationLockOwner {
         created_unix_secs: created.as_secs(),
         token: format!("{}-{}-{sequence}", std::process::id(), created.as_nanos()),
     }
+}
+
+fn lock_age_secs(metadata: &fs::Metadata, owner: &OperationLockOwner) -> u64 {
+    let wall_age = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|now| now.as_secs().saturating_sub(owner.created_unix_secs));
+    wall_age.unwrap_or_else(|| {
+        metadata
+            .modified()
+            .ok()
+            .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+            .unwrap_or_default()
+            .as_secs()
+    })
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> Result<bool, AppError> {
+    let request = CommandSpec::new("ps").args(["-p", &pid.to_string(), "-o", "pid="]);
+    let output = ProcessRunner::new()
+        .with_timeout(Duration::from_secs(5))
+        .run(&request)
+        .map_err(|error| lock_command_error(&error, Path::new(".")))?;
+    match output.code {
+        Some(0) => Ok(output
+            .stdout
+            .split_whitespace()
+            .any(|value| value == pid.to_string())),
+        Some(1) => Ok(false),
+        _ => Err(AppError::structured(
+            ErrorCategory::ExecutionFailure,
+            "operation_lock_process_probe_failed",
+            "could not determine whether the operation lock owner PID is alive",
+            Some(json!({
+                "pid": pid,
+                "exit_code": output.code,
+                "stdout": bounded_text(&output.stdout),
+                "stderr": bounded_text(&output.stderr),
+            })),
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn process_is_alive(pid: u32) -> Result<bool, AppError> {
+    let filter = format!("PID eq {pid}");
+    let request = CommandSpec::new("tasklist").args(["/FI", &filter, "/FO", "CSV", "/NH"]);
+    let output = ProcessRunner::new()
+        .with_timeout(Duration::from_secs(5))
+        .run(&request)
+        .map_err(|error| lock_command_error(&error, Path::new(".")))?;
+    if !output.is_success() {
+        return Err(AppError::structured(
+            ErrorCategory::ExecutionFailure,
+            "operation_lock_process_probe_failed",
+            "could not determine whether the operation lock owner PID is alive",
+            Some(json!({ "pid": pid, "stderr": bounded_text(&output.stderr) })),
+        ));
+    }
+    Ok(output.stdout.contains(&pid.to_string()))
 }
 
 fn existing_lock_error(path: &Path, stale_after: Duration) -> Result<AppError, io::Error> {
@@ -411,6 +644,61 @@ mod tests {
         assert_eq!(error.code(), "stale_operation_lock");
         assert!(path.exists(), "stale classification must not reap the lock");
         first.release().expect("owner still releases its own lock");
+    }
+
+    #[test]
+    fn status_reports_absent_and_live_owner_without_mutation() {
+        let repository = test_repository();
+        let absent = inspect_lock(repository.path(), DEFAULT_STALE_AFTER).unwrap();
+        assert!(!absent.present);
+
+        let lock = OperationLock::acquire(repository.path(), "sync").unwrap();
+        let status = inspect_lock(repository.path(), Duration::ZERO).unwrap();
+        assert!(status.present);
+        assert!(status.stale);
+        assert_eq!(status.owner_alive, Some(true));
+        assert_eq!(status.owner.as_ref().unwrap().token, lock.owner().token);
+
+        let error = recover_stale_lock(repository.path(), Duration::ZERO, &lock.owner().token)
+            .expect_err("a live owner must never be reaped");
+        assert_eq!(error.code(), "operation_lock_owner_alive");
+        assert!(lock.path().exists());
+        lock.release().unwrap();
+    }
+
+    #[test]
+    fn recovery_requires_dead_old_owner_and_exact_token() {
+        let repository = test_repository();
+        let path = lock_path(repository.path()).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let owner = OperationLockOwner {
+            version: 1,
+            pid: 999_999,
+            operation: "split".to_owned(),
+            created_unix_secs: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                .saturating_sub(3_600),
+            token: "dead-owner-token".to_owned(),
+        };
+        fs::write(&path, serde_json::to_vec(&owner).unwrap()).unwrap();
+
+        let status = inspect_lock(repository.path(), Duration::from_secs(1_800)).unwrap();
+        assert!(status.stale);
+        assert_eq!(status.owner_alive, Some(false));
+        let wrong = recover_stale_lock(repository.path(), Duration::ZERO, "wrong-token")
+            .expect_err("wrong token must fail closed");
+        assert_eq!(wrong.code(), "operation_lock_token_mismatch");
+        assert!(path.exists());
+
+        let receipt =
+            recover_stale_lock(repository.path(), Duration::from_secs(1_800), &owner.token)
+                .unwrap();
+        assert_eq!(receipt.removed_owner, owner);
+        assert!(receipt.token_verified);
+        assert!(!receipt.owner_alive);
+        assert!(!path.exists());
     }
 
     #[test]

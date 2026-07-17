@@ -5,9 +5,9 @@ use std::io;
 use std::path::PathBuf;
 
 use caravan::{
-    AGENT_HELP, AppContext, AppError, CheckInput, CreateInput, EvictInput, JoinInput, LoopInput,
-    SplitInput, SyncInput, TOOL_NAME, build_router, feedback_config, feedback_destination,
-    updater_config,
+    AGENT_HELP, AppContext, AppError, CheckInput, CreateInput, EvictInput, JoinInput,
+    LockRecoverInput, LockStatusInput, LoopInput, SplitInput, SyncInput, TOOL_NAME, build_router,
+    feedback_config, feedback_destination, updater_config,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use feedback_cli::{FeedbackEvent, FeedbackKind, Reporter, Severity};
@@ -64,6 +64,9 @@ enum Command {
     Split(SplitInput),
     /// Repeatedly run lightweight sync-all ticks in the foreground.
     Loop(LoopInput),
+    /// Inspect or recover the repository operation lock.
+    #[command(subcommand)]
+    Lock(LockCommand),
     /// Fleet-level caravan browsing operations.
     #[command(subcommand)]
     Van(VanCommand),
@@ -88,6 +91,14 @@ enum VanCommand {
     Next,
     /// Check out the previous caravan head.
     Prev,
+}
+
+#[derive(Debug, Subcommand)]
+enum LockCommand {
+    /// Inspect lock owner, age, stale state, token, and PID liveness.
+    Status(LockStatusInput),
+    /// Remove only a verified-stale lock after explicit confirmation.
+    Recover(LockRecoverInput),
 }
 
 #[derive(Debug, Subcommand)]
@@ -217,6 +228,7 @@ fn run(cli: &Cli) -> Result<(), i32> {
         Command::Evict(input) => run_evict(cli, input),
         Command::Split(input) => run_split(cli, input),
         Command::Loop(input) => run_loop(cli, input),
+        Command::Lock(command) => run_lock(cli, command),
         Command::Van(command) => match command {
             VanCommand::List => run_van_list(cli),
             VanCommand::Next => run_navigation(
@@ -319,6 +331,34 @@ fn run_sync(cli: &Cli, input: &SyncInput) -> Result<(), i32> {
             Ok(())
         }
         Err(error) => emit_human_error(error),
+    }
+}
+
+fn run_lock(cli: &Cli, command: &LockCommand) -> Result<(), i32> {
+    let context = load_context(cli)?;
+    match command {
+        LockCommand::Status(input) => emit_result(
+            cli.json,
+            caravan::operation_lock::inspect_lock(
+                &context.repository_path,
+                std::time::Duration::from_secs(input.stale_after_secs),
+            ),
+        ),
+        LockCommand::Recover(input) => {
+            let result = if input.confirm {
+                caravan::operation_lock::recover_stale_lock(
+                    &context.repository_path,
+                    std::time::Duration::from_secs(input.stale_after_secs),
+                    &input.token,
+                )
+            } else {
+                Err(AppError::validation(
+                    "operation_lock_recovery_confirmation_required",
+                    "pass --confirm only after reviewing `cara lock status` evidence",
+                ))
+            };
+            emit_result(cli.json, result)
+        }
     }
 }
 
