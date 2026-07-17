@@ -147,12 +147,16 @@ pub fn events_from_error(error: &AppError) -> Vec<CaravanEvent> {
         return Vec::new();
     };
     let mut values = Vec::new();
+    let decision_evidence = details
+        .get("decision")
+        .and_then(|decision| decision.get("evidence"));
+    if let Some(event) = decision_evidence.and_then(|evidence| evidence.get("event")) {
+        values.push(event.clone());
+    }
     if let Some(events) = details.get("events").and_then(serde_json::Value::as_array) {
         values.extend(events.iter().cloned());
     }
-    if let Some(events) = details
-        .get("decision")
-        .and_then(|decision| decision.get("evidence"))
+    if let Some(events) = decision_evidence
         .and_then(|evidence| evidence.get("events"))
         .and_then(serde_json::Value::as_array)
     {
@@ -375,7 +379,24 @@ mod tests {
     }
 
     #[test]
-    fn error_event_extraction_preserves_ids_and_deduplicates() {
+    fn error_event_extraction_reads_singular_decision_event_with_exact_ids() {
+        let event = event(EventKind::CiFailed);
+        let error = AppError::structured(
+            ErrorCategory::Validation,
+            "ci_failure",
+            "failed",
+            Some(json!({
+                "decision": {"evidence": {"event": event.clone()}},
+            })),
+        );
+
+        let extracted = events_from_error(&error);
+
+        assert_eq!(extracted, vec![event]);
+    }
+
+    #[test]
+    fn error_event_extraction_deduplicates_singular_and_array_forms() {
         let event = event(EventKind::CiFailed);
         let error = AppError::structured(
             ErrorCategory::Validation,
@@ -383,13 +404,52 @@ mod tests {
             "failed",
             Some(json!({
                 "events": [event.clone()],
-                "decision": {"evidence": {"events": [event.clone()]}},
+                "decision": {"evidence": {
+                    "event": event.clone(),
+                    "events": [event.clone()],
+                }},
             })),
         );
 
         let extracted = events_from_error(&error);
 
         assert_eq!(extracted, vec![event]);
+    }
+
+    #[test]
+    fn singular_ci_decision_dispatches_ci_failed_once() {
+        let repository = tempfile::tempdir().unwrap();
+        let event_path = repository.path().join("events.txt");
+        let hook = HookConfig {
+            command: format!(
+                "printf '%s|%s|%s\\n' \"$CARA_EVENT\" \"$CARA_EVENT_ID\" \"$CARA_OPERATION_ID\" >> '{}'",
+                event_path.display()
+            ),
+            timeout_secs: 5,
+            blocking: true,
+        };
+        let mut context = context(repository.path(), hook.clone());
+        context.config.hooks.insert(EventKind::CiFailed, hook);
+        let event = event(EventKind::CiFailed);
+        let error = AppError::structured(
+            ErrorCategory::Validation,
+            "ci_failure",
+            "failed",
+            Some(json!({
+                "decision": {"evidence": {"event": event.clone()}},
+            })),
+        );
+
+        let extracted = events_from_error(&error);
+        let deliveries = dispatch_events(&context, &extracted).unwrap();
+
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].kind, EventKind::CiFailed);
+        assert_eq!(deliveries[0].event_id, event.event_id);
+        assert_eq!(
+            fs::read_to_string(event_path).unwrap(),
+            format!("ci_failed|{}|{}\n", event.event_id.0, event.operation_id.0)
+        );
     }
 
     #[test]
