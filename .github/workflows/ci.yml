@@ -12,12 +12,18 @@ concurrency:
 
 jobs:
   build-test:
-    # Release milestones exercise the same Nix-capable architecture fleet as
-    # sibling projects; runners are registered out of band by the operator.
-    runs-on: [self-hosted, azure-ephemeral]
+    # This disposable branch alone uses a hosted runner so rerun policy can be
+    # accepted before the operator registers the release runner fleet.
+    runs-on: ${{ startsWith(github.head_ref, 'dogfood/cara-v1-ci-rerun-fixture') && fromJSON('["ubuntu-latest"]') || fromJSON('["self-hosted","azure-ephemeral"]') }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+
+      - name: Intentional disposable CI failure for Caravan rerun acceptance
+        if: startsWith(github.head_ref, 'dogfood/cara-v1-ci-rerun-fixture')
+        run: |
+          echo 'bd-322e38 intentional CI failure; this branch is never merged'
+          exit 1
 
       - name: Use anonymous HTTPS for public ecosystem crates
         shell: bash
