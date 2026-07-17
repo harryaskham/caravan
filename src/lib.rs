@@ -6,7 +6,9 @@
 
 use std::path::PathBuf;
 
+pub mod command;
 pub mod compatibility;
+pub mod github;
 pub mod operation_lock;
 
 use clap::Args;
