@@ -9,7 +9,9 @@ use std::path::PathBuf;
 pub mod command;
 pub mod compatibility;
 pub mod github;
+pub mod graph;
 pub mod operation_lock;
+pub mod read;
 
 use clap::Args;
 use feedback_cli::{FeedbackConfig, Reporter};
@@ -130,6 +132,8 @@ impl StructuredError for AppError {
 /// Context shared by MCP tools.
 #[derive(Debug, Clone)]
 pub struct AppContext {
+    /// Repository/worktree used by Git, GitHub, and compatibility adapters.
+    pub repository_path: PathBuf,
     /// Resolved `.caravan/config.yaml` path (or explicit override).
     pub config_path: PathBuf,
     /// Whether the resolved file existed; absent defaults remain visible.
@@ -143,6 +147,7 @@ impl AppContext {
     pub fn load(path: Option<&std::path::Path>) -> Result<Self, ConfigError> {
         let loaded = CaravanConfig::load_or_default(path)?;
         Ok(Self {
+            repository_path: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             config_path: loaded.path,
             config_existed: loaded.existed,
             config: loaded.config,
@@ -153,6 +158,7 @@ impl AppContext {
 impl Default for AppContext {
     fn default() -> Self {
         Self {
+            repository_path: PathBuf::from("."),
             config_path: PathBuf::from(config::DEFAULT_CONFIG_PATH),
             config_existed: false,
             config: CaravanConfig::default(),
@@ -309,11 +315,6 @@ fn validate_target(tail_pr: Option<u64>, head_pr: Option<u64>) -> Result<(), App
     Ok(())
 }
 
-fn check(input: &CheckInput) -> Result<OperationOutput, AppError> {
-    validate_target(input.tail_pr, input.head_pr)?;
-    scaffold_operation("check", input)
-}
-
 fn join(operation: &str, input: &JoinInput) -> Result<OperationOutput, AppError> {
     validate_target(input.tail_pr, input.head_pr)?;
     scaffold_operation(operation, input)
@@ -332,12 +333,12 @@ pub fn build_router() -> ToolRouter<AppContext> {
     router.add_typed_tool_with_output_schema(
         "status",
         "Discover the current repository, current PR, every caravan, invalid graph fragments, and unresolved decision points. Read-only.",
-        |_context: &AppContext, input: EmptyInput| scaffold_operation("status", &input),
+        |context: &AppContext, _input: EmptyInput| read::status(context),
     );
     router.add_typed_tool_with_output_schema(
         "check",
         "Validate the current PR/caravan without mutation. Optionally test joining --tail-pr or the resolved tail of --head-pr.",
-        |_context: &AppContext, input: CheckInput| check(&input),
+        |context: &AppContext, input: CheckInput| read::check(context, &input),
     );
     router.add_typed_tool_with_output_schema(
         "new",
@@ -362,7 +363,7 @@ pub fn build_router() -> ToolRouter<AppContext> {
     router.add_typed_tool_with_output_schema(
         "show",
         "Show the current branch's complete caravan and highlighted position. Read-only.",
-        |_context: &AppContext, input: EmptyInput| scaffold_operation("show", &input),
+        |context: &AppContext, _input: EmptyInput| read::show(context),
     );
     router.add_typed_tool_with_output_schema(
         "next",
@@ -453,11 +454,8 @@ mod tests {
 
     #[test]
     fn target_forms_are_mutually_exclusive_even_over_mcp() {
-        let error = check(&CheckInput {
-            tail_pr: Some(10),
-            head_pr: Some(20),
-        })
-        .expect_err("both target forms must be rejected");
+        let error =
+            validate_target(Some(10), Some(20)).expect_err("both target forms must be rejected");
         assert_eq!(error.code(), "ambiguous_target");
     }
 

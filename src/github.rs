@@ -672,6 +672,13 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
             &repository,
         )?;
         validate_active_heads(&repository, &open_labeled_prs)?;
+        // Status and ready-PR hooks need every open PR, not only members that
+        // already carry the active label. The labelled query remains separate
+        // so active-member bounds and fork validation stay explicit.
+        let all_open_prs = self.pull_requests(
+            open_pr_command(&repository.slug(), self.options.open_limit),
+            &repository,
+        )?;
         let recently_merged_labeled_prs = self.pull_requests(
             labeled_pr_command(
                 &repository.slug(),
@@ -685,8 +692,9 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
 
         let current_pr_number = current_pr.as_ref().map(|pr| pr.number);
         let mut pull_requests = BTreeMap::new();
-        for pull_request in open_labeled_prs
+        for pull_request in all_open_prs
             .into_iter()
+            .chain(open_labeled_prs)
             .chain(recently_merged_labeled_prs)
             .chain(current_pr)
         {
@@ -814,6 +822,21 @@ fn current_pr_command(repository: &str, branch: &str) -> CommandSpec {
         "2",
         "--json",
         PR_JSON_FIELDS,
+    ])
+}
+
+fn open_pr_command(repository: &str, limit: usize) -> CommandSpec {
+    CommandSpec::new("gh").args([
+        "pr".to_owned(),
+        "list".to_owned(),
+        "--repo".to_owned(),
+        repository.to_owned(),
+        "--state".to_owned(),
+        "open".to_owned(),
+        "--limit".to_owned(),
+        limit.to_string(),
+        "--json".to_owned(),
+        PR_JSON_FIELDS.to_owned(),
     ])
 }
 
@@ -1062,6 +1085,7 @@ struct PullRequestJson {
     number: u64,
     title: String,
     state: ProviderPullRequestState,
+    is_draft: bool,
     head_ref_name: String,
     head_ref_oid: String,
     head_repository: Option<HeadRepositoryJson>,
@@ -1117,6 +1141,7 @@ impl PullRequestJson {
             title: self.title,
             url: self.url,
             state: self.state.into(),
+            draft: self.is_draft,
             head: BranchSnapshot {
                 repository: head_repository,
                 name: self.head_ref_name,
@@ -1281,6 +1306,10 @@ mod tests {
                 CommandOutput::success(open_prs),
             ),
             (
+                open_pr_command("acme/widgets", 1_000),
+                CommandOutput::success(open_prs),
+            ),
+            (
                 labeled_pr_command("acme/widgets", "merged", "caravan", 100, true),
                 CommandOutput::success(merged_pr_json()),
             ),
@@ -1377,7 +1406,8 @@ mod tests {
     fn rejects_fork_only_active_caravan_heads() {
         let fork_prs = pr_list_json(14, "fork-feature", "someone/widgets", true);
         let mut calls = successful_discovery_calls(&fork_prs);
-        calls.pop(); // active-head validation stops before merged-history discovery
+        calls.pop(); // merged-history query
+        calls.pop(); // all-open query; active-head validation stops before both
         let runner = FakeRunner::new(calls);
         let discovery = GitHubDiscovery::new(runner);
 
@@ -1412,6 +1442,10 @@ mod tests {
             ),
             (
                 labeled_pr_command("acme/widgets", "open", "caravan", 1_000, false),
+                CommandOutput::success("[]"),
+            ),
+            (
+                open_pr_command("acme/widgets", 1_000),
                 CommandOutput::success("[]"),
             ),
             (

@@ -146,6 +146,8 @@ pub struct PullRequestSnapshot {
     pub title: String,
     pub url: String,
     pub state: PullRequestState,
+    #[serde(default)]
+    pub draft: bool,
     pub head: BranchSnapshot,
     pub base: BranchSnapshot,
     pub cross_repository: bool,
@@ -222,7 +224,9 @@ impl Caravan {
 }
 
 /// Structural/fleet problem classes returned by graph validation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum GraphProblemKind {
     MissingHead,
@@ -233,6 +237,7 @@ pub enum GraphProblemKind {
     ActiveAndEvicted,
     DuplicateMember,
     ForkOnlyPredecessor,
+    AutoMergeInvariant,
     Incompatible,
     Unknown,
 }
@@ -519,6 +524,7 @@ mod tests {
             title: "A queue change".to_owned(),
             url: "https://example.invalid/pull/42".to_owned(),
             state: PullRequestState::Open,
+            draft: false,
             head: branch("feature", "abc"),
             base: branch("main", "def"),
             cross_repository: false,

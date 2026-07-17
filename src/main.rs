@@ -1,5 +1,6 @@
 //! `cara` command-line entry point.
 
+use std::fmt::Write as _;
 use std::io;
 use std::path::PathBuf;
 
@@ -187,13 +188,13 @@ fn main() {
 
 fn run(cli: &Cli) -> Result<(), i32> {
     match &cli.command {
-        Command::Status => run_domain(cli.json, "status", &EmptyInput::default()),
-        Command::Check(input) => run_domain(cli.json, "check", input),
+        Command::Status => run_status(cli),
+        Command::Check(input) => run_check(cli, input),
         Command::New(input) => run_domain(cli.json, "new", input),
         Command::Renew(input) => run_domain(cli.json, "renew", input),
         Command::Join(input) => run_domain(cli.json, "join", input),
         Command::Rejoin(input) => run_domain(cli.json, "rejoin", input),
-        Command::Show => run_domain(cli.json, "show", &EmptyInput::default()),
+        Command::Show => run_show(cli),
         Command::Next => run_domain(cli.json, "next", &EmptyInput::default()),
         Command::Prev => run_domain(cli.json, "prev", &EmptyInput::default()),
         Command::Sync(input) => run_domain(cli.json, "sync", input),
@@ -210,6 +211,168 @@ fn run(cli: &Cli) -> Result<(), i32> {
         Command::SelfUpdate(command) => run_self_update(cli.json, command),
         Command::Feedback(command) => run_feedback(cli.json, command),
     }
+}
+
+fn load_context(cli: &Cli) -> Result<AppContext, i32> {
+    AppContext::load(cli.config.as_deref()).map_err(|error| {
+        eprintln!("cara: {error}");
+        2
+    })
+}
+
+fn run_status(cli: &Cli) -> Result<(), i32> {
+    let context = load_context(cli)?;
+    let result = caravan::read::status(&context);
+    if cli.json {
+        return emit_result(true, result);
+    }
+    match result {
+        Ok(output) => {
+            print!("{}", render_status(&output));
+            Ok(())
+        }
+        Err(error) => emit_human_error(error),
+    }
+}
+
+fn run_check(cli: &Cli, input: &CheckInput) -> Result<(), i32> {
+    let context = load_context(cli)?;
+    let result = caravan::read::check(&context, input);
+    if cli.json {
+        return emit_result(true, result);
+    }
+    match result {
+        Ok(output) => {
+            print!("{}", render_check(&output));
+            Ok(())
+        }
+        Err(error) => emit_human_error(error),
+    }
+}
+
+fn run_show(cli: &Cli) -> Result<(), i32> {
+    let context = load_context(cli)?;
+    let result = caravan::read::show(&context);
+    if cli.json {
+        return emit_result(true, result);
+    }
+    match result {
+        Ok(output) => {
+            print!("{}", render_show(&output));
+            Ok(())
+        }
+        Err(error) => emit_human_error(error),
+    }
+}
+
+fn render_status(output: &caravan::read::StatusOutput) -> String {
+    let mut text = String::new();
+    let _ = writeln!(
+        text,
+        "{} @ {} — {}",
+        output.repository,
+        output.default_branch,
+        if output.healthy {
+            "healthy"
+        } else {
+            "needs attention"
+        }
+    );
+    let current = output
+        .current_pr
+        .map_or_else(|| "no open PR".to_owned(), |number| format!("PR #{number}"));
+    let _ = writeln!(
+        text,
+        "current: {} ({current})",
+        output.current_branch.as_deref().unwrap_or("detached HEAD")
+    );
+    let _ = writeln!(text, "caravans: {}", output.analysis.fleet.caravans.len());
+    for caravan in &output.analysis.fleet.caravans {
+        let chain = caravan
+            .members
+            .iter()
+            .map(|number| format!("#{number}"))
+            .collect::<Vec<_>>()
+            .join(" -> ");
+        let _ = writeln!(text, "  #{}: {chain}", caravan.id);
+    }
+    if !output.analysis.fleet.unqueued.is_empty() {
+        let ready = output
+            .analysis
+            .fleet
+            .unqueued
+            .iter()
+            .map(|number| format!("#{number}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(text, "ready unqueued: {ready}");
+    }
+    for problem in &output.analysis.fleet.problems {
+        let _ = writeln!(text, "! {:?}: {}", problem.kind, problem.message);
+    }
+    text
+}
+
+fn render_show(output: &caravan::read::ShowOutput) -> String {
+    let mut text = format!(
+        "caravan #{} — {}\n",
+        output.caravan.id,
+        if output.healthy {
+            "healthy"
+        } else {
+            "needs attention"
+        }
+    );
+    for pull_request in &output.pull_requests {
+        let marker = if pull_request.number == output.current_pr {
+            ">"
+        } else {
+            " "
+        };
+        let _ = writeln!(
+            text,
+            "{marker} #{} {} [{} -> {}]{}",
+            pull_request.number,
+            pull_request.title,
+            pull_request.head.name,
+            pull_request.base.name,
+            if pull_request.auto_merge.enabled {
+                " auto-merge"
+            } else {
+                ""
+            }
+        );
+    }
+    for problem in &output.problems {
+        let _ = writeln!(text, "! {:?}: {}", problem.kind, problem.message);
+    }
+    text
+}
+
+fn render_check(output: &caravan::read::CheckOutput) -> String {
+    let mut text = format!(
+        "check: eligible ({:?}) — PR #{}",
+        output.mode, output.current_pr
+    );
+    if let Some(target) = output.target_pr {
+        let _ = write!(text, " after #{target}");
+    }
+    text.push('\n');
+    for report in &output.compatibility {
+        let _ = writeln!(
+            text,
+            "  {:?}: {} -> {}",
+            report.outcome, report.candidate.name, report.target.name
+        );
+    }
+    text
+}
+
+fn emit_human_error<E>(error: E) -> Result<(), i32>
+where
+    E: StructuredError + std::fmt::Display,
+{
+    emit_result::<serde_json::Value, E>(false, Err(error))
 }
 
 fn run_domain<T>(json: bool, operation: &str, input: &T) -> Result<(), i32> {
@@ -369,5 +532,40 @@ mod tests {
         assert!(
             Cli::try_parse_from(["cara", "check", "--tail-pr", "1", "--head-pr", "2"]).is_err()
         );
+    }
+
+    #[test]
+    fn human_status_is_compact_instead_of_dumping_nested_json() {
+        let repository = caravan::model::RepositoryId {
+            owner: "harryaskham".to_owned(),
+            name: "caravan".to_owned(),
+        };
+        let default_branch = caravan::model::BranchSnapshot {
+            repository: repository.clone(),
+            name: "main".to_owned(),
+            oid: caravan::model::CommitOid("0".repeat(40)),
+        };
+        let output = caravan::read::StatusOutput {
+            repository: repository.clone(),
+            default_branch: "main".to_owned(),
+            current_branch: Some("feature".to_owned()),
+            current_pr: None,
+            healthy: true,
+            analysis: caravan::graph::GraphAnalysis {
+                fleet: caravan::model::CaravanFleet {
+                    repository,
+                    default_branch,
+                    caravans: Vec::new(),
+                    unqueued: Vec::new(),
+                    problems: Vec::new(),
+                },
+                pull_requests: std::collections::BTreeMap::new(),
+                compatibility: Vec::new(),
+            },
+        };
+        let rendered = render_status(&output);
+        assert!(rendered.contains("harryaskham/caravan @ main — healthy"));
+        assert!(rendered.contains("current: feature (no open PR)"));
+        assert!(!rendered.contains("\"analysis\""));
     }
 }
