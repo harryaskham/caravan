@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use schemars::JsonSchema;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::command::{CommandOutput, CommandRunError, CommandRunner, CommandSpec, ProcessRunner};
 use crate::model::{
@@ -2691,10 +2691,12 @@ mod tests {
         let snapshot = discovery.discover().expect("historical context resolves");
 
         assert_eq!(snapshot.current_pr, Some(PrNumber(10)));
-        assert!(snapshot
-            .pull_requests
-            .iter()
-            .any(|pull| pull.number == PrNumber(9)));
+        assert!(
+            snapshot
+                .pull_requests
+                .iter()
+                .any(|pull| pull.number == PrNumber(9))
+        );
         discovery.runner.assert_exhausted();
     }
 
@@ -2895,18 +2897,22 @@ mod tests {
                 .count(),
             30
         );
-        assert!(snapshot
-            .pull_requests
-            .iter()
-            .filter(|pr| pr.state == model::PullRequestState::Open)
-            .all(|pr| pr.checks.len() == 2));
-        assert!(snapshot
-            .pull_requests
-            .iter()
-            .find(|pr| pr.state == model::PullRequestState::Merged)
-            .unwrap()
-            .checks
-            .is_empty());
+        assert!(
+            snapshot
+                .pull_requests
+                .iter()
+                .filter(|pr| pr.state == model::PullRequestState::Open)
+                .all(|pr| pr.checks.len() == 2)
+        );
+        assert!(
+            snapshot
+                .pull_requests
+                .iter()
+                .find(|pr| pr.state == model::PullRequestState::Merged)
+                .unwrap()
+                .checks
+                .is_empty()
+        );
         discovery.runner.assert_exhausted();
     }
 
@@ -3226,10 +3232,12 @@ mod tests {
             .ensure_control_label_comment(&repository, &expected, &audit)
             .unwrap();
 
-        assert!(receipt
-            .provider_output
-            .unwrap()
-            .starts_with("existing GitHub comment"));
+        assert!(
+            receipt
+                .provider_output
+                .unwrap()
+                .starts_with("existing GitHub comment")
+        );
         adapter.runner.assert_exhausted();
     }
 
@@ -3280,10 +3288,12 @@ mod tests {
             .ensure_control_label_comment(&repository, &expected, &retry)
             .unwrap();
 
-        assert!(receipt
-            .provider_output
-            .unwrap()
-            .starts_with("existing GitHub comment"));
+        assert!(
+            receipt
+                .provider_output
+                .unwrap()
+                .starts_with("existing GitHub comment")
+        );
         adapter.runner.assert_exhausted();
     }
 

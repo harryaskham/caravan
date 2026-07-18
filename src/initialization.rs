@@ -439,7 +439,10 @@ fn is_default_config_path(context: &AppContext) -> bool {
     } else {
         context.repository_path.join(&context.config_path)
     };
-    configured == context.repository_path.join(crate::config::DEFAULT_CONFIG_PATH)
+    configured
+        == context
+            .repository_path
+            .join(crate::config::DEFAULT_CONFIG_PATH)
 }
 
 fn require_default_parent_contained(
@@ -799,8 +802,8 @@ mod tests {
         let provider = FakeProvider::new(Vec::new());
         let caravan_dir = directory.path().join(".caravan");
         symlink(external.path(), &caravan_dir).unwrap();
-        let error = init_with_provider(&context(&directory), &repository(), "main", &provider)
-            .unwrap_err();
+        let error =
+            init_with_provider(&context(&directory), &repository(), "main", &provider).unwrap_err();
         assert_eq!(error.code(), "initialization_config_path_escape");
         assert!(!external.path().join("config.yaml").exists());
         assert!(provider.labels.lock().unwrap().is_empty());
@@ -810,8 +813,8 @@ mod tests {
         let target = external.path().join("existing.yaml");
         fs::write(&target, "{}\n").unwrap();
         symlink(&target, directory.path().join(".caravan/config.yaml")).unwrap();
-        let error = init_with_provider(&context(&directory), &repository(), "main", &provider)
-            .unwrap_err();
+        let error =
+            init_with_provider(&context(&directory), &repository(), "main", &provider).unwrap_err();
         assert_eq!(error.code(), "initialization_config_incompatible");
         assert!(provider.labels.lock().unwrap().is_empty());
     }

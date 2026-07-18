@@ -1074,7 +1074,10 @@ mod tests {
         let mut line = String::new();
         loop {
             line.clear();
-            assert!(reader.read_line(&mut line).unwrap() > 0, "child exited before lock");
+            assert!(
+                reader.read_line(&mut line).unwrap() > 0,
+                "child exited before lock"
+            );
             if line.contains("LOCK_READY") {
                 break;
             }
@@ -1103,12 +1106,7 @@ mod tests {
         let recovery = lock.recovered_dead_owner().unwrap();
         assert_eq!(recovery.removed_owner.token, owner.token);
         assert_eq!(
-            recovery
-                .removed_owner
-                .checkpoint
-                .as_ref()
-                .unwrap()
-                .phase,
+            recovery.removed_owner.checkpoint.as_ref().unwrap().phase,
             "decision_checkout_in_flight"
         );
         lock.release().unwrap();

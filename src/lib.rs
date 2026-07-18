@@ -866,10 +866,12 @@ mod tests {
             build_router().call_tool(&AppContext::default(), "help", serde_json::json!({}));
         let value = serde_json::to_value(envelope).expect("envelope serializes");
         assert_eq!(value["status"], "success");
-        assert!(value["data"]["instructions"]
-            .as_str()
-            .expect("instructions")
-            .contains("Caravan"));
+        assert!(
+            value["data"]["instructions"]
+                .as_str()
+                .expect("instructions")
+                .contains("Caravan")
+        );
     }
 
     #[test]

@@ -12,8 +12,8 @@ use serde_json::json;
 
 use crate::command::CommandRunError;
 use crate::github::{
-    control_label_marker, ControlLabelAudit, CreatePullRequestInput, DiscoveryError,
-    GitHubMutationAdapter, GitHubMutationReceipt, MutationError,
+    ControlLabelAudit, CreatePullRequestInput, DiscoveryError, GitHubMutationAdapter,
+    GitHubMutationReceipt, MutationError, control_label_marker,
 };
 use crate::graph::{CompatibilityChecker, GitCompatibilityChecker};
 use crate::hooks::{self, HookDelivery};
@@ -1661,12 +1661,14 @@ mod tests {
             mcp_cli::StructuredError::code(&error),
             "default_branch_not_protected"
         );
-        assert!(!provider
-            .pull_requests
-            .borrow()
-            .get(&PrNumber(1))
-            .unwrap()
-            .has_label(ACTIVE_LABEL));
+        assert!(
+            !provider
+                .pull_requests
+                .borrow()
+                .get(&PrNumber(1))
+                .unwrap()
+                .has_label(ACTIVE_LABEL)
+        );
     }
 
     #[test]
@@ -1694,12 +1696,14 @@ mod tests {
             mcp_cli::StructuredError::code(&error),
             "auto_merge_not_enabled"
         );
-        assert!(!provider
-            .pull_requests
-            .borrow()
-            .get(&PrNumber(1))
-            .unwrap()
-            .has_label(ACTIVE_LABEL));
+        assert!(
+            !provider
+                .pull_requests
+                .borrow()
+                .get(&PrNumber(1))
+                .unwrap()
+                .has_label(ACTIVE_LABEL)
+        );
     }
 
     #[test]
@@ -1727,12 +1731,14 @@ mod tests {
             mcp_cli::StructuredError::code(&error),
             "required_labels_missing"
         );
-        assert!(!provider
-            .pull_requests
-            .borrow()
-            .get(&PrNumber(1))
-            .unwrap()
-            .has_label(ACTIVE_LABEL));
+        assert!(
+            !provider
+                .pull_requests
+                .borrow()
+                .get(&PrNumber(1))
+                .unwrap()
+                .has_label(ACTIVE_LABEL)
+        );
     }
 
     #[test]
@@ -1757,13 +1763,15 @@ mod tests {
         )
         .unwrap_err();
         let details = mcp_cli::StructuredError::details(&error).unwrap();
-        assert!(details["provider_receipts"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|receipt| {
-                receipt["kind"] == serde_json::Value::String("add_label".to_owned())
-            }));
+        assert!(
+            details["provider_receipts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|receipt| {
+                    receipt["kind"] == serde_json::Value::String("add_label".to_owned())
+                })
+        );
 
         *provider.fail_kind.borrow_mut() = None;
         let partial = provider
@@ -1825,11 +1833,13 @@ mod tests {
         let details = error.details().unwrap();
         assert_eq!(details["stage"], "control_label_comment");
         assert_eq!(details["resumable"], true);
-        assert!(details["completed_steps"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|step| step["kind"] == "add_label"));
+        assert!(
+            details["completed_steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|step| step["kind"] == "add_label")
+        );
     }
 
     #[test]
@@ -1854,11 +1864,13 @@ mod tests {
         .unwrap();
 
         assert!(output.pull_request.has_label("caravan-priority:high"));
-        assert!(output
-            .receipt
-            .completed_steps
-            .iter()
-            .any(|step| step.kind == MutationKind::Comment));
+        assert!(
+            output
+                .receipt
+                .completed_steps
+                .iter()
+                .any(|step| step.kind == MutationKind::Comment)
+        );
     }
 
     #[test]

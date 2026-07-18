@@ -9,7 +9,7 @@ use serde_json::json;
 
 use crate::command::CommandRunError;
 use crate::github::{DiscoveryError, GitHubDiscovery};
-use crate::graph::{analyze, CompatibilityChecker, GitCompatibilityChecker, GraphAnalysis};
+use crate::graph::{CompatibilityChecker, GitCompatibilityChecker, GraphAnalysis, analyze};
 use crate::model::{
     Caravan, CompatibilityOutcome, CompatibilityReport, GraphProblem, GraphProblemKind, PrNumber,
     PullRequestSnapshot, PullRequestState, RepositoryId,
@@ -1582,10 +1582,12 @@ mod tests {
         assert_eq!(details["timeout_ms"], 500);
         assert_eq!(details["stdout"], "partial");
         assert_eq!(details["retryable"], true);
-        assert!(details["safe_next_action"]
-            .as_str()
-            .unwrap()
-            .contains("no mutations"));
+        assert!(
+            details["safe_next_action"]
+                .as_str()
+                .unwrap()
+                .contains("no mutations")
+        );
     }
 
     #[test]
@@ -1630,13 +1632,17 @@ mod tests {
         );
         assert_eq!(admission.next_candidate, Some(PrNumber(20)));
         assert!(admission.candidates[0].reason.contains("FIFO"));
-        assert!(admission.candidates[0]
-            .reason
-            .contains("preflight required"));
+        assert!(
+            admission.candidates[0]
+                .reason
+                .contains("preflight required")
+        );
         assert!(admission.policy.contains("never LIFO"));
-        assert!(admission
-            .policy
-            .contains("never causes automatic leapfrogging"));
+        assert!(
+            admission
+                .policy
+                .contains("never causes automatic leapfrogging")
+        );
     }
 
     #[test]
@@ -1696,10 +1702,12 @@ mod tests {
             "the rejected first attempt must block rather than leapfrog to #30"
         );
         assert_eq!(admission.rejected.len(), 2);
-        assert!(admission
-            .rejected
-            .iter()
-            .all(|candidate| candidate.reason.contains("fail closed")));
+        assert!(
+            admission
+                .rejected
+                .iter()
+                .all(|candidate| candidate.reason.contains("fail closed"))
+        );
     }
 
     #[test]
@@ -1752,10 +1760,12 @@ mod tests {
         assert!(!output.eligible);
         assert!(!output.canonical_candidate);
         assert_eq!(output.next_action, CandidateNextAction::Reject);
-        assert!(output
-            .problems
-            .iter()
-            .any(|problem| problem.message.contains("fail closed on PR #10")));
+        assert!(
+            output
+                .problems
+                .iter()
+                .any(|problem| problem.message.contains("fail closed on PR #10"))
+        );
         let json = serde_json::to_value(&output).expect("remote receipt serializes");
         assert_eq!(json["next_action"], "reject");
         assert_eq!(json["candidate"]["number"], 20);
