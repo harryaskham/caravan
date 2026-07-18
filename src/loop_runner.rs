@@ -143,12 +143,18 @@ fn ready_unqueued_events(output: &SyncOutput) -> Vec<CaravanEvent> {
     for (position, candidate) in output.status.admission.candidates.iter().enumerate() {
         let mut metadata = BTreeMap::new();
         metadata.insert("admission_position".to_owned(), serde_json::json!(position));
-        metadata.insert("requires_membership_preflight".to_owned(), serde_json::json!(true));
+        metadata.insert(
+            "requires_membership_preflight".to_owned(),
+            serde_json::json!(true),
+        );
         metadata.insert(
             "rejection_policy".to_owned(),
             serde_json::json!("fail closed without automatic leapfrogging"),
         );
-        metadata.insert("admission_reason".to_owned(), serde_json::json!(candidate.reason));
+        metadata.insert(
+            "admission_reason".to_owned(),
+            serde_json::json!(candidate.reason),
+        );
         metadata.insert(
             "priority_label".to_owned(),
             serde_json::json!(candidate.priority_label),

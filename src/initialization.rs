@@ -31,6 +31,8 @@ fn required_label(name: &str, color: &str, description: impl Into<String>) -> Re
     }
 }
 
+const PRIORITY_COLORS: [&str; 6] = ["B60205", "D93F0B", "FBCA04", "0E8A16", "1D76DB", "5319E7"];
+
 /// Complete deterministic label policy: fixed membership labels followed by
 /// configured highest-to-lowest admission-priority labels.
 #[must_use]

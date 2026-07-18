@@ -381,7 +381,10 @@ fn run_next_candidate(cli: &Cli) -> Result<(), i32> {
     match result {
         Ok(output) => {
             if let Some(candidate) = output.admission.candidates.first() {
-                println!("next admission attempt: #{} — {}", candidate.pr, candidate.reason);
+                println!(
+                    "next admission attempt: #{} — {}",
+                    candidate.pr, candidate.reason
+                );
                 println!("  {}", output.attempt_contract);
             } else {
                 println!("no automatic-admission attempt");
