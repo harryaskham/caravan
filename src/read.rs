@@ -19,6 +19,15 @@ use crate::{AppContext, AppError, CheckInput};
 /// Repository-wide live Caravan status.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct StatusOutput {
+    /// Bounded, secret-free provider identity and lineage for active members.
+    #[serde(default)]
+    pub merge_candidates: Vec<crate::model::MergeCandidateIdentity>,
+    #[serde(default)]
+    pub merge_candidates_truncated: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_default_oid: Option<crate::model::CommitOid>,
+    #[serde(default)]
+    pub default_branch_movements: Vec<crate::model::DefaultBranchMovement>,
     /// Successful phase timings make large-repository regressions diagnosable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timing: Option<StatusTiming>,
@@ -102,6 +111,9 @@ pub struct ShowOutput {
     /// Zero-based head-to-tail position.
     pub position: usize,
     pub pull_requests: Vec<PullRequestSnapshot>,
+    /// Exact synthetic lineage for these caravan members.
+    #[serde(default)]
+    pub merge_candidates: Vec<crate::model::MergeCandidateIdentity>,
     pub healthy: bool,
     #[serde(default)]
     pub problems: Vec<GraphProblem>,
@@ -230,6 +242,10 @@ pub(crate) fn status_with_deadline(
     let admission = resolve_admission(&analysis, &context.config.agent_priority_labels);
     let labels_elapsed = started.elapsed();
     let mut output = StatusOutput {
+        merge_candidates: snapshot.merge_candidates,
+        merge_candidates_truncated: snapshot.merge_candidates_truncated,
+        previous_default_oid: snapshot.previous_default_oid,
+        default_branch_movements: snapshot.default_branch_movements,
         timing: None,
         repository: snapshot.repository,
         default_branch: snapshot.default_branch.name,
@@ -446,12 +462,19 @@ pub fn show(context: &AppContext) -> Result<ShowOutput, AppError> {
         .iter()
         .filter_map(|number| status.analysis.pull_requests.get(number).cloned())
         .collect();
+    let merge_candidates = status
+        .merge_candidates
+        .iter()
+        .filter(|candidate| caravan.members.contains(&candidate.pr))
+        .cloned()
+        .collect();
     Ok(ShowOutput {
         repository: status.repository,
         current_pr,
         caravan,
         position,
         pull_requests,
+        merge_candidates,
         healthy: status.healthy,
         problems: status.analysis.fleet.problems,
     })
@@ -896,6 +919,10 @@ mod tests {
             pull_requests.push(current);
         }
         let snapshot = crate::model::RepositorySnapshot {
+            merge_candidates: Vec::new(),
+            merge_candidates_truncated: 0,
+            previous_default_oid: None,
+            default_branch_movements: Vec::new(),
             repository: repository(),
             default_branch: branch("main"),
             current_branch: Some("current".to_owned()),
@@ -906,6 +933,10 @@ mod tests {
         let checker = clean_checker;
         let analysis = analyze(&snapshot, &checker).unwrap();
         StatusOutput {
+            merge_candidates: Vec::new(),
+            merge_candidates_truncated: 0,
+            previous_default_oid: None,
+            default_branch_movements: Vec::new(),
             timing: None,
             repository: repository(),
             default_branch: "main".to_owned(),

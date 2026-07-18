@@ -703,6 +703,10 @@ mod tests {
             .map(|pull_request| (pull_request.number, pull_request))
             .collect();
         StatusOutput {
+            merge_candidates: Vec::new(),
+            merge_candidates_truncated: 0,
+            previous_default_oid: None,
+            default_branch_movements: Vec::new(),
             timing: None,
             repository: repository(),
             default_branch: "main".to_owned(),

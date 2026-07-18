@@ -217,6 +217,10 @@ mod tests {
                 events: Vec::new(),
                 hook_deliveries: Vec::new(),
                 status: StatusOutput {
+                    merge_candidates: Vec::new(),
+                    merge_candidates_truncated: 0,
+                    previous_default_oid: None,
+                    default_branch_movements: Vec::new(),
                     timing: None,
                     repository: repository.clone(),
                     default_branch: "main".to_owned(),

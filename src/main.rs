@@ -682,6 +682,7 @@ fn append_hook_deliveries(text: &mut String, deliveries: &[caravan::hooks::HookD
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_status(output: &caravan::read::StatusOutput) -> String {
     let mut text = String::new();
     let _ = writeln!(
@@ -718,6 +719,23 @@ fn render_status(output: &caravan::read::StatusOutput) -> String {
             .map_or_else(String::new, |next| format!(" — {next}"))
     );
     let _ = writeln!(text, "caravans: {}", output.analysis.fleet.caravans.len());
+    if let Some(previous) = &output.previous_default_oid {
+        let _ = writeln!(text, "previous observed default: {previous}");
+    }
+    if !output.default_branch_movements.is_empty() {
+        let _ = writeln!(text, "recent default-branch movements:");
+        for movement in &output.default_branch_movements {
+            let actor = movement.actor.as_deref().unwrap_or("unknown");
+            let source = movement
+                .source_pr
+                .map_or_else(|| "no PR".to_owned(), |pr| format!("PR #{pr}"));
+            let _ = writeln!(
+                text,
+                "  {} {} actor={} source={} {:?}",
+                movement.oid, movement.timestamp, actor, source, movement.ownership
+            );
+        }
+    }
     for pause in &output.pauses {
         let _ = writeln!(
             text,
@@ -733,6 +751,49 @@ fn render_status(output: &caravan::read::StatusOutput) -> String {
             .collect::<Vec<_>>()
             .join(" -> ");
         let _ = writeln!(text, "  #{}: {chain}", caravan.id);
+    }
+    if output.merge_candidates_truncated > 0 {
+        let _ = writeln!(
+            text,
+            "! merge-candidate evidence truncated: {} additional active members",
+            output.merge_candidates_truncated
+        );
+    }
+    for candidate in &output.merge_candidates {
+        let synthetic = candidate.synthetic.as_ref().map_or_else(
+            || "unavailable".to_owned(),
+            |merge| {
+                format!(
+                    "{} tree={} parents=[{}]",
+                    merge.oid,
+                    merge.tree_oid,
+                    merge
+                        .parents
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            },
+        );
+        let owner = candidate.auto_merge.actor.as_deref().unwrap_or("unknown");
+        let _ = writeln!(
+            text,
+            "  candidate #{}: {:?} base={}@{} head={}@{} synthetic={} auto-merge={} owner={} updated={}",
+            candidate.pr,
+            candidate.freshness,
+            candidate.base.name,
+            candidate.base.oid,
+            candidate.head.name,
+            candidate.head.oid,
+            synthetic,
+            candidate.auto_merge.enabled,
+            owner,
+            candidate.provider_updated_at,
+        );
+        for reason in &candidate.stale_reasons {
+            let _ = writeln!(text, "    ! {reason}");
+        }
     }
     if !output.admission.candidates.is_empty() {
         let _ = writeln!(text, "automatic admission (priority then FIFO):");
@@ -777,6 +838,34 @@ fn render_show(output: &caravan::read::ShowOutput) -> String {
             } else {
                 ""
             }
+        );
+    }
+    for candidate in &output.merge_candidates {
+        let synthetic = candidate.synthetic.as_ref().map_or_else(
+            || "unavailable".to_owned(),
+            |merge| {
+                format!(
+                    "{} parents=[{}]",
+                    merge.oid,
+                    merge
+                        .parents
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            },
+        );
+        let _ = writeln!(
+            text,
+            "  lineage #{}: {:?} base={}@{} head={}@{} synthetic={}",
+            candidate.pr,
+            candidate.freshness,
+            candidate.base.name,
+            candidate.base.oid,
+            candidate.head.name,
+            candidate.head.oid,
+            synthetic,
         );
     }
     for problem in &output.problems {
@@ -1066,6 +1155,10 @@ mod tests {
             oid: caravan::model::CommitOid("0".repeat(40)),
         };
         let output = caravan::read::StatusOutput {
+            merge_candidates: Vec::new(),
+            merge_candidates_truncated: 0,
+            previous_default_oid: None,
+            default_branch_movements: Vec::new(),
             timing: None,
             repository: repository.clone(),
             default_branch: "main".to_owned(),

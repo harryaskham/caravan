@@ -1494,6 +1494,10 @@ mod tests {
             pull_requests.push(current);
         }
         let snapshot = crate::model::RepositorySnapshot {
+            merge_candidates: Vec::new(),
+            merge_candidates_truncated: 0,
+            previous_default_oid: None,
+            default_branch_movements: Vec::new(),
             repository: repository(),
             default_branch: branch("main"),
             current_branch: Some("current".to_owned()),
@@ -1503,6 +1507,10 @@ mod tests {
         };
         let analysis = analyze(&snapshot, &clean).unwrap();
         StatusOutput {
+            merge_candidates: Vec::new(),
+            merge_candidates_truncated: 0,
+            previous_default_oid: None,
+            default_branch_movements: Vec::new(),
             timing: None,
             repository: repository(),
             default_branch: "main".to_owned(),

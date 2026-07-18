@@ -82,12 +82,25 @@ pub enum MergeMethod {
 }
 
 /// Exact observed auto-merge state.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AutoMergeState {
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_method: Option<MergeMethod>,
+    /// Provider actor that enabled native auto-merge, when exposed by GitHub.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
 }
+
+// Mutation policy historically guards enabled/method. Actor is observability:
+// a provider may redact it between reads without making an otherwise exact
+// mutation retry stale.
+impl PartialEq for AutoMergeState {
+    fn eq(&self, other: &Self) -> bool {
+        self.enabled == other.enabled && self.merge_method == other.merge_method
+    }
+}
+impl Eq for AutoMergeState {}
 
 impl AutoMergeState {
     #[must_use]
@@ -95,6 +108,7 @@ impl AutoMergeState {
         Self {
             enabled: false,
             merge_method: None,
+            actor: None,
         }
     }
 
@@ -103,6 +117,7 @@ impl AutoMergeState {
         Self {
             enabled: true,
             merge_method: Some(MergeMethod::Squash),
+            actor: None,
         }
     }
 }
@@ -184,6 +199,18 @@ impl PullRequestSnapshot {
 pub struct RepositorySnapshot {
     pub repository: RepositoryId,
     pub default_branch: BranchSnapshot,
+    /// Bounded provider evidence for active merge candidates. This is kept
+    /// separate from graph policy so JSON/MCP clients can audit exact lineage.
+    #[serde(default)]
+    pub merge_candidates: Vec<MergeCandidateIdentity>,
+    /// Number of additional active members omitted by the provider bound.
+    #[serde(default)]
+    pub merge_candidates_truncated: usize,
+    /// Prior locally observed provider default OID, when a sync receipt exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_default_oid: Option<CommitOid>,
+    #[serde(default)]
+    pub default_branch_movements: Vec<DefaultBranchMovement>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -194,6 +221,81 @@ pub struct RepositorySnapshot {
     pub pull_requests: Vec<PullRequestSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_at: Option<String>,
+}
+
+/// Provenance classification for a default-branch movement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MovementOwnership {
+    CaraOwned,
+    External,
+    /// A Caravan-labelled source is associated with Cara but does not prove
+    /// which actor performed the merge without a matching operation receipt.
+    Unknown,
+}
+
+/// One bounded recent commit that advanced the provider default branch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DefaultBranchMovement {
+    pub oid: CommitOid,
+    pub timestamp: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_pr: Option<PrNumber>,
+    pub ownership: MovementOwnership,
+}
+
+/// Whether a synthetic provider merge candidate belongs to the currently
+/// observed base/head generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeCandidateFreshness {
+    Fresh,
+    StaleHead,
+    StaleBase,
+    Missing,
+    Unknown,
+}
+
+/// GitHub's bounded synthetic `refs/pull/<n>/merge` commit lineage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SyntheticMergeCandidate {
+    pub git_ref: String,
+    pub oid: CommitOid,
+    pub tree_oid: CommitOid,
+    /// Provider order is preserved (GitHub normally emits base then head).
+    pub parents: Vec<CommitOid>,
+}
+
+/// Provider-native auto-merge ownership, including the actor omitted by the
+/// older graph-only auto-merge projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct NativeAutoMergeState {
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_method: Option<MergeMethod>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+}
+
+/// Exact identity of one active PR and its current synthetic candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct MergeCandidateIdentity {
+    pub pr: PrNumber,
+    pub provider_updated_at: String,
+    pub observed_at: String,
+    pub base: BranchSnapshot,
+    pub head: BranchSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synthetic: Option<SyntheticMergeCandidate>,
+    pub auto_merge: NativeAutoMergeState,
+    pub freshness: MergeCandidateFreshness,
+    /// Independent flags preserve a simultaneous base+head generation mismatch.
+    pub stale_base: bool,
+    pub stale_head: bool,
+    #[serde(default)]
+    pub stale_reasons: Vec<String>,
 }
 
 /// A single linear caravan, ordered head to tail. `id` must equal `head()`.

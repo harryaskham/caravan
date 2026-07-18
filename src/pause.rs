@@ -741,6 +741,10 @@ mod tests {
     }
     fn status(pr: PullRequestSnapshot) -> StatusOutput {
         StatusOutput {
+            merge_candidates: Vec::new(),
+            merge_candidates_truncated: 0,
+            previous_default_oid: None,
+            default_branch_movements: Vec::new(),
             repository: repository(),
             default_branch: "main".to_owned(),
             current_branch: Some("pr-1".to_owned()),

@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 
+pub mod ci;
 pub mod command;
 pub mod compatibility;
 pub mod github;

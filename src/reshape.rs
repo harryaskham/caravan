@@ -435,6 +435,10 @@ fn virtual_status(
     pull_requests: BTreeMap<PrNumber, PullRequestSnapshot>,
 ) -> StatusOutput {
     let snapshot = RepositorySnapshot {
+        merge_candidates: Vec::new(),
+        merge_candidates_truncated: 0,
+        previous_default_oid: None,
+        default_branch_movements: Vec::new(),
         repository: status.repository.clone(),
         default_branch: status.analysis.fleet.default_branch.clone(),
         current_branch: status.current_branch.clone(),
@@ -445,6 +449,10 @@ fn virtual_status(
     let analysis = crate::graph::derive(&snapshot);
     let admission = crate::read::resolve_admission(&analysis, &status.admission.priority_labels);
     StatusOutput {
+        merge_candidates: Vec::new(),
+        merge_candidates_truncated: 0,
+        previous_default_oid: None,
+        default_branch_movements: Vec::new(),
         timing: None,
         repository: status.repository.clone(),
         default_branch: status.default_branch.clone(),
@@ -463,6 +471,10 @@ fn preflight_result(
     checker: &impl CompatibilityChecker,
 ) -> Result<(), AppError> {
     let snapshot = RepositorySnapshot {
+        merge_candidates: Vec::new(),
+        merge_candidates_truncated: 0,
+        previous_default_oid: None,
+        default_branch_movements: Vec::new(),
         repository: status.repository.clone(),
         default_branch: status.analysis.fleet.default_branch.clone(),
         current_branch: status.current_branch.clone(),
@@ -934,6 +946,10 @@ mod tests {
 
     fn status(pulls: Vec<PullRequestSnapshot>) -> StatusOutput {
         let snapshot = RepositorySnapshot {
+            merge_candidates: Vec::new(),
+            merge_candidates_truncated: 0,
+            previous_default_oid: None,
+            default_branch_movements: Vec::new(),
             repository: repository(),
             default_branch: branch("main", 99),
             current_branch: Some("fixture".to_owned()),
@@ -943,6 +959,10 @@ mod tests {
         };
         let analysis = crate::graph::analyze(&snapshot, &Clean).unwrap();
         StatusOutput {
+            merge_candidates: Vec::new(),
+            merge_candidates_truncated: 0,
+            previous_default_oid: None,
+            default_branch_movements: Vec::new(),
             timing: None,
             repository: repository(),
             default_branch: "main".to_owned(),

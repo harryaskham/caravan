@@ -13,6 +13,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::ci::{WorkflowFailureDiagnostics, WorkflowRunFailureDiagnostic};
 use crate::command::CommandRunError;
 use crate::github::{
     ControlLabelAudit, DiscoveryError, GitHubMutationAdapter, GitHubMutationReceipt, MutationError,
@@ -21,9 +22,9 @@ use crate::github::{
 use crate::hooks::{self, HookDelivery};
 use crate::model::{
     Caravan, CaravanEvent, CheckSnapshot, CheckState, CompatibilityOutcome, DecisionKind,
-    DecisionPoint, EventId, EventKind, GraphProblem, GraphProblemKind, MergeMethod, MutationKind,
-    MutationStep, MutationStepState, OperationId, OperationReceipt, PrNumber,
-    PullRequestPrecondition, PullRequestSnapshot, PullRequestState, RepositoryId,
+    DecisionPoint, EventId, EventKind, GraphProblem, GraphProblemKind, MergeCandidateIdentity,
+    MergeMethod, MutationKind, MutationStep, MutationStepState, OperationId, OperationReceipt,
+    PrNumber, PullRequestPrecondition, PullRequestSnapshot, PullRequestState, RepositoryId,
 };
 use crate::operation_lock::{OperationLock, OperationLockRecovery};
 use crate::read::{self, StatusOutput};
@@ -51,6 +52,49 @@ pub enum CiDisposition {
     Forced,
 }
 
+/// Run-to-current-PR generation relationship derived from immutable provider facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowRunGeneration {
+    Current,
+    StaleHead,
+    StaleBase,
+    StaleHeadAndBase,
+    MissingAssociation,
+}
+
+/// Deterministic sync-owned failure class; raw logs are never required.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowFailureClass {
+    StaleGeneration,
+    RetryableInfrastructure,
+    SourceOrTestFailure,
+    Cancelled,
+    Unknown,
+}
+
+/// Safe sync action selected from generation and structured failure evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowFailureAction {
+    FreshCandidateTrigger,
+    RerunFailedJobs,
+    RepairSource,
+    WaitOrInspect,
+}
+
+/// Classified evidence consumed directly by the CI decision and hook event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ClassifiedWorkflowRunFailure {
+    pub diagnostic: WorkflowRunFailureDiagnostic,
+    pub generation: WorkflowRunGeneration,
+    pub classification: WorkflowFailureClass,
+    pub action: WorkflowFailureAction,
+    #[serde(default)]
+    pub reasons: Vec<String>,
+}
+
 /// Exact check and workflow-run evidence for one selected PR.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CiObservation {
@@ -60,6 +104,10 @@ pub struct CiObservation {
     pub checks: Vec<CheckSnapshot>,
     #[serde(default)]
     pub failed_runs: Vec<WorkflowRunSnapshot>,
+    /// Bounded run/job/failed-step evidence with generation-aware policy.
+    #[serde(default)]
+    pub failure_diagnostics: Vec<ClassifiedWorkflowRunFailure>,
+    /// Exact current-generation infrastructure runs safe to rerun.
     #[serde(default)]
     pub rerunnable_run_ids: Vec<u64>,
 }
@@ -153,6 +201,13 @@ pub trait SyncProvider {
         expected: &PullRequestPrecondition,
     ) -> Result<Vec<WorkflowRunSnapshot>, MutationError>;
 
+    fn failed_run_diagnostics(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+        run_ids: &[u64],
+    ) -> Result<WorkflowFailureDiagnostics, MutationError>;
+
     fn rerun_failed_run(
         &self,
         repository: &RepositoryId,
@@ -232,6 +287,15 @@ impl<R: crate::command::CommandRunner> SyncProvider for GitHubMutationAdapter<R>
         expected: &PullRequestPrecondition,
     ) -> Result<Vec<WorkflowRunSnapshot>, MutationError> {
         self.failed_runs_for_pull_request(repository, expected)
+    }
+
+    fn failed_run_diagnostics(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+        run_ids: &[u64],
+    ) -> Result<WorkflowFailureDiagnostics, MutationError> {
+        self.failed_run_diagnostics(repository, expected, run_ids)
     }
 
     fn rerun_failed_run(
@@ -998,10 +1062,32 @@ fn ci_decision_error(
         ),
         "apply caravan-force only for a known acceptable failure".to_owned(),
     ];
-    if !observation.rerunnable_run_ids.is_empty() {
+    if observation
+        .failure_diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.action == WorkflowFailureAction::FreshCandidateTrigger)
+    {
         suggested_actions.insert(
             0,
-            "rerun only the listed runs with `cara sync --rerun-failed`".to_owned(),
+            "trigger a fresh exact-candidate workflow; do not rerun the listed stale generation"
+                .to_owned(),
+        );
+    } else if !observation.rerunnable_run_ids.is_empty() {
+        suggested_actions.insert(
+            0,
+            "rerun only the listed current-generation infrastructure runs with `cara sync --rerun-failed`"
+                .to_owned(),
+        );
+    }
+    if observation
+        .failure_diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.action == WorkflowFailureAction::WaitOrInspect)
+    {
+        suggested_actions.insert(
+            0,
+            "wait for provider evidence or inspect the bounded run/job/step receipts before retrying"
+                .to_owned(),
         );
     }
     let decision = DecisionPoint {
@@ -1017,6 +1103,163 @@ fn ci_decision_error(
         suggested_actions,
     };
     decision_error(&decision, progress)
+}
+
+fn classify_workflow_failure(
+    diagnostic: WorkflowRunFailureDiagnostic,
+    candidate: Option<&MergeCandidateIdentity>,
+) -> ClassifiedWorkflowRunFailure {
+    let (mut generation, mut reasons) = workflow_run_generation(&diagnostic);
+    let mut candidate_lineage_unknown = false;
+    if let Some(candidate) = candidate {
+        if candidate.pr != diagnostic.expected_pr {
+            generation = WorkflowRunGeneration::MissingAssociation;
+            reasons.push(format!(
+                "candidate identity belongs to PR {}, expected {}",
+                candidate.pr, diagnostic.expected_pr
+            ));
+        } else if candidate.stale_head || candidate.stale_base {
+            generation = match (candidate.stale_head, candidate.stale_base) {
+                (true, true) => WorkflowRunGeneration::StaleHeadAndBase,
+                (true, false) => WorkflowRunGeneration::StaleHead,
+                (false, true) => WorkflowRunGeneration::StaleBase,
+                (false, false) => WorkflowRunGeneration::Current,
+            };
+            reasons.extend(
+                candidate
+                    .stale_reasons
+                    .iter()
+                    .map(|reason| format!("current synthetic candidate is stale: {reason}")),
+            );
+        } else if matches!(
+            candidate.freshness,
+            crate::model::MergeCandidateFreshness::Missing
+                | crate::model::MergeCandidateFreshness::Unknown
+        ) {
+            candidate_lineage_unknown = true;
+            reasons.push("current synthetic candidate lineage is missing or unknown".to_owned());
+        }
+    }
+
+    let failed_lineage_step = diagnostic.failed_jobs.iter().any(|job| {
+        job.failed_steps.iter().any(|step| {
+            step.name
+                .to_ascii_lowercase()
+                .contains("verify exact ci ref lineage")
+        })
+    });
+    let (classification, action) = if generation != WorkflowRunGeneration::Current {
+        (
+            WorkflowFailureClass::StaleGeneration,
+            WorkflowFailureAction::FreshCandidateTrigger,
+        )
+    } else if candidate_lineage_unknown && failed_lineage_step {
+        reasons.push(
+            "lineage verification failed while current candidate identity is unavailable"
+                .to_owned(),
+        );
+        (
+            WorkflowFailureClass::Unknown,
+            WorkflowFailureAction::FreshCandidateTrigger,
+        )
+    } else if diagnostic.conclusion.eq_ignore_ascii_case("cancelled") {
+        reasons.push("current-generation run was cancelled".to_owned());
+        (
+            WorkflowFailureClass::Cancelled,
+            WorkflowFailureAction::FreshCandidateTrigger,
+        )
+    } else if retryable_infrastructure(&diagnostic) {
+        reasons.push("structured job conclusion indicates retryable infrastructure".to_owned());
+        (
+            WorkflowFailureClass::RetryableInfrastructure,
+            WorkflowFailureAction::RerunFailedJobs,
+        )
+    } else if diagnostic.failed_jobs.is_empty() {
+        reasons.push("provider exposed no bounded failed job/step evidence".to_owned());
+        (
+            WorkflowFailureClass::Unknown,
+            WorkflowFailureAction::WaitOrInspect,
+        )
+    } else {
+        reasons.push("current-generation jobs contain source or test failures".to_owned());
+        (
+            WorkflowFailureClass::SourceOrTestFailure,
+            WorkflowFailureAction::RepairSource,
+        )
+    };
+    ClassifiedWorkflowRunFailure {
+        diagnostic,
+        generation,
+        classification,
+        action,
+        reasons,
+    }
+}
+
+fn workflow_run_generation(
+    diagnostic: &WorkflowRunFailureDiagnostic,
+) -> (WorkflowRunGeneration, Vec<String>) {
+    let Some(association) = diagnostic
+        .pull_requests
+        .iter()
+        .find(|association| association.pr == diagnostic.expected_pr)
+    else {
+        return (
+            WorkflowRunGeneration::MissingAssociation,
+            vec!["run has no immutable association for the expected PR".to_owned()],
+        );
+    };
+    let stale_head = association
+        .head_oid
+        .as_ref()
+        .is_some_and(|oid| *oid != diagnostic.expected_head_oid);
+    let stale_base = association
+        .base_oid
+        .as_ref()
+        .is_some_and(|oid| *oid != diagnostic.expected_base_oid);
+    let generation = match (stale_head, stale_base) {
+        (true, true) => WorkflowRunGeneration::StaleHeadAndBase,
+        (true, false) => WorkflowRunGeneration::StaleHead,
+        (false, true) => WorkflowRunGeneration::StaleBase,
+        (false, false) => WorkflowRunGeneration::Current,
+    };
+    let mut reasons = Vec::new();
+    if stale_head {
+        reasons.push(format!(
+            "run PR head {} does not match current head {}",
+            association
+                .head_oid
+                .as_ref()
+                .map_or("missing", |oid| oid.0.as_str()),
+            diagnostic.expected_head_oid
+        ));
+    }
+    if stale_base {
+        reasons.push(format!(
+            "run PR base {} does not match current base {}",
+            association
+                .base_oid
+                .as_ref()
+                .map_or("missing", |oid| oid.0.as_str()),
+            diagnostic.expected_base_oid
+        ));
+    }
+    (generation, reasons)
+}
+
+fn retryable_infrastructure(diagnostic: &WorkflowRunFailureDiagnostic) -> bool {
+    const INFRA_CONCLUSIONS: [&str; 4] =
+        ["timed_out", "startup_failure", "stale", "action_required"];
+    let conclusion_is_infra = |value: &str| {
+        INFRA_CONCLUSIONS
+            .iter()
+            .any(|candidate| value.eq_ignore_ascii_case(candidate))
+    };
+    conclusion_is_infra(&diagnostic.conclusion)
+        || diagnostic
+            .failed_jobs
+            .iter()
+            .any(|job| conclusion_is_infra(&job.conclusion))
 }
 
 fn classify_checks(checks: &[CheckSnapshot], forced: bool) -> CiDisposition {
@@ -1376,6 +1619,7 @@ struct SyncProgress {
     ci: Vec<CiObservation>,
     events: Vec<CaravanEvent>,
     current: BTreeMap<PrNumber, PullRequestSnapshot>,
+    merge_candidates: BTreeMap<PrNumber, MergeCandidateIdentity>,
 }
 
 impl SyncProgress {
@@ -1391,6 +1635,12 @@ impl SyncProgress {
             ci: Vec::new(),
             events: Vec::new(),
             current: status.analysis.pull_requests.clone(),
+            merge_candidates: status
+                .merge_candidates
+                .iter()
+                .cloned()
+                .map(|candidate| (candidate.pr, candidate))
+                .collect(),
         }
     }
 
@@ -1507,12 +1757,33 @@ impl SyncProgress {
             };
         failed_runs.sort_by_key(|run| run.database_id);
         failed_runs.dedup_by_key(|run| run.database_id);
-        let rerunnable_run_ids = select_rerunnable_run_ids(&current.checks, &failed_runs);
+        let selected_run_ids = select_rerunnable_run_ids(&current.checks, &failed_runs);
+        let failure_diagnostics = if selected_run_ids.is_empty() {
+            Vec::new()
+        } else {
+            provider
+                .failed_run_diagnostics(repository, &self.precondition(number), &selected_run_ids)
+                .map_err(|error| mutation_error(&error, self, Some(number)))?
+                .runs
+                .into_iter()
+                .map(|diagnostic| {
+                    classify_workflow_failure(diagnostic, self.merge_candidates.get(&number))
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut rerunnable_run_ids = failure_diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.action == WorkflowFailureAction::RerunFailedJobs)
+            .map(|diagnostic| diagnostic.diagnostic.run_id)
+            .collect::<Vec<_>>();
+        rerunnable_run_ids.sort_unstable();
+        rerunnable_run_ids.dedup();
         Ok(CiObservation {
             pr: number,
             disposition,
             checks: current.checks.clone(),
             failed_runs,
+            failure_diagnostics,
             rerunnable_run_ids,
         })
     }
@@ -1787,6 +2058,8 @@ mod tests {
         failures: RefCell<VecDeque<MutationKind>>,
         calls: RefCell<Vec<MutationKind>>,
         failed_runs: RefCell<BTreeMap<PrNumber, Vec<WorkflowRunSnapshot>>>,
+        diagnostic_heads: RefCell<BTreeMap<PrNumber, CommitOid>>,
+        diagnostic_job_conclusions: RefCell<BTreeMap<PrNumber, String>>,
         admin_permission: bool,
         branch_head: RefCell<crate::model::CommitOid>,
         audits: RefCell<Vec<ControlLabelAudit>>,
@@ -1806,6 +2079,8 @@ mod tests {
                 failures: RefCell::new(VecDeque::new()),
                 calls: RefCell::new(Vec::new()),
                 failed_runs: RefCell::new(BTreeMap::new()),
+                diagnostic_heads: RefCell::new(BTreeMap::new()),
+                diagnostic_job_conclusions: RefCell::new(BTreeMap::new()),
                 admin_permission: true,
                 branch_head: RefCell::new(branch("main").oid),
                 audits: RefCell::new(Vec::new()),
@@ -1948,6 +2223,77 @@ mod tests {
                 .get(&expected.number)
                 .cloned()
                 .unwrap_or_default())
+        }
+
+        fn failed_run_diagnostics(
+            &self,
+            _repository: &RepositoryId,
+            expected: &PullRequestPrecondition,
+            run_ids: &[u64],
+        ) -> Result<WorkflowFailureDiagnostics, MutationError> {
+            let failed_runs = self
+                .failed_runs
+                .borrow()
+                .get(&expected.number)
+                .cloned()
+                .unwrap_or_default();
+            let runs = run_ids
+                .iter()
+                .filter_map(|run_id| {
+                    failed_runs
+                        .iter()
+                        .find(|run| run.database_id == *run_id)
+                        .map(|run| crate::ci::WorkflowRunFailureDiagnostic {
+                            run_id: *run_id,
+                            attempt: 1,
+                            workflow_id: *run_id,
+                            check_suite_id: *run_id,
+                            workflow_name: run.workflow_name.clone(),
+                            event: "pull_request".to_owned(),
+                            status: run.status.clone(),
+                            conclusion: run.conclusion.clone(),
+                            head_branch: "feature".to_owned(),
+                            head_sha: CommitOid(run.head_sha.clone()),
+                            expected_pr: expected.number,
+                            expected_head_oid: expected.head_oid.clone(),
+                            expected_base_oid: expected.base_oid.clone(),
+                            pull_requests: vec![crate::ci::WorkflowRunPullRequestAssociation {
+                                pr: expected.number,
+                                head_oid: Some(
+                                    self.diagnostic_heads
+                                        .borrow()
+                                        .get(&expected.number)
+                                        .cloned()
+                                        .unwrap_or_else(|| expected.head_oid.clone()),
+                                ),
+                                base_oid: Some(expected.base_oid.clone()),
+                            }],
+                            failed_jobs: vec![crate::ci::WorkflowJobFailureDiagnostic {
+                                job_id: *run_id,
+                                name: "test infrastructure".to_owned(),
+                                status: "completed".to_owned(),
+                                conclusion: self
+                                    .diagnostic_job_conclusions
+                                    .borrow()
+                                    .get(&expected.number)
+                                    .cloned()
+                                    .unwrap_or_else(|| "timed_out".to_owned()),
+                                url: run.url.clone(),
+                                runner_name: None,
+                                runner_labels: Vec::new(),
+                                failed_steps: Vec::new(),
+                                steps_truncated: false,
+                            }],
+                            jobs_total: 1,
+                            jobs_truncated: false,
+                        })
+                })
+                .collect();
+            Ok(WorkflowFailureDiagnostics {
+                requested_run_ids: run_ids.to_vec(),
+                runs,
+                runs_truncated: false,
+            })
         }
 
         fn rerun_failed_run(
@@ -2110,6 +2456,10 @@ mod tests {
         checker: &impl graph::CompatibilityChecker,
     ) -> StatusOutput {
         let snapshot = RepositorySnapshot {
+            merge_candidates: Vec::new(),
+            merge_candidates_truncated: 0,
+            previous_default_oid: None,
+            default_branch_movements: Vec::new(),
             repository: repository(),
             default_branch: branch("main"),
             current_branch: current.map(|number| format!("pr-{number}")),
@@ -2119,6 +2469,10 @@ mod tests {
         };
         let analysis = graph::analyze(&snapshot, checker).expect("analysis");
         StatusOutput {
+            merge_candidates: Vec::new(),
+            merge_candidates_truncated: 0,
+            previous_default_oid: None,
+            default_branch_movements: Vec::new(),
             timing: None,
             repository: repository(),
             default_branch: "main".to_owned(),
@@ -2208,6 +2562,72 @@ mod tests {
             details["decision"]["operation_id"]
         );
         assert!(provider.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn stale_run_generation_requires_fresh_trigger_and_is_never_rerunnable() {
+        let mut pulls = healthy_chain();
+        pulls[0].checks = vec![check("build-test", CheckState::Failure, Some(10))];
+        let matching = failed_run(10, &pulls[0]);
+        let provider = FakeProvider::with_pull_requests(pulls.clone());
+        provider
+            .failed_runs
+            .borrow_mut()
+            .insert(PrNumber(1), vec![matching]);
+        provider
+            .diagnostic_heads
+            .borrow_mut()
+            .insert(PrNumber(1), CommitOid("prior-head".to_owned()));
+        let status = status(pulls, Some(PrNumber(1)), &clean);
+
+        let error = execute(&status, &provider, false, true, false)
+            .expect_err("stale generation cannot be rerun");
+
+        assert!(provider.calls.borrow().is_empty());
+        let details = mcp_cli::StructuredError::details(&error).expect("details");
+        let ci = &details["decision"]["evidence"]["ci"];
+        assert_eq!(ci["rerunnable_run_ids"], json!([]));
+        assert_eq!(ci["failure_diagnostics"][0]["generation"], "stale_head");
+        assert_eq!(
+            ci["failure_diagnostics"][0]["action"],
+            "fresh_candidate_trigger"
+        );
+        assert!(
+            details["decision"]["suggested_actions"][0]
+                .as_str()
+                .expect("action")
+                .contains("fresh exact-candidate")
+        );
+    }
+
+    #[test]
+    fn current_generation_source_failure_recommends_repair_not_rerun() {
+        let mut pulls = healthy_chain();
+        pulls[0].checks = vec![check("build-test", CheckState::Failure, Some(10))];
+        let matching = failed_run(10, &pulls[0]);
+        let provider = FakeProvider::with_pull_requests(pulls.clone());
+        provider
+            .failed_runs
+            .borrow_mut()
+            .insert(PrNumber(1), vec![matching]);
+        provider
+            .diagnostic_job_conclusions
+            .borrow_mut()
+            .insert(PrNumber(1), "failure".to_owned());
+        let status = status(pulls, Some(PrNumber(1)), &clean);
+
+        let error = execute(&status, &provider, false, true, false)
+            .expect_err("source failure requires repair");
+
+        assert!(provider.calls.borrow().is_empty());
+        let details = mcp_cli::StructuredError::details(&error).expect("details");
+        let ci = &details["decision"]["evidence"]["ci"];
+        assert_eq!(ci["rerunnable_run_ids"], json!([]));
+        assert_eq!(
+            ci["failure_diagnostics"][0]["classification"],
+            "source_or_test_failure"
+        );
+        assert_eq!(ci["failure_diagnostics"][0]["action"], "repair_source");
     }
 
     #[test]
@@ -2594,7 +3014,10 @@ mod tests {
         let error = attach_lock_recovery(error, Some(&recovery));
 
         let details = error.details().unwrap();
-        assert_eq!(details["lock_recovery"]["removed_owner"]["token"], "exact-token");
+        assert_eq!(
+            details["lock_recovery"]["removed_owner"]["token"],
+            "exact-token"
+        );
         assert_eq!(
             details["lock_recovery"]["removed_owner"]["checkpoint"]["phase"],
             "decision_checkout_in_flight"
@@ -2681,11 +3104,7 @@ mod tests {
             Some(json!({ "decision": decision })),
         );
 
-        let error = checkout_for_decision(
-            &context,
-            error,
-            Instant::now() + Duration::from_secs(1),
-        );
+        let error = checkout_for_decision(&context, error, Instant::now() + Duration::from_secs(1));
 
         assert_eq!(error.code(), "ci_failure");
         let details = error.details().unwrap();

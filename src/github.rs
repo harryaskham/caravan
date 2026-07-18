@@ -20,6 +20,8 @@ const PR_JSON_FIELDS: &str = "number,title,state,isDraft,headRefName,headRefOid,
 const PR_HISTORY_JSON_FIELDS: &str = "number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository,baseRefName,baseRefOid,labels,autoMergeRequest,createdAt,mergedAt,url,updatedAt";
 const WORKFLOW_RUN_JSON_FIELDS: &str =
     "databaseId,headSha,status,conclusion,event,name,workflowName,url";
+/// Keeps JSON/MCP output and GraphQL cost bounded on pathological repositories.
+const MERGE_CANDIDATE_LIMIT: usize = 100;
 
 /// Limits and label used by one discovery pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -760,6 +762,18 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
             .collect())
     }
 
+    /// Fetch bounded structured job/step evidence for selected failed runs.
+    pub fn failed_run_diagnostics(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+        run_ids: &[u64],
+    ) -> Result<crate::ci::WorkflowFailureDiagnostics, MutationError> {
+        self.verify_precondition(repository, expected)?;
+        crate::ci::diagnose_failed_runs(&self.runner, repository, expected, run_ids)
+            .map_err(Into::into)
+    }
+
     /// Rerun failed jobs for one exact Actions run after PR verification.
     pub fn rerun_failed_run(
         &self,
@@ -992,6 +1006,7 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
             .name;
         let repository = repository_id(&repository_json.name_with_owner)?;
         let current_branch = self.current_branch()?;
+        let previous_default_oid = self.previous_default_oid(&default_branch_name)?;
         let default_ref: GitRefJson = self.json(default_branch_command(
             &repository.slug(),
             &default_branch_name,
@@ -1035,6 +1050,16 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
             .cloned()
             .collect::<Vec<_>>();
         validate_active_heads(&repository, &open_labeled_prs)?;
+        let observed_at = provider_observed_at();
+        let bounded_members = open_labeled_prs
+            .iter()
+            .take(MERGE_CANDIDATE_LIMIT)
+            .cloned()
+            .collect::<Vec<_>>();
+        let merge_candidates_truncated =
+            open_labeled_prs.len().saturating_sub(bounded_members.len());
+        let (merge_candidates, default_branch_movements) =
+            self.merge_candidate_identities(&repository, &bounded_members, &observed_at)?;
         let recently_merged_labeled_prs = self.pull_requests(
             labeled_pr_command(
                 &repository.slug(),
@@ -1062,11 +1087,127 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
         Ok(model::RepositorySnapshot {
             repository,
             default_branch,
+            merge_candidates,
+            merge_candidates_truncated,
+            previous_default_oid,
+            default_branch_movements,
             current_branch,
             current_pr: current_pr_number,
             pull_requests: pull_requests.into_values().collect(),
             observed_at: None,
         })
+    }
+
+    fn merge_candidate_identities(
+        &self,
+        repository: &RepositoryId,
+        pull_requests: &[model::PullRequestSnapshot],
+        observed_at: &str,
+    ) -> Result<
+        (
+            Vec<model::MergeCandidateIdentity>,
+            Vec<model::DefaultBranchMovement>,
+        ),
+        DiscoveryError,
+    > {
+        let command = merge_candidates_command(repository, pull_requests);
+        let response: MergeCandidatesResponse = self.json(command)?;
+        let candidates = pull_requests
+            .iter()
+            .enumerate()
+            .map(|(index, pull_request)| {
+                let commit = response
+                    .data
+                    .repository
+                    .candidates
+                    .get(&format!("c{index}"))
+                    .and_then(Option::as_ref);
+                let synthetic = commit.map(|commit| model::SyntheticMergeCandidate {
+                    git_ref: format!("refs/pull/{}/merge", pull_request.number),
+                    oid: CommitOid(commit.oid.clone()),
+                    tree_oid: CommitOid(commit.tree.oid.clone()),
+                    parents: commit
+                        .parents
+                        .nodes
+                        .iter()
+                        .map(|parent| CommitOid(parent.oid.clone()))
+                        .collect(),
+                });
+                let (freshness, stale_base, stale_head, stale_reasons) = classify_candidate(
+                    synthetic.as_ref(),
+                    &pull_request.base.oid,
+                    &pull_request.head.oid,
+                );
+                Ok(model::MergeCandidateIdentity {
+                    pr: pull_request.number,
+                    provider_updated_at: pull_request.updated_at.clone().unwrap_or_default(),
+                    observed_at: observed_at.to_owned(),
+                    base: pull_request.base.clone(),
+                    head: pull_request.head.clone(),
+                    synthetic,
+                    auto_merge: model::NativeAutoMergeState {
+                        enabled: pull_request.auto_merge.enabled,
+                        merge_method: pull_request.auto_merge.merge_method,
+                        actor: pull_request.auto_merge.actor.clone(),
+                    },
+                    freshness,
+                    stale_base,
+                    stale_head,
+                    stale_reasons,
+                })
+            })
+            .collect::<Result<Vec<_>, DiscoveryError>>()?;
+        let movements = response
+            .data
+            .repository
+            .default_branch_ref
+            .map(|reference| reference.target.history.nodes)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|commit| {
+                let source = commit.associated_pull_requests.nodes.into_iter().next();
+                let cara_owned = source.as_ref().is_some_and(|pull| {
+                    pull.labels
+                        .nodes
+                        .iter()
+                        .any(|label| label.name == "caravan")
+                });
+                model::DefaultBranchMovement {
+                    oid: CommitOid(commit.oid),
+                    timestamp: commit.committed_date,
+                    actor: commit
+                        .author
+                        .and_then(|author| author.user.map(|user| user.login).or(author.name)),
+                    source_pr: source.map(|pull| PrNumber(pull.number)),
+                    ownership: if cara_owned {
+                        // A label proves queue association, not the merge actor.
+                        // Status may upgrade this only with a matching durable
+                        // Cara operation receipt; never falsely claim ownership.
+                        model::MovementOwnership::Unknown
+                    } else {
+                        model::MovementOwnership::External
+                    },
+                }
+            })
+            .collect();
+        Ok((candidates, movements))
+    }
+
+    fn previous_default_oid(&self, branch: &str) -> Result<Option<CommitOid>, DiscoveryError> {
+        let command = previous_default_command(branch);
+        let output = self.runner.run(&command)?;
+        if output.code == Some(1) || output.code == Some(128) {
+            return Ok(None);
+        }
+        if !output.is_success() {
+            return Err(DiscoveryError::CommandFailed {
+                command,
+                code: output.code,
+                stderr: output.stderr.trim().to_owned(),
+            });
+        }
+        let oid = output.stdout.trim();
+        Ok((!oid.is_empty()).then(|| CommitOid(oid.to_owned())))
     }
 
     fn current_branch(&self) -> Result<Option<String>, DiscoveryError> {
@@ -1152,6 +1293,100 @@ fn repository_id(slug: &str) -> Result<RepositoryId, DiscoveryError> {
 
 fn repository_command() -> CommandSpec {
     CommandSpec::new("gh").args(["repo", "view", "--json", "nameWithOwner,defaultBranchRef"])
+}
+
+fn merge_candidates_command(
+    repository: &RepositoryId,
+    pull_requests: &[model::PullRequestSnapshot],
+) -> CommandSpec {
+    let aliases = pull_requests
+        .iter()
+        .enumerate()
+        .map(|(index, pull_request)| format!(
+            "c{index}: object(expression:\"refs/pull/{}/merge\") {{ ... on Commit {{ oid tree {{ oid }} parents(first: 2) {{ nodes {{ oid }} }} }} }}",
+            pull_request.number
+        ))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let query = format!(
+        "query($owner:String!,$name:String!) {{ repository(owner:$owner,name:$name) {{ {aliases} defaultBranchRef {{ target {{ ... on Commit {{ history(first:20) {{ nodes {{ oid committedDate author {{ name user {{ login }} }} associatedPullRequests(first:5) {{ nodes {{ number labels(first:20) {{ nodes {{ name }} }} }} }} }} }} }} }} }} }} }}"
+    );
+    CommandSpec::new("gh").args([
+        "api".to_owned(),
+        "graphql".to_owned(),
+        "-f".to_owned(),
+        format!("query={query}"),
+        "-F".to_owned(),
+        format!("owner={}", repository.owner),
+        "-F".to_owned(),
+        format!("name={}", repository.name),
+    ])
+}
+
+fn provider_observed_at() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or_else(
+            |_| "unix:0".to_owned(),
+            |duration| format!("unix:{}", duration.as_secs()),
+        )
+}
+
+fn classify_candidate(
+    candidate: Option<&model::SyntheticMergeCandidate>,
+    base: &CommitOid,
+    head: &CommitOid,
+) -> (model::MergeCandidateFreshness, bool, bool, Vec<String>) {
+    let Some(candidate) = candidate else {
+        return (
+            model::MergeCandidateFreshness::Missing,
+            false,
+            false,
+            vec!["synthetic merge ref is unavailable".to_owned()],
+        );
+    };
+    if candidate.parents.len() != 2 {
+        return (
+            model::MergeCandidateFreshness::Unknown,
+            false,
+            false,
+            vec![format!(
+                "synthetic candidate has {} parents; expected 2",
+                candidate.parents.len()
+            )],
+        );
+    }
+    let stale_base = candidate.parents[0] != *base;
+    let stale_head = candidate.parents[1] != *head;
+    let mut reasons = Vec::new();
+    if stale_base {
+        reasons.push(format!(
+            "first parent {} does not match current base {}",
+            candidate.parents[0], base
+        ));
+    }
+    if stale_head {
+        reasons.push(format!(
+            "second parent {} does not match current head {}",
+            candidate.parents[1], head
+        ));
+    }
+    let freshness = if stale_head {
+        model::MergeCandidateFreshness::StaleHead
+    } else if stale_base {
+        model::MergeCandidateFreshness::StaleBase
+    } else {
+        model::MergeCandidateFreshness::Fresh
+    };
+    (freshness, stale_base, stale_head, reasons)
+}
+
+fn previous_default_command(branch: &str) -> CommandSpec {
+    CommandSpec::new("git").args([
+        "rev-parse".to_owned(),
+        "--verify".to_owned(),
+        format!("refs/remotes/origin/{branch}"),
+    ])
 }
 
 fn current_branch_command() -> CommandSpec {
@@ -1474,6 +1709,92 @@ struct GitObjectJson {
 }
 
 #[derive(Debug, Deserialize)]
+struct MergeCandidatesResponse {
+    data: MergeCandidatesData,
+}
+
+#[derive(Debug, Deserialize)]
+struct MergeCandidatesData {
+    repository: MergeCandidatesRepository,
+}
+
+#[derive(Debug, Deserialize)]
+struct MergeCandidatesRepository {
+    #[serde(rename = "defaultBranchRef")]
+    default_branch_ref: Option<GraphDefaultBranchRefJson>,
+    #[serde(flatten)]
+    candidates: BTreeMap<String, Option<GraphCommitJson>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphCommitJson {
+    oid: String,
+    tree: GraphOidJson,
+    parents: GraphParentsJson,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphParentsJson {
+    nodes: Vec<GraphOidJson>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphOidJson {
+    oid: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphDefaultBranchRefJson {
+    target: GraphHistoryTargetJson,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphHistoryTargetJson {
+    history: GraphHistoryJson,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphHistoryJson {
+    nodes: Vec<GraphHistoryCommitJson>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphHistoryCommitJson {
+    oid: String,
+    committed_date: String,
+    author: Option<GraphAuthorJson>,
+    associated_pull_requests: GraphPullRequestsJson,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphAuthorJson {
+    name: Option<String>,
+    user: Option<GraphUserJson>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphUserJson {
+    login: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphPullRequestsJson {
+    nodes: Vec<GraphPullRequestJson>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphPullRequestJson {
+    number: u64,
+    labels: GraphLabelsJson,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphLabelsJson {
+    nodes: Vec<LabelJson>,
+}
+
+#[derive(Debug, Deserialize)]
 struct BranchSettingsJson {
     protected: bool,
 }
@@ -1653,6 +1974,7 @@ impl PullRequestJson {
             .map_or_else(AutoMergeState::disabled, |request| AutoMergeState {
                 enabled: true,
                 merge_method: (request.merge_method == "SQUASH").then_some(MergeMethod::Squash),
+                actor: request.enabled_by.map(|actor| actor.login),
             });
 
         Ok(model::PullRequestSnapshot {
@@ -1740,6 +2062,8 @@ pub struct RepositoryLabel {
 #[serde(rename_all = "camelCase")]
 struct AutoMergeJson {
     merge_method: String,
+    #[serde(default)]
+    enabled_by: Option<RepositoryOwnerJson>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1816,6 +2140,38 @@ mod tests {
     }
 
     fn successful_discovery_calls(open_prs: &str) -> Vec<(CommandSpec, CommandOutput)> {
+        let pulls = serde_json::from_str::<Vec<PullRequestJson>>(open_prs)
+            .unwrap()
+            .into_iter()
+            .map(|pull| pull.into_snapshot(&repository()).unwrap())
+            .collect::<Vec<_>>();
+        let mut candidates = pulls
+            .iter()
+            .enumerate()
+            .map(|(index, pull)| {
+                (
+                    format!("c{index}"),
+                    serde_json::json!({
+                        "oid": format!("merge-{}", pull.number),
+                        "tree": {"oid": format!("tree-{}", pull.number)},
+                        "parents": {"nodes": [
+                            {"oid": pull.base.oid.0}, {"oid": pull.head.oid.0}
+                        ]}
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        candidates.insert(
+            "defaultBranchRef".to_owned(),
+            serde_json::json!({
+                "target": {"history": {"nodes": [{
+                    "oid": "default-sha",
+                    "committedDate": "2026-07-18T10:00:00Z",
+                    "author": {"name": "Outside User", "user": {"login": "outside"}},
+                    "associatedPullRequests": {"nodes": []}
+                }]}}
+            }),
+        );
         vec![
             (
                 repository_command(),
@@ -1828,12 +2184,22 @@ mod tests {
                 CommandOutput::success("feature/widget\n"),
             ),
             (
+                previous_default_command("main"),
+                CommandOutput::success("previous-default-sha\n"),
+            ),
+            (
                 default_branch_command("acme/widgets", "main"),
                 CommandOutput::success(r#"{"object":{"sha":"default-sha"}}"#),
             ),
             (
                 open_pr_command("acme/widgets", 1_000),
                 CommandOutput::success(open_prs),
+            ),
+            (
+                merge_candidates_command(&repository(), &pulls),
+                CommandOutput::success(
+                    serde_json::json!({"data": {"repository": candidates}}).to_string(),
+                ),
             ),
             (
                 labeled_pr_command("acme/widgets", "merged", "caravan", 100, true),
@@ -1936,7 +2302,24 @@ mod tests {
         assert_eq!(open.head.oid, CommitOid("head-12".into()));
         assert_eq!(open.base.oid, CommitOid("base-12".into()));
         assert_eq!(open.auto_merge, AutoMergeState::squash());
+        assert_eq!(open.auto_merge.actor.as_deref(), Some("octocat"));
         assert_eq!(open.created_at.as_deref(), Some("2026-07-17T10:00:00Z"));
+        assert_eq!(
+            snapshot.previous_default_oid,
+            Some(CommitOid("previous-default-sha".into()))
+        );
+        assert_eq!(
+            snapshot.merge_candidates[0].freshness,
+            model::MergeCandidateFreshness::Fresh
+        );
+        assert_eq!(
+            snapshot.merge_candidates[0].auto_merge.actor.as_deref(),
+            Some("octocat")
+        );
+        assert_eq!(
+            snapshot.default_branch_movements[0].ownership,
+            model::MovementOwnership::External
+        );
         assert_eq!(open.checks[0].state, CheckState::Success);
         assert_eq!(open.checks[0].provider_state.as_deref(), Some("SUCCESS"));
         let merged = snapshot
@@ -1955,10 +2338,10 @@ mod tests {
         let calls = successful_discovery_calls(&open_prs);
         assert_eq!(
             calls.len(),
-            5,
+            7,
             "discovery command count must remain constant"
         );
-        let merged_command = &calls[4].0;
+        let merged_command = &calls[6].0;
         let projection = merged_command.args.last().unwrap();
         assert!(!projection.contains("statusCheckRollup"));
 
@@ -1992,6 +2375,30 @@ mod tests {
                 .is_empty()
         );
         discovery.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn candidate_freshness_preserves_simultaneous_base_and_head_staleness() {
+        let candidate = model::SyntheticMergeCandidate {
+            git_ref: "refs/pull/12/merge".to_owned(),
+            oid: CommitOid("merge".to_owned()),
+            tree_oid: CommitOid("tree".to_owned()),
+            parents: vec![
+                CommitOid("old-base".to_owned()),
+                CommitOid("old-head".to_owned()),
+            ],
+        };
+
+        let (freshness, stale_base, stale_head, reasons) = classify_candidate(
+            Some(&candidate),
+            &CommitOid("base".to_owned()),
+            &CommitOid("head".to_owned()),
+        );
+
+        assert_eq!(freshness, model::MergeCandidateFreshness::StaleHead);
+        assert!(stale_base);
+        assert!(stale_head);
+        assert_eq!(reasons.len(), 2);
     }
 
     #[test]
@@ -2039,7 +2446,8 @@ mod tests {
     fn rejects_fork_only_active_caravan_heads() {
         let fork_prs = pr_list_json(14, "fork-feature", "someone/widgets", true);
         let mut calls = successful_discovery_calls(&fork_prs);
-        calls.pop(); // merged-history query; active-head validation stops before it
+        calls.pop(); // merged-history query
+        calls.pop(); // lineage/history query; active-head validation stops before it
         let runner = FakeRunner::new(calls);
         let discovery = GitHubDiscovery::new(runner);
 
@@ -2069,12 +2477,20 @@ mod tests {
             ),
             (current_branch_command(), CommandOutput::failure(1, "")),
             (
+                previous_default_command("main"),
+                CommandOutput::failure(128, "unknown revision"),
+            ),
+            (
                 default_branch_command("acme/widgets", "main"),
                 CommandOutput::success(r#"{"object":{"sha":"default-sha"}}"#),
             ),
             (
                 open_pr_command("acme/widgets", 1_000),
                 CommandOutput::success("[]"),
+            ),
+            (
+                merge_candidates_command(&repository(), &[]),
+                CommandOutput::success(r#"{"data":{"repository":{"defaultBranchRef":null}}}"#),
             ),
             (
                 labeled_pr_command("acme/widgets", "merged", "caravan", 100, true),
