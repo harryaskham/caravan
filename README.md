@@ -67,7 +67,7 @@ Domain surface:
 ```text
 cara init
 cara status
-cara check [--tail-pr N | --head-pr N]
+cara check [--pr N] [--tail-pr N | --head-pr N]
 cara new [--create-pr]
 cara join [--tail-pr N | --head-pr N] [--create-pr]
 cara renew | cara rejoin
@@ -81,6 +81,8 @@ cara mcp tools | cara mcp stdio
 cara self-update status | check | run
 cara feedback status | report
 ```
+
+`cara next-candidate` selects the canonical priority/FIFO attempt. Preflight that exact provider candidate with `cara check --pr N` (and optionally `--tail-pr T` or `--head-pr H`) without checking out or mutating a branch, base, label, or auto-merge state. The receipt includes the canonical provider candidate identity/freshness evidence, exact head/base repository and OIDs, draft/labels/auto-merge facts, enrollment and canonical-order state, pairwise conflict paths, and a mechanical `new`, `join`, `repair`, `wait`, or `reject` continuation. Provider/ref races fail closed, and a rejected first attempt is never silently leapfrogged.
 
 First use is always explicit: run `cara status`, then `cara init`. Init atomically
 creates `.caravan/config.yaml` only when absent, verifies repository permission,

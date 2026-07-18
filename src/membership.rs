@@ -837,6 +837,14 @@ fn preflight_eligibility(
                 read::CheckMode::NewCaravan
             },
             current_pr: candidate.number,
+            candidate: candidate.clone(),
+            enrolled: true,
+            canonical_candidate: status.admission.next_candidate == Some(candidate.number),
+            next_action: if request.operation.is_join() {
+                read::CandidateNextAction::Join
+            } else {
+                read::CandidateNextAction::New
+            },
             caravan_id: target
                 .map(|target| target.caravan.id)
                 .or(Some(candidate.number)),
@@ -859,6 +867,7 @@ fn preflight_eligibility(
         virtual_candidate.labels.remove(FORCE_LABEL);
     }
     let check_input = target.map_or_else(CheckInput::default, |target| CheckInput {
+        pr: None,
         tail_pr: target.caravan.tail().map(|number| number.0),
         head_pr: None,
     });

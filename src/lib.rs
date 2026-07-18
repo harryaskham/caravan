@@ -51,7 +51,7 @@ Safe operating loop:
 2. Inspect the canonical automatic-admission order (explicit agent priority,
    then immutable PR createdAt) in status or with `cara next-candidate`; never
    re-sort or leapfrog its first ordered attempt.
-3. Use `cara check`, `new`, or `join` to validate a proposed queue change.
+3. Use `cara check --pr N` to preflight the exact remote candidate (optionally against a tail) without checkout or provider mutation, then follow its `new`, `join`, `repair`, `wait`, or `reject` next action.
 4. Run `cara sync` (or `sync --all`) until it either converges or returns one
    typed decision point.
 5. At a CI decision, optionally use `cara sync --rerun-failed` to rerun only
@@ -187,6 +187,11 @@ pub struct TargetInput {
 /// Input for `cara check`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Args)]
 pub struct CheckInput {
+    /// Exact remote candidate PR. When omitted, use the current checkout's PR.
+    #[arg(long, value_name = "PR")]
+    #[serde(default)]
+    pub pr: Option<u64>,
+
     /// Exact tail PR to check as the proposed merge target.
     #[arg(long, value_name = "PR", conflicts_with = "head_pr")]
     #[serde(default)]
@@ -432,7 +437,7 @@ pub fn build_router() -> ToolRouter<AppContext> {
     );
     router.add_typed_tool_with_output_schema(
         "check",
-        "Validate the current PR/caravan without mutation. Optionally test joining --tail-pr or the resolved tail of --head-pr.",
+        "Preflight an exact remote candidate with --pr, or the current PR when omitted, without checkout or provider mutation. Optionally test joining --tail-pr or the resolved tail of --head-pr; returns exact facts and a mechanical next action.",
         |context: &AppContext, input: CheckInput| read::check(context, &input),
     );
     router.add_typed_tool_with_output_schema(

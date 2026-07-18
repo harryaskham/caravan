@@ -11,7 +11,7 @@ is required or used.
 | repository inspection | `cara status` | envelope | `status` | live discovery, graph, PR/check facts, initialization, canonical priority-then-FIFO attempts |
 | event journal | `cara log` / `cara log -f` | bounded envelope / NDJSON follow | bounded `log` only | common-Git storage, filters, exact IDs, hook receipts, locking, rotation, torn-tail recovery |
 | next admission | `cara next-candidate` | envelope | `next_candidate` | nonmutating canonical first attempt; membership preflight remains required and rejection cannot leapfrog; invalid labels fail closed |
-| eligibility | `cara check [--tail-pr N\|--head-pr N]` | envelope | `check` | active/new/join modes; target forms exclusive |
+| eligibility / remote preflight | `cara check [--pr N] [--tail-pr N\|--head-pr N]` | envelope | `check` | exact provider candidate receipt, active/new/join modes, canonical fail-closed selection, stale-head rejection, next action; target forms exclusive |
 | create caravan | `cara new [--create-pr]` | envelope | `new` | live preflight, label/base, squash auto-merge |
 | renew evicted | `cara renew [--create-pr]` | envelope | `renew` | evicted/force labels removed only after preflight |
 | join tail | `cara join [...]` | envelope | `join` | explicit/dynamic tail, resumable exact receipts |
