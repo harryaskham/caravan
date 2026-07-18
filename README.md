@@ -171,13 +171,17 @@ hooks:
 ```
 
 Cumulative mode rejects fork heads, stale leases, empty/ambiguous ranges, and
-candidate-only merge commits. It fetches exact remote OIDs, simulates the whole
-rebase in a disposable detached worktree, performs a dry-run permission/lease
-preflight, and pushes only with
-`--force-with-lease=refs/heads/<branch>:<old-oid>`. Errors are resumable and do
-not speculatively push a conflicted range. Successful membership output includes
-old/new head and base OIDs, the resulting tree, and the exact lease alongside
-GitHub mutation receipts.
+candidate-only merge commits. Membership rewrites one candidate; `cara sync
+--all` builds every selected caravan head-to-tail, feeding each retained planned
+head into its child. It materializes each generation exactly once in a retained
+detached worktree, then verifies every conflict, PR precondition, remote head,
+dry-run permission, and exact lease across the complete plan before the first
+write. Only independent, disjoint caravans apply concurrently (at most two);
+each caravan remains strictly parent-to-descendant. Pushes use only
+`--force-with-lease=refs/heads/<branch>:<old-oid>`. A mandatory midpoint GitHub
+rediscovery verifies every new head and replaces stale CI facts before normal
+sync convergence. Errors preserve exact plan, completed-prefix, provider, and
+lease receipts and never force-rollback rewritten branches.
 
 GitHub Actions must also be configured to run for non-default PR bases.
 `pull_request.branches` filters match the PR's base branch; a workflow restricted
@@ -187,8 +191,16 @@ to `main` will not run for B targeting A. Cumulative mode therefore requires a g
 dedicated stack/full job can then skip unless `base_ref == 'main'` or the PR has
 the `caravan` label. The `labeled` event closes the race where the base-edit
 `edited` event occurs before Caravan adds its label. Physical ancestry cannot
-override provider workflow filters; opt-in membership fails with
-`rebase_ci_trigger_missing` when this trigger proof is absent.
+override provider workflow filters; opt-in membership and whole-chain sync fail
+with `rebase_ci_trigger_missing` when this trigger proof is absent.
+
+For an existing repository, enable this first on a disposable or paused
+caravan: commit `rebase_on_join: true`, run `cara status`, `cara check`, and then
+one `cara sync --all`; verify the returned plans, leases, rewritten heads, and
+fresh pending CI before widening the rollout. Roll back by reverting the config
+to `rebase_on_join: false`. Do **not** force-push branches back: any successfully
+applied prefix is authoritative and the resumable recovery is rediscovery plus
+the same idempotent sync.
 
 This proves cumulative *tree content*, not stable GitHub check identity. Because
 Caravan heads currently squash-merge, retargeting a child after its parent lands

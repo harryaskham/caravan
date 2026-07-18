@@ -32,6 +32,7 @@ use crate::{AppContext, AppError, SyncInput};
 
 const MAX_SYNC_OPERATION_SECS: u64 = 150;
 const SYNC_BUDGET_MULTIPLIER: u64 = 5;
+const MAX_PARALLEL_REBASE_CHAINS: usize = 2;
 
 /// One observed rolling-head transition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -134,6 +135,12 @@ pub struct SyncOutput {
     /// Exact provider before/after facts for completed remote mutations.
     #[serde(default)]
     pub provider_receipts: Vec<GitHubMutationReceipt>,
+    /// Complete immutable physical-rebase plans approved before the write barrier.
+    #[serde(default)]
+    pub rebase_plans: Vec<crate::physical_rebase::RebasePlan>,
+    /// Exact old/new head and lease facts for applied branch generations.
+    #[serde(default)]
+    pub rebase_receipts: Vec<crate::physical_rebase::RebaseReceipt>,
     /// Merged branch-local predecessor that selected the active caravan.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub historical_predecessor: Option<PrNumber>,
@@ -161,6 +168,18 @@ pub struct SyncOutput {
 
 /// Provider facts and primitives required by sync policy.
 pub trait SyncProvider {
+    fn verify_pull_request(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+    ) -> Result<PullRequestSnapshot, MutationError>;
+
+    fn refetch_pull_request(
+        &self,
+        repository: &RepositoryId,
+        number: PrNumber,
+    ) -> Result<PullRequestSnapshot, MutationError>;
+
     fn verify_branch_head(
         &self,
         repository: &RepositoryId,
@@ -235,6 +254,22 @@ pub trait SyncProvider {
 }
 
 impl<R: crate::command::CommandRunner> SyncProvider for GitHubMutationAdapter<R> {
+    fn verify_pull_request(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+    ) -> Result<PullRequestSnapshot, MutationError> {
+        self.verify_precondition(repository, expected)
+    }
+
+    fn refetch_pull_request(
+        &self,
+        repository: &RepositoryId,
+        number: PrNumber,
+    ) -> Result<PullRequestSnapshot, MutationError> {
+        self.refetch_pull_request(repository, number)
+    }
+
     fn verify_branch_head(
         &self,
         repository: &RepositoryId,
@@ -366,8 +401,358 @@ fn sync_operation_budget(context: &AppContext) -> Duration {
     )
 }
 
+struct PreparedChain {
+    caravan: Caravan,
+    members: Vec<crate::physical_rebase::PreparedRebase>,
+}
+
+#[derive(Default)]
+struct PhysicalRebuildOutcome {
+    plans: Vec<crate::physical_rebase::RebasePlan>,
+    receipts: Vec<crate::physical_rebase::RebaseReceipt>,
+    provider_receipts: Vec<GitHubMutationReceipt>,
+    steps: Vec<MutationStep>,
+}
+
+fn selected_unpaused_caravans(status: &StatusOutput, all: bool) -> Result<Vec<Caravan>, AppError> {
+    let mut selected = select_caravans(status, all)?;
+    selected.retain(|caravan| {
+        !status.pauses.iter().any(|pause| {
+            pause.state != crate::pause::PauseState::Stale
+                && pause.record.caravan_head == caravan.id
+        })
+    });
+    Ok(selected)
+}
+
 fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn prepare_physical_chains(
+    context: &AppContext,
+    status: &StatusOutput,
+    all: bool,
+    provider: &impl SyncProvider,
+    operation_deadline: Instant,
+) -> Result<(Vec<PreparedChain>, SyncProgress), AppError> {
+    let selected = selected_unpaused_caravans(status, all)?;
+    let progress = SyncProgress::new(status, selected.iter().map(|caravan| caravan.id).collect());
+    preflight_repository(provider, status, &progress)?;
+    validate_rebase_preflight_graph(status, &selected, &progress)?;
+    let timeout = Duration::from_secs(context.config.command_timeout_secs);
+    let mut chains = Vec::with_capacity(selected.len());
+    for caravan in selected {
+        let mut target = crate::physical_rebase::PlannedBase::Remote(
+            status.analysis.fleet.default_branch.clone(),
+        );
+        let predecessor = merged_predecessor(status, &caravan);
+        let mut members = Vec::with_capacity(caravan.members.len());
+        for (index, number) in caravan.members.iter().enumerate() {
+            let candidate = status
+                .analysis
+                .pull_requests
+                .get(number)
+                .expect("selected caravan member has provider facts");
+            let range_source = if index == 0 {
+                predecessor.map_or_else(
+                    || crate::physical_rebase::PlannedRangeBase::RemoteBranch {
+                        branch: candidate.base.clone(),
+                    },
+                    |merged| crate::physical_rebase::PlannedRangeBase::PullRequestHead {
+                        pr: merged.number,
+                        branch: candidate.base.clone(),
+                    },
+                )
+            } else {
+                crate::physical_rebase::PlannedRangeBase::RemoteBranch {
+                    branch: candidate.base.clone(),
+                }
+            };
+            let prepared = match crate::physical_rebase::prepare_candidate(
+                &context.repository_path,
+                &status.repository,
+                candidate,
+                range_source,
+                target,
+                &status.analysis.fleet.default_branch,
+                crate::physical_rebase::RebaseExecutionBudget::new(timeout)
+                    .with_deadline(operation_deadline),
+            ) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    let plans =
+                        chains
+                            .iter()
+                            .flat_map(|chain: &PreparedChain| {
+                                chain.members.iter().map(|item| item.plan.clone())
+                            })
+                            .chain(members.iter().map(
+                                |item: &crate::physical_rebase::PreparedRebase| item.plan.clone(),
+                            ))
+                            .collect();
+                    return Err(attach_physical_rebuild(
+                        error,
+                        &PhysicalRebuildOutcome {
+                            plans,
+                            ..PhysicalRebuildOutcome::default()
+                        },
+                    ));
+                }
+            };
+            target = crate::physical_rebase::PlannedBase::Simulated(crate::model::BranchSnapshot {
+                repository: status.repository.clone(),
+                name: candidate.head.name.clone(),
+                oid: prepared.plan.new_head_oid.clone(),
+            });
+            members.push(prepared);
+        }
+        chains.push(PreparedChain { caravan, members });
+    }
+    if let Err(error) =
+        verify_physical_write_barrier(context, status, provider, &chains, operation_deadline)
+    {
+        let plans = chains
+            .iter()
+            .flat_map(|chain| chain.members.iter().map(|item| item.plan.clone()))
+            .collect();
+        return Err(attach_physical_rebuild(
+            error,
+            &PhysicalRebuildOutcome {
+                plans,
+                ..PhysicalRebuildOutcome::default()
+            },
+        ));
+    }
+    Ok((chains, progress))
+}
+
+fn validate_rebase_preflight_graph(
+    status: &StatusOutput,
+    selected: &[Caravan],
+    progress: &SyncProgress,
+) -> Result<(), AppError> {
+    for problem in &status.analysis.fleet.problems {
+        let auto_merge = problem.kind == GraphProblemKind::AutoMergeInvariant
+            && problem.prs.iter().all(|number| {
+                selected
+                    .iter()
+                    .any(|caravan| caravan.members.contains(number))
+            });
+        let advancement = problem.kind == GraphProblemKind::DanglingBase
+            && recoverable_dangling_problem(status, selected, problem);
+        let rebase = problem.kind == GraphProblemKind::Incompatible
+            && selected.iter().any(|caravan| {
+                problem
+                    .prs
+                    .iter()
+                    .all(|number| caravan.members.contains(number))
+                    && (problem.prs.len() == 1
+                        || caravan.members.windows(2).any(|pair| {
+                            problem.prs.as_slice() == pair
+                                || problem.prs.as_slice() == [pair[1], pair[0]]
+                        }))
+            });
+        if auto_merge || advancement || rebase {
+            continue;
+        }
+        return Err(decision_error(
+            &decision_for_problem(problem, status, progress),
+            progress,
+        ));
+    }
+    Ok(())
+}
+
+fn verify_physical_write_barrier(
+    context: &AppContext,
+    status: &StatusOutput,
+    provider: &impl SyncProvider,
+    chains: &[PreparedChain],
+    _operation_deadline: Instant,
+) -> Result<(), AppError> {
+    let timeout = Duration::from_secs(context.config.command_timeout_secs);
+    crate::physical_rebase::verify_branch_snapshot(
+        &context.repository_path,
+        &status.analysis.fleet.default_branch,
+        timeout,
+    )?;
+    let mut branches = BTreeSet::new();
+    for chain in chains {
+        for prepared in &chain.members {
+            if !branches.insert(prepared.plan.branch.clone()) {
+                return Err(AppError::structured(
+                    ErrorCategory::Validation,
+                    "rebase_overlapping_branch_sets",
+                    "selected caravans contain the same physical branch",
+                    Some(
+                        json!({"branch": prepared.plan.branch, "plans": chains.iter().flat_map(|chain| chain.members.iter().map(|item| &item.plan)).collect::<Vec<_>>() }),
+                    ),
+                ));
+            }
+            let expected = PullRequestPrecondition::from(
+                status
+                    .analysis
+                    .pull_requests
+                    .get(&prepared.plan.pr)
+                    .expect("planned PR has initial provider facts"),
+            );
+            provider
+                .verify_pull_request(&status.repository, &expected)
+                .map_err(|error| {
+                    mutation_error(
+                        &error,
+                        &SyncProgress::new(status, Vec::new()),
+                        Some(prepared.plan.pr),
+                    )
+                })?;
+            crate::physical_rebase::verify_prepared(prepared)?;
+        }
+    }
+    Ok(())
+}
+
+fn apply_physical_chains(
+    status: &StatusOutput,
+    provider: &impl SyncProvider,
+    chains: &[PreparedChain],
+    mut progress: SyncProgress,
+) -> Result<PhysicalRebuildOutcome, AppError> {
+    let plans = chains
+        .iter()
+        .flat_map(|chain| chain.members.iter().map(|prepared| prepared.plan.clone()))
+        .collect::<Vec<_>>();
+    let mut outcome = PhysicalRebuildOutcome {
+        plans,
+        ..PhysicalRebuildOutcome::default()
+    };
+    for chain in chains {
+        for prepared in &chain.members {
+            if let Err(error) =
+                progress.ensure_auto_merge_disabled(provider, &status.repository, prepared.plan.pr)
+            {
+                outcome
+                    .provider_receipts
+                    .clone_from(&progress.provider_receipts);
+                outcome.steps.clone_from(&progress.steps);
+                return Err(attach_physical_rebuild(error, &outcome));
+            }
+        }
+    }
+    outcome
+        .provider_receipts
+        .clone_from(&progress.provider_receipts);
+    outcome.steps.clone_from(&progress.steps);
+    for batch in chains.chunks(MAX_PARALLEL_REBASE_CHAINS) {
+        let results = std::thread::scope(|scope| {
+            batch
+                .iter()
+                .map(|chain| scope.spawn(|| apply_prepared_chain(chain)))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(std::thread::ScopedJoinHandle::join)
+                .collect::<Vec<_>>()
+        });
+        let mut first_error = None;
+        for (chain, result) in batch.iter().zip(results) {
+            match result {
+                Ok((receipts, error)) => {
+                    outcome.receipts.extend(receipts);
+                    if first_error.is_none() {
+                        first_error = error;
+                    }
+                }
+                Err(_) if first_error.is_none() => {
+                    first_error = Some(AppError::structured(
+                        ErrorCategory::ExecutionFailure,
+                        "rebase_worker_panicked",
+                        "bounded independent-caravan rebase worker panicked",
+                        Some(json!({"caravan": chain.caravan.id, "resumable": true})),
+                    ));
+                }
+                Err(_) => {}
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(attach_physical_rebuild(error, &outcome));
+        }
+    }
+    for receipt in &outcome.receipts {
+        let observed = provider
+            .refetch_pull_request(&status.repository, receipt.pr)
+            .map_err(|error| {
+                attach_physical_rebuild(
+                    mutation_error(&error, &progress, Some(receipt.pr)),
+                    &outcome,
+                )
+            })?;
+        if observed.head.oid != receipt.new_head_oid {
+            return Err(attach_physical_rebuild(
+                AppError::structured(
+                    ErrorCategory::Validation,
+                    "rebase_midpoint_head_stale",
+                    "provider did not expose the exact applied branch generation",
+                    Some(
+                        json!({"receipt": receipt, "observed_head": observed.head.oid, "resumable": true}),
+                    ),
+                ),
+                &outcome,
+            ));
+        }
+        progress.current.insert(receipt.pr, observed);
+        outcome.steps.push(MutationStep {
+            kind: MutationKind::RebaseBranch,
+            state: if receipt.already_satisfied {
+                MutationStepState::AlreadySatisfied
+            } else {
+                MutationStepState::Completed
+            },
+            pr: Some(receipt.pr),
+            summary: format!(
+                "rebased branch {} from {} to {} onto {} under exact lease",
+                receipt.branch, receipt.old_head_oid, receipt.new_head_oid, receipt.new_base_oid
+            ),
+        });
+    }
+    Ok(outcome)
+}
+
+fn apply_prepared_chain(
+    chain: &PreparedChain,
+) -> (Vec<crate::physical_rebase::RebaseReceipt>, Option<AppError>) {
+    let mut receipts = Vec::with_capacity(chain.members.len());
+    for prepared in &chain.members {
+        match crate::physical_rebase::apply_prepared(prepared) {
+            Ok(receipt) => receipts.push(receipt),
+            Err(error) => return (receipts, Some(error)),
+        }
+    }
+    (receipts, None)
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn attach_physical_rebuild(error: AppError, outcome: &PhysicalRebuildOutcome) -> AppError {
+    let mut details = error.details().unwrap_or_else(|| json!({}));
+    if let Some(object) = details.as_object_mut() {
+        object.insert("rebase_plans".to_owned(), json!(outcome.plans));
+        object.insert("rebase_receipts".to_owned(), json!(outcome.receipts));
+        object.insert(
+            "provider_receipts".to_owned(),
+            json!(outcome.provider_receipts),
+        );
+        object.insert("completed_steps".to_owned(), json!(outcome.steps));
+        object.insert("resumable".to_owned(), json!(true));
+        object.insert(
+            "next".to_owned(),
+            json!("rediscover provider state and rerun `cara sync --all`"),
+        );
+    }
+    AppError::structured(
+        error.category(),
+        error.code(),
+        error.message(),
+        Some(details),
+    )
 }
 
 fn checkout_for_decision(
@@ -536,7 +921,7 @@ fn sync_with_lock(
     )?;
     let timeout = Duration::from_secs(context.config.command_timeout_secs);
     let initial_status_started = Instant::now();
-    let status = read::status_with_deadline(context, operation_deadline)?;
+    let mut status = read::status_with_deadline(context, operation_deadline)?;
     let initial_status_elapsed = initial_status_started.elapsed();
     crate::initialization::require_ready(&status.initialization)?;
     let runner = crate::command::ProcessRunner::in_directory(&context.repository_path)
@@ -551,6 +936,74 @@ fn sync_with_lock(
         &runner,
     )?;
     let provider = GitHubMutationAdapter::new(runner);
+    let convergence_started = Instant::now();
+    let mut physical_rebuild = PhysicalRebuildOutcome::default();
+    if context.config.rebase_on_join {
+        lock.checkpoint(
+            "physical_rebase_planning_in_flight",
+            json!({
+                "operation": "sync",
+                "all": input.all,
+                "default_branch": status.analysis.fleet.default_branch,
+                "write_barrier": "no provider or branch writes before all selected plans verify",
+            }),
+            false,
+        )?;
+        let (prepared, progress) =
+            prepare_physical_chains(context, &status, input.all, &provider, operation_deadline)?;
+        let plans = prepared
+            .iter()
+            .flat_map(|chain| chain.members.iter().map(|item| item.plan.clone()))
+            .collect::<Vec<_>>();
+        lock.checkpoint(
+            "physical_rebase_global_preflight_complete",
+            json!({"rebase_plans": plans, "provider_writes": 0, "branch_writes": 0}),
+            false,
+        )?;
+        physical_rebuild = apply_physical_chains(&status, &provider, &prepared, progress)?;
+        lock.checkpoint(
+            "physical_rebase_applied",
+            json!({
+                "rebase_plans": &physical_rebuild.plans,
+                "rebase_receipts": &physical_rebuild.receipts,
+                "provider_receipts": &physical_rebuild.provider_receipts,
+            }),
+            false,
+        )?;
+        let midpoint = read::status_with_deadline(context, operation_deadline)
+            .map_err(|error| attach_physical_rebuild(error, &physical_rebuild))?;
+        for receipt in &physical_rebuild.receipts {
+            let observed = midpoint
+                .analysis
+                .pull_requests
+                .get(&receipt.pr)
+                .ok_or_else(|| {
+                    attach_physical_rebuild(
+                        AppError::structured(
+                            ErrorCategory::Validation,
+                            "rebase_midpoint_pr_missing",
+                            "rewritten PR disappeared during mandatory midpoint rediscovery",
+                            Some(json!({"receipt": receipt, "resumable": true})),
+                        ),
+                        &physical_rebuild,
+                    )
+                })?;
+            if observed.head.oid != receipt.new_head_oid {
+                return Err(attach_physical_rebuild(
+                    AppError::structured(
+                        ErrorCategory::Validation,
+                        "rebase_midpoint_head_stale",
+                        "midpoint discovery did not contain the exact planned head",
+                        Some(
+                            json!({"receipt": receipt, "observed_head": observed.head.oid, "resumable": true}),
+                        ),
+                    ),
+                    &physical_rebuild,
+                ));
+            }
+        }
+        status = midpoint;
+    }
     lock.checkpoint(
         "provider_convergence_in_flight",
         json!({
@@ -567,14 +1020,23 @@ fn sync_with_lock(
         }),
         true,
     )?;
-    let convergence_started = Instant::now();
-    let progress = execute(
+    let mut progress = execute(
         &status,
         &provider,
         input.all,
         input.rerun_failed,
         context.config.force_merge,
     )?;
+    if context.config.rebase_on_join {
+        physical_rebuild.steps.append(&mut progress.steps);
+        progress.steps = physical_rebuild.steps;
+        physical_rebuild
+            .provider_receipts
+            .append(&mut progress.provider_receipts);
+        progress.provider_receipts = physical_rebuild.provider_receipts;
+        progress.rebase_plans = physical_rebuild.plans;
+        progress.rebase_receipts = physical_rebuild.receipts;
+    }
     let convergence_elapsed = convergence_started.elapsed();
     lock.checkpoint(
         "provider_converged",
@@ -633,6 +1095,8 @@ fn sync_with_lock(
         }),
         lock_recovery,
         provider_receipts: progress.provider_receipts,
+        rebase_plans: progress.rebase_plans,
+        rebase_receipts: progress.rebase_receipts,
         historical_predecessor: read::historical_predecessor(&status),
         synchronized_caravans: progress.synchronized_caravans,
         paused_caravans: progress.paused_caravans,
@@ -951,6 +1415,8 @@ fn head_is_conflict_free_with_default(status: &StatusOutput, head: &PullRequestS
 fn sync_checkpoint_evidence(progress: &SyncProgress) -> Value {
     json!({
         "operation_receipt": progress.operation_receipt(),
+        "rebase_plans": progress.rebase_plans,
+        "rebase_receipts": progress.rebase_receipts,
         "provider_receipts": progress.provider_receipts.iter().map(|receipt| json!({
             "kind": receipt.kind,
             "before": receipt.before.as_ref().map(PullRequestPrecondition::from),
@@ -1703,6 +2169,8 @@ struct SyncProgress {
     repository: RepositoryId,
     steps: Vec<MutationStep>,
     provider_receipts: Vec<GitHubMutationReceipt>,
+    rebase_plans: Vec<crate::physical_rebase::RebasePlan>,
+    rebase_receipts: Vec<crate::physical_rebase::RebaseReceipt>,
     synchronized_caravans: Vec<PrNumber>,
     paused_caravans: Vec<crate::pause::PauseStatus>,
     head_advancements: Vec<HeadAdvancement>,
@@ -1719,6 +2187,8 @@ impl SyncProgress {
             repository: status.repository.clone(),
             steps: Vec::new(),
             provider_receipts: Vec::new(),
+            rebase_plans: Vec::new(),
+            rebase_receipts: Vec::new(),
             synchronized_caravans,
             paused_caravans: Vec::new(),
             head_advancements: Vec::new(),
@@ -2227,6 +2697,36 @@ mod tests {
     }
 
     impl SyncProvider for FakeProvider {
+        fn verify_pull_request(
+            &self,
+            _repository: &RepositoryId,
+            expected: &PullRequestPrecondition,
+        ) -> Result<PullRequestSnapshot, MutationError> {
+            let actual = self
+                .pulls
+                .borrow()
+                .get(&expected.number)
+                .cloned()
+                .expect("fake PR");
+            let actual_precondition = PullRequestPrecondition::from(&actual);
+            if actual_precondition != *expected {
+                return Err(MutationError::StalePrecondition {
+                    expected: Box::new(expected.clone()),
+                    actual: Box::new(actual_precondition),
+                    changed_fields: vec!["fake_race".to_owned()],
+                });
+            }
+            Ok(actual)
+        }
+
+        fn refetch_pull_request(
+            &self,
+            _repository: &RepositoryId,
+            number: PrNumber,
+        ) -> Result<PullRequestSnapshot, MutationError> {
+            Ok(self.pulls.borrow()[&number].clone())
+        }
+
         fn verify_branch_head(
             &self,
             _repository: &RepositoryId,

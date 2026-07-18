@@ -315,15 +315,30 @@ hooks:
 Unknown config fields are errors. Secrets belong in environment variables, not committed YAML or hook metadata.
 
 `rebase_on_join` is a strict, explicit history-rewrite opt-in and defaults to
-`false`, preserving the virtual compatibility contract above. When enabled,
-membership rebases the candidate-only linear range from its exact old base onto
-the exact selected predecessor (or default for a new head) in an isolated
-temporary worktree. Exact remote OIDs, same-repository ownership, a clean linear
-range, conflict-free simulation, push permission, and the old head lease are
-proved before `git push --force-with-lease=refs/heads/<branch>:<old-oid>`.
-A moved branch, merge commit, ambiguous range, or conflict is a typed resumable
-decision and is never forced. The command rediscovers GitHub after a push and
-returns old/new OID and tree evidence together with provider receipts.
+`false`, preserving the virtual compatibility contract above. Status and check
+always expose the effective mode and config path; a disabled sync conflict gives
+the exact `rebase_on_join: true` project-config action instead of implying a
+manual hand-rebase.
+
+When enabled, membership rebases one candidate-only linear range.
+`sync --all` plans each selected caravan head-to-tail from exact discovered
+facts: the head targets the exact default OID and every descendant targets the
+retained, simulated new head of its parent. Rebase objects are materialized once
+and retained through apply; they are never recomputed. Every edge conflict,
+workflow trigger, PR precondition, remote old head, branch-set disjointness,
+dry-run permission, and exact lease is verified globally before provider or
+branch writes. Auto-merge is disabled for all selected members only after that
+barrier. Independent caravans may apply with bounded parallelism; each chain is
+strictly parent-to-descendant. A mandatory midpoint rediscovery verifies every
+new head and refreshes invalidated CI before ordinary sync policy runs.
+
+A moved branch, merge commit, ambiguous range, conflict, or apply-time lease race
+is a typed resumable decision and is never forced. Global preflight failure has
+zero writes. Apply-time failure preserves the exact successfully rebuilt prefix
+and skips its descendants; independent in-flight chains may complete. Recovery
+never force-rolls back: rediscover GitHub and rerun the same idempotent sync.
+Outputs and errors retain old/new head/base/tree, workflow proof, exact lease,
+provider receipts, and completed physical-rebase receipts.
 
 Provider CI configuration remains a repository precondition. GitHub Actions
 `pull_request.branches` filters apply to the PR base: a workflow restricted to

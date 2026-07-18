@@ -648,6 +648,18 @@ fn render_sync(output: &caravan::sync::SyncOutput) -> String {
             advancement.merged_predecessor, advancement.new_head
         );
     }
+    for receipt in &output.rebase_receipts {
+        let _ = writeln!(
+            text,
+            "  rebase #{} {}: {} -> {} onto {} ({})",
+            receipt.pr,
+            receipt.branch,
+            receipt.old_head_oid,
+            receipt.new_head_oid,
+            receipt.new_base_oid,
+            receipt.lease
+        );
+    }
     for observation in &output.ci {
         let _ = writeln!(
             text,

@@ -211,6 +211,8 @@ mod tests {
                 timing: None,
                 lock_recovery: None,
                 provider_receipts: Vec::new(),
+                rebase_plans: Vec::new(),
+                rebase_receipts: Vec::new(),
                 historical_predecessor: None,
                 synchronized_caravans: Vec::new(),
                 head_advancements: Vec::new(),

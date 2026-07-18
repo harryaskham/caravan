@@ -498,6 +498,8 @@ pub enum MutationKind {
     Comment,
     EnableAutoMerge,
     DisableAutoMerge,
+    /// Exact planned branch generation pushed under force-with-lease.
+    RebaseBranch,
     RerunChecks,
     SquashMerge,
     Checkout,
