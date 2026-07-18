@@ -73,6 +73,9 @@ cara join [--tail-pr N | --head-pr N] [--create-pr]
 cara renew | cara rejoin
 cara show | cara next | cara prev
 cara sync [--all] [--rerun-failed] | cara loop [--once]
+cara repair start --pr N [--target-pr T]
+cara repair status --session ID | cara repair continue --session ID
+cara repair abort --session ID --confirm
 cara evict [--pr N] --reason TEXT
 cara split [--pr N]
 cara van list | cara van next | cara van prev
@@ -99,6 +102,34 @@ open caravan PR.
 
 Use `cara help` for the agent operating loop and recovery rules. Use `--json`
 for stable `mcp-cli` envelopes.
+
+## Managed sync repair
+
+When sync returns a typed head or link conflict, do not create a nested
+worktree, update a local PR ref, or hand-push a guessed generation. Start an
+exact Cara-owned session instead:
+
+```sh
+cara repair start --pr 1962                 # merge current default
+cara repair start --pr 1959 --target-pr 1962 # merge exact predecessor
+cara repair status --session pr-1962-<generation>
+# edit and stage only the reported conflict paths inside `workspace`
+cara repair continue --session pr-1962-<generation>
+```
+
+Repair uses an independent provider-owned clone below Git's common Caravan
+metadata, so a dirty caller checkout, a daemon-internal `origin`, and locally
+diverged PR refs are irrelevant and remain untouched. The manifest persists the
+exact provider head and target, allowed conflict paths, mechanically staged
+baseline, config path, lifecycle state, and publication receipt. Continue
+rejects unstaged/untracked files, unresolved markers, edits outside the typed
+conflict scope, changed parents, and moved provider heads. It creates the exact
+merge commit itself, publishes only by ordinary non-force fast-forward, verifies
+the provider ref, and resumes `sync --all` from the clean managed workspace.
+Interrupted committed or published sessions resume idempotently; nonterminal
+workspaces are preserved rather than deleted. After inspecting status, an
+operator can explicitly remove abandoned local state with `repair abort
+--session ID --confirm`; abort never changes provider state.
 
 ## Releases and self-update
 

@@ -20,6 +20,7 @@ pub mod operation_lock;
 pub mod pause;
 pub mod physical_rebase;
 pub mod read;
+pub mod repair;
 pub mod reshape;
 pub mod sync;
 
@@ -54,10 +55,14 @@ Safe operating loop:
 3. Use `cara check --pr N` to preflight the exact remote candidate (optionally against a tail) without checkout or provider mutation, then follow its `new`, `join`, `repair`, `wait`, or `reject` next action.
 4. Run `cara sync` (or `sync --all`) until it either converges or returns one
    typed decision point.
-5. At a CI decision, optionally use `cara sync --rerun-failed` to rerun only
+5. At a repair decision, use `cara repair start --pr N [--target-pr T]` to
+   enter a Cara-owned exact-head workspace. Resolve only its typed conflicts,
+   stage them, and use `cara repair continue --session ID`; never create a raw
+   nested worktree, update a branch ref, or force-push.
+6. At a CI decision, optionally use `cara sync --rerun-failed` to rerun only
    exact failed workflow runs. Otherwise repair/push, evict, split, renew, or
    rejoin; then rerun the same sync.
-6. For an incident/maintenance hold, run explicit `cara pause` with actor and
+7. For an incident/maintenance hold, run explicit `cara pause` with actor and
    reason. Expiry never resumes it. After recovery, only an audited `cara resume`
    may revalidate exact facts and restore squash auto-merge.
 
@@ -501,6 +506,26 @@ pub fn build_router() -> ToolRouter<AppContext> {
         "sync",
         "Idempotently synchronize one or all caravans under optimistic preconditions. Intentionally paused caravans return stable no-op receipts and are skipped by sync-all.",
         |context: &AppContext, input: SyncInput| sync::sync(context, &input),
+    );
+    router.add_typed_tool_with_output_schema(
+        "repair_start",
+        "Create or reuse a Cara-owned isolated exact-head workspace for one typed sync repair. Starts a non-committing exact-target merge without changing the caller checkout, provider branch, labels, or bases.",
+        |context: &AppContext, input: repair::RepairStartInput| repair::start(context, &input),
+    );
+    router.add_typed_tool_with_output_schema(
+        "repair_continue",
+        "Verify staged conflict resolution stayed inside the typed path scope, recheck the exact provider head, create an exact-parent merge commit, publish by ordinary non-force fast-forward, and resume sync-all from the managed workspace.",
+        |context: &AppContext, input: repair::RepairContinueInput| repair::continue_session(context, &input),
+    );
+    router.add_typed_tool_with_output_schema(
+        "repair_status",
+        "Inspect one persisted Cara-owned repair workspace and its exact head/target/conflict/publication evidence without mutation.",
+        |context: &AppContext, input: repair::RepairStatusInput| repair::status(context, &input),
+    );
+    router.add_typed_tool_with_output_schema(
+        "repair_abort",
+        "After explicit confirmation, remove one reviewed local repair workspace/session. Never changes provider refs, branches, labels, or PR state.",
+        |context: &AppContext, input: repair::RepairAbortInput| repair::abort(context, &input),
     );
     router.add_typed_tool_with_output_schema(
         "evict",

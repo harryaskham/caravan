@@ -3,18 +3,19 @@
 use std::fmt::Write as _;
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use caravan::{
-    build_router, feedback_config, feedback_configuration_error, feedback_panic_config,
-    updater_config, AppContext, AppError, CheckInput, CreateInput, EvictInput, JoinInput,
+    AGENT_HELP, AppContext, AppError, CheckInput, CreateInput, EvictInput, JoinInput,
     LockRecoverInput, LockStatusInput, LoopInput, PauseInput, ResumeInput, SplitInput, SyncInput,
-    AGENT_HELP, TOOL_NAME,
+    TOOL_NAME, build_router, feedback_config, feedback_configuration_error, feedback_panic_config,
+    repair::{RepairAbortInput, RepairContinueInput, RepairStartInput, RepairStatusInput},
+    updater_config,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use feedback_cli::{FeedbackEvent, FeedbackKind, Reporter, Severity};
-use mcp_cli::{write_json_result, McpServer, StdioServerConfig, StructuredError};
+use mcp_cli::{McpServer, StdioServerConfig, StructuredError, write_json_result};
 use serde::Serialize;
 
 #[derive(Debug, Parser)]
@@ -71,6 +72,9 @@ enum Command {
     Resume(ResumeInput),
     /// Idempotently synchronize one or all caravans until a decision point.
     Sync(SyncInput),
+    /// Prepare, inspect, or continue a Cara-owned isolated repair workspace.
+    #[command(subcommand)]
+    Repair(RepairCommand),
     /// Evict a PR and safely reconnect its child when compatible.
     Evict(EvictInput),
     /// Split before a PR, making it a new caravan head.
@@ -121,6 +125,18 @@ enum LockCommand {
     Status(LockStatusInput),
     /// Remove only a verified-stale lock after explicit confirmation.
     Recover(LockRecoverInput),
+}
+
+#[derive(Debug, Subcommand)]
+enum RepairCommand {
+    /// Create or reuse an isolated exact-head repair workspace.
+    Start(RepairStartInput),
+    /// Verify, non-force publish, and resume sync-all.
+    Continue(RepairContinueInput),
+    /// Inspect persisted repair evidence without mutation.
+    Status(RepairStatusInput),
+    /// Explicitly remove one reviewed local repair workspace/session.
+    Abort(RepairAbortInput),
 }
 
 #[derive(Debug, Subcommand)]
@@ -252,6 +268,7 @@ fn run(cli: &Cli) -> Result<(), i32> {
         Command::Pause(input) => run_pause(cli, input),
         Command::Resume(input) => run_resume(cli, input),
         Command::Sync(input) => run_sync(cli, input),
+        Command::Repair(command) => run_repair(cli, command),
         Command::Evict(input) => run_evict(cli, input),
         Command::Split(input) => run_split(cli, input),
         Command::Loop(input) => run_loop(cli, input),
@@ -525,6 +542,106 @@ fn run_sync(cli: &Cli, input: &SyncInput) -> Result<(), i32> {
             Ok(())
         }
         Err(error) => emit_human_error(error),
+    }
+}
+
+fn run_repair(cli: &Cli, command: &RepairCommand) -> Result<(), i32> {
+    let context = load_context(cli)?;
+    match command {
+        RepairCommand::Start(input) => {
+            let result = caravan::repair::start(&context, input);
+            if cli.json {
+                return emit_result(true, result);
+            }
+            match result {
+                Ok(output) => {
+                    println!(
+                        "repair {}: PR #{} {} -> {} in {}",
+                        output.repair.session,
+                        output.repair.pr,
+                        output.repair.head.oid,
+                        output.repair.target.oid,
+                        output.repair.workspace
+                    );
+                    if output.repair.conflicting_paths.is_empty() {
+                        println!("  merge prepared without textual conflicts");
+                    } else {
+                        println!(
+                            "  resolve and stage: {}",
+                            output.repair.conflicting_paths.join(", ")
+                        );
+                    }
+                    println!("  {}", output.next);
+                    Ok(())
+                }
+                Err(error) => emit_human_error(error),
+            }
+        }
+        RepairCommand::Continue(input) => {
+            let result = caravan::repair::continue_session(&context, input);
+            if cli.json {
+                return emit_result(true, result);
+            }
+            match result {
+                Ok(output) => {
+                    if let Some(receipt) = &output.publication {
+                        println!(
+                            "repair {} published {} -> {} by non-force fast-forward",
+                            output.repair.session, receipt.old_head, receipt.new_head
+                        );
+                    }
+                    if output.sync.is_some() {
+                        println!("  sync-all resumed and converged");
+                    }
+                    println!("  {}", output.next);
+                    Ok(())
+                }
+                Err(error) => emit_human_error(error),
+            }
+        }
+        RepairCommand::Status(input) => {
+            let result = caravan::repair::status(&context, input);
+            if cli.json {
+                return emit_result(true, result);
+            }
+            match result {
+                Ok(repair) => {
+                    println!(
+                        "repair {}: {:?} PR #{} {} -> {} workspace={}",
+                        repair.session,
+                        repair.state,
+                        repair.pr,
+                        repair.head.oid,
+                        repair.target.oid,
+                        repair.workspace
+                    );
+                    if !repair.conflicting_paths.is_empty() {
+                        println!("  conflicts: {}", repair.conflicting_paths.join(", "));
+                    }
+                    Ok(())
+                }
+                Err(error) => emit_human_error(error),
+            }
+        }
+        RepairCommand::Abort(input) => {
+            let result = caravan::repair::abort(&context, input);
+            if cli.json {
+                return emit_result(true, result);
+            }
+            match result {
+                Ok(output) => {
+                    println!(
+                        "repair {} aborted: PR #{} local workspace removed={} provider_mutated={}",
+                        output.session,
+                        output.pr,
+                        output.workspace_removed,
+                        output.provider_mutated
+                    );
+                    Ok(())
+                }
+                Err(error) => emit_human_error(error),
+            }
+        }
     }
 }
 
@@ -943,7 +1060,13 @@ fn render_check(output: &caravan::read::CheckOutput) -> String {
         output.head_repository_owner,
         !output.candidate.cross_repository,
         output.candidate.draft,
-        output.candidate.labels.iter().cloned().collect::<Vec<_>>().join(","),
+        output
+            .candidate
+            .labels
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(","),
         output.candidate.auto_merge.enabled,
         output.enrolled,
         output.canonical_candidate,
@@ -1238,6 +1361,39 @@ mod tests {
         };
         assert_eq!(input.pr, Some(41));
         assert_eq!(input.tail_pr, Some(40));
+    }
+
+    #[test]
+    fn repair_commands_require_exact_session_and_pr_inputs() {
+        let start = Cli::try_parse_from([
+            "cara",
+            "repair",
+            "start",
+            "--pr",
+            "1962",
+            "--target-pr",
+            "1972",
+        ])
+        .expect("repair start parses");
+        let Command::Repair(RepairCommand::Start(input)) = start.command else {
+            panic!("expected repair start");
+        };
+        assert_eq!(input.pr, 1962);
+        assert_eq!(input.target_pr, Some(1972));
+
+        let continuation = Cli::try_parse_from([
+            "cara",
+            "repair",
+            "continue",
+            "--session",
+            "pr-1962-deadbeef",
+        ])
+        .expect("repair continue parses");
+        let Command::Repair(RepairCommand::Continue(input)) = continuation.command else {
+            panic!("expected repair continue");
+        };
+        assert_eq!(input.session, "pr-1962-deadbeef");
+        assert!(!input.no_sync);
     }
 
     #[test]

@@ -159,6 +159,10 @@ Splitting retargets the selected non-head to the default branch, making it a new
 
 - `cara sync` — synchronize the current caravan.
 - `cara sync --all` — synchronize every non-paused caravan in deterministic head order.
+- `cara repair start --pr N [--target-pr T]` — create or reuse a durable isolated provider-owned workspace at PR `N`'s exact head, and start an exact-target non-committing merge. The target is current default when omitted.
+- `cara repair status --session ID` — inspect the persisted exact head/target/conflict/workspace/publication receipt without mutation.
+- `cara repair continue --session ID [--no-sync]` — verify and commit only the staged typed conflict resolution, publish by non-force fast-forward under an exact remote-head check, then resume `sync --all` unless explicitly suppressed.
+- `cara repair abort --session ID --confirm` — after explicit review, remove only the local persisted workspace/session; provider state is never changed.
 - `cara pause --head-pr N --actor A --reason R` — place an explicit incident or maintenance hold on one exact caravan and disable only its head auto-merge.
 - `cara resume --head-pr N --actor A` — explicitly revalidate and release that hold.
 - `cara loop` — repeatedly run `sync --all` at the configured interval.
@@ -202,7 +206,7 @@ A sync tick:
 
 Already-correct steps are no-ops. Rerunning after interruption resumes from rediscovered GitHub state rather than a local cursor.
 
-Sync never invents an agent decision. At an incompatible edge or unhandled CI failure, it stops like an interactive rebase, checks out the affected PR when safe, emits a structured decision point, fires its hook, and exits. After a user/agent pushes a repair or reshapes the chain, the next sync reaches the same edge, observes it fixed, and continues.
+Sync never invents an agent decision. At an incompatible edge or unhandled CI failure, it stops like an interactive rebase, checks out the affected PR when safe, emits a structured decision point, fires its hook, and exits. A dirty or internally-remoted caller must not trigger raw Git surgery: `repair start` resolves an explicit provider-owned URL, creates an independent workspace below Git's common Caravan state, fetches/checks out only exact provider OIDs, and leaves caller HEAD, refs, config, index, and files untouched. After the agent resolves and stages only the typed conflict paths, `repair continue` verifies the persistent manifest, merge target, baseline index, scope, conflict markers, remote head, and exact merge parents before ordinary non-force publication. It then rediscovers and resumes the stored `sync --all`; interruption after commit or push is idempotent and preserves the workspace until convergence.
 
 ## 7. CI and merging
 
@@ -224,7 +228,7 @@ source/test failure, cancelled, or unknown. Only current-generation
 infrastructure failures are rerunnable; stale or unproved lineage requires a
 fresh exact-candidate trigger.
 
-A user/agent may repair and push, rerun failed checks, evict/split, or mark a known acceptable failure with `caravan-force`.
+A user/agent may use the managed repair workspace, rerun failed checks, evict/split, or mark a known acceptable failure with `caravan-force`. Raw nested worktrees, manual `update-ref`, and force publication are not valid Cara decision continuations.
 
 `caravan-force` is explicit operator intent to bypass any CI state that is not fully successful, including expected, queued, running, failed, unknown, mixed, or empty checks. When it becomes head, `cara sync` may force-squash it only when:
 
@@ -251,6 +255,7 @@ Core decision kinds include:
 
 - `head_conflict`;
 - `link_conflict`;
+- `repair_stale_head` / `repair_scope_changed` / `repair_conflicts_unresolved`;
 - `cross_caravan_conflict`;
 - `ci_failure`;
 - `invalid_graph`;

@@ -26,6 +26,19 @@ fn every_bounded_v1_domain_command_has_a_real_json_operation() {
         ("next", &["next"]),
         ("prev", &["prev"]),
         ("sync", &["sync", "--all", "--rerun-failed"]),
+        ("repair_start", &["repair", "start", "--pr", "1"]),
+        (
+            "repair_status",
+            &["repair", "status", "--session", "pr-1-parity"],
+        ),
+        (
+            "repair_continue",
+            &["repair", "continue", "--session", "pr-1-parity"],
+        ),
+        (
+            "repair_abort",
+            &["repair", "abort", "--session", "pr-1-parity", "--confirm"],
+        ),
         ("evict", &["evict", "--pr", "1", "--reason", "parity audit"]),
         ("split", &["split", "--pr", "1"]),
         ("loop_once", &["loop", "--once"]),
@@ -96,6 +109,19 @@ fn every_bounded_mcp_domain_tool_routes_to_the_real_operation() {
             "sync",
             serde_json::json!({ "all": true, "rerun_failed": true }),
         ),
+        ("repair_start", serde_json::json!({ "pr": 1 })),
+        (
+            "repair_status",
+            serde_json::json!({ "session": "pr-1-parity" }),
+        ),
+        (
+            "repair_continue",
+            serde_json::json!({ "session": "pr-1-parity" }),
+        ),
+        (
+            "repair_abort",
+            serde_json::json!({ "session": "pr-1-parity", "confirm": true }),
+        ),
         (
             "evict",
             serde_json::json!({ "pr": 1, "reason": "parity audit" }),
@@ -157,6 +183,10 @@ fn mcp_registry_covers_all_bounded_v1_operations_with_schemas() {
         "next",
         "prev",
         "sync",
+        "repair_start",
+        "repair_status",
+        "repair_continue",
+        "repair_abort",
         "evict",
         "split",
         "van_list",
