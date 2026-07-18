@@ -1068,7 +1068,7 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 [[package]]
 name = "updatable-cli"
 version = "0.1.0"
-source = "git+https://github.com/harryaskham/updatable-cli?branch=main#98f35cdc07c085155746bf0d0981bb52930f8c90"
+source = "git+https://github.com/harryaskham/updatable-cli?branch=main#5167a197f7c950b19e5c812931f0949e0cdedfd4"
 dependencies = [
  "anyhow",
  "flate2",
