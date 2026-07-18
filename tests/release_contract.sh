@@ -26,12 +26,8 @@ workspace="$(mktemp -d "${TMPDIR:-/tmp}/cara-release-contract.XXXXXX")"
 trap 'rm -rf "$workspace"' EXIT
 
 # Exercise the mutating helper only in an isolated throwaway repository.
-next_version="$(python3 - "$version" <<'PY'
-import sys
-major, minor, patch = map(int, sys.argv[1].split("."))
-print(f"{major}.{minor}.{patch + 1}")
-PY
-)"
+IFS=. read -r major minor patch <<<"$version"
+next_version="$major.$minor.$((patch + 1))"
 git init --quiet --bare "$workspace/origin.git"
 mkdir -p "$workspace/release-repo/scripts"
 cp Cargo.toml Cargo.lock flake.nix "$workspace/release-repo/"
@@ -93,19 +89,11 @@ if [ -n "$binary" ]; then
   }
   mkdir -p "$workspace/home"
   status_json="$(HOME="$workspace/home" "$binary" --json self-update status)"
-  python3 - "$version" "$workspace/home" "$status_json" <<'PY'
-import json
-import sys
-
-version, home, raw = sys.argv[1:]
-envelope = json.loads(raw)
-assert envelope["status"] == "success", envelope
-status = envelope["data"]
-assert status["tool"] == "cara", status
-assert status["current_version"] == version, status
-assert status["install_dir"] == f"{home}/.local/bin", status
-assert status["next_staged"] is False, status
-PY
+  [[ "$status_json" == *'"status":"success"'* ]]
+  [[ "$status_json" == *'"tool":"cara"'* ]]
+  [[ "$status_json" == *"\"current_version\":\"$version\""* ]]
+  [[ "$status_json" == *"\"install_dir\":\"$workspace/home/.local/bin\""* ]]
+  [[ "$status_json" == *'"next_staged":false'* ]]
 fi
 
 echo "release contract ok: cara $version"

@@ -85,16 +85,16 @@ jobs:
         run: nix develop --command cargo test --all
       - name: Exercise asset and self-update status contracts offline
         shell: bash
-        env:
-          # v0.0.1 predates python3 in its dev shell. Use the exact same pinned
-          # nixpkgs source as the tagged flake rather than ambient runner tools.
-          NIXPKGS_URL: https://api.flakehub.com/f/pinned/NixOS/nixpkgs/0.2511.914302%2Brev-1d4e0f865d68258aada31e68e6d79c8c463f3b34/019f1c78-b5ab-7af2-8516-c0d5406b0646/source.tar.gz
         run: |
           set -euo pipefail
           nix develop --command cargo build --bin cara
-          python_path="$(nix build --no-link --print-out-paths "$NIXPKGS_URL#python3")"
-          nix develop --command env "PATH=$python_path/bin:$PATH" \
-            ./tests/release_contract.sh target/debug/cara
+          # The tag may predate later test-harness portability fixes. Execute
+          # the reviewed harness from this workflow generation against tagged
+          # source/binary inputs; fetch-depth=0 makes GITHUB_SHA available.
+          contract="$RUNNER_TEMP/release-contract.sh"
+          git show "$GITHUB_SHA:tests/release_contract.sh" > "$contract"
+          chmod 0755 "$contract"
+          nix develop --command "$contract" target/debug/cara
 
   build:
     name: build ${{ matrix.target }}
