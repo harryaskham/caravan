@@ -379,7 +379,13 @@ fn ensure_config(context: &AppContext) -> Result<ConfigReceipt, AppError> {
         });
     }
     let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    if is_default_config_path(context) {
+        require_default_parent_contained(&context.repository_path, parent, path)?;
+    }
     fs::create_dir_all(parent).map_err(|error| io_error(path, error))?;
+    if is_default_config_path(context) {
+        require_default_parent_contained(&context.repository_path, parent, path)?;
+    }
 
     // Publish a fully written inode with an atomic, no-overwrite hard link.
     // Unlike rename, hard_link fails if a concurrent initializer won the name.
@@ -419,6 +425,42 @@ fn sync_parent_directory(parent: &std::path::Path) -> std::io::Result<()> {
 
 #[cfg(not(unix))]
 fn sync_parent_directory(_parent: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+fn is_default_config_path(context: &AppContext) -> bool {
+    let configured = if context.config_path.is_absolute() {
+        context.config_path.clone()
+    } else {
+        context.repository_path.join(&context.config_path)
+    };
+    configured == context.repository_path.join(crate::config::DEFAULT_CONFIG_PATH)
+}
+
+fn require_default_parent_contained(
+    repository: &std::path::Path,
+    parent: &std::path::Path,
+    config_path: &std::path::Path,
+) -> Result<(), AppError> {
+    let repository = fs::canonicalize(repository).map_err(|error| io_error(config_path, error))?;
+    let mut ancestor = parent;
+    while !ancestor.exists() {
+        ancestor = ancestor.parent().ok_or_else(|| {
+            AppError::validation(
+                "initialization_config_path_escape",
+                "default config parent does not resolve inside the repository",
+            )
+        })?;
+    }
+    let ancestor = fs::canonicalize(ancestor).map_err(|error| io_error(config_path, error))?;
+    if !ancestor.starts_with(&repository) {
+        return Err(AppError::structured(
+            ErrorCategory::ConfigError,
+            "initialization_config_path_escape",
+            "refusing to create the default config through a path outside the repository",
+            Some(json!({ "path": config_path, "repository": repository })),
+        ));
+    }
     Ok(())
 }
 
@@ -512,6 +554,8 @@ fn io_error(path: &std::path::Path, error: std::io::Error) -> AppError {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+
+    use mcp_cli::StructuredError;
 
     use super::*;
     use crate::command::CommandSpec;
@@ -720,6 +764,47 @@ mod tests {
         );
         assert_eq!(fs::read(&config_path).unwrap(), before);
         assert!(provider.labels.lock().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_config_rejects_symlink_and_parent_escape_before_provider_mutation() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let provider = FakeProvider::new(Vec::new());
+        let caravan_dir = directory.path().join(".caravan");
+        symlink(external.path(), &caravan_dir).unwrap();
+        let error = init_with_provider(&context(&directory), &repository(), "main", &provider)
+            .unwrap_err();
+        assert_eq!(error.code(), "initialization_config_path_escape");
+        assert!(!external.path().join("config.yaml").exists());
+        assert!(provider.labels.lock().unwrap().is_empty());
+
+        fs::remove_file(caravan_dir).unwrap();
+        fs::create_dir_all(directory.path().join(".caravan")).unwrap();
+        let target = external.path().join("existing.yaml");
+        fs::write(&target, "{}\n").unwrap();
+        symlink(&target, directory.path().join(".caravan/config.yaml")).unwrap();
+        let error = init_with_provider(&context(&directory), &repository(), "main", &provider)
+            .unwrap_err();
+        assert_eq!(error.code(), "initialization_config_incompatible");
+        assert!(provider.labels.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn explicit_config_outside_worktree_is_supported() {
+        let directory = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let config_path = external.path().join("config.yaml");
+        let mut explicit = context(&directory);
+        explicit.config_path = config_path.clone();
+        let provider = FakeProvider::new(Vec::new());
+
+        let output = init_with_provider(&explicit, &repository(), "main", &provider).unwrap();
+        assert_eq!(output.config.state, ResourceState::Created);
+        crate::config::CaravanConfig::load(&config_path).unwrap();
     }
 
     #[test]

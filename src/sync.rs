@@ -344,9 +344,17 @@ fn sync_without_hooks(context: &AppContext, input: &SyncInput) -> Result<SyncOut
     let timeout = std::time::Duration::from_secs(context.config.command_timeout_secs);
     let status = read::status(context)?;
     crate::initialization::require_ready(&status.initialization)?;
-    let provider = GitHubMutationAdapter::new(
-        crate::command::ProcessRunner::in_directory(&context.repository_path).with_timeout(timeout),
-    );
+    let runner =
+        crate::command::ProcessRunner::in_directory(&context.repository_path).with_timeout(timeout);
+    // A decision can require an exact branch checkout. Prove checkout safety
+    // before the first provider mutation so a dirty worktree can never turn a
+    // partially-mutated sync into an unrepairable decision receipt.
+    crate::navigation::ensure_safe_worktree(
+        &context.repository_path,
+        &context.config_path,
+        &runner,
+    )?;
+    let provider = GitHubMutationAdapter::new(runner);
     let progress = execute(
         &status,
         &provider,

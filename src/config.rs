@@ -153,6 +153,16 @@ impl CaravanConfig {
 
     /// Read an explicit config file. Missing files are errors.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        let metadata = fs::symlink_metadata(path).map_err(|error| ConfigError::Read {
+            path: path.to_path_buf(),
+            message: error.to_string(),
+        })?;
+        if !metadata.file_type().is_file() {
+            return Err(ConfigError::Read {
+                path: path.to_path_buf(),
+                message: "config must be a regular file, not a symlink or special file".to_owned(),
+            });
+        }
         let content = fs::read_to_string(path).map_err(|error| ConfigError::Read {
             path: path.to_path_buf(),
             message: error.to_string(),
