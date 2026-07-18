@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use mcp_cli::ErrorCategory;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::AppError;
 use crate::command::{CommandRunError, CommandRunner, CommandSpec, ProcessRunner};
@@ -39,6 +39,20 @@ pub struct OperationLockOwner {
     pub created_unix_secs: u64,
     /// Unique token used to avoid deleting a replacement owner's lock.
     pub token: String,
+    /// Last durable operation phase/receipt checkpoint written by the owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<OperationLockCheckpoint>,
+}
+
+/// Compact durable evidence used to recover safely after client termination.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct OperationLockCheckpoint {
+    pub phase: String,
+    pub updated_unix_ms: u64,
+    /// Operation-specific compact receipt and exact provider precondition facts.
+    pub evidence: Value,
+    /// True while a provider write may have completed without an after receipt.
+    pub provider_state_indeterminate: bool,
 }
 
 /// Read-only lock inspection returned by CLI and MCP.
@@ -52,6 +66,9 @@ pub struct OperationLockStatus {
     pub age_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_alive: Option<bool>,
+    /// A subsequent mutating operation may clean this exact proven-dead owner
+    /// immediately, without waiting for the stale-age floor.
+    pub auto_recoverable: bool,
     pub stale_after_secs: u64,
     pub stale: bool,
 }
@@ -72,6 +89,7 @@ pub struct OperationLock {
     path: PathBuf,
     owner: OperationLockOwner,
     file: Option<File>,
+    recovered_dead_owner: Option<OperationLockRecovery>,
     released: bool,
 }
 
@@ -109,9 +127,12 @@ impl OperationLock {
             )
         })?;
         let owner = new_owner(operation);
+        let mut recovered_dead_owner = None;
 
-        // If a prior owner drops between create_new and inspection, retry once.
-        for attempt in 0..2 {
+        // A process killed by its client cannot run Drop. Prove its owner PID
+        // dead and revalidate the exact owner token before removing that fresh
+        // orphan; live or ambiguous ownership remains fail-closed.
+        for attempt in 0..3 {
             match OpenOptions::new().write(true).create_new(true).open(&path) {
                 Ok(mut file) => {
                     let encoded = serde_json::to_vec(&owner).map_err(|error| {
@@ -136,22 +157,37 @@ impl OperationLock {
                         path,
                         owner,
                         file: Some(file),
+                        recovered_dead_owner,
                         released: false,
                     });
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    match existing_lock_error(&path, stale_after) {
-                        Ok(error) => return Err(error),
-                        Err(read_error)
-                            if read_error.kind() == io::ErrorKind::NotFound && attempt == 0 => {}
-                        Err(read_error) => {
-                            return Err(lock_io_error(
-                                "operation_lock_inspection_failed",
-                                "the operation lock exists but its owner evidence could not be read",
-                                &path,
-                                &read_error,
+                    match recover_dead_owner_for_acquire(&path)? {
+                        DeadOwnerProbe::Recovered(receipt) => {
+                            recovered_dead_owner.get_or_insert(receipt);
+                        }
+                        DeadOwnerProbe::Gone if attempt < 2 => {}
+                        DeadOwnerProbe::Gone => {
+                            return Err(AppError::structured(
+                                ErrorCategory::ExecutionFailure,
+                                "operation_lock_race",
+                                "the operation lock repeatedly changed during dead-owner inspection",
+                                Some(json!({ "path": path })),
                             ));
                         }
+                        DeadOwnerProbe::Live => match existing_lock_error(&path, stale_after) {
+                            Ok(error) => return Err(error),
+                            Err(read_error)
+                                if read_error.kind() == io::ErrorKind::NotFound && attempt < 2 => {}
+                            Err(read_error) => {
+                                return Err(lock_io_error(
+                                    "operation_lock_inspection_failed",
+                                    "the operation lock exists but its owner evidence could not be read",
+                                    &path,
+                                    &read_error,
+                                ));
+                            }
+                        },
                     }
                 }
                 Err(error) => {
@@ -183,6 +219,172 @@ impl OperationLock {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Exact receipt when acquisition cleaned a proven-dead prior owner.
+    #[must_use]
+    pub fn recovered_dead_owner(&self) -> Option<&OperationLockRecovery> {
+        self.recovered_dead_owner.as_ref()
+    }
+
+    /// Persist a compact phase/receipt checkpoint under the same exact owner
+    /// token. A torn checkpoint remains fail-closed as invalid owner evidence.
+    pub fn checkpoint(
+        &mut self,
+        phase: impl Into<String>,
+        evidence: Value,
+        provider_state_indeterminate: bool,
+    ) -> Result<(), AppError> {
+        let existing = read_owner(&self.path).map_err(|error| {
+            lock_io_error(
+                "operation_lock_checkpoint_inspection_failed",
+                "could not verify operation lock ownership before checkpoint",
+                &self.path,
+                &error,
+            )
+        })?;
+        if existing.token != self.owner.token {
+            return Err(AppError::structured(
+                ErrorCategory::Validation,
+                "operation_lock_owner_changed",
+                "refusing to checkpoint an operation lock now owned by another process",
+                Some(json!({
+                    "path": self.path,
+                    "expected_owner": self.owner,
+                    "actual_owner": existing,
+                })),
+            ));
+        }
+        let updated_unix_ms = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        self.owner.checkpoint = Some(OperationLockCheckpoint {
+            phase: phase.into(),
+            updated_unix_ms,
+            evidence,
+            provider_state_indeterminate,
+        });
+        let encoded = serde_json::to_vec(&self.owner).map_err(|error| {
+            AppError::structured(
+                ErrorCategory::SerializationError,
+                "operation_lock_checkpoint_encode_failed",
+                format!("could not encode operation lock checkpoint: {error}"),
+                None,
+            )
+        })?;
+        if u64::try_from(encoded.len()).unwrap_or(u64::MAX) > MAX_OWNER_BYTES {
+            return Err(AppError::structured(
+                ErrorCategory::Validation,
+                "operation_lock_checkpoint_too_large",
+                "operation lock checkpoint exceeds the bounded owner-file limit",
+                Some(json!({
+                    "path": self.path,
+                    "bytes": encoded.len(),
+                    "max_bytes": MAX_OWNER_BYTES,
+                })),
+            ));
+        }
+        if self.file.is_none() {
+            return Err(AppError::structured(
+                ErrorCategory::ExecutionFailure,
+                "operation_lock_checkpoint_file_closed",
+                "cannot checkpoint a released operation lock",
+                Some(json!({ "path": self.path })),
+            ));
+        }
+        self.persist_checkpoint_bytes(&encoded)
+    }
+
+    #[cfg(unix)]
+    fn persist_checkpoint_bytes(&mut self, encoded: &[u8]) -> Result<(), AppError> {
+        let temporary = self.path.with_extension(format!(
+            "checkpoint-{}-{}.tmp",
+            self.owner.pid,
+            TOKEN_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let write_result = (|| -> io::Result<()> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            file.write_all(encoded)?;
+            file.sync_all()
+        })();
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&temporary);
+            return Err(lock_io_error(
+                "operation_lock_checkpoint_write_failed",
+                "could not persist operation lock checkpoint temporary file",
+                &temporary,
+                &error,
+            ));
+        }
+        let latest = read_owner(&self.path).map_err(|error| {
+            let _ = fs::remove_file(&temporary);
+            lock_io_error(
+                "operation_lock_checkpoint_inspection_failed",
+                "could not revalidate owner before atomic checkpoint",
+                &self.path,
+                &error,
+            )
+        })?;
+        if latest.token != self.owner.token {
+            let _ = fs::remove_file(&temporary);
+            return Err(AppError::structured(
+                ErrorCategory::Validation,
+                "operation_lock_owner_changed",
+                "operation lock owner changed before atomic checkpoint; refusing replacement",
+                Some(json!({ "expected_owner": self.owner, "actual_owner": latest })),
+            ));
+        }
+        fs::rename(&temporary, &self.path).map_err(|error| {
+            let _ = fs::remove_file(&temporary);
+            lock_io_error(
+                "operation_lock_checkpoint_write_failed",
+                "could not atomically replace operation lock checkpoint",
+                &self.path,
+                &error,
+            )
+        })?;
+        self.file = Some(
+            OpenOptions::new()
+                .write(true)
+                .open(&self.path)
+                .map_err(|error| {
+                    lock_io_error(
+                        "operation_lock_checkpoint_reopen_failed",
+                        "could not reopen operation lock after atomic checkpoint",
+                        &self.path,
+                        &error,
+                    )
+                })?,
+        );
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn persist_checkpoint_bytes(&mut self, encoded: &[u8]) -> Result<(), AppError> {
+        use std::io::{Seek, SeekFrom};
+
+        let file = self.file.as_mut().expect("checked open checkpoint file");
+        let write_result = (|| -> io::Result<()> {
+            file.seek(SeekFrom::Start(0))?;
+            file.set_len(0)?;
+            file.write_all(encoded)?;
+            file.sync_all()
+        })();
+        write_result.map_err(|error| {
+            lock_io_error(
+                "operation_lock_checkpoint_write_failed",
+                "could not persist operation lock checkpoint",
+                &self.path,
+                &error,
+            )
+        })
     }
 
     /// Release the lock and report an ownership mismatch instead of deleting a successor.
@@ -261,6 +463,7 @@ pub fn inspect_lock(
                 owner: None,
                 age_secs: None,
                 owner_alive: None,
+                auto_recoverable: false,
                 stale_after_secs,
                 stale: false,
             });
@@ -290,6 +493,7 @@ pub fn inspect_lock(
         owner: Some(owner),
         age_secs: Some(age_secs),
         owner_alive: Some(owner_alive),
+        auto_recoverable: !owner_alive,
         stale_after_secs,
         stale: age_secs >= stale_after_secs,
     })
@@ -464,6 +668,7 @@ fn new_owner(operation: &str) -> OperationLockOwner {
         operation: operation.to_owned(),
         created_unix_secs: created.as_secs(),
         token: format!("{}-{}-{sequence}", std::process::id(), created.as_nanos()),
+        checkpoint: None,
     }
 }
 
@@ -531,6 +736,85 @@ fn process_is_alive(pid: u32) -> Result<bool, AppError> {
         ));
     }
     Ok(output.stdout.contains(&pid.to_string()))
+}
+
+enum DeadOwnerProbe {
+    Gone,
+    Live,
+    Recovered(OperationLockRecovery),
+}
+
+fn recover_dead_owner_for_acquire(path: &Path) -> Result<DeadOwnerProbe, AppError> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(DeadOwnerProbe::Gone),
+        Err(error) => {
+            return Err(lock_io_error(
+                "operation_lock_inspection_failed",
+                "could not inspect the existing operation lock",
+                path,
+                &error,
+            ));
+        }
+    };
+    let owner = match read_owner(path) {
+        Ok(owner) => owner,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(DeadOwnerProbe::Gone),
+        Err(error) => {
+            return Err(lock_io_error(
+                "operation_lock_owner_invalid",
+                "could not read existing operation lock owner evidence",
+                path,
+                &error,
+            ));
+        }
+    };
+    if process_is_alive(owner.pid)? {
+        return Ok(DeadOwnerProbe::Live);
+    }
+
+    // Re-read both bytes and liveness immediately before unlinking. A reused
+    // PID, replacement token, or changed owner is ambiguous and must not be
+    // removed automatically.
+    let latest = match read_owner(path) {
+        Ok(owner) => owner,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(DeadOwnerProbe::Gone),
+        Err(error) => {
+            return Err(lock_io_error(
+                "operation_lock_recovery_inspection_failed",
+                "could not re-read dead owner evidence before cleanup",
+                path,
+                &error,
+            ));
+        }
+    };
+    if latest != owner || latest.token != owner.token {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "operation_lock_owner_changed",
+            "operation lock ownership changed during dead-owner cleanup; refusing removal",
+            Some(json!({ "inspected_owner": owner, "latest_owner": latest })),
+        ));
+    }
+    if process_is_alive(latest.pid)? {
+        return Ok(DeadOwnerProbe::Live);
+    }
+    fs::remove_file(path).map_err(|error| {
+        lock_io_error(
+            "operation_lock_recovery_failed",
+            "could not remove a proven-dead operation lock",
+            path,
+            &error,
+        )
+    })?;
+    let age_secs = lock_age_secs(&metadata, &latest);
+    Ok(DeadOwnerProbe::Recovered(OperationLockRecovery {
+        path: path.display().to_string(),
+        removed_owner: latest,
+        age_secs,
+        owner_alive: false,
+        token_verified: true,
+    }))
 }
 
 fn existing_lock_error(path: &Path, stale_after: Duration) -> Result<AppError, io::Error> {
@@ -607,7 +891,8 @@ fn bounded_text(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
-    use std::process::Command;
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
 
     use mcp_cli::StructuredError;
     use tempfile::TempDir;
@@ -662,6 +947,7 @@ mod tests {
         assert!(status.present);
         assert!(status.stale);
         assert_eq!(status.owner_alive, Some(true));
+        assert!(!status.auto_recoverable);
         assert_eq!(status.owner.as_ref().unwrap().token, lock.owner().token);
 
         let error = recover_stale_lock(repository.path(), Duration::ZERO, &lock.owner().token)
@@ -686,12 +972,14 @@ mod tests {
                 .as_secs()
                 .saturating_sub(3_600),
             token: "dead-owner-token".to_owned(),
+            checkpoint: None,
         };
         fs::write(&path, serde_json::to_vec(&owner).unwrap()).unwrap();
 
         let status = inspect_lock(repository.path(), Duration::from_secs(1_800)).unwrap();
         assert!(status.stale);
         assert_eq!(status.owner_alive, Some(false));
+        assert!(status.auto_recoverable);
         let wrong = recover_stale_lock(repository.path(), Duration::ZERO, "wrong-token")
             .expect_err("wrong token must fail closed");
         assert_eq!(wrong.code(), "operation_lock_token_mismatch");
@@ -704,6 +992,179 @@ mod tests {
         assert!(receipt.token_verified);
         assert!(!receipt.owner_alive);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn checkpoint_persists_phase_and_provider_indeterminacy_under_owner_token() {
+        let repository = test_repository();
+        let mut lock = OperationLock::acquire(repository.path(), "sync").unwrap();
+
+        lock.checkpoint(
+            "provider_write_in_flight",
+            json!({ "operation_id": "op-1", "pr": 2008 }),
+            true,
+        )
+        .unwrap();
+
+        let persisted = read_owner(lock.path()).unwrap();
+        assert_eq!(persisted.token, lock.owner().token);
+        let checkpoint = persisted.checkpoint.unwrap();
+        assert_eq!(checkpoint.phase, "provider_write_in_flight");
+        assert_eq!(checkpoint.evidence["pr"], 2008);
+        assert!(checkpoint.provider_state_indeterminate);
+        lock.release().unwrap();
+    }
+
+    #[test]
+    fn acquisition_recovers_a_fresh_proven_dead_owner_with_exact_receipt() {
+        let repository = test_repository();
+        let path = lock_path(repository.path()).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let dead_owner = OperationLockOwner {
+            version: 1,
+            pid: 999_999,
+            operation: "sync_decision_checkout".to_owned(),
+            created_unix_secs: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            token: "fresh-dead-owner-token".to_owned(),
+            checkpoint: Some(OperationLockCheckpoint {
+                phase: "provider_write_in_flight".to_owned(),
+                updated_unix_ms: 1,
+                evidence: json!({ "pr": 2008 }),
+                provider_state_indeterminate: true,
+            }),
+        };
+        fs::write(&path, serde_json::to_vec(&dead_owner).unwrap()).unwrap();
+        let status = inspect_lock(repository.path(), DEFAULT_STALE_AFTER).unwrap();
+        assert!(!status.stale);
+        assert_eq!(status.owner_alive, Some(false));
+        assert!(status.auto_recoverable);
+
+        let lock = OperationLock::acquire(repository.path(), "sync")
+            .expect("a proven-dead owner must not block until the stale floor");
+
+        let recovery = lock
+            .recovered_dead_owner()
+            .expect("dead-owner recovery receipt");
+        assert_eq!(recovery.removed_owner, dead_owner);
+        assert!(recovery.token_verified);
+        assert!(!recovery.owner_alive);
+        assert_eq!(read_owner(lock.path()).unwrap(), *lock.owner());
+        lock.release().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sigterm_during_decision_checkout_preserves_checkpoint_and_recovers() {
+        let repository = test_repository();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "operation_lock::tests::lock_child_fixture",
+                "--nocapture",
+            ])
+            .env("CARA_LOCK_CHILD_REPOSITORY", repository.path())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn exact lock-owner test process");
+        let stdout = child.stdout.take().unwrap();
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert!(reader.read_line(&mut line).unwrap() > 0, "child exited before lock");
+            if line.contains("LOCK_READY") {
+                break;
+            }
+        }
+        let path = lock_path(repository.path()).unwrap();
+        let owner = read_owner(&path).unwrap();
+        assert_eq!(owner.operation, "sync_decision_checkout");
+        assert_eq!(
+            owner.checkpoint.as_ref().unwrap().phase,
+            "decision_checkout_in_flight"
+        );
+
+        let status = Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .expect("send SIGTERM");
+        assert!(status.success());
+        let exit = child.wait().unwrap();
+        assert!(!exit.success());
+        let stranded = inspect_lock(repository.path(), DEFAULT_STALE_AFTER).unwrap();
+        assert!(!stranded.stale);
+        assert_eq!(stranded.owner_alive, Some(false));
+        assert!(stranded.auto_recoverable);
+
+        let lock = OperationLock::acquire(repository.path(), "sync").unwrap();
+        let recovery = lock.recovered_dead_owner().unwrap();
+        assert_eq!(recovery.removed_owner.token, owner.token);
+        assert_eq!(
+            recovery
+                .removed_owner
+                .checkpoint
+                .as_ref()
+                .unwrap()
+                .phase,
+            "decision_checkout_in_flight"
+        );
+        lock.release().unwrap();
+    }
+
+    #[test]
+    fn lock_child_fixture() {
+        let Ok(repository) = std::env::var("CARA_LOCK_CHILD_REPOSITORY") else {
+            return;
+        };
+        let mut lock = OperationLock::acquire(repository, "sync_decision_checkout").unwrap();
+        lock.checkpoint(
+            "decision_checkout_in_flight",
+            json!({ "pr": 2008, "head_oid": "fixture" }),
+            false,
+        )
+        .unwrap();
+        println!("LOCK_READY");
+        std::io::stdout().flush().unwrap();
+        std::thread::sleep(Duration::from_secs(30));
+        lock.release().unwrap();
+    }
+
+    #[test]
+    fn terminated_client_owner_is_recovered_below_the_stale_floor() {
+        let repository = test_repository();
+        let path = lock_path(repository.path()).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .expect("spawn lock owner fixture");
+        let dead_owner = OperationLockOwner {
+            version: 1,
+            pid: child.id(),
+            operation: "sync_decision_checkout".to_owned(),
+            created_unix_secs: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            token: "terminated-client-token".to_owned(),
+            checkpoint: None,
+        };
+        fs::write(&path, serde_json::to_vec(&dead_owner).unwrap()).unwrap();
+        child.kill().expect("terminate fixture owner");
+        child.wait().expect("reap fixture owner");
+
+        let lock =
+            OperationLock::acquire_with_stale_after(repository.path(), "sync", DEFAULT_STALE_AFTER)
+                .expect("terminated owner is cleaned without waiting thirty minutes");
+
+        assert_eq!(
+            lock.recovered_dead_owner().unwrap().removed_owner,
+            dead_owner
+        );
+        lock.release().unwrap();
     }
 
     #[test]

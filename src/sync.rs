@@ -6,7 +6,7 @@
 //! resume after interruption.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mcp_cli::{ErrorCategory, StructuredError};
 use schemars::JsonSchema;
@@ -25,9 +25,12 @@ use crate::model::{
     MutationStep, MutationStepState, OperationId, OperationReceipt, PrNumber,
     PullRequestPrecondition, PullRequestSnapshot, PullRequestState, RepositoryId,
 };
-use crate::operation_lock::OperationLock;
+use crate::operation_lock::{OperationLock, OperationLockRecovery};
 use crate::read::{self, StatusOutput};
 use crate::{AppContext, AppError, SyncInput};
+
+const MAX_SYNC_OPERATION_SECS: u64 = 150;
+const SYNC_BUDGET_MULTIPLIER: u64 = 5;
 
 /// One observed rolling-head transition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -61,10 +64,25 @@ pub struct CiObservation {
     pub rerunnable_run_ids: Vec<u64>,
 }
 
+/// Bounded whole-sync phase timings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SyncTiming {
+    pub deadline_ms: u64,
+    pub total_ms: u64,
+    pub initial_status_ms: u64,
+    pub provider_convergence_ms: u64,
+    pub final_status_ms: u64,
+}
+
 /// Stable result of one converged synchronization tick.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SyncOutput {
     pub receipt: OperationReceipt,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing: Option<SyncTiming>,
+    /// Exact dead-owner cleanup performed before this sync acquired its lock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_recovery: Option<OperationLockRecovery>,
     /// Exact provider before/after facts for completed remote mutations.
     #[serde(default)]
     pub provider_receipts: Vec<GitHubMutationReceipt>,
@@ -245,13 +263,16 @@ impl<R: crate::command::CommandRunner> SyncProvider for GitHubMutationAdapter<R>
 
 /// Synchronize the current caravan or every caravan and dispatch its canonical events.
 pub fn sync(context: &AppContext, input: &SyncInput) -> Result<SyncOutput, AppError> {
-    match sync_without_hooks(context, input) {
+    let started = Instant::now();
+    let budget = sync_operation_budget(context);
+    let operation_deadline = started + budget;
+    match sync_without_hooks(context, input, started, operation_deadline) {
         Ok(mut output) => {
             output.hook_deliveries = hooks::dispatch_events(context, &output.events)?;
             Ok(output)
         }
         Err(error) => {
-            let error = checkout_for_decision(context, error);
+            let error = checkout_for_decision(context, error, operation_deadline);
             let mut events = hooks::events_from_error(&error);
             if events.is_empty() {
                 if let Some(event) = sync_failed_event(&error) {
@@ -264,7 +285,25 @@ pub fn sync(context: &AppContext, input: &SyncInput) -> Result<SyncOutput, AppEr
     }
 }
 
-fn checkout_for_decision(context: &AppContext, error: AppError) -> AppError {
+fn sync_operation_budget(context: &AppContext) -> Duration {
+    Duration::from_secs(
+        context
+            .config
+            .command_timeout_secs
+            .saturating_mul(SYNC_BUDGET_MULTIPLIER)
+            .min(MAX_SYNC_OPERATION_SECS),
+    )
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn checkout_for_decision(
+    context: &AppContext,
+    error: AppError,
+    operation_deadline: Instant,
+) -> AppError {
     let Some(details) = error.details() else {
         return error;
     };
@@ -278,12 +317,33 @@ fn checkout_for_decision(context: &AppContext, error: AppError) -> AppError {
     let Some(target) = target else {
         return error;
     };
-    let checkout = match crate::navigation::checkout_decision_pr(context, target) {
-        Ok(pull_request) => json!({
+    let Some(pull_request) = decision_checkout_pull_request(&decision, target) else {
+        return attach_checkout_evidence(
+            &error,
+            details,
+            json!({
+                "state": "skipped",
+                "pr": target,
+                "error": {
+                    "category": "validation",
+                    "code": "decision_checkout_snapshot_missing",
+                    "message": "the decision did not preserve the affected PR snapshot",
+                },
+                "next": "rediscover status and check out the affected PR before repairing the decision",
+            }),
+        );
+    };
+    let checkout = match crate::navigation::checkout_decision_snapshot(
+        context,
+        &pull_request,
+        operation_deadline,
+    ) {
+        Ok(lock_recovery) => json!({
             "state": "completed",
             "pr": target,
             "branch": pull_request.head.name,
             "oid": pull_request.head.oid,
+            "lock_recovery": lock_recovery,
         }),
         Err(checkout_error) => json!({
             "state": "skipped",
@@ -297,7 +357,10 @@ fn checkout_for_decision(context: &AppContext, error: AppError) -> AppError {
             "next": "make the local worktree safe, then check out the affected PR before repairing the decision",
         }),
     };
-    let mut details = details;
+    attach_checkout_evidence(&error, details, checkout)
+}
+
+fn attach_checkout_evidence(error: &AppError, mut details: Value, checkout: Value) -> AppError {
     if let Some(object) = details.as_object_mut() {
         object.insert("checkout".to_owned(), checkout);
     }
@@ -307,6 +370,30 @@ fn checkout_for_decision(context: &AppContext, error: AppError) -> AppError {
         error.message(),
         Some(details),
     )
+}
+
+fn decision_checkout_pull_request(
+    decision: &DecisionPoint,
+    target: PrNumber,
+) -> Option<PullRequestSnapshot> {
+    decision
+        .evidence
+        .get("pull_request")
+        .and_then(|value| serde_json::from_value::<PullRequestSnapshot>(value.clone()).ok())
+        .filter(|pull_request| pull_request.number == target)
+        .or_else(|| {
+            decision
+                .evidence
+                .get("pull_requests")
+                .and_then(|value| {
+                    serde_json::from_value::<Vec<PullRequestSnapshot>>(value.clone()).ok()
+                })
+                .and_then(|pull_requests| {
+                    pull_requests
+                        .into_iter()
+                        .find(|pull_request| pull_request.number == target)
+                })
+        })
 }
 
 fn decision_checkout_target(decision: &DecisionPoint) -> Option<PrNumber> {
@@ -339,14 +426,70 @@ fn sync_failed_event(error: &AppError) -> Option<CaravanEvent> {
     ))
 }
 
-fn sync_without_hooks(context: &AppContext, input: &SyncInput) -> Result<SyncOutput, AppError> {
-    let _lock = OperationLock::acquire(&context.repository_path, "sync")?;
-    let timeout = std::time::Duration::from_secs(context.config.command_timeout_secs);
-    let status = read::status(context)?;
+fn sync_without_hooks(
+    context: &AppContext,
+    input: &SyncInput,
+    started: Instant,
+    operation_deadline: Instant,
+) -> Result<SyncOutput, AppError> {
+    let lock = OperationLock::acquire(&context.repository_path, "sync")?;
+    let lock_recovery = lock.recovered_dead_owner().cloned();
+    sync_with_lock(
+        context,
+        input,
+        started,
+        operation_deadline,
+        lock,
+        lock_recovery.clone(),
+    )
+    .map_err(|error| attach_lock_recovery(error, lock_recovery.as_ref()))
+}
+
+#[allow(clippy::too_many_lines)]
+fn sync_with_lock(
+    context: &AppContext,
+    input: &SyncInput,
+    started: Instant,
+    operation_deadline: Instant,
+    mut lock: OperationLock,
+    lock_recovery: Option<OperationLockRecovery>,
+) -> Result<SyncOutput, AppError> {
+    lock.checkpoint(
+        "initial_discovery_in_flight",
+        json!({
+            "operation": "sync",
+            "all": input.all,
+            "deadline_ms": duration_millis(operation_deadline.saturating_duration_since(started)),
+        }),
+        false,
+    )?;
+    let timeout = Duration::from_secs(context.config.command_timeout_secs);
+    let initial_status_started = Instant::now();
+    let status = read::status_with_deadline(context, operation_deadline)?;
+    let initial_status_elapsed = initial_status_started.elapsed();
     crate::initialization::require_ready(&status.initialization)?;
     let provider = GitHubMutationAdapter::new(
-        crate::command::ProcessRunner::in_directory(&context.repository_path).with_timeout(timeout),
+        crate::command::ProcessRunner::in_directory(&context.repository_path)
+            .with_timeout(timeout)
+            .with_operation_deadline(operation_deadline),
     );
+    lock.checkpoint(
+        "provider_convergence_in_flight",
+        json!({
+            "operation": "sync",
+            "repository": &status.repository,
+            "default_branch": &status.analysis.fleet.default_branch,
+            "initial_status_timing": &status.timing,
+            "selected_caravans": if input.all {
+                json!(status.analysis.fleet.caravans.iter().map(|caravan| caravan.id).collect::<Vec<_>>())
+            } else {
+                json!(status.current_pr.and_then(|pr| status.analysis.fleet.containing(pr).map(|caravan| caravan.id)))
+            },
+            "recovery": "rediscover provider state and replay the same idempotent sync",
+        }),
+        true,
+    )?;
+    let convergence_started = Instant::now();
     let progress = execute(
         &status,
         &provider,
@@ -354,23 +497,44 @@ fn sync_without_hooks(context: &AppContext, input: &SyncInput) -> Result<SyncOut
         input.rerun_failed,
         context.config.force_merge,
     )?;
+    let convergence_elapsed = convergence_started.elapsed();
+    lock.checkpoint(
+        "provider_converged",
+        sync_checkpoint_evidence(&progress),
+        false,
+    )?;
+    lock.checkpoint(
+        "final_discovery_in_flight",
+        sync_checkpoint_evidence(&progress),
+        false,
+    )?;
 
     // A fresh graph is the authoritative completion receipt. It detects a
     // default-branch or fleet change that raced after the preflight proof.
-    let final_status = read::status(context).map_err(|error| {
+    let final_status_started = Instant::now();
+    let final_status = read::status_with_deadline(context, operation_deadline).map_err(|error| {
         AppError::structured(
-            ErrorCategory::ExecutionFailure,
-            "sync_rediscovery_failed",
+            error.category(),
+            if error.category() == ErrorCategory::Timeout {
+                "sync_operation_timeout"
+            } else {
+                "sync_rediscovery_failed"
+            },
             error.to_string(),
             Some(json!({
                 "operation_receipt": progress.operation_receipt(),
                 "provider_receipts": progress.provider_receipts,
                 "events": progress.events,
+                "phase": "final_status",
+                "elapsed_ms": duration_millis(started.elapsed()),
+                "deadline_ms": duration_millis(operation_deadline.saturating_duration_since(started)),
+                "source": error.details(),
                 "resumable": true,
                 "next": "rerun `cara sync` to rediscover GitHub state",
             })),
         )
     })?;
+    let final_status_elapsed = final_status_started.elapsed();
     if let Some(problem) = final_status.analysis.fleet.problems.first() {
         return Err(decision_error(
             &decision_for_problem(problem, &final_status, &progress),
@@ -378,8 +542,18 @@ fn sync_without_hooks(context: &AppContext, input: &SyncInput) -> Result<SyncOut
         ));
     }
 
+    lock.checkpoint("completed", sync_checkpoint_evidence(&progress), false)?;
+
     Ok(SyncOutput {
         receipt: progress.operation_receipt(),
+        timing: Some(SyncTiming {
+            deadline_ms: duration_millis(operation_deadline.saturating_duration_since(started)),
+            total_ms: duration_millis(started.elapsed()),
+            initial_status_ms: duration_millis(initial_status_elapsed),
+            provider_convergence_ms: duration_millis(convergence_elapsed),
+            final_status_ms: duration_millis(final_status_elapsed),
+        }),
+        lock_recovery,
         provider_receipts: progress.provider_receipts,
         synchronized_caravans: progress.synchronized_caravans,
         head_advancements: progress.head_advancements,
@@ -388,6 +562,29 @@ fn sync_without_hooks(context: &AppContext, input: &SyncInput) -> Result<SyncOut
         hook_deliveries: Vec::new(),
         status: final_status,
     })
+}
+
+fn attach_lock_recovery(
+    error: AppError,
+    lock_recovery: Option<&OperationLockRecovery>,
+) -> AppError {
+    let Some(lock_recovery) = lock_recovery else {
+        return error;
+    };
+    let mut details = error.details().unwrap_or_else(|| json!({}));
+    if let Some(object) = details.as_object_mut() {
+        object.insert("lock_recovery".to_owned(), json!(lock_recovery));
+        object.insert(
+            "lock_recovery_next".to_owned(),
+            json!("provider state was rediscovered after exact dead-owner cleanup; rerun the same idempotent command after repairing this error"),
+        );
+    }
+    AppError::structured(
+        error.category(),
+        error.code(),
+        error.message(),
+        Some(details),
+    )
 }
 
 fn execute(
@@ -643,6 +840,23 @@ fn head_is_conflict_free_with_default(status: &StatusOutput, head: &PullRequestS
         report.candidate == head.head
             && report.target == status.analysis.fleet.default_branch
             && report.outcome == CompatibilityOutcome::Clean
+    })
+}
+
+fn sync_checkpoint_evidence(progress: &SyncProgress) -> Value {
+    json!({
+        "operation_receipt": progress.operation_receipt(),
+        "provider_receipts": progress.provider_receipts.iter().map(|receipt| json!({
+            "kind": receipt.kind,
+            "before": receipt.before.as_ref().map(PullRequestPrecondition::from),
+            "after": PullRequestPrecondition::from(&receipt.after),
+        })).collect::<Vec<_>>(),
+        "events": progress.events.iter().map(|event| json!({
+            "event_id": event.event_id,
+            "kind": event.kind,
+            "prs": event.prs,
+        })).collect::<Vec<_>>(),
+        "recovery": "rediscover provider state and replay the same idempotent sync",
     })
 }
 
@@ -2246,6 +2460,49 @@ mod tests {
     }
 
     #[test]
+    fn dead_owner_recovery_is_preserved_on_later_sync_error() {
+        let recovery = OperationLockRecovery {
+            path: ".git/caravan/operation.lock".to_owned(),
+            removed_owner: crate::operation_lock::OperationLockOwner {
+                version: 1,
+                pid: 99,
+                operation: "sync_decision_checkout".to_owned(),
+                created_unix_secs: 1,
+                token: "exact-token".to_owned(),
+                checkpoint: Some(crate::operation_lock::OperationLockCheckpoint {
+                    phase: "decision_checkout_in_flight".to_owned(),
+                    updated_unix_ms: 2,
+                    evidence: json!({ "pr": 2008 }),
+                    provider_state_indeterminate: false,
+                }),
+            },
+            age_secs: 3,
+            owner_alive: false,
+            token_verified: true,
+        };
+        let error = AppError::validation("repository_not_initialized", "repair init");
+
+        let error = attach_lock_recovery(error, Some(&recovery));
+
+        let details = error.details().unwrap();
+        assert_eq!(details["lock_recovery"]["removed_owner"]["token"], "exact-token");
+        assert_eq!(
+            details["lock_recovery"]["removed_owner"]["checkpoint"]["phase"],
+            "decision_checkout_in_flight"
+        );
+    }
+
+    #[test]
+    fn whole_sync_budget_is_bounded_below_the_client_ceiling() {
+        let mut context = AppContext::default();
+        assert_eq!(sync_operation_budget(&context), Duration::from_secs(150));
+        context.config.command_timeout_secs = 10;
+        assert_eq!(sync_operation_budget(&context), Duration::from_secs(50));
+        context.config.command_timeout_secs = 100;
+        assert_eq!(sync_operation_budget(&context), Duration::from_secs(150));
+    }
+
+    #[test]
     fn decision_checkout_targets_the_repair_pr_only_when_unambiguous() {
         let decision = |kind, affected_prs| DecisionPoint {
             kind,
@@ -2289,6 +2546,13 @@ mod tests {
             config_existed: false,
             config: crate::config::CaravanConfig::default(),
         };
+        let pull_request = pull_request(
+            1,
+            "one",
+            "main",
+            PullRequestState::Open,
+            AutoMergeState::squash(),
+        );
         let decision = DecisionPoint {
             kind: DecisionKind::CiFailure,
             operation_id: OperationId::new(),
@@ -2296,7 +2560,7 @@ mod tests {
             caravan_id: Some(PrNumber(1)),
             affected_prs: vec![PrNumber(1)],
             message: "repair".to_owned(),
-            evidence: BTreeMap::new(),
+            evidence: BTreeMap::from([("pull_request".to_owned(), json!(pull_request))]),
             completed_steps: Vec::new(),
             resumable: true,
             suggested_actions: Vec::new(),
@@ -2308,7 +2572,11 @@ mod tests {
             Some(json!({ "decision": decision })),
         );
 
-        let error = checkout_for_decision(&context, error);
+        let error = checkout_for_decision(
+            &context,
+            error,
+            Instant::now() + Duration::from_secs(1),
+        );
 
         assert_eq!(error.code(), "ci_failure");
         let details = error.details().unwrap();

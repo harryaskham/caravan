@@ -63,25 +63,34 @@ pub fn list(context: &AppContext) -> Result<VanListOutput, AppError> {
 /// This is deliberately separate from directional browsing: sync already chose
 /// the affected PR and only needs the same clean-worktree and exact-OID safety
 /// transaction.
-pub fn checkout_decision_pr(
+pub fn checkout_decision_snapshot(
     context: &AppContext,
-    number: PrNumber,
-) -> Result<PullRequestSnapshot, AppError> {
-    let lock = OperationLock::acquire(&context.repository_path, "sync_decision_checkout")?;
-    let runner = ProcessRunner::in_directory(&context.repository_path).with_timeout(
-        std::time::Duration::from_secs(context.config.command_timeout_secs),
-    );
+    pull_request: &PullRequestSnapshot,
+    operation_deadline: std::time::Instant,
+) -> Result<Option<crate::operation_lock::OperationLockRecovery>, AppError> {
+    let mut lock = OperationLock::acquire(&context.repository_path, "sync_decision_checkout")?;
+    let lock_recovery = lock.recovered_dead_owner().cloned();
+    lock.checkpoint(
+        "decision_checkout_in_flight",
+        serde_json::json!({
+            "pr": pull_request.number,
+            "head": &pull_request.head,
+            "provider_state_indeterminate": false,
+        }),
+        false,
+    )?;
+    let runner = ProcessRunner::in_directory(&context.repository_path)
+        .with_timeout(std::time::Duration::from_secs(
+            context.config.command_timeout_secs,
+        ))
+        .with_operation_deadline(operation_deadline);
     ensure_safe_worktree(&context.repository_path, &runner)?;
-    let status = read::status(context)?;
-    let pull_request = status
-        .analysis
-        .pull_requests
-        .get(&number)
-        .cloned()
-        .ok_or_else(|| missing_pr(number))?;
-    checkout_exact(&context.repository_path, "origin", &runner, &pull_request)?;
+    // The decision already embeds the exact provider snapshot. checkout_exact
+    // verifies the remote branch still advertises that OID, avoiding a third
+    // full repository discovery during an already-bounded sync decision.
+    checkout_exact(&context.repository_path, "origin", &runner, pull_request)?;
     lock.release()?;
-    Ok(pull_request)
+    Ok(lock_recovery)
 }
 
 /// Navigate and check out an exact PR head in the live repository.

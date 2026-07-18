@@ -546,6 +546,24 @@ fn render_sync(output: &caravan::sync::SyncOutput) -> String {
             format!("caravans {caravans}")
         }
     );
+    if let Some(timing) = &output.timing {
+        let _ = writeln!(
+            text,
+            "  timing: {}ms total (status {}ms + provider {}ms + verify {}ms; deadline {}ms)",
+            timing.total_ms,
+            timing.initial_status_ms,
+            timing.provider_convergence_ms,
+            timing.final_status_ms,
+            timing.deadline_ms,
+        );
+    }
+    if let Some(recovery) = &output.lock_recovery {
+        let _ = writeln!(
+            text,
+            "  recovered dead {:?} lock owner pid {} (token verified)",
+            recovery.removed_owner.operation, recovery.removed_owner.pid
+        );
+    }
     for advancement in &output.head_advancements {
         let _ = writeln!(
             text,

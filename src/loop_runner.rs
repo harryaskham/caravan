@@ -208,6 +208,8 @@ mod tests {
                     completed_steps: Vec::new(),
                     changed: false,
                 },
+                timing: None,
+                lock_recovery: None,
                 provider_receipts: Vec::new(),
                 synchronized_caravans: Vec::new(),
                 head_advancements: Vec::new(),
