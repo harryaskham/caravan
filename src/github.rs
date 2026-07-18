@@ -345,6 +345,18 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
         Self { runner }
     }
 
+    /// Resolve only repository identity and default-branch name. This bounded
+    /// initialization read deliberately performs no PR or Git-ref discovery.
+    pub fn repository_identity(&self) -> Result<(RepositoryId, String), MutationError> {
+        let repository_json: RepositoryJson = self.json(repository_command())?;
+        let default_branch = repository_json
+            .default_branch_ref
+            .ok_or(DiscoveryError::MissingDefaultBranch)?
+            .name;
+        let repository = repository_id(&repository_json.name_with_owner)?;
+        Ok((repository, default_branch))
+    }
+
     /// Verify that a branch still points at an exact preflight revision.
     pub fn verify_branch_head(
         &self,
@@ -1706,6 +1718,23 @@ mod tests {
             labels: std::collections::BTreeSet::from(["caravan".to_owned()]),
             auto_merge: AutoMergeState::squash(),
         }
+    }
+
+    #[test]
+    fn initialization_identity_never_queries_prs_or_moving_refs() {
+        let runner = FakeRunner::new(vec![(
+            repository_command(),
+            CommandOutput::success(
+                r#"{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}"#,
+            ),
+        )]);
+        let adapter = GitHubMutationAdapter::new(runner);
+
+        let (repository, default_branch) = adapter.repository_identity().unwrap();
+
+        assert_eq!(repository.slug(), "acme/widgets");
+        assert_eq!(default_branch, "main");
+        adapter.runner.assert_exhausted();
     }
 
     #[test]

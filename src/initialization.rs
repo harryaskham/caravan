@@ -131,6 +131,9 @@ pub struct InitOutput {
 }
 
 pub trait InitializationProvider {
+    /// Lightweight repository/default-branch discovery; must not enumerate PRs
+    /// or verify moving PR/default-branch object IDs.
+    fn repository_identity(&self) -> Result<(RepositoryId, String), MutationError>;
     fn labels(&self, repository: &RepositoryId) -> Result<Vec<RepositoryLabel>, MutationError>;
     fn permission(&self, repository: &RepositoryId) -> Result<String, MutationError>;
     fn allows_auto_merge(&self, repository: &RepositoryId) -> Result<bool, MutationError>;
@@ -152,6 +155,9 @@ pub trait InitializationProvider {
 }
 
 impl<R: crate::command::CommandRunner> InitializationProvider for GitHubMutationAdapter<R> {
+    fn repository_identity(&self) -> Result<(RepositoryId, String), MutationError> {
+        self.repository_identity()
+    }
     fn labels(&self, repository: &RepositoryId) -> Result<Vec<RepositoryLabel>, MutationError> {
         self.repository_label_definitions(repository)
     }
@@ -240,18 +246,13 @@ pub fn require_ready(status: &InitializationStatus) -> Result<(), AppError> {
 
 /// Run the reviewed first-use operation. No pull request is ever mutated here.
 pub fn init(context: &AppContext) -> Result<InitOutput, AppError> {
-    let status = crate::read::status(context)?;
     let provider = GitHubMutationAdapter::new(
         crate::command::ProcessRunner::in_directory(&context.repository_path).with_timeout(
             std::time::Duration::from_secs(context.config.command_timeout_secs),
         ),
     );
-    init_with_provider(
-        context,
-        &status.repository,
-        &status.default_branch,
-        &provider,
-    )
+    let (repository, default_branch) = provider.repository_identity().map_err(provider_error)?;
+    init_with_provider(context, &repository, &default_branch, &provider)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -545,6 +546,9 @@ mod tests {
     }
 
     impl InitializationProvider for FakeProvider {
+        fn repository_identity(&self) -> Result<(RepositoryId, String), MutationError> {
+            Ok((repository(), "main".to_owned()))
+        }
         fn labels(&self, _: &RepositoryId) -> Result<Vec<RepositoryLabel>, MutationError> {
             Ok(self.labels.lock().unwrap().clone())
         }

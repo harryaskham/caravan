@@ -74,6 +74,9 @@ All commands are non-interactive.
 - When `.caravan/config.yaml` is absent it is created atomically with version-1
   defaults. An existing valid file is preserved byte-for-byte; incompatible or
   unreadable files are bounded errors and are never merged or overwritten.
+- Init resolves only repository identity and the default-branch name before
+  preflight. It never enumerates PRs, reads PR head OIDs, runs graph compatibility,
+  or verifies a moving Git ref, so unrelated pushes cannot make repeated init stale.
 - Init preflights repository write capability, squash auto-merge support, and
   default-branch protection with a required check or review policy. It creates
   `caravan` (`5319E7`, active member), `caravan-evicted` (`B60205`, evicted
