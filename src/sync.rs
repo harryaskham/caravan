@@ -1696,6 +1696,7 @@ mod tests {
         };
         let analysis = graph::analyze(&snapshot, checker).expect("analysis");
         StatusOutput {
+            timing: None,
             repository: repository(),
             default_branch: "main".to_owned(),
             current_branch: snapshot.current_branch,

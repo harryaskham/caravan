@@ -160,9 +160,23 @@ hooks:
     blocking: false
 ```
 
-`command_timeout_secs` is the hard deadline for each `git` or `gh` child;
-timeouts terminate and reap the child process group and return a structured,
-resumable error with the command stage and bounded output evidence.
+`command_timeout_secs` is both the hard ceiling for each `git` or `gh` child
+and the complete operator-safe budget for `cara status` (30 seconds by
+default). Status propagates one absolute deadline through discovery,
+compatibility, and label inventory; every child receives only the remaining
+budget. Timeouts terminate and reap the child process group and return stable
+`github_discovery_timeout` evidence with the exact phase, operation
+`elapsed_ms`/`deadline_ms`, retryability, bounded output, and a mutation-free
+safe next action. Successful JSON status includes `timing` with total and
+per-phase milliseconds (`github_discovery`, `compatibility_analysis`, and
+`repository_label_inventory`) so repository-size regressions are visible
+without an outer shell timeout.
+
+Discovery performs one bounded all-open PR query containing current check
+rollups, derives the current PR and caravan-labelled members from that snapshot,
+and uses a separate bounded merged-history query that deliberately omits check
+rollups. Provider command count therefore remains constant as open PR count
+grows; compatibility subprocesses share the same whole-status deadline.
 
 Hooks receive one versioned `CaravanEvent` JSON object on stdin plus non-secret
 `CARA_EVENT`, `CARA_EVENT_ID`, `CARA_OPERATION_ID`, `CARA_REPOSITORY`,

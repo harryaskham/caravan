@@ -209,6 +209,7 @@ mod tests {
                 events: Vec::new(),
                 hook_deliveries: Vec::new(),
                 status: StatusOutput {
+                    timing: None,
                     repository: repository.clone(),
                     default_branch: "main".to_owned(),
                     current_branch: None,

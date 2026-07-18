@@ -1128,6 +1128,7 @@ mod tests {
         };
         let analysis = analyze(&snapshot, &clean).unwrap();
         StatusOutput {
+            timing: None,
             repository: repository(),
             default_branch: "main".to_owned(),
             current_branch: snapshot.current_branch,

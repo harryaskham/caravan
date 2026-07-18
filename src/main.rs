@@ -972,6 +972,7 @@ mod tests {
             oid: caravan::model::CommitOid("0".repeat(40)),
         };
         let output = caravan::read::StatusOutput {
+            timing: None,
             repository: repository.clone(),
             default_branch: "main".to_owned(),
             current_branch: Some("feature".to_owned()),

@@ -15,6 +15,9 @@ use crate::model::{
 };
 
 const PR_JSON_FIELDS: &str = "number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository,baseRefName,baseRefOid,labels,autoMergeRequest,statusCheckRollup,createdAt,mergedAt,url,updatedAt";
+// Merged predecessors are graph history, never CI candidates. Omitting the
+// rollup prevents old check suites from dominating provider response size.
+const PR_HISTORY_JSON_FIELDS: &str = "number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository,baseRefName,baseRefOid,labels,autoMergeRequest,createdAt,mergedAt,url,updatedAt";
 const WORKFLOW_RUN_JSON_FIELDS: &str =
     "databaseId,headSha,status,conclusion,event,name,workflowName,url";
 
@@ -855,10 +858,20 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
             oid: CommitOid(default_ref.object.sha),
         };
 
+        // One bounded snapshot supplies current-branch lookup, active members,
+        // admission candidates, and all live check rollups. Do not re-fetch the
+        // same expensive rollups through current/labelled provider queries.
+        let all_open_prs = self.pull_requests(
+            open_pr_command(&repository.slug(), self.options.open_limit),
+            &repository,
+        )?;
         let current_pr = match &current_branch {
             Some(branch) => {
-                let mut matches = self
-                    .pull_requests(current_pr_command(&repository.slug(), branch), &repository)?;
+                let mut matches = all_open_prs
+                    .iter()
+                    .filter(|pull_request| pull_request.head.name == *branch)
+                    .cloned()
+                    .collect::<Vec<_>>();
                 match matches.len() {
                     0 => None,
                     1 => matches.pop(),
@@ -872,25 +885,12 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
             }
             None => None,
         };
-
-        let open_labeled_prs = self.pull_requests(
-            labeled_pr_command(
-                &repository.slug(),
-                "open",
-                &self.options.label,
-                self.options.open_limit,
-                false,
-            ),
-            &repository,
-        )?;
+        let open_labeled_prs = all_open_prs
+            .iter()
+            .filter(|pull_request| pull_request.labels.contains(&self.options.label))
+            .cloned()
+            .collect::<Vec<_>>();
         validate_active_heads(&repository, &open_labeled_prs)?;
-        // Status and ready-PR hooks need every open PR, not only members that
-        // already carry the active label. The labelled query remains separate
-        // so active-member bounds and fork validation stay explicit.
-        let all_open_prs = self.pull_requests(
-            open_pr_command(&repository.slug(), self.options.open_limit),
-            &repository,
-        )?;
         let recently_merged_labeled_prs = self.pull_requests(
             labeled_pr_command(
                 &repository.slug(),
@@ -1021,23 +1021,6 @@ fn default_branch_command(repository: &str, branch: &str) -> CommandSpec {
             "repos/{repository}/git/ref/heads/{}",
             encode_path_segment(branch)
         ),
-    ])
-}
-
-fn current_pr_command(repository: &str, branch: &str) -> CommandSpec {
-    CommandSpec::new("gh").args([
-        "pr",
-        "list",
-        "--repo",
-        repository,
-        "--state",
-        "open",
-        "--head",
-        branch,
-        "--limit",
-        "2",
-        "--json",
-        PR_JSON_FIELDS,
     ])
 }
 
@@ -1255,7 +1238,11 @@ fn labeled_pr_command(
         "--limit".to_owned(),
         limit.to_string(),
         "--json".to_owned(),
-        PR_JSON_FIELDS.to_owned(),
+        if state == "merged" {
+            PR_HISTORY_JSON_FIELDS.to_owned()
+        } else {
+            PR_JSON_FIELDS.to_owned()
+        },
     ]);
     if most_recently_updated {
         command = command.args(["--search", "sort:updated-desc"]);
@@ -1668,14 +1655,6 @@ mod tests {
                 CommandOutput::success(r#"{"object":{"sha":"default-sha"}}"#),
             ),
             (
-                current_pr_command("acme/widgets", "feature/widget"),
-                CommandOutput::success(pr_list_json(12, "feature/widget", "acme/widgets", false)),
-            ),
-            (
-                labeled_pr_command("acme/widgets", "open", "caravan", 1_000, false),
-                CommandOutput::success(open_prs),
-            ),
-            (
                 open_pr_command("acme/widgets", 1_000),
                 CommandOutput::success(open_prs),
             ),
@@ -1693,12 +1672,29 @@ mod tests {
     }
 
     fn merged_pr_json() -> &'static str {
-        r#"[{"number":9,"title":"Merged queue change","state":"MERGED","isDraft":false,"headRefName":"old-head","headRefOid":"head-9","headRepository":{"name":"widgets","nameWithOwner":"acme/widgets"},"headRepositoryOwner":{"login":"acme"},"isCrossRepository":false,"baseRefName":"main","baseRefOid":"base-9","labels":[{"name":"caravan"}],"autoMergeRequest":null,"statusCheckRollup":[{"__typename":"StatusContext","name":null,"context":"legacy-ci","status":null,"conclusion":null,"state":"SUCCESS","workflowName":null,"detailsUrl":null,"targetUrl":"https://example.test/status"}],"createdAt":"2026-07-17T08:00:00Z","mergedAt":"2026-07-17T09:00:00Z","url":"https://example.test/pr/9","updatedAt":"2026-07-17T09:00:00Z"}]"#
+        r#"[{"number":9,"title":"Merged queue change","state":"MERGED","isDraft":false,"headRefName":"old-head","headRefOid":"head-9","headRepository":{"name":"widgets","nameWithOwner":"acme/widgets"},"headRepositoryOwner":{"login":"acme"},"isCrossRepository":false,"baseRefName":"main","baseRefOid":"base-9","labels":[{"name":"caravan"}],"autoMergeRequest":null,"createdAt":"2026-07-17T08:00:00Z","mergedAt":"2026-07-17T09:00:00Z","url":"https://example.test/pr/9","updatedAt":"2026-07-17T09:00:00Z"}]"#
     }
 
     fn pr_object_json(number: u64, branch: &str, repository: &str) -> String {
         let list = pr_list_json(number, branch, repository, false);
         list[1..list.len() - 1].to_owned()
+    }
+
+    fn large_open_pr_fixture() -> String {
+        let pulls = (101..=130)
+            .map(|number| {
+                let branch = format!("feature-{number}");
+                let mut value: serde_json::Value =
+                    serde_json::from_str(&pr_object_json(number, &branch, "acme/widgets")).unwrap();
+                let checks = value["statusCheckRollup"].as_array_mut().unwrap();
+                checks.push(checks[0].clone());
+                if number > 101 {
+                    value["baseRefName"] = serde_json::json!(format!("feature-{}", number - 1));
+                }
+                value
+            })
+            .collect::<Vec<_>>();
+        serde_json::to_string(&pulls).unwrap()
     }
 
     fn repository() -> RepositoryId {
@@ -1766,7 +1762,52 @@ mod tests {
             .find(|pull_request| pull_request.number == PrNumber(9))
             .expect("merged predecessor is present");
         assert_eq!(merged.state, model::PullRequestState::Merged);
-        assert_eq!(merged.checks[0].state, CheckState::Success);
+        assert!(merged.checks.is_empty());
+        discovery.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn large_repository_uses_one_open_rollup_and_minimal_history_query() {
+        let open_prs = large_open_pr_fixture();
+        let calls = successful_discovery_calls(&open_prs);
+        assert_eq!(
+            calls.len(),
+            5,
+            "discovery command count must remain constant"
+        );
+        let merged_command = &calls[4].0;
+        let projection = merged_command.args.last().unwrap();
+        assert!(!projection.contains("statusCheckRollup"));
+
+        let runner = FakeRunner::new(calls);
+        let discovery = GitHubDiscovery::new(runner);
+        let snapshot = discovery.discover().expect("large discovery succeeds");
+
+        assert_eq!(snapshot.pull_requests.len(), 31);
+        assert_eq!(
+            snapshot
+                .pull_requests
+                .iter()
+                .filter(|pull_request| pull_request.state == model::PullRequestState::Open)
+                .count(),
+            30
+        );
+        assert!(
+            snapshot
+                .pull_requests
+                .iter()
+                .filter(|pr| pr.state == model::PullRequestState::Open)
+                .all(|pr| pr.checks.len() == 2)
+        );
+        assert!(
+            snapshot
+                .pull_requests
+                .iter()
+                .find(|pr| pr.state == model::PullRequestState::Merged)
+                .unwrap()
+                .checks
+                .is_empty()
+        );
         discovery.runner.assert_exhausted();
     }
 
@@ -1815,8 +1856,7 @@ mod tests {
     fn rejects_fork_only_active_caravan_heads() {
         let fork_prs = pr_list_json(14, "fork-feature", "someone/widgets", true);
         let mut calls = successful_discovery_calls(&fork_prs);
-        calls.pop(); // merged-history query
-        calls.pop(); // all-open query; active-head validation stops before both
+        calls.pop(); // merged-history query; active-head validation stops before it
         let runner = FakeRunner::new(calls);
         let discovery = GitHubDiscovery::new(runner);
 
@@ -1848,10 +1888,6 @@ mod tests {
             (
                 default_branch_command("acme/widgets", "main"),
                 CommandOutput::success(r#"{"object":{"sha":"default-sha"}}"#),
-            ),
-            (
-                labeled_pr_command("acme/widgets", "open", "caravan", 1_000, false),
-                CommandOutput::success("[]"),
             ),
             (
                 open_pr_command("acme/widgets", 1_000),
