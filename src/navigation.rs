@@ -144,54 +144,23 @@ pub fn select_destination(
     direction: Direction,
 ) -> Result<(Option<PrNumber>, PrNumber), AppError> {
     let Some(current) = status.current_pr else {
-        if scope != Scope::Fleet
-            || status.current_branch.as_deref() != Some(status.default_branch.as_str())
-        {
-            return Err(AppError::validation(
-                "current_pr_not_found",
-                "the current branch has no unique open GitHub pull request",
-            ));
-        }
-        if direction == Direction::Previous {
-            return Err(AppError::structured(
-                ErrorCategory::TargetNotFound,
-                "navigation_boundary",
-                "the default branch is already before the first caravan in fleet order",
-                Some(json!({
-                    "current_pr": null,
-                    "current_branch": status.default_branch,
-                    "scope": scope,
-                    "direction": direction,
-                })),
-            ));
-        }
-        let destination = status
-            .analysis
-            .fleet
-            .caravans
-            .first()
-            .and_then(Caravan::head)
-            .ok_or_else(|| {
-                AppError::structured(
-                    ErrorCategory::TargetNotFound,
-                    "navigation_boundary",
-                    "there are no caravan heads to navigate to",
-                    Some(json!({
-                        "current_pr": null,
-                        "current_branch": status.default_branch,
-                        "scope": scope,
-                        "direction": direction,
-                    })),
-                )
-            })?;
-        return Ok((None, destination));
+        return select_without_active_pr(status, scope, direction);
     };
+    let historical = read::historical_predecessor(status);
     let current_caravan = status.analysis.fleet.containing(current).ok_or_else(|| {
         AppError::validation(
             "current_pr_not_in_caravan",
             format!("PR #{current} is not an active caravan member"),
         )
     })?;
+
+    // A retained merged branch occupies the historical slot immediately before
+    // its recovered active successor. Enter that successor for both chain and
+    // fleet `next`; `previous` uses the active successor's deterministic lower
+    // boundary/fleet predecessor semantics.
+    if historical.is_some() && direction == Direction::Next {
+        return Ok((historical, current));
+    }
 
     let destination = match scope {
         Scope::Caravan => {
@@ -242,7 +211,83 @@ pub fn select_destination(
                 })),
             ))
         },
-        |destination| Ok((Some(current), destination)),
+        |destination| Ok((Some(historical.unwrap_or(current)), destination)),
+    )
+}
+
+fn select_without_active_pr(
+    status: &StatusOutput,
+    scope: Scope,
+    direction: Direction,
+) -> Result<(Option<PrNumber>, PrNumber), AppError> {
+    if let Some(predecessor) = read::historical_predecessor(status) {
+        return Err(historical_boundary_error(
+            status,
+            predecessor,
+            scope,
+            direction,
+        ));
+    }
+    if scope != Scope::Fleet
+        || status.current_branch.as_deref() != Some(status.default_branch.as_str())
+    {
+        return Err(AppError::validation(
+            "current_pr_not_found",
+            "the current branch has no unique open GitHub pull request",
+        ));
+    }
+    if direction == Direction::Previous {
+        return Err(AppError::structured(
+            ErrorCategory::TargetNotFound,
+            "navigation_boundary",
+            "the default branch is already before the first caravan in fleet order",
+            Some(json!({
+                "current_pr": null,
+                "current_branch": status.default_branch,
+                "scope": scope,
+                "direction": direction,
+            })),
+        ));
+    }
+    let destination = status
+        .analysis
+        .fleet
+        .caravans
+        .first()
+        .and_then(Caravan::head)
+        .ok_or_else(|| {
+            AppError::structured(
+                ErrorCategory::TargetNotFound,
+                "navigation_boundary",
+                "there are no caravan heads to navigate to",
+                Some(json!({
+                    "current_pr": null,
+                    "current_branch": status.default_branch,
+                    "scope": scope,
+                    "direction": direction,
+                })),
+            )
+        })?;
+    Ok((None, destination))
+}
+
+fn historical_boundary_error(
+    status: &StatusOutput,
+    predecessor: PrNumber,
+    scope: Scope,
+    direction: Direction,
+) -> AppError {
+    AppError::structured(
+        ErrorCategory::TargetNotFound,
+        "historical_successor_not_found",
+        format!("merged Caravan PR #{predecessor} has no unique active rolling successor"),
+        Some(json!({
+            "historical_predecessor": predecessor,
+            "current_branch": status.current_branch,
+            "scope": scope,
+            "direction": direction,
+            "fail_closed": true,
+        })),
     )
 }
 
@@ -258,12 +303,7 @@ pub fn ensure_safe_worktree(
     let allowance = local_config_allowance(repository, config_path);
     let status = run(
         runner,
-        CommandSpec::new("git").args([
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=all",
-        ]),
+        CommandSpec::new("git").args(["status", "--porcelain=v1", "-z", "--untracked-files=all"]),
     )?;
     require_success(
         "git_status_failed",
@@ -756,6 +796,49 @@ mod tests {
     }
 
     #[test]
+    fn historical_branch_next_enters_recovered_successor() {
+        let mut historical = status(1);
+        let mut merged = pull_request(9, "main");
+        merged.state = PullRequestState::Merged;
+        merged.head = branch("old-head", 9);
+        merged.merged_at = Some("2026-01-01T00:01:00Z".to_owned());
+        historical
+            .analysis
+            .pull_requests
+            .insert(merged.number, merged);
+        historical.current_branch = Some("old-head".to_owned());
+
+        assert_eq!(
+            select_destination(&historical, Scope::Caravan, Direction::Next).unwrap(),
+            (Some(PrNumber(9)), PrNumber(1))
+        );
+        assert_eq!(
+            select_destination(&historical, Scope::Fleet, Direction::Next).unwrap(),
+            (Some(PrNumber(9)), PrNumber(1))
+        );
+    }
+
+    #[test]
+    fn historical_branch_without_successor_has_typed_boundary() {
+        let mut historical = status(1);
+        let mut merged = pull_request(9, "main");
+        merged.state = PullRequestState::Merged;
+        merged.head = branch("old-head", 9);
+        historical
+            .analysis
+            .pull_requests
+            .insert(merged.number, merged);
+        historical.current_branch = Some("old-head".to_owned());
+        historical.current_pr = None;
+
+        let error = select_destination(&historical, Scope::Caravan, Direction::Next).unwrap_err();
+        assert_eq!(
+            mcp_cli::StructuredError::code(&error),
+            "historical_successor_not_found"
+        );
+    }
+
+    #[test]
     fn fleet_next_enters_first_caravan_from_default_branch() {
         let mut default_branch = status(1);
         default_branch.current_branch = Some("main".to_owned());
@@ -850,7 +933,10 @@ mod tests {
         fs::create_dir_all(config.parent().unwrap()).unwrap();
         fs::write(&config, "{}\n").unwrap();
         git(directory.path(), ["add", ".caravan/config.yaml"]);
-        git(directory.path(), ["commit", "--quiet", "--message", "config"]);
+        git(
+            directory.path(),
+            ["commit", "--quiet", "--message", "config"],
+        );
         let runner = ProcessRunner::in_directory(directory.path());
         ensure_safe_worktree(directory.path(), &config, &runner).unwrap();
 

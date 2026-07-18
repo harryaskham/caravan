@@ -106,6 +106,13 @@ pub struct NextCandidateOutput {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ShowOutput {
     pub repository: RepositoryId,
+    /// Merged PR named by the checked-out branch, when rolling context was recovered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub historical_predecessor: Option<PrNumber>,
+    /// Exact bounded-history facts for the merged branch-local predecessor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub historical_pull_request: Option<PullRequestSnapshot>,
+    /// Effective active successor used for chain position and navigation.
     pub current_pr: PrNumber,
     pub caravan: Caravan,
     /// Zero-based head-to-tail position.
@@ -434,14 +441,43 @@ pub fn resolve_admission(analysis: &GraphAnalysis, priority_labels: &[String]) -
     }
 }
 
+/// Return the unique merged Caravan PR named by the local branch when the
+/// effective current PR is its active rolling successor.
+#[must_use]
+pub fn historical_predecessor(status: &StatusOutput) -> Option<PrNumber> {
+    let branch = status.current_branch.as_deref()?;
+    let mut matches = status.analysis.pull_requests.values().filter(|pull| {
+        pull.state == PullRequestState::Merged
+            && pull.has_label("caravan")
+            && pull.head.repository == status.repository
+            && !pull.cross_repository
+            && pull.head.name == branch
+    });
+    let predecessor = matches.next()?.number;
+    matches.next().is_none().then_some(predecessor)
+}
+
 /// Show the current branch's active caravan and position.
 pub fn show(context: &AppContext) -> Result<ShowOutput, AppError> {
     let status = status(context)?;
     let current_pr = status.current_pr.ok_or_else(|| {
-        AppError::validation(
-            "current_pr_not_found",
-            "the current branch has no unique open GitHub pull request",
-        )
+        if let Some(predecessor) = historical_predecessor(&status) {
+            AppError::structured(
+                ErrorCategory::TargetNotFound,
+                "historical_successor_not_found",
+                format!("merged Caravan PR #{predecessor} has no unique active rolling successor"),
+                Some(json!({
+                    "historical_predecessor": predecessor,
+                    "current_branch": status.current_branch,
+                    "fail_closed": true,
+                })),
+            )
+        } else {
+            AppError::validation(
+                "current_pr_not_found",
+                "the current branch has no unique open GitHub pull request",
+            )
+        }
     })?;
     let caravan = status
         .analysis
@@ -468,7 +504,12 @@ pub fn show(context: &AppContext) -> Result<ShowOutput, AppError> {
         .filter(|candidate| caravan.members.contains(&candidate.pr))
         .cloned()
         .collect();
+    let historical_predecessor = historical_predecessor(&status);
+    let historical_pull_request = historical_predecessor
+        .and_then(|number| status.analysis.pull_requests.get(&number).cloned());
     Ok(ShowOutput {
+        historical_predecessor,
+        historical_pull_request,
         repository: status.repository,
         current_pr,
         caravan,
@@ -785,8 +826,28 @@ fn discovery_error(error: &DiscoveryError) -> AppError {
             })),
         );
     }
+    if let DiscoveryError::HistoricalCurrentPullRequest {
+        reason,
+        branch,
+        candidates,
+    } = error
+    {
+        return AppError::structured(
+            ErrorCategory::Validation,
+            format!("historical_current_pr_{reason}"),
+            error.to_string(),
+            Some(json!({
+                "historical_branch": branch,
+                "candidates": candidates,
+                "reason": reason,
+                "fail_closed": true,
+                "next": "inspect bounded same-repository PR history and restore an exact, unique retained Caravan branch before retrying",
+            })),
+        );
+    }
     let category = match error {
         DiscoveryError::AmbiguousCurrentPullRequest { .. }
+        | DiscoveryError::HistoricalCurrentPullRequest { .. }
         | DiscoveryError::ForkOnlyHead { .. }
         | DiscoveryError::InvalidLimit(_)
         | DiscoveryError::InvalidRepositorySlug(_)

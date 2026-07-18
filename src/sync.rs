@@ -134,6 +134,9 @@ pub struct SyncOutput {
     /// Exact provider before/after facts for completed remote mutations.
     #[serde(default)]
     pub provider_receipts: Vec<GitHubMutationReceipt>,
+    /// Merged branch-local predecessor that selected the active caravan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub historical_predecessor: Option<PrNumber>,
     /// Caravan IDs actually selected from the initial snapshot.
     #[serde(default)]
     pub synchronized_caravans: Vec<PrNumber>,
@@ -630,6 +633,7 @@ fn sync_with_lock(
         }),
         lock_recovery,
         provider_receipts: progress.provider_receipts,
+        historical_predecessor: read::historical_predecessor(&status),
         synchronized_caravans: progress.synchronized_caravans,
         paused_caravans: progress.paused_caravans,
         head_advancements: progress.head_advancements,
@@ -1343,10 +1347,25 @@ fn select_caravans(status: &StatusOutput, all: bool) -> Result<Vec<Caravan>, App
         status.analysis.fleet.caravans.clone()
     } else {
         let current = status.current_pr.ok_or_else(|| {
-            AppError::validation(
-                "current_pr_not_found",
-                "the current branch has no unique open PR; use `cara sync --all`",
-            )
+            if let Some(predecessor) = read::historical_predecessor(status) {
+                AppError::structured(
+                    ErrorCategory::TargetNotFound,
+                    "historical_successor_not_found",
+                    format!(
+                        "merged Caravan PR #{predecessor} has no unique active rolling successor"
+                    ),
+                    Some(json!({
+                        "historical_predecessor": predecessor,
+                        "current_branch": status.current_branch,
+                        "fail_closed": true,
+                    })),
+                )
+            } else {
+                AppError::validation(
+                    "current_pr_not_found",
+                    "the current branch has no unique open PR; use `cara sync --all`",
+                )
+            }
         })?;
         vec![
             status

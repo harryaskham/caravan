@@ -132,7 +132,7 @@ Every successful mutation of `caravan`, `caravan-evicted`, `caravan-force`, or a
 - `cara next` — check out the labelled child of the current PR; error at the tail.
 - `cara prev` — check out the predecessor/base PR; error at the head.
 
-Navigation refuses dirty worktrees, in-progress Git operations, ambiguous PR mappings, and unsafe branch switches.
+Navigation refuses dirty worktrees, in-progress Git operations, ambiguous PR mappings, and unsafe branch switches. When the checked-out branch still names an exact, retained, same-repository merged Caravan PR, discovery follows bounded base-ref change history through merged members to its unique active rolling successor. `show` reports both the historical predecessor and the active chain position; chain and fleet `next` enter that successor. Closed-unmerged or unlabelled history, branch reuse, deleted/fork-only heads, stale local or remote OIDs, ambiguous successors, and exhausted history all fail closed with typed evidence. A valid historical predecessor with no successor reports `historical_successor_not_found` rather than silently entering another caravan.
 
 `cara van` is the fleet-level command prefix:
 

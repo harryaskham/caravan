@@ -85,6 +85,15 @@ pub enum DiscoveryError {
         /// Candidate PR numbers.
         candidates: Vec<u64>,
     },
+    /// A branch that names historical PR state could not be mapped safely.
+    HistoricalCurrentPullRequest {
+        /// Stable fail-closed reason for CLI/JSON/MCP diagnostics.
+        reason: &'static str,
+        /// Current local branch.
+        branch: String,
+        /// Relevant PR candidates, in deterministic order.
+        candidates: Vec<u64>,
+    },
     /// A PR has no resolvable head repository.
     MissingHeadRepository {
         /// Affected PR number.
@@ -131,6 +140,14 @@ impl std::fmt::Display for DiscoveryError {
             Self::AmbiguousCurrentPullRequest { branch, candidates } => write!(
                 formatter,
                 "branch `{branch}` maps to multiple open pull requests: {candidates:?}"
+            ),
+            Self::HistoricalCurrentPullRequest {
+                reason,
+                branch,
+                candidates,
+            } => write!(
+                formatter,
+                "historical branch `{branch}` is unsafe ({reason}); candidates: {candidates:?}"
             ),
             Self::MissingHeadRepository { pr } => {
                 write!(formatter, "PR #{pr} has no resolvable head repository")
@@ -991,6 +1008,7 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
     }
 
     /// Run a complete, internally consistent read-only discovery pass.
+    #[allow(clippy::too_many_lines)]
     pub fn discover(&self) -> Result<model::RepositorySnapshot, DiscoveryError> {
         if self.options.open_limit == 0 {
             return Err(DiscoveryError::InvalidLimit("open_limit"));
@@ -1071,18 +1089,25 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
             &repository,
         )?;
 
-        let current_pr_number = current_pr.as_ref().map(|pr| pr.number);
         let mut pull_requests = BTreeMap::new();
         for pull_request in all_open_prs
             .into_iter()
             .chain(open_labeled_prs)
             .chain(recently_merged_labeled_prs)
-            .chain(current_pr)
+            .chain(current_pr.clone())
         {
             pull_requests
                 .entry(pull_request.number)
                 .or_insert(pull_request);
         }
+
+        let current_pr_number = self.resolve_current_pr(
+            &repository,
+            &default_branch.name,
+            current_branch.as_deref(),
+            current_pr,
+            &mut pull_requests,
+        )?;
 
         Ok(model::RepositorySnapshot {
             repository,
@@ -1096,6 +1121,29 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
             pull_requests: pull_requests.into_values().collect(),
             observed_at: None,
         })
+    }
+
+    fn resolve_current_pr(
+        &self,
+        repository: &RepositoryId,
+        default_branch: &str,
+        current_branch: Option<&str>,
+        current_pr: Option<model::PullRequestSnapshot>,
+        pulls: &mut BTreeMap<PrNumber, model::PullRequestSnapshot>,
+    ) -> Result<Option<PrNumber>, DiscoveryError> {
+        if let Some(current) = current_pr {
+            return Ok(Some(current.number));
+        }
+        let Some(branch) = current_branch.filter(|branch| *branch != default_branch) else {
+            return Ok(None);
+        };
+        let Some((historical, successor)) =
+            self.resolve_historical_current_pr(repository, branch, pulls)?
+        else {
+            return Ok(None);
+        };
+        pulls.entry(historical.number).or_insert(historical);
+        Ok(successor)
     }
 
     fn merge_candidate_identities(
@@ -1208,6 +1256,178 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
         }
         let oid = output.stdout.trim();
         Ok((!oid.is_empty()).then(|| CommitOid(oid.to_owned())))
+    }
+
+    /// Resolve an exact retained merged branch through bounded Caravan history.
+    /// The returned number is the active rolling successor, not the merged PR;
+    /// callers can recover the predecessor from `current_branch` and the
+    /// included merged snapshots for explicit receipts.
+    fn resolve_historical_current_pr(
+        &self,
+        repository: &RepositoryId,
+        branch: &str,
+        pulls: &BTreeMap<PrNumber, model::PullRequestSnapshot>,
+    ) -> Result<Option<(model::PullRequestSnapshot, Option<PrNumber>)>, DiscoveryError> {
+        let mut history = self.pull_requests(
+            branch_pr_history_command(&repository.slug(), branch, self.options.merged_limit),
+            repository,
+        )?;
+        history.retain(|pull| pull.head.name == branch);
+        history.sort_by_key(|pull| pull.number);
+        let candidates = history.iter().map(|pull| pull.number.0).collect::<Vec<_>>();
+        if history.is_empty() {
+            return Ok(None);
+        }
+        if history.len() != 1 {
+            return Err(DiscoveryError::HistoricalCurrentPullRequest {
+                reason: "branch_reuse_ambiguous",
+                branch: branch.to_owned(),
+                candidates,
+            });
+        }
+        let historical = &history[0];
+        let fail = |reason| DiscoveryError::HistoricalCurrentPullRequest {
+            reason,
+            branch: branch.to_owned(),
+            candidates: vec![historical.number.0],
+        };
+        if historical.state != model::PullRequestState::Merged {
+            return Err(fail("closed_unmerged"));
+        }
+        if !historical.has_label(&self.options.label) {
+            return Err(fail("missing_caravan_label"));
+        }
+        if historical.cross_repository || historical.head.repository != *repository {
+            return Err(fail("fork_only_head"));
+        }
+
+        self.validate_historical_head(repository, branch, historical)?;
+
+        let mut base_history = BTreeMap::new();
+        let mut current = historical.number;
+        loop {
+            let predecessor = pulls.get(&current).unwrap_or(historical);
+            let mut successors = pulls
+                .values()
+                .filter(|candidate| {
+                    candidate.number != current
+                        && candidate.has_label(&self.options.label)
+                        && candidate.head.repository == *repository
+                        && !candidate.cross_repository
+                        && candidate.base.name == predecessor.head.name
+                })
+                .map(|candidate| candidate.number)
+                .collect::<Vec<_>>();
+            if successors.is_empty() {
+                if base_history.is_empty() {
+                    base_history = self.base_ref_history(repository, pulls.keys().copied())?;
+                }
+                successors = pulls
+                    .values()
+                    .filter(|candidate| {
+                        candidate.number != current
+                            && candidate.has_label(&self.options.label)
+                            && candidate.head.repository == *repository
+                            && !candidate.cross_repository
+                            && base_history
+                                .get(&candidate.number)
+                                .is_some_and(|names| names.contains(&predecessor.head.name))
+                    })
+                    .map(|candidate| candidate.number)
+                    .collect();
+            }
+            successors.sort_unstable();
+            successors.dedup();
+            match successors.as_slice() {
+                [] => return Ok(Some((historical.clone(), None))),
+                [successor] => {
+                    let successor_pull = pulls.get(successor).expect("successor came from pulls");
+                    if successor_pull.state == model::PullRequestState::Open
+                        && successor_pull.is_active_caravan_member()
+                    {
+                        return Ok(Some((historical.clone(), Some(*successor))));
+                    }
+                    if successor_pull.state != model::PullRequestState::Merged {
+                        return Err(fail("successor_not_active_or_merged"));
+                    }
+                    current = *successor;
+                }
+                _ => {
+                    return Err(DiscoveryError::HistoricalCurrentPullRequest {
+                        reason: "ambiguous_successor",
+                        branch: branch.to_owned(),
+                        candidates: successors.iter().map(|number| number.0).collect(),
+                    });
+                }
+            }
+        }
+    }
+
+    fn validate_historical_head(
+        &self,
+        repository: &RepositoryId,
+        branch: &str,
+        historical: &model::PullRequestSnapshot,
+    ) -> Result<(), DiscoveryError> {
+        let fail = |reason| DiscoveryError::HistoricalCurrentPullRequest {
+            reason,
+            branch: branch.to_owned(),
+            candidates: vec![historical.number.0],
+        };
+        let local_oid = self.command_text(current_head_oid_command())?;
+        let remote: GitRefJson = self
+            .json(historical_head_command(&repository.slug(), branch))
+            .map_err(|error| match &error {
+                DiscoveryError::CommandFailed { code, stderr, .. }
+                    if *code == Some(1) && stderr.contains("404") =>
+                {
+                    fail("deleted_head")
+                }
+                _ => error,
+            })?;
+        if local_oid != historical.head.oid.0 || remote.object.sha != historical.head.oid.0 {
+            return Err(fail("stale_oid"));
+        }
+        Ok(())
+    }
+
+    fn base_ref_history(
+        &self,
+        repository: &RepositoryId,
+        numbers: impl Iterator<Item = PrNumber>,
+    ) -> Result<BTreeMap<PrNumber, BTreeSet<String>>, DiscoveryError> {
+        let numbers = numbers.collect::<Vec<_>>();
+        if numbers.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let response: BaseHistoryResponse =
+            self.json(base_history_command(repository, &numbers))?;
+        let mut result = BTreeMap::new();
+        for (alias, pull) in response.data.repository.pulls {
+            let Some(number) = alias.strip_prefix('p').and_then(|value| value.parse().ok()) else {
+                continue;
+            };
+            let names = pull
+                .timeline_items
+                .nodes
+                .into_iter()
+                .filter_map(|node| node.previous_ref_name)
+                .collect();
+            result.insert(PrNumber(number), names);
+        }
+        Ok(result)
+    }
+
+    fn command_text(&self, command: CommandSpec) -> Result<String, DiscoveryError> {
+        let output = self.runner.run(&command)?;
+        if !output.is_success() {
+            return Err(DiscoveryError::CommandFailed {
+                command,
+                code: output.code,
+                stderr: output.stderr.trim().to_owned(),
+            });
+        }
+        Ok(output.stdout.trim().to_owned())
     }
 
     fn current_branch(&self) -> Result<Option<String>, DiscoveryError> {
@@ -1626,6 +1846,50 @@ fn admin_squash_merge_command(repository: &RepositoryId, number: PrNumber) -> Co
     ])
 }
 
+fn branch_pr_history_command(repository: &str, branch: &str, limit: usize) -> CommandSpec {
+    CommandSpec::new("gh").args([
+        "pr",
+        "list",
+        "--repo",
+        repository,
+        "--state",
+        "all",
+        "--head",
+        branch,
+        "--limit",
+        &limit.to_string(),
+        "--json",
+        PR_HISTORY_JSON_FIELDS,
+    ])
+}
+
+fn current_head_oid_command() -> CommandSpec {
+    CommandSpec::new("git").args(["rev-parse", "HEAD"])
+}
+
+fn historical_head_command(repository: &str, branch: &str) -> CommandSpec {
+    CommandSpec::new("gh").args([
+        "api".to_owned(),
+        format!(
+            "repos/{repository}/git/ref/heads/{}",
+            encode_path_segment(branch)
+        ),
+    ])
+}
+
+fn base_history_command(repository: &RepositoryId, numbers: &[PrNumber]) -> CommandSpec {
+    let selections = numbers
+        .iter()
+        .map(|number| format!("p{}: pullRequest(number:{}) {{ timelineItems(last:100, itemTypes:[BASE_REF_CHANGED_EVENT]) {{ nodes {{ ... on BaseRefChangedEvent {{ previousRefName currentRefName }} }} }} }}", number.0, number.0))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let query = format!(
+        "query {{ repository(owner:\"{}\", name:\"{}\") {{ {selections} }} }}",
+        repository.owner, repository.name
+    );
+    CommandSpec::new("gh").args(["api", "graphql", "-f", &format!("query={query}")])
+}
+
 fn labeled_pr_command(
     repository: &str,
     state: &str,
@@ -1684,6 +1948,42 @@ fn normalize_check_state(provider_state: Option<&str>) -> CheckState {
         Some("ACTION_REQUIRED") => CheckState::ActionRequired,
         _ => CheckState::Unknown,
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct BaseHistoryResponse {
+    data: BaseHistoryData,
+}
+
+#[derive(Debug, Deserialize)]
+struct BaseHistoryData {
+    repository: BaseHistoryRepository,
+}
+
+#[derive(Debug, Deserialize)]
+struct BaseHistoryRepository {
+    #[serde(flatten)]
+    pulls: BTreeMap<String, BaseHistoryPull>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BaseHistoryPull {
+    timeline_items: BaseHistoryTimeline,
+}
+
+#[derive(Debug, Deserialize)]
+struct BaseHistoryTimeline {
+    #[serde(default)]
+    nodes: Vec<BaseHistoryNode>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BaseHistoryNode {
+    previous_ref_name: Option<String>,
+    #[allow(dead_code)]
+    current_ref_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2332,14 +2632,230 @@ mod tests {
         discovery.runner.assert_exhausted();
     }
 
+    fn historical_discovery_calls(
+        open_prs: &str,
+        branch_history: String,
+    ) -> Vec<(CommandSpec, CommandOutput)> {
+        let mut calls = successful_discovery_calls(open_prs);
+        calls[1] = (
+            current_branch_command(),
+            CommandOutput::success("old-head\n"),
+        );
+        calls.push((
+            branch_pr_history_command("acme/widgets", "old-head", 100),
+            CommandOutput::success(branch_history),
+        ));
+        calls
+    }
+
+    #[test]
+    fn merged_current_branch_resolves_direct_active_successor() {
+        let open = pr_list_json(10, "next", "acme/widgets", false)
+            .replace("\"baseRefName\":\"main\"", "\"baseRefName\":\"old-head\"");
+        let mut calls = historical_discovery_calls(&open, merged_pr_json().to_owned());
+        calls.extend([
+            (
+                current_head_oid_command(),
+                CommandOutput::success("head-9\n"),
+            ),
+            (
+                historical_head_command("acme/widgets", "old-head"),
+                CommandOutput::success(r#"{"object":{"sha":"head-9"}}"#),
+            ),
+        ]);
+        let discovery = GitHubDiscovery::new(FakeRunner::new(calls));
+
+        let snapshot = discovery.discover().expect("historical context resolves");
+
+        assert_eq!(snapshot.current_pr, Some(PrNumber(10)));
+        assert!(
+            snapshot
+                .pull_requests
+                .iter()
+                .any(|pull| pull.number == PrNumber(9))
+        );
+        discovery.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn merged_current_branch_resolves_successor_after_child_retarget() {
+        let mut calls = historical_discovery_calls(
+            &pr_list_json(10, "next", "acme/widgets", false),
+            merged_pr_json().to_owned(),
+        );
+        calls.extend([
+            (current_head_oid_command(), CommandOutput::success("head-9\n")),
+            (
+                historical_head_command("acme/widgets", "old-head"),
+                CommandOutput::success(r#"{"object":{"sha":"head-9"}}"#),
+            ),
+            (
+                base_history_command(&repository(), &[PrNumber(9), PrNumber(10)]),
+                CommandOutput::success(r#"{"data":{"repository":{"p9":{"timelineItems":{"nodes":[]}},"p10":{"timelineItems":{"nodes":[{"previousRefName":"old-head","currentRefName":"main"}]}}}}}"#),
+            ),
+        ]);
+        let discovery = GitHubDiscovery::new(FakeRunner::new(calls));
+
+        let snapshot = discovery.discover().expect("retarget history resolves");
+
+        assert_eq!(snapshot.current_pr, Some(PrNumber(10)));
+        discovery.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn merged_middle_branch_follows_history_to_active_rolling_head() {
+        let merged_ten = pr_list_json(10, "next", "acme/widgets", false)
+            .replace("\"state\":\"OPEN\"", "\"state\":\"MERGED\"")
+            .replace("\"mergedAt\":null", "\"mergedAt\":\"2026-07-17T12:00:00Z\"");
+        let merged = format!(
+            "[{},{}]",
+            &merged_pr_json()[1..merged_pr_json().len() - 1],
+            &merged_ten[1..merged_ten.len() - 1]
+        );
+        let mut calls = historical_discovery_calls(
+            &pr_list_json(11, "latest", "acme/widgets", false),
+            merged_pr_json().to_owned(),
+        );
+        calls[6].1 = CommandOutput::success(merged);
+        calls.extend([
+            (
+                current_head_oid_command(),
+                CommandOutput::success("head-9\n"),
+            ),
+            (
+                historical_head_command("acme/widgets", "old-head"),
+                CommandOutput::success(r#"{"object":{"sha":"head-9"}}"#),
+            ),
+            (
+                base_history_command(
+                    &repository(),
+                    &[PrNumber(9), PrNumber(10), PrNumber(11)],
+                ),
+                CommandOutput::success(r#"{"data":{"repository":{"p9":{"timelineItems":{"nodes":[]}},"p10":{"timelineItems":{"nodes":[{"previousRefName":"old-head","currentRefName":"main"}]}},"p11":{"timelineItems":{"nodes":[{"previousRefName":"next","currentRefName":"main"}]}}}}}"#),
+            ),
+        ]);
+        let discovery = GitHubDiscovery::new(FakeRunner::new(calls));
+
+        let snapshot = discovery.discover().expect("middle history resolves");
+
+        assert_eq!(snapshot.current_pr, Some(PrNumber(11)));
+        discovery.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn merged_current_branch_without_successor_is_explicit_context() {
+        let mut calls = historical_discovery_calls("[]", merged_pr_json().to_owned());
+        calls.extend([
+            (
+                current_head_oid_command(),
+                CommandOutput::success("head-9\n"),
+            ),
+            (
+                historical_head_command("acme/widgets", "old-head"),
+                CommandOutput::success(r#"{"object":{"sha":"head-9"}}"#),
+            ),
+            (
+                base_history_command(&repository(), &[PrNumber(9)]),
+                CommandOutput::success(
+                    r#"{"data":{"repository":{"p9":{"timelineItems":{"nodes":[]}}}}}"#,
+                ),
+            ),
+        ]);
+        let discovery = GitHubDiscovery::new(FakeRunner::new(calls));
+
+        let snapshot = discovery
+            .discover()
+            .expect("history is valid without a successor");
+
+        assert_eq!(snapshot.current_pr, None);
+        assert_eq!(snapshot.current_branch.as_deref(), Some("old-head"));
+        discovery.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn deleted_historical_branch_fails_closed() {
+        let mut calls = historical_discovery_calls("[]", merged_pr_json().to_owned());
+        calls.extend([
+            (
+                current_head_oid_command(),
+                CommandOutput::success("head-9\n"),
+            ),
+            (
+                historical_head_command("acme/widgets", "old-head"),
+                CommandOutput::failure(1, "HTTP 404"),
+            ),
+        ]);
+        let discovery = GitHubDiscovery::new(FakeRunner::new(calls));
+
+        let error = discovery.discover().expect_err("deleted branch is unsafe");
+
+        assert!(matches!(
+            error,
+            DiscoveryError::HistoricalCurrentPullRequest {
+                reason: "deleted_head",
+                ..
+            }
+        ));
+        discovery.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn closed_unmerged_historical_branch_fails_closed() {
+        let closed = merged_pr_json()
+            .replace("\"state\":\"MERGED\"", "\"state\":\"CLOSED\"")
+            .replace("\"mergedAt\":\"2026-07-17T09:00:00Z\"", "\"mergedAt\":null");
+        let calls = historical_discovery_calls("[]", closed);
+        let discovery = GitHubDiscovery::new(FakeRunner::new(calls));
+
+        let error = discovery
+            .discover()
+            .expect_err("unmerged closure is unsafe");
+
+        assert!(matches!(
+            error,
+            DiscoveryError::HistoricalCurrentPullRequest {
+                reason: "closed_unmerged",
+                ..
+            }
+        ));
+        discovery.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn reused_historical_branch_fails_closed_before_oid_checks() {
+        let duplicate = format!(
+            "[{},{}]",
+            &merged_pr_json()[1..merged_pr_json().len() - 1],
+            &merged_pr_json()[1..merged_pr_json().len() - 1]
+                .replace("\"number\":9", "\"number\":8")
+        );
+        let calls = historical_discovery_calls("[]", duplicate);
+        let discovery = GitHubDiscovery::new(FakeRunner::new(calls));
+
+        let error = discovery.discover().expect_err("branch reuse is ambiguous");
+
+        assert!(matches!(
+            error,
+            DiscoveryError::HistoricalCurrentPullRequest {
+                reason: "branch_reuse_ambiguous",
+                ..
+            }
+        ));
+        discovery.runner.assert_exhausted();
+    }
+
     #[test]
     fn large_repository_uses_one_open_rollup_and_minimal_history_query() {
         let open_prs = large_open_pr_fixture();
-        let calls = successful_discovery_calls(&open_prs);
+        let mut calls = successful_discovery_calls(&open_prs);
+        calls.push((
+            branch_pr_history_command("acme/widgets", "feature/widget", 100),
+            CommandOutput::success("[]"),
+        ));
         assert_eq!(
             calls.len(),
-            7,
-            "discovery command count must remain constant"
+            8,
+            "non-PR branches add only one bounded history lookup"
         );
         let merged_command = &calls[6].0;
         let projection = merged_command.args.last().unwrap();

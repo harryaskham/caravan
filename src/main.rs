@@ -601,6 +601,9 @@ fn render_sync(output: &caravan::sync::SyncOutput) -> String {
             format!("caravans {caravans}")
         }
     );
+    if let Some(predecessor) = output.historical_predecessor {
+        let _ = writeln!(text, "  selected from merged predecessor #{predecessor}");
+    }
     if let Some(timing) = &output.timing {
         let _ = writeln!(
             text,
@@ -820,6 +823,13 @@ fn render_show(output: &caravan::read::ShowOutput) -> String {
             "needs attention"
         }
     );
+    if let Some(predecessor) = output.historical_predecessor {
+        let _ = writeln!(
+            text,
+            "~ merged predecessor #{predecessor} -> active successor #{} (position {})",
+            output.current_pr, output.position
+        );
+    }
     for pull_request in &output.pull_requests {
         let marker = if pull_request.number == output.current_pr {
             ">"
