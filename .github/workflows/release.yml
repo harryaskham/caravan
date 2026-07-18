@@ -93,7 +93,8 @@ jobs:
           # source/binary inputs; fetch-depth=0 makes GITHUB_SHA available.
           contract="$RUNNER_TEMP/release-contract.sh"
           git show "$GITHUB_SHA:tests/release_contract.sh" > "$contract"
-          chmod 0755 "$contract"
+          git show "$GITHUB_SHA:scripts/release.sh" > scripts/release.sh
+          chmod 0755 "$contract" scripts/release.sh
           nix develop --command "$contract" target/debug/cara
 
   build:

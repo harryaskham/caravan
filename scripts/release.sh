@@ -86,37 +86,37 @@ case "$remote_tag_status" in
     ;;
 esac
 
-python3 - "$current" "$next" <<'PY'
-from pathlib import Path
-import re
-import sys
+replace_exact_once() {
+  local file="$1" old="$2" new="$3" content suffix
+  content="$(<"$file")"
+  case "$content" in
+    *"$old"*) ;;
+    *)
+      echo "expected version marker not found in $file" >&2
+      return 1
+      ;;
+  esac
+  suffix="${content#*"$old"}"
+  case "$suffix" in
+    *"$old"*)
+      echo "version marker is ambiguous in $file" >&2
+      return 1
+      ;;
+  esac
+  printf '%s%s%s\n' "${content%%"$old"*}" "$new" "$suffix" >"$file"
+}
 
-old, new = sys.argv[1:]
-
-def replace(path: str, pattern: str, replacement: str) -> None:
-    file = Path(path)
-    text = file.read_text()
-    updated, count = re.subn(pattern, replacement, text, count=1, flags=re.MULTILINE)
-    if count != 1:
-        raise SystemExit(f"expected exactly one version match in {path}, found {count}")
-    file.write_text(updated)
-
-replace(
-    "Cargo.toml",
-    rf'(^\[package\][\s\S]*?^version = "){re.escape(old)}("$)',
-    rf'\g<1>{new}\2',
-)
-replace(
-    "Cargo.lock",
-    rf'(\[\[package\]\]\nname = "caravan"\nversion = "){re.escape(old)}("\n)',
-    rf'\g<1>{new}\2',
-)
-replace(
-    "flake.nix",
-    rf'(version = "){re.escape(old)}(";)',
-    rf'\g<1>{new}\2',
-)
-PY
+replace_exact_once Cargo.toml \
+  "version = \"$current\"" \
+  "version = \"$next\""
+replace_exact_once Cargo.lock \
+  "name = \"caravan\"
+version = \"$current\"" \
+  "name = \"caravan\"
+version = \"$next\""
+replace_exact_once flake.nix \
+  "version = \"$current\";" \
+  "version = \"$next\";"
 
 for file in Cargo.toml Cargo.lock flake.nix; do
   grep -q "$next" "$file" || {
