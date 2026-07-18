@@ -271,11 +271,13 @@ pub(crate) fn prepare_branch_snapshots_with_runner(
     }
     verify_advertised_batch(runner, remote, &branches, &references)?;
 
-    let input = branches.iter().fold(String::new(), |mut input, (_, oid, _)| {
-        use std::fmt::Write as _;
-        writeln!(input, "{oid}^{{commit}}").expect("writing to String cannot fail");
-        input
-    });
+    let input = branches
+        .iter()
+        .fold(String::new(), |mut input, (_, oid, _)| {
+            use std::fmt::Write as _;
+            writeln!(input, "{oid}^{{commit}}").expect("writing to String cannot fail");
+            input
+        });
     let command = CommandSpec::new("git")
         .args(["cat-file", "--batch-check=%(objectname) %(objecttype)"])
         .stdin(input);

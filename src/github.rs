@@ -193,6 +193,88 @@ pub struct WorkflowRunSnapshot {
     pub url: String,
 }
 
+/// Durable explanation attached to every Caravan control-label transition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ControlLabelAudit {
+    pub operation: String,
+    pub marker: String,
+    pub before_labels: BTreeSet<String>,
+    pub after_labels: BTreeSet<String>,
+    pub actor: String,
+    pub reason: String,
+    pub reason_source: String,
+    pub compatibility_evidence: String,
+    pub clean_squash_evidence: String,
+    pub admission_priority_basis: String,
+}
+
+/// Build a deterministic transition identity from GitHub-authoritative facts.
+/// A second transition on the same head receives a different marker, while an
+/// exact retry finds the same marker in PR comments.
+#[must_use]
+pub fn control_label_marker(
+    operation: &str,
+    number: PrNumber,
+    head_oid: &CommitOid,
+    before: &BTreeSet<String>,
+    after: &BTreeSet<String>,
+) -> String {
+    use std::fmt::Write as _;
+    let controls = |labels: &BTreeSet<String>| {
+        labels
+            .iter()
+            .filter(|label| {
+                matches!(
+                    label.as_str(),
+                    "caravan" | "caravan-evicted" | "caravan-force"
+                ) || label.starts_with("caravan-priority:")
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("|")
+    };
+    let transition = format!("{}->{}", controls(before), controls(after));
+    let mut fingerprint = String::with_capacity(transition.len() * 2);
+    for byte in transition.bytes() {
+        write!(&mut fingerprint, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    format!("v2:{operation}:{number}:{}:{fingerprint}", head_oid.0)
+}
+
+impl ControlLabelAudit {
+    /// Render stable Markdown. The marker is intentionally GitHub-visible so
+    /// retries can deduplicate without process-local state.
+    #[must_use]
+    pub fn body(&self) -> String {
+        format!(
+            "<!-- caravan-control-label-audit:{} -->\n### Caravan queue transition: `{}`\n\n- **Labels:** `{}` → `{}`\n- **Actor/source:** {}\n- **Reason:** {} ({})\n- **Compatibility:** {}\n- **Clean squash:** {}\n- **Admission priority:** {}\n",
+            self.marker,
+            self.operation,
+            self.before_labels
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", "),
+            self.after_labels
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", "),
+            self.actor,
+            self.reason,
+            self.reason_source,
+            self.compatibility_evidence,
+            self.clean_squash_evidence,
+            self.admission_priority_basis,
+        )
+    }
+
+    #[must_use]
+    pub fn visible_marker(&self) -> String {
+        format!("<!-- caravan-control-label-audit:{} -->", self.marker)
+    }
+}
+
 /// Exact provider receipt for one primitive PR mutation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct GitHubMutationReceipt {
@@ -551,6 +633,59 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
         )
     }
 
+    /// Post a control-label audit comment, or return an already-satisfied
+    /// receipt when its deterministic marker is present in GitHub comments.
+    pub fn ensure_control_label_comment(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+        audit: &ControlLabelAudit,
+    ) -> Result<GitHubMutationReceipt, MutationError> {
+        let before = self.verify_precondition(repository, expected)?;
+        let comment_pages: Vec<Vec<IssueCommentJson>> =
+            self.json(issue_comments_command(repository, expected.number))?;
+        let marker = audit.visible_marker();
+        let marker_prefix = format!(
+            "<!-- caravan-control-label-audit:v2:{}:{}:{}:",
+            audit.operation, expected.number, expected.head_oid.0
+        );
+        let after_state = format!(
+            " → `{}`",
+            audit
+                .after_labels
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let latest_audit = comment_pages
+            .iter()
+            .flatten()
+            .rev()
+            .find(|comment| comment.body.contains("<!-- caravan-control-label-audit:"));
+        let already_visible = latest_audit.is_some_and(|comment| {
+            comment.body.contains(&marker)
+                || (comment.body.contains(&marker_prefix) && comment.body.contains(&after_state))
+        });
+        let provider_output = if already_visible {
+            Some(format!("existing GitHub comment {marker}"))
+        } else {
+            let output = self.checked(comment_pull_request_command(
+                repository,
+                expected.number,
+                &audit.body(),
+            ))?;
+            trimmed_provider_output(&output).or(Some(marker))
+        };
+        let after = self.refetch_pull_request(repository, expected.number)?;
+        Ok(GitHubMutationReceipt {
+            kind: MutationKind::Comment,
+            before: Some(before),
+            after,
+            provider_output,
+        })
+    }
+
     /// Add one label after exact precondition verification.
     pub fn add_label(
         &self,
@@ -666,18 +801,24 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
         })
     }
 
+    /// Authenticated repository permission used by force-policy evidence.
+    pub fn viewer_permission(&self, repository: &RepositoryId) -> Result<String, MutationError> {
+        let permission: RepositoryPermissionJson =
+            self.json(repository_permission_command(repository))?;
+        Ok(permission.viewer_permission)
+    }
+
     /// Force-squash one PR only when GitHub reports administrator permission.
     pub fn admin_squash_merge(
         &self,
         repository: &RepositoryId,
         expected: &PullRequestPrecondition,
     ) -> Result<GitHubMutationReceipt, MutationError> {
-        let permission: RepositoryPermissionJson =
-            self.json(repository_permission_command(repository))?;
-        if permission.viewer_permission != "ADMIN" {
+        let permission = self.viewer_permission(repository)?;
+        if permission != "ADMIN" {
             return Err(MutationError::PermissionDenied {
                 required: "ADMIN".to_owned(),
-                actual: permission.viewer_permission,
+                actual: permission,
             });
         }
         self.mutate_pull_request(
@@ -1197,6 +1338,34 @@ fn create_repository_label_command(
     ])
 }
 
+fn issue_comments_command(repository: &RepositoryId, number: PrNumber) -> CommandSpec {
+    CommandSpec::new("gh").args([
+        "api".to_owned(),
+        format!(
+            "repos/{}/issues/{number}/comments?per_page=100",
+            repository.slug()
+        ),
+        "--paginate".to_owned(),
+        "--slurp".to_owned(),
+    ])
+}
+
+fn comment_pull_request_command(
+    repository: &RepositoryId,
+    number: PrNumber,
+    body: &str,
+) -> CommandSpec {
+    CommandSpec::new("gh").args([
+        "pr".to_owned(),
+        "comment".to_owned(),
+        number.to_string(),
+        "--repo".to_owned(),
+        repository.slug(),
+        "--body".to_owned(),
+        body.to_owned(),
+    ])
+}
+
 fn repository_permission_command(repository: &RepositoryId) -> CommandSpec {
     CommandSpec::new("gh").args([
         "repo".to_owned(),
@@ -1542,6 +1711,11 @@ struct HeadRepositoryJson {
 #[derive(Debug, Deserialize)]
 struct RepositoryOwnerJson {
     login: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct IssueCommentJson {
+    body: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1998,6 +2172,164 @@ mod tests {
         assert_eq!(receipt.before, None);
         assert_eq!(receipt.after.number, PrNumber(12));
         assert_eq!(receipt.provider_output.as_deref(), Some(url));
+        adapter.runner.assert_exhausted();
+    }
+
+    fn audit(marker: &str) -> ControlLabelAudit {
+        ControlLabelAudit {
+            operation: "new".to_owned(),
+            marker: marker.to_owned(),
+            before_labels: BTreeSet::new(),
+            after_labels: BTreeSet::from(["caravan".to_owned()]),
+            actor: "cara test actor".to_owned(),
+            reason: "eligible admission".to_owned(),
+            reason_source: "deterministic policy".to_owned(),
+            compatibility_evidence: "clean".to_owned(),
+            clean_squash_evidence: "squash enabled".to_owned(),
+            admission_priority_basis: "FIFO".to_owned(),
+        }
+    }
+
+    #[test]
+    fn control_label_markers_dedupe_exact_retries_but_distinguish_same_head_transitions() {
+        let before = BTreeSet::new();
+        let active = BTreeSet::from(["caravan".to_owned()]);
+        let prioritized =
+            BTreeSet::from(["caravan".to_owned(), "caravan-priority:high".to_owned()]);
+        let head = CommitOid("same-head".to_owned());
+
+        let first = control_label_marker("new", PrNumber(12), &head, &before, &active);
+        let retry = control_label_marker("new", PrNumber(12), &head, &before, &active);
+        let second = control_label_marker("new", PrNumber(12), &head, &active, &prioritized);
+
+        assert_eq!(first, retry);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn control_label_comment_posts_marked_durable_reason() {
+        let repository = repository();
+        let expected = precondition(12);
+        let audit = audit("v1:new:12:head-12");
+        let pull = pr_object_json(12, "feature/widget", "acme/widgets");
+        let runner = FakeRunner::new(vec![
+            (
+                pull_request_command(&repository, "12"),
+                CommandOutput::success(pull.clone()),
+            ),
+            (
+                issue_comments_command(&repository, PrNumber(12)),
+                CommandOutput::success("[[]]"),
+            ),
+            (
+                comment_pull_request_command(&repository, PrNumber(12), &audit.body()),
+                CommandOutput::success("https://example.test/comment/1"),
+            ),
+            (
+                pull_request_command(&repository, "12"),
+                CommandOutput::success(pull),
+            ),
+        ]);
+        let adapter = GitHubMutationAdapter::new(runner);
+
+        let receipt = adapter
+            .ensure_control_label_comment(&repository, &expected, &audit)
+            .unwrap();
+
+        assert_eq!(receipt.kind, MutationKind::Comment);
+        assert!(audit.body().contains("Admission priority:** FIFO"));
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn control_label_comment_dedupes_from_github_visible_marker() {
+        let repository = repository();
+        let expected = precondition(12);
+        let audit = audit("v1:new:12:head-12");
+        let pull = pr_object_json(12, "feature/widget", "acme/widgets");
+        let comments = format!(r#"[[{{"body":"{}"}}]]"#, audit.visible_marker());
+        let runner = FakeRunner::new(vec![
+            (
+                pull_request_command(&repository, "12"),
+                CommandOutput::success(pull.clone()),
+            ),
+            (
+                issue_comments_command(&repository, PrNumber(12)),
+                CommandOutput::success(comments),
+            ),
+            (
+                pull_request_command(&repository, "12"),
+                CommandOutput::success(pull),
+            ),
+        ]);
+        let adapter = GitHubMutationAdapter::new(runner);
+
+        let receipt = adapter
+            .ensure_control_label_comment(&repository, &expected, &audit)
+            .unwrap();
+
+        assert!(
+            receipt
+                .provider_output
+                .unwrap()
+                .starts_with("existing GitHub comment")
+        );
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn control_label_comment_dedupes_partial_retry_with_changed_local_before_snapshot() {
+        let repository = repository();
+        let expected = precondition(12);
+        let mut first = audit("");
+        first.marker = control_label_marker(
+            "new",
+            PrNumber(12),
+            &expected.head_oid,
+            &BTreeSet::new(),
+            &first.after_labels,
+        );
+        let mut retry = first.clone();
+        retry.before_labels = retry.after_labels.clone();
+        retry.marker = control_label_marker(
+            "new",
+            PrNumber(12),
+            &expected.head_oid,
+            &retry.before_labels,
+            &retry.after_labels,
+        );
+        assert_ne!(first.marker, retry.marker);
+        let comments = serde_json::to_string(&vec![vec![serde_json::json!({
+            "body": first.body(),
+        })]])
+        .unwrap();
+        let pull = pr_object_json(12, "feature/widget", "acme/widgets");
+        let runner = FakeRunner::new(vec![
+            (
+                pull_request_command(&repository, "12"),
+                CommandOutput::success(pull.clone()),
+            ),
+            (
+                issue_comments_command(&repository, PrNumber(12)),
+                CommandOutput::success(comments),
+            ),
+            (
+                pull_request_command(&repository, "12"),
+                CommandOutput::success(pull),
+            ),
+        ]);
+        let adapter = GitHubMutationAdapter::new(runner);
+
+        let receipt = adapter
+            .ensure_control_label_comment(&repository, &expected, &retry)
+            .unwrap();
+
+        assert!(
+            receipt
+                .provider_output
+                .unwrap()
+                .starts_with("existing GitHub comment")
+        );
         adapter.runner.assert_exhausted();
     }
 

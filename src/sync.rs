@@ -15,8 +15,8 @@ use serde_json::{Value, json};
 
 use crate::command::CommandRunError;
 use crate::github::{
-    DiscoveryError, GitHubMutationAdapter, GitHubMutationReceipt, MutationError,
-    WorkflowRunSnapshot,
+    ControlLabelAudit, DiscoveryError, GitHubMutationAdapter, GitHubMutationReceipt, MutationError,
+    WorkflowRunSnapshot, control_label_marker,
 };
 use crate::hooks::{self, HookDelivery};
 use crate::model::{
@@ -138,6 +138,15 @@ pub trait SyncProvider {
         run_id: u64,
     ) -> Result<GitHubMutationReceipt, MutationError>;
 
+    fn viewer_permission(&self, repository: &RepositoryId) -> Result<String, MutationError>;
+
+    fn ensure_control_label_comment(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+        audit: &ControlLabelAudit,
+    ) -> Result<GitHubMutationReceipt, MutationError>;
+
     fn admin_squash_merge(
         &self,
         repository: &RepositoryId,
@@ -210,6 +219,19 @@ impl<R: crate::command::CommandRunner> SyncProvider for GitHubMutationAdapter<R>
         run_id: u64,
     ) -> Result<GitHubMutationReceipt, MutationError> {
         self.rerun_failed_run(repository, expected, run_id)
+    }
+
+    fn viewer_permission(&self, repository: &RepositoryId) -> Result<String, MutationError> {
+        self.viewer_permission(repository)
+    }
+
+    fn ensure_control_label_comment(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+        audit: &ControlLabelAudit,
+    ) -> Result<GitHubMutationReceipt, MutationError> {
+        self.ensure_control_label_comment(repository, expected, audit)
     }
 
     fn admin_squash_merge(
@@ -446,6 +468,7 @@ fn reconcile_caravan(
     progress.ensure_squash_auto_merge(provider, &status.repository, head)
 }
 
+#[allow(clippy::too_many_lines)]
 fn force_merge_head(
     status: &StatusOutput,
     provider: &impl SyncProvider,
@@ -454,7 +477,11 @@ fn force_merge_head(
     progress: &mut SyncProgress,
 ) -> Result<(), AppError> {
     let head = caravan.head().expect("caravan head");
-    let current = progress.current.get(&head).expect("current head facts");
+    let current = progress
+        .current
+        .get(&head)
+        .expect("current head facts")
+        .clone();
     if !force_merge {
         return Err(force_merge_denied(
             status,
@@ -476,7 +503,7 @@ fn force_merge_head(
             None,
         ));
     }
-    if !head_is_conflict_free_with_default(status, current) {
+    if !head_is_conflict_free_with_default(status, &current) {
         return Err(force_merge_denied(
             status,
             caravan,
@@ -486,11 +513,6 @@ fn force_merge_head(
         ));
     }
 
-    // Non-heads are repaired before the exceptional merge so force cannot
-    // create a transient second auto-merge candidate.
-    for number in caravan.members.iter().skip(1).copied() {
-        progress.ensure_auto_merge_disabled(provider, &status.repository, number)?;
-    }
     provider
         .verify_branch_head(
             &status.repository,
@@ -498,6 +520,7 @@ fn force_merge_head(
             &status.analysis.fleet.default_branch.oid,
         )
         .map_err(|error| mutation_error(&error, progress, Some(head)))?;
+
     progress.events.push(progress.event(
         EventKind::ForceMergeAttempted,
         Some(caravan.id),
@@ -506,6 +529,74 @@ fn force_merge_head(
         force_event_metadata(progress, head),
     ));
 
+    let permission = provider
+        .viewer_permission(&status.repository)
+        .map_err(|error| mutation_error(&error, progress, Some(head)))?;
+    if permission != "ADMIN" {
+        let error = MutationError::PermissionDenied {
+            required: "ADMIN".to_owned(),
+            actual: permission,
+        };
+        return Err(force_merge_denied(
+            status,
+            caravan,
+            progress,
+            "authenticated actor cannot perform the required administrator squash merge",
+            Some(&error),
+        ));
+    }
+
+    let mut before_labels = current.labels.clone();
+    before_labels.remove("caravan-force");
+    let observation = progress
+        .ci
+        .iter()
+        .find(|item| item.pr == head)
+        .expect("forced head has CI observation");
+    let compatibility = status
+        .analysis
+        .compatibility
+        .iter()
+        .find(|report| {
+            report.candidate == current.head
+                && report.target == status.analysis.fleet.default_branch
+        })
+        .expect("force policy requires exact compatibility proof");
+    let audit = ControlLabelAudit {
+        operation: "force_accept".to_owned(),
+        marker: control_label_marker(
+            "force_accept",
+            head,
+            &current.head.oid,
+            &before_labels,
+            &current.labels,
+        ),
+        before_labels,
+        after_labels: current.labels.clone(),
+        actor: "authenticated GitHub comment author; cara sync/loop force policy".to_owned(),
+        reason: format!(
+            "observed external `caravan-force`; force_merge=true; ADMIN permission confirmed; failed checks: {}",
+            serde_json::to_string(&observation.checks).expect("checks serialize")
+        ),
+        reason_source: "deterministic evidence from GitHub checks, external label, repository config, and permission preflight".to_owned(),
+        compatibility_evidence: format!(
+            "{}@{} -> {}@{} = {:?}",
+            compatibility.candidate.name,
+            compatibility.candidate.oid.0,
+            compatibility.target.name,
+            compatibility.target.oid.0,
+            compatibility.outcome,
+        ),
+        clean_squash_evidence: "exact head/default compatibility is clean; ADMIN squash merge is the configured force action".to_owned(),
+        admission_priority_basis: "not applicable: force acceptance preserves existing caravan order".to_owned(),
+    };
+    progress.ensure_control_label_comment(provider, &status.repository, head, &audit)?;
+
+    // Non-heads are repaired before the exceptional merge so force cannot
+    // create a transient second auto-merge candidate.
+    for number in caravan.members.iter().skip(1).copied() {
+        progress.ensure_auto_merge_disabled(provider, &status.repository, number)?;
+    }
     let receipt =
         match provider.admin_squash_merge(&status.repository, &progress.precondition(head)) {
             Ok(receipt) => receipt,
@@ -1183,6 +1274,33 @@ impl SyncProgress {
         Ok(())
     }
 
+    fn ensure_control_label_comment(
+        &mut self,
+        provider: &impl SyncProvider,
+        repository: &RepositoryId,
+        number: PrNumber,
+        audit: &ControlLabelAudit,
+    ) -> Result<(), AppError> {
+        let receipt = provider
+            .ensure_control_label_comment(repository, &self.precondition(number), audit)
+            .map_err(|error| comment_mutation_error(&error, self, number))?;
+        let already = receipt
+            .provider_output
+            .as_deref()
+            .is_some_and(|output| output.starts_with("existing GitHub comment"));
+        if already {
+            self.already(
+                MutationKind::Comment,
+                number,
+                "control-label audit comment already present",
+            );
+            self.current.insert(number, receipt.after);
+        } else {
+            self.record(receipt, "posted durable force-label audit comment");
+        }
+        Ok(())
+    }
+
     fn ensure_base(
         &mut self,
         provider: &impl SyncProvider,
@@ -1262,6 +1380,28 @@ impl SyncProgress {
         self.record(receipt, "enabled squash auto-merge on head PR");
         Ok(())
     }
+}
+
+fn comment_mutation_error(
+    error: &MutationError,
+    progress: &SyncProgress,
+    affected_pr: PrNumber,
+) -> AppError {
+    AppError::structured(
+        ErrorCategory::ExecutionFailure,
+        "github_comment_failed",
+        format!("force label was accepted but its durable GitHub comment failed: {error}"),
+        Some(json!({
+            "stage": "control_label_comment",
+            "affected_pr": affected_pr,
+            "operation_receipt": progress.operation_receipt(),
+            "provider_receipts": progress.provider_receipts,
+            "events": progress.events,
+            "resumable": true,
+            "dedupe": "deterministic GitHub-visible caravan-control-label-audit marker",
+            "next": "rediscover and rerun `cara sync`",
+        })),
+    )
 }
 
 fn mutation_error(
@@ -1581,6 +1721,24 @@ mod tests {
                     }
                 }
             })
+        }
+
+        fn viewer_permission(&self, _repository: &RepositoryId) -> Result<String, MutationError> {
+            Ok(if self.admin_permission {
+                "ADMIN"
+            } else {
+                "WRITE"
+            }
+            .to_owned())
+        }
+
+        fn ensure_control_label_comment(
+            &self,
+            _repository: &RepositoryId,
+            expected: &PullRequestPrecondition,
+            _audit: &ControlLabelAudit,
+        ) -> Result<GitHubMutationReceipt, MutationError> {
+            self.mutate(expected, MutationKind::Comment, |_| {})
         }
 
         fn admin_squash_merge(
@@ -1948,6 +2106,42 @@ mod tests {
     }
 
     #[test]
+    fn force_comment_failure_is_structured_and_prevents_admin_merge() {
+        let mut pulls = healthy_chain();
+        pulls.truncate(1);
+        pulls[0].labels.insert("caravan-force".to_owned());
+        pulls[0].checks = vec![check("build-test", CheckState::Failure, Some(34))];
+        let run = failed_run(34, &pulls[0]);
+        let provider = FakeProvider::with_pull_requests(pulls.clone());
+        provider
+            .failed_runs
+            .borrow_mut()
+            .insert(PrNumber(1), vec![run]);
+        provider
+            .failures
+            .borrow_mut()
+            .push_back(MutationKind::Comment);
+        let status = status(pulls, Some(PrNumber(1)), &clean);
+
+        let error = execute(&status, &provider, false, false, true)
+            .expect_err("comment is part of force receipt");
+
+        assert_eq!(error.code(), "github_comment_failed");
+        let details = error.details().expect("details");
+        assert_eq!(details["stage"], "control_label_comment");
+        assert_eq!(details["resumable"], true);
+        assert_eq!(details["events"][0]["kind"], "force_merge_attempted");
+        let extracted = crate::hooks::events_from_error(&error);
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted[0].kind, EventKind::ForceMergeAttempted);
+        assert_eq!(
+            json!(extracted[0].event_id),
+            details["events"][0]["event_id"]
+        );
+        assert_eq!(*provider.calls.borrow(), vec![MutationKind::Comment]);
+    }
+
+    #[test]
     fn force_merge_permission_denial_preserves_attempt_event() {
         let mut pulls = healthy_chain();
         pulls.truncate(1);
@@ -2026,6 +2220,7 @@ mod tests {
         assert_eq!(
             *provider.calls.borrow(),
             vec![
+                MutationKind::Comment,
                 MutationKind::SquashMerge,
                 MutationKind::SetBase,
                 MutationKind::EnableAutoMerge,

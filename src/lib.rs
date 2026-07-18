@@ -199,6 +199,16 @@ pub struct CreateInput {
     #[arg(long)]
     #[serde(default)]
     pub create_pr: bool,
+
+    /// Human/agent admission rationale; otherwise a deterministic mechanical reason is used.
+    #[arg(long, value_name = "TEXT")]
+    #[serde(default)]
+    pub reason: Option<String>,
+
+    /// Exact configured agent-priority label. Without it, admission is FIFO.
+    #[arg(long, value_name = "LABEL")]
+    #[serde(default)]
+    pub priority_label: Option<String>,
 }
 
 /// Input for `join` and `rejoin`.
@@ -218,6 +228,16 @@ pub struct JoinInput {
     #[arg(long)]
     #[serde(default)]
     pub create_pr: bool,
+
+    /// Human/agent admission rationale; otherwise selected-target policy is recorded.
+    #[arg(long, value_name = "TEXT")]
+    #[serde(default)]
+    pub reason: Option<String>,
+
+    /// Exact configured agent-priority label. Without it, admission is FIFO.
+    #[arg(long, value_name = "LABEL")]
+    #[serde(default)]
+    pub priority_label: Option<String>,
 }
 
 /// Input for `cara sync`.

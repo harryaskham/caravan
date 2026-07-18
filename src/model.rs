@@ -388,6 +388,8 @@ pub enum MutationKind {
     SetBase,
     AddLabel,
     RemoveLabel,
+    /// Durable GitHub-visible explanation of a control-label transition.
+    Comment,
     EnableAutoMerge,
     DisableAutoMerge,
     RerunChecks,

@@ -415,7 +415,10 @@ hooks:
             "version: 1\nagent_priority_labels: [caravan-priority:high, caravan-priority:high]\n",
             "version: 1\nagent_priority_labels: ['caravan-priority: ']\n",
         ] {
-            assert_eq!(CaravanConfig::parse(yaml).unwrap_err().code(), "invalid_config");
+            assert_eq!(
+                CaravanConfig::parse(yaml).unwrap_err().code(),
+                "invalid_config"
+            );
         }
     }
 

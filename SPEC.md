@@ -120,7 +120,9 @@ Without a current PR, these commands fail unless `--create-pr` is set. Creation 
 
 `new`/`join` reject active or evicted PRs, closed PRs, PRs with auto-merge already enabled, and stale/incompatible graphs. `renew`/`rejoin` additionally remove `caravan-evicted` only after all other preconditions pass.
 
-A new caravan applies `caravan`, targets the default branch, verifies fleet compatibility, and enables squash auto-merge. Joining retargets the PR to the tail branch, applies `caravan`, disables auto-merge, and verifies the resulting fleet.
+A new caravan applies `caravan`, targets the default branch, verifies fleet compatibility, and enables squash auto-merge. Joining retargets the PR to the tail branch, applies `caravan`, disables auto-merge, and verifies the resulting fleet. Membership commands accept `--reason TEXT` and `--priority-label LABEL`; an explicit label must exactly match a configured `agent_priority_labels` entry, while omission records FIFO admission.
+
+Every successful mutation of `caravan`, `caravan-evicted`, `caravan-force`, or a configured priority label is completed by a durable PR comment. The comment records operation, before/after labels, actor and reason source, exact compatibility and clean-squash evidence where applicable, and explicit configured label/rank or canonical FIFO basis. A deterministic `caravan-control-label-audit` HTML marker fingerprints operation, PR/head, and the before→after control-label transition; GitHub-visible latest-transition evidence deduplicates partial retries without conflating a later transition on the same head. Comment failure after labels changed returns `github_comment_failed` with completed receipts and a resumable rerun instruction; it is never reported as full success.
 
 ### Navigation
 
@@ -136,7 +138,7 @@ Navigation refuses dirty worktrees, in-progress Git operations, ambiguous PR map
 
 From the repository's default branch, where there is no current PR, `cara van next` enters the first caravan head and `cara van prev` reports the lower navigation boundary. Chain-level `cara next`/`prev` and fleet navigation from any other non-PR branch still require a current caravan member.
 
-Fleet navigation is browsing, not queue priority. V1 orders heads by PR number until a separate configurable fleet-priority policy is specified.
+Fleet navigation is browsing, not queue priority. V1 browses heads by PR number. Admission records either an explicit configured priority label or FIFO (oldest eligible PR first); this does not change browsing order.
 
 ### Reshaping
 
@@ -204,7 +206,7 @@ A user/agent may repair and push, rerun failed checks, evict/split, or mark a kn
 3. it remains mechanically conflict-free with the default branch;
 4. the authenticated actor has repository permission.
 
-No approval hook is required. The attempt and result are emitted as audit events. Force never bypasses textual conflicts.
+No approval hook or interactive reason is required. Before accepting the externally applied `caravan-force` label, sync/loop posts a durable generated-reason comment containing the exact failed checks, enabled force policy, authenticated ADMIN permission, exact clean compatibility proof, and squash action. Comment failure is resumable and prevents the force merge. The attempt and result are emitted as audit events. Force never bypasses textual conflicts.
 
 ## 8. Decision points and errors
 
