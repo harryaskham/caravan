@@ -207,6 +207,27 @@ Caravan intentionally owns no cross-process hook dedupe. A long-running hook can
 use an external lock and return success while that lock exists; repeated ticks
 then become visible no-ops rather than duplicate coordination.
 
+## Incident holds
+
+Freeze one caravan without invalidating or blocking independent caravans:
+
+```sh
+cara pause --head-pr 42 --actor oncall --reason "incident INC-123"
+cara status                    # reports active, expired, or stale hold evidence
+cara sync --all                # skips #42 without mutation; continues the fleet
+# After CI/operator recovery:
+cara resume --head-pr 42 --actor oncall
+cara sync
+```
+
+Pause changes only the exact head's auto-merge state and preserves labels,
+branches, bases, children, and all PR heads. Optional `--expires-unix-secs` and
+`--external-reference` metadata are bounded and non-secret. Expiry only changes
+the status warning: no background loop can resume a hold. Resume is an explicit
+audited action and fails closed if the head, base, labels, topology, compatibility,
+or safe terminal check state no longer matches. See `SPEC.md` for recovery and
+retry semantics.
+
 ```sh
 cara loop --once --json     # one bounded sync --all tick for agents/schedulers
 cara loop                   # foreground human stream until SIGINT/SIGTERM

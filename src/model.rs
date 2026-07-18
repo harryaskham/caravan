@@ -311,6 +311,9 @@ pub struct PullRequestPrecondition {
     pub base_ref: String,
     pub base_oid: CommitOid,
     pub labels: BTreeSet<String>,
+    /// Exact check facts guard mutations, especially explicit hold resume.
+    #[serde(default)]
+    pub checks: Vec<CheckSnapshot>,
     pub auto_merge: AutoMergeState,
 }
 
@@ -323,6 +326,7 @@ impl From<&PullRequestSnapshot> for PullRequestPrecondition {
             base_ref: snapshot.base.name.clone(),
             base_oid: snapshot.base.oid.clone(),
             labels: snapshot.labels.clone(),
+            checks: snapshot.checks.clone(),
             auto_merge: snapshot.auto_merge.clone(),
         }
     }

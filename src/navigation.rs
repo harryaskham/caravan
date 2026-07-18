@@ -633,6 +633,7 @@ mod tests {
                 pull_requests,
                 compatibility: Vec::new(),
             },
+            pauses: Vec::new(),
         }
     }
 

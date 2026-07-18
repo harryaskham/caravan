@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use caravan::{
     AGENT_HELP, AppContext, AppError, CheckInput, CreateInput, EvictInput, JoinInput,
-    LockRecoverInput, LockStatusInput, LoopInput, SplitInput, SyncInput, TOOL_NAME, build_router,
-    feedback_config, updater_config,
+    LockRecoverInput, LockStatusInput, LoopInput, PauseInput, ResumeInput, SplitInput, SyncInput,
+    TOOL_NAME, build_router, feedback_config, updater_config,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use feedback_cli::{FeedbackEvent, FeedbackKind, Reporter, Severity};
@@ -64,6 +64,10 @@ enum Command {
     Next,
     /// Check out the previous PR toward the current caravan head.
     Prev,
+    /// Explicitly freeze one caravan and disable only its head auto-merge.
+    Pause(PauseInput),
+    /// Explicitly revalidate and resume one paused caravan.
+    Resume(ResumeInput),
     /// Idempotently synchronize one or all caravans until a decision point.
     Sync(SyncInput),
     /// Evict a PR and safely reconnect its child when compatible.
@@ -244,6 +248,8 @@ fn run(cli: &Cli) -> Result<(), i32> {
             caravan::navigation::Scope::Caravan,
             caravan::navigation::Direction::Previous,
         ),
+        Command::Pause(input) => run_pause(cli, input),
+        Command::Resume(input) => run_resume(cli, input),
         Command::Sync(input) => run_sync(cli, input),
         Command::Evict(input) => run_evict(cli, input),
         Command::Split(input) => run_split(cli, input),
@@ -446,6 +452,54 @@ fn run_membership(
     }
 }
 
+fn run_pause(cli: &Cli, input: &PauseInput) -> Result<(), i32> {
+    let context = load_context(cli)?;
+    let result = caravan::pause::pause(&context, input);
+    if cli.json {
+        return emit_result(true, result);
+    }
+    match result {
+        Ok(output) => {
+            println!(
+                "pause #{}: {} — {}",
+                output.pause.caravan_head,
+                if output.receipt.changed {
+                    "changed"
+                } else {
+                    "already paused"
+                },
+                output.next
+            );
+            Ok(())
+        }
+        Err(error) => emit_human_error(error),
+    }
+}
+
+fn run_resume(cli: &Cli, input: &ResumeInput) -> Result<(), i32> {
+    let context = load_context(cli)?;
+    let result = caravan::pause::resume(&context, input);
+    if cli.json {
+        return emit_result(true, result);
+    }
+    match result {
+        Ok(output) => {
+            println!(
+                "resume #{}: {} — {}",
+                output.pause.caravan_head,
+                if output.receipt.changed {
+                    "changed"
+                } else {
+                    "already resumed"
+                },
+                output.next
+            );
+            Ok(())
+        }
+        Err(error) => emit_human_error(error),
+    }
+}
+
 fn run_sync(cli: &Cli, input: &SyncInput) -> Result<(), i32> {
     let context = load_context(cli)?;
     let result = caravan::sync::sync(&context, input);
@@ -564,6 +618,13 @@ fn render_sync(output: &caravan::sync::SyncOutput) -> String {
             recovery.removed_owner.operation, recovery.removed_owner.pid
         );
     }
+    for pause in &output.paused_caravans {
+        let _ = writeln!(
+            text,
+            "  paused #{}: {:?}; {}",
+            pause.record.caravan_head, pause.state, pause.safe_next_action
+        );
+    }
     for advancement in &output.head_advancements {
         let _ = writeln!(
             text,
@@ -656,6 +717,13 @@ fn render_status(output: &caravan::read::StatusOutput) -> String {
             .map_or_else(String::new, |next| format!(" — {next}"))
     );
     let _ = writeln!(text, "caravans: {}", output.analysis.fleet.caravans.len());
+    for pause in &output.pauses {
+        let _ = writeln!(
+            text,
+            "  paused #{}: {:?} — {}",
+            pause.record.caravan_head, pause.state, pause.safe_next_action
+        );
+    }
     for caravan in &output.analysis.fleet.caravans {
         let chain = caravan
             .members
@@ -1018,6 +1086,7 @@ mod tests {
                 pull_requests: std::collections::BTreeMap::new(),
                 compatibility: Vec::new(),
             },
+            pauses: Vec::new(),
         };
         let rendered = render_status(&output);
         assert!(rendered.contains("harryaskham/caravan @ main — healthy"));

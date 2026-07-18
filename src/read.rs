@@ -32,6 +32,10 @@ pub struct StatusOutput {
     /// Read-only first-use readiness. Status never creates or edits resources.
     pub initialization: crate::initialization::InitializationStatus,
     pub analysis: GraphAnalysis,
+    /// Explicit caravan holds. Active and expired holds intentionally suspend
+    /// only their exact head auto-merge invariant; stale holds fail closed.
+    #[serde(default)]
+    pub pauses: Vec<crate::pause::PauseStatus>,
     /// Canonical, nonmutating automatic-admission order derived from GitHub.
     pub admission: AdmissionStatus,
 }
@@ -224,12 +228,28 @@ pub(crate) fn status_with_deadline(
         initialization.next = Some("run `cara init` to atomically create .caravan/config.yaml and verify repository readiness".to_owned());
     }
     let admission = resolve_admission(&analysis, &context.config.agent_priority_labels);
+    let labels_elapsed = started.elapsed();
+    let mut output = StatusOutput {
+        timing: None,
+        repository: snapshot.repository,
+        default_branch: snapshot.default_branch.name,
+        current_branch: snapshot.current_branch,
+        current_pr: snapshot.current_pr,
+        healthy: false,
+        initialization,
+        analysis,
+        pauses: Vec::new(),
+        admission,
+    };
+    crate::pause::apply_to_status(&context.repository_path, &mut output)?;
+    output.healthy = output.analysis.healthy() && output.initialization.ready;
+
     let total = started.elapsed();
     if std::time::Instant::now() >= operation_deadline {
         return Err(AppError::structured(
             ErrorCategory::Timeout,
             "github_discovery_timeout",
-            "status deadline expired after repository label inventory",
+            "status deadline expired while finalizing status and paused-caravan projection",
             Some(json!({
                 "stage": "github_discovery",
                 "phase": "finalize_status",
@@ -242,7 +262,7 @@ pub(crate) fn status_with_deadline(
     }
     let millis =
         |duration: std::time::Duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
-    let timing = StatusTiming {
+    output.timing = Some(StatusTiming {
         deadline_ms: millis(operation_budget),
         total_ms: millis(total),
         phases_ms: std::collections::BTreeMap::from([
@@ -253,21 +273,15 @@ pub(crate) fn status_with_deadline(
             ),
             (
                 "repository_label_inventory".to_owned(),
-                millis(total.saturating_sub(analysis_elapsed)),
+                millis(labels_elapsed.saturating_sub(analysis_elapsed)),
+            ),
+            (
+                "paused_caravan_projection".to_owned(),
+                millis(total.saturating_sub(labels_elapsed)),
             ),
         ]),
-    };
-    Ok(StatusOutput {
-        timing: Some(timing),
-        repository: snapshot.repository,
-        default_branch: snapshot.default_branch.name,
-        current_branch: snapshot.current_branch,
-        current_pr: snapshot.current_pr,
-        healthy: analysis.healthy() && initialization.ready,
-        initialization,
-        analysis,
-        admission,
-    })
+    });
+    Ok(output)
 }
 
 /// Return the canonical first automatic-admission candidate without mutation.
@@ -904,6 +918,7 @@ mod tests {
                 &crate::config::CaravanConfig::default().agent_priority_labels,
             ),
             analysis,
+            pauses: Vec::new(),
         }
     }
 

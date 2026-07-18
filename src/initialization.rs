@@ -21,8 +21,6 @@ pub struct RequiredLabel {
     pub description: String,
 }
 
-const PRIORITY_COLORS: [&str; 6] = ["B60205", "D93F0B", "FBCA04", "0E8A16", "1D76DB", "5319E7"];
-
 fn required_label(name: &str, color: &str, description: impl Into<String>) -> RequiredLabel {
     RequiredLabel {
         name: name.to_owned(),
@@ -35,6 +33,7 @@ fn required_label(name: &str, color: &str, description: impl Into<String>) -> Re
 /// configured highest-to-lowest admission-priority labels.
 #[must_use]
 pub fn required_labels(priority_labels: &[String]) -> Vec<RequiredLabel> {
+    const PRIORITY_COLORS: [&str; 6] = ["B60205", "D93F0B", "FBCA04", "0E8A16", "1D76DB", "5319E7"];
     let mut labels = vec![
         required_label("caravan", "5319E7", "Active member of a Caravan PR chain"),
         required_label(

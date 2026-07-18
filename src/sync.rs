@@ -86,9 +86,13 @@ pub struct SyncOutput {
     /// Exact provider before/after facts for completed remote mutations.
     #[serde(default)]
     pub provider_receipts: Vec<GitHubMutationReceipt>,
-    /// Caravan IDs selected from the initial snapshot, in deterministic order.
+    /// Caravan IDs actually selected from the initial snapshot.
     #[serde(default)]
     pub synchronized_caravans: Vec<PrNumber>,
+    /// Intentional holds skipped without any provider mutation. Expired holds
+    /// remain here until an explicit resume; they never resume by time alone.
+    #[serde(default)]
+    pub paused_caravans: Vec<crate::pause::PauseStatus>,
     #[serde(default)]
     pub head_advancements: Vec<HeadAdvancement>,
     /// CI policy facts in deterministic head-to-tail order.
@@ -556,6 +560,7 @@ fn sync_with_lock(
         lock_recovery,
         provider_receipts: progress.provider_receipts,
         synchronized_caravans: progress.synchronized_caravans,
+        paused_caravans: progress.paused_caravans,
         head_advancements: progress.head_advancements,
         ci: progress.ci,
         events: progress.events,
@@ -594,9 +599,34 @@ fn execute(
     rerun_failed: bool,
     force_merge: bool,
 ) -> Result<SyncProgress, AppError> {
-    let caravans = select_caravans(status, all)?;
+    let mut caravans = select_caravans(status, all)?;
+    let paused_caravans = status
+        .pauses
+        .iter()
+        .filter(|pause| {
+            pause.state != crate::pause::PauseState::Stale
+                && caravans
+                    .iter()
+                    .any(|caravan| caravan.id == pause.record.caravan_head)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    caravans.retain(|caravan| {
+        !paused_caravans
+            .iter()
+            .any(|pause| pause.record.caravan_head == caravan.id)
+    });
     let synchronized_caravans = caravans.iter().map(|caravan| caravan.id).collect();
     let mut progress = SyncProgress::new(status, synchronized_caravans);
+    progress.paused_caravans = paused_caravans;
+    for pause in &progress.paused_caravans {
+        progress.steps.push(MutationStep {
+            kind: MutationKind::DisableAutoMerge,
+            state: MutationStepState::AlreadySatisfied,
+            pr: Some(pause.record.caravan_head),
+            summary: format!("caravan #{} intentionally paused ({:?}); no mutation; after recovery explicitly run `cara resume --head-pr {} --actor <actor>`", pause.record.caravan_head, pause.state, pause.record.caravan_head),
+        });
+    }
     if caravans.is_empty() {
         return Ok(progress);
     }
@@ -1325,6 +1355,7 @@ struct SyncProgress {
     steps: Vec<MutationStep>,
     provider_receipts: Vec<GitHubMutationReceipt>,
     synchronized_caravans: Vec<PrNumber>,
+    paused_caravans: Vec<crate::pause::PauseStatus>,
     head_advancements: Vec<HeadAdvancement>,
     ci: Vec<CiObservation>,
     events: Vec<CaravanEvent>,
@@ -1339,6 +1370,7 @@ impl SyncProgress {
             steps: Vec::new(),
             provider_receipts: Vec::new(),
             synchronized_caravans,
+            paused_caravans: Vec::new(),
             head_advancements: Vec::new(),
             ci: Vec::new(),
             events: Vec::new(),
@@ -2080,6 +2112,7 @@ mod tests {
                 &crate::config::CaravanConfig::default().agent_priority_labels,
             ),
             analysis,
+            pauses: Vec::new(),
         }
     }
 
@@ -2863,6 +2896,59 @@ mod tests {
 
         assert_eq!(mcp_cli::StructuredError::code(&error), "link_conflict");
         assert!(provider.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn sync_all_skips_paused_caravan_and_progresses_independent_caravan() {
+        let mut pulls = healthy_chain();
+        pulls[0].auto_merge = AutoMergeState::disabled();
+        pulls[2].base = branch("main");
+        let provider = FakeProvider::with_pull_requests(pulls.clone());
+        let mut status = status(pulls, Some(PrNumber(1)), &clean);
+        let head = status.analysis.pull_requests[&PrNumber(1)].clone();
+        let record = crate::pause::PauseRecord {
+            version: 1,
+            caravan_head: PrNumber(1),
+            members: vec![PrNumber(1), PrNumber(2)],
+            expected_head: {
+                let mut expected = PullRequestPrecondition::from(&head);
+                expected.auto_merge = AutoMergeState::squash();
+                expected
+            },
+            expected_checks: head.checks.clone(),
+            actor: "oncall".to_owned(),
+            reason: "incident".to_owned(),
+            paused_unix_secs: 1,
+            expires_unix_secs: None,
+            external_reference: Some("INC-1".to_owned()),
+            resume_authorized_by: None,
+        };
+        status.pauses.push(crate::pause::PauseStatus {
+            record,
+            state: crate::pause::PauseState::Active,
+            auto_merge_suspended: true,
+            safe_next_action: "explicit resume".to_owned(),
+        });
+        status.analysis.fleet.problems.retain(|problem| {
+            !(problem.kind == GraphProblemKind::AutoMergeInvariant
+                && problem.prs == vec![PrNumber(1)])
+        });
+
+        let progress = execute(&status, &provider, true, false, false)
+            .expect("independent caravan progresses");
+
+        assert_eq!(progress.synchronized_caravans, vec![PrNumber(3)]);
+        assert_eq!(progress.paused_caravans.len(), 1);
+        assert_eq!(
+            *provider.calls.borrow(),
+            vec![MutationKind::EnableAutoMerge]
+        );
+        assert!(
+            progress
+                .steps
+                .iter()
+                .any(|step| step.summary.contains("intentionally paused"))
+        );
     }
 
     #[test]

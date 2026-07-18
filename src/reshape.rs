@@ -453,6 +453,7 @@ fn virtual_status(
         healthy: false,
         initialization: status.initialization.clone(),
         analysis,
+        pauses: status.pauses.clone(),
         admission,
     }
 }
@@ -954,6 +955,7 @@ mod tests {
                 &crate::config::CaravanConfig::default().agent_priority_labels,
             ),
             analysis,
+            pauses: Vec::new(),
         }
     }
 

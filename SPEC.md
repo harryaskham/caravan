@@ -152,10 +152,20 @@ Splitting retargets the selected non-head to the default branch, making it a new
 ### Synchronization
 
 - `cara sync` — synchronize the current caravan.
-- `cara sync --all` — synchronize every caravan in deterministic head order.
+- `cara sync --all` — synchronize every non-paused caravan in deterministic head order.
+- `cara pause --head-pr N --actor A --reason R` — place an explicit incident or maintenance hold on one exact caravan and disable only its head auto-merge.
+- `cara resume --head-pr N --actor A` — explicitly revalidate and release that hold.
 - `cara loop` — repeatedly run `sync --all` at the configured interval.
 
 `loop` is a lightweight foreground daemon. It keeps no authority beyond GitHub and performs the same idempotent ticks as direct `sync --all` calls.
+
+### Incident and maintenance holds
+
+A pause stores bounded, non-secret evidence below Git's shared common metadata directory: the rolling head and members, exact head SHA/base/labels, observed checks, actor, reason, creation time, optional expiry, and optional external incident/choice reference. The remote mutation uses the complete PR precondition and changes only head auto-merge. Branches, labels, bases, children, and PR heads are preserved.
+
+Status classifies a matching hold as `active` or `expired` and suspends only the exact missing-head-auto-merge problem. Expiry is an alert, never authority to resume. Cycles, branching, closure, changed heads/bases/labels, incompatible links, and non-head auto-merge remain graph failures; stale hold evidence is reported and fails closed. `sync --all` emits a no-op skip receipt for held caravans and continues independent caravans. A targeted sync returns the same bounded no-op continuation.
+
+Resume is operator/agent initiated only. Before enabling squash auto-merge it revalidates the exact head, base, labels, open state, membership topology, compatibility, and safe terminal checks. An authorization marker makes interrupted resume retries idempotent without treating an external re-enable as valid. Every pause/resume authorization is appended to a secret-free local audit record. No loop, expiry timer, status call, or sync call may remove a hold or enable its head.
 
 ### Ecosystem surfaces
 

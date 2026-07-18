@@ -16,6 +16,7 @@ pub mod loop_runner;
 pub mod membership;
 pub mod navigation;
 pub mod operation_lock;
+pub mod pause;
 pub mod read;
 pub mod reshape;
 pub mod sync;
@@ -54,6 +55,9 @@ Safe operating loop:
 5. At a CI decision, optionally use `cara sync --rerun-failed` to rerun only
    exact failed workflow runs. Otherwise repair/push, evict, split, renew, or
    rejoin; then rerun the same sync.
+6. For an incident/maintenance hold, run explicit `cara pause` with actor and
+   reason. Expiry never resumes it. After recovery, only an audited `cara resume`
+   may revalidate exact facts and restore squash auto-merge.
 
 Caravan does not routinely rebase branches. A link means the child PR targets
 its predecessor branch and is mechanically merge-compatible with it. Only a
@@ -238,6 +242,40 @@ pub struct JoinInput {
     #[arg(long, value_name = "LABEL")]
     #[serde(default)]
     pub priority_label: Option<String>,
+}
+
+/// Input for `cara pause`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Args)]
+pub struct PauseInput {
+    /// Current rolling caravan head to freeze.
+    #[arg(long, value_name = "PR")]
+    pub head_pr: u64,
+    /// Audited human or agent identity (non-secret).
+    #[arg(long)]
+    pub actor: String,
+    /// Bounded incident/maintenance rationale.
+    #[arg(long)]
+    pub reason: String,
+    /// Optional Unix timestamp after which status reports the hold expired.
+    /// Expiry never resumes the caravan automatically.
+    #[arg(long)]
+    #[serde(default)]
+    pub expires_unix_secs: Option<u64>,
+    /// Optional external incident, hold, or choice reference.
+    #[arg(long)]
+    #[serde(default)]
+    pub external_reference: Option<String>,
+}
+
+/// Input for explicit `cara resume`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Args)]
+pub struct ResumeInput {
+    /// Exact paused rolling head.
+    #[arg(long, value_name = "PR")]
+    pub head_pr: u64,
+    /// Audited human or agent identity authorizing resume.
+    #[arg(long)]
+    pub actor: String,
 }
 
 /// Input for `cara sync`.
@@ -443,8 +481,18 @@ pub fn build_router() -> ToolRouter<AppContext> {
         }
     );
     router.add_typed_tool_with_output_schema(
+        "pause",
+        "Explicitly freeze one exact caravan head, recording bounded incident metadata and disabling only its squash auto-merge under exact preconditions. Expiry never auto-resumes.",
+        |context: &AppContext, input: PauseInput| pause::pause(context, &input),
+    );
+    router.add_typed_tool_with_output_schema(
+        "resume",
+        "Explicitly resume a paused caravan only after exact head, base, labels, checks, state, and topology revalidation; stale facts fail closed.",
+        |context: &AppContext, input: ResumeInput| pause::resume(context, &input),
+    );
+    router.add_typed_tool_with_output_schema(
         "sync",
-        "Idempotently synchronize one or all caravans under optimistic preconditions. Stops at the first typed decision with completed steps and recovery actions; rerun_failed reruns only exact PR/head-verified failed runs.",
+        "Idempotently synchronize one or all caravans under optimistic preconditions. Intentionally paused caravans return stable no-op receipts and are skipped by sync-all.",
         |context: &AppContext, input: SyncInput| sync::sync(context, &input),
     );
     router.add_typed_tool_with_output_schema(

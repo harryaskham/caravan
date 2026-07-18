@@ -909,6 +909,9 @@ fn changed_precondition_fields(
     if expected.labels != actual.labels {
         changed.push("labels".to_owned());
     }
+    if expected.checks != actual.checks {
+        changed.push("checks".to_owned());
+    }
     if expected.auto_merge != actual.auto_merge {
         changed.push("auto_merge".to_owned());
     }
@@ -1886,6 +1889,12 @@ mod tests {
             base_ref: "main".to_owned(),
             base_oid: CommitOid(format!("base-{number}")),
             labels: std::collections::BTreeSet::from(["caravan".to_owned()]),
+            checks: vec![model::CheckSnapshot {
+                name: "test".to_owned(),
+                state: model::CheckState::Success,
+                provider_state: Some("SUCCESS".to_owned()),
+                details_url: Some("https://example.test/check".to_owned()),
+            }],
             auto_merge: AutoMergeState::squash(),
         }
     }

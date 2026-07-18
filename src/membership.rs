@@ -1379,6 +1379,7 @@ mod tests {
                 &crate::config::CaravanConfig::default().agent_priority_labels,
             ),
             analysis,
+            pauses: Vec::new(),
         }
     }
 

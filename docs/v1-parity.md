@@ -19,7 +19,8 @@ is required or used.
 | current caravan | `cara show` | envelope | `show` | whole chain and highlighted position |
 | chain navigation | `cara next`, `cara prev` | envelope | `next`, `prev` | clean-worktree/exact-head guarded checkout |
 | fleet list/navigation | `cara van list/next/prev` | envelope | `van_list/next/prev` | deterministic PR-number head order |
-| synchronize | `cara sync [--all] [--rerun-failed]` | envelope | `sync` | idempotence, rolling head, typed decisions, safe affected-PR checkout, exact-run rerun |
+| synchronize | `cara sync [--all] [--rerun-failed]` | envelope | `sync` | idempotence, rolling head, typed decisions, safe affected-PR checkout, exact-run rerun, intentional hold skips |
+| incident hold | `cara pause/resume --head-pr N --actor A [...]` | envelope | `pause`, `resume` | bounded metadata, exact disable/enable preconditions, expiry warning without auto-resume, stale-fact closure |
 | foreground ticks | `cara loop [--once]` | one-shot envelope only | intentionally absent | canonical sync events and bounded hook delivery |
 | eviction | `cara evict [--pr N] --reason TEXT` | envelope | `evict` | safe gap closure, exact receipts and success/failure events |
 | split | `cara split [--pr N]` | envelope | `split` | only non-heads; both resulting fleets validated |
