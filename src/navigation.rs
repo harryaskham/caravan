@@ -596,6 +596,7 @@ mod tests {
             .map(|pull_request| (pull_request.number, pull_request))
             .collect();
         StatusOutput {
+            timing: None,
             repository: repository(),
             default_branch: "main".to_owned(),
             current_branch: Some(format!("pr-{current}")),

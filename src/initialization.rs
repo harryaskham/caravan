@@ -21,6 +21,8 @@ pub struct RequiredLabel {
     pub description: String,
 }
 
+const PRIORITY_COLORS: [&str; 6] = ["B60205", "D93F0B", "FBCA04", "0E8A16", "1D76DB", "5319E7"];
+
 fn required_label(name: &str, color: &str, description: impl Into<String>) -> RequiredLabel {
     RequiredLabel {
         name: name.to_owned(),
@@ -45,9 +47,6 @@ pub fn required_labels(priority_labels: &[String]) -> Vec<RequiredLabel> {
             "D93F0B",
             "Allow configured force handling for known CI failures",
         ),
-    ];
-    const PRIORITY_COLORS: [&str; 6] = [
-        "B60205", "D93F0B", "FBCA04", "0E8A16", "1D76DB", "5319E7",
     ];
     labels.extend(priority_labels.iter().enumerate().map(|(rank, name)| {
         required_label(
@@ -186,12 +185,7 @@ impl<R: crate::command::CommandRunner> InitializationProvider for GitHubMutation
         repository: &RepositoryId,
         label: &RequiredLabel,
     ) -> Result<(), MutationError> {
-        self.create_repository_label(
-            repository,
-            &label.name,
-            &label.color,
-            &label.description,
-        )
+        self.create_repository_label(repository, &label.name, &label.color, &label.description)
     }
 }
 
@@ -598,9 +592,9 @@ mod tests {
 
     fn canonical(label: &RequiredLabel) -> RepositoryLabel {
         RepositoryLabel {
-            name: label.name.to_owned(),
-            color: label.color.to_owned(),
-            description: Some(label.description.to_owned()),
+            name: label.name.clone(),
+            color: label.color.clone(),
+            description: Some(label.description.clone()),
         }
     }
 
@@ -668,8 +662,9 @@ mod tests {
             first.labels[3].description,
             "Caravan automatic admission priority rank 1 (1 highest)"
         );
-        let generated = crate::config::CaravanConfig::load(&directory.path().join(".caravan/config.yaml"))
-            .unwrap();
+        let generated =
+            crate::config::CaravanConfig::load(&directory.path().join(".caravan/config.yaml"))
+                .unwrap();
         assert_eq!(
             generated.agent_priority_labels,
             crate::config::CaravanConfig::default().agent_priority_labels
@@ -748,21 +743,26 @@ mod tests {
 
         let first =
             init_with_provider(&context(&directory), &repository(), "main", &provider).unwrap();
-        assert!(first.labels[..3]
-            .iter()
-            .all(|receipt| receipt.state == ResourceState::AlreadyPresent));
-        assert!(first.labels[3..]
-            .iter()
-            .all(|receipt| receipt.state == ResourceState::Created));
+        assert!(
+            first.labels[..3]
+                .iter()
+                .all(|receipt| receipt.state == ResourceState::AlreadyPresent)
+        );
+        assert!(
+            first.labels[3..]
+                .iter()
+                .all(|receipt| receipt.state == ResourceState::Created)
+        );
 
         let mut replay_context = context(&directory);
         replay_context.config_existed = true;
-        let replay =
-            init_with_provider(&replay_context, &repository(), "main", &provider).unwrap();
-        assert!(replay
-            .labels
-            .iter()
-            .all(|receipt| receipt.state == ResourceState::AlreadyPresent));
+        let replay = init_with_provider(&replay_context, &repository(), "main", &provider).unwrap();
+        assert!(
+            replay
+                .labels
+                .iter()
+                .all(|receipt| receipt.state == ResourceState::AlreadyPresent)
+        );
     }
 
     #[test]
@@ -771,11 +771,13 @@ mod tests {
         let mut labels: Vec<_> = required().iter().map(canonical).collect();
         labels[0].color = LEGACY_ACTIVE_COLOR.to_owned();
         labels[0].description = Some(LEGACY_ACTIVE_DESCRIPTION.to_owned());
-        assert!(inspect_labels(
-            &labels,
-            &crate::config::CaravanConfig::default().agent_priority_labels,
-        )
-        .ready);
+        assert!(
+            inspect_labels(
+                &labels,
+                &crate::config::CaravanConfig::default().agent_priority_labels,
+            )
+            .ready
+        );
         let provider = FakeProvider::new(labels);
         let output =
             init_with_provider(&context(&directory), &repository(), "main", &provider).unwrap();

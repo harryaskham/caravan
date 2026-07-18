@@ -19,6 +19,9 @@ use crate::{AppContext, AppError, CheckInput};
 /// Repository-wide live Caravan status.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct StatusOutput {
+    /// Successful phase timings make large-repository regressions diagnosable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing: Option<StatusTiming>,
     pub repository: RepositoryId,
     pub default_branch: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -31,6 +34,14 @@ pub struct StatusOutput {
     pub analysis: GraphAnalysis,
     /// Canonical, nonmutating automatic-admission order derived from GitHub.
     pub admission: AdmissionStatus,
+}
+
+/// Timing evidence for one complete read-only status operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct StatusTiming {
+    pub deadline_ms: u64,
+    pub total_ms: u64,
+    pub phases_ms: std::collections::BTreeMap<String, u64>,
 }
 
 /// One selectable PR in canonical priority-then-FIFO order.
@@ -120,22 +131,79 @@ pub struct CheckOutput {
 
 /// Discover and validate the real current repository without mutation.
 pub fn status(context: &AppContext) -> Result<StatusOutput, AppError> {
-    let timeout = std::time::Duration::from_secs(context.config.command_timeout_secs);
+    let budget = std::time::Duration::from_secs(context.config.command_timeout_secs);
+    status_with_deadline(context, std::time::Instant::now() + budget)
+}
+
+/// Run status under a caller-supplied absolute deadline. This narrow seam lets
+/// orchestration share a future whole-operation budget without changing child APIs.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn status_with_deadline(
+    context: &AppContext,
+    operation_deadline: std::time::Instant,
+) -> Result<StatusOutput, AppError> {
+    // Sharing one absolute deadline prevents a large repository from
+    // multiplying its budget by provider and compatibility subprocess count.
+    let started = std::time::Instant::now();
+    let timeout = operation_deadline.saturating_duration_since(started);
     let discovery = GitHubDiscovery::new(
-        crate::command::ProcessRunner::in_directory(&context.repository_path).with_timeout(timeout),
+        crate::command::ProcessRunner::in_directory(&context.repository_path)
+            .with_timeout(timeout)
+            .with_operation_deadline(operation_deadline),
     );
-    let snapshot = discovery
-        .discover()
-        .map_err(|error| discovery_error(&error))?;
-    let checker =
-        GitCompatibilityChecker::new(&context.repository_path, "origin").with_timeout(timeout);
-    let analysis = analyze(&snapshot, &checker)?;
+    let snapshot = discovery.discover().map_err(|error| {
+        if let DiscoveryError::Runner(CommandRunError::Timeout { command, .. }) = &error {
+            discovery_timeout_error(&error, discovery_phase(command), started.elapsed(), timeout)
+        } else {
+            discovery_error(&error)
+        }
+    })?;
+    let discovery_elapsed = started.elapsed();
+    let checker = GitCompatibilityChecker::new(&context.repository_path, "origin")
+        .with_timeout(timeout)
+        .with_operation_deadline(operation_deadline);
+    let analysis = analyze(&snapshot, &checker).map_err(|error| {
+        if mcp_cli::StructuredError::category(&error) == ErrorCategory::Timeout {
+            AppError::structured(
+                ErrorCategory::Timeout,
+                "github_discovery_timeout",
+                "compatibility analysis exceeded the status deadline",
+                Some(json!({
+                    "stage": "github_discovery",
+                    "phase": "compatibility_analysis",
+                    "elapsed_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    "deadline_ms": u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                    "retryable": true,
+                    "safe_next_action": "retry `cara status` after restoring Git transport health; status made no mutations",
+                    "source": mcp_cli::StructuredError::details(&error),
+                })),
+            )
+        } else {
+            error
+        }
+    })?;
+    let analysis_elapsed = started.elapsed();
     let label_provider = crate::github::GitHubMutationAdapter::new(
-        crate::command::ProcessRunner::in_directory(&context.repository_path).with_timeout(timeout),
+        crate::command::ProcessRunner::in_directory(&context.repository_path)
+            .with_timeout(timeout)
+            .with_operation_deadline(operation_deadline),
     );
     let labels = label_provider
         .repository_label_definitions(&snapshot.repository)
         .map_err(|error| {
+            if let crate::github::MutationError::Provider(provider) = &error {
+                if matches!(
+                    provider,
+                    DiscoveryError::Runner(CommandRunError::Timeout { .. })
+                ) {
+                    return discovery_timeout_error(
+                        provider,
+                        "repository_label_inventory",
+                        started.elapsed(),
+                        timeout,
+                    );
+                }
+            }
             AppError::structured(
                 mcp_cli::ErrorCategory::ExecutionFailure,
                 "repository_initialization_inventory_failed",
@@ -143,16 +211,48 @@ pub fn status(context: &AppContext) -> Result<StatusOutput, AppError> {
                 Some(json!({"next": "repair GitHub read access and rerun `cara status`"})),
             )
         })?;
-    let mut initialization = crate::initialization::inspect_labels(
-        &labels,
-        &context.config.agent_priority_labels,
-    );
+    let mut initialization =
+        crate::initialization::inspect_labels(&labels, &context.config.agent_priority_labels);
     if !context.config_existed {
         initialization.ready = false;
         initialization.next = Some("run `cara init` to atomically create .caravan/config.yaml and verify repository readiness".to_owned());
     }
     let admission = resolve_admission(&analysis, &context.config.agent_priority_labels);
+    let total = started.elapsed();
+    if std::time::Instant::now() >= operation_deadline {
+        return Err(AppError::structured(
+            ErrorCategory::Timeout,
+            "github_discovery_timeout",
+            "status deadline expired after repository label inventory",
+            Some(json!({
+                "stage": "github_discovery",
+                "phase": "finalize_status",
+                "elapsed_ms": u64::try_from(total.as_millis()).unwrap_or(u64::MAX),
+                "deadline_ms": u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                "retryable": true,
+                "safe_next_action": "retry `cara status`; status made no mutations",
+            })),
+        ));
+    }
+    let millis =
+        |duration: std::time::Duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+    let timing = StatusTiming {
+        deadline_ms: millis(timeout),
+        total_ms: millis(total),
+        phases_ms: std::collections::BTreeMap::from([
+            ("github_discovery".to_owned(), millis(discovery_elapsed)),
+            (
+                "compatibility_analysis".to_owned(),
+                millis(analysis_elapsed.saturating_sub(discovery_elapsed)),
+            ),
+            (
+                "repository_label_inventory".to_owned(),
+                millis(total.saturating_sub(analysis_elapsed)),
+            ),
+        ]),
+    };
     Ok(StatusOutput {
+        timing: Some(timing),
         repository: snapshot.repository,
         default_branch: snapshot.default_branch.name,
         current_branch: snapshot.current_branch,
@@ -176,6 +276,7 @@ pub fn next_candidate(context: &AppContext) -> Result<NextCandidateOutput, AppEr
 
 /// Resolve configured explicit priority and FIFO from one GitHub snapshot.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn resolve_admission(analysis: &GraphAnalysis, priority_labels: &[String]) -> AdmissionStatus {
     let ranks: std::collections::BTreeMap<&str, usize> = priority_labels
         .iter()
@@ -230,7 +331,10 @@ pub fn resolve_admission(analysis: &GraphAnalysis, priority_labels: &[String]) -
             None
         };
         if let Some(reason) = rejection {
-            rejected.push(RejectedAdmissionCandidate { pr: *number, reason });
+            rejected.push(RejectedAdmissionCandidate {
+                pr: *number,
+                reason,
+            });
             continue;
         }
 
@@ -238,9 +342,7 @@ pub fn resolve_admission(analysis: &GraphAnalysis, priority_labels: &[String]) -
         let fifo_reason = created_at.as_ref().map_or_else(
             || format!("provider created_at missing; deterministic PR number #{number} fallback"),
             |created_at| {
-                format!(
-                    "immutable provider created_at {created_at}, PR number #{number} tie-break"
-                )
+                format!("immutable provider created_at {created_at}, PR number #{number} tie-break")
             },
         );
         let (priority_label, priority_rank, reason) = configured.first().map_or_else(
@@ -279,9 +381,7 @@ pub fn resolve_admission(analysis: &GraphAnalysis, priority_labels: &[String]) -
     // after provider-timestamped candidates, ordered by PR number.
     candidates.sort_by_key(|candidate| {
         (
-            candidate
-                .priority_rank
-                .unwrap_or(priority_labels.len() + 1),
+            candidate.priority_rank.unwrap_or(priority_labels.len() + 1),
             candidate.created_at.is_none(),
             candidate.created_at.clone().unwrap_or_default(),
             candidate.pr,
@@ -610,23 +710,14 @@ fn discovery_error(error: &DiscoveryError) -> AppError {
     if let DiscoveryError::Runner(CommandRunError::Timeout {
         command,
         timeout_ms,
-        stdout,
-        stderr,
+        ..
     }) = error
     {
-        return AppError::structured(
-            ErrorCategory::Timeout,
-            "github_discovery_timeout",
-            error.to_string(),
-            Some(json!({
-                "stage": "github_discovery",
-                "command": command.display(),
-                "timeout_ms": timeout_ms,
-                "stdout": stdout,
-                "stderr": stderr,
-                "resumable": true,
-                "next": "retry the read operation after restoring Git/GitHub transport health",
-            })),
+        return discovery_timeout_error(
+            error,
+            discovery_phase(command),
+            std::time::Duration::from_millis(*timeout_ms),
+            std::time::Duration::from_millis(*timeout_ms),
         );
     }
     if let DiscoveryError::InvalidJson {
@@ -667,6 +758,61 @@ fn discovery_error(error: &DiscoveryError) -> AppError {
         "github_discovery_failed",
         error.to_string(),
         Some(json!({ "error": format!("{error:?}") })),
+    )
+}
+
+fn discovery_phase(command: &crate::command::CommandSpec) -> &'static str {
+    let args = command.args.iter().map(String::as_str).collect::<Vec<_>>();
+    if command.program == "git" {
+        "current_branch"
+    } else if args.starts_with(&["repo", "view"]) {
+        "repository_identity"
+    } else if args.starts_with(&["api"]) {
+        "default_branch_revision"
+    } else if args.contains(&"--head") {
+        "current_pull_request"
+    } else if args.windows(2).any(|pair| pair == ["--state", "merged"]) {
+        "historical_caravan_members"
+    } else if args.contains(&"--label") {
+        "active_caravan_members"
+    } else {
+        "open_pull_requests_and_checks"
+    }
+}
+
+fn discovery_timeout_error(
+    error: &DiscoveryError,
+    phase: &str,
+    elapsed: std::time::Duration,
+    deadline: std::time::Duration,
+) -> AppError {
+    let (command, stdout, stderr) = match error {
+        DiscoveryError::Runner(CommandRunError::Timeout {
+            command,
+            stdout,
+            stderr,
+            ..
+        }) => (command.display(), stdout.as_str(), stderr.as_str()),
+        _ => ("unknown".to_owned(), "", ""),
+    };
+    AppError::structured(
+        ErrorCategory::Timeout,
+        "github_discovery_timeout",
+        format!("GitHub discovery phase `{phase}` exceeded the status deadline"),
+        Some(json!({
+            "stage": "github_discovery",
+            "phase": phase,
+            "command": command,
+            "elapsed_ms": u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            "deadline_ms": u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
+            "timeout_ms": u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
+            "stdout": stdout,
+            "stderr": stderr,
+            "retryable": true,
+            "resumable": true,
+            "safe_next_action": "retry `cara status` after restoring Git/GitHub transport health; status made no mutations",
+            "next": "retry `cara status` after restoring Git/GitHub transport health; status made no mutations",
+        })),
     )
 }
 
@@ -740,6 +886,7 @@ mod tests {
         let checker = clean_checker;
         let analysis = analyze(&snapshot, &checker).unwrap();
         StatusOutput {
+            timing: None,
             repository: repository(),
             default_branch: "main".to_owned(),
             current_branch: snapshot.current_branch,
@@ -903,8 +1050,36 @@ mod tests {
         );
         let details = mcp_cli::StructuredError::details(&error).unwrap();
         assert_eq!(details["stage"], "github_discovery");
+        assert_eq!(details["phase"], "open_pull_requests_and_checks");
         assert_eq!(details["timeout_ms"], 500);
         assert_eq!(details["stdout"], "partial");
+        assert_eq!(details["retryable"], true);
+        assert!(
+            details["safe_next_action"]
+                .as_str()
+                .unwrap()
+                .contains("no mutations")
+        );
+    }
+
+    #[test]
+    fn status_deadline_error_reports_total_elapsed_and_phase() {
+        let provider = DiscoveryError::Runner(CommandRunError::Timeout {
+            command: crate::command::CommandSpec::new("gh").args(["pr", "list"]),
+            timeout_ms: 250,
+            stdout: String::new(),
+            stderr: "stalled".to_owned(),
+        });
+        let error = discovery_timeout_error(
+            &provider,
+            "compatibility_prepare",
+            std::time::Duration::from_millis(875),
+            std::time::Duration::from_secs(1),
+        );
+        let details = mcp_cli::StructuredError::details(&error).unwrap();
+        assert_eq!(details["phase"], "compatibility_prepare");
+        assert_eq!(details["elapsed_ms"], 875);
+        assert_eq!(details["deadline_ms"], 1_000);
     }
 
     #[test]
@@ -929,9 +1104,17 @@ mod tests {
         );
         assert_eq!(admission.next_candidate, Some(PrNumber(20)));
         assert!(admission.candidates[0].reason.contains("FIFO"));
-        assert!(admission.candidates[0].reason.contains("preflight required"));
+        assert!(
+            admission.candidates[0]
+                .reason
+                .contains("preflight required")
+        );
         assert!(admission.policy.contains("never LIFO"));
-        assert!(admission.policy.contains("never causes automatic leapfrogging"));
+        assert!(
+            admission
+                .policy
+                .contains("never causes automatic leapfrogging")
+        );
     }
 
     #[test]
@@ -973,7 +1156,9 @@ mod tests {
     #[test]
     fn invalid_and_conflicting_priority_labels_fail_closed() {
         let mut unknown = pr(10, "unknown", "main", false);
-        unknown.labels.insert("caravan-priority:surprise".to_owned());
+        unknown
+            .labels
+            .insert("caravan-priority:surprise".to_owned());
         let mut conflicting = pr(20, "conflicting", "main", false);
         conflicting.labels.extend([
             "caravan-priority:high".to_owned(),

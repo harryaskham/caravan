@@ -90,6 +90,18 @@ fn check_compatibility_with_runner(
 
     let target_oid = resolve_branch_snapshot_with_runner(runner, remote, target)?;
     let candidate_oid = resolve_branch_snapshot_with_runner(runner, remote, candidate)?;
+    check_resolved_compatibility_with_runner(runner, candidate, target, &candidate_oid, &target_oid)
+}
+
+/// Construct one merge report from revisions already validated and fetched by
+/// a bounded graph preparation phase.
+pub(crate) fn check_resolved_compatibility_with_runner(
+    runner: &impl CommandRunner,
+    candidate: &BranchSnapshot,
+    target: &BranchSnapshot,
+    candidate_oid: &CommitOid,
+    target_oid: &CommitOid,
+) -> Result<CompatibilityReport, AppError> {
     let output = git_output(
         runner,
         [
@@ -176,7 +188,7 @@ pub fn resolve_branch_snapshot_with_timeout(
     resolve_branch_snapshot_with_runner(&runner, remote, snapshot)
 }
 
-fn resolve_branch_snapshot_with_runner(
+pub(crate) fn resolve_branch_snapshot_with_runner(
     runner: &impl CommandRunner,
     remote: &str,
     snapshot: &BranchSnapshot,
@@ -211,6 +223,146 @@ fn resolve_branch_snapshot_with_runner(
     // caller from silently validating a newer remote head than it requested.
     require_advertised_oid(runner, remote, &reference, &snapshot.oid.0)?;
     resolve_local_commit(runner, &snapshot.oid.0)
+}
+
+/// Validate and fetch a complete unique branch set with a constant three
+/// network subprocesses, then verify every object in one local batch.
+pub(crate) fn prepare_branch_snapshots_with_runner(
+    runner: &impl CommandRunner,
+    remote: &str,
+    snapshots: &[BranchSnapshot],
+) -> Result<std::collections::BTreeMap<(String, String), CommitOid>, AppError> {
+    validate_remote(remote)?;
+    let mut branches = Vec::with_capacity(snapshots.len());
+    for snapshot in snapshots {
+        validate_expected_oid(&snapshot.oid.0)?;
+        branches.push((
+            branch_reference(runner, &snapshot.name)?,
+            snapshot.oid.0.clone(),
+            snapshot.name.clone(),
+        ));
+    }
+    let references = branches
+        .iter()
+        .map(|(reference, _, _)| reference.clone())
+        .collect::<Vec<_>>();
+    verify_advertised_batch(runner, remote, &branches, &references)?;
+
+    let fetch = git_output(
+        runner,
+        [
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--refmap=",
+            remote,
+        ]
+        .into_iter()
+        .chain(references.iter().map(String::as_str)),
+    )?;
+    if !fetch.is_success() {
+        return Err(git_failure(
+            "git_fetch_failed",
+            "Git could not fetch the requested exact remote refs",
+            fetch.code,
+            &fetch,
+        ));
+    }
+    verify_advertised_batch(runner, remote, &branches, &references)?;
+
+    let input = branches.iter().fold(String::new(), |mut input, (_, oid, _)| {
+        use std::fmt::Write as _;
+        writeln!(input, "{oid}^{{commit}}").expect("writing to String cannot fail");
+        input
+    });
+    let command = CommandSpec::new("git")
+        .args(["cat-file", "--batch-check=%(objectname) %(objecttype)"])
+        .stdin(input);
+    let output = runner
+        .run(&command)
+        .map_err(|error| command_run_error(&error))?;
+    if !output.is_success() {
+        return Err(git_failure(
+            "revision_not_found",
+            "Git could not verify prepared commit objects",
+            output.code,
+            &output,
+        ));
+    }
+    let lines = output.stdout.lines().collect::<Vec<_>>();
+    if lines.len() != branches.len() {
+        return Err(malformed_git_output(
+            "git_object_batch_invalid",
+            "git cat-file returned an unexpected number of objects",
+            &output,
+        ));
+    }
+    let mut prepared = std::collections::BTreeMap::new();
+    for ((_, expected, name), line) in branches.into_iter().zip(lines) {
+        let mut fields = line.split_whitespace();
+        if fields.next() != Some(expected.as_str()) || fields.next() != Some("commit") {
+            return Err(malformed_git_output(
+                "git_object_batch_invalid",
+                "git cat-file did not resolve an expected commit",
+                &output,
+            ));
+        }
+        prepared.insert((name, expected.clone()), CommitOid(expected));
+    }
+    Ok(prepared)
+}
+
+fn verify_advertised_batch(
+    runner: &impl CommandRunner,
+    remote: &str,
+    branches: &[(String, String, String)],
+    references: &[String],
+) -> Result<(), AppError> {
+    let output = git_output(
+        runner,
+        ["ls-remote", "--refs", "--exit-code", remote]
+            .into_iter()
+            .chain(references.iter().map(String::as_str)),
+    )?;
+    if !output.is_success() {
+        return Err(git_failure(
+            "remote_ref_not_found",
+            "Git did not advertise every prepared branch",
+            output.code,
+            &output,
+        ));
+    }
+    let advertised = output
+        .stdout
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .map(|(oid, reference)| (reference, oid))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for (reference, expected, _) in branches {
+        match advertised.get(reference.as_str()) {
+            Some(actual) if *actual == expected => {}
+            Some(actual) => {
+                return Err(AppError::structured(
+                    ErrorCategory::Validation,
+                    "stale_remote_revision",
+                    format!("remote ref `{reference}` moved since discovery"),
+                    Some(
+                        json!({"reference": reference, "expected_oid": expected, "advertised_oid": actual, "resumable": true}),
+                    ),
+                ));
+            }
+            None => {
+                return Err(AppError::structured(
+                    ErrorCategory::TargetNotFound,
+                    "remote_ref_not_found",
+                    format!("remote ref `{reference}` is not advertised by `{remote}`"),
+                    Some(json!({"remote": remote, "reference": reference})),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_remote(remote: &str) -> Result<(), AppError> {
@@ -469,6 +621,18 @@ mod tests {
     use super::*;
     use crate::model::RepositoryId;
 
+    struct CountingRunner {
+        inner: ProcessRunner,
+        commands: std::cell::RefCell<Vec<CommandSpec>>,
+    }
+
+    impl CommandRunner for CountingRunner {
+        fn run(&self, command: &CommandSpec) -> Result<CommandOutput, CommandRunError> {
+            self.commands.borrow_mut().push(command.clone());
+            self.inner.run(command)
+        }
+    }
+
     struct TestRepo {
         directory: TempDir,
     }
@@ -529,6 +693,60 @@ mod tests {
                 oid: CommitOid(oid.to_owned()),
             }
         }
+    }
+
+    #[test]
+    fn batch_preparation_has_constant_network_calls_and_one_merge_per_report() {
+        let repository = TestRepo::new();
+        let main = repository.commit_file("base.txt", "base\n", "base");
+        repository.switch("one", &main);
+        let one = repository.commit_file("one.txt", "one\n", "one");
+        repository.switch("two", &one);
+        let two = repository.commit_file("two.txt", "two\n", "two");
+        let branches = [
+            TestRepo::branch("main", &main),
+            TestRepo::branch("one", &one),
+            TestRepo::branch("two", &two),
+        ];
+        let runner = CountingRunner {
+            inner: ProcessRunner::in_directory(repository.path()),
+            commands: std::cell::RefCell::new(Vec::new()),
+        };
+        let prepared = prepare_branch_snapshots_with_runner(&runner, "fixture", &branches).unwrap();
+        check_resolved_compatibility_with_runner(
+            &runner,
+            &branches[1],
+            &branches[0],
+            prepared.get(&("one".to_owned(), one.clone())).unwrap(),
+            prepared.get(&("main".to_owned(), main)).unwrap(),
+        )
+        .unwrap();
+        check_resolved_compatibility_with_runner(
+            &runner,
+            &branches[2],
+            &branches[1],
+            prepared.get(&("two".to_owned(), two)).unwrap(),
+            prepared.get(&("one".to_owned(), one.clone())).unwrap(),
+        )
+        .unwrap();
+
+        let commands = runner.commands.borrow();
+        let network = commands
+            .iter()
+            .filter(|command| {
+                matches!(
+                    command.args.first().map(String::as_str),
+                    Some("ls-remote" | "fetch")
+                )
+            })
+            .count();
+        let merge_reports = commands
+            .iter()
+            .filter(|command| command.args.first().is_some_and(|arg| arg == "merge-tree"))
+            .count();
+        assert_eq!(network, 3, "two advertised snapshots plus one batch fetch");
+        assert_eq!(merge_reports, 2);
+        assert_eq!(commands.len(), branches.len() + 4 + merge_reports);
     }
 
     #[test]

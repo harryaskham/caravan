@@ -416,6 +416,7 @@ fn virtual_status(
     let admission =
         crate::read::resolve_admission(&analysis, &status.admission.priority_labels);
     StatusOutput {
+        timing: None,
         repository: status.repository.clone(),
         default_branch: status.default_branch.clone(),
         current_branch: status.current_branch.clone(),
@@ -859,6 +860,7 @@ mod tests {
         };
         let analysis = crate::graph::analyze(&snapshot, &Clean).unwrap();
         StatusOutput {
+            timing: None,
             repository: repository(),
             default_branch: "main".to_owned(),
             current_branch: snapshot.current_branch,

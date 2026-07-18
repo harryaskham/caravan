@@ -224,6 +224,7 @@ pub trait CommandRunner {
 pub struct ProcessRunner {
     cwd: Option<PathBuf>,
     timeout: Duration,
+    operation_deadline: Option<Instant>,
 }
 
 impl Default for ProcessRunner {
@@ -231,6 +232,7 @@ impl Default for ProcessRunner {
         Self {
             cwd: None,
             timeout: DEFAULT_COMMAND_TIMEOUT,
+            operation_deadline: None,
         }
     }
 }
@@ -248,6 +250,7 @@ impl ProcessRunner {
         Self {
             cwd: Some(path.as_ref().to_path_buf()),
             timeout: DEFAULT_COMMAND_TIMEOUT,
+            operation_deadline: None,
         }
     }
 
@@ -257,10 +260,37 @@ impl ProcessRunner {
         self.timeout = timeout.max(Duration::from_millis(1));
         self
     }
+
+    /// Share one absolute deadline across a multi-command operation. Each child
+    /// receives only the smaller of its normal timeout and the operation's
+    /// remaining budget.
+    #[must_use]
+    pub fn with_operation_deadline(mut self, deadline: Instant) -> Self {
+        self.operation_deadline = Some(deadline);
+        self
+    }
+
+    fn effective_timeout(&self, request: &CommandSpec) -> Result<Duration, CommandRunError> {
+        let timeout = self.operation_deadline.map_or(self.timeout, |deadline| {
+            self.timeout
+                .min(deadline.saturating_duration_since(Instant::now()))
+        });
+        if timeout.is_zero() {
+            return Err(CommandRunError::Timeout {
+                command: request.clone(),
+                timeout_ms: 0,
+                stdout: String::new(),
+                stderr: "operation deadline exhausted before this phase".to_owned(),
+            });
+        }
+        Ok(timeout)
+    }
 }
 
 impl CommandRunner for ProcessRunner {
+    #[allow(clippy::too_many_lines)]
     fn run(&self, request: &CommandSpec) -> Result<CommandOutput, CommandRunError> {
+        let timeout = self.effective_timeout(request)?;
         let mut command = Command::new(&request.program);
         command
             .args(&request.args)
@@ -298,7 +328,7 @@ impl CommandRunner for ProcessRunner {
         let stderr = child.stderr.take().expect("piped stderr");
         let stdout_reader = thread::spawn(move || capture(stdout, MAX_STDOUT_CAPTURE_BYTES));
         let stderr_reader = thread::spawn(move || capture(stderr, MAX_STDERR_CAPTURE_BYTES));
-        let deadline = Instant::now() + self.timeout;
+        let deadline = Instant::now() + timeout;
 
         let (status, timed_out) = loop {
             match child.try_wait() {
@@ -343,7 +373,7 @@ impl CommandRunner for ProcessRunner {
         if timed_out {
             return Err(CommandRunError::Timeout {
                 command: request.clone(),
-                timeout_ms: duration_millis(self.timeout),
+                timeout_ms: duration_millis(timeout),
                 stdout: String::from_utf8_lossy(&stdout).into_owned(),
                 stderr: String::from_utf8_lossy(&stderr).into_owned(),
             });
@@ -480,6 +510,30 @@ mod tests {
         assert!(output.stderr.contains("wrapper diagnostic"));
         assert!(output.stderr.contains('\u{1}'));
         assert!(!output.stdout.contains("wrapper diagnostic"));
+    }
+
+    #[test]
+    fn one_absolute_deadline_bounds_multiple_phases_and_reaps_the_hung_phase() {
+        let operation_started = Instant::now();
+        let runner = ProcessRunner::new()
+            .with_timeout(Duration::from_secs(5))
+            .with_operation_deadline(operation_started + Duration::from_secs(1));
+        runner
+            .run(&CommandSpec::new("sh").args(["-c", "sleep 0.05"]))
+            .expect("first phase fits the budget");
+        let error = runner
+            .run(&CommandSpec::new("sh").args(["-c", "printf phase-two; sleep 30"]))
+            .expect_err("hung second phase must consume only the remaining budget");
+
+        assert!(operation_started.elapsed() < Duration::from_secs(2));
+        let CommandRunError::Timeout {
+            timeout_ms, stdout, ..
+        } = error
+        else {
+            panic!("expected deadline timeout");
+        };
+        assert!(timeout_ms <= 950, "remaining budget was {timeout_ms}ms");
+        assert!(stdout.is_empty() || stdout == "phase-two");
     }
 
     #[test]

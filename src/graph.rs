@@ -36,6 +36,12 @@ impl GraphAnalysis {
 /// Injectable compatibility seam. Production uses worktree-free Git; tests can
 /// focus on graph policy without subprocesses.
 pub trait CompatibilityChecker {
+    /// Validate/fetch unique branches once before pairwise reports. Fakes keep
+    /// the default no-op while production caches exact revisions.
+    fn prepare(&self, _branches: &[BranchSnapshot]) -> Result<(), AppError> {
+        Ok(())
+    }
+
     fn check(
         &self,
         candidate: &BranchSnapshot,
@@ -62,6 +68,8 @@ pub struct GitCompatibilityChecker {
     repository: PathBuf,
     remote: String,
     timeout: Duration,
+    operation_deadline: Option<std::time::Instant>,
+    prepared: std::cell::RefCell<BTreeMap<(String, String), crate::model::CommitOid>>,
 }
 
 impl GitCompatibilityChecker {
@@ -71,6 +79,8 @@ impl GitCompatibilityChecker {
             repository: repository.as_ref().to_path_buf(),
             remote: remote.into(),
             timeout: crate::command::DEFAULT_COMMAND_TIMEOUT,
+            operation_deadline: None,
+            prepared: std::cell::RefCell::new(BTreeMap::new()),
         }
     }
 
@@ -80,21 +90,78 @@ impl GitCompatibilityChecker {
         self.timeout = timeout;
         self
     }
+
+    /// Share the status operation's absolute deadline across every compatibility subprocess.
+    #[must_use]
+    pub fn with_operation_deadline(mut self, deadline: std::time::Instant) -> Self {
+        self.operation_deadline = Some(deadline);
+        self
+    }
 }
 
 impl CompatibilityChecker for GitCompatibilityChecker {
+    fn prepare(&self, branches: &[BranchSnapshot]) -> Result<(), AppError> {
+        let runner = crate::command::ProcessRunner::in_directory(&self.repository)
+            .with_timeout(self.timeout)
+            .with_operation_deadline(
+                self.operation_deadline
+                    .unwrap_or_else(|| std::time::Instant::now() + self.timeout),
+            );
+        let missing = {
+            let cache = self.prepared.borrow();
+            branches
+                .iter()
+                .filter(|branch| !cache.contains_key(&(branch.name.clone(), branch.oid.0.clone())))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        if !missing.is_empty() {
+            let prepared = compatibility::prepare_branch_snapshots_with_runner(
+                &runner,
+                &self.remote,
+                &missing,
+            )?;
+            self.prepared.borrow_mut().extend(prepared);
+        }
+        Ok(())
+    }
+
     fn check(
         &self,
         candidate: &BranchSnapshot,
         target: &BranchSnapshot,
     ) -> Result<CompatibilityReport, AppError> {
-        compatibility::check_compatibility_with_timeout(
-            &self.repository,
-            &self.remote,
-            candidate,
-            target,
-            self.timeout,
-        )
+        let key = |branch: &BranchSnapshot| (branch.name.clone(), branch.oid.0.clone());
+        let cache = self.prepared.borrow();
+        if let (Some(candidate_oid), Some(target_oid)) =
+            (cache.get(&key(candidate)), cache.get(&key(target)))
+        {
+            let runner = crate::command::ProcessRunner::in_directory(&self.repository)
+                .with_timeout(self.timeout)
+                .with_operation_deadline(
+                    self.operation_deadline
+                        .unwrap_or_else(|| std::time::Instant::now() + self.timeout),
+                );
+            compatibility::check_resolved_compatibility_with_runner(
+                &runner,
+                candidate,
+                target,
+                candidate_oid,
+                target_oid,
+            )
+        } else {
+            let timeout = self.operation_deadline.map_or(self.timeout, |deadline| {
+                self.timeout
+                    .min(deadline.saturating_duration_since(std::time::Instant::now()))
+            });
+            compatibility::check_compatibility_with_timeout(
+                &self.repository,
+                &self.remote,
+                candidate,
+                target,
+                timeout,
+            )
+        }
     }
 }
 
@@ -331,6 +398,18 @@ pub fn analyze(
 ) -> Result<GraphAnalysis, AppError> {
     let mut analysis = derive(snapshot);
     let caravans = analysis.fleet.caravans.clone();
+    let mut branches = vec![snapshot.default_branch.clone()];
+    branches.extend(caravans.iter().flat_map(|caravan| {
+        caravan.members.iter().filter_map(|number| {
+            analysis
+                .pull_requests
+                .get(number)
+                .map(|pull_request| pull_request.head.clone())
+        })
+    }));
+    branches.sort_by(|left, right| (&left.name, &left.oid.0).cmp(&(&right.name, &right.oid.0)));
+    branches.dedup_by(|left, right| left.name == right.name && left.oid == right.oid);
+    checker.prepare(&branches)?;
 
     for caravan in &caravans {
         let Some(head_number) = caravan.head() else {
@@ -545,6 +624,50 @@ mod tests {
             conflicting_paths: Vec::new(),
             diagnostic: None,
         })
+    }
+
+    #[test]
+    fn compatibility_prepares_unique_branches_once_then_checks_only_reports() {
+        struct CountingChecker {
+            prepared: std::cell::RefCell<Vec<BranchSnapshot>>,
+            reports: std::cell::Cell<usize>,
+        }
+        impl CompatibilityChecker for CountingChecker {
+            fn prepare(&self, branches: &[BranchSnapshot]) -> Result<(), AppError> {
+                *self.prepared.borrow_mut() = branches.to_vec();
+                Ok(())
+            }
+
+            fn check(
+                &self,
+                candidate: &BranchSnapshot,
+                target: &BranchSnapshot,
+            ) -> Result<CompatibilityReport, AppError> {
+                self.reports.set(self.reports.get() + 1);
+                clean(candidate, target)
+            }
+        }
+        let checker = CountingChecker {
+            prepared: std::cell::RefCell::new(Vec::new()),
+            reports: std::cell::Cell::new(0),
+        };
+        analyze(
+            &snapshot(vec![
+                pull_request(1, "one", "main"),
+                pull_request(2, "two", "one"),
+                pull_request(3, "three", "two"),
+            ]),
+            &checker,
+        )
+        .unwrap();
+
+        let prepared = checker.prepared.borrow();
+        assert_eq!(prepared.len(), 4, "default plus three unique active heads");
+        assert_eq!(
+            checker.reports.get(),
+            3,
+            "head/default plus two adjacent reports"
+        );
     }
 
     #[test]
