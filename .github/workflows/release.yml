@@ -26,7 +26,7 @@ permissions:
 jobs:
   resolve:
     name: resolve release context
-    runs-on: [self-hosted, azure-ephemeral]
+    runs-on: [self-hosted, nix, x86_64-linux]
     timeout-minutes: 10
     outputs:
       tag: ${{ steps.context.outputs.tag }}
@@ -57,7 +57,7 @@ jobs:
   test:
     name: release contract
     needs: resolve
-    runs-on: [self-hosted, azure-ephemeral]
+    runs-on: [self-hosted, nix, x86_64-linux]
     timeout-minutes: 30
     steps:
       - name: Reset persistent-runner Git URL rewrites
@@ -85,20 +85,22 @@ jobs:
       - resolve
       - test
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-linux
-            runner: [self-hosted, azure-ephemeral]
-            cargo_target: ""
+            runner: [self-hosted, nix, x86_64-linux]
+            timeout_minutes: 60
+          # ms-dev-2 advertises aarch64-linux in Nix extra-platforms, so this
+          # remains a pinned Nix build instead of depending on apt cross tools.
           - target: aarch64-linux
-            runner: [self-hosted, azure-ephemeral]
-            cargo_target: aarch64-unknown-linux-gnu
+            runner: [self-hosted, nix, ms-dev-2]
+            timeout_minutes: 120
           - target: aarch64-darwin
-            runner: [self-hosted, aarch64-darwin]
-            cargo_target: ""
+            runner: [self-hosted, nix, aarch64-darwin]
+            timeout_minutes: 60
     steps:
       - name: Reset persistent-runner Git URL rewrites
         shell: bash
@@ -119,43 +121,17 @@ jobs:
           done
           exit 0
 
-      - name: Install Rust toolchain on Linux
-        if: matrix.target != 'aarch64-darwin'
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install Linux C and cross toolchains
-        if: matrix.target != 'aarch64-darwin'
-        shell: bash
-        env:
-          CARGO_TARGET: ${{ matrix.cargo_target }}
-        run: |
-          set -euo pipefail
-          if command -v apt-get >/dev/null 2>&1; then
-            sudo_command=""
-            if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then sudo_command="sudo"; fi
-            $sudo_command apt-get update -qq
-            $sudo_command apt-get install -y --no-install-recommends build-essential
-            if [ -n "$CARGO_TARGET" ]; then
-              $sudo_command apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
-            fi
-          fi
-
       - name: Build release binary
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
-          CARGO_TARGET: ${{ matrix.cargo_target }}
         run: |
           set -euo pipefail
           if [ "$TARGET" = "aarch64-darwin" ]; then
             nix develop '.#devShells.aarch64-darwin.default' --builders '' \
               --command ./scripts/build-darwin-release.sh
-          elif [ -n "$CARGO_TARGET" ]; then
-            rustup target add "$CARGO_TARGET"
-            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
-            cargo build --release --bin cara --target "$CARGO_TARGET"
           else
-            cargo build --release --bin cara
+            nix build ".#packages.$TARGET.caravan" --out-link "result-$TARGET"
           fi
 
       - name: Package update-compatible asset
@@ -163,14 +139,17 @@ jobs:
         env:
           VERSION: ${{ needs.resolve.outputs.version }}
           TARGET: ${{ matrix.target }}
-          CARGO_TARGET: ${{ matrix.cargo_target }}
         run: |
           set -euo pipefail
-          binary="${CARGO_TARGET_DIR:-target}${CARGO_TARGET:+/$CARGO_TARGET}/release/cara"
+          if [ "$TARGET" = "aarch64-darwin" ]; then
+            binary="target/release/cara"
+          else
+            binary="result-$TARGET/bin/cara"
+          fi
           ./scripts/package-release.sh "$VERSION" "$TARGET" "$binary" dist
 
       - name: Smoke packaged native binary
-        if: matrix.cargo_target == ''
+        if: matrix.target != 'aarch64-linux'
         shell: bash
         env:
           VERSION: ${{ needs.resolve.outputs.version }}

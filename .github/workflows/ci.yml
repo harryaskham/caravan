@@ -12,9 +12,9 @@ concurrency:
 
 jobs:
   build-test:
-    # Release milestones exercise the same Nix-capable architecture fleet as
-    # sibling projects; runners are registered out of band by the operator.
-    runs-on: [self-hosted, azure-ephemeral]
+    # Match the registered persistent Nix runner fleet explicitly. Generic
+    # `azure-ephemeral` is intentionally not required for this repository.
+    runs-on: [self-hosted, nix, x86_64-linux]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
