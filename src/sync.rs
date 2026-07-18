@@ -759,7 +759,7 @@ fn force_merge_head(
         EventKind::ForceMergeAttempted,
         Some(caravan.id),
         vec![head],
-        Some("terminal CI failure accepted by caravan-force policy".to_owned()),
+        Some("non-successful CI state accepted by explicit caravan-force policy".to_owned()),
         force_event_metadata(progress, head),
     ));
 
@@ -809,7 +809,7 @@ fn force_merge_head(
         after_labels: current.labels.clone(),
         actor: "authenticated GitHub comment author; cara sync/loop force policy".to_owned(),
         reason: format!(
-            "observed external `caravan-force`; force_merge=true; ADMIN permission confirmed; failed checks: {}",
+            "observed external `caravan-force`; force_merge=true; ADMIN permission confirmed; observed checks (including pending, running, failed, or empty): {}",
             serde_json::to_string(&observation.checks).expect("checks serialize")
         ),
         reason_source: "deterministic evidence from GitHub checks, external label, repository config, and permission preflight".to_owned(),
@@ -1020,6 +1020,17 @@ fn ci_decision_error(
 }
 
 fn classify_checks(checks: &[CheckSnapshot], forced: bool) -> CiDisposition {
+    let fully_successful = !checks.is_empty()
+        && checks.iter().all(|check| {
+            matches!(
+                check.state,
+                CheckState::Success | CheckState::Neutral | CheckState::Skipped
+            )
+        });
+    if forced && !fully_successful {
+        return CiDisposition::Forced;
+    }
+
     let pending = checks.is_empty()
         || checks.iter().any(|check| {
             matches!(
@@ -1039,8 +1050,6 @@ fn classify_checks(checks: &[CheckSnapshot], forced: bool) -> CiDisposition {
     });
     if pending {
         CiDisposition::Waiting
-    } else if failed && forced {
-        CiDisposition::Forced
     } else if failed {
         CiDisposition::Failed
     } else {
@@ -1780,6 +1789,7 @@ mod tests {
         failed_runs: RefCell<BTreeMap<PrNumber, Vec<WorkflowRunSnapshot>>>,
         admin_permission: bool,
         branch_head: RefCell<crate::model::CommitOid>,
+        audits: RefCell<Vec<ControlLabelAudit>>,
     }
 
     impl FakeProvider {
@@ -1798,6 +1808,7 @@ mod tests {
                 failed_runs: RefCell::new(BTreeMap::new()),
                 admin_permission: true,
                 branch_head: RefCell::new(branch("main").oid),
+                audits: RefCell::new(Vec::new()),
             }
         }
 
@@ -1989,8 +2000,9 @@ mod tests {
             &self,
             _repository: &RepositoryId,
             expected: &PullRequestPrecondition,
-            _audit: &ControlLabelAudit,
+            audit: &ControlLabelAudit,
         ) -> Result<GitHubMutationReceipt, MutationError> {
+            self.audits.borrow_mut().push(audit.clone());
             self.mutate(expected, MutationKind::Comment, |_| {})
         }
 
@@ -2423,22 +2435,79 @@ mod tests {
     }
 
     #[test]
-    fn mixed_pending_and_failure_never_force_merges() {
+    fn forced_head_bypasses_queued_expected_in_progress_and_empty_checks() {
+        for checks in [
+            vec![check("build-test", CheckState::Queued, Some(40))],
+            vec![check("build-test", CheckState::Expected, None)],
+            vec![check("build-test", CheckState::InProgress, Some(41))],
+            vec![],
+        ] {
+            let mut pulls = healthy_chain();
+            pulls.truncate(1);
+            pulls[0].labels.insert("caravan-force".to_owned());
+            pulls[0].checks = checks;
+            let provider = FakeProvider::with_pull_requests(pulls.clone());
+            let status = status(pulls, Some(PrNumber(1)), &clean);
+
+            let progress = execute(&status, &provider, false, false, true)
+                .expect("explicit force bypasses every non-successful CI state");
+
+            assert_eq!(progress.ci[0].disposition, CiDisposition::Forced);
+            assert_eq!(
+                *provider.calls.borrow(),
+                vec![MutationKind::Comment, MutationKind::SquashMerge]
+            );
+            assert_eq!(
+                progress.current[&PrNumber(1)].state,
+                PullRequestState::Merged
+            );
+        }
+    }
+
+    #[test]
+    fn forced_head_bypasses_mixed_pending_and_failed_checks_with_accurate_audit() {
         let mut pulls = healthy_chain();
         pulls.truncate(1);
         pulls[0].labels.insert("caravan-force".to_owned());
         pulls[0].checks = vec![
-            check("build-test", CheckState::Failure, Some(40)),
-            check("security", CheckState::InProgress, Some(41)),
+            check("build-test", CheckState::Failure, Some(42)),
+            check("security", CheckState::InProgress, Some(43)),
         ];
         let provider = FakeProvider::with_pull_requests(pulls.clone());
         let status = status(pulls, Some(PrNumber(1)), &clean);
 
-        let progress = execute(&status, &provider, false, false, true).expect("pending wins");
+        let progress = execute(&status, &provider, false, false, true)
+            .expect("explicit force bypasses mixed pending and failed checks");
 
-        assert_eq!(progress.ci[0].disposition, CiDisposition::Waiting);
-        assert!(provider.calls.borrow().is_empty());
+        assert_eq!(progress.ci[0].disposition, CiDisposition::Forced);
+        let audits = provider.audits.borrow();
+        assert_eq!(audits.len(), 1);
+        assert!(audits[0].reason.contains("observed checks"));
+        assert!(audits[0].reason.contains("INPROGRESS"));
+        assert!(audits[0].reason.contains("FAILURE"));
+        assert!(!audits[0].reason.contains("failed checks:"));
+    }
+
+    #[test]
+    fn passing_checks_with_stale_force_label_use_normal_auto_merge() {
+        let mut pulls = healthy_chain();
+        pulls.truncate(1);
+        pulls[0].labels.insert("caravan-force".to_owned());
+        pulls[0].checks = vec![check("build-test", CheckState::Success, Some(44))];
+        pulls[0].auto_merge = AutoMergeState::disabled();
+        let provider = FakeProvider::with_pull_requests(pulls.clone());
+        let status = status(pulls, Some(PrNumber(1)), &clean);
+
+        let progress = execute(&status, &provider, false, false, true)
+            .expect("successful CI does not invoke exceptional force");
+
+        assert_eq!(progress.ci[0].disposition, CiDisposition::Passing);
+        assert_eq!(
+            *provider.calls.borrow(),
+            vec![MutationKind::EnableAutoMerge]
+        );
         assert!(progress.events.is_empty());
+        assert!(provider.audits.borrow().is_empty());
     }
 
     #[test]
@@ -2767,7 +2836,7 @@ mod tests {
         let mut pulls = healthy_chain();
         pulls.truncate(1);
         pulls[0].labels.insert("caravan-force".to_owned());
-        pulls[0].checks = vec![check("build-test", CheckState::Failure, Some(60))];
+        pulls[0].checks = vec![check("build-test", CheckState::Expected, None)];
         let provider = FakeProvider::with_pull_requests(pulls.clone());
         let status = status(pulls, Some(PrNumber(1)), &conflict);
 

@@ -212,14 +212,14 @@ Normal behavior:
 
 A user/agent may repair and push, rerun failed checks, evict/split, or mark a known acceptable failure with `caravan-force`.
 
-`caravan-force` means failed checks do not evict or block that PR. When it becomes head, `cara sync` may force-squash it only when:
+`caravan-force` is explicit operator intent to bypass any CI state that is not fully successful, including expected, queued, running, failed, unknown, mixed, or empty checks. When it becomes head, `cara sync` may force-squash it only when:
 
 1. `.caravan/config.yaml` sets `force_merge: true`;
 2. the open head has `caravan-force`;
 3. it remains mechanically conflict-free with the default branch;
 4. the authenticated actor has repository permission.
 
-No approval hook or interactive reason is required. Before accepting the externally applied `caravan-force` label, sync/loop posts a durable generated-reason comment containing the exact failed checks, enabled force policy, authenticated ADMIN permission, exact clean compatibility proof, and squash action. Comment failure is resumable and prevents the force merge. The attempt and result are emitted as audit events. Force never bypasses textual conflicts.
+No approval hook or interactive reason is required. Before accepting the externally applied `caravan-force` label, sync/loop posts a durable generated-reason comment containing the exact observed checks (including pending, running, failed, mixed, or empty observations), enabled force policy, authenticated ADMIN permission, exact clean compatibility proof, and squash action. Comment failure is resumable and prevents the force merge. The attempt and result are emitted as audit events. Force never bypasses textual conflicts.
 
 ## 8. Decision points and errors
 

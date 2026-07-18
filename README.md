@@ -34,9 +34,11 @@ after the same check passes.
 - `cara sync` is idempotent: pending CI waits, failed CI returns exact check/run
   evidence, and `--rerun-failed` reruns only verified runs for the selected PR
   and head SHA.
-- `caravan-force` keeps a known acceptable failure in-chain. A forced head is
-  admin-squashed only when repository policy permits it, the exact head/default
-  compatibility proof is still current, and GitHub reports admin permission.
+- `caravan-force` is explicit operator intent to bypass any CI state that is
+  not fully successful, including pending, running, failed, mixed, and empty
+  checks. A forced head is admin-squashed only when repository policy permits
+  it, the exact head/default compatibility proof is still current, and GitHub
+  reports admin permission.
 
 ## V1 command surface
 
