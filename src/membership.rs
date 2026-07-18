@@ -356,6 +356,7 @@ fn execute(
         ));
     }
 
+    crate::initialization::require_ready(&status.initialization)?;
     let mut state = ExecutionState::new(request.operation);
     preflight_repository(
         provider,
@@ -608,6 +609,7 @@ fn preflight_eligibility(
             eligible: true,
             compatibility: status.analysis.compatibility.clone(),
             problems: Vec::new(),
+            initialization: status.initialization.clone(),
         });
     }
 
@@ -1130,6 +1132,7 @@ mod tests {
             current_branch: snapshot.current_branch,
             current_pr: snapshot.current_pr,
             healthy: analysis.healthy(),
+            initialization: crate::initialization::InitializationStatus::default(),
             analysis,
         }
     }

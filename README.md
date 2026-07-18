@@ -45,6 +45,7 @@ cargo run -- feedback status
 Domain surface:
 
 ```text
+cara init
 cara status
 cara check [--tail-pr N | --head-pr N]
 cara new [--create-pr]
@@ -60,6 +61,15 @@ cara mcp tools | cara mcp stdio
 cara self-update status | check | run
 cara feedback status | report
 ```
+
+First use is always explicit: run `cara status`, then `cara init`. Init atomically
+creates `.caravan/config.yaml` only when absent, verifies repository permission,
+default-branch protection, and squash auto-merge policy, and creates only the
+three canonical labels. It never overwrites an existing config or label and
+never mutates a pull request. Repeated init calls are verification-only no-ops.
+If label metadata differs, reconcile it manually and retry. The legacy active
+label `1D76DB` / `Active member of a Caravan merge chain` is explicitly
+compatible and preserved. See [`docs/first-use.md`](docs/first-use.md).
 
 `cara van next` on the default branch enters the first caravan head; ordinary
 `cara next` remains chain-local and requires the current branch to map to an

@@ -418,6 +418,7 @@ fn virtual_status(
         current_branch: status.current_branch.clone(),
         current_pr: status.current_pr,
         healthy: false,
+        initialization: status.initialization.clone(),
         analysis: crate::graph::derive(&snapshot),
     }
 }
@@ -858,6 +859,7 @@ mod tests {
             current_branch: snapshot.current_branch,
             current_pr: snapshot.current_pr,
             healthy: analysis.healthy(),
+            initialization: crate::initialization::InitializationStatus::default(),
             analysis,
         }
     }

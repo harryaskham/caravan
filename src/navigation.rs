@@ -600,6 +600,7 @@ mod tests {
             current_branch: Some(format!("pr-{current}")),
             current_pr: Some(PrNumber(current)),
             healthy: true,
+            initialization: crate::initialization::InitializationStatus::default(),
             analysis: GraphAnalysis {
                 fleet: CaravanFleet {
                     repository: repository(),

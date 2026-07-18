@@ -26,6 +26,8 @@ pub struct StatusOutput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_pr: Option<PrNumber>,
     pub healthy: bool,
+    /// Read-only first-use readiness. Status never creates or edits resources.
+    pub initialization: crate::initialization::InitializationStatus,
     pub analysis: GraphAnalysis,
 }
 
@@ -66,6 +68,7 @@ pub struct CheckOutput {
     pub compatibility: Vec<CompatibilityReport>,
     #[serde(default)]
     pub problems: Vec<GraphProblem>,
+    pub initialization: crate::initialization::InitializationStatus,
 }
 
 /// Discover and validate the real current repository without mutation.
@@ -80,12 +83,31 @@ pub fn status(context: &AppContext) -> Result<StatusOutput, AppError> {
     let checker =
         GitCompatibilityChecker::new(&context.repository_path, "origin").with_timeout(timeout);
     let analysis = analyze(&snapshot, &checker)?;
+    let label_provider = crate::github::GitHubMutationAdapter::new(
+        crate::command::ProcessRunner::in_directory(&context.repository_path).with_timeout(timeout),
+    );
+    let labels = label_provider
+        .repository_label_definitions(&snapshot.repository)
+        .map_err(|error| {
+            AppError::structured(
+                mcp_cli::ErrorCategory::ExecutionFailure,
+                "repository_initialization_inventory_failed",
+                error.to_string(),
+                Some(json!({"next": "repair GitHub read access and rerun `cara status`"})),
+            )
+        })?;
+    let mut initialization = crate::initialization::inspect_labels(&labels);
+    if !context.config_existed {
+        initialization.ready = false;
+        initialization.next = Some("run `cara init` to atomically create .caravan/config.yaml and verify repository readiness".to_owned());
+    }
     Ok(StatusOutput {
         repository: snapshot.repository,
         default_branch: snapshot.default_branch.name,
         current_branch: snapshot.current_branch,
         current_pr: snapshot.current_pr,
-        healthy: analysis.healthy(),
+        healthy: analysis.healthy() && initialization.ready,
+        initialization,
         analysis,
     })
 }
@@ -150,6 +172,7 @@ pub fn check_analysis(
     input: &CheckInput,
     checker: &impl CompatibilityChecker,
 ) -> Result<CheckOutput, AppError> {
+    crate::initialization::require_ready(&status.initialization)?;
     let current_pr = status.current_pr.ok_or_else(|| {
         AppError::validation(
             "current_pr_not_found",
@@ -182,6 +205,7 @@ pub fn check_analysis(
             eligible: status.healthy,
             compatibility: status.analysis.compatibility.clone(),
             problems: status.analysis.fleet.problems.clone(),
+            initialization: status.initialization.clone(),
         };
         return eligible_or_error(output);
     }
@@ -201,6 +225,7 @@ pub fn check_analysis(
             eligible: problems.is_empty(),
             compatibility: reports,
             problems,
+            initialization: status.initialization.clone(),
         });
     }
 
@@ -245,6 +270,7 @@ pub fn check_analysis(
         eligible: problems.is_empty(),
         compatibility: reports,
         problems,
+        initialization: status.initialization.clone(),
     })
 }
 
@@ -532,6 +558,7 @@ mod tests {
             current_branch: snapshot.current_branch,
             current_pr: snapshot.current_pr,
             healthy: analysis.healthy(),
+            initialization: crate::initialization::InitializationStatus::default(),
             analysis,
         }
     }

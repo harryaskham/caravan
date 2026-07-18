@@ -190,6 +190,7 @@ mod tests {
                     current_branch: None,
                     current_pr: None,
                     healthy: true,
+                    initialization: crate::initialization::InitializationStatus::default(),
                     analysis: crate::graph::GraphAnalysis {
                         fleet: CaravanFleet {
                             repository: repository.clone(),

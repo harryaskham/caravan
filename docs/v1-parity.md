@@ -23,6 +23,7 @@ is required or used.
 | eviction | `cara evict [--pr N] --reason TEXT` | envelope | `evict` | safe gap closure, exact receipts and success/failure events |
 | split | `cara split [--pr N]` | envelope | `split` | only non-heads; both resulting fleets validated |
 | operation lock | `cara lock status/recover` | envelope | `lock_status/recover` | exact-token, age, and dead-owner guarded recovery |
+| repository init | `cara init` | envelope | `init` | atomic config create-new, repository-policy preflight, exact label ensure receipts |
 | agent help | `cara help` | envelope | `help` | resumable operating loop and recovery guidance |
 | MCP metadata/server | `cara mcp tools/stdio` | metadata is JSON | n/a | all bounded domain inputs and outputs have schemas |
 | self update | `cara self-update status/check/run` | envelope | `self_update_*` | release-asset updater contract |

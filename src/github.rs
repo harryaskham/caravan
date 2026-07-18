@@ -375,6 +375,38 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
         Ok(branch.protected)
     }
 
+    /// Exact classic default-branch check/review requirements used by
+    /// repository initialization. A protected branch with no such requirement
+    /// deliberately returns an empty policy rather than being considered ready.
+    pub fn default_branch_policy(
+        &self,
+        repository: &RepositoryId,
+        branch: &str,
+    ) -> Result<DefaultBranchPolicy, MutationError> {
+        let policy: BranchProtectionJson =
+            self.json(branch_protection_command(repository, branch))?;
+        let mut required_status_checks = policy
+            .required_status_checks
+            .as_ref()
+            .map(|checks| checks.contexts.clone())
+            .unwrap_or_default();
+        if let Some(checks) = policy.required_status_checks.as_ref() {
+            required_status_checks.extend(checks.checks.iter().map(|check| check.context.clone()));
+        }
+        required_status_checks.sort();
+        required_status_checks.dedup();
+        Ok(DefaultBranchPolicy {
+            required_status_checks,
+            strict_status_checks: policy
+                .required_status_checks
+                .as_ref()
+                .is_some_and(|checks| checks.strict),
+            required_approving_review_count: policy
+                .required_pull_request_reviews
+                .map_or(0, |reviews| reviews.required_approving_review_count),
+        })
+    }
+
     /// Whether repository settings permit GitHub auto-merge.
     pub fn repository_allows_auto_merge(
         &self,
@@ -390,8 +422,48 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
         &self,
         repository: &RepositoryId,
     ) -> Result<BTreeSet<String>, MutationError> {
-        let labels: Vec<LabelJson> = self.json(repository_labels_command(repository))?;
-        Ok(labels.into_iter().map(|label| label.name).collect())
+        Ok(self
+            .repository_label_definitions(repository)?
+            .into_iter()
+            .map(|label| label.name)
+            .collect())
+    }
+
+    /// List exact repository label metadata for initialization verification.
+    pub fn repository_label_definitions(
+        &self,
+        repository: &RepositoryId,
+    ) -> Result<Vec<RepositoryLabel>, MutationError> {
+        self.json(repository_labels_command(repository))
+    }
+
+    /// Return the authenticated actor's repository permission.
+    pub fn repository_permission(
+        &self,
+        repository: &RepositoryId,
+    ) -> Result<String, MutationError> {
+        let permission: RepositoryPermissionJson =
+            self.json(repository_permission_command(repository))?;
+        Ok(permission.viewer_permission)
+    }
+
+    /// Create one repository label. Callers must re-read exact metadata after
+    /// this command because provider timeout and concurrent creation are
+    /// intentionally treated as indeterminate.
+    pub fn create_repository_label(
+        &self,
+        repository: &RepositoryId,
+        name: &str,
+        color: &str,
+        description: &str,
+    ) -> Result<(), MutationError> {
+        self.checked(create_repository_label_command(
+            repository,
+            name,
+            color,
+            description,
+        ))?;
+        Ok(())
     }
 
     /// Refetch one PR by number without applying policy.
@@ -1083,6 +1155,17 @@ fn branch_settings_command(repository: &RepositoryId, branch: &str) -> CommandSp
     ])
 }
 
+fn branch_protection_command(repository: &RepositoryId, branch: &str) -> CommandSpec {
+    CommandSpec::new("gh").args([
+        "api".to_owned(),
+        format!(
+            "repos/{}/branches/{}/protection",
+            repository.slug(),
+            encode_path_segment(branch)
+        ),
+    ])
+}
+
 fn repository_settings_command(repository: &RepositoryId) -> CommandSpec {
     CommandSpec::new("gh").args(["api".to_owned(), format!("repos/{}", repository.slug())])
 }
@@ -1096,7 +1179,26 @@ fn repository_labels_command(repository: &RepositoryId) -> CommandSpec {
         "--limit".to_owned(),
         "1000".to_owned(),
         "--json".to_owned(),
-        "name".to_owned(),
+        "name,color,description".to_owned(),
+    ])
+}
+
+fn create_repository_label_command(
+    repository: &RepositoryId,
+    name: &str,
+    color: &str,
+    description: &str,
+) -> CommandSpec {
+    CommandSpec::new("gh").args([
+        "label".to_owned(),
+        "create".to_owned(),
+        name.to_owned(),
+        "--repo".to_owned(),
+        repository.slug(),
+        "--color".to_owned(),
+        color.to_owned(),
+        "--description".to_owned(),
+        description.to_owned(),
     ])
 }
 
@@ -1203,6 +1305,46 @@ struct GitObjectJson {
 #[derive(Debug, Deserialize)]
 struct BranchSettingsJson {
     protected: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DefaultBranchPolicy {
+    #[serde(default)]
+    pub required_status_checks: Vec<String>,
+    pub strict_status_checks: bool,
+    pub required_approving_review_count: u64,
+}
+
+impl DefaultBranchPolicy {
+    #[must_use]
+    pub fn ready(&self) -> bool {
+        !self.required_status_checks.is_empty() || self.required_approving_review_count > 0
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BranchProtectionJson {
+    required_status_checks: Option<RequiredStatusChecksJson>,
+    required_pull_request_reviews: Option<RequiredPullRequestReviewsJson>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RequiredStatusChecksJson {
+    #[serde(default)]
+    contexts: Vec<String>,
+    #[serde(default)]
+    checks: Vec<RequiredCheckJson>,
+    strict: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct RequiredCheckJson {
+    context: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RequiredPullRequestReviewsJson {
+    required_approving_review_count: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1404,6 +1546,16 @@ struct RepositoryOwnerJson {
 #[derive(Debug, Deserialize)]
 struct LabelJson {
     name: String,
+}
+
+/// Exact repository-label metadata used by initialization preconditions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepositoryLabel {
+    pub name: String,
+    #[serde(default)]
+    pub color: String,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2065,6 +2217,27 @@ mod tests {
                 && expected == CommitOid("old-main".to_owned())
                 && actual == CommitOid("new-main".to_owned())
         ));
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn default_branch_policy_preserves_required_check_and_review_evidence() {
+        let repository = repository();
+        let runner = FakeRunner::new(vec![(
+            branch_protection_command(&repository, "main"),
+            CommandOutput::success(
+                r#"{"required_status_checks":{"strict":false,"contexts":["Check & Lint"],"checks":[{"context":"Fast Tests (unit)","app_id":1}]},"required_pull_request_reviews":{"required_approving_review_count":2}}"#,
+            ),
+        )]);
+        let adapter = GitHubMutationAdapter::new(runner);
+        let policy = adapter.default_branch_policy(&repository, "main").unwrap();
+        assert_eq!(
+            policy.required_status_checks,
+            ["Check & Lint", "Fast Tests (unit)"]
+        );
+        assert!(!policy.strict_status_checks);
+        assert_eq!(policy.required_approving_review_count, 2);
+        assert!(policy.ready());
         adapter.runner.assert_exhausted();
     }
 

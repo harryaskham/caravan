@@ -58,7 +58,29 @@ A dangling base is reconciled when it belongs to a just-merged labelled predeces
 
 ## 5. Command contract
 
-All commands are non-interactive. Mutating commands perform a complete preflight before their first mutation, rediscover immediately before each GitHub mutation, and abort on stale preconditions.
+All commands are non-interactive.
+
+### Repository initialization
+
+- `cara init` is the only automatic first-use mutation surface.
+- When `.caravan/config.yaml` is absent it is created atomically with version-1
+  defaults. An existing valid file is preserved byte-for-byte; incompatible or
+  unreadable files are bounded errors and are never merged or overwritten.
+- Init preflights repository write capability, squash auto-merge support, and
+  default-branch protection with a required check or review policy. It creates
+  exactly `caravan` (`5319E7`, active member), `caravan-evicted` (`B60205`,
+  evicted member), and `caravan-force` (`D93F0B`, operator force exception),
+  with their canonical descriptions.
+- Exact existing labels no-op. The historical active-label definition
+  `1D76DB` / `Active member of a Caravan merge chain` is also compatible and
+  preserved byte-for-byte; receipts report its actual metadata. No other
+  variation is accepted. Unexpected metadata is operator-owned and is never
+  overwritten. Every create is followed by an exact re-read; concurrent
+  creation and indeterminate provider responses converge only when metadata is
+  exact.
+- Status and check are read-only and report initialization readiness and the
+  `cara init` continuation. Membership and sync fail before PR mutation while
+  initialization is incomplete. Mutating commands perform a complete preflight before their first mutation, rediscover immediately before each GitHub mutation, and abort on stale preconditions.
 
 ### Inspection
 
@@ -121,6 +143,7 @@ Splitting retargets the selected non-head to the default branch, making it a new
 ### Ecosystem surfaces
 
 - `cara help` — agent operating instructions and recovery examples.
+- `cara init` / MCP `init` — bounded explicit repository initialization with typed receipts.
 - `cara log [--limit N] [--kind KIND] [--pr N] [--since MS] [--until MS]` — bounded canonical event and hook-delivery journal snapshot.
 - `cara log -f` — foreground existing-tail-then-follow stream; signal-aware and CLI-only.
 - `cara mcp stdio` — expose typed command operations through `mcp-cli`.

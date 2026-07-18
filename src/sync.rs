@@ -321,6 +321,7 @@ fn sync_without_hooks(context: &AppContext, input: &SyncInput) -> Result<SyncOut
     let _lock = OperationLock::acquire(&context.repository_path, "sync")?;
     let timeout = std::time::Duration::from_secs(context.config.command_timeout_secs);
     let status = read::status(context)?;
+    crate::initialization::require_ready(&status.initialization)?;
     let provider = GitHubMutationAdapter::new(
         crate::command::ProcessRunner::in_directory(&context.repository_path).with_timeout(timeout),
     );
@@ -1699,6 +1700,7 @@ mod tests {
             current_branch: snapshot.current_branch,
             current_pr: snapshot.current_pr,
             healthy: analysis.healthy(),
+            initialization: crate::initialization::InitializationStatus::default(),
             analysis,
         }
     }

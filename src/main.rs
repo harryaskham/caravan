@@ -40,6 +40,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Explicitly initialize local config and verify/create repository resources.
+    Init,
     /// Discover the current PR, all caravans, invalid fragments, and decisions.
     Status,
     /// Read the bounded repository event journal, optionally following new records.
@@ -212,6 +214,7 @@ fn main() {
 
 fn run(cli: &Cli) -> Result<(), i32> {
     match &cli.command {
+        Command::Init => run_init(cli),
         Command::Status => run_status(cli),
         Command::Log(command) => run_log(cli, command),
         Command::Check(input) => run_check(cli, input),
@@ -344,6 +347,11 @@ fn render_journal_record(record: &caravan::journal::JournalRecord) -> String {
             delivery.stderr_bytes
         ),
     }
+}
+
+fn run_init(cli: &Cli) -> Result<(), i32> {
+    let context = load_context(cli)?;
+    emit_result(cli.json, caravan::initialization::init(&context))
 }
 
 fn run_status(cli: &Cli) -> Result<(), i32> {
@@ -585,6 +593,20 @@ fn render_status(output: &caravan::read::StatusOutput) -> String {
         text,
         "current: {} ({current})",
         output.current_branch.as_deref().unwrap_or("detached HEAD")
+    );
+    let _ = writeln!(
+        text,
+        "initialization: {}{}",
+        if output.initialization.ready {
+            "ready"
+        } else {
+            "not ready"
+        },
+        output
+            .initialization
+            .next
+            .as_ref()
+            .map_or_else(String::new, |next| format!(" — {next}"))
     );
     let _ = writeln!(text, "caravans: {}", output.analysis.fleet.caravans.len());
     for caravan in &output.analysis.fleet.caravans {
@@ -931,6 +953,7 @@ mod tests {
             current_branch: Some("feature".to_owned()),
             current_pr: None,
             healthy: true,
+            initialization: caravan::initialization::InitializationStatus::default(),
             analysis: caravan::graph::GraphAnalysis {
                 fleet: caravan::model::CaravanFleet {
                     repository,

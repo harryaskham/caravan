@@ -10,6 +10,7 @@ pub mod compatibility;
 pub mod github;
 pub mod graph;
 pub mod hooks;
+pub mod initialization;
 pub mod journal;
 pub mod loop_runner;
 pub mod membership;
@@ -42,7 +43,8 @@ pub const SPEC_PATH: &str = "SPEC.md";
 pub const AGENT_HELP: &str = r"Caravan is an agent-in-the-loop GitHub merge queue.
 
 Safe operating loop:
-1. Run `cara status` to discover caravans and decision points.
+1. Run `cara status`; if repository initialization is not ready, run the explicit
+   idempotent `cara init` command and reconcile any reported metadata mismatch.
 2. Use `cara check`, `new`, or `join` to validate a proposed queue change.
 3. Run `cara sync` (or `sync --all`) until it either converges or returns one
    typed decision point.
@@ -344,6 +346,11 @@ pub fn build_router() -> ToolRouter<AppContext> {
         "help",
         "Return concise agent instructions for operating Caravan and recovering from sync decision points.",
         |_context: &AppContext, _input: EmptyInput| Ok::<_, AppError>(help()),
+    );
+    router.add_typed_tool_with_output_schema(
+        "init",
+        "Explicitly create a missing version-1 config and required repository labels, then verify permissions, default-branch protection, and squash auto-merge policy. Existing compatible resources are never changed.",
+        |context: &AppContext, _input: EmptyInput| initialization::init(context),
     );
     router.add_typed_tool_with_output_schema(
         "log",
