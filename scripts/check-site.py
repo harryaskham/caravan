@@ -11,7 +11,7 @@ from urllib.parse import unquote, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 SITE = ROOT / "site"
 BASE = "/caravan/"
-REQUIRED_META = {"description", "og:title", "og:description", "og:image", "og:url"}
+REQUIRED_META = {"description", "og:title", "og:description", "og:image", "og:url", "twitter:card", "twitter:image"}
 
 
 class PageParser(HTMLParser):
@@ -94,6 +94,13 @@ def main() -> None:
         checked.add(path)
         if parts.fragment and path == index and parts.fragment not in ids:
             fail(f"broken fragment #{parts.fragment}")
+
+    social_card = SITE / "assets/og-caravan.png"
+    png = social_card.read_bytes() if social_card.is_file() else b""
+    if not png.startswith(b"\x89PNG\r\n\x1a\n"):
+        fail("social card is missing or is not a PNG")
+    if index.read_text(encoding="utf-8").count("https://a.skh.am/caravan/assets/og-caravan.png") != 2:
+        fail("Open Graph and Twitter metadata must reference the PNG social card")
 
     css = (SITE / "assets/styles.css").read_text(encoding="utf-8")
     if re.search(r"@import|url\(\s*['\"]?https?://", css, re.IGNORECASE):
