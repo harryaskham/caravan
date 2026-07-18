@@ -478,6 +478,13 @@ pub enum EventKind {
     ForceMergeCompleted,
 }
 
+impl std::fmt::Display for EventKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let encoded = serde_json::to_string(self).map_err(|_| std::fmt::Error)?;
+        formatter.write_str(encoded.trim_matches('"'))
+    }
+}
+
 /// Versioned metadata delivered to hooks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CaravanEvent {
@@ -597,10 +604,11 @@ mod tests {
     }
 
     #[test]
-    fn event_kind_serializes_to_config_key_spelling() {
+    fn event_kind_serializes_and_displays_with_canonical_spelling() {
         assert_eq!(
             serde_json::to_string(&EventKind::HeadAdvanced).unwrap(),
             "\"head_advanced\""
         );
+        assert_eq!(EventKind::CiFailed.to_string(), "ci_failed");
     }
 }

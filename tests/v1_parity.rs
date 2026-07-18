@@ -138,6 +138,7 @@ fn mcp_registry_covers_all_bounded_v1_operations_with_schemas() {
 
     for expected in [
         "help",
+        "log",
         "status",
         "check",
         "new",
@@ -166,6 +167,10 @@ fn mcp_registry_covers_all_bounded_v1_operations_with_schemas() {
     assert!(
         !names.contains("loop"),
         "unbounded loop must stay out of MCP"
+    );
+    assert!(
+        !names.contains("log_follow"),
+        "unbounded log follow must stay out of MCP"
     );
 
     for tool in &tools {

@@ -10,6 +10,7 @@ pub mod compatibility;
 pub mod github;
 pub mod graph;
 pub mod hooks;
+pub mod journal;
 pub mod loop_runner;
 pub mod membership;
 pub mod navigation;
@@ -343,6 +344,11 @@ pub fn build_router() -> ToolRouter<AppContext> {
         "help",
         "Return concise agent instructions for operating Caravan and recovering from sync decision points.",
         |_context: &AppContext, _input: EmptyInput| Ok::<_, AppError>(help()),
+    );
+    router.add_typed_tool_with_output_schema(
+        "log",
+        "Return a bounded, deterministically ordered snapshot of canonical events and secret-free hook delivery receipts. Follow mode is CLI-only.",
+        |context: &AppContext, input: journal::LogInput| journal::snapshot(context, &input),
     );
     router.add_typed_tool_with_output_schema(
         "status",

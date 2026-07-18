@@ -121,6 +121,8 @@ Splitting retargets the selected non-head to the default branch, making it a new
 ### Ecosystem surfaces
 
 - `cara help` — agent operating instructions and recovery examples.
+- `cara log [--limit N] [--kind KIND] [--pr N] [--since MS] [--until MS]` — bounded canonical event and hook-delivery journal snapshot.
+- `cara log -f` — foreground existing-tail-then-follow stream; signal-aware and CLI-only.
 - `cara mcp stdio` — expose typed command operations through `mcp-cli`.
 - `cara mcp tools` — print MCP tool metadata.
 - `cara self-update status|check|run` — `updatable-cli` release flow.
@@ -212,6 +214,12 @@ Hook events include:
 - `force_merge_completed`.
 
 A hook is a configured shell command. It receives one versioned metadata JSON object on stdin and non-secret context such as `CARA_EVENT`, repository, and PR numbers in environment variables. Hook metadata contains operation/event IDs suitable for external deduplication.
+Before hook delivery, every canonical secret-free event is durably appended with
+its exact IDs to a versioned journal under common Git metadata. Secret-free hook
+delivery status is appended afterward. Locked append/read, bounded rotation, and
+torn-final-record recovery make this an audit surface only; it is never queue
+state or cursor authority. Journal I/O errors report that completed provider
+mutations were not rolled back.
 
 Hooks may coordinate arbitrarily complex external workflows. Caravan does not wait for an agent protocol or hold a distributed lock. A decision-point sync always stops after firing its hook. A coordinator that outlives the hook process must own an external lock/dedupe record; repeated ticks may invoke the hook again, and the hook must no-op while that coordination is active.
 
@@ -244,7 +252,7 @@ Multi-step remote mutations are not atomic. Errors report completed steps. The g
 
 ## 11. MCP contract
 
-The CLI and MCP tools share typed inputs, outputs, and domain errors. MCP exposes bounded single operations (`status`, `check`, `new`, `join`, `sync`, `evict`, and peers), not the unbounded `loop` process. An agent implements a long-lived loop by scheduling repeated `sync --all` calls or by running `cara loop` externally.
+The CLI and MCP tools share typed inputs, outputs, and domain errors. MCP exposes bounded single operations (`status`, `log`, `check`, `new`, `join`, `sync`, `evict`, and peers), not the unbounded `loop` or `log --follow` processes. An agent implements a long-lived loop by scheduling repeated `sync --all` calls or by running `cara loop` externally.
 
 Tool descriptions must explain preconditions, side effects, decision-point behavior, and safe recovery. Self-update and feedback registrars are included in the same router.
 
