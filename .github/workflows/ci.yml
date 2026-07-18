@@ -24,21 +24,14 @@ jobs:
         run: |
           git config --global --unset-all url."ssh://git@github.com/".insteadOf 2>/dev/null || true
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Format
-        run: cargo fmt --all --check
-
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
-
-      - name: Test
-        run: cargo test --all
-
-      - name: Agent surface smoke
+      - name: Run pinned format, lint, test, and agent-surface gates
+        shell: bash
         run: |
-          cargo run -- help
-          cargo run -- mcp tools >/dev/null
+          nix develop --command bash -lc '
+            set -euo pipefail
+            cargo fmt --all --check
+            cargo clippy --all-targets -- -D warnings
+            cargo test --all
+            cargo run -- help
+            cargo run -- mcp tools >/dev/null
+          '
