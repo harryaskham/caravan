@@ -1,5 +1,7 @@
 version: 1
 force_merge: false
+# Explicit opt-in: rewrites owned PR branches under exact force-with-lease.
+rebase_on_join: false
 # Highest to lowest; ties and unlabelled attempts use immutable PR createdAt FIFO.
 agent_priority_labels:
   - caravan-priority:high

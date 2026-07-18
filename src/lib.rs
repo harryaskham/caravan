@@ -17,6 +17,7 @@ pub mod membership;
 pub mod navigation;
 pub mod operation_lock;
 pub mod pause;
+pub mod physical_rebase;
 pub mod read;
 pub mod reshape;
 pub mod sync;

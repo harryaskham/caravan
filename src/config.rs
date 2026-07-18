@@ -113,6 +113,9 @@ impl Default for HookConfig {
 pub struct CaravanConfig {
     pub version: u32,
     pub force_merge: bool,
+    /// Explicitly authorize lease-protected history rewriting so PR ancestry
+    /// physically follows the Caravan chain. Safe default is disabled.
+    pub rebase_on_join: bool,
     /// GitHub labels in highest-to-lowest automatic-admission priority order.
     /// Candidates without one of these labels follow all explicitly prioritized
     /// candidates. Labels in the `caravan-priority:` namespace which are not
@@ -131,6 +134,7 @@ impl Default for CaravanConfig {
         Self {
             version: config_version(),
             force_merge: false,
+            rebase_on_join: false,
             agent_priority_labels: default_agent_priority_labels(),
             command_timeout_secs: default_command_timeout_secs(),
             loop_config: LoopConfig::default(),
@@ -360,6 +364,7 @@ mod tests {
         let config = CaravanConfig::parse("{}\n").expect("defaults parse");
         assert_eq!(config.version, 1);
         assert!(!config.force_merge);
+        assert!(!config.rebase_on_join);
         assert_eq!(
             config.agent_priority_labels,
             vec![
@@ -379,6 +384,7 @@ mod tests {
             r"
 version: 1
 force_merge: true
+rebase_on_join: true
 command_timeout_secs: 45
 loop:
   interval_secs: 10
@@ -391,6 +397,7 @@ hooks:
         )
         .expect("example config");
         assert!(config.force_merge);
+        assert!(config.rebase_on_join);
         assert_eq!(config.command_timeout_secs, 45);
         let hook = config.hook(EventKind::SyncFailed).expect("hook");
         assert_eq!(hook.command, "./scripts/on-sync-failed");

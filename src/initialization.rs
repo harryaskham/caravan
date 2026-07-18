@@ -63,7 +63,7 @@ pub fn required_labels(priority_labels: &[String]) -> Vec<RequiredLabel> {
 const LEGACY_ACTIVE_COLOR: &str = "1D76DB";
 const LEGACY_ACTIVE_DESCRIPTION: &str = "Active member of a Caravan merge chain";
 
-const DEFAULT_CONFIG: &str = "version: 1\nforce_merge: false\nagent_priority_labels:\n  - caravan-priority:high\n  - caravan-priority:normal\n  - caravan-priority:low\ncommand_timeout_secs: 30\nloop:\n  interval_secs: 60\njournal:\n  max_bytes: 8388608\n  max_archives: 3\nhooks: {}\n";
+const DEFAULT_CONFIG: &str = "version: 1\nforce_merge: false\nrebase_on_join: false\nagent_priority_labels:\n  - caravan-priority:high\n  - caravan-priority:normal\n  - caravan-priority:low\ncommand_timeout_secs: 30\nloop:\n  interval_secs: 60\njournal:\n  max_bytes: 8388608\n  max_archives: 3\nhooks: {}\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]

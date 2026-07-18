@@ -283,6 +283,7 @@ Minimal config shape:
 ```yaml
 version: 1
 force_merge: false
+rebase_on_join: false
 agent_priority_labels:
   - caravan-priority:high
   - caravan-priority:normal
@@ -298,6 +299,33 @@ hooks:
 ```
 
 Unknown config fields are errors. Secrets belong in environment variables, not committed YAML or hook metadata.
+
+`rebase_on_join` is a strict, explicit history-rewrite opt-in and defaults to
+`false`, preserving the virtual compatibility contract above. When enabled,
+membership rebases the candidate-only linear range from its exact old base onto
+the exact selected predecessor (or default for a new head) in an isolated
+temporary worktree. Exact remote OIDs, same-repository ownership, a clean linear
+range, conflict-free simulation, push permission, and the old head lease are
+proved before `git push --force-with-lease=refs/heads/<branch>:<old-oid>`.
+A moved branch, merge commit, ambiguous range, or conflict is a typed resumable
+decision and is never forced. The command rediscovers GitHub after a push and
+returns old/new OID and tree evidence together with provider receipts.
+
+Provider CI configuration remains a repository precondition. GitHub Actions
+`pull_request.branches` filters apply to the PR base: a workflow restricted to
+the default branch will not run on a child targeting its parent. Cumulative mode requires a global `pull_request` trigger without `branches` or
+`branches-ignore`, with `opened`, `synchronize`, `reopened`, `edited`, and
+`labeled` activity types. A stack/full job may gate on default base or the
+`caravan` label. `labeled` closes the race where `edited` occurs before the
+membership label mutation. Missing trigger evidence is
+`rebase_ci_trigger_missing`; an empty downstream check set is never passing.
+Ancestry rewriting alone cannot cause checks to run.
+
+Cumulative tree proof does not imply stable provider check identity. With the
+current squash-merge heads, retargeting a child after its parent lands may
+change GitHub's merge ref and rerun CI. Caravan does not claim instant no-rerun
+landing without ancestry-preserving merges or an audited exact-tree/check
+receipt policy.
 
 ## 10. Concurrency and idempotency
 
@@ -318,7 +346,7 @@ Tool descriptions must explain preconditions, side effects, decision-point behav
 Caravan v1 does not:
 
 - prove semantic compatibility;
-- rewrite branch history merely to maintain a chain;
+- rewrite branch history merely to maintain a chain unless the repository explicitly enables `rebase_on_join`;
 - host or spawn a specific agent runtime;
 - maintain a second authoritative queue database;
 - provide a distributed consensus lock;

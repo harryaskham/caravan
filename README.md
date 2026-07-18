@@ -142,11 +142,15 @@ nor fetch Git dependencies at build time.
 
 ## Configuration
 
-Repository policy and hooks will live at `.caravan/config.yaml`:
+Repository policy and hooks live at `.caravan/config.yaml`. The optional
+`rebase_on_join: true` mode physically rebases each owned PR's candidate-only,
+linear commit range onto its exact predecessor under an exact force-with-lease;
+it is disabled by default and never mutates the caller's worktree:
 
 ```yaml
 version: 1
 force_merge: false
+rebase_on_join: false
 command_timeout_secs: 30
 loop:
   interval_secs: 60
@@ -159,6 +163,33 @@ hooks:
     timeout_secs: 30
     blocking: false
 ```
+
+Cumulative mode rejects fork heads, stale leases, empty/ambiguous ranges, and
+candidate-only merge commits. It fetches exact remote OIDs, simulates the whole
+rebase in a disposable detached worktree, performs a dry-run permission/lease
+preflight, and pushes only with
+`--force-with-lease=refs/heads/<branch>:<old-oid>`. Errors are resumable and do
+not speculatively push a conflicted range. Successful membership output includes
+old/new head and base OIDs, the resulting tree, and the exact lease alongside
+GitHub mutation receipts.
+
+GitHub Actions must also be configured to run for non-default PR bases.
+`pull_request.branches` filters match the PR's base branch; a workflow restricted
+to `main` will not run for B targeting A. Cumulative mode therefore requires a global `pull_request` trigger with no
+`branches` or `branches-ignore` filter and activity types `opened`,
+`synchronize`, `reopened`, `edited`, and `labeled` (usually also `unlabeled`). A
+dedicated stack/full job can then skip unless `base_ref == 'main'` or the PR has
+the `caravan` label. The `labeled` event closes the race where the base-edit
+`edited` event occurs before Caravan adds its label. Physical ancestry cannot
+override provider workflow filters; opt-in membership fails with
+`rebase_ci_trigger_missing` when this trigger proof is absent.
+
+This proves cumulative *tree content*, not stable GitHub check identity. Because
+Caravan heads currently squash-merge, retargeting a child after its parent lands
+can change GitHub's merge ref and trigger CI again even when that cumulative tree
+was already tested. Instant no-rerun landing requires an ancestry-preserving
+merge mode or an audited exact-tree/check receipt policy, neither of which is
+currently implemented.
 
 `command_timeout_secs` is both the hard ceiling for each `git` or `gh` child
 and the complete operator-safe budget for `cara status` (30 seconds by

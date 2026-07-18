@@ -2,6 +2,7 @@ use std::process::{Command, Output};
 
 fn cara(arguments: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_cara"))
+        .env("CACOPHONY_FEEDBACK_TOKEN", "cli-exit-test-token")
         .args(arguments)
         .output()
         .expect("run cara test binary")
@@ -9,6 +10,7 @@ fn cara(arguments: &[&str]) -> Output {
 
 fn cara_in(directory: &std::path::Path, arguments: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_cara"))
+        .env("CACOPHONY_FEEDBACK_TOKEN", "cli-exit-test-token")
         .current_dir(directory)
         .args(arguments)
         .output()

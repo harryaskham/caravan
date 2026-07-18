@@ -76,6 +76,9 @@ pub struct MembershipRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct MembershipOutput {
     pub receipt: OperationReceipt,
+    /// Exact old/new OIDs for the optional physical ancestry rewrite.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebase_receipt: Option<crate::physical_rebase::RebaseReceipt>,
     /// Exact provider before/after facts for every completed remote mutation.
     #[serde(default)]
     pub provider_receipts: Vec<GitHubMutationReceipt>,
@@ -302,13 +305,14 @@ pub fn rejoin(context: &AppContext, input: &JoinInput) -> Result<MembershipOutpu
     )
 }
 
+#[allow(clippy::too_many_lines)]
 fn execute_live(
     context: &AppContext,
     request: &MembershipRequest,
 ) -> Result<MembershipOutput, AppError> {
     let _lock = OperationLock::acquire(&context.repository_path, request.operation.name())?;
     let timeout = std::time::Duration::from_secs(context.config.command_timeout_secs);
-    let status = read::status(context)?;
+    let mut status = read::status(context)?;
     let checker =
         GitCompatibilityChecker::new(&context.repository_path, "origin").with_timeout(timeout);
     let provider = GitHubMutationAdapter::new(
@@ -316,7 +320,113 @@ fn execute_live(
     );
     let repository = status.repository.clone();
     let failure_status = status.clone();
-    let mut output = match execute(status, &checker, &provider, request.clone()) {
+    let rebase_receipt = if context.config.rebase_on_join {
+        if request.create_pr && status.current_pr.is_none() {
+            return Err(AppError::validation(
+                "rebase_requires_existing_pr",
+                "rebase_on_join requires an existing discovered PR so no provider write precedes the complete rewrite preflight",
+            ));
+        }
+        let number = status.current_pr.ok_or_else(|| {
+            AppError::validation(
+                "current_pr_not_found",
+                "rebase_on_join requires the current branch to have an open PR",
+            )
+        })?;
+        let candidate = status
+            .analysis
+            .pull_requests
+            .get(&number)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::validation(
+                    "current_pr_missing_from_snapshot",
+                    "current PR was not included in discovery",
+                )
+            })?;
+        if request
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.trim().is_empty())
+            || (request.tail_pr.is_some() && request.head_pr.is_some())
+        {
+            return Err(AppError::validation(
+                "rebase_membership_input_invalid",
+                "membership input must pass complete validation before a branch rewrite",
+            ));
+        }
+        if request.priority_label.as_deref().is_some_and(|label| {
+            !request
+                .agent_priority_labels
+                .iter()
+                .any(|configured| configured == label.trim())
+        }) {
+            return Err(AppError::validation(
+                "priority_label_not_configured",
+                "priority label is not an exact configured agent_priority_labels entry",
+            ));
+        }
+        let join_target = request
+            .operation
+            .is_join()
+            .then(|| resolve_join_target(&status, request))
+            .transpose()?;
+        let desired_base = join_target.as_ref().map_or_else(
+            || status.default_branch.clone(),
+            |target| target.tail.head.name.clone(),
+        );
+        let preflight_state = ExecutionState::new(request.operation);
+        crate::initialization::require_ready(&status.initialization)?;
+        preflight_repository(
+            &provider,
+            &status.repository,
+            &status.default_branch,
+            request.operation,
+            &request.agent_priority_labels,
+            &preflight_state,
+        )?;
+        validate_operation_shape(&candidate, request, &desired_base)?;
+        preflight_eligibility(&status, &candidate, request, join_target.as_ref(), &checker)?;
+        let target = join_target.map_or_else(
+            || status.analysis.fleet.default_branch.clone(),
+            |target| target.tail.head,
+        );
+        let receipt = crate::physical_rebase::rewrite_candidate(
+            &context.repository_path,
+            &repository,
+            &candidate,
+            &target,
+            &status.analysis.fleet.default_branch,
+            timeout,
+        )?;
+        // GitHub is authoritative after a push. Never apply base/label changes
+        // against the stale pre-rewrite PR snapshot.
+        status = read::status(context)?;
+        let observed = status.analysis.pull_requests.get(&number).ok_or_else(|| {
+            AppError::structured(
+                ErrorCategory::ExecutionFailure,
+                "rebase_rediscovery_failed",
+                "rewritten PR was absent from post-push discovery",
+                Some(json!({"rebase_receipt": receipt, "resumable": true})),
+            )
+        })?;
+        if observed.head.oid != receipt.new_head_oid {
+            return Err(AppError::structured(
+                ErrorCategory::Validation,
+                "rebase_rediscovery_stale",
+                "provider did not report the exact pushed head after rewrite",
+                Some(
+                    json!({"rebase_receipt": receipt, "observed_oid": observed.head.oid, "resumable": true}),
+                ),
+            ));
+        }
+        Some(receipt)
+    } else {
+        None
+    };
+    let execution = execute(status, &checker, &provider, request.clone())
+        .map_err(|error| attach_rebase_receipt(error, rebase_receipt.as_ref()));
+    let mut output = match execution {
         Ok(output) => output,
         Err(error) if request.operation.is_join() => {
             let event = join_failed_event(&failure_status, request, &error);
@@ -341,9 +451,34 @@ fn execute_live(
         None,
         BTreeMap::from([("receipt".to_owned(), json!(output.receipt))]),
     );
+    output.rebase_receipt = rebase_receipt;
     output.events.push(event);
     output.hook_deliveries = hooks::dispatch_events(context, &output.events)?;
     Ok(output)
+}
+
+fn attach_rebase_receipt(
+    error: AppError,
+    receipt: Option<&crate::physical_rebase::RebaseReceipt>,
+) -> AppError {
+    let Some(receipt) = receipt else {
+        return error;
+    };
+    let mut details = error.details().unwrap_or_else(|| json!({}));
+    if let Some(object) = details.as_object_mut() {
+        object.insert("rebase_receipt".to_owned(), json!(receipt));
+        object.insert("resumable".to_owned(), json!(true));
+        object.insert(
+            "next".to_owned(),
+            json!("rediscover provider state and rerun the same idempotent membership command"),
+        );
+    }
+    AppError::structured(
+        error.category(),
+        error.code(),
+        error.message(),
+        Some(details),
+    )
 }
 
 fn join_failed_event(
@@ -545,6 +680,7 @@ fn execute(
         .map_or(pull_request.number, |target| target.caravan.id);
     Ok(MembershipOutput {
         receipt,
+        rebase_receipt: None,
         provider_receipts: state.provider_receipts,
         pull_request,
         caravan_id,
