@@ -746,6 +746,7 @@ mod tests {
             previous_default_oid: None,
             default_branch_movements: Vec::new(),
             repository: repository(),
+            rebase_on_join: crate::read::RebaseOnJoinStatus::default(),
             default_branch: "main".to_owned(),
             current_branch: Some("pr-1".to_owned()),
             current_pr: Some(PrNumber(1)),

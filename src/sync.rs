@@ -1595,17 +1595,30 @@ fn decision_for_problem(
         ),
     );
     evidence.insert("events".to_owned(), json!(progress.events));
+    evidence.insert("rebase_on_join".to_owned(), json!(status.rebase_on_join));
+    let message = if matches!(
+        kind,
+        DecisionKind::HeadConflict | DecisionKind::LinkConflict
+    ) && !status.rebase_on_join.enabled
+    {
+        format!(
+            "{}; rebase_on_join=disabled, so Cara will not rewrite the affected branch",
+            problem.message
+        )
+    } else {
+        problem.message.clone()
+    };
     DecisionPoint {
         kind,
         operation_id: progress.operation_id.clone(),
         repository: status.repository.clone(),
         caravan_id,
         affected_prs: problem.prs.clone(),
-        message: problem.message.clone(),
+        message,
         evidence,
         completed_steps: progress.steps.clone(),
         resumable: true,
-        suggested_actions: suggested_actions(kind, problem),
+        suggested_actions: suggested_actions(kind, problem, &status.rebase_on_join),
     }
 }
 
@@ -1621,10 +1634,27 @@ fn is_adjacent_pair(status: &StatusOutput, prs: &[PrNumber]) -> bool {
     })
 }
 
-fn suggested_actions(kind: DecisionKind, problem: &GraphProblem) -> Vec<String> {
+fn suggested_actions(
+    kind: DecisionKind,
+    problem: &GraphProblem,
+    rebase: &crate::read::RebaseOnJoinStatus,
+) -> Vec<String> {
     match kind {
+        DecisionKind::HeadConflict | DecisionKind::LinkConflict if !rebase.enabled => vec![
+            rebase.required_action.clone().unwrap_or_else(|| {
+                "set `rebase_on_join: true` in .caravan/config.yaml".to_owned()
+            }),
+            "after committing the config change, run `cara check` and then rerun `cara sync --all`"
+                .to_owned(),
+            problem.prs.last().map_or_else(
+                || "inspect `cara status --json` before reshaping".to_owned(),
+                |number| {
+                    format!("if rewriting is not acceptable, run `cara evict --pr {number} --reason <text>` or split the chain")
+                },
+            ),
+        ],
         DecisionKind::HeadConflict | DecisionKind::LinkConflict => vec![
-            "check out the affected PR, repair and push its exact head, then rerun `cara sync`"
+            "inspect the exact rebase preflight conflict and repair the affected PR before rerunning `cara sync --all`"
                 .to_owned(),
             problem.prs.last().map_or_else(
                 || "inspect `cara status --json` before reshaping".to_owned(),
@@ -2569,6 +2599,7 @@ mod tests {
             default_branch_movements: Vec::new(),
             timing: None,
             repository: repository(),
+            rebase_on_join: crate::read::RebaseOnJoinStatus::default(),
             default_branch: "main".to_owned(),
             current_branch: snapshot.current_branch,
             current_pr: snapshot.current_pr,
@@ -3488,6 +3519,23 @@ mod tests {
         let error = execute(&status, &provider, false, false, false).expect_err("link decides");
 
         assert_eq!(mcp_cli::StructuredError::code(&error), "link_conflict");
+        let details = error.details().expect("decision details");
+        assert_eq!(
+            details["decision"]["evidence"]["rebase_on_join"]["state"],
+            "disabled"
+        );
+        assert!(
+            details["decision"]["message"]
+                .as_str()
+                .expect("message")
+                .contains("rebase_on_join=disabled")
+        );
+        assert!(
+            details["decision"]["suggested_actions"][0]
+                .as_str()
+                .expect("action")
+                .contains("rebase_on_join: true")
+        );
         assert!(provider.calls.borrow().is_empty());
     }
 

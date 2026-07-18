@@ -16,6 +16,49 @@ use crate::model::{
 };
 use crate::{AppContext, AppError, CheckInput};
 
+/// Explicit repository policy and rollout action for physical chain rebuilding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RebaseOnJoinStatus {
+    pub enabled: bool,
+    pub state: String,
+    pub config_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_action: Option<String>,
+}
+
+impl Default for RebaseOnJoinStatus {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            state: "disabled".to_owned(),
+            config_path: crate::config::DEFAULT_CONFIG_PATH.to_owned(),
+            required_action: Some(format!(
+                "set `rebase_on_join: true` in {} after canary review",
+                crate::config::DEFAULT_CONFIG_PATH
+            )),
+        }
+    }
+}
+
+fn rebase_on_join_status(context: &AppContext) -> RebaseOnJoinStatus {
+    let config_path = context.config_path.display().to_string();
+    RebaseOnJoinStatus {
+        enabled: context.config.rebase_on_join,
+        state: if context.config.rebase_on_join {
+            "enabled"
+        } else {
+            "disabled"
+        }
+        .to_owned(),
+        required_action: (!context.config.rebase_on_join).then(|| {
+            format!(
+                "set `rebase_on_join: true` in {config_path}, commit it, then run `cara check` and `cara sync --all`"
+            )
+        }),
+        config_path,
+    }
+}
+
 /// Repository-wide live Caravan status.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct StatusOutput {
@@ -32,6 +75,9 @@ pub struct StatusOutput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timing: Option<StatusTiming>,
     pub repository: RepositoryId,
+    /// Explicitly reports enabled/disabled physical chain-rebuild policy.
+    #[serde(default)]
+    pub rebase_on_join: RebaseOnJoinStatus,
     pub default_branch: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_branch: Option<String>,
@@ -138,6 +184,8 @@ pub enum CheckMode {
 /// Successful read-only eligibility/health result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CheckOutput {
+    #[serde(default)]
+    pub rebase_on_join: RebaseOnJoinStatus,
     pub mode: CheckMode,
     pub current_pr: PrNumber,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -255,6 +303,7 @@ pub(crate) fn status_with_deadline(
         default_branch_movements: snapshot.default_branch_movements,
         timing: None,
         repository: snapshot.repository,
+        rebase_on_join: rebase_on_join_status(context),
         default_branch: snapshot.default_branch.name,
         current_branch: snapshot.current_branch,
         current_pr: snapshot.current_pr,
@@ -568,6 +617,7 @@ pub fn check_analysis(
             ));
         }
         let output = CheckOutput {
+            rebase_on_join: status.rebase_on_join.clone(),
             mode: CheckMode::ActiveCaravan,
             current_pr,
             caravan_id: Some(caravan.id),
@@ -588,6 +638,7 @@ pub fn check_analysis(
     if !explicit_join {
         check_new(status, pull_request, checker, &mut reports, &mut problems)?;
         return eligible_or_error(CheckOutput {
+            rebase_on_join: status.rebase_on_join.clone(),
             mode: CheckMode::NewCaravan,
             current_pr,
             caravan_id: Some(current_pr),
@@ -633,6 +684,7 @@ pub fn check_analysis(
     }
 
     eligible_or_error(CheckOutput {
+        rebase_on_join: status.rebase_on_join.clone(),
         mode: CheckMode::JoinTail,
         current_pr,
         caravan_id: Some(target_caravan.id),
@@ -1000,6 +1052,7 @@ mod tests {
             default_branch_movements: Vec::new(),
             timing: None,
             repository: repository(),
+            rebase_on_join: RebaseOnJoinStatus::default(),
             default_branch: "main".to_owned(),
             current_branch: snapshot.current_branch,
             current_pr: snapshot.current_pr,

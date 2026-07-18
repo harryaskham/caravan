@@ -831,6 +831,7 @@ fn preflight_eligibility(
             ));
         }
         return Ok(CheckOutput {
+            rebase_on_join: status.rebase_on_join.clone(),
             mode: if request.operation.is_join() {
                 read::CheckMode::JoinTail
             } else {
@@ -1513,6 +1514,7 @@ mod tests {
             default_branch_movements: Vec::new(),
             timing: None,
             repository: repository(),
+            rebase_on_join: crate::read::RebaseOnJoinStatus::default(),
             default_branch: "main".to_owned(),
             current_branch: snapshot.current_branch,
             current_pr: snapshot.current_pr,

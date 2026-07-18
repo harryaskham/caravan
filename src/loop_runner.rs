@@ -224,6 +224,7 @@ mod tests {
                     default_branch_movements: Vec::new(),
                     timing: None,
                     repository: repository.clone(),
+                    rebase_on_join: crate::read::RebaseOnJoinStatus::default(),
                     default_branch: "main".to_owned(),
                     current_branch: None,
                     current_pr: None,

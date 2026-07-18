@@ -721,6 +721,10 @@ fn render_status(output: &caravan::read::StatusOutput) -> String {
             .as_ref()
             .map_or_else(String::new, |next| format!(" — {next}"))
     );
+    let _ = writeln!(text, "rebase_on_join={}", output.rebase_on_join.state);
+    if let Some(action) = &output.rebase_on_join.required_action {
+        let _ = writeln!(text, "  action: {action}");
+    }
     let _ = writeln!(text, "caravans: {}", output.analysis.fleet.caravans.len());
     if let Some(previous) = &output.previous_default_oid {
         let _ = writeln!(text, "previous observed default: {previous}");
@@ -893,6 +897,10 @@ fn render_check(output: &caravan::read::CheckOutput) -> String {
         let _ = write!(text, " after #{target}");
     }
     text.push('\n');
+    let _ = writeln!(text, "rebase_on_join={}", output.rebase_on_join.state);
+    if let Some(action) = &output.rebase_on_join.required_action {
+        let _ = writeln!(text, "  action: {action}");
+    }
     for report in &output.compatibility {
         let _ = writeln!(
             text,
@@ -1171,6 +1179,7 @@ mod tests {
             default_branch_movements: Vec::new(),
             timing: None,
             repository: repository.clone(),
+            rebase_on_join: caravan::read::RebaseOnJoinStatus::default(),
             default_branch: "main".to_owned(),
             current_branch: Some("feature".to_owned()),
             current_pr: None,
@@ -1199,6 +1208,8 @@ mod tests {
         let rendered = render_status(&output);
         assert!(rendered.contains("harryaskham/caravan @ main — healthy"));
         assert!(rendered.contains("current: feature (no open PR)"));
+        assert!(rendered.contains("rebase_on_join=disabled"));
+        assert!(rendered.contains("set `rebase_on_join: true`"));
         assert!(!rendered.contains("\"analysis\""));
     }
 }

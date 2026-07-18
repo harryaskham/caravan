@@ -749,6 +749,7 @@ mod tests {
             default_branch_movements: Vec::new(),
             timing: None,
             repository: repository(),
+            rebase_on_join: crate::read::RebaseOnJoinStatus::default(),
             default_branch: "main".to_owned(),
             current_branch: Some(format!("pr-{current}")),
             current_pr: Some(PrNumber(current)),
