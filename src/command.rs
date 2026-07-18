@@ -622,8 +622,13 @@ mod tests {
     #[test]
     fn hanging_child_is_terminated_reaped_and_reported_with_evidence() {
         let started = Instant::now();
+        // Leave enough startup budget for the child to be scheduled even when
+        // the full Nix suite is running in parallel. The assertion below is
+        // about preserving bytes emitted before termination, not about proving
+        // that a fresh shell can always start within 100 ms on a loaded host.
+        let timeout = Duration::from_secs(1);
         let error = ProcessRunner::new()
-            .with_timeout(Duration::from_millis(100))
+            .with_timeout(timeout)
             .run(
                 &CommandSpec::new("sh")
                     .args(["-c", "printf started; printf diagnostic >&2; sleep 30"]),
@@ -641,7 +646,7 @@ mod tests {
             panic!("expected timeout error");
         };
         assert_eq!(command.program, "sh");
-        assert_eq!(timeout_ms, 100);
+        assert_eq!(timeout_ms, duration_millis(timeout));
         assert_eq!(stdout, "started");
         assert!(
             stderr.starts_with("diagnostic"),
