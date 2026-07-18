@@ -1147,21 +1147,24 @@ fn classify_workflow_failure(
 
     let failed_lineage_step = diagnostic.failed_jobs.iter().any(|job| {
         job.failed_steps.iter().any(|step| {
-            step.name
-                .to_ascii_lowercase()
-                .contains("verify exact ci ref lineage")
+            let name = step.name.to_ascii_lowercase();
+            name.contains("lineage") || name.contains("selected ref")
         })
     });
+    let lineage_receipt_present =
+        apply_selected_lineage_receipt(&diagnostic, &mut generation, &mut reasons);
     let (classification, action) = if generation != WorkflowRunGeneration::Current {
         (
             WorkflowFailureClass::StaleGeneration,
             WorkflowFailureAction::FreshCandidateTrigger,
         )
-    } else if candidate_lineage_unknown && failed_lineage_step {
-        reasons.push(
-            "lineage verification failed while current candidate identity is unavailable"
-                .to_owned(),
-        );
+    } else if failed_lineage_step && !lineage_receipt_present {
+        let cause = if candidate_lineage_unknown {
+            "current candidate identity and bounded lineage receipt are unavailable"
+        } else {
+            "bounded lineage receipt is unavailable"
+        };
+        reasons.push(format!("lineage verification failed while {cause}"));
         (
             WorkflowFailureClass::Unknown,
             WorkflowFailureAction::FreshCandidateTrigger,
@@ -1198,6 +1201,44 @@ fn classify_workflow_failure(
         action,
         reasons,
     }
+}
+
+fn apply_selected_lineage_receipt(
+    diagnostic: &WorkflowRunFailureDiagnostic,
+    generation: &mut WorkflowRunGeneration,
+    reasons: &mut Vec<String>,
+) -> bool {
+    let Some(receipt) = diagnostic
+        .failed_jobs
+        .iter()
+        .find_map(|job| job.selected_lineage.as_ref())
+    else {
+        return false;
+    };
+    let stale_base = receipt.parents.first() != Some(&diagnostic.expected_base_oid)
+        || receipt.expected_base != diagnostic.expected_base_oid;
+    let stale_head = receipt.parents.get(1) != Some(&diagnostic.expected_head_oid)
+        || receipt.expected_head != diagnostic.expected_head_oid;
+    if stale_base || stale_head {
+        *generation = match (stale_head, stale_base) {
+            (true, true) => WorkflowRunGeneration::StaleHeadAndBase,
+            (true, false) => WorkflowRunGeneration::StaleHead,
+            (false, true) => WorkflowRunGeneration::StaleBase,
+            (false, false) => WorkflowRunGeneration::Current,
+        };
+    }
+    reasons.push(format!(
+        "bounded lineage receipt selected ref {} commit {} with parents [{}]",
+        receipt.selected_ref,
+        receipt.selected_commit,
+        receipt
+            .parents
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    true
 }
 
 fn workflow_run_generation(
@@ -2079,6 +2120,7 @@ mod tests {
         failed_runs: RefCell<BTreeMap<PrNumber, Vec<WorkflowRunSnapshot>>>,
         diagnostic_heads: RefCell<BTreeMap<PrNumber, CommitOid>>,
         diagnostic_job_conclusions: RefCell<BTreeMap<PrNumber, String>>,
+        diagnostic_lineage: RefCell<BTreeMap<PrNumber, crate::ci::SelectedRefLineageReceipt>>,
         admin_permission: bool,
         branch_head: RefCell<crate::model::CommitOid>,
         audits: RefCell<Vec<ControlLabelAudit>>,
@@ -2100,6 +2142,7 @@ mod tests {
                 failed_runs: RefCell::new(BTreeMap::new()),
                 diagnostic_heads: RefCell::new(BTreeMap::new()),
                 diagnostic_job_conclusions: RefCell::new(BTreeMap::new()),
+                diagnostic_lineage: RefCell::new(BTreeMap::new()),
                 admin_permission: true,
                 branch_head: RefCell::new(branch("main").oid),
                 audits: RefCell::new(Vec::new()),
@@ -2302,6 +2345,20 @@ mod tests {
                                 runner_labels: Vec::new(),
                                 failed_steps: Vec::new(),
                                 steps_truncated: false,
+                                selected_lineage: self
+                                    .diagnostic_lineage
+                                    .borrow()
+                                    .get(&expected.number)
+                                    .cloned(),
+                                lineage_evidence_status: if self
+                                    .diagnostic_lineage
+                                    .borrow()
+                                    .contains_key(&expected.number)
+                                {
+                                    crate::ci::LineageEvidenceStatus::Parsed
+                                } else {
+                                    crate::ci::LineageEvidenceStatus::NotRequested
+                                },
                             }],
                             jobs_total: 1,
                             jobs_truncated: false,
@@ -2438,6 +2495,24 @@ mod tests {
             details_url: run_id.map(|id| {
                 format!("https://github.com/harryaskham/caravan/actions/runs/{id}/job/1")
             }),
+        }
+    }
+
+    fn selected_lineage_receipt(
+        pull_request: &PullRequestSnapshot,
+    ) -> crate::ci::SelectedRefLineageReceipt {
+        crate::ci::SelectedRefLineageReceipt {
+            event: "pull_request".to_owned(),
+            head_ref: pull_request.head.name.clone(),
+            selected_ref: "refs/pull/1/merge".to_owned(),
+            selected_commit: CommitOid("selected-merge".to_owned()),
+            actual_head: CommitOid("selected-merge".to_owned()),
+            expected_head: pull_request.head.oid.clone(),
+            expected_base: pull_request.base.oid.clone(),
+            parents: vec![
+                pull_request.base.oid.clone(),
+                CommitOid("prior-head".to_owned()),
+            ],
         }
     }
 
@@ -2594,9 +2669,9 @@ mod tests {
             .borrow_mut()
             .insert(PrNumber(1), vec![matching]);
         provider
-            .diagnostic_heads
+            .diagnostic_lineage
             .borrow_mut()
-            .insert(PrNumber(1), CommitOid("prior-head".to_owned()));
+            .insert(PrNumber(1), selected_lineage_receipt(&pulls[0]));
         let status = status(pulls, Some(PrNumber(1)), &clean);
 
         let error = execute(&status, &provider, false, true, false)
@@ -2607,6 +2682,10 @@ mod tests {
         let ci = &details["decision"]["evidence"]["ci"];
         assert_eq!(ci["rerunnable_run_ids"], json!([]));
         assert_eq!(ci["failure_diagnostics"][0]["generation"], "stale_head");
+        assert_eq!(
+            ci["failure_diagnostics"][0]["diagnostic"]["failed_jobs"][0]["selected_lineage"]["selected_commit"],
+            "selected-merge"
+        );
         assert_eq!(
             ci["failure_diagnostics"][0]["action"],
             "fresh_candidate_trigger"

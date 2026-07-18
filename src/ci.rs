@@ -15,6 +15,8 @@ use crate::model::{CommitOid, PrNumber, PullRequestPrecondition, RepositoryId};
 const MAX_DIAGNOSTIC_RUNS: usize = 10;
 const MAX_FAILED_JOBS: usize = 25;
 const MAX_FAILED_STEPS: usize = 25;
+const MAX_LINEAGE_LOG_JOBS: usize = 5;
+const MAX_LINEAGE_LOG_BODY_BYTES: usize = 60 * 1024;
 const MAX_EVIDENCE_EDGE_BYTES: usize = 4 * 1024;
 
 /// One PR generation associated with an immutable Actions run.
@@ -36,6 +38,32 @@ pub struct WorkflowStepFailureDiagnostic {
     pub conclusion: String,
 }
 
+/// Strictly allowlisted machine receipt extracted from a bounded job-log range.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SelectedRefLineageReceipt {
+    pub event: String,
+    pub head_ref: String,
+    pub selected_ref: String,
+    pub selected_commit: CommitOid,
+    pub actual_head: CommitOid,
+    pub expected_head: CommitOid,
+    pub expected_base: CommitOid,
+    #[serde(default)]
+    pub parents: Vec<CommitOid>,
+}
+
+/// Result of the bounded lineage-receipt extraction attempt.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LineageEvidenceStatus {
+    #[default]
+    NotRequested,
+    Parsed,
+    Missing,
+    Truncated,
+    Unavailable,
+}
+
 /// One failed/cancelled/timed-out Actions job and its bounded failed steps.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct WorkflowJobFailureDiagnostic {
@@ -51,6 +79,11 @@ pub struct WorkflowJobFailureDiagnostic {
     #[serde(default)]
     pub failed_steps: Vec<WorkflowStepFailureDiagnostic>,
     pub steps_truncated: bool,
+    /// Raw log text is never retained; only this strict receipt may escape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_lineage: Option<SelectedRefLineageReceipt>,
+    #[serde(default)]
+    pub lineage_evidence_status: LineageEvidenceStatus,
 }
 
 /// Bounded provider evidence for one immutable Actions run.
@@ -107,13 +140,136 @@ pub fn diagnose_failed_runs(
             checked_json(runner, workflow_run_command(repository, *run_id))?;
         let jobs: WorkflowJobsApiJson =
             checked_json(runner, workflow_jobs_command(repository, *run_id))?;
-        runs.push(run.into_diagnostic(expected, jobs));
+        let mut diagnostic = run.into_diagnostic(expected, jobs);
+        enrich_lineage_receipts(runner, repository, &mut diagnostic);
+        runs.push(diagnostic);
     }
     Ok(WorkflowFailureDiagnostics {
         requested_run_ids: requested_run_ids.into_iter().collect(),
         runs,
         runs_truncated,
     })
+}
+
+fn enrich_lineage_receipts(
+    runner: &impl CommandRunner,
+    repository: &RepositoryId,
+    diagnostic: &mut WorkflowRunFailureDiagnostic,
+) {
+    let mut requested = 0;
+    for job in &mut diagnostic.failed_jobs {
+        let is_lineage_job = job.failed_steps.iter().any(|step| {
+            step.name.to_ascii_lowercase().contains("lineage")
+                || step.name.to_ascii_lowercase().contains("selected ref")
+        });
+        if !is_lineage_job {
+            continue;
+        }
+        if requested >= MAX_LINEAGE_LOG_JOBS {
+            job.lineage_evidence_status = LineageEvidenceStatus::Truncated;
+            continue;
+        }
+        requested += 1;
+        let command = workflow_job_log_command(repository, job.job_id);
+        let Ok(output) = runner.run(&command) else {
+            job.lineage_evidence_status = LineageEvidenceStatus::Unavailable;
+            continue;
+        };
+        if !output.is_success() || !range_was_honored(&output.stdout) {
+            job.lineage_evidence_status = LineageEvidenceStatus::Unavailable;
+            continue;
+        }
+        job.selected_lineage = parse_selected_lineage_receipt(&output.stdout);
+        job.lineage_evidence_status = if job.selected_lineage.is_some() {
+            LineageEvidenceStatus::Parsed
+        } else if response_range_is_truncated(&output.stdout) {
+            LineageEvidenceStatus::Truncated
+        } else {
+            LineageEvidenceStatus::Missing
+        };
+    }
+}
+
+fn range_was_honored(output: &str) -> bool {
+    output.lines().take(40).any(|line| {
+        line.starts_with("HTTP/") && line.split_ascii_whitespace().nth(1) == Some("206")
+    }) && output.lines().take(40).any(|line| {
+        line.to_ascii_lowercase()
+            .starts_with("content-range: bytes ")
+    })
+}
+
+fn response_range_is_truncated(output: &str) -> bool {
+    output.lines().take(40).any(|line| {
+        let lower = line.to_ascii_lowercase();
+        let Some(range) = lower.strip_prefix("content-range: bytes ") else {
+            return false;
+        };
+        let Some((covered, total)) = range.trim().split_once('/') else {
+            return false;
+        };
+        let Some((_, end)) = covered.split_once('-') else {
+            return false;
+        };
+        end.parse::<usize>()
+            .ok()
+            .zip(total.parse::<usize>().ok())
+            .is_some_and(|(end, total)| end.saturating_add(1) < total)
+    }) || output.contains("...[truncated]")
+}
+
+fn parse_selected_lineage_receipt(output: &str) -> Option<SelectedRefLineageReceipt> {
+    const MARKER: &str = "ci-selected-ref-receipt ";
+    let body = output
+        .lines()
+        .find_map(|line| line.find(MARKER).map(|index| &line[index + MARKER.len()..]))?;
+    let tokens = body.split_ascii_whitespace().collect::<Vec<_>>();
+    let value = |key: &str| {
+        tokens.iter().find_map(|token| {
+            token
+                .split_once('=')
+                .filter(|(candidate, _)| *candidate == key)
+                .map(|(_, value)| value)
+        })
+    };
+    let parents_index = tokens
+        .iter()
+        .position(|token| token.starts_with("parents="))?;
+    let first_parent = tokens[parents_index].split_once('=')?.1;
+    let mut parents = vec![parse_oid(first_parent)?];
+    for token in tokens.iter().skip(parents_index + 1).take(3) {
+        if token.contains('=') {
+            break;
+        }
+        parents.push(parse_oid(token)?);
+    }
+    if parents.len() != 2 {
+        return None;
+    }
+    Some(SelectedRefLineageReceipt {
+        event: parse_safe_text(value("event")?, 64)?,
+        head_ref: parse_safe_text(value("head_ref")?, 512)?,
+        selected_ref: parse_safe_text(value("selected_ref")?, 512)?,
+        selected_commit: parse_oid(value("selected_commit")?)?,
+        actual_head: parse_oid(value("actual_head")?)?,
+        expected_head: parse_oid(value("expected_head")?)?,
+        expected_base: parse_oid(value("expected_base")?)?,
+        parents,
+    })
+}
+
+fn parse_oid(value: &str) -> Option<CommitOid> {
+    ((40..=64).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| CommitOid(value.to_ascii_lowercase()))
+}
+
+fn parse_safe_text(value: &str, max_len: usize) -> Option<String> {
+    (!value.is_empty()
+        && value.len() <= max_len
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b':')
+        }))
+    .then(|| value.to_owned())
 }
 
 fn checked_json<T: DeserializeOwned>(
@@ -175,6 +331,16 @@ fn workflow_jobs_command(repository: &RepositoryId, run_id: u64) -> CommandSpec 
         "filter=latest".to_owned(),
         "-f".to_owned(),
         "per_page=100".to_owned(),
+    ])
+}
+
+fn workflow_job_log_command(repository: &RepositoryId, job_id: u64) -> CommandSpec {
+    CommandSpec::new("gh").args([
+        "api".to_owned(),
+        "--include".to_owned(),
+        "-H".to_owned(),
+        format!("Range: bytes=0-{}", MAX_LINEAGE_LOG_BODY_BYTES - 1),
+        format!("repos/{}/actions/jobs/{job_id}/logs", repository.slug()),
     ])
 }
 
@@ -317,6 +483,8 @@ impl WorkflowJobJson {
             runner_labels: self.labels,
             failed_steps,
             steps_truncated,
+            selected_lineage: None,
+            lineage_evidence_status: LineageEvidenceStatus::NotRequested,
         }
     }
 }
@@ -395,8 +563,18 @@ mod tests {
         }
     }
 
+    fn bounded_lineage_log() -> String {
+        format!(
+            "HTTP/1.1 206 Partial Content\nContent-Range: bytes 0-2047/2048\n\nTOKEN=do-not-expose\n2026-07-18T13:53:23Z ci-selected-ref-receipt event=pull_request head_ref=feature selected_ref={selected} selected_commit={selected} actual_head={selected} expected_head={head} expected_base={base} parents={base} {prior}\n",
+            selected = "a".repeat(40),
+            head = "b".repeat(40),
+            base = "c".repeat(40),
+            prior = "d".repeat(40),
+        )
+    }
+
     #[test]
-    fn diagnostics_are_structured_bounded_and_never_fetch_logs() {
+    fn diagnostics_are_structured_bounded_and_never_fetch_raw_logs() {
         let repository = repository();
         let run_id = 99;
         let run = serde_json::json!({
@@ -429,7 +607,7 @@ mod tests {
                     "labels": ["self-hosted"],
                     "steps": [
                         {"number": 1, "name": "setup", "status": "completed", "conclusion": "success"},
-                        {"number": 2, "name": "test", "status": "completed", "conclusion": "failure"}
+                        {"number": 2, "name": "Verify exact CI ref lineage", "status": "completed", "conclusion": "failure"}
                     ]
                 },
                 {"id": 102, "name": "pass", "status": "completed", "conclusion": "success", "steps": []},
@@ -445,6 +623,10 @@ mod tests {
                 workflow_jobs_command(&repository, run_id),
                 CommandOutput::success(jobs.to_string()),
             ),
+            (
+                workflow_job_log_command(&repository, 101),
+                CommandOutput::success(bounded_lineage_log()),
+            ),
         ]);
 
         let output =
@@ -458,7 +640,16 @@ mod tests {
             Some(CommitOid("stale-head".to_owned()))
         );
         assert_eq!(diagnostic.failed_jobs.len(), 1);
-        assert_eq!(diagnostic.failed_jobs[0].failed_steps[0].name, "test");
+        let job = &diagnostic.failed_jobs[0];
+        assert_eq!(job.lineage_evidence_status, LineageEvidenceStatus::Parsed);
+        assert_eq!(
+            job.selected_lineage
+                .as_ref()
+                .map(|receipt| &receipt.selected_commit),
+            Some(&CommitOid("a".repeat(40)))
+        );
+        let serialized = serde_json::to_string(diagnostic).unwrap();
+        assert!(!serialized.contains("do-not-expose"));
         assert!(runner.calls.borrow().is_empty());
     }
 

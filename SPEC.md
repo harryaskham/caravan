@@ -210,6 +210,17 @@ Normal behavior:
 - Pending CI: sync reports waiting and makes no speculative repair.
 - Failed CI without `caravan-force`: decision point.
 
+A failed-CI decision contains bounded structured run, job, and failed-step
+facts. For an allowlisted lineage-verification step, Cara requests only the
+first 60 KiB of the job log and retains only a strict
+`ci-selected-ref-receipt`; all unrelated text, credentials, and raw log bytes
+are discarded. Missing, malformed, unavailable, or range-truncated receipts
+fail closed. Exact selected commit/parents and current synthetic-candidate
+identity classify the run as stale generation, retryable infrastructure,
+source/test failure, cancelled, or unknown. Only current-generation
+infrastructure failures are rerunnable; stale or unproved lineage requires a
+fresh exact-candidate trigger.
+
 A user/agent may repair and push, rerun failed checks, evict/split, or mark a known acceptable failure with `caravan-force`.
 
 `caravan-force` is explicit operator intent to bypass any CI state that is not fully successful, including expected, queued, running, failed, unknown, mixed, or empty checks. When it becomes head, `cara sync` may force-squash it only when:

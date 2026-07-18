@@ -31,9 +31,11 @@ after the same check passes.
 - Every member has the `caravan` label.
 - Only the head has squash auto-merge enabled.
 - The current head PR number is the caravan ID.
-- `cara sync` is idempotent: pending CI waits, failed CI returns exact check/run
-  evidence, and `--rerun-failed` reruns only verified runs for the selected PR
-  and head SHA.
+- `cara sync` is idempotent: pending CI waits, failed CI returns bounded
+  run/job/failed-step and exact selected-lineage receipts, and
+  `--rerun-failed` reruns only current-generation infrastructure failures.
+  Stale synthetic generations require a fresh candidate trigger; raw logs and
+  unrelated log text are never retained or exposed.
 - `caravan-force` is explicit operator intent to bypass any CI state that is
   not fully successful, including pending, running, failed, mixed, and empty
   checks. A forced head is admin-squashed only when repository policy permits
