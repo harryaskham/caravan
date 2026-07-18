@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::command::{CommandOutput, CommandRunError, CommandRunner, CommandSpec, ProcessRunner};
 use crate::model::{
@@ -1005,6 +1005,29 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
     pub fn with_options(mut self, options: DiscoveryOptions) -> Self {
         self.options = options;
         self
+    }
+
+    /// Resolve canonical provider identity/freshness for one exact PR snapshot.
+    /// This shares the status/show schema and performs no checkout or mutation.
+    pub fn merge_candidate_identity(
+        &self,
+        repository: &RepositoryId,
+        pull_request: &model::PullRequestSnapshot,
+    ) -> Result<model::MergeCandidateIdentity, DiscoveryError> {
+        let observed_at = provider_observed_at();
+        let (mut identities, _) = self.merge_candidate_identities(
+            repository,
+            std::slice::from_ref(pull_request),
+            &observed_at,
+        )?;
+        identities.pop().ok_or_else(|| DiscoveryError::InvalidJson {
+            command: merge_candidates_command(repository, std::slice::from_ref(pull_request)),
+            message: "provider omitted the requested candidate identity".to_owned(),
+            evidence: Box::new(JsonDecodeEvidence {
+                stdout: String::new(),
+                stderr: String::new(),
+            }),
+        })
     }
 
     /// Run a complete, internally consistent read-only discovery pass.
@@ -2668,12 +2691,10 @@ mod tests {
         let snapshot = discovery.discover().expect("historical context resolves");
 
         assert_eq!(snapshot.current_pr, Some(PrNumber(10)));
-        assert!(
-            snapshot
-                .pull_requests
-                .iter()
-                .any(|pull| pull.number == PrNumber(9))
-        );
+        assert!(snapshot
+            .pull_requests
+            .iter()
+            .any(|pull| pull.number == PrNumber(9)));
         discovery.runner.assert_exhausted();
     }
 
@@ -2874,22 +2895,18 @@ mod tests {
                 .count(),
             30
         );
-        assert!(
-            snapshot
-                .pull_requests
-                .iter()
-                .filter(|pr| pr.state == model::PullRequestState::Open)
-                .all(|pr| pr.checks.len() == 2)
-        );
-        assert!(
-            snapshot
-                .pull_requests
-                .iter()
-                .find(|pr| pr.state == model::PullRequestState::Merged)
-                .unwrap()
-                .checks
-                .is_empty()
-        );
+        assert!(snapshot
+            .pull_requests
+            .iter()
+            .filter(|pr| pr.state == model::PullRequestState::Open)
+            .all(|pr| pr.checks.len() == 2));
+        assert!(snapshot
+            .pull_requests
+            .iter()
+            .find(|pr| pr.state == model::PullRequestState::Merged)
+            .unwrap()
+            .checks
+            .is_empty());
         discovery.runner.assert_exhausted();
     }
 
@@ -3209,12 +3226,10 @@ mod tests {
             .ensure_control_label_comment(&repository, &expected, &audit)
             .unwrap();
 
-        assert!(
-            receipt
-                .provider_output
-                .unwrap()
-                .starts_with("existing GitHub comment")
-        );
+        assert!(receipt
+            .provider_output
+            .unwrap()
+            .starts_with("existing GitHub comment"));
         adapter.runner.assert_exhausted();
     }
 
@@ -3265,12 +3280,10 @@ mod tests {
             .ensure_control_label_comment(&repository, &expected, &retry)
             .unwrap();
 
-        assert!(
-            receipt
-                .provider_output
-                .unwrap()
-                .starts_with("existing GitHub comment")
-        );
+        assert!(receipt
+            .provider_output
+            .unwrap()
+            .starts_with("existing GitHub comment"));
         adapter.runner.assert_exhausted();
     }
 

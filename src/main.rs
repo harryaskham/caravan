@@ -3,18 +3,18 @@
 use std::fmt::Write as _;
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use caravan::{
-    AGENT_HELP, AppContext, AppError, CheckInput, CreateInput, EvictInput, JoinInput,
+    build_router, feedback_config, feedback_configuration_error, feedback_panic_config,
+    updater_config, AppContext, AppError, CheckInput, CreateInput, EvictInput, JoinInput,
     LockRecoverInput, LockStatusInput, LoopInput, PauseInput, ResumeInput, SplitInput, SyncInput,
-    TOOL_NAME, build_router, feedback_config, feedback_configuration_error, feedback_panic_config,
-    updater_config,
+    AGENT_HELP, TOOL_NAME,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use feedback_cli::{FeedbackEvent, FeedbackKind, Reporter, Severity};
-use mcp_cli::{McpServer, StdioServerConfig, StructuredError, write_json_result};
+use mcp_cli::{write_json_result, McpServer, StdioServerConfig, StructuredError};
 use serde::Serialize;
 
 #[derive(Debug, Parser)]
@@ -387,11 +387,23 @@ fn run_next_candidate(cli: &Cli) -> Result<(), i32> {
     }
     match result {
         Ok(output) => {
-            if let Some(candidate) = output.admission.candidates.first() {
-                println!(
-                    "next admission attempt: #{} — {}",
-                    candidate.pr, candidate.reason
-                );
+            if let Some(number) = output.admission.next_candidate {
+                let reason = output
+                    .admission
+                    .candidates
+                    .iter()
+                    .find(|candidate| candidate.pr == number)
+                    .map(|candidate| candidate.reason.as_str())
+                    .or_else(|| {
+                        output
+                            .admission
+                            .rejected
+                            .iter()
+                            .find(|candidate| candidate.pr == number)
+                            .map(|candidate| candidate.reason.as_str())
+                    })
+                    .unwrap_or("fail closed: provider attempt metadata unavailable");
+                println!("next admission attempt: #{number} — {reason}");
                 println!("  {}", output.attempt_contract);
             } else {
                 println!("no automatic-admission attempt");
@@ -890,8 +902,19 @@ fn render_show(output: &caravan::read::ShowOutput) -> String {
 
 fn render_check(output: &caravan::read::CheckOutput) -> String {
     let mut text = format!(
-        "check: eligible ({:?}) — PR #{}",
-        output.mode, output.current_pr
+        "check: {} ({:?}) — PR #{} [{}@{} -> {}@{}]; next: {:?}",
+        if output.eligible {
+            "eligible"
+        } else {
+            "not eligible"
+        },
+        output.mode,
+        output.current_pr,
+        output.candidate.head.name,
+        output.candidate.head.oid,
+        output.candidate.base.name,
+        output.candidate.base.oid,
+        output.next_action,
     );
     if let Some(target) = output.target_pr {
         let _ = write!(text, " after #{target}");
@@ -901,12 +924,45 @@ fn render_check(output: &caravan::read::CheckOutput) -> String {
     if let Some(action) = &output.rebase_on_join.required_action {
         let _ = writeln!(text, "  action: {action}");
     }
+    let _ = writeln!(
+        text,
+        "  head_repository={} head_repository_owner={} same_repository={} draft={} labels=[{}] auto_merge={} enrolled={} canonical={}",
+        output.candidate.head.repository,
+        output.head_repository_owner,
+        !output.candidate.cross_repository,
+        output.candidate.draft,
+        output.candidate.labels.iter().cloned().collect::<Vec<_>>().join(","),
+        output.candidate.auto_merge.enabled,
+        output.enrolled,
+        output.canonical_candidate,
+    );
+    if let Some(identity) = &output.merge_candidate {
+        let _ = writeln!(
+            text,
+            "  provider identity: {:?} base={}@{} head={}@{} stale_base={} stale_head={}",
+            identity.freshness,
+            identity.base.name,
+            identity.base.oid,
+            identity.head.name,
+            identity.head.oid,
+            identity.stale_base,
+            identity.stale_head,
+        );
+    }
     for report in &output.compatibility {
         let _ = writeln!(
             text,
-            "  {:?}: {} -> {}",
-            report.outcome, report.candidate.name, report.target.name
+            "  {:?}: {}@{} -> {}@{} conflicts=[{}]",
+            report.outcome,
+            report.candidate.name,
+            report.candidate.oid,
+            report.target.name,
+            report.target.oid,
+            report.conflicting_paths.join(","),
         );
+    }
+    for problem in &output.problems {
+        let _ = writeln!(text, "! {:?}: {}", problem.kind, problem.message);
     }
     text
 }
@@ -1159,6 +1215,17 @@ mod tests {
         assert!(
             Cli::try_parse_from(["cara", "check", "--tail-pr", "1", "--head-pr", "2"]).is_err()
         );
+    }
+
+    #[test]
+    fn check_accepts_remote_candidate_and_tail_without_checkout() {
+        let cli = Cli::try_parse_from(["cara", "check", "--pr", "41", "--tail-pr", "40"])
+            .expect("remote candidate preflight parses");
+        let Command::Check(input) = cli.command else {
+            panic!("expected check");
+        };
+        assert_eq!(input.pr, Some(41));
+        assert_eq!(input.tail_pr, Some(40));
     }
 
     #[test]

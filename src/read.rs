@@ -9,7 +9,7 @@ use serde_json::json;
 
 use crate::command::CommandRunError;
 use crate::github::{DiscoveryError, GitHubDiscovery};
-use crate::graph::{CompatibilityChecker, GitCompatibilityChecker, GraphAnalysis, analyze};
+use crate::graph::{analyze, CompatibilityChecker, GitCompatibilityChecker, GraphAnalysis};
 use crate::model::{
     Caravan, CompatibilityOutcome, CompatibilityReport, GraphProblem, GraphProblemKind, PrNumber,
     PullRequestSnapshot, PullRequestState, RepositoryId,
@@ -122,6 +122,10 @@ pub struct AdmissionCandidate {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RejectedAdmissionCandidate {
     pub pr: PrNumber,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority_rank: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
     pub reason: String,
 }
 
@@ -181,13 +185,37 @@ pub enum CheckMode {
     JoinTail,
 }
 
+/// Mechanical continuation after an exact read-only candidate preflight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateNextAction {
+    New,
+    Join,
+    Repair,
+    Wait,
+    Reject,
+}
+
 /// Successful read-only eligibility/health result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CheckOutput {
     #[serde(default)]
     pub rebase_on_join: RebaseOnJoinStatus,
     pub mode: CheckMode,
+    /// Candidate PR (named `current_pr` for backwards-compatible JSON).
     pub current_pr: PrNumber,
+    /// Exact provider candidate facts used by this receipt.
+    pub candidate: PullRequestSnapshot,
+    /// Provider-visible head repository owner (branch ownership, not PR authorship).
+    pub head_repository_owner: String,
+    /// Canonical provider merge-candidate identity and freshness from status/show.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_candidate: Option<crate::model::MergeCandidateIdentity>,
+    /// Whether the candidate was already in the discovered active fleet.
+    pub enrolled: bool,
+    /// Whether this is the canonical first priority/FIFO admission attempt.
+    pub canonical_candidate: bool,
+    pub next_action: CandidateNextAction,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caravan_id: Option<PrNumber>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -361,7 +389,7 @@ pub fn next_candidate(context: &AppContext) -> Result<NextCandidateOutput, AppEr
     let status = status(context)?;
     Ok(NextCandidateOutput {
         repository: status.repository,
-        attempt_contract: "ordered admission attempt only; run check/new preflight for the first candidate; on rejection fail closed and retry after GitHub state changes rather than leapfrogging".to_owned(),
+        attempt_contract: "ordered admission attempt only; run `cara check --pr N` for this exact first candidate; on rejection fail closed and retry after GitHub state changes rather than leapfrogging".to_owned(),
         admission: status.admission,
     })
 }
@@ -415,6 +443,8 @@ pub fn resolve_admission(analysis: &GraphAnalysis, priority_labels: &[String]) -
                     .collect::<Vec<_>>()
                     .join(", ")
             ))
+        } else if pull_request.draft {
+            Some("fail closed: draft PR must wait until marked ready".to_owned())
         } else if pull_request.cross_repository {
             Some("fail closed: fork-only PR cannot be admitted to a caravan".to_owned())
         } else if pull_request.auto_merge.enabled {
@@ -425,6 +455,11 @@ pub fn resolve_admission(analysis: &GraphAnalysis, priority_labels: &[String]) -
         if let Some(reason) = rejection {
             rejected.push(RejectedAdmissionCandidate {
                 pr: *number,
+                // Unknown priority metadata blocks before known attempts: its
+                // rank cannot safely be guessed. Otherwise preserve the same
+                // configured rank/FIFO key as selectable candidates.
+                priority_rank: (configured.len() == 1).then(|| configured[0].1 + 1),
+                created_at: pull_request.created_at.clone(),
                 reason,
             });
             continue;
@@ -479,8 +514,36 @@ pub fn resolve_admission(analysis: &GraphAnalysis, priority_labels: &[String]) -
             candidate.pr,
         )
     });
-    rejected.sort_by_key(|candidate| candidate.pr);
-    let next_candidate = candidates.first().map(|candidate| candidate.pr);
+    rejected.sort_by_key(|candidate| {
+        (
+            candidate.priority_rank.unwrap_or(priority_labels.len() + 1),
+            candidate.created_at.is_none(),
+            candidate.created_at.clone().unwrap_or_default(),
+            candidate.pr,
+        )
+    });
+    // Select from candidates and rejected attempts together. A rejected first
+    // attempt remains canonical and therefore cannot be silently leapfrogged.
+    let next_candidate = candidates
+        .iter()
+        .map(|candidate| {
+            (
+                candidate.priority_rank.unwrap_or(priority_labels.len() + 1),
+                candidate.created_at.is_none(),
+                candidate.created_at.clone().unwrap_or_default(),
+                candidate.pr,
+            )
+        })
+        .chain(rejected.iter().map(|candidate| {
+            (
+                candidate.priority_rank.unwrap_or(priority_labels.len() + 1),
+                candidate.created_at.is_none(),
+                candidate.created_at.clone().unwrap_or_default(),
+                candidate.pr,
+            )
+        }))
+        .min()
+        .map(|(_, _, _, pr)| pr);
     AdmissionStatus {
         policy: "ordered admission attempts: explicit agent priority label (configured high to low), then FIFO by immutable provider created_at ascending with PR number ascending as equal-time tie-break; missing created_at falls back deterministically to PR number after timestamped peers; never LIFO; check/new preflight required and rejection never causes automatic leapfrogging".to_owned(),
         priority_labels: priority_labels.to_vec(),
@@ -578,24 +641,100 @@ pub fn check(context: &AppContext, input: &CheckInput) -> Result<CheckOutput, Ap
             "--tail-pr and --head-pr are mutually exclusive",
         ));
     }
-    let status = status(context)?;
+    let mut status = status(context)?;
+    if let Some(number) = input.pr.map(PrNumber) {
+        // Re-read the selected provider PR after fleet discovery. Comparing the
+        // complete snapshot closes the discovery/refetch race before exact Git
+        // revision checks; merge compatibility subsequently verifies refs both
+        // before and after its fetch.
+        let provider = crate::github::GitHubMutationAdapter::new(
+            crate::command::ProcessRunner::in_directory(&context.repository_path).with_timeout(
+                std::time::Duration::from_secs(context.config.command_timeout_secs),
+            ),
+        );
+        let fresh = provider
+            .refetch_pull_request(&status.repository, number)
+            .map_err(|error| {
+                AppError::structured(
+                    ErrorCategory::ExecutionFailure,
+                    "candidate_refetch_failed",
+                    error.to_string(),
+                    Some(
+                        json!({"pr": number, "safe_next_action": "retry the read-only preflight"}),
+                    ),
+                )
+            })?;
+        let discovered = status.analysis.pull_requests.get(&number).ok_or_else(|| {
+            AppError::validation(
+                "candidate_not_found",
+                format!("PR #{number} is not an open provider candidate"),
+            )
+        })?;
+        require_fresh_candidate(discovered, &fresh)?;
+        let identity = GitHubDiscovery::new(
+            crate::command::ProcessRunner::in_directory(&context.repository_path).with_timeout(
+                std::time::Duration::from_secs(context.config.command_timeout_secs),
+            ),
+        )
+        .merge_candidate_identity(&status.repository, &fresh)
+        .map_err(|error| discovery_error(&error))?;
+        status
+            .merge_candidates
+            .retain(|candidate| candidate.pr != number);
+        status.merge_candidates.push(identity);
+        status.current_pr = Some(number);
+    }
     let checker = GitCompatibilityChecker::new(&context.repository_path, "origin").with_timeout(
         std::time::Duration::from_secs(context.config.command_timeout_secs),
     );
     check_analysis(&status, input, &checker)
 }
 
+fn require_fresh_candidate(
+    discovered: &PullRequestSnapshot,
+    fresh: &PullRequestSnapshot,
+) -> Result<(), AppError> {
+    // Check churn, provider timestamps, title, and URL do not invalidate an
+    // identity preflight. Every operation-shaping fact does.
+    let identity_matches = discovered.number == fresh.number
+        && discovered.state == fresh.state
+        && discovered.draft == fresh.draft
+        && discovered.head == fresh.head
+        && discovered.base == fresh.base
+        && discovered.cross_repository == fresh.cross_repository
+        && discovered.labels == fresh.labels
+        && discovered.auto_merge == fresh.auto_merge;
+    if identity_matches {
+        return Ok(());
+    }
+    Err(AppError::structured(
+        ErrorCategory::Validation,
+        "stale_candidate_snapshot",
+        format!("PR #{} changed during remote preflight", discovered.number),
+        Some(json!({
+            "pr": discovered.number,
+            "expected_head_oid": discovered.head.oid,
+            "actual_head_oid": fresh.head.oid,
+            "expected": discovered,
+            "actual": fresh,
+            "safe_next_action": "retry `cara check --pr` to preflight the new exact provider state",
+            "mutated": false,
+        })),
+    ))
+}
+
 /// Pure/injectable check policy used by live commands and fixture tests.
+#[allow(clippy::too_many_lines)]
 pub fn check_analysis(
     status: &StatusOutput,
     input: &CheckInput,
     checker: &impl CompatibilityChecker,
 ) -> Result<CheckOutput, AppError> {
     crate::initialization::require_ready(&status.initialization)?;
-    let current_pr = status.current_pr.ok_or_else(|| {
+    let current_pr = input.pr.map(PrNumber).or(status.current_pr).ok_or_else(|| {
         AppError::validation(
             "current_pr_not_found",
-            "the current branch has no unique open GitHub pull request",
+            "the selected remote PR was not found and the current branch has no unique open GitHub pull request",
         )
     })?;
     let pull_request = status
@@ -608,46 +747,153 @@ pub fn check_analysis(
                 format!("PR #{current_pr} was not included in discovery"),
             )
         })?;
+    let canonical_candidate = status.admission.next_candidate == Some(current_pr)
+        || (input.pr.is_some() && pull_request.draft && status.admission.next_candidate.is_none());
+    let admission_rejection = status
+        .admission
+        .rejected
+        .iter()
+        .find(|candidate| candidate.pr == current_pr);
+    let merge_candidate = status
+        .merge_candidates
+        .iter()
+        .find(|candidate| candidate.pr == current_pr)
+        .cloned();
+    let candidate_stale = merge_candidate.as_ref().is_some_and(|candidate| {
+        candidate.freshness != crate::model::MergeCandidateFreshness::Fresh
+    });
+    let remote = input.pr.is_some();
 
     if let Some(caravan) = status.analysis.fleet.containing(current_pr) {
-        if input.tail_pr.is_some() || input.head_pr.is_some() {
+        if (input.tail_pr.is_some() || input.head_pr.is_some()) && !remote {
             return Err(AppError::validation(
                 "active_pr_cannot_join",
                 format!("PR #{current_pr} is already in caravan #{}", caravan.id),
             ));
         }
+        let mut active_problems = status.analysis.fleet.problems.clone();
+        if input.tail_pr.is_some() || input.head_pr.is_some() {
+            active_problems.push(GraphProblem {
+                kind: GraphProblemKind::Unknown,
+                prs: vec![current_pr],
+                message: format!("candidate is already enrolled in caravan #{}", caravan.id),
+            });
+        }
+        if candidate_stale {
+            active_problems.push(GraphProblem {
+                kind: GraphProblemKind::Unknown,
+                prs: vec![current_pr],
+                message: "provider merge-candidate identity is stale or incomplete; wait for the current generation".to_owned(),
+            });
+        }
+        let eligible = status.healthy && active_problems.is_empty();
         let output = CheckOutput {
             rebase_on_join: status.rebase_on_join.clone(),
             mode: CheckMode::ActiveCaravan,
             current_pr,
+            candidate: pull_request.clone(),
+            head_repository_owner: pull_request.head.repository.owner.clone(),
+            merge_candidate,
+            enrolled: true,
+            canonical_candidate,
+            next_action: if input.tail_pr.is_some() || input.head_pr.is_some() {
+                CandidateNextAction::Reject
+            } else if candidate_stale || eligible {
+                CandidateNextAction::Wait
+            } else {
+                CandidateNextAction::Repair
+            },
             caravan_id: Some(caravan.id),
             target_pr: None,
-            eligible: status.healthy,
+            eligible,
             compatibility: status.analysis.compatibility.clone(),
-            problems: status.analysis.fleet.problems.clone(),
+            problems: active_problems,
             initialization: status.initialization.clone(),
         };
-        return eligible_or_error(output);
+        return eligible_or_error(output, remote);
     }
 
     let mut problems = status.analysis.fleet.problems.clone();
     validate_candidate(pull_request, &mut problems);
+    if candidate_stale {
+        problems.push(GraphProblem {
+            kind: GraphProblemKind::Unknown,
+            prs: vec![current_pr],
+            message: "provider merge-candidate identity is stale or incomplete; wait for the current generation".to_owned(),
+        });
+    }
+    if let Some(rejected) = admission_rejection {
+        problems.push(GraphProblem {
+            kind: GraphProblemKind::Unknown,
+            prs: vec![current_pr],
+            message: rejected.reason.clone(),
+        });
+    }
+    if remote && !canonical_candidate {
+        problems.push(GraphProblem {
+            kind: GraphProblemKind::Unknown,
+            prs: vec![current_pr],
+            message: status.admission.next_candidate.map_or_else(
+                || "candidate is not selectable because no canonical admission attempt exists".to_owned(),
+                |first| format!("candidate is not canonical first admission attempt; fail closed on PR #{first}"),
+            ),
+        });
+    }
     let mut reports = Vec::new();
 
     let explicit_join = input.tail_pr.is_some() || input.head_pr.is_some();
     if !explicit_join {
-        check_new(status, pull_request, checker, &mut reports, &mut problems)?;
-        return eligible_or_error(CheckOutput {
-            rebase_on_join: status.rebase_on_join.clone(),
-            mode: CheckMode::NewCaravan,
-            current_pr,
-            caravan_id: Some(current_pr),
-            target_pr: None,
-            eligible: problems.is_empty(),
-            compatibility: reports,
-            problems,
-            initialization: status.initialization.clone(),
-        });
+        if !pull_request.cross_repository {
+            check_new(status, pull_request, checker, &mut reports, &mut problems)?;
+        }
+        let eligible = problems.is_empty();
+        let next_action = candidate_action(
+            pull_request,
+            &reports,
+            &CandidateActionContext {
+                eligibility: if eligible {
+                    ActionEligibility::Eligible
+                } else {
+                    ActionEligibility::Ineligible
+                },
+                target: ActionTarget::New,
+                order: if canonical_candidate || !remote {
+                    ActionOrder::Canonical
+                } else {
+                    ActionOrder::NonCanonical
+                },
+                admission: if admission_rejection.is_some() {
+                    AdmissionDecision::Rejected
+                } else {
+                    AdmissionDecision::Accepted
+                },
+                freshness: if candidate_stale {
+                    CandidateFreshness::Stale
+                } else {
+                    CandidateFreshness::Fresh
+                },
+            },
+        );
+        return eligible_or_error(
+            CheckOutput {
+                rebase_on_join: status.rebase_on_join.clone(),
+                mode: CheckMode::NewCaravan,
+                current_pr,
+                candidate: pull_request.clone(),
+                head_repository_owner: pull_request.head.repository.owner.clone(),
+                merge_candidate,
+                enrolled: false,
+                canonical_candidate,
+                next_action,
+                caravan_id: Some(current_pr),
+                target_pr: None,
+                eligible,
+                compatibility: reports,
+                problems,
+                initialization: status.initialization.clone(),
+            },
+            remote,
+        );
     }
 
     let target_caravan = resolve_target_caravan(status, input)?;
@@ -657,43 +903,82 @@ pub fn check_analysis(
         .pull_requests
         .get(&tail_number)
         .expect("derived tail has a snapshot");
-    record_report(
-        checker.check(&pull_request.head, &tail.head)?,
-        vec![tail_number, current_pr],
-        "candidate does not merge cleanly after the selected tail",
-        &mut reports,
-        &mut problems,
-    );
-    for caravan in &status.analysis.fleet.caravans {
-        if caravan.id == target_caravan.id {
-            continue;
-        }
-        let head_number = caravan.head().expect("caravans are non-empty");
-        let head = status
-            .analysis
-            .pull_requests
-            .get(&head_number)
-            .expect("derived head has a snapshot");
+    if !pull_request.cross_repository {
         record_report(
-            checker.check(&head.head, &pull_request.head)?,
-            vec![head_number, current_pr],
-            "another caravan head cannot attach after the proposed new tail",
+            checker.check(&pull_request.head, &tail.head)?,
+            vec![tail_number, current_pr],
+            "candidate does not merge cleanly after the selected tail",
             &mut reports,
             &mut problems,
         );
+        for caravan in &status.analysis.fleet.caravans {
+            if caravan.id == target_caravan.id {
+                continue;
+            }
+            let head_number = caravan.head().expect("caravans are non-empty");
+            let head = status
+                .analysis
+                .pull_requests
+                .get(&head_number)
+                .expect("derived head has a snapshot");
+            record_report(
+                checker.check(&head.head, &pull_request.head)?,
+                vec![head_number, current_pr],
+                "another caravan head cannot attach after the proposed new tail",
+                &mut reports,
+                &mut problems,
+            );
+        }
     }
 
-    eligible_or_error(CheckOutput {
-        rebase_on_join: status.rebase_on_join.clone(),
-        mode: CheckMode::JoinTail,
-        current_pr,
-        caravan_id: Some(target_caravan.id),
-        target_pr: Some(tail_number),
-        eligible: problems.is_empty(),
-        compatibility: reports,
-        problems,
-        initialization: status.initialization.clone(),
-    })
+    let eligible = problems.is_empty();
+    let next_action = candidate_action(
+        pull_request,
+        &reports,
+        &CandidateActionContext {
+            eligibility: if eligible {
+                ActionEligibility::Eligible
+            } else {
+                ActionEligibility::Ineligible
+            },
+            target: ActionTarget::Join,
+            order: if canonical_candidate || !remote {
+                ActionOrder::Canonical
+            } else {
+                ActionOrder::NonCanonical
+            },
+            admission: if admission_rejection.is_some() {
+                AdmissionDecision::Rejected
+            } else {
+                AdmissionDecision::Accepted
+            },
+            freshness: if candidate_stale {
+                CandidateFreshness::Stale
+            } else {
+                CandidateFreshness::Fresh
+            },
+        },
+    );
+    eligible_or_error(
+        CheckOutput {
+            rebase_on_join: status.rebase_on_join.clone(),
+            mode: CheckMode::JoinTail,
+            current_pr,
+            candidate: pull_request.clone(),
+            head_repository_owner: pull_request.head.repository.owner.clone(),
+            merge_candidate,
+            enrolled: false,
+            canonical_candidate,
+            next_action,
+            caravan_id: Some(target_caravan.id),
+            target_pr: Some(tail_number),
+            eligible,
+            compatibility: reports,
+            problems,
+            initialization: status.initialization.clone(),
+        },
+        remote,
+    )
 }
 
 fn check_new(
@@ -830,8 +1115,84 @@ fn record_report(
     reports.push(report);
 }
 
-fn eligible_or_error(output: CheckOutput) -> Result<CheckOutput, AppError> {
-    if output.eligible {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActionEligibility {
+    Eligible,
+    Ineligible,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActionTarget {
+    New,
+    Join,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActionOrder {
+    Canonical,
+    NonCanonical,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdmissionDecision {
+    Accepted,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateFreshness {
+    Fresh,
+    Stale,
+}
+
+struct CandidateActionContext {
+    eligibility: ActionEligibility,
+    target: ActionTarget,
+    order: ActionOrder,
+    admission: AdmissionDecision,
+    freshness: CandidateFreshness,
+}
+
+fn candidate_action(
+    candidate: &PullRequestSnapshot,
+    reports: &[CompatibilityReport],
+    context: &CandidateActionContext,
+) -> CandidateNextAction {
+    if context.order == ActionOrder::NonCanonical {
+        return CandidateNextAction::Reject;
+    }
+    if candidate.draft || context.freshness == CandidateFreshness::Stale {
+        return CandidateNextAction::Wait;
+    }
+    if context.admission == AdmissionDecision::Rejected {
+        return CandidateNextAction::Reject;
+    }
+    if context.eligibility == ActionEligibility::Eligible {
+        return match context.target {
+            ActionTarget::Join => CandidateNextAction::Join,
+            ActionTarget::New => CandidateNextAction::New,
+        };
+    }
+    if candidate.state != PullRequestState::Open
+        || candidate.cross_repository
+        || candidate.has_label("caravan-evicted")
+    {
+        return CandidateNextAction::Reject;
+    }
+    if reports
+        .iter()
+        .any(|report| report.outcome != CompatibilityOutcome::Clean)
+    {
+        return CandidateNextAction::Repair;
+    }
+    CandidateNextAction::Repair
+}
+
+fn eligible_or_error(
+    output: CheckOutput,
+    return_rejection_receipt: bool,
+) -> Result<CheckOutput, AppError> {
+    if output.eligible || return_rejection_receipt {
         return Ok(output);
     }
     Err(AppError::structured(
@@ -1134,6 +1495,7 @@ mod tests {
         let output = check_analysis(
             &status,
             &CheckInput {
+                pr: None,
                 tail_pr: None,
                 head_pr: Some(1),
             },
@@ -1220,12 +1582,10 @@ mod tests {
         assert_eq!(details["timeout_ms"], 500);
         assert_eq!(details["stdout"], "partial");
         assert_eq!(details["retryable"], true);
-        assert!(
-            details["safe_next_action"]
-                .as_str()
-                .unwrap()
-                .contains("no mutations")
-        );
+        assert!(details["safe_next_action"]
+            .as_str()
+            .unwrap()
+            .contains("no mutations"));
     }
 
     #[test]
@@ -1270,17 +1630,13 @@ mod tests {
         );
         assert_eq!(admission.next_candidate, Some(PrNumber(20)));
         assert!(admission.candidates[0].reason.contains("FIFO"));
-        assert!(
-            admission.candidates[0]
-                .reason
-                .contains("preflight required")
-        );
+        assert!(admission.candidates[0]
+            .reason
+            .contains("preflight required"));
         assert!(admission.policy.contains("never LIFO"));
-        assert!(
-            admission
-                .policy
-                .contains("never causes automatic leapfrogging")
-        );
+        assert!(admission
+            .policy
+            .contains("never causes automatic leapfrogging"));
     }
 
     #[test]
@@ -1334,14 +1690,140 @@ mod tests {
         let status = status(unknown, vec![conflicting, safe]);
         let labels = crate::config::CaravanConfig::default().agent_priority_labels;
         let admission = resolve_admission(&status.analysis, &labels);
-        assert_eq!(admission.next_candidate, Some(PrNumber(30)));
-        assert_eq!(admission.rejected.len(), 2);
-        assert!(
-            admission
-                .rejected
-                .iter()
-                .all(|candidate| candidate.reason.contains("fail closed"))
+        assert_eq!(
+            admission.next_candidate,
+            Some(PrNumber(10)),
+            "the rejected first attempt must block rather than leapfrog to #30"
         );
+        assert_eq!(admission.rejected.len(), 2);
+        assert!(admission
+            .rejected
+            .iter()
+            .all(|candidate| candidate.reason.contains("fail closed")));
+    }
+
+    #[test]
+    fn unrelated_check_churn_does_not_stale_candidate_identity() {
+        let discovered = pr(9, "nine", "main", false);
+        let mut fresh = discovered.clone();
+        fresh.checks.push(crate::model::CheckSnapshot {
+            name: "ci".to_owned(),
+            state: crate::model::CheckState::InProgress,
+            provider_state: Some("IN_PROGRESS".to_owned()),
+            details_url: None,
+        });
+        fresh.updated_at = Some("2026-01-02T00:00:00Z".to_owned());
+        require_fresh_candidate(&discovered, &fresh)
+            .expect("check/timestamp churn does not change candidate identity");
+    }
+
+    #[test]
+    fn stale_head_between_discovery_and_refetch_fails_closed() {
+        let discovered = pr(9, "nine", "main", false);
+        let mut fresh = discovered.clone();
+        fresh.head.oid = crate::model::CommitOid("f".repeat(40));
+        let error = require_fresh_candidate(&discovered, &fresh)
+            .expect_err("a moved provider head must invalidate the receipt");
+        assert_eq!(
+            mcp_cli::StructuredError::code(&error),
+            "stale_candidate_snapshot"
+        );
+        let details = mcp_cli::StructuredError::details(&error).unwrap();
+        assert_eq!(details["expected_head_oid"], discovered.head.oid.0);
+        assert_eq!(details["actual_head_oid"], fresh.head.oid.0);
+        assert_eq!(details["mutated"], false);
+    }
+
+    #[test]
+    fn remote_candidate_receipt_rejects_a_noncanonical_pr_without_leapfrogging() {
+        let first = pr(10, "first", "main", false);
+        let second = pr(20, "second", "main", false);
+        let status = status(first, vec![second]);
+        let output = check_analysis(
+            &status,
+            &CheckInput {
+                pr: Some(20),
+                tail_pr: None,
+                head_pr: None,
+            },
+            &clean_checker,
+        )
+        .expect("remote rejection is an inspectable receipt");
+        assert!(!output.eligible);
+        assert!(!output.canonical_candidate);
+        assert_eq!(output.next_action, CandidateNextAction::Reject);
+        assert!(output
+            .problems
+            .iter()
+            .any(|problem| problem.message.contains("fail closed on PR #10")));
+        let json = serde_json::to_value(&output).expect("remote receipt serializes");
+        assert_eq!(json["next_action"], "reject");
+        assert_eq!(json["candidate"]["number"], 20);
+        assert!(json.get("merge_candidate").is_none());
+    }
+
+    #[test]
+    fn canonical_provider_staleness_returns_wait_receipt() {
+        let candidate = pr(9, "nine", "main", false);
+        let mut status = status(candidate.clone(), Vec::new());
+        status
+            .merge_candidates
+            .push(crate::model::MergeCandidateIdentity {
+                pr: candidate.number,
+                provider_updated_at: "2026-01-01T00:00:00Z".to_owned(),
+                observed_at: "2026-01-01T00:00:01Z".to_owned(),
+                base: candidate.base.clone(),
+                head: candidate.head.clone(),
+                synthetic: None,
+                auto_merge: crate::model::NativeAutoMergeState {
+                    enabled: false,
+                    merge_method: None,
+                    actor: None,
+                },
+                freshness: crate::model::MergeCandidateFreshness::StaleHead,
+                stale_base: false,
+                stale_head: true,
+                stale_reasons: vec!["synthetic head parent is stale".to_owned()],
+            });
+        let output = check_analysis(
+            &status,
+            &CheckInput {
+                pr: Some(9),
+                tail_pr: None,
+                head_pr: None,
+            },
+            &clean_checker,
+        )
+        .expect("provider staleness is an inspectable remote receipt");
+        assert!(!output.eligible);
+        assert_eq!(output.next_action, CandidateNextAction::Wait);
+        assert_eq!(
+            output
+                .merge_candidate
+                .as_ref()
+                .map(|identity| identity.freshness),
+            Some(crate::model::MergeCandidateFreshness::StaleHead)
+        );
+    }
+
+    #[test]
+    fn remote_draft_receipt_waits_on_the_canonical_candidate() {
+        let mut candidate = pr(9, "nine", "main", false);
+        candidate.draft = true;
+        let status = status(candidate, Vec::new());
+        let output = check_analysis(
+            &status,
+            &CheckInput {
+                pr: Some(9),
+                tail_pr: None,
+                head_pr: None,
+            },
+            &clean_checker,
+        )
+        .expect("remote draft rejection is an inspectable receipt");
+        assert!(!output.eligible);
+        assert_eq!(output.next_action, CandidateNextAction::Wait);
+        assert_eq!(output.candidate.number, PrNumber(9));
     }
 
     #[test]
