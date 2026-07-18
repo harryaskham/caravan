@@ -79,7 +79,7 @@
 
         caravan = pkgs.rustPlatform.buildRustPackage {
           pname = "caravan";
-          version = "0.0.1";
+          version = "0.0.2";
           src = caravanSrc;
 
           cargoLock.lockFile = "${caravanSrc}/Cargo.lock";
