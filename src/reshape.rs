@@ -7,7 +7,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::github::{GitHubMutationAdapter, GitHubMutationReceipt, MutationError};
+use crate::github::{
+    ControlLabelAudit, GitHubMutationAdapter, GitHubMutationReceipt, MutationError,
+    control_label_marker,
+};
 use crate::graph::{CompatibilityChecker, GitCompatibilityChecker, analyze};
 use crate::hooks::{self, HookDelivery};
 use crate::membership::MembershipProvider;
@@ -211,6 +214,7 @@ fn execute(
     let mut state = ReshapeState::new(operation, status.analysis.pull_requests.clone());
     match operation {
         ReshapeOperation::Evict => {
+            let before_labels = state.current(number).labels.clone();
             state.ensure_auto_merge_disabled(provider, &status.repository, number)?;
             state.ensure_label_absent(provider, &status.repository, number, FORCE_LABEL)?;
             state.ensure_label_absent(provider, &status.repository, number, ACTIVE_LABEL)?;
@@ -227,6 +231,32 @@ fn execute(
                     state.ensure_auto_merge_disabled(provider, &status.repository, child)?;
                 }
             }
+            let after = state.current(number);
+            let audit = ControlLabelAudit {
+                operation: operation.name().to_owned(),
+                marker: control_label_marker(
+                    operation.name(),
+                    number,
+                    &after.head.oid,
+                    &before_labels,
+                    &after.labels,
+                ),
+                before_labels,
+                after_labels: after.labels.clone(),
+                actor: "authenticated GitHub actor invoked through cara CLI/JSON/MCP".to_owned(),
+                reason: reason.clone().expect("eviction reason validated by caller"),
+                reason_source: "explicit --reason input".to_owned(),
+                compatibility_evidence: "complete resulting-fleet compatibility preflight passed"
+                    .to_owned(),
+                clean_squash_evidence: if plan.creates_head {
+                    "replacement head passed compatibility preflight and has squash auto-merge enabled".to_owned()
+                } else {
+                    "no replacement head required, or replacement remains a non-head with auto-merge disabled".to_owned()
+                },
+                admission_priority_basis:
+                    "not applicable: eviction preserves relative queue priority".to_owned(),
+            };
+            state.ensure_control_label_comment(provider, &status.repository, number, &audit)?;
         }
         ReshapeOperation::Split => {
             state.ensure_base(
@@ -413,8 +443,7 @@ fn virtual_status(
         observed_at: None,
     };
     let analysis = crate::graph::derive(&snapshot);
-    let admission =
-        crate::read::resolve_admission(&analysis, &status.admission.priority_labels);
+    let admission = crate::read::resolve_admission(&analysis, &status.admission.priority_labels);
     StatusOutput {
         timing: None,
         repository: status.repository.clone(),
@@ -601,6 +630,33 @@ impl ReshapeState {
         Ok(())
     }
 
+    fn ensure_control_label_comment(
+        &mut self,
+        provider: &impl MembershipProvider,
+        repository: &crate::model::RepositoryId,
+        number: PrNumber,
+        audit: &ControlLabelAudit,
+    ) -> Result<(), AppError> {
+        let receipt = provider
+            .ensure_control_label_comment(repository, &self.precondition(number), audit)
+            .map_err(|error| comment_provider_error(&error, self))?;
+        let already = receipt
+            .provider_output
+            .as_deref()
+            .is_some_and(|output| output.starts_with("existing GitHub comment"));
+        if already {
+            self.already(
+                MutationKind::Comment,
+                number,
+                "control-label audit comment already present",
+            );
+            self.pull_requests.insert(number, receipt.after);
+        } else {
+            self.record(receipt, "posted durable control-label audit comment");
+        }
+        Ok(())
+    }
+
     fn ensure_squash_auto_merge(
         &mut self,
         provider: &impl MembershipProvider,
@@ -645,6 +701,23 @@ impl ReshapeState {
         self.record(receipt, "disabled auto-merge during reshape");
         Ok(())
     }
+}
+
+fn comment_provider_error(error: &MutationError, state: &ReshapeState) -> AppError {
+    AppError::structured(
+        ErrorCategory::ExecutionFailure,
+        "github_comment_failed",
+        format!("control labels changed but their durable GitHub comment failed: {error}"),
+        Some(json!({
+            "stage": "control_label_comment",
+            "operation_id": state.operation_id,
+            "completed_steps": state.steps,
+            "provider_receipts": state.provider_receipts,
+            "resumable": true,
+            "dedupe": "deterministic GitHub-visible caravan-control-label-audit marker",
+            "next": format!("rediscover and rerun `cara {}`", state.operation.name()),
+        })),
+    )
 }
 
 fn provider_error(error: &MutationError, state: Option<&ReshapeState>) -> AppError {
@@ -788,6 +861,15 @@ mod tests {
             self.mutate(expected, MutationKind::RemoveLabel, |pull_request| {
                 pull_request.labels.remove(label);
             })
+        }
+
+        fn ensure_control_label_comment(
+            &self,
+            _repository: &RepositoryId,
+            expected: &PullRequestPrecondition,
+            _audit: &crate::github::ControlLabelAudit,
+        ) -> Result<GitHubMutationReceipt, MutationError> {
+            self.mutate(expected, MutationKind::Comment, |_| {})
         }
 
         fn enable_squash_auto_merge(

@@ -12,8 +12,8 @@ use serde_json::json;
 
 use crate::command::CommandRunError;
 use crate::github::{
-    CreatePullRequestInput, DiscoveryError, GitHubMutationAdapter, GitHubMutationReceipt,
-    MutationError,
+    ControlLabelAudit, CreatePullRequestInput, DiscoveryError, GitHubMutationAdapter,
+    GitHubMutationReceipt, MutationError, control_label_marker,
 };
 use crate::graph::{CompatibilityChecker, GitCompatibilityChecker};
 use crate::hooks::{self, HookDelivery};
@@ -61,12 +61,15 @@ impl MembershipOperation {
 }
 
 /// Input normalized across the four membership commands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MembershipRequest {
     pub operation: MembershipOperation,
     pub create_pr: bool,
     pub tail_pr: Option<u64>,
     pub head_pr: Option<u64>,
+    pub reason: Option<String>,
+    pub priority_label: Option<String>,
+    pub agent_priority_labels: Vec<String>,
 }
 
 /// Successful, resumable membership result.
@@ -129,6 +132,13 @@ pub trait MembershipProvider {
         repository: &RepositoryId,
         expected: &PullRequestPrecondition,
         label: &str,
+    ) -> Result<GitHubMutationReceipt, MutationError>;
+
+    fn ensure_control_label_comment(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+        audit: &ControlLabelAudit,
     ) -> Result<GitHubMutationReceipt, MutationError>;
 
     fn enable_squash_auto_merge(
@@ -202,6 +212,15 @@ impl<R: crate::command::CommandRunner> MembershipProvider for GitHubMutationAdap
         self.remove_label(repository, expected, label)
     }
 
+    fn ensure_control_label_comment(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+        audit: &ControlLabelAudit,
+    ) -> Result<GitHubMutationReceipt, MutationError> {
+        self.ensure_control_label_comment(repository, expected, audit)
+    }
+
     fn enable_squash_auto_merge(
         &self,
         repository: &RepositoryId,
@@ -223,11 +242,14 @@ impl<R: crate::command::CommandRunner> MembershipProvider for GitHubMutationAdap
 pub fn new(context: &AppContext, input: &CreateInput) -> Result<MembershipOutput, AppError> {
     execute_live(
         context,
-        MembershipRequest {
+        &MembershipRequest {
             operation: MembershipOperation::New,
             create_pr: input.create_pr,
             tail_pr: None,
             head_pr: None,
+            reason: input.reason.clone(),
+            priority_label: input.priority_label.clone(),
+            agent_priority_labels: context.config.agent_priority_labels.clone(),
         },
     )
 }
@@ -236,11 +258,14 @@ pub fn new(context: &AppContext, input: &CreateInput) -> Result<MembershipOutput
 pub fn renew(context: &AppContext, input: &CreateInput) -> Result<MembershipOutput, AppError> {
     execute_live(
         context,
-        MembershipRequest {
+        &MembershipRequest {
             operation: MembershipOperation::Renew,
             create_pr: input.create_pr,
             tail_pr: None,
             head_pr: None,
+            reason: input.reason.clone(),
+            priority_label: input.priority_label.clone(),
+            agent_priority_labels: context.config.agent_priority_labels.clone(),
         },
     )
 }
@@ -249,11 +274,14 @@ pub fn renew(context: &AppContext, input: &CreateInput) -> Result<MembershipOutp
 pub fn join(context: &AppContext, input: &JoinInput) -> Result<MembershipOutput, AppError> {
     execute_live(
         context,
-        MembershipRequest {
+        &MembershipRequest {
             operation: MembershipOperation::Join,
             create_pr: input.create_pr,
             tail_pr: input.tail_pr,
             head_pr: input.head_pr,
+            reason: input.reason.clone(),
+            priority_label: input.priority_label.clone(),
+            agent_priority_labels: context.config.agent_priority_labels.clone(),
         },
     )
 }
@@ -262,18 +290,21 @@ pub fn join(context: &AppContext, input: &JoinInput) -> Result<MembershipOutput,
 pub fn rejoin(context: &AppContext, input: &JoinInput) -> Result<MembershipOutput, AppError> {
     execute_live(
         context,
-        MembershipRequest {
+        &MembershipRequest {
             operation: MembershipOperation::Rejoin,
             create_pr: input.create_pr,
             tail_pr: input.tail_pr,
             head_pr: input.head_pr,
+            reason: input.reason.clone(),
+            priority_label: input.priority_label.clone(),
+            agent_priority_labels: context.config.agent_priority_labels.clone(),
         },
     )
 }
 
 fn execute_live(
     context: &AppContext,
-    request: MembershipRequest,
+    request: &MembershipRequest,
 ) -> Result<MembershipOutput, AppError> {
     let _lock = OperationLock::acquire(&context.repository_path, request.operation.name())?;
     let timeout = std::time::Duration::from_secs(context.config.command_timeout_secs);
@@ -285,10 +316,10 @@ fn execute_live(
     );
     let repository = status.repository.clone();
     let failure_status = status.clone();
-    let mut output = match execute(status, &checker, &provider, request) {
+    let mut output = match execute(status, &checker, &provider, request.clone()) {
         Ok(output) => output,
         Err(error) if request.operation.is_join() => {
-            let event = join_failed_event(&failure_status, &request, &error);
+            let event = join_failed_event(&failure_status, request, &error);
             let error = hooks::attach_events(error, std::slice::from_ref(&event));
             let deliveries = hooks::dispatch_events(context, std::slice::from_ref(&event))?;
             return Err(hooks::attach_deliveries(error, &deliveries));
@@ -343,12 +374,23 @@ fn join_failed_event(
     )
 }
 
+#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 fn execute(
     mut status: StatusOutput,
     checker: &impl CompatibilityChecker,
     provider: &impl MembershipProvider,
     request: MembershipRequest,
 ) -> Result<MembershipOutput, AppError> {
+    if request
+        .reason
+        .as_deref()
+        .is_some_and(|reason| reason.trim().is_empty())
+    {
+        return Err(AppError::validation(
+            "membership_reason_empty",
+            "--reason must contain a non-empty rationale when supplied",
+        ));
+    }
     if request.tail_pr.is_some() && request.head_pr.is_some() {
         return Err(AppError::validation(
             "ambiguous_target",
@@ -363,8 +405,25 @@ fn execute(
         &status.repository,
         &status.default_branch,
         request.operation,
+        &request.agent_priority_labels,
         &state,
     )?;
+    let desired_priority_label = request.priority_label.as_deref().map(str::trim);
+    if let Some(label) = desired_priority_label {
+        if label.is_empty()
+            || !request
+                .agent_priority_labels
+                .iter()
+                .any(|item| item == label)
+        {
+            return Err(AppError::validation(
+                "priority_label_not_configured",
+                format!(
+                    "priority label `{label}` is not an exact configured agent_priority_labels entry"
+                ),
+            ));
+        }
+    }
 
     let target = if request.operation.is_join() {
         Some(resolve_join_target(&status, &request)?)
@@ -422,11 +481,43 @@ fn execute(
         })?;
 
     validate_operation_shape(&candidate, &request, &desired_base)?;
-    preflight_eligibility(&status, &candidate, &request, target.as_ref(), checker)?;
+    let eligibility =
+        preflight_eligibility(&status, &candidate, &request, target.as_ref(), checker)?;
+    let before_labels = candidate.labels.clone();
+    let admission_priority_basis = desired_priority_label.map_or_else(
+        || {
+            status
+                .admission
+                .candidates
+                .iter()
+                .find(|item| item.pr == current_number)
+                .map_or_else(
+                    || "FIFO (oldest eligible PR first); no explicit agent priority".to_owned(),
+                    |item| item.reason.clone(),
+                )
+        },
+        |label| {
+            let rank = request
+                .agent_priority_labels
+                .iter()
+                .position(|item| item == label)
+                .expect("validated label")
+                + 1;
+            format!("explicit configured agent priority label `{label}` (rank {rank}, 1 highest)")
+        },
+    );
     state.current = Some(candidate);
 
     state.ensure_base(provider, &status.repository, &desired_base)?;
     state.ensure_label_absent(provider, &status.repository, FORCE_LABEL)?;
+    for label in &request.agent_priority_labels {
+        if Some(label.as_str()) != desired_priority_label {
+            state.ensure_label_absent(provider, &status.repository, label)?;
+        }
+    }
+    if let Some(label) = desired_priority_label {
+        state.ensure_label_present(provider, &status.repository, label)?;
+    }
     if request.operation.is_renewal() {
         state.ensure_label_absent(provider, &status.repository, EVICTED_LABEL)?;
     }
@@ -436,6 +527,14 @@ fn execute(
     } else {
         state.ensure_squash_auto_merge(provider, &status.repository)?;
     }
+    let audit = membership_audit(
+        &request,
+        &before_labels,
+        &eligibility,
+        state.current.as_ref().expect("current PR"),
+        admission_priority_basis,
+    );
+    state.ensure_control_label_comment(provider, &status.repository, &audit)?;
 
     let receipt = state.operation_receipt();
     let pull_request = state
@@ -635,12 +734,26 @@ fn preflight_repository(
     repository: &RepositoryId,
     default_branch: &str,
     operation: MembershipOperation,
+    priority_labels: &[String],
     state: &ExecutionState,
 ) -> Result<(), AppError> {
     let labels = provider
         .repository_labels(repository)
         .map_err(|error| mutation_error(&error, state))?;
     require_labels(repository, &labels)?;
+    let missing_priorities: Vec<_> = priority_labels
+        .iter()
+        .filter(|label| !labels.contains(*label))
+        .cloned()
+        .collect();
+    if !missing_priorities.is_empty() {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "required_priority_labels_missing",
+            "configured priority labels must exist before mutation",
+            Some(json!({ "repository": repository, "missing_labels": missing_priorities })),
+        ));
+    }
     if !operation.is_join()
         && !provider
             .repository_allows_auto_merge(repository)
@@ -819,6 +932,31 @@ impl ExecutionState {
         Ok(())
     }
 
+    fn ensure_control_label_comment(
+        &mut self,
+        provider: &impl MembershipProvider,
+        repository: &RepositoryId,
+        audit: &ControlLabelAudit,
+    ) -> Result<(), AppError> {
+        let receipt = provider
+            .ensure_control_label_comment(repository, &self.precondition(), audit)
+            .map_err(|error| comment_error(&error, self))?;
+        let already = receipt
+            .provider_output
+            .as_deref()
+            .is_some_and(|output| output.starts_with("existing GitHub comment"));
+        if already {
+            self.already(
+                MutationKind::Comment,
+                "control-label audit comment already present",
+            );
+            self.current = Some(receipt.after);
+        } else {
+            self.record(receipt, "posted durable control-label audit comment");
+        }
+        Ok(())
+    }
+
     fn ensure_squash_auto_merge(
         &mut self,
         provider: &impl MembershipProvider,
@@ -865,6 +1003,98 @@ impl ExecutionState {
         self.record(receipt, "disabled auto-merge");
         Ok(())
     }
+}
+
+fn membership_audit(
+    request: &MembershipRequest,
+    before_labels: &BTreeSet<String>,
+    eligibility: &CheckOutput,
+    after: &PullRequestSnapshot,
+    admission_priority_basis: String,
+) -> ControlLabelAudit {
+    let (reason, source) = request.reason.as_ref().map_or_else(
+        || {
+            let generated = if request.operation.is_join() {
+                if request.tail_pr.is_some() || request.head_pr.is_some() {
+                    "admitted after the explicitly selected caravan target"
+                } else {
+                    "admitted to the only mechanically inferred caravan tail"
+                }
+            } else if request.operation.is_renewal() {
+                "evicted PR passed renewed queue eligibility"
+            } else {
+                "eligible PR admitted as a new caravan"
+            };
+            (
+                generated.to_owned(),
+                "deterministic Caravan policy".to_owned(),
+            )
+        },
+        |reason| {
+            (
+                reason.trim().to_owned(),
+                "explicit --reason input".to_owned(),
+            )
+        },
+    );
+    let compatibility = if eligibility.compatibility.is_empty() {
+        "no new chain edge; repository and graph preflight passed".to_owned()
+    } else {
+        eligibility
+            .compatibility
+            .iter()
+            .map(|report| {
+                format!(
+                    "{}@{} -> {}@{} = {:?}",
+                    report.candidate.name,
+                    report.candidate.oid.0,
+                    report.target.name,
+                    report.target.oid.0,
+                    report.outcome
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    ControlLabelAudit {
+        operation: request.operation.name().to_owned(),
+        marker: control_label_marker(
+            request.operation.name(),
+            after.number,
+            &after.head.oid,
+            before_labels,
+            &after.labels,
+        ),
+        before_labels: before_labels.clone(),
+        after_labels: after.labels.clone(),
+        actor: "authenticated GitHub actor invoked through cara CLI/JSON/MCP".to_owned(),
+        reason,
+        reason_source: source,
+        compatibility_evidence: compatibility,
+        clean_squash_evidence: if request.operation.is_join() {
+            "compatibility check was clean; non-head auto-merge is disabled".to_owned()
+        } else {
+            "compatibility check was clean; squash auto-merge is enabled on the head".to_owned()
+        },
+        admission_priority_basis,
+    }
+}
+
+fn comment_error(error: &MutationError, state: &ExecutionState) -> AppError {
+    AppError::structured(
+        ErrorCategory::ExecutionFailure,
+        "github_comment_failed",
+        format!("control labels changed but their durable GitHub comment failed: {error}"),
+        Some(json!({
+            "stage": "control_label_comment",
+            "operation_id": state.operation_id,
+            "completed_steps": state.steps,
+            "provider_receipts": state.provider_receipts,
+            "resumable": true,
+            "dedupe": "deterministic GitHub-visible caravan-control-label-audit marker",
+            "next": format!("rediscover and rerun `cara {}`", state.operation.name()),
+        })),
+    )
 }
 
 fn mutation_error(error: &MutationError, state: &ExecutionState) -> AppError {
@@ -1050,6 +1280,15 @@ mod tests {
             })
         }
 
+        fn ensure_control_label_comment(
+            &self,
+            _repository: &RepositoryId,
+            expected: &PullRequestPrecondition,
+            _audit: &ControlLabelAudit,
+        ) -> Result<GitHubMutationReceipt, MutationError> {
+            self.mutate(expected, MutationKind::Comment, |_| {})
+        }
+
         fn enable_squash_auto_merge(
             &self,
             _repository: &RepositoryId,
@@ -1167,6 +1406,9 @@ mod tests {
             create_pr: false,
             tail_pr: Some(1),
             head_pr: None,
+            reason: None,
+            priority_label: None,
+            agent_priority_labels: Vec::new(),
         };
         let error = AppError::validation("candidate_rejected", "cannot join");
 
@@ -1192,6 +1434,9 @@ mod tests {
                 create_pr: false,
                 tail_pr: None,
                 head_pr: None,
+                reason: None,
+                priority_label: None,
+                agent_priority_labels: Vec::new(),
             },
         )
         .unwrap();
@@ -1216,6 +1461,9 @@ mod tests {
                 create_pr: false,
                 tail_pr: None,
                 head_pr: None,
+                reason: None,
+                priority_label: None,
+                agent_priority_labels: Vec::new(),
             },
         )
         .unwrap();
@@ -1240,6 +1488,9 @@ mod tests {
                 create_pr: false,
                 tail_pr: None,
                 head_pr: None,
+                reason: None,
+                priority_label: None,
+                agent_priority_labels: Vec::new(),
             },
         )
         .unwrap_err();
@@ -1272,6 +1523,9 @@ mod tests {
                 create_pr: false,
                 tail_pr: None,
                 head_pr: None,
+                reason: None,
+                priority_label: None,
+                agent_priority_labels: Vec::new(),
             },
         )
         .unwrap_err();
@@ -1304,6 +1558,9 @@ mod tests {
                 create_pr: false,
                 tail_pr: None,
                 head_pr: None,
+                reason: None,
+                priority_label: None,
+                agent_priority_labels: Vec::new(),
             },
         )
         .unwrap_err();
@@ -1332,8 +1589,17 @@ mod tests {
             create_pr: false,
             tail_pr: None,
             head_pr: None,
+            reason: None,
+            priority_label: None,
+            agent_priority_labels: Vec::new(),
         };
-        let error = execute(status(candidate, Vec::new()), &clean, &provider, request).unwrap_err();
+        let error = execute(
+            status(candidate, Vec::new()),
+            &clean,
+            &provider,
+            request.clone(),
+        )
+        .unwrap_err();
         let details = mcp_cli::StructuredError::details(&error).unwrap();
         assert!(
             details["provider_receipts"]
@@ -1354,6 +1620,95 @@ mod tests {
             .clone();
         let output = execute(status(partial, Vec::new()), &clean, &provider, request).unwrap();
         assert_eq!(output.pull_request.auto_merge, AutoMergeState::squash());
+    }
+
+    #[test]
+    fn explicit_membership_reason_must_not_be_whitespace() {
+        let candidate = pull_request(1, "one", "main", &[]);
+        let provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
+        let error = execute(
+            status(candidate, Vec::new()),
+            &clean,
+            &provider,
+            MembershipRequest {
+                operation: MembershipOperation::New,
+                create_pr: false,
+                tail_pr: None,
+                head_pr: None,
+                reason: Some("  \n".to_owned()),
+                priority_label: None,
+                agent_priority_labels: Vec::new(),
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), "membership_reason_empty");
+        assert!(!provider.pull_requests.borrow()[&PrNumber(1)].has_label(ACTIVE_LABEL));
+    }
+
+    #[test]
+    fn comment_failure_is_a_resumable_partial_label_mutation() {
+        let candidate = pull_request(1, "one", "main", &[]);
+        let provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
+        *provider.fail_kind.borrow_mut() = Some(MutationKind::Comment);
+        let error = execute(
+            status(candidate, Vec::new()),
+            &clean,
+            &provider,
+            MembershipRequest {
+                operation: MembershipOperation::New,
+                create_pr: false,
+                tail_pr: None,
+                head_pr: None,
+                reason: Some("operator admission".to_owned()),
+                priority_label: None,
+                agent_priority_labels: Vec::new(),
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), "github_comment_failed");
+        let details = error.details().unwrap();
+        assert_eq!(details["stage"], "control_label_comment");
+        assert_eq!(details["resumable"], true);
+        assert!(
+            details["completed_steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|step| step["kind"] == "add_label")
+        );
+    }
+
+    #[test]
+    fn explicit_priority_applies_configured_control_label() {
+        let candidate = pull_request(1, "one", "main", &[]);
+        let mut provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
+        provider.labels.insert("caravan-priority:high".to_owned());
+        let output = execute(
+            status(candidate, Vec::new()),
+            &clean,
+            &provider,
+            MembershipRequest {
+                operation: MembershipOperation::New,
+                create_pr: false,
+                tail_pr: None,
+                head_pr: None,
+                reason: None,
+                priority_label: Some("caravan-priority:high".to_owned()),
+                agent_priority_labels: vec!["caravan-priority:high".to_owned()],
+            },
+        )
+        .unwrap();
+
+        assert!(output.pull_request.has_label("caravan-priority:high"));
+        assert!(
+            output
+                .receipt
+                .completed_steps
+                .iter()
+                .any(|step| step.kind == MutationKind::Comment)
+        );
     }
 
     #[test]
@@ -1403,6 +1758,9 @@ mod tests {
                 create_pr: false,
                 tail_pr: Some(1),
                 head_pr: None,
+                reason: None,
+                priority_label: None,
+                agent_priority_labels: Vec::new(),
             },
         )
         .unwrap();
