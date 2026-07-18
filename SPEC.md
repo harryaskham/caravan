@@ -19,6 +19,14 @@ Order is head → tail. `next` moves toward the tail; `prev` moves toward the he
 
 A PR with `caravan-evicted` is excluded and cannot use `new` or `join`. It must use `renew` or `rejoin`.
 
+### Automatic admission order
+
+GitHub is authoritative for automatic admission. `.caravan/config.yaml` lists `agent_priority_labels` from highest to lowest priority. Unqueued, non-draft admission attempts with an explicit configured label precede lower-priority and unlabelled attempts. Ties, including all candidates without an explicit priority, are FIFO by immutable GitHub `createdAt` ascending. PR number ascending is only the deterministic equal-time tie-break (and legacy missing-time fallback after timestamped peers). Head commit/author timestamps and PR updated time never affect position: pushes and rebases cannot reset queue age. Automatic admission is never LIFO.
+
+`status`, JSON, MCP, and `next-candidate` expose the same complete ordered attempt list, the resolved label/rank, and a reason for every candidate. This is a selection contract, not a claim that candidate/default and cross-caravan compatibility preflight has passed. Automation must select the canonical first attempt, run `cara check` and the corresponding `new`/`join` preflight, and must not re-sort or leapfrog it if preflight rejects it. The oldest selected eligible PR becomes a new head targeting the default branch; each later selected eligible PR appends at the tail. Rejection fails closed: repair or explicitly change the PR's GitHub state/labels, then rediscover the canonical list. More than one configured priority label on a PR, or any unknown `caravan-priority:*` label, also fails closed and excludes that PR with an explicit rejection reason.
+
+An operator may override this automatic order for an explicit canary selection only by supplying a non-empty reason and recording that reason as a comment on the selected PR. A canary override does not alter the automatic policy or the canonical order subsequently reported by Caravan.
+
 Caravan v1 requires member head branches to exist in the base repository: GitHub cannot target a PR at a fork-only branch.
 
 ## 2. Graph invariants
@@ -68,9 +76,12 @@ All commands are non-interactive.
   unreadable files are bounded errors and are never merged or overwritten.
 - Init preflights repository write capability, squash auto-merge support, and
   default-branch protection with a required check or review policy. It creates
-  exactly `caravan` (`5319E7`, active member), `caravan-evicted` (`B60205`,
-  evicted member), and `caravan-force` (`D93F0B`, operator force exception),
-  with their canonical descriptions.
+  `caravan` (`5319E7`, active member), `caravan-evicted` (`B60205`, evicted
+  member), and `caravan-force` (`D93F0B`, operator force exception), plus every
+  configured `agent_priority_labels` entry in configured order. Priority-label
+  colors come from the stable rank palette `B60205`, `D93F0B`, `FBCA04`,
+  `0E8A16`, `1D76DB`, `5319E7` (cycling for additional ranks), and descriptions
+  identify the one-based rank and highest-priority direction.
 - Exact existing labels no-op. The historical active-label definition
   `1D76DB` / `Active member of a Caravan merge chain` is also compatible and
   preserved byte-for-byte; receipts report its actual metadata. No other
@@ -84,7 +95,8 @@ All commands are non-interactive.
 
 ### Inspection
 
-- `cara status` — repository overview: current PR, all caravans, unqueued ready PRs, invalid graph fragments, and pending decision points.
+- `cara status` — repository overview: current PR, all caravans, the canonical priority-then-FIFO admission list with per-PR reasons, invalid graph fragments, and pending decision points.
+- `cara next-candidate` — return the same canonical first ordered admission attempt and complete reasoning without mutation; it explicitly requires subsequent membership preflight and never authorizes leapfrogging a rejected first attempt.
 - `cara show` — print the current PR's whole caravan and highlight its position.
 - `cara check` — no-update validation. For an active member, check its whole caravan and fleet invariants. Otherwise check whether `new` would succeed.
 - `cara check --tail-pr N` — check whether the current PR can join after tail `N`.
@@ -253,6 +265,10 @@ Minimal config shape:
 ```yaml
 version: 1
 force_merge: false
+agent_priority_labels:
+  - caravan-priority:high
+  - caravan-priority:normal
+  - caravan-priority:low
 command_timeout_secs: 30
 loop:
   interval_secs: 60

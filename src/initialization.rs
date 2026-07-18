@@ -14,36 +14,58 @@ use crate::model::RepositoryId;
 use crate::{AppContext, AppError};
 
 /// Canonical repository label managed by Caravan.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequiredLabel {
-    pub name: &'static str,
-    pub color: &'static str,
-    pub description: &'static str,
+    pub name: String,
+    pub color: String,
+    pub description: String,
 }
 
-/// The complete and deliberately small set of labels Caravan requires.
-pub const REQUIRED_LABELS: [RequiredLabel; 3] = [
+fn required_label(name: &str, color: &str, description: impl Into<String>) -> RequiredLabel {
     RequiredLabel {
-        name: "caravan",
-        color: "5319E7",
-        description: "Active member of a Caravan PR chain",
-    },
-    RequiredLabel {
-        name: "caravan-evicted",
-        color: "B60205",
-        description: "Removed from a Caravan chain pending renew or rejoin",
-    },
-    RequiredLabel {
-        name: "caravan-force",
-        color: "D93F0B",
-        description: "Allow configured force handling for known CI failures",
-    },
-];
+        name: name.to_owned(),
+        color: color.to_owned(),
+        description: description.into(),
+    }
+}
+
+/// Complete deterministic label policy: fixed membership labels followed by
+/// configured highest-to-lowest admission-priority labels.
+#[must_use]
+pub fn required_labels(priority_labels: &[String]) -> Vec<RequiredLabel> {
+    let mut labels = vec![
+        required_label("caravan", "5319E7", "Active member of a Caravan PR chain"),
+        required_label(
+            "caravan-evicted",
+            "B60205",
+            "Removed from a Caravan chain pending renew or rejoin",
+        ),
+        required_label(
+            "caravan-force",
+            "D93F0B",
+            "Allow configured force handling for known CI failures",
+        ),
+    ];
+    const PRIORITY_COLORS: [&str; 6] = [
+        "B60205", "D93F0B", "FBCA04", "0E8A16", "1D76DB", "5319E7",
+    ];
+    labels.extend(priority_labels.iter().enumerate().map(|(rank, name)| {
+        required_label(
+            name,
+            PRIORITY_COLORS[rank % PRIORITY_COLORS.len()],
+            format!(
+                "Caravan automatic admission priority rank {} (1 highest)",
+                rank + 1
+            ),
+        )
+    }));
+    labels
+}
 
 const LEGACY_ACTIVE_COLOR: &str = "1D76DB";
 const LEGACY_ACTIVE_DESCRIPTION: &str = "Active member of a Caravan merge chain";
 
-const DEFAULT_CONFIG: &str = "version: 1\nforce_merge: false\ncommand_timeout_secs: 30\nloop:\n  interval_secs: 60\nhooks: {}\n";
+const DEFAULT_CONFIG: &str = "version: 1\nforce_merge: false\nagent_priority_labels:\n  - caravan-priority:high\n  - caravan-priority:normal\n  - caravan-priority:low\ncommand_timeout_secs: 30\nloop:\n  interval_secs: 60\njournal:\n  max_bytes: 8388608\n  max_archives: 3\nhooks: {}\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -125,7 +147,7 @@ pub trait InitializationProvider {
     fn create_label(
         &self,
         repository: &RepositoryId,
-        label: RequiredLabel,
+        label: &RequiredLabel,
     ) -> Result<(), MutationError>;
 }
 
@@ -156,27 +178,35 @@ impl<R: crate::command::CommandRunner> InitializationProvider for GitHubMutation
     fn create_label(
         &self,
         repository: &RepositoryId,
-        label: RequiredLabel,
+        label: &RequiredLabel,
     ) -> Result<(), MutationError> {
-        self.create_repository_label(repository, label.name, label.color, label.description)
+        self.create_repository_label(
+            repository,
+            &label.name,
+            &label.color,
+            &label.description,
+        )
     }
 }
 
 /// Inspect labels without mutation. Existing metadata is compared exactly
 /// (colors are hexadecimal and therefore case-insensitive).
 #[must_use]
-pub fn inspect_labels(labels: &[RepositoryLabel]) -> InitializationStatus {
+pub fn inspect_labels(
+    labels: &[RepositoryLabel],
+    priority_labels: &[String],
+) -> InitializationStatus {
     let by_name: BTreeMap<_, _> = labels
         .iter()
         .map(|label| (label.name.as_str(), label))
         .collect();
     let mut missing = Vec::new();
     let mut mismatched = Vec::new();
-    for required in REQUIRED_LABELS {
-        match by_name.get(required.name) {
-            None => missing.push(required.name.to_owned()),
-            Some(actual) if !label_matches(actual, required) => {
-                mismatched.push(required.name.to_owned());
+    for required in required_labels(priority_labels) {
+        match by_name.get(required.name.as_str()) {
+            None => missing.push(required.name.clone()),
+            Some(actual) if !label_matches(actual, &required) => {
+                mismatched.push(required.name.clone());
             }
             Some(_) => {}
         }
@@ -285,10 +315,11 @@ pub fn init_with_provider(
         ));
     }
 
+    let required = required_labels(&context.config.agent_priority_labels);
     let initial = provider.labels(repository).map_err(provider_error)?;
-    reject_mismatches(repository, &initial)?;
+    reject_mismatches(repository, &initial, &required)?;
     let mut receipts = Vec::new();
-    for required in REQUIRED_LABELS {
+    for required in &required {
         let current = provider.labels(repository).map_err(provider_error)?;
         if let Some(actual) = current.iter().find(|label| label.name == required.name) {
             if !label_matches(actual, required) {
@@ -411,8 +442,9 @@ fn validate_existing_config(path: &std::path::Path) -> Result<(), AppError> {
 fn reject_mismatches(
     repository: &RepositoryId,
     labels: &[RepositoryLabel],
+    required_labels: &[RequiredLabel],
 ) -> Result<(), AppError> {
-    for required in REQUIRED_LABELS {
+    for required in required_labels {
         if let Some(actual) = labels.iter().find(|label| label.name == required.name) {
             if !label_matches(actual, required) {
                 return Err(mismatch_error(repository, actual, required));
@@ -422,9 +454,9 @@ fn reject_mismatches(
     Ok(())
 }
 
-fn label_matches(actual: &RepositoryLabel, required: RequiredLabel) -> bool {
-    let canonical = actual.color.eq_ignore_ascii_case(required.color)
-        && actual.description.as_deref() == Some(required.description);
+fn label_matches(actual: &RepositoryLabel, required: &RequiredLabel) -> bool {
+    let canonical = actual.color.eq_ignore_ascii_case(&required.color)
+        && actual.description.as_deref() == Some(required.description.as_str());
     let legacy_active = required.name == "caravan"
         && actual.color.eq_ignore_ascii_case(LEGACY_ACTIVE_COLOR)
         && actual.description.as_deref() == Some(LEGACY_ACTIVE_DESCRIPTION);
@@ -443,7 +475,7 @@ fn label_receipt_actual(label: &RepositoryLabel, state: ResourceState) -> LabelR
 fn mismatch_error(
     repository: &RepositoryId,
     actual: &RepositoryLabel,
-    expected: RequiredLabel,
+    expected: &RequiredLabel,
 ) -> AppError {
     AppError::structured(
         ErrorCategory::Validation,
@@ -543,7 +575,7 @@ mod tests {
         fn create_label(
             &self,
             _: &RepositoryId,
-            label: RequiredLabel,
+            label: &RequiredLabel,
         ) -> Result<(), MutationError> {
             let mut labels = self.labels.lock().unwrap();
             if !labels.iter().any(|actual| actual.name == label.name) {
@@ -560,12 +592,16 @@ mod tests {
         }
     }
 
-    fn canonical(label: RequiredLabel) -> RepositoryLabel {
+    fn canonical(label: &RequiredLabel) -> RepositoryLabel {
         RepositoryLabel {
             name: label.name.to_owned(),
             color: label.color.to_owned(),
             description: Some(label.description.to_owned()),
         }
+    }
+
+    fn required() -> Vec<RequiredLabel> {
+        required_labels(&crate::config::CaravanConfig::default().agent_priority_labels)
     }
 
     fn repository() -> RepositoryId {
@@ -599,11 +635,40 @@ mod tests {
                 .required_status_checks,
             ["Check & Lint"]
         );
+        assert_eq!(first.labels.len(), 6);
+        assert_eq!(
+            first
+                .labels
+                .iter()
+                .map(|receipt| receipt.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "caravan",
+                "caravan-evicted",
+                "caravan-force",
+                "caravan-priority:high",
+                "caravan-priority:normal",
+                "caravan-priority:low",
+            ]
+        );
         assert!(
             first
                 .labels
                 .iter()
                 .all(|receipt| receipt.state == ResourceState::Created)
+        );
+        assert_eq!(first.labels[3].color, "B60205");
+        assert_eq!(first.labels[4].color, "D93F0B");
+        assert_eq!(first.labels[5].color, "FBCA04");
+        assert_eq!(
+            first.labels[3].description,
+            "Caravan automatic admission priority rank 1 (1 highest)"
+        );
+        let generated = crate::config::CaravanConfig::load(&directory.path().join(".caravan/config.yaml"))
+            .unwrap();
+        assert_eq!(
+            generated.agent_priority_labels,
+            crate::config::CaravanConfig::default().agent_priority_labels
         );
 
         let mut replay_context = context(&directory);
@@ -661,7 +726,8 @@ mod tests {
     #[test]
     fn partial_repository_creates_only_missing_labels() {
         let directory = tempfile::tempdir().unwrap();
-        let provider = FakeProvider::new(vec![canonical(REQUIRED_LABELS[0])]);
+        let required = required();
+        let provider = FakeProvider::new(vec![canonical(&required[0])]);
         let output =
             init_with_provider(&context(&directory), &repository(), "main", &provider).unwrap();
         assert_eq!(output.labels[0].state, ResourceState::AlreadyPresent);
@@ -670,12 +736,42 @@ mod tests {
     }
 
     #[test]
+    fn missing_priority_labels_are_created_then_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        let required = required();
+        let fixed = required[..3].iter().map(canonical).collect();
+        let provider = FakeProvider::new(fixed);
+
+        let first =
+            init_with_provider(&context(&directory), &repository(), "main", &provider).unwrap();
+        assert!(first.labels[..3]
+            .iter()
+            .all(|receipt| receipt.state == ResourceState::AlreadyPresent));
+        assert!(first.labels[3..]
+            .iter()
+            .all(|receipt| receipt.state == ResourceState::Created));
+
+        let mut replay_context = context(&directory);
+        replay_context.config_existed = true;
+        let replay =
+            init_with_provider(&replay_context, &repository(), "main", &provider).unwrap();
+        assert!(replay
+            .labels
+            .iter()
+            .all(|receipt| receipt.state == ResourceState::AlreadyPresent));
+    }
+
+    #[test]
     fn legacy_active_label_is_ready_and_receipt_preserves_actual_metadata() {
         let directory = tempfile::tempdir().unwrap();
-        let mut labels: Vec<_> = REQUIRED_LABELS.into_iter().map(canonical).collect();
+        let mut labels: Vec<_> = required().iter().map(canonical).collect();
         labels[0].color = LEGACY_ACTIVE_COLOR.to_owned();
         labels[0].description = Some(LEGACY_ACTIVE_DESCRIPTION.to_owned());
-        assert!(inspect_labels(&labels).ready);
+        assert!(inspect_labels(
+            &labels,
+            &crate::config::CaravanConfig::default().agent_priority_labels,
+        )
+        .ready);
         let provider = FakeProvider::new(labels);
         let output =
             init_with_provider(&context(&directory), &repository(), "main", &provider).unwrap();
@@ -711,7 +807,7 @@ mod tests {
         let output =
             init_with_provider(&context(&directory), &repository(), "main", &provider).unwrap();
         assert!(output.ready);
-        assert_eq!(provider.labels.lock().unwrap().len(), 3);
+        assert_eq!(provider.labels.lock().unwrap().len(), required().len());
     }
 
     #[test]
@@ -768,17 +864,27 @@ mod tests {
 
     #[test]
     fn read_only_inventory_reports_missing_and_mismatch() {
+        let required = required();
         let labels = vec![
-            canonical(REQUIRED_LABELS[0]),
+            canonical(&required[0]),
             RepositoryLabel {
-                name: REQUIRED_LABELS[1].name.to_owned(),
+                name: required[1].name.clone(),
                 color: "000000".to_owned(),
                 description: None,
             },
         ];
-        let status = inspect_labels(&labels);
+        let priorities = crate::config::CaravanConfig::default().agent_priority_labels;
+        let status = inspect_labels(&labels, &priorities);
         assert!(!status.ready);
-        assert_eq!(status.missing_labels, ["caravan-force"]);
+        assert_eq!(
+            status.missing_labels,
+            [
+                "caravan-force",
+                "caravan-priority:high",
+                "caravan-priority:normal",
+                "caravan-priority:low",
+            ]
+        );
         assert_eq!(status.mismatched_labels, ["caravan-evicted"]);
         assert!(status.next.unwrap().contains("cara init"));
     }

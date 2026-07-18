@@ -1636,6 +1636,7 @@ mod tests {
             labels: BTreeSet::from(["caravan".to_owned()]),
             auto_merge,
             checks: Vec::<CheckSnapshot>::new(),
+            created_at: Some(format!("2026-01-01T00:00:{number:02}Z")),
             merged_at: (state == PullRequestState::Merged).then(|| "now".to_owned()),
             updated_at: None,
         }
@@ -1701,6 +1702,10 @@ mod tests {
             current_pr: snapshot.current_pr,
             healthy: analysis.healthy(),
             initialization: crate::initialization::InitializationStatus::default(),
+            admission: read::resolve_admission(
+                &analysis,
+                &crate::config::CaravanConfig::default().agent_priority_labels,
+            ),
             analysis,
         }
     }

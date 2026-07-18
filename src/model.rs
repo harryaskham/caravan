@@ -156,6 +156,9 @@ pub struct PullRequestSnapshot {
     pub auto_merge: AutoMergeState,
     #[serde(default)]
     pub checks: Vec<CheckSnapshot>,
+    /// Immutable provider creation time used for FIFO admission ordering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merged_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -538,6 +541,7 @@ mod tests {
             labels: BTreeSet::from(["caravan".to_owned()]),
             auto_merge: AutoMergeState::squash(),
             checks: Vec::new(),
+            created_at: Some("2026-01-01T00:00:00Z".to_owned()),
             merged_at: None,
             updated_at: None,
         }

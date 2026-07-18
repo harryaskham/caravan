@@ -516,6 +516,7 @@ mod tests {
                 AutoMergeState::disabled()
             },
             checks: Vec::<CheckSnapshot>::new(),
+            created_at: Some(format!("2026-01-01T00:00:{number:02}Z")),
             merged_at: None,
             updated_at: None,
         }

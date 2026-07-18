@@ -14,7 +14,7 @@ use crate::model::{
     PrNumber, PullRequestPrecondition, RepositoryId,
 };
 
-const PR_JSON_FIELDS: &str = "number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository,baseRefName,baseRefOid,labels,autoMergeRequest,statusCheckRollup,mergedAt,url,updatedAt";
+const PR_JSON_FIELDS: &str = "number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository,baseRefName,baseRefOid,labels,autoMergeRequest,statusCheckRollup,createdAt,mergedAt,url,updatedAt";
 const WORKFLOW_RUN_JSON_FIELDS: &str =
     "databaseId,headSha,status,conclusion,event,name,workflowName,url";
 
@@ -1445,6 +1445,7 @@ struct PullRequestJson {
     auto_merge_request: Option<AutoMergeJson>,
     #[serde(default)]
     status_check_rollup: Vec<CheckJson>,
+    created_at: String,
     merged_at: Option<String>,
     url: String,
     updated_at: String,
@@ -1507,6 +1508,7 @@ impl PullRequestJson {
                 .into_iter()
                 .map(CheckJson::into_snapshot)
                 .collect(),
+            created_at: Some(self.created_at),
             merged_at: self.merged_at,
             updated_at: Some(self.updated_at),
         })
@@ -1674,12 +1676,12 @@ mod tests {
 
     fn pr_list_json(number: u64, branch: &str, repository: &str, cross_repo: bool) -> String {
         format!(
-            r#"[{{"number":{number},"title":"Queue change {number}","state":"OPEN","isDraft":false,"headRefName":"{branch}","headRefOid":"head-{number}","headRepository":{{"name":"widgets","nameWithOwner":"{repository}"}},"headRepositoryOwner":{{"login":"acme"}},"isCrossRepository":{cross_repo},"baseRefName":"main","baseRefOid":"base-{number}","labels":[{{"name":"caravan"}}],"autoMergeRequest":{{"mergeMethod":"SQUASH","enabledAt":"2026-07-17T10:00:00Z","enabledBy":{{"login":"octocat"}}}},"statusCheckRollup":[{{"__typename":"CheckRun","name":"test","context":null,"status":"COMPLETED","conclusion":"SUCCESS","state":null,"workflowName":"CI","detailsUrl":"https://example.test/check","targetUrl":null}}],"mergedAt":null,"url":"https://example.test/pr/{number}","updatedAt":"2026-07-17T11:00:00Z"}}]"#
+            r#"[{{"number":{number},"title":"Queue change {number}","state":"OPEN","isDraft":false,"headRefName":"{branch}","headRefOid":"head-{number}","headRepository":{{"name":"widgets","nameWithOwner":"{repository}"}},"headRepositoryOwner":{{"login":"acme"}},"isCrossRepository":{cross_repo},"baseRefName":"main","baseRefOid":"base-{number}","labels":[{{"name":"caravan"}}],"autoMergeRequest":{{"mergeMethod":"SQUASH","enabledAt":"2026-07-17T10:00:00Z","enabledBy":{{"login":"octocat"}}}},"statusCheckRollup":[{{"__typename":"CheckRun","name":"test","context":null,"status":"COMPLETED","conclusion":"SUCCESS","state":null,"workflowName":"CI","detailsUrl":"https://example.test/check","targetUrl":null}}],"createdAt":"2026-07-17T10:00:00Z","mergedAt":null,"url":"https://example.test/pr/{number}","updatedAt":"2026-07-17T11:00:00Z"}}]"#
         )
     }
 
     fn merged_pr_json() -> &'static str {
-        r#"[{"number":9,"title":"Merged queue change","state":"MERGED","isDraft":false,"headRefName":"old-head","headRefOid":"head-9","headRepository":{"name":"widgets","nameWithOwner":"acme/widgets"},"headRepositoryOwner":{"login":"acme"},"isCrossRepository":false,"baseRefName":"main","baseRefOid":"base-9","labels":[{"name":"caravan"}],"autoMergeRequest":null,"statusCheckRollup":[{"__typename":"StatusContext","name":null,"context":"legacy-ci","status":null,"conclusion":null,"state":"SUCCESS","workflowName":null,"detailsUrl":null,"targetUrl":"https://example.test/status"}],"mergedAt":"2026-07-17T09:00:00Z","url":"https://example.test/pr/9","updatedAt":"2026-07-17T09:00:00Z"}]"#
+        r#"[{"number":9,"title":"Merged queue change","state":"MERGED","isDraft":false,"headRefName":"old-head","headRefOid":"head-9","headRepository":{"name":"widgets","nameWithOwner":"acme/widgets"},"headRepositoryOwner":{"login":"acme"},"isCrossRepository":false,"baseRefName":"main","baseRefOid":"base-9","labels":[{"name":"caravan"}],"autoMergeRequest":null,"statusCheckRollup":[{"__typename":"StatusContext","name":null,"context":"legacy-ci","status":null,"conclusion":null,"state":"SUCCESS","workflowName":null,"detailsUrl":null,"targetUrl":"https://example.test/status"}],"createdAt":"2026-07-17T08:00:00Z","mergedAt":"2026-07-17T09:00:00Z","url":"https://example.test/pr/9","updatedAt":"2026-07-17T09:00:00Z"}]"#
     }
 
     fn pr_object_json(number: u64, branch: &str, repository: &str) -> String {
@@ -1726,6 +1728,7 @@ mod tests {
         assert_eq!(open.head.oid, CommitOid("head-12".into()));
         assert_eq!(open.base.oid, CommitOid("base-12".into()));
         assert_eq!(open.auto_merge, AutoMergeState::squash());
+        assert_eq!(open.created_at.as_deref(), Some("2026-07-17T10:00:00Z"));
         assert_eq!(open.checks[0].state, CheckState::Success);
         assert_eq!(open.checks[0].provider_state.as_deref(), Some("SUCCESS"));
         let merged = snapshot

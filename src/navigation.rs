@@ -579,6 +579,7 @@ mod tests {
                 AutoMergeState::disabled()
             },
             checks: Vec::new(),
+            created_at: Some(format!("2026-01-01T00:00:{number:02}Z")),
             merged_at: None,
             updated_at: None,
         }
@@ -601,6 +602,13 @@ mod tests {
             current_pr: Some(PrNumber(current)),
             healthy: true,
             initialization: crate::initialization::InitializationStatus::default(),
+            admission: crate::read::AdmissionStatus {
+                policy: "priority then FIFO".to_owned(),
+                priority_labels: Vec::new(),
+                candidates: Vec::new(),
+                rejected: Vec::new(),
+                next_candidate: None,
+            },
             analysis: GraphAnalysis {
                 fleet: CaravanFleet {
                     repository: repository(),
@@ -800,6 +808,7 @@ mod tests {
             labels: BTreeSet::from(["caravan".to_owned()]),
             auto_merge: AutoMergeState::disabled(),
             checks: Vec::new(),
+            created_at: Some("2026-01-01T00:00:02Z".to_owned()),
             merged_at: None,
             updated_at: None,
         };
