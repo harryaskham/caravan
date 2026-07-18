@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en" data-theme="auto">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#f6f1e6" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#111a19" media="(prefers-color-scheme: dark)">
+  <title>Caravan — A merge queue that keeps agents moving</title>
+  <meta name="description" content="Caravan is a deterministic, agent-friendly merge queue built directly on GitHub pull-request topology—no queue database required.">
+  <link rel="canonical" href="https://a.skh.am/caravan/">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Caravan — Keep the whole convoy moving">
+  <meta property="og:description" content="A deterministic, agent-friendly merge queue built on GitHub topology.">
+  <meta property="og:url" content="https://a.skh.am/caravan/">
+  <meta property="og:image" content="https://a.skh.am/caravan/assets/og-caravan.svg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="A bright orange lead vehicle pulling a convoy along a winding road">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="icon" href="/caravan/assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/caravan/assets/styles.css">
+  <script src="/caravan/assets/site.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="/caravan/" aria-label="Caravan home">
+      <svg aria-hidden="true" viewBox="0 0 56 32"><path d="M4 22h34l7-11h7v14H4z"/><circle cx="15" cy="26" r="4"/><circle cx="43" cy="26" r="4"/></svg>
+      <span>CARAVAN</span>
+    </a>
+    <nav aria-label="Primary navigation">
+      <a href="#model">Model</a><a href="#loop">Loop</a><a href="#install">Install</a>
+      <a class="nav-github" href="https://github.com/harryaskham/caravan">GitHub <span aria-hidden="true">↗</span></a>
+    </nav>
+  </header>
+
+  <main id="main">
+    <section class="hero" aria-labelledby="hero-title">
+      <div class="hero-copy">
+        <p class="eyebrow"><span></span> GitHub-native merge movement</p>
+        <h1 id="hero-title">Keep the whole<br><em>convoy moving.</em></h1>
+        <p class="lede">Caravan is a deterministic merge queue for people and agents. It turns pull-request topology into a safe, visible chain—without inventing another database.</p>
+        <div class="hero-actions">
+          <a class="button primary" href="#install">Get on the road <span aria-hidden="true">→</span></a>
+          <a class="button secondary" href="https://github.com/harryaskham/caravan/blob/main/SPEC.md">Read the specification</a>
+        </div>
+        <dl class="hero-facts">
+          <div><dt>Source of truth</dt><dd>GitHub</dd></div>
+          <div><dt>Queue state</dt><dd>PR topology</dd></div>
+          <div><dt>Agent surface</dt><dd>CLI · JSON · MCP</dd></div>
+        </dl>
+      </div>
+
+      <div class="road-scene" aria-label="An illustrated convoy of pull requests rolling toward main">
+        <div class="sun" aria-hidden="true"></div>
+        <div class="cloud cloud-one" aria-hidden="true"></div><div class="cloud cloud-two" aria-hidden="true"></div>
+        <div class="ridge ridge-back" aria-hidden="true"></div><div class="ridge ridge-front" aria-hidden="true"></div>
+        <div class="road" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+        <div class="convoy" aria-hidden="true">
+          <div class="vehicle lead"><b>MAIN</b><span class="cab"></span><span class="wheel w1"></span><span class="wheel w2"></span></div>
+          <span class="hitch"></span>
+          <div class="vehicle trailer t1"><b>PR 42</b><span class="wheel w1"></span><span class="wheel w2"></span></div>
+          <span class="hitch"></span>
+          <div class="vehicle trailer t2"><b>PR 43</b><span class="wheel w1"></span><span class="wheel w2"></span></div>
+        </div>
+        <p class="scene-label"><span></span> HEAD IS CLEAR <b>→ ROLL</b></p>
+      </div>
+    </section>
+
+    <section class="manifesto" aria-label="Caravan principle">
+      <p>One chain. Exact evidence.<br><strong>No mystery state.</strong></p>
+      <div class="manifesto-mark" aria-hidden="true">C/<sup>01</sup></div>
+    </section>
+
+    <section class="section model" id="model" aria-labelledby="model-title">
+      <div class="section-heading">
+        <p class="kicker">01 / The topology is the queue</p>
+        <h2 id="model-title">Nothing hiding<br>behind GitHub.</h2>
+        <p>A caravan is simply a linear chain of open pull requests. Every member carries the <code>caravan</code> label; each PR targets the branch ahead of it. The head alone targets the default branch and holds squash auto-merge.</p>
+      </div>
+      <div class="topology" role="img" aria-label="Pull request 42 at the head, followed by pull requests 43 and 44 at the tail">
+        <div class="branch main-branch"><span>main</span><b></b></div>
+        <div class="topology-line"></div>
+        <article class="pr-card head-card"><small>HEAD · CARAVAN 42</small><strong>#42</strong><p>targets <code>main</code></p><span class="status ready">READY</span></article>
+        <article class="pr-card"><small>MEMBER</small><strong>#43</strong><p>targets <code>feature/42</code></p><span class="status">WAITING</span></article>
+        <article class="pr-card"><small>TAIL</small><strong>#44</strong><p>targets <code>feature/43</code></p><span class="status">WAITING</span></article>
+      </div>
+    </section>
+
+    <section class="section loop-section" id="loop" aria-labelledby="loop-title">
+      <div class="section-heading light">
+        <p class="kicker">02 / The operating loop</p>
+        <h2 id="loop-title">Mechanical work rolls.<br>Judgment stops.</h2>
+        <p>Every tick rediscovers GitHub state. Caravan advances what it can prove, then returns a typed, resumable decision whenever semantics need a person or agent.</p>
+      </div>
+      <ol class="loop-grid">
+        <li><span>01</span><div><h3>Discover</h3><p>Read branches, labels, checks, bases, and exact revisions fresh from GitHub.</p></div></li>
+        <li><span>02</span><div><h3>Prove</h3><p>Validate graph shape, mechanical compatibility, CI, and cross-convoy safety.</p></div></li>
+        <li><span>03</span><div><h3>Move</h3><p>Keep auto-merge on the head, advance merged chains, and preserve ordering.</p></div></li>
+        <li class="decision"><span>04</span><div><h3>Hand off judgment</h3><p>Conflict or failed CI? Return exact evidence and safe next commands—never guess.</p></div></li>
+      </ol>
+      <div class="command-strip"><span>$</span><code>cara loop --once --json</code><button type="button" data-copy="cara loop --once --json">Copy</button></div>
+    </section>
+
+    <section class="section evidence" aria-labelledby="evidence-title">
+      <div class="section-heading">
+        <p class="kicker">03 / Evidence over optimism</p>
+        <h2 id="evidence-title">Safe by construction.<br>Legible by default.</h2>
+      </div>
+      <div class="feature-grid">
+        <article><div class="feature-icon">⌁</div><h3>Mechanical compatibility</h3><p>Non-mutating merge proofs use exact head and base revisions. No history rewrite just to test a theory.</p></article>
+        <article><div class="feature-icon">{ }</div><h3>Typed decisions</h3><p>Human output stays concise while JSON and MCP receive stable errors, evidence, and resumable commands.</p></article>
+        <article><div class="feature-icon">↻</div><h3>Idempotent recovery</h3><p>Interrupted operations resume from rediscovered GitHub state—not a fragile local cursor.</p></article>
+        <article><div class="feature-icon">◎</div><h3>Canonical events</h3><p>A bounded, secret-free journal records transitions and hook receipts in shared Git metadata.</p></article>
+        <article><div class="feature-icon">⇄</div><h3>Three equal surfaces</h3><p>The human CLI, stable JSON envelopes, and MCP tools all route through one typed library path.</p></article>
+        <article><div class="feature-icon">◇</div><h3>Force is still proof</h3><p>Known CI failures may be accepted, but conflicts, stale revisions, and permissions are never bypassed.</p></article>
+      </div>
+    </section>
+
+    <section class="section commands" aria-labelledby="commands-title">
+      <div class="section-heading compact"><p class="kicker">04 / Command map</p><h2 id="commands-title">From first PR<br>to open road.</h2></div>
+      <div class="route-map">
+        <div><span>START</span><code>cara check</code><p>Prove the current PR can travel.</p></div>
+        <i aria-hidden="true">→</i>
+        <div><span>JOIN</span><code>cara new</code><p>Lead a convoy—or <code>cara join</code> a tail.</p></div>
+        <i aria-hidden="true">→</i>
+        <div><span>ROLL</span><code>cara sync</code><p>Advance safe work and expose decisions.</p></div>
+        <i aria-hidden="true">→</i>
+        <div><span>OBSERVE</span><code>cara status</code><p>See the entire fleet and its evidence.</p></div>
+      </div>
+    </section>
+
+    <section class="section integration" aria-labelledby="integration-title">
+      <div class="integration-copy">
+        <p class="kicker">Built for agent traffic</p>
+        <h2 id="integration-title">Caravan ×<br>Cacophony</h2>
+        <p>Caravan owns bounded GitHub queue mechanics. Cacophony listens to typed hooks, sends the right specialist to a decision point, and schedules another sync. Authority stays crisp: Caravan never pretends to be the agent runtime.</p>
+        <a href="https://github.com/harryaskham/cacophony">Explore Cacophony <span aria-hidden="true">↗</span></a>
+      </div>
+      <pre aria-label="Example Caravan hook configuration"><code><span>hooks:</span>
+  sync_failed:
+    command: ./scripts/dispatch-agent
+    timeout_secs: 30
+    blocking: false
+
+<span># exact evidence enters on stdin</span>
+<span># the next tick starts fresh</span></code></pre>
+    </section>
+
+    <section class="install" id="install" aria-labelledby="install-title">
+      <div>
+        <p class="kicker">05 / Join the convoy</p>
+        <h2 id="install-title">Ready to roll?</h2>
+        <p>Build from source today. Release archives include checksums and support bounded self-update on Linux and Apple silicon.</p>
+      </div>
+      <div class="install-commands">
+        <div><code>git clone https://github.com/harryaskham/caravan.git</code><button type="button" data-copy="git clone https://github.com/harryaskham/caravan.git">Copy</button></div>
+        <div><code>cd caravan &amp;&amp; nix develop</code><button type="button" data-copy="cd caravan &amp;&amp; nix develop">Copy</button></div>
+        <div><code>cargo build --release</code><button type="button" data-copy="cargo build --release">Copy</button></div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <a class="brand footer-brand" href="/caravan/"><svg aria-hidden="true" viewBox="0 0 56 32"><path d="M4 22h34l7-11h7v14H4z"/><circle cx="15" cy="26" r="4"/><circle cx="43" cy="26" r="4"/></svg><span>CARAVAN</span></a>
+    <p>GitHub-native. Agent-friendly. Open source.</p>
+    <div><a href="https://github.com/harryaskham/caravan">Source</a><a href="https://github.com/harryaskham/caravan/blob/main/SPEC.md">Spec</a><a href="#main">Back to top ↑</a></div>
+  </footer>
+</body>
+</html>

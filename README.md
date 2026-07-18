@@ -5,7 +5,23 @@ CLI represents a queue as one or more labelled PR chains, performs deterministic
 compatibility and CI checks, and returns typed decision points when semantic
 judgment or code repair is required.
 
-The normative behavior is in [`SPEC.md`](SPEC.md).
+The normative behavior is in [`SPEC.md`](SPEC.md). Visit the public project site at
+[**a.skh.am/caravan/**](https://a.skh.am/caravan/) for a visual guide to the
+queue model, agent loop, safety evidence, commands, and installation.
+
+## Website
+
+The GitHub Pages site is deterministic static source in [`site/`](site/), with
+no external runtime assets or tracking. All project-local URLs use the
+`/caravan/` Pages base path. Run its dependency-free link, metadata, and asset
+smoke check with:
+
+```sh
+python3 scripts/check-site.py
+```
+
+Pushes that touch the site deploy through [the Pages workflow](.github/workflows/pages.yml)
+after the same check passes.
 
 ## Core model
 

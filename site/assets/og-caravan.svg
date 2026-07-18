@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-labelledby="title desc">
+  <title id="title">Caravan — keep the whole convoy moving</title><desc id="desc">An orange lead vehicle and two pull request trailers cross a graphic landscape.</desc>
+  <rect width="1200" height="630" fill="#f7c84b"/>
+  <circle cx="1000" cy="118" r="180" fill="#ffdc72" stroke="#17201e" stroke-width="5"/><circle cx="1000" cy="118" r="145" fill="none" stroke="#17201e" stroke-width="4"/>
+  <path d="M0 365l165-112 130 92 168-188 165 173 139-118 173 161 160-131 90 89v150H0z" fill="#b8c7ad" stroke="#17201e" stroke-width="5"/>
+  <path d="M0 424l190-99 176 107 183-140 188 141 148-92 180 111 135-71v249H0z" fill="#718d70" stroke="#17201e" stroke-width="5"/>
+  <path d="M0 475l1200-54v209H0z" fill="#17201e"/><path d="M60 546l180-9m110-5 180-9m110-5 180-9m110-5 180-9" stroke="#fffaf0" stroke-width="9"/>
+  <g transform="translate(110 340)" stroke="#17201e" stroke-width="7" stroke-linejoin="round">
+    <path d="M0 92h300V18h126l72 74v68H0z" fill="#f2572a"/><path d="M321 34h91l47 55H321z" fill="#bee0de"/><path d="M499 137h53"/><rect x="552" y="70" width="210" height="90" rx="5" fill="#fffaf0"/><path d="M763 137h53"/><rect x="816" y="70" width="210" height="90" rx="5" fill="#b8c7ad"/>
+    <g fill="#f5efe2"><circle cx="86" cy="164" r="29"/><circle cx="390" cy="164" r="29"/><circle cx="610" cy="164" r="29"/><circle cx="714" cy="164" r="29"/><circle cx="874" cy="164" r="29"/><circle cx="978" cy="164" r="29"/></g>
+  </g>
+  <g fill="#17201e" font-family="Arial Narrow,Arial,sans-serif" font-weight="900"><text x="62" y="82" font-size="24" letter-spacing="7">CARAVAN</text><text x="60" y="145" font-size="62">KEEP THE WHOLE</text><text x="60" y="204" font-size="62" fill="#f2572a">CONVOY MOVING.</text></g>
+  <g font-family="monospace" font-size="18" font-weight="700" fill="#17201e"><text x="145" y="389">MAIN</text><text x="692" y="439">PR 42</text><text x="956" y="439">PR 43</text></g>
+</svg>
