@@ -16,7 +16,7 @@ concurrency:
 jobs:
   build:
     name: Check and package site
-    runs-on: [self-hosted, nix]
+    runs-on: [self-hosted, nix, Linux, X64]
     permissions:
       contents: read
       pages: write
@@ -35,7 +35,7 @@ jobs:
   deploy:
     name: Deploy site
     needs: build
-    runs-on: [self-hosted, nix]
+    runs-on: [self-hosted, nix, Linux, X64]
     permissions:
       pages: write
       id-token: write
