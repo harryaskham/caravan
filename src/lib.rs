@@ -23,7 +23,7 @@ pub mod reshape;
 pub mod sync;
 
 use clap::Args;
-use feedback_cli::{FeedbackConfig, Reporter};
+use feedback_cli::{FeedbackConfig, FeedbackError, ReportStrategy, Reporter};
 use mcp_cli::{ErrorCategory, StructuredError, ToolRouter};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -596,27 +596,99 @@ fn register_self_update_tools(router: &mut ToolRouter<AppContext>) {
     );
 }
 
-fn feedback_strategy_name(strategy: &feedback_cli::ReportStrategy) -> &'static str {
+fn feedback_strategy_name(strategy: &ReportStrategy) -> &'static str {
     match strategy {
-        feedback_cli::ReportStrategy::Disabled => "disabled",
-        feedback_cli::ReportStrategy::Stderr => "stderr",
-        feedback_cli::ReportStrategy::Webhook(_) => "webhook",
-        feedback_cli::ReportStrategy::CacoCli(_) => "caco_cli",
-        feedback_cli::ReportStrategy::File(_) => "file",
+        ReportStrategy::Disabled => "disabled",
+        ReportStrategy::Stderr => "stderr",
+        ReportStrategy::Webhook(_) => "webhook",
+        ReportStrategy::CacoCli(_) => "caco_cli",
+        ReportStrategy::File(_) => "file",
     }
 }
 
-/// Resolve the same secret-free feedback status returned by CLI and MCP.
+/// Secret-free evidence explaining why configured feedback is unavailable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct FeedbackConfigurationDiagnostic {
+    pub code: String,
+    pub message: String,
+    pub next: String,
+}
+
+/// Effective feedback state returned by CLI and MCP without startup side effects.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct FeedbackRuntimeStatus {
+    pub enabled: bool,
+    pub strategy: String,
+    pub destination: String,
+    pub component: Option<String>,
+    pub project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configuration_error: Option<FeedbackConfigurationDiagnostic>,
+}
+
+/// Validate the startup-sensitive webhook fields without constructing a reporter
+/// whose compatibility fallback writes directly to stderr.
 #[must_use]
-pub fn feedback_status() -> feedback_cli::FeedbackStatus {
+pub fn feedback_configuration_error(config: &FeedbackConfig) -> Option<FeedbackError> {
+    if !config.enabled {
+        return None;
+    }
+    let ReportStrategy::Webhook(webhook) = &config.strategy else {
+        return None;
+    };
+    if webhook.url.trim().is_empty() {
+        return Some(FeedbackError::Config(
+            "webhook url must not be empty".to_owned(),
+        ));
+    }
+    webhook.resolve_token_for(config.project.as_deref()).err()
+}
+
+fn feedback_configuration_diagnostic(error: &FeedbackError) -> FeedbackConfigurationDiagnostic {
+    FeedbackConfigurationDiagnostic {
+        code: error.code(),
+        message: error.message(),
+        next:
+            "set the configured feedback token environment variable or disable feedback reporting"
+                .to_owned(),
+    }
+}
+
+/// Configure panic feedback for one output mode. Machine commands deliberately
+/// install a disabled hook when feedback is invalid so optional startup
+/// diagnostics cannot contaminate their stderr contract.
+#[must_use]
+pub fn feedback_panic_config(json: bool) -> FeedbackConfig {
+    let mut config = feedback_config();
+    if json && feedback_configuration_error(&config).is_some() {
+        config.enabled = false;
+    }
+    config
+}
+
+/// Resolve secret-free effective feedback status without emitting diagnostics.
+#[must_use]
+pub fn feedback_status() -> FeedbackRuntimeStatus {
     let config = feedback_config();
+    let strategy = feedback_strategy_name(&config.strategy).to_owned();
+    if let Some(error) = feedback_configuration_error(&config) {
+        return FeedbackRuntimeStatus {
+            enabled: false,
+            strategy,
+            destination: "disabled".to_owned(),
+            component: config.component,
+            project: config.project,
+            configuration_error: Some(feedback_configuration_diagnostic(&error)),
+        };
+    }
     let reporter = Reporter::from_config(&config);
-    feedback_cli::FeedbackStatus {
+    FeedbackRuntimeStatus {
         enabled: config.enabled,
-        strategy: feedback_strategy_name(&config.strategy).to_owned(),
+        strategy,
         destination: reporter.destination(),
         component: config.component,
         project: config.project,
+        configuration_error: None,
     }
 }
 
@@ -625,7 +697,11 @@ fn register_feedback_tools(router: &mut ToolRouter<AppContext>) {
         "feedback_report",
         "Report one structured feedback/error/performance event through the configured strategy. Returns a secret-free delivery receipt; retry only after inspecting a typed delivery error.",
         |_context: &AppContext, input: feedback_cli::ReportArgs| {
-            let reporter = Reporter::from_config(&feedback_config());
+            let config = feedback_config();
+            if let Some(error) = feedback_configuration_error(&config) {
+                return Err(error);
+            }
+            let reporter = Reporter::from_config(&config);
             let destination = reporter.destination();
             reporter.report(&input.into_event())?;
             Ok::<_, feedback_cli::FeedbackError>(feedback_cli::ReportReceipt {

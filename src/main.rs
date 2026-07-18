@@ -9,7 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use caravan::{
     AGENT_HELP, AppContext, AppError, CheckInput, CreateInput, EvictInput, JoinInput,
     LockRecoverInput, LockStatusInput, LoopInput, PauseInput, ResumeInput, SplitInput, SyncInput,
-    TOOL_NAME, build_router, feedback_config, updater_config,
+    TOOL_NAME, build_router, feedback_config, feedback_configuration_error, feedback_panic_config,
+    updater_config,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use feedback_cli::{FeedbackEvent, FeedbackKind, Reporter, Severity};
@@ -206,13 +207,13 @@ impl From<SeverityArg> for Severity {
 }
 
 fn main() {
-    let feedback = feedback_config();
-    feedback_cli::install_panic_hook(&feedback);
+    let cli = Cli::parse();
+    let panic_feedback = feedback_panic_config(cli.json);
+    feedback_cli::install_panic_hook(&panic_feedback);
     if let Err(error) = updatable_cli::maybe_apply_staged_update(TOOL_NAME) {
         eprintln!("warning: staged-update check failed: {error}");
     }
 
-    let cli = Cli::parse();
     if let Err(code) = run(&cli) {
         std::process::exit(code);
     }
@@ -978,7 +979,11 @@ fn run_feedback(json: bool, command: &FeedbackCommand) -> Result<(), i32> {
             if let Some(severity) = args.severity {
                 event = event.with_severity(severity.into());
             }
-            let reporter = Reporter::from_config(&feedback_config());
+            let config = feedback_config();
+            if let Some(error) = feedback_configuration_error(&config) {
+                return emit_result::<feedback_cli::ReportReceipt, _>(json, Err(error));
+            }
+            let reporter = Reporter::from_config(&config);
             emit_result(
                 json,
                 reporter
