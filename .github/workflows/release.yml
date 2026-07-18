@@ -46,7 +46,17 @@ jobs:
             exit 2
           }
           git rev-parse --verify "refs/tags/$tag^{commit}" >/dev/null
-          cargo_version="$(git show "${tag}:Cargo.toml" | awk -F '"' '/^version = "/ { print $2; exit }')"
+          cargo_version=""
+          while IFS= read -r line; do
+            if [[ "$line" =~ ^version\ =\ \"([^\"]+)\" ]]; then
+              cargo_version="${BASH_REMATCH[1]}"
+              break
+            fi
+          done < <(git show "${tag}:Cargo.toml")
+          [ -n "$cargo_version" ] || {
+            echo "tag $tag has no package version in Cargo.toml" >&2
+            exit 2
+          }
           [ "$version" = "$cargo_version" ] || {
             echo "tag $tag does not match tagged Cargo.toml version $cargo_version" >&2
             exit 2
@@ -146,7 +156,7 @@ jobs:
           else
             binary="result-$TARGET/bin/cara"
           fi
-          ./scripts/package-release.sh "$VERSION" "$TARGET" "$binary" dist
+          nix develop --command ./scripts/package-release.sh "$VERSION" "$TARGET" "$binary" dist
 
       - name: Smoke packaged native binary
         if: matrix.target != 'aarch64-linux'
@@ -159,7 +169,7 @@ jobs:
           root="cara-$VERSION-$TARGET"
           rm -rf smoke
           mkdir smoke
-          tar -xzf "dist/$root.tar.gz" -C smoke
+          nix develop --command tar -xzf "dist/$root.tar.gz" -C smoke
           "smoke/$root/cara" --version
 
       - name: Upload assets to the GitHub release
