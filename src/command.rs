@@ -513,6 +513,20 @@ mod tests {
     }
 
     #[test]
+    fn long_operation_budget_still_caps_each_child_at_normal_timeout() {
+        let request = CommandSpec::new("never-executed");
+        let runner = ProcessRunner::new()
+            .with_timeout(Duration::from_secs(30))
+            .with_operation_deadline(Instant::now() + Duration::from_secs(150));
+
+        let effective = runner
+            .effective_timeout(&request)
+            .expect("long operation has remaining budget");
+        assert!(effective <= Duration::from_secs(30));
+        assert!(effective >= Duration::from_secs(29));
+    }
+
+    #[test]
     fn one_absolute_deadline_bounds_multiple_phases_and_reaps_the_hung_phase() {
         let operation_started = Instant::now();
         let runner = ProcessRunner::new()

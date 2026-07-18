@@ -145,22 +145,28 @@ pub(crate) fn status_with_deadline(
     // Sharing one absolute deadline prevents a large repository from
     // multiplying its budget by provider and compatibility subprocess count.
     let started = std::time::Instant::now();
-    let timeout = operation_deadline.saturating_duration_since(started);
+    let operation_budget = operation_deadline.saturating_duration_since(started);
+    let child_timeout = std::time::Duration::from_secs(context.config.command_timeout_secs);
     let discovery = GitHubDiscovery::new(
         crate::command::ProcessRunner::in_directory(&context.repository_path)
-            .with_timeout(timeout)
+            .with_timeout(child_timeout)
             .with_operation_deadline(operation_deadline),
     );
     let snapshot = discovery.discover().map_err(|error| {
         if let DiscoveryError::Runner(CommandRunError::Timeout { command, .. }) = &error {
-            discovery_timeout_error(&error, discovery_phase(command), started.elapsed(), timeout)
+            discovery_timeout_error(
+                &error,
+                discovery_phase(command),
+                started.elapsed(),
+                operation_budget,
+            )
         } else {
             discovery_error(&error)
         }
     })?;
     let discovery_elapsed = started.elapsed();
     let checker = GitCompatibilityChecker::new(&context.repository_path, "origin")
-        .with_timeout(timeout)
+        .with_timeout(child_timeout)
         .with_operation_deadline(operation_deadline);
     let analysis = analyze(&snapshot, &checker).map_err(|error| {
         if mcp_cli::StructuredError::category(&error) == ErrorCategory::Timeout {
@@ -172,7 +178,7 @@ pub(crate) fn status_with_deadline(
                     "stage": "github_discovery",
                     "phase": "compatibility_analysis",
                     "elapsed_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                    "deadline_ms": u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                    "deadline_ms": u64::try_from(operation_budget.as_millis()).unwrap_or(u64::MAX),
                     "retryable": true,
                     "safe_next_action": "retry `cara status` after restoring Git transport health; status made no mutations",
                     "source": mcp_cli::StructuredError::details(&error),
@@ -185,7 +191,7 @@ pub(crate) fn status_with_deadline(
     let analysis_elapsed = started.elapsed();
     let label_provider = crate::github::GitHubMutationAdapter::new(
         crate::command::ProcessRunner::in_directory(&context.repository_path)
-            .with_timeout(timeout)
+            .with_timeout(child_timeout)
             .with_operation_deadline(operation_deadline),
     );
     let labels = label_provider
@@ -200,7 +206,7 @@ pub(crate) fn status_with_deadline(
                         provider,
                         "repository_label_inventory",
                         started.elapsed(),
-                        timeout,
+                        operation_budget,
                     );
                 }
             }
@@ -228,7 +234,7 @@ pub(crate) fn status_with_deadline(
                 "stage": "github_discovery",
                 "phase": "finalize_status",
                 "elapsed_ms": u64::try_from(total.as_millis()).unwrap_or(u64::MAX),
-                "deadline_ms": u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                "deadline_ms": u64::try_from(operation_budget.as_millis()).unwrap_or(u64::MAX),
                 "retryable": true,
                 "safe_next_action": "retry `cara status`; status made no mutations",
             })),
@@ -237,7 +243,7 @@ pub(crate) fn status_with_deadline(
     let millis =
         |duration: std::time::Duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
     let timing = StatusTiming {
-        deadline_ms: millis(timeout),
+        deadline_ms: millis(operation_budget),
         total_ms: millis(total),
         phases_ms: std::collections::BTreeMap::from([
             ("github_discovery".to_owned(), millis(discovery_elapsed)),
