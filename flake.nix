@@ -113,6 +113,7 @@
           inputsFrom = [ caravan ];
           packages = with pkgs; [
             cargo
+            python3
             rustc
             rustfmt
             clippy
