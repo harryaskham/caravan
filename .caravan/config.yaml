@@ -1,5 +1,10 @@
 version: 1
 force_merge: false
+# Highest to lowest; ties and unlabelled attempts use immutable PR createdAt FIFO.
+agent_priority_labels:
+  - caravan-priority:high
+  - caravan-priority:normal
+  - caravan-priority:low
 command_timeout_secs: 30
 loop:
   interval_secs: 60

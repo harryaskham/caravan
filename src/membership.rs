@@ -1103,6 +1103,7 @@ mod tests {
                 AutoMergeState::disabled()
             },
             checks: Vec::new(),
+            created_at: Some(format!("2026-01-01T00:00:{number:02}Z")),
             merged_at: None,
             updated_at: None,
         }
@@ -1133,6 +1134,10 @@ mod tests {
             current_pr: snapshot.current_pr,
             healthy: analysis.healthy(),
             initialization: crate::initialization::InitializationStatus::default(),
+            admission: crate::read::resolve_admission(
+                &analysis,
+                &crate::config::CaravanConfig::default().agent_priority_labels,
+            ),
             analysis,
         }
     }

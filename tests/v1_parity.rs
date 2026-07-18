@@ -13,7 +13,10 @@ fn cara_in(directory: &std::path::Path, arguments: &[&str]) -> Output {
 fn every_bounded_v1_domain_command_has_a_real_json_operation() {
     let temp = tempfile::tempdir().expect("temp directory");
     let commands: &[(&str, &[&str])] = &[
+        ("init", &["init"]),
+        ("log", &["log"]),
         ("status", &["status"]),
+        ("next_candidate", &["next-candidate"]),
         ("check", &["check"]),
         ("new", &["new"]),
         ("renew", &["renew"]),
@@ -77,7 +80,10 @@ fn every_bounded_mcp_domain_tool_routes_to_the_real_operation() {
     let router = caravan::build_router();
     let calls = [
         ("help", serde_json::json!({})),
+        ("init", serde_json::json!({})),
+        ("log", serde_json::json!({})),
         ("status", serde_json::json!({})),
+        ("next_candidate", serde_json::json!({})),
         ("check", serde_json::json!({})),
         ("new", serde_json::json!({})),
         ("renew", serde_json::json!({})),
@@ -138,8 +144,10 @@ fn mcp_registry_covers_all_bounded_v1_operations_with_schemas() {
 
     for expected in [
         "help",
+        "init",
         "log",
         "status",
+        "next_candidate",
         "check",
         "new",
         "renew",

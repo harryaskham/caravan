@@ -46,6 +46,8 @@ enum Command {
     Status,
     /// Read the bounded repository event journal, optionally following new records.
     Log(LogCommand),
+    /// Return the canonical next priority-then-FIFO admission without mutation.
+    NextCandidate,
     /// Validate current or proposed caravan state without mutation.
     Check(CheckInput),
     /// Create a one-PR caravan from the current branch.
@@ -217,6 +219,7 @@ fn run(cli: &Cli) -> Result<(), i32> {
         Command::Init => run_init(cli),
         Command::Status => run_status(cli),
         Command::Log(command) => run_log(cli, command),
+        Command::NextCandidate => run_next_candidate(cli),
         Command::Check(input) => run_check(cli, input),
         Command::New(input) => {
             run_membership(cli, |context| caravan::membership::new(context, input))
@@ -363,6 +366,29 @@ fn run_status(cli: &Cli) -> Result<(), i32> {
     match result {
         Ok(output) => {
             print!("{}", render_status(&output));
+            Ok(())
+        }
+        Err(error) => emit_human_error(error),
+    }
+}
+
+fn run_next_candidate(cli: &Cli) -> Result<(), i32> {
+    let context = load_context(cli)?;
+    let result = caravan::read::next_candidate(&context);
+    if cli.json {
+        return emit_result(true, result);
+    }
+    match result {
+        Ok(output) => {
+            if let Some(candidate) = output.admission.candidates.first() {
+                println!("next admission attempt: #{} — {}", candidate.pr, candidate.reason);
+                println!("  {}", output.attempt_contract);
+            } else {
+                println!("no automatic-admission attempt");
+            }
+            for rejected in output.admission.rejected {
+                println!("! #{}: {}", rejected.pr, rejected.reason);
+            }
             Ok(())
         }
         Err(error) => emit_human_error(error),
@@ -618,16 +644,14 @@ fn render_status(output: &caravan::read::StatusOutput) -> String {
             .join(" -> ");
         let _ = writeln!(text, "  #{}: {chain}", caravan.id);
     }
-    if !output.analysis.fleet.unqueued.is_empty() {
-        let ready = output
-            .analysis
-            .fleet
-            .unqueued
-            .iter()
-            .map(|number| format!("#{number}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let _ = writeln!(text, "ready unqueued: {ready}");
+    if !output.admission.candidates.is_empty() {
+        let _ = writeln!(text, "automatic admission (priority then FIFO):");
+        for candidate in &output.admission.candidates {
+            let _ = writeln!(text, "  #{}: {}", candidate.pr, candidate.reason);
+        }
+    }
+    for rejected in &output.admission.rejected {
+        let _ = writeln!(text, "! admission #{}: {}", rejected.pr, rejected.reason);
     }
     for problem in &output.analysis.fleet.problems {
         let _ = writeln!(text, "! {:?}: {}", problem.kind, problem.message);
@@ -954,6 +978,13 @@ mod tests {
             current_pr: None,
             healthy: true,
             initialization: caravan::initialization::InitializationStatus::default(),
+            admission: caravan::read::AdmissionStatus {
+                policy: "priority then FIFO".to_owned(),
+                priority_labels: Vec::new(),
+                candidates: Vec::new(),
+                rejected: Vec::new(),
+                next_candidate: None,
+            },
             analysis: caravan::graph::GraphAnalysis {
                 fleet: caravan::model::CaravanFleet {
                     repository,

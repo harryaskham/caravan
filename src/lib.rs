@@ -45,10 +45,13 @@ pub const AGENT_HELP: &str = r"Caravan is an agent-in-the-loop GitHub merge queu
 Safe operating loop:
 1. Run `cara status`; if repository initialization is not ready, run the explicit
    idempotent `cara init` command and reconcile any reported metadata mismatch.
-2. Use `cara check`, `new`, or `join` to validate a proposed queue change.
-3. Run `cara sync` (or `sync --all`) until it either converges or returns one
+2. Inspect the canonical automatic-admission order (explicit agent priority,
+   then immutable PR createdAt) in status or with `cara next-candidate`; never
+   re-sort or leapfrog its first ordered attempt.
+3. Use `cara check`, `new`, or `join` to validate a proposed queue change.
+4. Run `cara sync` (or `sync --all`) until it either converges or returns one
    typed decision point.
-4. At a CI decision, optionally use `cara sync --rerun-failed` to rerun only
+5. At a CI decision, optionally use `cara sync --rerun-failed` to rerun only
    exact failed workflow runs. Otherwise repair/push, evict, split, renew, or
    rejoin; then rerun the same sync.
 
@@ -363,6 +366,11 @@ pub fn build_router() -> ToolRouter<AppContext> {
         |context: &AppContext, _input: EmptyInput| read::status(context),
     );
     router.add_typed_tool_with_output_schema(
+        "next_candidate",
+        "Return the canonical first priority-then-FIFO admission attempt without mutation. Selection is not compatibility proof: run check/new preflight, and fail closed rather than leapfrogging on rejection.",
+        |context: &AppContext, _input: EmptyInput| read::next_candidate(context),
+    );
+    router.add_typed_tool_with_output_schema(
         "check",
         "Validate the current PR/caravan without mutation. Optionally test joining --tail-pr or the resolved tail of --head-pr.",
         |context: &AppContext, input: CheckInput| read::check(context, &input),
@@ -627,7 +635,10 @@ mod tests {
         );
         for expected in [
             "help",
+            "init",
+            "log",
             "status",
+            "next_candidate",
             "check",
             "new",
             "renew",

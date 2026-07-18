@@ -8,8 +8,9 @@ is required or used.
 
 | SPEC operation | Human CLI | `--json` | MCP tool | Checked behavior |
 |---|---|---|---|---|
-| repository inspection | `cara status` | envelope | `status` | live discovery, graph, PR/check facts |
+| repository inspection | `cara status` | envelope | `status` | live discovery, graph, PR/check facts, initialization, canonical priority-then-FIFO attempts |
 | event journal | `cara log` / `cara log -f` | bounded envelope / NDJSON follow | bounded `log` only | common-Git storage, filters, exact IDs, hook receipts, locking, rotation, torn-tail recovery |
+| next admission | `cara next-candidate` | envelope | `next_candidate` | nonmutating canonical first attempt; membership preflight remains required and rejection cannot leapfrog; invalid labels fail closed |
 | eligibility | `cara check [--tail-pr N\|--head-pr N]` | envelope | `check` | active/new/join modes; target forms exclusive |
 | create caravan | `cara new [--create-pr]` | envelope | `new` | live preflight, label/base, squash auto-merge |
 | renew evicted | `cara renew [--create-pr]` | envelope | `renew` | evicted/force labels removed only after preflight |
@@ -23,7 +24,7 @@ is required or used.
 | eviction | `cara evict [--pr N] --reason TEXT` | envelope | `evict` | safe gap closure, exact receipts and success/failure events |
 | split | `cara split [--pr N]` | envelope | `split` | only non-heads; both resulting fleets validated |
 | operation lock | `cara lock status/recover` | envelope | `lock_status/recover` | exact-token, age, and dead-owner guarded recovery |
-| repository init | `cara init` | envelope | `init` | atomic config create-new, repository-policy preflight, exact label ensure receipts |
+| repository init | `cara init` | envelope | `init` | atomic config with ordered priority defaults, repository-policy preflight, idempotent fixed/configured label ensure receipts |
 | agent help | `cara help` | envelope | `help` | resumable operating loop and recovery guidance |
 | MCP metadata/server | `cara mcp tools/stdio` | metadata is JSON | n/a | all bounded domain inputs and outputs have schemas |
 | self update | `cara self-update status/check/run` | envelope | `self_update_*` | release-asset updater contract |

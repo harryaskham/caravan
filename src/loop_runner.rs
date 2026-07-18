@@ -140,16 +140,40 @@ fn drive(
 
 fn ready_unqueued_events(output: &SyncOutput) -> Vec<CaravanEvent> {
     let mut events = Vec::new();
-    for number in &output.status.analysis.fleet.unqueued {
+    for (position, candidate) in output.status.admission.candidates.iter().enumerate() {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("admission_position".to_owned(), serde_json::json!(position));
+        metadata.insert("requires_membership_preflight".to_owned(), serde_json::json!(true));
+        metadata.insert(
+            "rejection_policy".to_owned(),
+            serde_json::json!("fail closed without automatic leapfrogging"),
+        );
+        metadata.insert("admission_reason".to_owned(), serde_json::json!(candidate.reason));
+        metadata.insert(
+            "priority_label".to_owned(),
+            serde_json::json!(candidate.priority_label),
+        );
+        metadata.insert(
+            "ordered_candidates".to_owned(),
+            serde_json::json!(
+                output
+                    .status
+                    .admission
+                    .candidates
+                    .iter()
+                    .map(|candidate| candidate.pr)
+                    .collect::<Vec<_>>()
+            ),
+        );
         events.push(hooks::event(
             EventKind::ReadyPrUnqueued,
             output.receipt.operation_id.clone(),
             output.status.repository.clone(),
             None,
-            vec![*number],
+            vec![candidate.pr],
             Some(output.status.analysis.fleet.clone()),
-            None,
-            BTreeMap::new(),
+            Some(candidate.reason.clone()),
+            metadata,
         ));
     }
     events
@@ -191,6 +215,13 @@ mod tests {
                     current_pr: None,
                     healthy: true,
                     initialization: crate::initialization::InitializationStatus::default(),
+                    admission: crate::read::AdmissionStatus {
+                        policy: "priority then FIFO".to_owned(),
+                        priority_labels: Vec::new(),
+                        candidates: Vec::new(),
+                        rejected: Vec::new(),
+                        next_candidate: None,
+                    },
                     analysis: crate::graph::GraphAnalysis {
                         fleet: CaravanFleet {
                             repository: repository.clone(),

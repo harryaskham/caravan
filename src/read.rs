@@ -29,6 +29,53 @@ pub struct StatusOutput {
     /// Read-only first-use readiness. Status never creates or edits resources.
     pub initialization: crate::initialization::InitializationStatus,
     pub analysis: GraphAnalysis,
+    /// Canonical, nonmutating automatic-admission order derived from GitHub.
+    pub admission: AdmissionStatus,
+}
+
+/// One selectable PR in canonical priority-then-FIFO order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AdmissionCandidate {
+    pub pr: PrNumber,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority_rank: Option<usize>,
+    /// Immutable GitHub creation timestamp used as the FIFO key. Legacy or
+    /// synthetic snapshots may omit it and deterministically fall back to PR number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    pub reason: String,
+}
+
+/// One ready-looking PR excluded from automation because priority metadata is unsafe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RejectedAdmissionCandidate {
+    pub pr: PrNumber,
+    pub reason: String,
+}
+
+/// Resolved GitHub-visible automatic-admission policy and result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AdmissionStatus {
+    pub policy: String,
+    pub priority_labels: Vec<String>,
+    /// Ordered highest priority first, then immutable provider creation time.
+    pub candidates: Vec<AdmissionCandidate>,
+    #[serde(default)]
+    pub rejected: Vec<RejectedAdmissionCandidate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_candidate: Option<PrNumber>,
+}
+
+/// Dedicated read-only result for deterministic admission coordination.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct NextCandidateOutput {
+    pub repository: RepositoryId,
+    /// Ordering is selection-only: the chosen PR must still pass `check`/`new`
+    /// preflight and a failure must not cause an automatic leapfrog.
+    pub attempt_contract: String,
+    pub admission: AdmissionStatus,
 }
 
 /// Current PR's ordered caravan view.
@@ -96,11 +143,15 @@ pub fn status(context: &AppContext) -> Result<StatusOutput, AppError> {
                 Some(json!({"next": "repair GitHub read access and rerun `cara status`"})),
             )
         })?;
-    let mut initialization = crate::initialization::inspect_labels(&labels);
+    let mut initialization = crate::initialization::inspect_labels(
+        &labels,
+        &context.config.agent_priority_labels,
+    );
     if !context.config_existed {
         initialization.ready = false;
         initialization.next = Some("run `cara init` to atomically create .caravan/config.yaml and verify repository readiness".to_owned());
     }
+    let admission = resolve_admission(&analysis, &context.config.agent_priority_labels);
     Ok(StatusOutput {
         repository: snapshot.repository,
         default_branch: snapshot.default_branch.name,
@@ -109,7 +160,142 @@ pub fn status(context: &AppContext) -> Result<StatusOutput, AppError> {
         healthy: analysis.healthy() && initialization.ready,
         initialization,
         analysis,
+        admission,
     })
+}
+
+/// Return the canonical first automatic-admission candidate without mutation.
+pub fn next_candidate(context: &AppContext) -> Result<NextCandidateOutput, AppError> {
+    let status = status(context)?;
+    Ok(NextCandidateOutput {
+        repository: status.repository,
+        attempt_contract: "ordered admission attempt only; run check/new preflight for the first candidate; on rejection fail closed and retry after GitHub state changes rather than leapfrogging".to_owned(),
+        admission: status.admission,
+    })
+}
+
+/// Resolve configured explicit priority and FIFO from one GitHub snapshot.
+#[must_use]
+pub fn resolve_admission(analysis: &GraphAnalysis, priority_labels: &[String]) -> AdmissionStatus {
+    let ranks: std::collections::BTreeMap<&str, usize> = priority_labels
+        .iter()
+        .enumerate()
+        .map(|(rank, label)| (label.as_str(), rank))
+        .collect();
+    let mut candidates = Vec::new();
+    let mut rejected = Vec::new();
+
+    for number in &analysis.fleet.unqueued {
+        let Some(pull_request) = analysis.pull_requests.get(number) else {
+            continue;
+        };
+        let priority_namespace: Vec<&String> = pull_request
+            .labels
+            .iter()
+            .filter(|label| label.starts_with("caravan-priority:"))
+            .collect();
+        let configured: Vec<(&String, usize)> = priority_namespace
+            .iter()
+            .filter_map(|label| ranks.get(label.as_str()).map(|rank| (*label, *rank)))
+            .collect();
+        let invalid: Vec<&String> = priority_namespace
+            .iter()
+            .copied()
+            .filter(|label| !ranks.contains_key(label.as_str()))
+            .collect();
+
+        let rejection = if !invalid.is_empty() {
+            Some(format!(
+                "fail closed: unknown priority label(s): {}",
+                invalid
+                    .iter()
+                    .map(|label| label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        } else if configured.len() > 1 {
+            Some(format!(
+                "fail closed: conflicting priority labels: {}",
+                configured
+                    .iter()
+                    .map(|(label, _)| label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        } else if pull_request.cross_repository {
+            Some("fail closed: fork-only PR cannot be admitted to a caravan".to_owned())
+        } else if pull_request.auto_merge.enabled {
+            Some("fail closed: candidate already has auto-merge enabled".to_owned())
+        } else {
+            None
+        };
+        if let Some(reason) = rejection {
+            rejected.push(RejectedAdmissionCandidate { pr: *number, reason });
+            continue;
+        }
+
+        let created_at = pull_request.created_at.clone();
+        let fifo_reason = created_at.as_ref().map_or_else(
+            || format!("provider created_at missing; deterministic PR number #{number} fallback"),
+            |created_at| {
+                format!(
+                    "immutable provider created_at {created_at}, PR number #{number} tie-break"
+                )
+            },
+        );
+        let (priority_label, priority_rank, reason) = configured.first().map_or_else(
+            || {
+                (
+                    None,
+                    None,
+                    format!(
+                        "no explicit agent priority; FIFO by {fifo_reason}; selection only, check/new preflight required"
+                    ),
+                )
+            },
+            |(label, rank)| {
+                (
+                    Some((*label).clone()),
+                    Some(rank + 1),
+                    format!(
+                        "explicit agent priority `{label}` (rank {}); FIFO by {fifo_reason} within this priority; selection only, check/new preflight required",
+                        rank + 1
+                    ),
+                )
+            },
+        );
+        candidates.push(AdmissionCandidate {
+            pr: *number,
+            priority_label,
+            priority_rank,
+            created_at,
+            reason,
+        });
+    }
+
+    // An absent explicit priority sorts after every configured rank. GitHub's
+    // immutable creation timestamp is FIFO; PR number deterministically breaks
+    // equal timestamps. Missing timestamps form a deterministic fallback group
+    // after provider-timestamped candidates, ordered by PR number.
+    candidates.sort_by_key(|candidate| {
+        (
+            candidate
+                .priority_rank
+                .unwrap_or(priority_labels.len() + 1),
+            candidate.created_at.is_none(),
+            candidate.created_at.clone().unwrap_or_default(),
+            candidate.pr,
+        )
+    });
+    rejected.sort_by_key(|candidate| candidate.pr);
+    let next_candidate = candidates.first().map(|candidate| candidate.pr);
+    AdmissionStatus {
+        policy: "ordered admission attempts: explicit agent priority label (configured high to low), then FIFO by immutable provider created_at ascending with PR number ascending as equal-time tie-break; missing created_at falls back deterministically to PR number after timestamped peers; never LIFO; check/new preflight required and rejection never causes automatic leapfrogging".to_owned(),
+        priority_labels: priority_labels.to_vec(),
+        candidates,
+        rejected,
+        next_candidate,
+    }
 }
 
 /// Show the current branch's active caravan and position.
@@ -527,6 +713,7 @@ mod tests {
                 AutoMergeState::disabled()
             },
             checks: Vec::new(),
+            created_at: Some(format!("2026-01-01T00:00:{number:02}Z")),
             merged_at: None,
             updated_at: None,
         }
@@ -559,6 +746,10 @@ mod tests {
             current_pr: snapshot.current_pr,
             healthy: analysis.healthy(),
             initialization: crate::initialization::InitializationStatus::default(),
+            admission: resolve_admission(
+                &analysis,
+                &crate::config::CaravanConfig::default().agent_priority_labels,
+            ),
             analysis,
         }
     }
@@ -714,6 +905,92 @@ mod tests {
         assert_eq!(details["stage"], "github_discovery");
         assert_eq!(details["timeout_ms"], 500);
         assert_eq!(details["stdout"], "partial");
+    }
+
+    #[test]
+    fn admission_is_fifo_for_equal_and_absent_priority() {
+        let mut older = pr(20, "older", "main", false);
+        older.created_at = Some("2026-01-01T00:00:01Z".to_owned());
+        older.labels.insert("caravan-priority:normal".to_owned());
+        let mut newer = pr(10, "newer", "main", false);
+        newer.created_at = Some("2026-01-01T00:00:02Z".to_owned());
+        newer.labels.insert("caravan-priority:normal".to_owned());
+        let no_priority = pr(5, "unprioritized", "main", false);
+        let status = status(older, vec![newer, no_priority]);
+        let labels = crate::config::CaravanConfig::default().agent_priority_labels;
+        let admission = resolve_admission(&status.analysis, &labels);
+        assert_eq!(
+            admission
+                .candidates
+                .iter()
+                .map(|candidate| candidate.pr)
+                .collect::<Vec<_>>(),
+            [PrNumber(20), PrNumber(10), PrNumber(5)]
+        );
+        assert_eq!(admission.next_candidate, Some(PrNumber(20)));
+        assert!(admission.candidates[0].reason.contains("FIFO"));
+        assert!(admission.candidates[0].reason.contains("preflight required"));
+        assert!(admission.policy.contains("never LIFO"));
+        assert!(admission.policy.contains("never causes automatic leapfrogging"));
+    }
+
+    #[test]
+    fn equal_and_missing_created_at_use_pr_number_deterministically() {
+        let mut equal_high = pr(20, "equal-high", "main", false);
+        equal_high.created_at = Some("2026-01-01T00:00:01Z".to_owned());
+        let mut equal_low = pr(10, "equal-low", "main", false);
+        equal_low.created_at = Some("2026-01-01T00:00:01Z".to_owned());
+        let mut missing_high = pr(40, "missing-high", "main", false);
+        missing_high.created_at = None;
+        let mut missing_low = pr(30, "missing-low", "main", false);
+        missing_low.created_at = None;
+        let status = status(equal_high, vec![missing_high, equal_low, missing_low]);
+        let labels = crate::config::CaravanConfig::default().agent_priority_labels;
+        let admission = resolve_admission(&status.analysis, &labels);
+        assert_eq!(
+            admission
+                .candidates
+                .iter()
+                .map(|candidate| candidate.pr)
+                .collect::<Vec<_>>(),
+            [PrNumber(10), PrNumber(20), PrNumber(30), PrNumber(40)]
+        );
+        assert!(admission.candidates[2].reason.contains("fallback"));
+    }
+
+    #[test]
+    fn explicit_priority_deliberately_overrides_fifo() {
+        let older = pr(10, "older", "main", false);
+        let mut newer = pr(20, "newer", "main", false);
+        newer.labels.insert("caravan-priority:high".to_owned());
+        let status = status(older, vec![newer]);
+        let labels = crate::config::CaravanConfig::default().agent_priority_labels;
+        let admission = resolve_admission(&status.analysis, &labels);
+        assert_eq!(admission.next_candidate, Some(PrNumber(20)));
+        assert_eq!(admission.candidates[0].priority_rank, Some(1));
+    }
+
+    #[test]
+    fn invalid_and_conflicting_priority_labels_fail_closed() {
+        let mut unknown = pr(10, "unknown", "main", false);
+        unknown.labels.insert("caravan-priority:surprise".to_owned());
+        let mut conflicting = pr(20, "conflicting", "main", false);
+        conflicting.labels.extend([
+            "caravan-priority:high".to_owned(),
+            "caravan-priority:low".to_owned(),
+        ]);
+        let safe = pr(30, "safe", "main", false);
+        let status = status(unknown, vec![conflicting, safe]);
+        let labels = crate::config::CaravanConfig::default().agent_priority_labels;
+        let admission = resolve_admission(&status.analysis, &labels);
+        assert_eq!(admission.next_candidate, Some(PrNumber(30)));
+        assert_eq!(admission.rejected.len(), 2);
+        assert!(
+            admission
+                .rejected
+                .iter()
+                .all(|candidate| candidate.reason.contains("fail closed"))
+        );
     }
 
     #[test]

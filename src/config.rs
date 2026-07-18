@@ -43,6 +43,14 @@ fn default_journal_max_archives() -> u32 {
     3
 }
 
+fn default_agent_priority_labels() -> Vec<String> {
+    vec![
+        "caravan-priority:high".to_owned(),
+        "caravan-priority:normal".to_owned(),
+        "caravan-priority:low".to_owned(),
+    ]
+}
+
 /// Bounded repository event-journal retention policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
@@ -105,6 +113,11 @@ impl Default for HookConfig {
 pub struct CaravanConfig {
     pub version: u32,
     pub force_merge: bool,
+    /// GitHub labels in highest-to-lowest automatic-admission priority order.
+    /// Candidates without one of these labels follow all explicitly prioritized
+    /// candidates. Labels in the `caravan-priority:` namespace which are not
+    /// listed here are invalid and fail closed.
+    pub agent_priority_labels: Vec<String>,
     /// Hard deadline for each Git or GitHub CLI subprocess.
     pub command_timeout_secs: u64,
     #[serde(rename = "loop")]
@@ -118,6 +131,7 @@ impl Default for CaravanConfig {
         Self {
             version: config_version(),
             force_merge: false,
+            agent_priority_labels: default_agent_priority_labels(),
             command_timeout_secs: default_command_timeout_secs(),
             loop_config: LoopConfig::default(),
             journal: JournalConfig::default(),
@@ -179,6 +193,22 @@ impl CaravanConfig {
                 found: self.version,
                 supported: CONFIG_VERSION,
             });
+        }
+        let mut priority_labels = std::collections::BTreeSet::new();
+        for label in &self.agent_priority_labels {
+            if !label.starts_with("caravan-priority:")
+                || label.trim() == "caravan-priority:"
+                || label.trim() != label
+            {
+                return Err(ConfigError::Validation(format!(
+                    "agent_priority_labels entry `{label}` must be an exact non-empty `caravan-priority:*` label"
+                )));
+            }
+            if !priority_labels.insert(label) {
+                return Err(ConfigError::Validation(format!(
+                    "agent_priority_labels contains duplicate `{label}`"
+                )));
+            }
         }
         if !(1..=MAX_COMMAND_TIMEOUT_SECS).contains(&self.command_timeout_secs) {
             return Err(ConfigError::Validation(format!(
@@ -320,6 +350,14 @@ mod tests {
         let config = CaravanConfig::parse("{}\n").expect("defaults parse");
         assert_eq!(config.version, 1);
         assert!(!config.force_merge);
+        assert_eq!(
+            config.agent_priority_labels,
+            vec![
+                "caravan-priority:high".to_owned(),
+                "caravan-priority:normal".to_owned(),
+                "caravan-priority:low".to_owned(),
+            ]
+        );
         assert_eq!(config.command_timeout_secs, 30);
         assert_eq!(config.loop_config.interval_secs, 60);
         assert!(config.hooks.is_empty());
@@ -363,6 +401,22 @@ hooks:
         )
         .unwrap_err();
         assert_eq!(hook.code(), "config_parse_failed");
+    }
+
+    #[test]
+    fn priority_labels_are_ordered_and_strictly_validated() {
+        let config = CaravanConfig::parse(
+            "version: 1\nagent_priority_labels: [caravan-priority:urgent, caravan-priority:later]\n",
+        )
+        .unwrap();
+        assert_eq!(config.agent_priority_labels[0], "caravan-priority:urgent");
+        for yaml in [
+            "version: 1\nagent_priority_labels: [urgent]\n",
+            "version: 1\nagent_priority_labels: [caravan-priority:high, caravan-priority:high]\n",
+            "version: 1\nagent_priority_labels: ['caravan-priority: ']\n",
+        ] {
+            assert_eq!(CaravanConfig::parse(yaml).unwrap_err().code(), "invalid_config");
+        }
     }
 
     #[test]
