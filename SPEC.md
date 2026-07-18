@@ -74,6 +74,9 @@ All commands are non-interactive.
 - When `.caravan/config.yaml` is absent it is created atomically with version-1
   defaults. An existing valid file is preserved byte-for-byte; incompatible or
   unreadable files are bounded errors and are never merged or overwritten.
+  The checkout guard permits only this exact, validated regular file when it is
+  untracked; tracked modifications, symlinks/path escapes, and every other
+  untracked file (including neighbors under `.caravan/`) remain dirty.
 - Init resolves only repository identity and the default-branch name before
   preflight. It never enumerates PRs, reads PR head OIDs, runs graph compatibility,
   or verifies a moving Git ref, so unrelated pushes cannot make repeated init stale.

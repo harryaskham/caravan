@@ -84,11 +84,17 @@ pub fn checkout_decision_snapshot(
             context.config.command_timeout_secs,
         ))
         .with_operation_deadline(operation_deadline);
-    ensure_safe_worktree(&context.repository_path, &runner)?;
+    ensure_safe_worktree(&context.repository_path, &context.config_path, &runner)?;
     // The decision already embeds the exact provider snapshot. checkout_exact
     // verifies the remote branch still advertises that OID, avoiding a third
     // full repository discovery during an already-bounded sync decision.
-    checkout_exact(&context.repository_path, "origin", &runner, pull_request)?;
+    checkout_exact(
+        &context.repository_path,
+        &context.config_path,
+        "origin",
+        &runner,
+        pull_request,
+    )?;
     lock.release()?;
     Ok(lock_recovery)
 }
@@ -104,7 +110,7 @@ pub fn navigate(
     let runner = ProcessRunner::in_directory(&context.repository_path).with_timeout(
         std::time::Duration::from_secs(context.config.command_timeout_secs),
     );
-    ensure_safe_worktree(&context.repository_path, &runner)?;
+    ensure_safe_worktree(&context.repository_path, &context.config_path, &runner)?;
     let status = read::status(context)?;
     let (from_pr, to_pr) = select_destination(&status, scope, direction)?;
     let pull_request = status
@@ -112,7 +118,13 @@ pub fn navigate(
         .pull_requests
         .get(&to_pr)
         .ok_or_else(|| missing_pr(to_pr))?;
-    checkout_exact(&context.repository_path, "origin", &runner, pull_request)?;
+    checkout_exact(
+        &context.repository_path,
+        &context.config_path,
+        "origin",
+        &runner,
+        pull_request,
+    )?;
     lock.release()?;
     Ok(NavigationOutput {
         repository: status.repository,
@@ -237,23 +249,46 @@ pub fn select_destination(
 /// Refuse dirty worktrees and in-progress Git operations before changing HEAD.
 pub fn ensure_safe_worktree(
     repository: &Path,
+    config_path: &Path,
     runner: &impl CommandRunner,
 ) -> Result<(), AppError> {
+    // Request individual untracked files and NUL delimiters so only the exact
+    // validated config can be recognized. In particular, never exempt the
+    // `.caravan/` directory or another file beside the config.
+    let allowance = local_config_allowance(repository, config_path);
     let status = run(
         runner,
-        CommandSpec::new("git").args(["status", "--porcelain=v1", "--untracked-files=normal"]),
+        CommandSpec::new("git").args([
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        ]),
     )?;
     require_success(
         "git_status_failed",
         "could not inspect worktree status",
         &status,
     )?;
-    if !status.stdout.is_empty() {
+    let allowed_entry = allowance
+        .as_ref()
+        .map(|allowed| format!("?? {}", allowed.relative.display()));
+    let dirty = status
+        .stdout
+        .split_terminator('\0')
+        .filter(|entry| !entry.is_empty())
+        .filter(|entry| allowed_entry.as_deref() != Some(*entry))
+        .collect::<Vec<_>>();
+    let allowance_still_valid = allowance.as_ref().is_none_or(|allowed| {
+        Some(allowed.identity) == file_identity(&allowed.path)
+            && crate::config::CaravanConfig::load(&allowed.path).is_ok()
+    });
+    if !dirty.is_empty() || !allowance_still_valid {
         return Err(AppError::structured(
             ErrorCategory::Validation,
             "dirty_worktree",
             "refusing to switch branches because the worktree has tracked or untracked changes",
-            Some(json!({ "status": bounded(&status.stdout) })),
+            Some(json!({ "status": bounded(&status.stdout.replace('\0', "\n")) })),
         ));
     }
 
@@ -293,7 +328,8 @@ pub fn ensure_safe_worktree(
 /// in one transaction-shaped function so no caller can omit a safety phase.
 #[allow(clippy::too_many_lines)]
 pub fn checkout_exact(
-    _repository: &Path,
+    repository: &Path,
+    config_path: &Path,
     remote: &str,
     runner: &impl CommandRunner,
     pull_request: &PullRequestSnapshot,
@@ -417,6 +453,9 @@ pub fn checkout_exact(
         return Err(stale_head(pull_request, verify.stdout.trim()));
     }
 
+    // Discovery and transport may have taken time. Recheck immediately before
+    // changing HEAD, including the exact config inode/content allowance.
+    ensure_safe_worktree(repository, config_path, runner)?;
     let switch = run(
         runner,
         CommandSpec::new("git").args(["switch", "--quiet", branch]),
@@ -522,6 +561,65 @@ fn missing_pr(number: PrNumber) -> AppError {
         format!("PR #{number} is missing from the discovery snapshot"),
         None,
     )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalConfigAllowance {
+    path: PathBuf,
+    relative: PathBuf,
+    identity: FileIdentity,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(not(unix))]
+type FileIdentity = (u64, Option<std::time::SystemTime>);
+
+#[cfg(unix)]
+fn file_identity(path: &Path) -> Option<FileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    metadata.file_type().is_file().then_some(FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+fn file_identity(path: &Path) -> Option<FileIdentity> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    metadata
+        .file_type()
+        .is_file()
+        .then(|| (metadata.len(), metadata.modified().ok()))
+}
+
+fn local_config_allowance(repository: &Path, config_path: &Path) -> Option<LocalConfigAllowance> {
+    let repository = std::fs::canonicalize(repository).ok()?;
+    let path = if config_path.is_absolute() {
+        config_path.to_path_buf()
+    } else {
+        repository.join(config_path)
+    };
+    // `symlink_metadata` rejects a final-component symlink. Canonicalization
+    // additionally rejects a parent symlink which escapes the worktree.
+    let identity = file_identity(&path)?;
+    let canonical = std::fs::canonicalize(&path).ok()?;
+    let relative = canonical.strip_prefix(&repository).ok()?.to_path_buf();
+    if relative.as_os_str().is_empty() {
+        return None;
+    }
+    crate::config::CaravanConfig::load(&path).ok()?;
+    Some(LocalConfigAllowance {
+        path,
+        relative,
+        identity,
+    })
 }
 
 fn resolve_git_dir(repository: &Path, reported: &str) -> PathBuf {
@@ -704,7 +802,91 @@ mod tests {
         );
         fs::write(directory.path().join("dirty.txt"), "dirty\n").unwrap();
         let runner = ProcessRunner::in_directory(directory.path());
-        let error = ensure_safe_worktree(directory.path(), &runner).unwrap_err();
+        let error = ensure_safe_worktree(
+            directory.path(),
+            &directory.path().join(".caravan/config.yaml"),
+            &runner,
+        )
+        .unwrap_err();
+        assert_eq!(mcp_cli::StructuredError::code(&error), "dirty_worktree");
+    }
+
+    #[test]
+    fn exact_valid_untracked_config_is_allowed_but_neighbors_are_not() {
+        let directory = tempfile::tempdir().unwrap();
+        git(
+            directory.path(),
+            ["init", "--quiet", "--initial-branch=main"],
+        );
+        let config = directory.path().join(".caravan/config.yaml");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(&config, "{}\n").unwrap();
+        let runner = ProcessRunner::in_directory(directory.path());
+
+        ensure_safe_worktree(directory.path(), &config, &runner)
+            .expect("the exact validated init-owned config is safe");
+        fs::write(directory.path().join(".caravan/notes.txt"), "unrelated\n").unwrap();
+        let error = ensure_safe_worktree(directory.path(), &config, &runner).unwrap_err();
+        assert_eq!(mcp_cli::StructuredError::code(&error), "dirty_worktree");
+    }
+
+    #[test]
+    fn tracked_config_is_treated_like_every_other_tracked_file() {
+        let directory = tempfile::tempdir().unwrap();
+        git(
+            directory.path(),
+            ["init", "--quiet", "--initial-branch=main"],
+        );
+        git(directory.path(), ["config", "user.name", "Caravan Test"]);
+        git(
+            directory.path(),
+            ["config", "user.email", "caravan@example.invalid"],
+        );
+        let config = directory.path().join(".caravan/config.yaml");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(&config, "{}\n").unwrap();
+        git(directory.path(), ["add", ".caravan/config.yaml"]);
+        git(directory.path(), ["commit", "--quiet", "--message", "config"]);
+        let runner = ProcessRunner::in_directory(directory.path());
+        ensure_safe_worktree(directory.path(), &config, &runner).unwrap();
+
+        fs::write(&config, "version: 1\nforce_merge: true\n").unwrap();
+        let error = ensure_safe_worktree(directory.path(), &config, &runner).unwrap_err();
+        assert_eq!(mcp_cli::StructuredError::code(&error), "dirty_worktree");
+    }
+
+    #[test]
+    fn config_override_outside_worktree_needs_no_exemption() {
+        let directory = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        git(
+            directory.path(),
+            ["init", "--quiet", "--initial-branch=main"],
+        );
+        let config = external.path().join("config.yaml");
+        fs::write(&config, "{}\n").unwrap();
+        let runner = ProcessRunner::in_directory(directory.path());
+        ensure_safe_worktree(directory.path(), &config, &runner).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_config_is_never_exempted() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        git(
+            directory.path(),
+            ["init", "--quiet", "--initial-branch=main"],
+        );
+        let config = directory.path().join(".caravan/config.yaml");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let target = external.path().join("config.yaml");
+        fs::write(&target, "{}\n").unwrap();
+        symlink(&target, &config).unwrap();
+        let runner = ProcessRunner::in_directory(directory.path());
+        let error = ensure_safe_worktree(directory.path(), &config, &runner).unwrap_err();
         assert_eq!(mcp_cli::StructuredError::code(&error), "dirty_worktree");
     }
 
@@ -718,7 +900,12 @@ mod tests {
         let marker = directory.path().join(".git").join("rebase-merge");
         fs::create_dir_all(&marker).unwrap();
         let runner = ProcessRunner::in_directory(directory.path());
-        let error = ensure_safe_worktree(directory.path(), &runner).unwrap_err();
+        let error = ensure_safe_worktree(
+            directory.path(),
+            &directory.path().join(".caravan/config.yaml"),
+            &runner,
+        )
+        .unwrap_err();
         assert_eq!(
             mcp_cli::StructuredError::code(&error),
             "git_operation_in_progress"
@@ -823,15 +1010,31 @@ mod tests {
             merged_at: None,
             updated_at: None,
         };
+        let config = checkout.join(".caravan/config.yaml");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(&config, "{}\n").unwrap();
         let runner = ProcessRunner::in_directory(&checkout);
 
-        checkout_exact(&checkout, "origin", &runner, &pull_request).unwrap();
+        checkout_exact(
+            &checkout,
+            &checkout.join(".caravan/config.yaml"),
+            "origin",
+            &runner,
+            &pull_request,
+        )
+        .unwrap();
 
         assert_eq!(
             git_stdout(&checkout, ["branch", "--show-current"]),
             branch_name
         );
         assert_eq!(git_stdout(&checkout, ["rev-parse", "HEAD"]), head_oid);
+        assert_eq!(fs::read_to_string(config).unwrap(), "{}\n");
+        assert!(
+            fs::read_dir(checkout.join(".caravan"))
+                .unwrap()
+                .all(|entry| entry.unwrap().file_name() == "config.yaml")
+        );
     }
 
     fn git_stdout<I, S>(repository: &Path, arguments: I) -> String

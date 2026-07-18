@@ -472,11 +472,18 @@ fn sync_with_lock(
     let status = read::status_with_deadline(context, operation_deadline)?;
     let initial_status_elapsed = initial_status_started.elapsed();
     crate::initialization::require_ready(&status.initialization)?;
-    let provider = GitHubMutationAdapter::new(
-        crate::command::ProcessRunner::in_directory(&context.repository_path)
-            .with_timeout(timeout)
-            .with_operation_deadline(operation_deadline),
-    );
+    let runner = crate::command::ProcessRunner::in_directory(&context.repository_path)
+        .with_timeout(timeout)
+        .with_operation_deadline(operation_deadline);
+    // A decision can require an exact branch checkout. Prove checkout safety
+    // before the first provider mutation so a dirty worktree can never turn a
+    // partially-mutated sync into an unrepairable decision receipt.
+    crate::navigation::ensure_safe_worktree(
+        &context.repository_path,
+        &context.config_path,
+        &runner,
+    )?;
+    let provider = GitHubMutationAdapter::new(runner);
     lock.checkpoint(
         "provider_convergence_in_flight",
         json!({
