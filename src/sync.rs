@@ -1396,6 +1396,7 @@ fn comment_mutation_error(
             "affected_pr": affected_pr,
             "operation_receipt": progress.operation_receipt(),
             "provider_receipts": progress.provider_receipts,
+            "events": progress.events,
             "resumable": true,
             "dedupe": "deterministic GitHub-visible caravan-control-label-audit marker",
             "next": "rediscover and rerun `cara sync`",
@@ -2129,6 +2130,14 @@ mod tests {
         let details = error.details().expect("details");
         assert_eq!(details["stage"], "control_label_comment");
         assert_eq!(details["resumable"], true);
+        assert_eq!(details["events"][0]["kind"], "force_merge_attempted");
+        let extracted = crate::hooks::events_from_error(&error);
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted[0].kind, EventKind::ForceMergeAttempted);
+        assert_eq!(
+            json!(extracted[0].event_id),
+            details["events"][0]["event_id"]
+        );
         assert_eq!(*provider.calls.borrow(), vec![MutationKind::Comment]);
     }
 

@@ -223,7 +223,12 @@ pub fn control_label_marker(
     let controls = |labels: &BTreeSet<String>| {
         labels
             .iter()
-            .filter(|label| label.starts_with("caravan"))
+            .filter(|label| {
+                matches!(
+                    label.as_str(),
+                    "caravan" | "caravan-evicted" | "caravan-force"
+                ) || label.starts_with("caravan-priority:")
+            })
             .cloned()
             .collect::<Vec<_>>()
             .join("|")
