@@ -1094,3 +1094,5 @@ mod tests {
         assert!(!rendered.contains("\"analysis\""));
     }
 }
+
+compile_error!("intentional disposable Caravan comment-audit canary; must never merge");
