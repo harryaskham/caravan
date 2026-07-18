@@ -535,9 +535,13 @@ mod tests {
     #[test]
     fn one_absolute_deadline_bounds_multiple_phases_and_reaps_the_hung_phase() {
         let operation_started = Instant::now();
+        // The assertion is about sharing one absolute budget, not requiring a
+        // loaded host to schedule the first shell within one second. Keep the
+        // child timeout larger so the operation deadline remains authoritative.
+        let operation_budget = Duration::from_secs(3);
         let runner = ProcessRunner::new()
             .with_timeout(Duration::from_secs(5))
-            .with_operation_deadline(operation_started + Duration::from_secs(1));
+            .with_operation_deadline(operation_started + operation_budget);
         runner
             .run(&CommandSpec::new("sh").args(["-c", "sleep 0.05"]))
             .expect("first phase fits the budget");
@@ -545,14 +549,17 @@ mod tests {
             .run(&CommandSpec::new("sh").args(["-c", "printf phase-two; sleep 30"]))
             .expect_err("hung second phase must consume only the remaining budget");
 
-        assert!(operation_started.elapsed() < Duration::from_secs(2));
+        assert!(operation_started.elapsed() < Duration::from_secs(4));
         let CommandRunError::Timeout {
             timeout_ms, stdout, ..
         } = error
         else {
             panic!("expected deadline timeout");
         };
-        assert!(timeout_ms <= 950, "remaining budget was {timeout_ms}ms");
+        assert!(
+            timeout_ms <= duration_millis(operation_budget).saturating_sub(50),
+            "remaining budget was {timeout_ms}ms"
+        );
         assert!(stdout.is_empty() || stdout == "phase-two");
     }
 
