@@ -357,16 +357,22 @@ impl CommandRunner for ProcessRunner {
             }
         };
         if let Some(writer) = stdin_writer {
-            writer
-                .join()
-                .map_err(|_| CommandRunError::Spawn {
-                    command: request.clone(),
-                    message: "stdin writer thread panicked".to_owned(),
-                })?
-                .map_err(|error| CommandRunError::Spawn {
-                    command: request.clone(),
-                    message: format!("could not write stdin: {error}"),
-                })?;
+            let write_result = writer.join().map_err(|_| CommandRunError::Spawn {
+                command: request.clone(),
+                message: "stdin writer thread panicked".to_owned(),
+            })?;
+            // A child is allowed to close stdin without consuming the whole
+            // request. Once it has exited and been reaped, its status and
+            // captured output are more authoritative than the writer's EPIPE.
+            // Other I/O failures still indicate that delivery itself broke.
+            if let Err(error) = write_result {
+                if error.kind() != std::io::ErrorKind::BrokenPipe {
+                    return Err(CommandRunError::Spawn {
+                        command: request.clone(),
+                        message: format!("could not write stdin: {error}"),
+                    });
+                }
+            }
         }
         let stdout = join_capture(stdout_reader, request, "stdout")?;
         let stderr = join_capture(stderr_reader, request, "stderr")?;
@@ -548,6 +554,69 @@ mod tests {
         };
         assert!(timeout_ms <= 950, "remaining budget was {timeout_ms}ms");
         assert!(stdout.is_empty() || stdout == "phase-two");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn child_that_closes_stdin_preserves_its_exit_status_and_stderr() {
+        let output = ProcessRunner::new()
+            .run(
+                &CommandSpec::new("sh")
+                    .args(["-c", "exec 0<&-; printf diagnostic >&2; exit 17"])
+                    .stdin("x".repeat(1024 * 1024)),
+            )
+            .unwrap_or_else(|error| {
+                panic!("the child's own result wins over a closed stdin pipe: {error}")
+            });
+
+        assert_eq!(output.code, Some(17));
+        assert_eq!(output.stderr, "diagnostic");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parallel_timeouts_cannot_erase_fast_child_status_or_output() {
+        const WORKERS: usize = 8;
+        const ITERATIONS: usize = 32;
+        let payload = "x".repeat(1024 * 1024);
+
+        thread::scope(|scope| {
+            for worker in 0..WORKERS {
+                let payload = &payload;
+                scope.spawn(move || {
+                    for iteration in 0..ITERATIONS {
+                        if iteration % 8 == 0 {
+                            let error = ProcessRunner::new()
+                                .with_timeout(Duration::from_millis(20))
+                                .run(&CommandSpec::new("sh").args(["-c", "sleep 30"]))
+                                .expect_err("the hanging sibling must time out");
+                            assert!(
+                                matches!(error, CommandRunError::Timeout { .. }),
+                                "worker {worker} iteration {iteration} returned {error}"
+                            );
+                            continue;
+                        }
+
+                        let output = ProcessRunner::new()
+                            .run(
+                                &CommandSpec::new("sh")
+                                    .args([
+                                        "-c",
+                                        "exec 0<&-; printf parallel-diagnostic >&2; exit 17",
+                                    ])
+                                    .stdin(payload.clone()),
+                            )
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "worker {worker} iteration {iteration} lost the child result: {error}"
+                                )
+                            });
+                        assert_eq!(output.code, Some(17));
+                        assert_eq!(output.stderr, "parallel-diagnostic");
+                    }
+                });
+            }
+        });
     }
 
     #[test]
