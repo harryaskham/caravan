@@ -23,6 +23,8 @@ use crate::operation_lock::OperationLock;
 use crate::{AppContext, AppError, SyncInput};
 
 const REPAIR_VERSION: u32 = 1;
+const REPAIR_GIT_NAME_CONFIG: &str = "user.name=Caravan Repair";
+const REPAIR_GIT_EMAIL_CONFIG: &str = "user.email=caravan-repair@users.noreply.github.com";
 const REPAIR_DIRECTORY: &str = "repair-workspaces";
 const MANIFEST_NAME: &str = "session.json";
 
@@ -329,6 +331,10 @@ fn start_exact(
         CommandSpec::new("git")
             .args([
                 "-c",
+                REPAIR_GIT_NAME_CONFIG,
+                "-c",
+                REPAIR_GIT_EMAIL_CONFIG,
+                "-c",
                 "commit.gpgSign=false",
                 "merge",
                 "--no-commit",
@@ -449,6 +455,10 @@ pub fn continue_session(
                     &runner,
                     CommandSpec::new("git")
                         .args([
+                            "-c",
+                            REPAIR_GIT_NAME_CONFIG,
+                            "-c",
+                            REPAIR_GIT_EMAIL_CONFIG,
                             "-c",
                             "commit.gpgSign=false",
                             "commit",
@@ -1529,6 +1539,10 @@ mod tests {
             &workspace,
             &[
                 "-c",
+                "user.name=Caravan Repair",
+                "-c",
+                "user.email=caravan-repair@users.noreply.github.com",
+                "-c",
                 "commit.gpgSign=false",
                 "commit",
                 "-m",
@@ -1685,6 +1699,18 @@ mod tests {
         assert_eq!(
             receipt.parents,
             [fixture.candidate.head.oid, fixture.target.oid]
+        );
+        assert_eq!(
+            git(
+                &workspace,
+                &[
+                    "show",
+                    "-s",
+                    "--format=%an <%ae>|%cn <%ce>",
+                    receipt.new_head.0.as_str(),
+                ],
+            ),
+            "Caravan Repair <caravan-repair@users.noreply.github.com>|Caravan Repair <caravan-repair@users.noreply.github.com>"
         );
         let remote_head = git(
             &fixture.clone,
