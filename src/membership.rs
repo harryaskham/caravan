@@ -118,6 +118,9 @@ pub struct JoinReceipt {
     pub rebase_receipt: Option<crate::physical_rebase::RebaseReceipt>,
     #[serde(default)]
     pub provider_receipts: Vec<GitHubMutationReceipt>,
+    /// Deterministic process-independent hash of this receipt with this field omitted.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub receipt_hash: String,
 }
 
 /// Successful, resumable membership result.
@@ -669,7 +672,7 @@ fn build_join_receipt(
         && !output.pull_request.has_label(FORCE_LABEL)
         && output.pull_request.base.name == predecessor.branch
         && output.pull_request.base.oid == predecessor.head_oid;
-    Ok(JoinReceipt {
+    let mut receipt = JoinReceipt {
         schema_version: 1,
         operation_id: output.receipt.operation_id.clone(),
         repository: repository.clone(),
@@ -691,7 +694,18 @@ fn build_join_receipt(
         config_fingerprint: membership_config_fingerprint(context),
         rebase_receipt: evidence.rebase_receipt.cloned(),
         provider_receipts: output.provider_receipts.clone(),
-    })
+        receipt_hash: String::new(),
+    };
+    let material = serde_json::to_vec(&receipt).expect("join receipt serializes");
+    receipt.receipt_hash = fnv1a64(&material);
+    Ok(receipt)
+}
+
+fn fnv1a64(bytes: &[u8]) -> String {
+    let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    format!("fnv1a64:{hash:016x}")
 }
 
 fn membership_config_fingerprint(context: &AppContext) -> String {
@@ -702,12 +716,7 @@ fn membership_config_fingerprint(context: &AppContext) -> String {
         "agent_priority_labels": &context.config.agent_priority_labels,
     }))
     .expect("validated config serializes");
-    let hash = contract
-        .iter()
-        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
-            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
-        });
-    format!("fnv1a64:{hash:016x}")
+    fnv1a64(&contract)
 }
 
 fn force_rewrite_invalidation_audit(
@@ -2042,6 +2051,14 @@ mod tests {
         assert_eq!(receipt.predecessor.pr, PrNumber(1));
         assert_eq!(receipt.result.base_oid, head.head.oid);
         assert!(receipt.config_fingerprint.starts_with("fnv1a64:"));
+        assert!(receipt.receipt_hash.starts_with("fnv1a64:"));
+        let mut unhashed = receipt.clone();
+        let expected_hash = unhashed.receipt_hash.clone();
+        unhashed.receipt_hash.clear();
+        assert_eq!(
+            fnv1a64(&serde_json::to_vec(&unhashed).unwrap()),
+            expected_hash
+        );
         assert!(receipt.provider_receipts.iter().any(|provider| {
             provider.kind == MutationKind::RemoveLabel
                 && provider

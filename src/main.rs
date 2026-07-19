@@ -790,6 +790,7 @@ fn render_loop_tick(output: &caravan::loop_runner::LoopTickOutput) -> String {
     text
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_sync(output: &caravan::sync::SyncOutput) -> String {
     let caravans = output
         .synchronized_caravans

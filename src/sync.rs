@@ -468,7 +468,7 @@ pub fn sync(context: &AppContext, input: &SyncInput) -> Result<SyncOutput, AppEr
         Err(error) => {
             let error = checkout_for_decision(context, error, operation_deadline);
             let scheduler_status = scheduler_failure_status(&error);
-            let error = attach_scheduler_failure(error, &scheduler_status);
+            let error = attach_scheduler_failure(&error, &scheduler_status);
             let mut events = hooks::events_from_error(&error);
             let already_wakes_repair = events
                 .iter()
@@ -1173,7 +1173,7 @@ fn scheduler_failure_status(error: &AppError) -> SyncFailureSchedulerStatus {
 }
 
 fn attach_scheduler_failure(
-    error: AppError,
+    error: &AppError,
     scheduler_status: &SyncFailureSchedulerStatus,
 ) -> AppError {
     let mut details = error.details().unwrap_or_else(|| json!({}));
@@ -3640,7 +3640,7 @@ mod tests {
         assert_eq!(scheduler.disposition, SchedulerDisposition::RetryTick);
         assert_eq!(scheduler.wake_class, SchedulerWakeClass::RetryTick);
         assert!(scheduler.retryable);
-        let attached = attach_scheduler_failure(error, &scheduler);
+        let attached = attach_scheduler_failure(&error, &scheduler);
         let details = attached.details().expect("scheduler details");
         assert_eq!(details["scheduler_status"]["disposition"], "retry_tick");
         assert_eq!(details["scheduler_status"]["wake_class"], "retry_tick");
@@ -3660,7 +3660,7 @@ mod tests {
         );
         let scheduler = scheduler_failure_status(&error);
         assert_eq!(scheduler.wake_class, SchedulerWakeClass::ExternalDecision);
-        let attached = attach_scheduler_failure(error, &scheduler);
+        let attached = attach_scheduler_failure(&error, &scheduler);
         let event = sync_failed_event(&attached).expect("external decision event");
         assert_eq!(event.kind, EventKind::SyncFailed);
         assert_eq!(event.metadata["error_code"], "rebase_midpoint_head_stale");
