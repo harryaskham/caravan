@@ -123,10 +123,82 @@ pub struct SyncTiming {
     pub final_status_ms: u64,
 }
 
+/// Scheduler-facing outcome of one bounded, idempotent sync tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SchedulerDisposition {
+    Healthy,
+    WaitingCi,
+    Held,
+    RetryTick,
+    ExternalDecision,
+    OperatorAction,
+}
+
+/// Whether an external coordinator should wake a repair actor for this tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SchedulerWakeClass {
+    None,
+    RetryTick,
+    ExternalDecision,
+    OperatorAction,
+}
+
+/// Exact provider generation retained for one member after a successful tick.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SyncMemberGeneration {
+    pub pr: PrNumber,
+    pub head: crate::model::BranchSnapshot,
+    pub base: crate::model::BranchSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate: Option<MergeCandidateIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci: Option<CiDisposition>,
+}
+
+/// Exact root-to-tail generation for one converged caravan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SyncCaravanGeneration {
+    pub caravan_id: PrNumber,
+    pub root: PrNumber,
+    pub tail: PrNumber,
+    pub members: Vec<SyncMemberGeneration>,
+}
+
+/// Stable status consumed by deterministic external tick schedulers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SyncSchedulerStatus {
+    pub schema_version: u32,
+    pub disposition: SchedulerDisposition,
+    pub wake_class: SchedulerWakeClass,
+    pub rebase_on_join: bool,
+    pub default_branch: crate::model::BranchSnapshot,
+    #[serde(default)]
+    pub caravans: Vec<SyncCaravanGeneration>,
+    #[serde(default)]
+    pub waiting_prs: Vec<PrNumber>,
+    #[serde(default)]
+    pub held_caravans: Vec<PrNumber>,
+    pub reason: String,
+}
+
+/// Scheduler classification attached to every failed tick.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SyncFailureSchedulerStatus {
+    pub schema_version: u32,
+    pub disposition: SchedulerDisposition,
+    pub wake_class: SchedulerWakeClass,
+    pub retryable: bool,
+    pub error_code: String,
+}
+
 /// Stable result of one converged synchronization tick.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SyncOutput {
     pub receipt: OperationReceipt,
+    /// Explicit no-wake/decision status for external deterministic schedulers.
+    pub scheduler_status: SyncSchedulerStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timing: Option<SyncTiming>,
     /// Exact dead-owner cleanup performed before this sync acquired its lock.
@@ -395,8 +467,15 @@ pub fn sync(context: &AppContext, input: &SyncInput) -> Result<SyncOutput, AppEr
         }
         Err(error) => {
             let error = checkout_for_decision(context, error, operation_deadline);
+            let scheduler_status = scheduler_failure_status(&error);
+            let error = attach_scheduler_failure(error, &scheduler_status);
             let mut events = hooks::events_from_error(&error);
-            if events.is_empty() {
+            let already_wakes_repair = events
+                .iter()
+                .any(|event| matches!(event.kind, EventKind::CiFailed | EventKind::SyncFailed));
+            if !already_wakes_repair
+                && scheduler_status.wake_class == SchedulerWakeClass::ExternalDecision
+            {
                 if let Some(event) = sync_failed_event(&error) {
                     events.push(event);
                 }
@@ -424,6 +503,7 @@ struct PreparedChain {
 
 #[derive(Default)]
 struct PhysicalRebuildOutcome {
+    repository: Option<RepositoryId>,
     plans: Vec<crate::physical_rebase::RebasePlan>,
     receipts: Vec<crate::physical_rebase::RebaseReceipt>,
     provider_receipts: Vec<GitHubMutationReceipt>,
@@ -510,6 +590,7 @@ fn prepare_physical_chains(
                     return Err(attach_physical_rebuild(
                         error,
                         &PhysicalRebuildOutcome {
+                            repository: Some(status.repository.clone()),
                             plans,
                             ..PhysicalRebuildOutcome::default()
                         },
@@ -535,6 +616,7 @@ fn prepare_physical_chains(
         return Err(attach_physical_rebuild(
             error,
             &PhysicalRebuildOutcome {
+                repository: Some(status.repository.clone()),
                 plans,
                 ..PhysicalRebuildOutcome::default()
             },
@@ -698,6 +780,7 @@ fn apply_physical_chains(
         .flat_map(|chain| chain.members.iter().map(|prepared| prepared.plan.clone()))
         .collect::<Vec<_>>();
     let mut outcome = PhysicalRebuildOutcome {
+        repository: Some(status.repository.clone()),
         plans,
         ..PhysicalRebuildOutcome::default()
     };
@@ -809,6 +892,7 @@ fn apply_prepared_chain(
 fn attach_physical_rebuild(error: AppError, outcome: &PhysicalRebuildOutcome) -> AppError {
     let mut details = error.details().unwrap_or_else(|| json!({}));
     if let Some(object) = details.as_object_mut() {
+        object.insert("repository".to_owned(), json!(outcome.repository));
         object.insert("rebase_plans".to_owned(), json!(outcome.plans));
         object.insert("rebase_receipts".to_owned(), json!(outcome.receipts));
         object.insert(
@@ -937,23 +1021,242 @@ fn decision_checkout_target(decision: &DecisionPoint) -> Option<PrNumber> {
     }
 }
 
+fn successful_scheduler_status(
+    status: &StatusOutput,
+    ci: &[CiObservation],
+    paused: &[crate::pause::PauseStatus],
+    rebase_on_join: bool,
+) -> SyncSchedulerStatus {
+    let ci_by_pr = ci
+        .iter()
+        .map(|observation| (observation.pr, observation.disposition))
+        .collect::<BTreeMap<_, _>>();
+    let candidates = status
+        .merge_candidates
+        .iter()
+        .cloned()
+        .map(|candidate| (candidate.pr, candidate))
+        .collect::<BTreeMap<_, _>>();
+    let caravans = status
+        .analysis
+        .fleet
+        .caravans
+        .iter()
+        .map(|caravan| {
+            let members = caravan
+                .members
+                .iter()
+                .filter_map(|number| {
+                    status
+                        .analysis
+                        .pull_requests
+                        .get(number)
+                        .map(|pull_request| SyncMemberGeneration {
+                            pr: *number,
+                            head: pull_request.head.clone(),
+                            base: pull_request.base.clone(),
+                            candidate: candidates.get(number).cloned(),
+                            ci: ci_by_pr.get(number).copied(),
+                        })
+                })
+                .collect::<Vec<_>>();
+            SyncCaravanGeneration {
+                caravan_id: caravan.id,
+                root: caravan.head().expect("caravans are non-empty"),
+                tail: caravan.tail().expect("caravans are non-empty"),
+                members,
+            }
+        })
+        .collect::<Vec<_>>();
+    let waiting_prs = ci
+        .iter()
+        .filter(|observation| observation.disposition == CiDisposition::Waiting)
+        .map(|observation| observation.pr)
+        .collect::<Vec<_>>();
+    let held_caravans = paused
+        .iter()
+        .map(|pause| pause.record.caravan_head)
+        .collect::<Vec<_>>();
+    let (disposition, reason) = if !waiting_prs.is_empty() {
+        (
+            SchedulerDisposition::WaitingCi,
+            "fresh or pending CI is the only incomplete condition; do not wake a repair actor",
+        )
+    } else if !held_caravans.is_empty() {
+        (
+            SchedulerDisposition::Held,
+            "one or more caravans are intentionally held; only explicit resume may release them",
+        )
+    } else {
+        (
+            SchedulerDisposition::Healthy,
+            "the exact provider graph and selected root-to-tail generations are converged",
+        )
+    };
+    SyncSchedulerStatus {
+        schema_version: 1,
+        disposition,
+        wake_class: SchedulerWakeClass::None,
+        rebase_on_join,
+        default_branch: status.analysis.fleet.default_branch.clone(),
+        caravans,
+        waiting_prs,
+        held_caravans,
+        reason: reason.to_owned(),
+    }
+}
+
+fn scheduler_failure_status(error: &AppError) -> SyncFailureSchedulerStatus {
+    let error_code = error.code();
+    let decision = error.details().and_then(|details| {
+        serde_json::from_value::<DecisionPoint>(details.get("decision")?.clone()).ok()
+    });
+    let (disposition, wake_class, retryable) = match decision.map(|item| item.kind) {
+        Some(DecisionKind::StalePrecondition) => (
+            SchedulerDisposition::RetryTick,
+            SchedulerWakeClass::RetryTick,
+            true,
+        ),
+        Some(DecisionKind::UnsafeCheckout | DecisionKind::HookFailure) => (
+            SchedulerDisposition::OperatorAction,
+            SchedulerWakeClass::OperatorAction,
+            false,
+        ),
+        Some(_) => (
+            SchedulerDisposition::ExternalDecision,
+            SchedulerWakeClass::ExternalDecision,
+            false,
+        ),
+        None if matches!(
+            error_code.as_str(),
+            "rebase_conflict"
+                | "rebase_midpoint_head_stale"
+                | "rebase_midpoint_pr_missing"
+                | "rebase_prepared_object_changed"
+                | "rebase_result_invalid"
+                | "rebase_worker_panicked"
+        ) =>
+        {
+            (
+                SchedulerDisposition::ExternalDecision,
+                SchedulerWakeClass::ExternalDecision,
+                false,
+            )
+        }
+        None if matches!(
+            error_code.as_str(),
+            "default_branch_not_protected"
+                | "rebase_ci_trigger_missing"
+                | "repository_not_initialized"
+                | "unsafe_checkout"
+        ) =>
+        {
+            (
+                SchedulerDisposition::OperatorAction,
+                SchedulerWakeClass::OperatorAction,
+                false,
+            )
+        }
+        None => (
+            SchedulerDisposition::RetryTick,
+            SchedulerWakeClass::RetryTick,
+            true,
+        ),
+    };
+    SyncFailureSchedulerStatus {
+        schema_version: 1,
+        disposition,
+        wake_class,
+        retryable,
+        error_code,
+    }
+}
+
+fn attach_scheduler_failure(
+    error: AppError,
+    scheduler_status: &SyncFailureSchedulerStatus,
+) -> AppError {
+    let mut details = error.details().unwrap_or_else(|| json!({}));
+    if let Some(object) = details.as_object_mut() {
+        object.insert("scheduler_status".to_owned(), json!(scheduler_status));
+    } else {
+        details = json!({
+            "original_details": details,
+            "scheduler_status": scheduler_status,
+        });
+    }
+    AppError::structured(
+        error.category(),
+        error.code(),
+        error.message(),
+        Some(details),
+    )
+}
+
 fn sync_failed_event(error: &AppError) -> Option<CaravanEvent> {
     let details = error.details()?;
-    let decision =
-        serde_json::from_value::<DecisionPoint>(details.get("decision")?.clone()).ok()?;
-    let fleet = decision
-        .evidence
-        .get("fleet")
-        .and_then(|value| serde_json::from_value(value.clone()).ok());
+    if let Some(decision) = details
+        .get("decision")
+        .and_then(|value| serde_json::from_value::<DecisionPoint>(value.clone()).ok())
+    {
+        let fleet = decision
+            .evidence
+            .get("fleet")
+            .and_then(|value| serde_json::from_value(value.clone()).ok());
+        return Some(hooks::event(
+            EventKind::SyncFailed,
+            decision.operation_id,
+            decision.repository,
+            decision.caravan_id,
+            decision.affected_prs,
+            fleet,
+            Some(decision.message),
+            BTreeMap::from([
+                ("error_code".to_owned(), json!(error.code())),
+                (
+                    "scheduler_status".to_owned(),
+                    details.get("scheduler_status").cloned().unwrap_or_default(),
+                ),
+            ]),
+        ));
+    }
+
+    let scheduler_status = serde_json::from_value::<SyncFailureSchedulerStatus>(
+        details.get("scheduler_status")?.clone(),
+    )
+    .ok()?;
+    if scheduler_status.wake_class != SchedulerWakeClass::ExternalDecision {
+        return None;
+    }
+    let repository =
+        serde_json::from_value::<RepositoryId>(details.get("repository")?.clone()).ok()?;
+    let mut prs = BTreeSet::new();
+    if let Some(plans) = details.get("rebase_plans").and_then(|value| {
+        serde_json::from_value::<Vec<crate::physical_rebase::RebasePlan>>(value.clone()).ok()
+    }) {
+        prs.extend(plans.into_iter().map(|plan| plan.pr));
+    }
+    if let Some(receipts) = details.get("rebase_receipts").and_then(|value| {
+        serde_json::from_value::<Vec<crate::physical_rebase::RebaseReceipt>>(value.clone()).ok()
+    }) {
+        prs.extend(receipts.into_iter().map(|receipt| receipt.pr));
+    }
     Some(hooks::event(
         EventKind::SyncFailed,
-        decision.operation_id,
-        decision.repository,
-        decision.caravan_id,
-        decision.affected_prs,
-        fleet,
-        Some(decision.message),
-        BTreeMap::from([("error_code".to_owned(), json!(error.code()))]),
+        hooks::operation_id_from_error(error),
+        repository,
+        None,
+        prs.into_iter().collect(),
+        None,
+        Some(error.message()),
+        BTreeMap::from([
+            ("error_code".to_owned(), json!(error.code())),
+            ("scheduler_status".to_owned(), json!(scheduler_status)),
+            (
+                "provider_invariant".to_owned(),
+                json!(details.get("rebase_receipts").is_some()),
+            ),
+        ]),
     ))
 }
 
@@ -1161,8 +1464,15 @@ fn sync_with_lock(
 
     lock.checkpoint("completed", sync_checkpoint_evidence(&progress), false)?;
 
+    let scheduler_status = successful_scheduler_status(
+        &final_status,
+        &progress.ci,
+        &progress.paused_caravans,
+        context.config.rebase_on_join,
+    );
     Ok(SyncOutput {
         receipt: progress.operation_receipt(),
+        scheduler_status,
         timing: Some(SyncTiming {
             deadline_ms: duration_millis(operation_deadline.saturating_duration_since(started)),
             total_ms: duration_millis(started.elapsed()),
@@ -3242,6 +3552,28 @@ mod tests {
         assert!(!progress.operation_receipt().changed);
         assert!(progress.events.is_empty());
         assert!(provider.calls.borrow().is_empty());
+        let scheduler =
+            successful_scheduler_status(&status, &progress.ci, &progress.paused_caravans, true);
+        assert_eq!(scheduler.disposition, SchedulerDisposition::WaitingCi);
+        assert_eq!(scheduler.wake_class, SchedulerWakeClass::None);
+        assert_eq!(
+            scheduler.waiting_prs,
+            [PrNumber(1), PrNumber(2), PrNumber(3)]
+        );
+        assert_eq!(scheduler.caravans[0].root, PrNumber(1));
+        assert_eq!(scheduler.caravans[0].tail, PrNumber(3));
+        assert_eq!(
+            scheduler.caravans[0].members[0].ci,
+            Some(CiDisposition::Waiting)
+        );
+        let encoded = serde_json::to_value(&scheduler).expect("scheduler status JSON");
+        assert_eq!(encoded["schema_version"], 1);
+        assert_eq!(encoded["disposition"], "waiting_ci");
+        assert_eq!(encoded["wake_class"], "none");
+        assert_eq!(encoded["default_branch"]["name"], "main");
+        assert_eq!(encoded["caravans"][0]["root"], 1);
+        assert_eq!(encoded["caravans"][0]["tail"], 3);
+        assert_eq!(encoded["caravans"][0]["members"][0]["pr"], 1);
     }
 
     #[test]
@@ -3276,6 +3608,66 @@ mod tests {
             details["decision"]["operation_id"]
         );
         assert!(provider.calls.borrow().is_empty());
+        let scheduler = scheduler_failure_status(&error);
+        assert_eq!(
+            scheduler.disposition,
+            SchedulerDisposition::ExternalDecision
+        );
+        assert_eq!(scheduler.wake_class, SchedulerWakeClass::ExternalDecision);
+        assert!(!scheduler.retryable);
+    }
+
+    #[test]
+    fn stale_provider_precondition_retries_without_waking_a_repair_actor() {
+        let pulls = healthy_chain();
+        let status = status(pulls.clone(), Some(PrNumber(1)), &clean);
+        let progress = SyncProgress::new(&status, vec![PrNumber(1)]);
+        let expected = PullRequestPrecondition::from(&pulls[0]);
+        let mut actual_pull = pulls[0].clone();
+        actual_pull.head.oid = CommitOid("moved-head".to_owned());
+        let actual = PullRequestPrecondition::from(&actual_pull);
+        let error = mutation_error(
+            &MutationError::StalePrecondition {
+                expected: Box::new(expected),
+                actual: Box::new(actual),
+                changed_fields: vec!["head_oid".to_owned()],
+            },
+            &progress,
+            Some(PrNumber(1)),
+        );
+
+        let scheduler = scheduler_failure_status(&error);
+        assert_eq!(scheduler.disposition, SchedulerDisposition::RetryTick);
+        assert_eq!(scheduler.wake_class, SchedulerWakeClass::RetryTick);
+        assert!(scheduler.retryable);
+        let attached = attach_scheduler_failure(error, &scheduler);
+        let details = attached.details().expect("scheduler details");
+        assert_eq!(details["scheduler_status"]["disposition"], "retry_tick");
+        assert_eq!(details["scheduler_status"]["wake_class"], "retry_tick");
+    }
+
+    #[test]
+    fn provider_generation_invariant_emits_external_decision_wake_event() {
+        let error = AppError::structured(
+            ErrorCategory::Validation,
+            "rebase_midpoint_head_stale",
+            "provider exposed a different rewritten head",
+            Some(json!({
+                "repository": repository(),
+                "rebase_plans": [],
+                "rebase_receipts": [],
+            })),
+        );
+        let scheduler = scheduler_failure_status(&error);
+        assert_eq!(scheduler.wake_class, SchedulerWakeClass::ExternalDecision);
+        let attached = attach_scheduler_failure(error, &scheduler);
+        let event = sync_failed_event(&attached).expect("external decision event");
+        assert_eq!(event.kind, EventKind::SyncFailed);
+        assert_eq!(event.metadata["error_code"], "rebase_midpoint_head_stale");
+        assert_eq!(
+            event.metadata["scheduler_status"]["wake_class"],
+            "external_decision"
+        );
     }
 
     #[test]

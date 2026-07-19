@@ -810,6 +810,24 @@ fn render_sync(output: &caravan::sync::SyncOutput) -> String {
             format!("caravans {caravans}")
         }
     );
+    let _ = writeln!(
+        text,
+        "  scheduler: {:?} wake={:?} rebase_on_join={} — {}",
+        output.scheduler_status.disposition,
+        output.scheduler_status.wake_class,
+        output.scheduler_status.rebase_on_join,
+        output.scheduler_status.reason,
+    );
+    if !output.scheduler_status.waiting_prs.is_empty() {
+        let waiting = output
+            .scheduler_status
+            .waiting_prs
+            .iter()
+            .map(|number| format!("#{number}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(text, "  scheduler waiting CI: {waiting}");
+    }
     if let Some(predecessor) = output.historical_predecessor {
         let _ = writeln!(text, "  selected from merged predecessor #{predecessor}");
     }

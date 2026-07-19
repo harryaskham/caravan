@@ -34,8 +34,13 @@ after the same check passes.
 - `cara sync` is idempotent: pending CI waits, failed CI returns bounded
   run/job/failed-step and exact selected-lineage receipts, and
   `--rerun-failed` reruns only current-generation infrastructure failures.
-  Stale synthetic generations require a fresh candidate trigger; raw logs and
-  unrelated log text are never retained or exposed.
+  Every successful tick includes a versioned `scheduler_status` with exact
+  default/root/tail/member generations and a `healthy`, `waiting_ci`, or `held`
+  disposition. Failed ticks classify `wake_class` as `retry_tick`,
+  `external_decision`, or `operator_action`; only an external decision emits a
+  repair-wake failure event. Stale provider preconditions are routine retry
+  ticks, not merger work. Stale synthetic generations require a fresh candidate
+  trigger; raw logs and unrelated log text are never retained or exposed.
 - `caravan-force` is explicit operator intent to bypass any CI state that is
   not fully successful, including pending, running, failed, mixed, and empty
   checks. A forced head is admin-squashed only when repository policy permits
