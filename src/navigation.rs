@@ -533,6 +533,7 @@ fn command_run_error(error: &CommandRunError) -> AppError {
         timeout_ms,
         stdout,
         stderr,
+        ..
     } = error
     {
         return AppError::structured(
@@ -1007,6 +1008,7 @@ mod tests {
     fn navigation_timeout_preserves_timeout_category_and_evidence() {
         let error = command_run_error(&CommandRunError::Timeout {
             command: CommandSpec::new("git").args(["ls-remote", "origin"]),
+            process_group_id: None,
             timeout_ms: 750,
             stdout: "partial".to_owned(),
             stderr: "stalled".to_owned(),

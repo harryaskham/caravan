@@ -189,6 +189,8 @@ version: 1
 force_merge: false
 rebase_on_join: false
 command_timeout_secs: 30
+repair:
+  materialization_timeout_secs: 180
 loop:
   interval_secs: 60
 journal:
@@ -240,9 +242,12 @@ was already tested. Instant no-rerun landing requires an ancestry-preserving
 merge mode or an audited exact-tree/check receipt policy, neither of which is
 currently implemented.
 
-`command_timeout_secs` is both the hard ceiling for each `git` or `gh` child
-and the complete operator-safe budget for `cara status` (30 seconds by
-default). Status propagates one absolute deadline through discovery,
+`command_timeout_secs` is the hard ceiling for lightweight `git` or `gh`
+children and the complete operator-safe budget for `cara status` (30 seconds by
+default). Network-heavy repair clone/fetch/checkout uses the separately bounded
+`repair.materialization_timeout_secs` (180 seconds by default), and persisted
+repair status reports its exact phase, budget, last error, and resume/abort path.
+Status propagates one absolute deadline through discovery,
 compatibility, and label inventory; every child receives only the remaining
 budget. Timeouts terminate and reap the child process group and return stable
 `github_discovery_timeout` evidence with the exact phase, operation

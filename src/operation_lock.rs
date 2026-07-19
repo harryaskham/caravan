@@ -633,6 +633,7 @@ fn lock_command_error(error: &CommandRunError, repository: &Path) -> AppError {
         timeout_ms,
         stdout,
         stderr,
+        ..
     } = error
     {
         return AppError::structured(

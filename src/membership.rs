@@ -1255,6 +1255,7 @@ fn mutation_error(error: &MutationError, state: &ExecutionState) -> AppError {
         timeout_ms,
         stdout,
         stderr,
+        ..
     })) = error
     {
         return AppError::structured(
@@ -1885,6 +1886,7 @@ mod tests {
         let error = mutation_error(
             &MutationError::Provider(DiscoveryError::Runner(CommandRunError::Timeout {
                 command: crate::command::CommandSpec::new("gh").args(["pr", "edit"]),
+                process_group_id: None,
                 timeout_ms: 900,
                 stdout: "partial".to_owned(),
                 stderr: "stalled".to_owned(),

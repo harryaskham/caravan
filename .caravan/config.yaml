@@ -8,6 +8,8 @@ agent_priority_labels:
   - caravan-priority:normal
   - caravan-priority:low
 command_timeout_secs: 30
+repair:
+  materialization_timeout_secs: 180
 loop:
   interval_secs: 60
 journal:

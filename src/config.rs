@@ -31,6 +31,10 @@ fn default_command_timeout_secs() -> u64 {
     30
 }
 
+fn default_repair_materialization_timeout_secs() -> u64 {
+    180
+}
+
 fn default_hook_timeout_secs() -> u64 {
     30
 }
@@ -85,6 +89,22 @@ impl Default for LoopConfig {
     }
 }
 
+/// Dedicated bounds for network-heavy isolated repair materialization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct RepairConfig {
+    /// Whole-command bound for clone/fetch/checkout materialization phases.
+    pub materialization_timeout_secs: u64,
+}
+
+impl Default for RepairConfig {
+    fn default() -> Self {
+        Self {
+            materialization_timeout_secs: default_repair_materialization_timeout_secs(),
+        }
+    }
+}
+
 /// One shell hook policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
@@ -121,8 +141,9 @@ pub struct CaravanConfig {
     /// candidates. Labels in the `caravan-priority:` namespace which are not
     /// listed here are invalid and fail closed.
     pub agent_priority_labels: Vec<String>,
-    /// Hard deadline for each Git or GitHub CLI subprocess.
+    /// Hard deadline for each lightweight Git or GitHub CLI subprocess.
     pub command_timeout_secs: u64,
+    pub repair: RepairConfig,
     #[serde(rename = "loop")]
     pub loop_config: LoopConfig,
     pub journal: JournalConfig,
@@ -137,6 +158,7 @@ impl Default for CaravanConfig {
             rebase_on_join: false,
             agent_priority_labels: default_agent_priority_labels(),
             command_timeout_secs: default_command_timeout_secs(),
+            repair: RepairConfig::default(),
             loop_config: LoopConfig::default(),
             journal: JournalConfig::default(),
             hooks: BTreeMap::new(),
@@ -227,6 +249,11 @@ impl CaravanConfig {
         if !(1..=MAX_COMMAND_TIMEOUT_SECS).contains(&self.command_timeout_secs) {
             return Err(ConfigError::Validation(format!(
                 "command_timeout_secs must be between 1 and {MAX_COMMAND_TIMEOUT_SECS}"
+            )));
+        }
+        if !(1..=MAX_COMMAND_TIMEOUT_SECS).contains(&self.repair.materialization_timeout_secs) {
+            return Err(ConfigError::Validation(format!(
+                "repair.materialization_timeout_secs must be between 1 and {MAX_COMMAND_TIMEOUT_SECS}"
             )));
         }
         if !(1..=MAX_INTERVAL_SECS).contains(&self.loop_config.interval_secs) {
@@ -374,6 +401,7 @@ mod tests {
             ]
         );
         assert_eq!(config.command_timeout_secs, 30);
+        assert_eq!(config.repair.materialization_timeout_secs, 180);
         assert_eq!(config.loop_config.interval_secs, 60);
         assert!(config.hooks.is_empty());
     }
@@ -386,6 +414,8 @@ version: 1
 force_merge: true
 rebase_on_join: true
 command_timeout_secs: 45
+repair:
+  materialization_timeout_secs: 240
 loop:
   interval_secs: 10
 hooks:
@@ -399,6 +429,7 @@ hooks:
         assert!(config.force_merge);
         assert!(config.rebase_on_join);
         assert_eq!(config.command_timeout_secs, 45);
+        assert_eq!(config.repair.materialization_timeout_secs, 240);
         let hook = config.hook(EventKind::SyncFailed).expect("hook");
         assert_eq!(hook.command, "./scripts/on-sync-failed");
         assert_eq!(hook.timeout_secs, 45);
@@ -413,6 +444,11 @@ hooks:
             CaravanConfig::parse("version: 1\nloop:\n  interval_secs: 10\n  surprise: true\n")
                 .unwrap_err();
         assert_eq!(nested.code(), "config_parse_failed");
+        let repair = CaravanConfig::parse(
+            "version: 1\nrepair:\n  materialization_timeout_secs: 180\n  surprise: true\n",
+        )
+        .unwrap_err();
+        assert_eq!(repair.code(), "config_parse_failed");
         let hook = CaravanConfig::parse(
             "version: 1\nhooks:\n  sync_failed:\n    command: echo hi\n    surprise: true\n",
         )
@@ -447,6 +483,12 @@ hooks:
         );
         assert_eq!(
             CaravanConfig::parse("version: 1\ncommand_timeout_secs: 0\n")
+                .unwrap_err()
+                .code(),
+            "invalid_config"
+        );
+        assert_eq!(
+            CaravanConfig::parse("version: 1\nrepair:\n  materialization_timeout_secs: 0\n",)
                 .unwrap_err()
                 .code(),
             "invalid_config"

@@ -1563,6 +1563,7 @@ mod tests {
     fn discovery_timeout_preserves_timeout_category_and_evidence() {
         let error = discovery_error(&DiscoveryError::Runner(CommandRunError::Timeout {
             command: crate::command::CommandSpec::new("gh").args(["pr", "list"]),
+            process_group_id: None,
             timeout_ms: 500,
             stdout: "partial".to_owned(),
             stderr: "stalled".to_owned(),
@@ -1594,6 +1595,7 @@ mod tests {
     fn status_deadline_error_reports_total_elapsed_and_phase() {
         let provider = DiscoveryError::Runner(CommandRunError::Timeout {
             command: crate::command::CommandSpec::new("gh").args(["pr", "list"]),
+            process_group_id: None,
             timeout_ms: 250,
             stdout: String::new(),
             stderr: "stalled".to_owned(),

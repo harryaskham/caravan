@@ -17,7 +17,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::command::{CommandOutput, CommandRunner, CommandSpec, ProcessRunner};
+use crate::command::{CommandOutput, CommandRunError, CommandRunner, CommandSpec, ProcessRunner};
 use crate::model::{BranchSnapshot, CommitOid, PrNumber, PullRequestSnapshot, RepositoryId};
 use crate::operation_lock::OperationLock;
 use crate::{AppContext, AppError, SyncInput};
@@ -92,6 +92,42 @@ pub enum RepairState {
     Published,
 }
 
+/// Exact external materialization phase persisted before each subprocess.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairPhase {
+    #[default]
+    Preparing,
+    Cloning,
+    FetchingHead,
+    FetchingTarget,
+    CheckingOut,
+    Merging,
+    Resolving,
+    Committed,
+    Published,
+    SyncPending,
+    Completed,
+}
+
+/// Bounded durable error evidence for a resumable materialization phase.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepairPhaseError {
+    pub phase: RepairPhase,
+    pub code: String,
+    pub message: String,
+    pub elapsed_ms: u64,
+    pub timeout_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_group_id: Option<u32>,
+    pub partial_path: String,
+    pub next: String,
+}
+
+fn default_materialization_timeout_secs() -> u64 {
+    180
+}
+
 /// Stable, secret-free repair session receipt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RepairSession {
@@ -102,13 +138,21 @@ pub struct RepairSession {
     pub head: BranchSnapshot,
     pub old_base: BranchSnapshot,
     pub target: BranchSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_pr: Option<PrNumber>,
     pub workspace: String,
     /// Explicit provider-owned Git URL. Repair never depends on or changes the
     /// caller checkout's possibly internal `origin` configuration.
     pub provider_git_url: String,
     pub config_path: String,
     pub config_fingerprint: String,
+    #[serde(default = "default_materialization_timeout_secs")]
+    pub materialization_timeout_secs: u64,
     pub state: RepairState,
+    #[serde(default)]
+    pub phase: RepairPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<RepairPhaseError>,
     #[serde(default)]
     pub conflicting_paths: Vec<String>,
     /// Stage-zero index entries created mechanically by the initial merge.
@@ -203,6 +247,7 @@ pub fn start(
         &status.repository,
         &candidate,
         &target,
+        input.target_pr.map(PrNumber),
         &provider_git_url,
     )?;
     lock.checkpoint("repair_workspace_ready", json!(&output.repair), false)?;
@@ -216,6 +261,7 @@ fn start_exact(
     repository: &RepositoryId,
     candidate: &PullRequestSnapshot,
     target: &BranchSnapshot,
+    target_pr: Option<PrNumber>,
     provider_git_url: &str,
 ) -> Result<RepairStartOutput, AppError> {
     require_owned_repair(repository, candidate, target)?;
@@ -223,6 +269,46 @@ fn start_exact(
     if paths.manifest.exists() {
         let existing = read_manifest(&paths.manifest)?;
         if existing.head == candidate.head && existing.target == *target {
+            if existing.state == RepairState::Preparing {
+                if existing.repository != *repository
+                    || existing.pr != candidate.number
+                    || existing.old_base != candidate.base
+                    || existing.target_pr != target_pr
+                    || existing.provider_git_url != provider_git_url
+                {
+                    return Err(AppError::structured(
+                        ErrorCategory::Validation,
+                        "repair_preparing_manifest_drift",
+                        "preserved preparing session no longer matches fresh repository/PR/provider facts",
+                        Some(json!({
+                            "existing": existing,
+                            "requested_head": candidate.head,
+                            "requested_target": target,
+                            "next": "inspect and confirm-abort the stale session; never overwrite it",
+                        })),
+                    ));
+                }
+                let mut resumed = existing;
+                resumed.config_path = absolute_config_path(context);
+                resumed.config_fingerprint = config_fingerprint(context)?;
+                resumed.materialization_timeout_secs =
+                    context.config.repair.materialization_timeout_secs;
+                resumed.last_error = None;
+                resumed.updated_unix_ms = unix_ms();
+                if paths.workspace.exists() {
+                    validate_partial_workspace_path(&paths, &resumed)?;
+                    fs::remove_dir_all(&paths.workspace).map_err(|error| {
+                        repair_io_error(
+                            "repair_partial_cleanup_failed",
+                            "could not remove the verified incomplete clone before resume",
+                            &paths.workspace,
+                            &error,
+                        )
+                    })?;
+                }
+                write_manifest(&paths.manifest, &resumed)?;
+                return materialize_repair(&paths, candidate, target, resumed, true);
+            }
             validate_workspace(&paths, &existing)?;
             return Ok(RepairStartOutput {
                 repair: existing,
@@ -255,7 +341,7 @@ fn start_exact(
         )
     })?;
     let now = unix_ms();
-    let mut repair = RepairSession {
+    let repair = RepairSession {
         version: REPAIR_VERSION,
         session: format!(
             "pr-{}-{}",
@@ -267,11 +353,15 @@ fn start_exact(
         head: candidate.head.clone(),
         old_base: candidate.base.clone(),
         target: target.clone(),
+        target_pr,
         workspace: paths.workspace.display().to_string(),
         provider_git_url: provider_git_url.to_owned(),
         config_path: absolute_config_path(context),
         config_fingerprint: config_fingerprint(context)?,
+        materialization_timeout_secs: context.config.repair.materialization_timeout_secs,
         state: RepairState::Preparing,
+        phase: RepairPhase::Preparing,
+        last_error: None,
         conflicting_paths: Vec::new(),
         baseline_index: BTreeMap::new(),
         created_unix_ms: now,
@@ -279,77 +369,121 @@ fn start_exact(
         published_head: None,
     };
     write_manifest(&paths.manifest, &repair)?;
+    materialize_repair(&paths, candidate, target, repair, false)
+}
 
-    let timeout = Duration::from_secs(context.config.command_timeout_secs);
+#[allow(clippy::too_many_lines)]
+fn materialize_repair(
+    paths: &RepairPaths,
+    candidate: &PullRequestSnapshot,
+    target: &BranchSnapshot,
+    mut repair: RepairSession,
+    resumed: bool,
+) -> Result<RepairStartOutput, AppError> {
+    let timeout = Duration::from_secs(repair.materialization_timeout_secs);
     let root_runner = ProcessRunner::in_directory(&paths.session_root).with_timeout(timeout);
     let workspace = paths.workspace.to_string_lossy().into_owned();
-    // Use an independent provider-owned clone. This deliberately ignores the
-    // caller's potentially daemon-internal origin and never edits shared Git
-    // config or local PR branch refs.
-    require_success(
-        &root_runner,
-        CommandSpec::new("git")
-            .args([
-                "clone",
-                "--quiet",
-                "--no-checkout",
-                "--origin",
-                "origin",
-                provider_git_url,
-                workspace.as_str(),
-            ])
-            .env("GIT_TERMINAL_PROMPT", "0"),
-        "repair_workspace_create_failed",
-        "could not create the isolated provider-owned repair clone",
-    )?;
+    let provider_git_url = repair.provider_git_url.clone();
+    run_materialization_phase(&mut repair, paths, RepairPhase::Cloning, timeout, || {
+        require_success(
+            &root_runner,
+            CommandSpec::new("git")
+                .args([
+                    "clone",
+                    "--quiet",
+                    "--no-checkout",
+                    "--origin",
+                    "origin",
+                    provider_git_url.as_str(),
+                    workspace.as_str(),
+                ])
+                .env("GIT_TERMINAL_PROMPT", "0"),
+            "repair_workspace_create_failed",
+            "could not create the isolated provider-owned repair clone",
+        )?;
+        Ok(())
+    })?;
+
     let workspace_runner = ProcessRunner::in_directory(&paths.workspace).with_timeout(timeout);
-    crate::compatibility::resolve_branch_snapshot_with_timeout(
-        &paths.workspace,
-        "origin",
-        &candidate.head,
+    run_materialization_phase(
+        &mut repair,
+        paths,
+        RepairPhase::FetchingHead,
         timeout,
+        || {
+            crate::compatibility::resolve_branch_snapshot_with_timeout(
+                &paths.workspace,
+                "origin",
+                &candidate.head,
+                timeout,
+            )?;
+            Ok(())
+        },
     )?;
-    crate::compatibility::resolve_branch_snapshot_with_timeout(
-        &paths.workspace,
-        "origin",
-        target,
+    run_materialization_phase(
+        &mut repair,
+        paths,
+        RepairPhase::FetchingTarget,
         timeout,
+        || {
+            crate::compatibility::resolve_branch_snapshot_with_timeout(
+                &paths.workspace,
+                "origin",
+                target,
+                timeout,
+            )?;
+            Ok(())
+        },
     )?;
-    require_success(
-        &workspace_runner,
-        CommandSpec::new("git").args([
-            "checkout",
-            "--quiet",
-            "--detach",
-            candidate.head.oid.0.as_str(),
-        ]),
-        "repair_workspace_checkout_failed",
-        "could not check out the exact provider repair head",
+    run_materialization_phase(
+        &mut repair,
+        paths,
+        RepairPhase::CheckingOut,
+        timeout,
+        || {
+            require_success(
+                &workspace_runner,
+                CommandSpec::new("git").args([
+                    "checkout",
+                    "--quiet",
+                    "--detach",
+                    candidate.head.oid.0.as_str(),
+                ]),
+                "repair_workspace_checkout_failed",
+                "could not check out the exact provider repair head",
+            )?;
+            Ok(())
+        },
     )?;
-    let merge = run(
-        &workspace_runner,
-        CommandSpec::new("git")
-            .args([
-                "-c",
-                REPAIR_GIT_NAME_CONFIG,
-                "-c",
-                REPAIR_GIT_EMAIL_CONFIG,
-                "-c",
-                "commit.gpgSign=false",
-                "merge",
-                "--no-commit",
-                "--no-ff",
-                target.oid.0.as_str(),
-            ])
-            .env("GIT_TERMINAL_PROMPT", "0"),
-    )?;
+    let merge =
+        run_materialization_phase(&mut repair, paths, RepairPhase::Merging, timeout, || {
+            run(
+                &workspace_runner,
+                CommandSpec::new("git")
+                    .args([
+                        "-c",
+                        REPAIR_GIT_NAME_CONFIG,
+                        "-c",
+                        REPAIR_GIT_EMAIL_CONFIG,
+                        "-c",
+                        "commit.gpgSign=false",
+                        "merge",
+                        "--no-commit",
+                        "--no-ff",
+                        target.oid.0.as_str(),
+                    ])
+                    .env("GIT_TERMINAL_PROMPT", "0"),
+            )
+        })?;
     if !matches!(merge.code, Some(0 | 1)) {
-        return Err(repair_command_failure(
+        let error = repair_command_failure(
             "repair_merge_failed",
             "Git could not start the exact-target repair merge",
             &merge,
             json!({"repair": repair, "workspace_preserved": true}),
-        ));
+        );
+        record_phase_error(&mut repair, paths, RepairPhase::Merging, timeout, 0, &error)?;
+        return Err(error);
     }
     let merge_head = rev_parse(&workspace_runner, "MERGE_HEAD")?;
     if merge_head != target.oid {
@@ -380,13 +514,103 @@ fn start_exact(
     repair.conflicting_paths = conflicting_paths;
     repair.baseline_index = stage_zero_index(&workspace_runner)?;
     repair.state = RepairState::Resolving;
+    repair.phase = RepairPhase::Resolving;
+    repair.last_error = None;
     repair.updated_unix_ms = unix_ms();
     write_manifest(&paths.manifest, &repair)?;
     Ok(RepairStartOutput {
         repair,
-        already_exists: false,
+        already_exists: resumed,
         next: "resolve only the reported conflicting paths in the managed workspace, stage them, then run `cara repair continue --session <id>`; do not commit, update refs, or push manually".to_owned(),
     })
+}
+
+fn run_materialization_phase<T>(
+    repair: &mut RepairSession,
+    paths: &RepairPaths,
+    phase: RepairPhase,
+    timeout: Duration,
+    operation: impl FnOnce() -> Result<T, AppError>,
+) -> Result<T, AppError> {
+    repair.phase = phase;
+    repair.last_error = None;
+    repair.updated_unix_ms = unix_ms();
+    write_manifest(&paths.manifest, repair)?;
+    let started = std::time::Instant::now();
+    match operation() {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            record_phase_error(
+                repair,
+                paths,
+                phase,
+                timeout,
+                duration_millis(started.elapsed()),
+                &error,
+            )?;
+            let mut details = error.details().unwrap_or_else(|| json!({}));
+            if let Some(object) = details.as_object_mut() {
+                object.insert("repair".to_owned(), json!(repair));
+                object.insert("phase".to_owned(), json!(phase));
+                object.insert(
+                    "elapsed_ms".to_owned(),
+                    json!(duration_millis(started.elapsed())),
+                );
+                object.insert("timeout_ms".to_owned(), json!(duration_millis(timeout)));
+                let process_group_reaped = error.category() == ErrorCategory::Timeout
+                    && error
+                        .details()
+                        .and_then(|details| details.get("process_group_id").cloned())
+                        .is_some_and(|value| !value.is_null());
+                object.insert(
+                    "process_group_reaped".to_owned(),
+                    json!(process_group_reaped),
+                );
+                object.insert(
+                    "next".to_owned(),
+                    json!("rerun the exact `cara repair start` to resume this preparing session, or inspect then confirm-abort it"),
+                );
+            }
+            Err(AppError::structured(
+                error.category(),
+                error.code(),
+                error.message(),
+                Some(details),
+            ))
+        }
+    }
+}
+
+fn record_phase_error(
+    repair: &mut RepairSession,
+    paths: &RepairPaths,
+    phase: RepairPhase,
+    timeout: Duration,
+    elapsed_ms: u64,
+    error: &AppError,
+) -> Result<(), AppError> {
+    let process_group_id = error
+        .details()
+        .and_then(|details| details.get("process_group_id").cloned())
+        .and_then(|value| serde_json::from_value::<Option<u32>>(value).ok())
+        .flatten();
+    repair.last_error = Some(RepairPhaseError {
+        phase,
+        code: error.code(),
+        message: error.message(),
+        elapsed_ms,
+        timeout_ms: duration_millis(timeout),
+        process_group_id,
+        partial_path: paths.workspace.display().to_string(),
+        next: "rerun exact repair start to resume, or repair status then confirmed abort"
+            .to_owned(),
+    });
+    repair.updated_unix_ms = unix_ms();
+    write_manifest(&paths.manifest, repair)
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Verify agent-owned conflict resolution, publish non-force, and resume sync.
@@ -399,6 +623,21 @@ pub fn continue_session(
     let paths = repair_paths_for_session(&context.repository_path, &input.session)?;
     let mut repair = read_manifest(&paths.manifest)?;
     require_session_match(&repair, &input.session)?;
+    if repair.state == RepairState::Preparing {
+        let target = repair
+            .target_pr
+            .map_or_else(String::new, |number| format!(" --target-pr {number}"));
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "repair_preparation_incomplete",
+            "repair workspace materialization is incomplete and must be resumed from fresh provider facts",
+            Some(json!({
+                "repair": repair,
+                "workspace_preserved": paths.workspace.exists(),
+                "next": format!("rerun `cara repair start --pr {}{target}` to resume the exact preparing session, or inspect then confirm-abort it", repair.pr),
+            })),
+        ));
+    }
     validate_workspace(&paths, &repair)?;
     let current_fingerprint = config_fingerprint(context)?;
     if current_fingerprint != repair.config_fingerprint {
@@ -439,14 +678,7 @@ pub fn continue_session(
     let expected_parents = vec![repair.head.oid.clone(), repair.target.oid.clone()];
 
     let (new_head, parents) = match repair.state {
-        RepairState::Preparing => {
-            return Err(AppError::structured(
-                ErrorCategory::Validation,
-                "repair_preparation_incomplete",
-                "repair workspace creation was interrupted before the exact merge was prepared",
-                Some(json!({"repair": repair, "workspace_preserved": true})),
-            ));
-        }
+        RepairState::Preparing => unreachable!("preparing state returned above"),
         RepairState::Resolving => {
             if try_rev_parse(&runner, "MERGE_HEAD")?.is_some() {
                 verify_resolution(&runner, &repair)?;
@@ -479,6 +711,8 @@ pub fn continue_session(
             let found_parents = commit_parents(&runner, &head)?;
             require_exact_parents(&repair, &head, &found_parents, &expected_parents)?;
             repair.state = RepairState::Committed;
+            repair.phase = RepairPhase::Committed;
+            repair.last_error = None;
             repair.published_head = Some(head.clone());
             repair.updated_unix_ms = unix_ms();
             write_manifest(&paths.manifest, &repair)?;
@@ -571,6 +805,8 @@ pub fn continue_session(
         remote_verified: true,
     };
     repair.state = RepairState::Published;
+    repair.phase = RepairPhase::Published;
+    repair.last_error = None;
     repair.published_head = Some(new_head);
     repair.updated_unix_ms = unix_ms();
     write_manifest(&paths.manifest, &repair)?;
@@ -583,7 +819,7 @@ fn resume_or_return(
     context: &AppContext,
     input: &RepairContinueInput,
     paths: &RepairPaths,
-    repair: RepairSession,
+    mut repair: RepairSession,
     publication: Option<RepairPublicationReceipt>,
 ) -> Result<RepairContinueOutput, AppError> {
     if input.no_sync {
@@ -598,6 +834,9 @@ fn resume_or_return(
     // Keep the caller repository lock held while sync runs in the independent
     // provider clone; this preserves one local mutation owner even though the
     // clone has separate Git metadata.
+    repair.phase = RepairPhase::SyncPending;
+    repair.updated_unix_ms = unix_ms();
+    write_manifest(&paths.manifest, &repair)?;
     let caller_lock = OperationLock::acquire(&context.repository_path, "repair-sync")?;
     let workspace_context = AppContext {
         repository_path: paths.workspace.clone(),
@@ -614,6 +853,9 @@ fn resume_or_return(
     ) {
         Ok(sync) => {
             caller_lock.release()?;
+            repair.phase = RepairPhase::Completed;
+            repair.updated_unix_ms = unix_ms();
+            write_manifest(&paths.manifest, &repair)?;
             cleanup_workspace(paths)?;
             Ok(RepairContinueOutput {
                 repair,
@@ -675,7 +917,14 @@ pub fn status(context: &AppContext, input: &RepairStatusInput) -> Result<RepairS
     let paths = repair_paths_for_session(&context.repository_path, &input.session)?;
     let repair = read_manifest(&paths.manifest)?;
     require_session_match(&repair, &input.session)?;
-    validate_workspace(&paths, &repair)?;
+    validate_manifest_path(&paths, &repair)?;
+    if repair.state == RepairState::Preparing {
+        if paths.workspace.exists() {
+            validate_partial_workspace_path(&paths, &repair)?;
+        }
+    } else {
+        validate_workspace(&paths, &repair)?;
+    }
     Ok(repair)
 }
 
@@ -1038,7 +1287,7 @@ fn git_common_dir(repository: &Path) -> Result<PathBuf, AppError> {
     Ok(path)
 }
 
-fn validate_workspace(paths: &RepairPaths, repair: &RepairSession) -> Result<(), AppError> {
+fn validate_manifest_path(paths: &RepairPaths, repair: &RepairSession) -> Result<(), AppError> {
     if repair.version != REPAIR_VERSION
         || repair.workspace != paths.workspace.display().to_string()
         || !paths.workspace.starts_with(&paths.root)
@@ -1048,7 +1297,33 @@ fn validate_workspace(paths: &RepairPaths, repair: &RepairSession) -> Result<(),
             "repair manifest does not match the canonical managed workspace",
         ));
     }
-    validate_provider_git_url(&repair.repository, &repair.provider_git_url)?;
+    validate_provider_git_url(&repair.repository, &repair.provider_git_url)
+}
+
+fn validate_partial_workspace_path(
+    paths: &RepairPaths,
+    repair: &RepairSession,
+) -> Result<(), AppError> {
+    validate_manifest_path(paths, repair)?;
+    let metadata = fs::symlink_metadata(&paths.workspace).map_err(|error| {
+        repair_io_error(
+            "repair_workspace_missing",
+            "managed repair workspace is unavailable",
+            &paths.workspace,
+            &error,
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(AppError::validation(
+            "repair_workspace_invalid",
+            "managed repair workspace must be a real directory, not a symlink",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_workspace(paths: &RepairPaths, repair: &RepairSession) -> Result<(), AppError> {
+    validate_manifest_path(paths, repair)?;
     let metadata = fs::symlink_metadata(&paths.workspace).map_err(|error| {
         repair_io_error(
             "repair_workspace_missing",
@@ -1273,13 +1548,32 @@ fn attach_repair_resume(
 
 #[allow(clippy::needless_pass_by_value)]
 fn run(runner: &impl CommandRunner, command: CommandSpec) -> Result<CommandOutput, AppError> {
-    runner.run(&command).map_err(|error| {
-        AppError::structured(
+    runner.run(&command).map_err(|error| match &error {
+        CommandRunError::Timeout {
+            process_group_id,
+            timeout_ms,
+            stdout,
+            stderr,
+            ..
+        } => AppError::structured(
+            ErrorCategory::Timeout,
+            "repair_command_timeout",
+            error.to_string(),
+            Some(json!({
+                "command": command.display(),
+                "process_group_id": process_group_id,
+                "timeout_ms": timeout_ms,
+                "stdout": bounded(stdout),
+                "stderr": bounded(stderr),
+                "process_group_reaped": true,
+            })),
+        ),
+        _ => AppError::structured(
             ErrorCategory::ExecutionFailure,
             "repair_command_failed",
             "could not run an isolated repair command",
             Some(json!({"command": command.display(), "source": error.to_string()})),
-        )
+        ),
     })
 }
 
@@ -1478,6 +1772,7 @@ mod tests {
             &fixture.repository,
             &fixture.candidate,
             &fixture.target,
+            None,
             fixture.root.path().join("remote.git").to_str().unwrap(),
         )
         .unwrap();
@@ -1498,6 +1793,98 @@ mod tests {
     }
 
     #[test]
+    fn exact_preparing_manifest_without_workspace_resumes_materialization() {
+        let fixture = fixture();
+        let context = context(&fixture.clone);
+        let output = start_exact(
+            &context,
+            &fixture.repository,
+            &fixture.candidate,
+            &fixture.target,
+            None,
+            fixture.root.path().join("remote.git").to_str().unwrap(),
+        )
+        .unwrap();
+        let paths = repair_paths(&fixture.clone, fixture.candidate.number).unwrap();
+        fs::remove_dir_all(&paths.workspace).unwrap();
+        let mut preparing = output.repair;
+        preparing.state = RepairState::Preparing;
+        preparing.phase = RepairPhase::Cloning;
+        preparing.last_error = Some(RepairPhaseError {
+            phase: RepairPhase::Cloning,
+            code: "repair_command_timeout".to_owned(),
+            message: "simulated timeout".to_owned(),
+            elapsed_ms: 30_000,
+            timeout_ms: 30_000,
+            process_group_id: Some(42),
+            partial_path: paths.workspace.display().to_string(),
+            next: "resume".to_owned(),
+        });
+        write_manifest(&paths.manifest, &preparing).unwrap();
+        let visible = status(
+            &context,
+            &RepairStatusInput {
+                session: preparing.session.clone(),
+            },
+        )
+        .expect("preparing status remains inspectable without a workspace");
+        assert_eq!(visible.phase, RepairPhase::Cloning);
+        assert_eq!(
+            visible.last_error.as_ref().map(|error| error.code.as_str()),
+            Some("repair_command_timeout")
+        );
+
+        let resumed = start_exact(
+            &context,
+            &fixture.repository,
+            &fixture.candidate,
+            &fixture.target,
+            None,
+            fixture.root.path().join("remote.git").to_str().unwrap(),
+        )
+        .unwrap();
+        assert!(resumed.already_exists);
+        assert_eq!(resumed.repair.state, RepairState::Resolving);
+        assert_eq!(resumed.repair.phase, RepairPhase::Resolving);
+        assert!(resumed.repair.last_error.is_none());
+        assert!(paths.workspace.exists());
+    }
+
+    #[test]
+    fn materialization_timeout_persists_phase_budget_and_process_group() {
+        let fixture = fixture();
+        let context = context(&fixture.clone);
+        let output = start_exact(
+            &context,
+            &fixture.repository,
+            &fixture.candidate,
+            &fixture.target,
+            None,
+            fixture.root.path().join("remote.git").to_str().unwrap(),
+        )
+        .unwrap();
+        let paths = repair_paths(&fixture.clone, fixture.candidate.number).unwrap();
+        let mut repair = output.repair;
+        repair.state = RepairState::Preparing;
+        let timeout = Duration::from_millis(100);
+        let runner = ProcessRunner::new().with_timeout(timeout);
+        let error =
+            run_materialization_phase(&mut repair, &paths, RepairPhase::Cloning, timeout, || {
+                run(&runner, CommandSpec::new("sh").args(["-c", "sleep 30"]))
+            })
+            .unwrap_err();
+        assert_eq!(error.category(), ErrorCategory::Timeout);
+        let persisted = read_manifest(&paths.manifest).unwrap();
+        let evidence = persisted.last_error.expect("durable phase error");
+        assert_eq!(evidence.phase, RepairPhase::Cloning);
+        assert_eq!(evidence.code, "repair_command_timeout");
+        assert_eq!(evidence.timeout_ms, 100);
+        assert!(evidence.elapsed_ms >= 100);
+        assert!(evidence.process_group_id.is_some());
+        assert_eq!(evidence.partial_path, paths.workspace.display().to_string());
+    }
+
+    #[test]
     fn continue_rejects_changes_outside_typed_conflicts() {
         let fixture = fixture();
         let output = start_exact(
@@ -1505,6 +1892,7 @@ mod tests {
             &fixture.repository,
             &fixture.candidate,
             &fixture.target,
+            None,
             fixture.root.path().join("remote.git").to_str().unwrap(),
         )
         .unwrap();
@@ -1529,6 +1917,7 @@ mod tests {
             &fixture.repository,
             &fixture.candidate,
             &fixture.target,
+            None,
             fixture.root.path().join("remote.git").to_str().unwrap(),
         )
         .unwrap();
@@ -1584,6 +1973,7 @@ mod tests {
             &fixture.repository,
             &fixture.candidate,
             &fixture.target,
+            None,
             fixture.root.path().join("remote.git").to_str().unwrap(),
         )
         .unwrap();
@@ -1626,6 +2016,7 @@ mod tests {
             &fixture.repository,
             &fixture.candidate,
             &fixture.target,
+            None,
             fixture.root.path().join("remote.git").to_str().unwrap(),
         )
         .unwrap();
@@ -1675,6 +2066,7 @@ mod tests {
             &fixture.repository,
             &fixture.candidate,
             &fixture.target,
+            None,
             fixture.root.path().join("remote.git").to_str().unwrap(),
         )
         .unwrap();

@@ -545,6 +545,7 @@ fn run_sync(cli: &Cli, input: &SyncInput) -> Result<(), i32> {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_repair(cli: &Cli, command: &RepairCommand) -> Result<(), i32> {
     let context = load_context(cli)?;
     match command {
@@ -607,16 +608,29 @@ fn run_repair(cli: &Cli, command: &RepairCommand) -> Result<(), i32> {
             match result {
                 Ok(repair) => {
                     println!(
-                        "repair {}: {:?} PR #{} {} -> {} workspace={}",
+                        "repair {}: {:?}/{:?} PR #{} {} -> {} workspace={} materialization_timeout={}s",
                         repair.session,
                         repair.state,
+                        repair.phase,
                         repair.pr,
                         repair.head.oid,
                         repair.target.oid,
-                        repair.workspace
+                        repair.workspace,
+                        repair.materialization_timeout_secs,
                     );
                     if !repair.conflicting_paths.is_empty() {
                         println!("  conflicts: {}", repair.conflicting_paths.join(", "));
+                    }
+                    if let Some(error) = &repair.last_error {
+                        println!(
+                            "  last error: {} phase={:?} elapsed={}ms budget={}ms partial={} — {}",
+                            error.code,
+                            error.phase,
+                            error.elapsed_ms,
+                            error.timeout_ms,
+                            error.partial_path,
+                            error.next,
+                        );
                     }
                     Ok(())
                 }

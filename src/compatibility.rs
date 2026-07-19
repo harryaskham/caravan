@@ -514,6 +514,7 @@ fn command_run_error(error: &CommandRunError) -> AppError {
         timeout_ms,
         stdout,
         stderr,
+        ..
     } = error
     {
         let subcommand = command.args.first().map_or("unknown", String::as_str);
@@ -897,6 +898,7 @@ mod tests {
         fn run(&self, command: &CommandSpec) -> Result<CommandOutput, CommandRunError> {
             Err(CommandRunError::Timeout {
                 command: command.clone(),
+                process_group_id: None,
                 timeout_ms: 250,
                 stdout: "partial".to_owned(),
                 stderr: "transport stalled".to_owned(),

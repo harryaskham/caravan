@@ -170,6 +170,8 @@ pub enum CommandRunError {
     Timeout {
         /// Requested command.
         command: CommandSpec,
+        /// Owned Unix process group (equal to child PID) when a child started.
+        process_group_id: Option<u32>,
         /// Configured hard deadline in milliseconds.
         timeout_ms: u64,
         /// Bounded output captured before termination.
@@ -278,6 +280,7 @@ impl ProcessRunner {
         if timeout.is_zero() {
             return Err(CommandRunError::Timeout {
                 command: request.clone(),
+                process_group_id: None,
                 timeout_ms: 0,
                 stdout: String::new(),
                 stderr: "operation deadline exhausted before this phase".to_owned(),
@@ -315,6 +318,7 @@ impl CommandRunner for ProcessRunner {
             command: request.clone(),
             message: error.to_string(),
         })?;
+        let child_process_group = child.id();
         let stdin_writer = request
             .io
             .as_ref()
@@ -379,6 +383,7 @@ impl CommandRunner for ProcessRunner {
         if timed_out {
             return Err(CommandRunError::Timeout {
                 command: request.clone(),
+                process_group_id: Some(child_process_group),
                 timeout_ms: duration_millis(timeout),
                 stdout: String::from_utf8_lossy(&stdout).into_owned(),
                 stderr: String::from_utf8_lossy(&stderr).into_owned(),
@@ -645,6 +650,7 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
         let CommandRunError::Timeout {
             command,
+            process_group_id,
             timeout_ms,
             stdout,
             stderr,
@@ -653,6 +659,7 @@ mod tests {
             panic!("expected timeout error");
         };
         assert_eq!(command.program, "sh");
+        assert!(process_group_id.is_some());
         assert_eq!(timeout_ms, duration_millis(timeout));
         assert_eq!(stdout, "started");
         assert!(

@@ -308,6 +308,8 @@ agent_priority_labels:
   - caravan-priority:normal
   - caravan-priority:low
 command_timeout_secs: 30
+repair:
+  materialization_timeout_secs: 180
 loop:
   interval_secs: 60
 hooks:
@@ -366,6 +368,8 @@ receipt policy.
 One local process at a time may mutate a repository, enforced by an operation lock under Git metadata. Read-only commands may run concurrently.
 
 No local lock can serialize distributed machines. Every mutation therefore carries optimistic preconditions over PR number, head SHA, base ref/SHA, labels, state, and auto-merge state. A mismatch aborts with `stale_precondition`; the caller rediscover/reruns rather than overwriting concurrent work.
+
+Lightweight provider/Git children remain bounded by `command_timeout_secs`. Repair clone/fetch/checkout materialization is separately bounded by `repair.materialization_timeout_secs` because a cold authenticated repository clone is not a lightweight probe. The manifest is checkpointed before each external phase and retains exact phase, budget, process-group/error evidence, partial path, and safe resume/abort guidance after timeout.
 
 Multi-step remote mutations are not atomic. Errors report completed steps. The graph invariants and idempotent sync are the recovery mechanism; commands never hide partial remote progress.
 
