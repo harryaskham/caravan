@@ -173,6 +173,37 @@ pub struct RepairSession {
     pub published_head: Option<CommitOid>,
 }
 
+/// Bounded read-only projection of a potentially large repair manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepairStatusOutput {
+    pub version: u32,
+    pub session: String,
+    pub repository: RepositoryId,
+    pub pr: PrNumber,
+    pub head: BranchSnapshot,
+    pub old_base: BranchSnapshot,
+    pub target: BranchSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_pr: Option<PrNumber>,
+    pub workspace: String,
+    pub provider_git_url: String,
+    pub object_cache_path: String,
+    pub object_cache_common_dir: String,
+    pub state: RepairState,
+    pub phase: RepairPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<RepairPhaseError>,
+    #[serde(default)]
+    pub conflicting_paths: Vec<String>,
+    pub baseline_index_count: usize,
+    pub baseline_index_fingerprint: String,
+    pub materialization_timeout_secs: u64,
+    pub created_unix_ms: u64,
+    pub updated_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_head: Option<CommitOid>,
+}
+
 /// Result of preparing an isolated workspace.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RepairStartOutput {
@@ -258,7 +289,11 @@ pub fn start(
         input.target_pr.map(PrNumber),
         &provider_git_url,
     )?;
-    lock.checkpoint("repair_workspace_ready", json!(&output.repair), false)?;
+    lock.checkpoint(
+        "repair_workspace_ready",
+        repair_lock_receipt(&output.repair)?,
+        false,
+    )?;
     lock.release()?;
     Ok(output)
 }
@@ -565,7 +600,7 @@ fn materialize_repair(
         ));
     }
     repair.conflicting_paths = conflicting_paths;
-    repair.baseline_index = stage_zero_index(&workspace_runner)?;
+    repair.baseline_index = staged_index(&workspace_runner)?;
     repair.state = RepairState::Resolving;
     repair.phase = RepairPhase::Resolving;
     repair.last_error = None;
@@ -725,7 +760,11 @@ pub fn continue_session(
     }
 
     let mut lock = OperationLock::acquire(&context.repository_path, "repair-continue")?;
-    lock.checkpoint("repair_verification_in_flight", json!(&repair), false)?;
+    lock.checkpoint(
+        "repair_verification_in_flight",
+        repair_lock_receipt(&repair)?,
+        false,
+    )?;
     let timeout = Duration::from_secs(context.config.command_timeout_secs);
     let runner = ProcessRunner::in_directory(&paths.workspace).with_timeout(timeout);
     let expected_parents = vec![repair.head.oid.clone(), repair.target.oid.clone()];
@@ -771,7 +810,11 @@ pub fn continue_session(
             write_manifest(&paths.manifest, &repair)?;
             lock.checkpoint(
                 "repair_committed",
-                json!({"repair": &repair, "new_head": &head, "parents": &found_parents}),
+                json!({
+                    "repair": repair_lock_receipt(&repair)?,
+                    "new_head": &head,
+                    "parents": &found_parents,
+                }),
                 false,
             )?;
             (head, found_parents)
@@ -807,7 +850,7 @@ pub fn continue_session(
         lock.checkpoint(
             "repair_publication_in_flight",
             json!({
-                "repair": &repair,
+                "repair": repair_lock_receipt(&repair)?,
                 "remote_expected_head": &repair.head.oid,
                 "new_head": &new_head,
                 "force": false,
@@ -964,8 +1007,46 @@ pub fn abort(
     })
 }
 
-/// Inspect a persisted repair session.
-pub fn status(context: &AppContext, input: &RepairStatusInput) -> Result<RepairSession, AppError> {
+fn repair_status_output(repair: &RepairSession) -> Result<RepairStatusOutput, AppError> {
+    let baseline = serde_json::to_vec(&repair.baseline_index).map_err(|error| {
+        AppError::structured(
+            ErrorCategory::SerializationError,
+            "repair_baseline_fingerprint_failed",
+            format!("could not fingerprint repair baseline index: {error}"),
+            None,
+        )
+    })?;
+    Ok(RepairStatusOutput {
+        version: repair.version,
+        session: repair.session.clone(),
+        repository: repair.repository.clone(),
+        pr: repair.pr,
+        head: repair.head.clone(),
+        old_base: repair.old_base.clone(),
+        target: repair.target.clone(),
+        target_pr: repair.target_pr,
+        workspace: repair.workspace.clone(),
+        provider_git_url: repair.provider_git_url.clone(),
+        object_cache_path: repair.object_cache_path.clone(),
+        object_cache_common_dir: repair.object_cache_common_dir.clone(),
+        state: repair.state,
+        phase: repair.phase,
+        last_error: repair.last_error.clone(),
+        conflicting_paths: repair.conflicting_paths.clone(),
+        baseline_index_count: repair.baseline_index.len(),
+        baseline_index_fingerprint: stable_fingerprint(&baseline),
+        materialization_timeout_secs: repair.materialization_timeout_secs,
+        created_unix_ms: repair.created_unix_ms,
+        updated_unix_ms: repair.updated_unix_ms,
+        published_head: repair.published_head.clone(),
+    })
+}
+
+/// Inspect a persisted repair session through a bounded manifest projection.
+pub fn status(
+    context: &AppContext,
+    input: &RepairStatusInput,
+) -> Result<RepairStatusOutput, AppError> {
     validate_session_id(&input.session)?;
     let paths = repair_paths_for_session(&context.repository_path, &input.session)?;
     let repair = read_manifest(&paths.manifest)?;
@@ -978,7 +1059,7 @@ pub fn status(context: &AppContext, input: &RepairStatusInput) -> Result<RepairS
     } else {
         validate_workspace(&paths, &repair)?;
     }
-    Ok(repair)
+    repair_status_output(&repair)
 }
 
 fn verify_resolution(runner: &impl CommandRunner, repair: &RepairSession) -> Result<(), AppError> {
@@ -1038,7 +1119,7 @@ fn verify_resolution(runner: &impl CommandRunner, repair: &RepairSession) -> Res
         "repair_conflict_markers_present",
         "staged repair still contains conflict markers or whitespace errors",
     )?;
-    let current = stage_zero_index(runner)?;
+    let current = staged_index(runner)?;
     let conflicts = repair
         .conflicting_paths
         .iter()
@@ -1230,6 +1311,21 @@ fn stage_zero_index(runner: &impl CommandRunner) -> Result<BTreeMap<String, Stri
             index.insert(path.to_owned(), oid.to_owned());
         }
     }
+    Ok(index)
+}
+
+fn staged_index(runner: &impl CommandRunner) -> Result<BTreeMap<String, String>, AppError> {
+    let changed = require_success(
+        runner,
+        CommandSpec::new("git").args(["diff", "--cached", "--name-only", "-z"]),
+        "repair_index_inspection_failed",
+        "could not inspect mechanically staged repair paths",
+    )?;
+    let changed = nul_paths(&changed.stdout)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let mut index = stage_zero_index(runner)?;
+    index.retain(|path, _| changed.contains(path));
     Ok(index)
 }
 
@@ -1581,6 +1677,42 @@ fn validate_workspace(paths: &RepairPaths, repair: &RepairSession) -> Result<(),
     Ok(())
 }
 
+fn repair_lock_receipt(repair: &RepairSession) -> Result<Value, AppError> {
+    let encoded = serde_json::to_vec(repair).map_err(|error| {
+        AppError::structured(
+            ErrorCategory::SerializationError,
+            "repair_manifest_fingerprint_failed",
+            format!("could not encode repair manifest fingerprint: {error}"),
+            None,
+        )
+    })?;
+    let manifest = Path::new(&repair.workspace).parent().map_or_else(
+        || PathBuf::from(MANIFEST_NAME),
+        |parent| parent.join(MANIFEST_NAME),
+    );
+    Ok(json!({
+        "version": repair.version,
+        "session": repair.session,
+        "pr": repair.pr,
+        "state": repair.state,
+        "phase": repair.phase,
+        "head_oid": repair.head.oid,
+        "target_oid": repair.target.oid,
+        "manifest_path": manifest,
+        "manifest_bytes": encoded.len(),
+        "manifest_fingerprint": stable_fingerprint(&encoded),
+        "baseline_index_count": repair.baseline_index.len(),
+        "conflicting_path_count": repair.conflicting_paths.len(),
+        "updated_unix_ms": repair.updated_unix_ms,
+    }))
+}
+
+fn stable_fingerprint(bytes: &[u8]) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hasher.write(bytes);
+    format!("{:016x}", hasher.finish())
+}
+
 fn config_fingerprint(context: &AppContext) -> Result<String, AppError> {
     let encoded = serde_json::to_vec(&context.config).map_err(|error| {
         AppError::structured(
@@ -1590,9 +1722,7 @@ fn config_fingerprint(context: &AppContext) -> Result<String, AppError> {
             None,
         )
     })?;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    hasher.write(&encoded);
-    Ok(format!("{:016x}", hasher.finish()))
+    Ok(stable_fingerprint(&encoded))
 }
 
 fn provider_git_url(context: &AppContext, repository: &RepositoryId) -> Result<String, AppError> {
@@ -2018,6 +2148,15 @@ mod tests {
         .unwrap();
         assert_eq!(output.repair.state, RepairState::Resolving);
         assert_eq!(output.repair.conflicting_paths, ["shared.txt"]);
+        assert_eq!(
+            output
+                .repair
+                .baseline_index
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["target.txt"]
+        );
         assert_eq!(git(&fixture.clone, &["rev-parse", "HEAD"]), before_head);
         assert_eq!(
             git(&fixture.clone, &["status", "--porcelain"]),
@@ -2321,6 +2460,49 @@ mod tests {
             &["ls-remote", "origin", "refs/heads/feature"],
         );
         assert_eq!(remote.split_whitespace().next(), Some(moved.as_str()));
+    }
+
+    #[test]
+    fn operation_lock_receipt_stays_bounded_for_huge_historical_manifest() {
+        let fixture = fixture();
+        let context = context(&fixture.clone);
+        let output = start_exact(
+            &context,
+            &fixture.repository,
+            &fixture.candidate,
+            &fixture.target,
+            None,
+            fixture.root.path().join("remote.git").to_str().unwrap(),
+        )
+        .unwrap();
+        let mut repair = output.repair;
+        for index in 0..10_000 {
+            repair.baseline_index.insert(
+                format!("large/canonical/path/{index:05}.rs"),
+                format!("{index:040x}"),
+            );
+        }
+        let receipt = repair_lock_receipt(&repair).unwrap();
+        let encoded = serde_json::to_vec(&receipt).unwrap();
+        assert!(
+            encoded.len() < 4 * 1024,
+            "compact receipt was {} bytes",
+            encoded.len()
+        );
+        assert_eq!(receipt["baseline_index_count"], 10_001);
+        assert!(receipt.get("baseline_index").is_none());
+        let status = repair_status_output(&repair).unwrap();
+        let status_json = serde_json::to_vec(&status).unwrap();
+        assert!(
+            status_json.len() < 8 * 1024,
+            "bounded status was {} bytes",
+            status_json.len()
+        );
+        assert_eq!(status.baseline_index_count, 10_001);
+        let mut lock = OperationLock::acquire(&fixture.clone, "repair-bounded-test").unwrap();
+        lock.checkpoint("repair_workspace_ready", receipt, false)
+            .expect("compact repair receipt fits operation lock cap");
+        lock.release().unwrap();
     }
 
     #[test]
