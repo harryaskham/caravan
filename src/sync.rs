@@ -217,6 +217,13 @@ pub trait SyncProvider {
         expected: &PullRequestPrecondition,
     ) -> Result<GitHubMutationReceipt, MutationError>;
 
+    fn remove_label(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+        label: &str,
+    ) -> Result<GitHubMutationReceipt, MutationError>;
+
     fn failed_runs_for_pull_request(
         &self,
         repository: &RepositoryId,
@@ -317,6 +324,15 @@ impl<R: crate::command::CommandRunner> SyncProvider for GitHubMutationAdapter<R>
         expected: &PullRequestPrecondition,
     ) -> Result<GitHubMutationReceipt, MutationError> {
         self.disable_auto_merge(repository, expected)
+    }
+
+    fn remove_label(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+        label: &str,
+    ) -> Result<GitHubMutationReceipt, MutationError> {
+        self.remove_label(repository, expected, label)
     }
 
     fn failed_runs_for_pull_request(
@@ -608,6 +624,65 @@ fn verify_physical_write_barrier(
                 })?;
             crate::physical_rebase::verify_prepared(prepared)?;
         }
+    }
+    Ok(())
+}
+
+fn invalidate_rewritten_force_intents(
+    status: &StatusOutput,
+    provider: &impl SyncProvider,
+    plans: &[crate::physical_rebase::RebasePlan],
+    progress: &mut SyncProgress,
+) -> Result<(), AppError> {
+    for plan in plans.iter().filter(|plan| !plan.already_satisfied) {
+        let current = progress
+            .current
+            .get(&plan.pr)
+            .expect("planned PR has current provider facts")
+            .clone();
+        if !current.has_label("caravan-force") {
+            continue;
+        }
+
+        let mut after_labels = current.labels.clone();
+        after_labels.remove("caravan-force");
+        let audit = ControlLabelAudit {
+            operation: "force_invalidate_rewrite".to_owned(),
+            marker: control_label_marker(
+                "force_invalidate_rewrite",
+                plan.pr,
+                &plan.old_head_oid,
+                &current.labels,
+                &after_labels,
+            ),
+            before_labels: current.labels.clone(),
+            after_labels,
+            actor: "cara sync physical-rebase policy".to_owned(),
+            reason: format!(
+                "invalidated caravan-force intent bound to old head {} before Cara-owned rewrite to {}",
+                plan.old_head_oid, plan.new_head_oid
+            ),
+            reason_source: "deterministic exact-generation safety policy".to_owned(),
+            compatibility_evidence: format!(
+                "physical rebase plan for PR #{} passed the global write barrier",
+                plan.pr
+            ),
+            clean_squash_evidence:
+                "not applicable: force intent is removed before branch history changes".to_owned(),
+            admission_priority_basis: "not applicable: caravan order is unchanged".to_owned(),
+        };
+        let receipt = provider
+            .remove_label(
+                &status.repository,
+                &progress.precondition(plan.pr),
+                "caravan-force",
+            )
+            .map_err(|error| mutation_error(&error, progress, Some(plan.pr)))?;
+        progress.record(
+            receipt,
+            "removed caravan-force before rewriting its exact head generation",
+        );
+        progress.ensure_control_label_comment(provider, &status.repository, plan.pr, &audit)?;
     }
     Ok(())
 }
@@ -960,6 +1035,8 @@ fn sync_with_lock(
             json!({"rebase_plans": plans, "provider_writes": 0, "branch_writes": 0}),
             false,
         )?;
+        let mut progress = progress;
+        invalidate_rewritten_force_intents(&status, &provider, &plans, &mut progress)?;
         physical_rebuild = apply_physical_chains(&status, &provider, &prepared, progress)?;
         lock.checkpoint(
             "physical_rebase_applied",
@@ -2791,6 +2868,17 @@ mod tests {
             })
         }
 
+        fn remove_label(
+            &self,
+            _repository: &RepositoryId,
+            expected: &PullRequestPrecondition,
+            label: &str,
+        ) -> Result<GitHubMutationReceipt, MutationError> {
+            self.mutate(expected, MutationKind::RemoveLabel, |pull_request| {
+                pull_request.labels.remove(label);
+            })
+        }
+
         fn failed_runs_for_pull_request(
             &self,
             _repository: &RepositoryId,
@@ -3482,6 +3570,147 @@ mod tests {
             "force_merge_attempted"
         );
         assert!(provider.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn physical_rewrite_invalidates_force_intent_bound_to_old_head_generation() {
+        let mut pulls = healthy_chain();
+        pulls.truncate(1);
+        pulls[0].labels.insert("caravan-force".to_owned());
+        let provider = FakeProvider::with_pull_requests(pulls.clone());
+        let status = status(pulls, Some(PrNumber(1)), &clean);
+        let old_head = status.analysis.pull_requests[&PrNumber(1)].head.clone();
+        let plan = crate::physical_rebase::RebasePlan {
+            pr: PrNumber(1),
+            branch: old_head.name.clone(),
+            old_head_oid: old_head.oid.clone(),
+            old_base_oid: status.analysis.fleet.default_branch.oid.clone(),
+            range_source: crate::physical_rebase::PlannedRangeBase::RemoteBranch {
+                branch: status.analysis.fleet.default_branch.clone(),
+            },
+            new_base: crate::physical_rebase::PlannedBase::Remote(
+                status.analysis.fleet.default_branch.clone(),
+            ),
+            new_head_oid: CommitOid("rewritten0000000000000000000000000000000".to_owned()),
+            new_tree_oid: CommitOid("tree000000000000000000000000000000000000".to_owned()),
+            commit_count: 1,
+            ci_trigger_workflows: vec!["CI".to_owned()],
+            lease: format!("refs/heads/{}:{}", old_head.name, old_head.oid),
+            already_satisfied: false,
+        };
+        let mut progress = SyncProgress::new(&status, vec![PrNumber(1)]);
+
+        invalidate_rewritten_force_intents(&status, &provider, &[plan], &mut progress)
+            .expect("old-generation force intent is invalidated before rewrite");
+
+        assert!(!progress.current[&PrNumber(1)].has_label("caravan-force"));
+        assert_eq!(
+            *provider.calls.borrow(),
+            vec![MutationKind::RemoveLabel, MutationKind::Comment]
+        );
+        assert_eq!(progress.provider_receipts.len(), 2);
+        let audits = provider.audits.borrow();
+        assert_eq!(audits[0].operation, "force_invalidate_rewrite");
+        assert!(audits[0].reason.contains(&old_head.oid.0));
+        assert!(audits[0].reason.contains("rewritten"));
+    }
+
+    #[test]
+    fn already_satisfied_generation_preserves_explicit_force_intent() {
+        let mut pulls = healthy_chain();
+        pulls.truncate(1);
+        pulls[0].labels.insert("caravan-force".to_owned());
+        let provider = FakeProvider::with_pull_requests(pulls.clone());
+        let status = status(pulls, Some(PrNumber(1)), &clean);
+        let head = status.analysis.pull_requests[&PrNumber(1)].head.clone();
+        let plan = crate::physical_rebase::RebasePlan {
+            pr: PrNumber(1),
+            branch: head.name.clone(),
+            old_head_oid: head.oid.clone(),
+            old_base_oid: status.analysis.fleet.default_branch.oid.clone(),
+            range_source: crate::physical_rebase::PlannedRangeBase::RemoteBranch {
+                branch: status.analysis.fleet.default_branch.clone(),
+            },
+            new_base: crate::physical_rebase::PlannedBase::Remote(
+                status.analysis.fleet.default_branch.clone(),
+            ),
+            new_head_oid: head.oid.clone(),
+            new_tree_oid: CommitOid("tree000000000000000000000000000000000000".to_owned()),
+            commit_count: 1,
+            ci_trigger_workflows: vec!["CI".to_owned()],
+            lease: format!("refs/heads/{}:{}", head.name, head.oid),
+            already_satisfied: true,
+        };
+        let mut progress = SyncProgress::new(&status, vec![PrNumber(1)]);
+
+        invalidate_rewritten_force_intents(&status, &provider, &[plan], &mut progress)
+            .expect("unchanged generation retains explicit force intent");
+
+        assert!(progress.current[&PrNumber(1)].has_label("caravan-force"));
+        assert!(provider.calls.borrow().is_empty());
+        assert!(provider.audits.borrow().is_empty());
+    }
+
+    #[test]
+    fn fresh_force_reapplication_on_rewritten_generation_can_enter_force_path() {
+        let mut pulls = healthy_chain();
+        pulls.truncate(1);
+        pulls[0].labels.insert("caravan-force".to_owned());
+        let provider = FakeProvider::with_pull_requests(pulls.clone());
+        let initial_status = status(pulls, Some(PrNumber(1)), &clean);
+        let head = initial_status.analysis.pull_requests[&PrNumber(1)]
+            .head
+            .clone();
+        let rewritten_oid = CommitOid("rewritten0000000000000000000000000000000".to_owned());
+        let plan = crate::physical_rebase::RebasePlan {
+            pr: PrNumber(1),
+            branch: head.name.clone(),
+            old_head_oid: head.oid.clone(),
+            old_base_oid: initial_status.analysis.fleet.default_branch.oid.clone(),
+            range_source: crate::physical_rebase::PlannedRangeBase::RemoteBranch {
+                branch: initial_status.analysis.fleet.default_branch.clone(),
+            },
+            new_base: crate::physical_rebase::PlannedBase::Remote(
+                initial_status.analysis.fleet.default_branch.clone(),
+            ),
+            new_head_oid: rewritten_oid.clone(),
+            new_tree_oid: CommitOid("tree000000000000000000000000000000000000".to_owned()),
+            commit_count: 1,
+            ci_trigger_workflows: vec!["CI".to_owned()],
+            lease: format!("refs/heads/{}:{}", head.name, head.oid),
+            already_satisfied: false,
+        };
+        let mut progress = SyncProgress::new(&initial_status, vec![PrNumber(1)]);
+        invalidate_rewritten_force_intents(&initial_status, &provider, &[plan], &mut progress)
+            .expect("old-generation force is consumed");
+
+        let rewritten = {
+            let mut provider_pulls = provider.pulls.borrow_mut();
+            let rewritten = provider_pulls.get_mut(&PrNumber(1)).expect("head");
+            rewritten.head.oid = rewritten_oid;
+            rewritten.checks.clear();
+            rewritten.labels.insert("caravan-force".to_owned());
+            rewritten.clone()
+        };
+        let rewritten_status = status(vec![rewritten], Some(PrNumber(1)), &clean);
+
+        let progress = execute(&rewritten_status, &provider, false, false, true)
+            .expect("fresh force label on exact rewritten generation is accepted");
+
+        assert_eq!(progress.ci[0].disposition, CiDisposition::Forced);
+        assert_eq!(
+            progress.current[&PrNumber(1)].state,
+            PullRequestState::Merged
+        );
+        assert_eq!(
+            *provider.calls.borrow(),
+            vec![
+                MutationKind::RemoveLabel,
+                MutationKind::Comment,
+                MutationKind::Comment,
+                MutationKind::SquashMerge,
+            ]
+        );
     }
 
     #[test]

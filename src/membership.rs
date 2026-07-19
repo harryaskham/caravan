@@ -415,6 +415,7 @@ fn execute_live(
             branch: target.tail.head.name.clone(),
             head_oid: target.tail.head.oid.clone(),
         });
+    let mut force_invalidation = None;
     let rebase_receipt = if context.config.rebase_on_join {
         if request.create_pr && status.current_pr.is_none() {
             return Err(AppError::validation(
@@ -482,14 +483,31 @@ fn execute_live(
             || status.analysis.fleet.default_branch.clone(),
             |target| target.tail.head,
         );
-        let receipt = crate::physical_rebase::rewrite_candidate(
+        let prepared = crate::physical_rebase::prepare_candidate(
             &context.repository_path,
             &repository,
             &candidate,
-            &target,
+            crate::physical_rebase::PlannedRangeBase::RemoteBranch {
+                branch: candidate.base.clone(),
+            },
+            crate::physical_rebase::PlannedBase::Remote(target.clone()),
             &status.analysis.fleet.default_branch,
-            timeout,
+            crate::physical_rebase::RebaseExecutionBudget::new(timeout),
         )?;
+        if candidate.has_label(FORCE_LABEL) && !prepared.plan.already_satisfied {
+            let mut invalidation = ExecutionState::new(request.operation);
+            invalidation.current = Some(candidate.clone());
+            invalidation.ensure_label_absent(&provider, &repository, FORCE_LABEL)?;
+            let audit = force_rewrite_invalidation_audit(
+                &candidate,
+                invalidation.current.as_ref().expect("force label removed"),
+                &prepared.plan,
+            );
+            invalidation.ensure_control_label_comment(&provider, &repository, &audit)?;
+            force_invalidation = Some(invalidation);
+        }
+        let receipt = crate::physical_rebase::apply_prepared(&prepared)
+            .map_err(|error| attach_force_invalidation(error, force_invalidation.as_ref()))?;
         // GitHub is authoritative after a push. Never apply base/label changes
         // against the stale pre-rewrite PR snapshot.
         status = candidate_pr.map_or_else(
@@ -525,7 +543,12 @@ fn execute_live(
         request.clone(),
         rebase_receipt.as_ref(),
     )
-    .map_err(|error| attach_rebase_receipt(error, rebase_receipt.as_ref()));
+    .map_err(|error| {
+        attach_force_invalidation(
+            attach_rebase_receipt(error, rebase_receipt.as_ref()),
+            force_invalidation.as_ref(),
+        )
+    });
     let mut output = match execution {
         Ok(output) => output,
         Err(error) if request.operation.is_join() => {
@@ -536,6 +559,17 @@ fn execute_live(
         }
         Err(error) => return Err(error),
     };
+    if let Some(mut invalidation) = force_invalidation {
+        invalidation
+            .steps
+            .append(&mut output.receipt.completed_steps);
+        output.receipt.completed_steps = invalidation.steps;
+        output.receipt.changed = true;
+        invalidation
+            .provider_receipts
+            .append(&mut output.provider_receipts);
+        output.provider_receipts = invalidation.provider_receipts;
+    }
     let kind = if request.operation.is_join() {
         EventKind::PrJoined
     } else {
@@ -674,6 +708,65 @@ fn membership_config_fingerprint(context: &AppContext) -> String {
             (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
         });
     format!("fnv1a64:{hash:016x}")
+}
+
+fn force_rewrite_invalidation_audit(
+    before: &PullRequestSnapshot,
+    after: &PullRequestSnapshot,
+    plan: &crate::physical_rebase::RebasePlan,
+) -> ControlLabelAudit {
+    let target = match &plan.new_base {
+        crate::physical_rebase::PlannedBase::Remote(branch)
+        | crate::physical_rebase::PlannedBase::Simulated(branch) => branch,
+    };
+    ControlLabelAudit {
+        operation: "force_invalidate_rewrite".to_owned(),
+        marker: control_label_marker(
+            "force_invalidate_rewrite",
+            before.number,
+            &before.head.oid,
+            &before.labels,
+            &after.labels,
+        ),
+        before_labels: before.labels.clone(),
+        after_labels: after.labels.clone(),
+        actor: "cara membership physical-rebase policy".to_owned(),
+        reason: format!(
+            "invalidated caravan-force intent bound to old head {} before Cara-owned rewrite to {} onto {}@{}",
+            before.head.oid, plan.new_head_oid, target.name, target.oid
+        ),
+        reason_source: "deterministic exact-generation safety policy".to_owned(),
+        compatibility_evidence:
+            "membership and exact target compatibility preflight passed before invalidation"
+                .to_owned(),
+        clean_squash_evidence:
+            "not applicable: force intent is removed before branch history changes".to_owned(),
+        admission_priority_basis: "unchanged from the membership request".to_owned(),
+    }
+}
+
+fn attach_force_invalidation(error: AppError, state: Option<&ExecutionState>) -> AppError {
+    let Some(state) = state else {
+        return error;
+    };
+    let mut details = error.details().unwrap_or_else(|| json!({}));
+    if let Some(object) = details.as_object_mut() {
+        object.insert(
+            "force_intent_invalidation".to_owned(),
+            json!({
+                "completed_steps": state.steps,
+                "provider_receipts": state.provider_receipts,
+                "resumable": true,
+                "next": "the old-generation force intent was consumed; repair the error and explicitly reapply caravan-force only to the intended current head generation",
+            }),
+        );
+    }
+    AppError::structured(
+        error.category(),
+        error.code(),
+        error.message(),
+        Some(details),
+    )
 }
 
 fn attach_rebase_receipt(
@@ -2009,6 +2102,39 @@ mod tests {
         assert!(output.pull_request.has_label(ACTIVE_LABEL));
         assert!(!output.pull_request.auto_merge.enabled);
         assert_eq!(output.caravan_id, PrNumber(1));
+    }
+
+    #[test]
+    fn routine_join_consumes_stale_force_label_instead_of_carrying_bypass_intent() {
+        let head = pull_request(1, "one", "main", &[ACTIVE_LABEL]);
+        let candidate = pull_request(2, "two", "main", &[FORCE_LABEL]);
+        let provider = FakeProvider::with_pull_requests(vec![head.clone(), candidate.clone()]);
+
+        let output = execute(
+            status(candidate, vec![head]),
+            &clean,
+            &provider,
+            MembershipRequest {
+                operation: MembershipOperation::Join,
+                create_pr: false,
+                tail_pr: None,
+                head_pr: None,
+                reason: None,
+                priority_label: None,
+                agent_priority_labels: Vec::new(),
+            },
+        )
+        .expect("routine join removes unrelated force intent");
+
+        assert!(!output.pull_request.has_label(FORCE_LABEL));
+        assert!(output.provider_receipts.iter().any(|receipt| {
+            receipt.kind == MutationKind::RemoveLabel
+                && receipt
+                    .before
+                    .as_ref()
+                    .is_some_and(|before| before.has_label(FORCE_LABEL))
+                && !receipt.after.has_label(FORCE_LABEL)
+        }));
     }
 
     #[test]

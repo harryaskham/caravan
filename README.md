@@ -40,7 +40,9 @@ after the same check passes.
   not fully successful, including pending, running, failed, mixed, and empty
   checks. A forced head is admin-squashed only when repository policy permits
   it, the exact head/default compatibility proof is still current, and GitHub
-  reports admin permission.
+  reports admin permission. Cara-owned physical rewrites consume and audit any
+  force label bound to the old head; the new generation requires a fresh
+  operator label, while routine membership never carries force intent.
 
 ## V1 command surface
 

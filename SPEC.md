@@ -239,6 +239,8 @@ A user/agent may use the managed repair workspace, rerun failed checks, evict/sp
 3. it remains mechanically conflict-free with the default branch;
 4. the authenticated actor has repository permission.
 
+Force intent is bound to the exact labelled head generation. Before any Cara-owned physical rewrite, sync/join removes `caravan-force` from the old head and posts a durable old→planned-generation invalidation audit; a force merge of the rewritten generation requires a fresh external operator label. An already-satisfied plan does not consume intent because its head OID did not change. Routine membership never adds or carries force intent.
+
 No approval hook or interactive reason is required. Before accepting the externally applied `caravan-force` label, sync/loop posts a durable generated-reason comment containing the exact observed checks (including pending, running, failed, mixed, or empty observations), enabled force policy, authenticated ADMIN permission, exact clean compatibility proof, and squash action. Comment failure is resumable and prevents the force merge. The attempt and result are emitted as audit events. Force never bypasses textual conflicts.
 
 ## 8. Decision points and errors
