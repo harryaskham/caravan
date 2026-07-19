@@ -77,8 +77,14 @@ FIRST USE AND EVERY SAFE TICK
    when proposing a join. Follow the typed `new`, `join`, `repair`, `wait`, or
    `reject` action from the returned receipt.
 4. Use `cara new`, `renew`, `join`, or `rejoin` only after that preflight.
-   Membership operations are optimistic and resumable; rerun the same command
-   after an indeterminate provider response rather than inventing local state.
+   For checkout-free orchestration, `cara join --pr N --tail-pr T` requires
+   `rebase_on_join: true`: it holds the repository operation lock, re-reads the
+   canonical live tail, rebases the exact candidate onto that tail, re-reads
+   provider facts, refuses admission if the tail moved, sets the provider base,
+   and returns a versioned exact join receipt. Routine join accepts no force
+   option and proves any stale-generation `caravan-force` intent was absent or
+   removed. Membership operations are optimistic and resumable; rerun the same
+   command after an indeterminate provider response rather than inventing state.
 5. Run `cara sync` for the current caravan or `cara sync --all` for the fleet.
    Continue until it converges, reports waiting CI, or returns one typed decision.
 6. Preserve the complete structured error. Its category, code, exact OIDs,
@@ -366,6 +372,11 @@ pub struct CreateInput {
 /// Input for `join` and `rejoin`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Args)]
 pub struct JoinInput {
+    /// Exact remote candidate PR. Required for checkout-free atomic integration.
+    #[arg(long, value_name = "PR", conflicts_with = "create_pr")]
+    #[serde(default)]
+    pub pr: Option<u64>,
+
     /// Exact tail PR to use as the proposed merge target.
     #[arg(long, value_name = "PR", conflicts_with = "head_pr")]
     #[serde(default)]
@@ -945,6 +956,7 @@ mod tests {
         assert!(output.instructions.contains("A, AB, ABC, ABCD, ABCDE"));
         assert!(output.instructions.contains("rebase_on_join: true"));
         assert!(output.instructions.contains("global barrier"));
+        assert!(output.instructions.contains("cara join --pr N --tail-pr T"));
         assert!(output.instructions.contains("cara repair start"));
         assert!(output.instructions.contains("caravan-force"));
         assert!(

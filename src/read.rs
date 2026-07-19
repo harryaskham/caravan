@@ -641,53 +641,61 @@ pub fn check(context: &AppContext, input: &CheckInput) -> Result<CheckOutput, Ap
             "--tail-pr and --head-pr are mutually exclusive",
         ));
     }
-    let mut status = status(context)?;
-    if let Some(number) = input.pr.map(PrNumber) {
-        // Re-read the selected provider PR after fleet discovery. Comparing the
-        // complete snapshot closes the discovery/refetch race before exact Git
-        // revision checks; merge compatibility subsequently verifies refs both
-        // before and after its fetch.
-        let provider = crate::github::GitHubMutationAdapter::new(
-            crate::command::ProcessRunner::in_directory(&context.repository_path).with_timeout(
-                std::time::Duration::from_secs(context.config.command_timeout_secs),
-            ),
-        );
-        let fresh = provider
-            .refetch_pull_request(&status.repository, number)
-            .map_err(|error| {
-                AppError::structured(
-                    ErrorCategory::ExecutionFailure,
-                    "candidate_refetch_failed",
-                    error.to_string(),
-                    Some(
-                        json!({"pr": number, "safe_next_action": "retry the read-only preflight"}),
-                    ),
-                )
-            })?;
-        let discovered = status.analysis.pull_requests.get(&number).ok_or_else(|| {
-            AppError::validation(
-                "candidate_not_found",
-                format!("PR #{number} is not an open provider candidate"),
-            )
-        })?;
-        require_fresh_candidate(discovered, &fresh)?;
-        let identity = GitHubDiscovery::new(
-            crate::command::ProcessRunner::in_directory(&context.repository_path).with_timeout(
-                std::time::Duration::from_secs(context.config.command_timeout_secs),
-            ),
-        )
-        .merge_candidate_identity(&status.repository, &fresh)
-        .map_err(|error| discovery_error(&error))?;
-        status
-            .merge_candidates
-            .retain(|candidate| candidate.pr != number);
-        status.merge_candidates.push(identity);
-        status.current_pr = Some(number);
-    }
+    let status = input.pr.map_or_else(
+        || status(context),
+        |number| status_for_remote_candidate(context, PrNumber(number)),
+    )?;
     let checker = GitCompatibilityChecker::new(&context.repository_path, "origin").with_timeout(
         std::time::Duration::from_secs(context.config.command_timeout_secs),
     );
     check_analysis(&status, input, &checker)
+}
+
+/// Discover the fleet and bind one exact remote candidate without checkout mutation.
+pub(crate) fn status_for_remote_candidate(
+    context: &AppContext,
+    number: PrNumber,
+) -> Result<StatusOutput, AppError> {
+    let mut status = status(context)?;
+    // Re-read the selected provider PR after fleet discovery. Comparing the
+    // complete snapshot closes the discovery/refetch race before exact Git
+    // revision checks; merge compatibility subsequently verifies refs both
+    // before and after its fetch.
+    let provider = crate::github::GitHubMutationAdapter::new(
+        crate::command::ProcessRunner::in_directory(&context.repository_path).with_timeout(
+            std::time::Duration::from_secs(context.config.command_timeout_secs),
+        ),
+    );
+    let fresh = provider
+        .refetch_pull_request(&status.repository, number)
+        .map_err(|error| {
+            AppError::structured(
+                ErrorCategory::ExecutionFailure,
+                "candidate_refetch_failed",
+                error.to_string(),
+                Some(json!({"pr": number, "safe_next_action": "retry the read-only preflight"})),
+            )
+        })?;
+    let discovered = status.analysis.pull_requests.get(&number).ok_or_else(|| {
+        AppError::validation(
+            "candidate_not_found",
+            format!("PR #{number} is not an open provider candidate"),
+        )
+    })?;
+    require_fresh_candidate(discovered, &fresh)?;
+    let identity = GitHubDiscovery::new(
+        crate::command::ProcessRunner::in_directory(&context.repository_path).with_timeout(
+            std::time::Duration::from_secs(context.config.command_timeout_secs),
+        ),
+    )
+    .merge_candidate_identity(&status.repository, &fresh)
+    .map_err(|error| discovery_error(&error))?;
+    status
+        .merge_candidates
+        .retain(|candidate| candidate.pr != number);
+    status.merge_candidates.push(identity);
+    status.current_pr = Some(number);
+    Ok(status)
 }
 
 fn require_fresh_candidate(

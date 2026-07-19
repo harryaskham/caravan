@@ -72,6 +72,54 @@ pub struct MembershipRequest {
     pub agent_priority_labels: Vec<String>,
 }
 
+/// Exact predecessor selected from the serialized live-tail snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct JoinPredecessorReceipt {
+    pub pr: PrNumber,
+    pub branch: String,
+    pub head_oid: crate::model::CommitOid,
+}
+
+/// Final exact candidate state after physical rewrite and provider admission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct JoinResultReceipt {
+    pub head_oid: crate::model::CommitOid,
+    pub base_ref: String,
+    pub base_oid: crate::model::CommitOid,
+    pub state: PullRequestState,
+}
+
+/// Operator-only force intent cannot silently survive routine atomic join.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum JoinForceIntent {
+    Absent,
+    RemovedStaleGeneration,
+}
+
+/// Versioned, additive contract consumed by Cacophony `pr_cara_join`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct JoinReceipt {
+    pub schema_version: u32,
+    pub operation_id: OperationId,
+    pub repository: RepositoryId,
+    pub caravan_id: PrNumber,
+    pub candidate_pr: PrNumber,
+    pub candidate_source_head_oid: crate::model::CommitOid,
+    pub predecessor: JoinPredecessorReceipt,
+    pub default_branch_oid: crate::model::CommitOid,
+    pub result: JoinResultReceipt,
+    pub rebase_on_join: bool,
+    pub ancestry_verified: bool,
+    pub membership_durable: bool,
+    pub force_intent: JoinForceIntent,
+    pub config_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebase_receipt: Option<crate::physical_rebase::RebaseReceipt>,
+    #[serde(default)]
+    pub provider_receipts: Vec<GitHubMutationReceipt>,
+}
+
 /// Successful, resumable membership result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct MembershipOutput {
@@ -82,6 +130,9 @@ pub struct MembershipOutput {
     /// Exact provider before/after facts for every completed remote mutation.
     #[serde(default)]
     pub provider_receipts: Vec<GitHubMutationReceipt>,
+    /// Present only for join/rejoin; stable checkout-free integration contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join_receipt: Option<JoinReceipt>,
     pub pull_request: PullRequestSnapshot,
     pub caravan_id: PrNumber,
     /// Canonical events emitted after the complete membership operation.
@@ -254,6 +305,7 @@ pub fn new(context: &AppContext, input: &CreateInput) -> Result<MembershipOutput
             priority_label: input.priority_label.clone(),
             agent_priority_labels: context.config.agent_priority_labels.clone(),
         },
+        None,
     )
 }
 
@@ -270,6 +322,7 @@ pub fn renew(context: &AppContext, input: &CreateInput) -> Result<MembershipOutp
             priority_label: input.priority_label.clone(),
             agent_priority_labels: context.config.agent_priority_labels.clone(),
         },
+        None,
     )
 }
 
@@ -286,6 +339,7 @@ pub fn join(context: &AppContext, input: &JoinInput) -> Result<MembershipOutput,
             priority_label: input.priority_label.clone(),
             agent_priority_labels: context.config.agent_priority_labels.clone(),
         },
+        input.pr,
     )
 }
 
@@ -302,6 +356,7 @@ pub fn rejoin(context: &AppContext, input: &JoinInput) -> Result<MembershipOutpu
             priority_label: input.priority_label.clone(),
             agent_priority_labels: context.config.agent_priority_labels.clone(),
         },
+        input.pr,
     )
 }
 
@@ -309,10 +364,33 @@ pub fn rejoin(context: &AppContext, input: &JoinInput) -> Result<MembershipOutpu
 fn execute_live(
     context: &AppContext,
     request: &MembershipRequest,
+    candidate_pr: Option<u64>,
 ) -> Result<MembershipOutput, AppError> {
     let _lock = OperationLock::acquire(&context.repository_path, request.operation.name())?;
+    if candidate_pr.is_some() && request.create_pr {
+        return Err(AppError::validation(
+            "remote_candidate_create_conflict",
+            "--pr selects an existing provider PR and cannot be combined with --create-pr",
+        ));
+    }
+    if candidate_pr.is_some() && request.operation.is_join() && !context.config.rebase_on_join {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "atomic_join_requires_rebase_on_join",
+            "checkout-free atomic join requires explicit `rebase_on_join: true`",
+            Some(json!({
+                "config_path": context.config_path,
+                "candidate_pr": candidate_pr,
+                "mutated": false,
+                "safe_next_action": "commit `rebase_on_join: true`, then retry the same join command"
+            })),
+        ));
+    }
     let timeout = std::time::Duration::from_secs(context.config.command_timeout_secs);
-    let mut status = read::status(context)?;
+    let mut status = candidate_pr.map_or_else(
+        || read::status(context),
+        |number| read::status_for_remote_candidate(context, PrNumber(number)),
+    )?;
     let checker =
         GitCompatibilityChecker::new(&context.repository_path, "origin").with_timeout(timeout);
     let provider = GitHubMutationAdapter::new(
@@ -320,6 +398,23 @@ fn execute_live(
     );
     let repository = status.repository.clone();
     let failure_status = status.clone();
+    let default_branch_oid = status.analysis.fleet.default_branch.oid.clone();
+    let candidate_source_head_oid = status
+        .current_pr
+        .and_then(|number| status.analysis.pull_requests.get(&number))
+        .map(|candidate| candidate.head.oid.clone());
+    let initial_join_target = request
+        .operation
+        .is_join()
+        .then(|| resolve_join_target(&status, request))
+        .transpose()?;
+    let selected_predecessor = initial_join_target
+        .as_ref()
+        .map(|target| JoinPredecessorReceipt {
+            pr: target.tail.number,
+            branch: target.tail.head.name.clone(),
+            head_oid: target.tail.head.oid.clone(),
+        });
     let rebase_receipt = if context.config.rebase_on_join {
         if request.create_pr && status.current_pr.is_none() {
             return Err(AppError::validation(
@@ -366,11 +461,7 @@ fn execute_live(
                 "priority label is not an exact configured agent_priority_labels entry",
             ));
         }
-        let join_target = request
-            .operation
-            .is_join()
-            .then(|| resolve_join_target(&status, request))
-            .transpose()?;
+        let join_target = initial_join_target.clone();
         let desired_base = join_target.as_ref().map_or_else(
             || status.default_branch.clone(),
             |target| target.tail.head.name.clone(),
@@ -401,7 +492,10 @@ fn execute_live(
         )?;
         // GitHub is authoritative after a push. Never apply base/label changes
         // against the stale pre-rewrite PR snapshot.
-        status = read::status(context)?;
+        status = candidate_pr.map_or_else(
+            || read::status(context),
+            |candidate| read::status_for_remote_candidate(context, PrNumber(candidate)),
+        )?;
         let observed = status.analysis.pull_requests.get(&number).ok_or_else(|| {
             AppError::structured(
                 ErrorCategory::ExecutionFailure,
@@ -424,8 +518,14 @@ fn execute_live(
     } else {
         None
     };
-    let execution = execute(status, &checker, &provider, request.clone())
-        .map_err(|error| attach_rebase_receipt(error, rebase_receipt.as_ref()));
+    let execution = execute_with_rebase_guard(
+        status,
+        &checker,
+        &provider,
+        request.clone(),
+        rebase_receipt.as_ref(),
+    )
+    .map_err(|error| attach_rebase_receipt(error, rebase_receipt.as_ref()));
     let mut output = match execution {
         Ok(output) => output,
         Err(error) if request.operation.is_join() => {
@@ -441,6 +541,32 @@ fn execute_live(
     } else {
         EventKind::CaravanCreated
     };
+    if request.operation.is_join() {
+        let join_receipt = build_join_receipt(
+            context,
+            &repository,
+            &failure_status,
+            JoinReceiptEvidence {
+                predecessor: selected_predecessor,
+                candidate_source_head_oid,
+                default_branch_oid,
+                rebase_receipt: rebase_receipt.as_ref(),
+            },
+            &output,
+        )?;
+        if candidate_pr.is_some()
+            && (!join_receipt.ancestry_verified || !join_receipt.membership_durable)
+        {
+            return Err(AppError::structured(
+                ErrorCategory::ExecutionFailure,
+                "atomic_join_receipt_incomplete",
+                "checkout-free join completed without exact ancestry and durable membership proof",
+                Some(json!({"join_receipt": join_receipt, "resumable": true})),
+            ));
+        }
+        output.join_receipt = Some(join_receipt);
+    }
+    output.rebase_receipt = rebase_receipt;
     let event = hooks::event(
         kind,
         output.receipt.operation_id.clone(),
@@ -449,12 +575,105 @@ fn execute_live(
         vec![output.pull_request.number],
         None,
         None,
-        BTreeMap::from([("receipt".to_owned(), json!(output.receipt))]),
+        BTreeMap::from([
+            ("receipt".to_owned(), json!(output.receipt)),
+            ("join_receipt".to_owned(), json!(output.join_receipt)),
+        ]),
     );
-    output.rebase_receipt = rebase_receipt;
     output.events.push(event);
     output.hook_deliveries = hooks::dispatch_events(context, &output.events)?;
     Ok(output)
+}
+
+struct JoinReceiptEvidence<'a> {
+    predecessor: Option<JoinPredecessorReceipt>,
+    candidate_source_head_oid: Option<crate::model::CommitOid>,
+    default_branch_oid: crate::model::CommitOid,
+    rebase_receipt: Option<&'a crate::physical_rebase::RebaseReceipt>,
+}
+
+fn build_join_receipt(
+    context: &AppContext,
+    repository: &RepositoryId,
+    before: &StatusOutput,
+    evidence: JoinReceiptEvidence<'_>,
+    output: &MembershipOutput,
+) -> Result<JoinReceipt, AppError> {
+    let predecessor = evidence.predecessor.ok_or_else(|| {
+        AppError::structured(
+            ErrorCategory::ExecutionFailure,
+            "join_receipt_predecessor_missing",
+            "successful join did not retain its exact predecessor receipt",
+            Some(json!({"candidate_pr": output.pull_request.number})),
+        )
+    })?;
+    let source_head = evidence.candidate_source_head_oid.ok_or_else(|| {
+        AppError::structured(
+            ErrorCategory::ExecutionFailure,
+            "join_receipt_source_missing",
+            "successful join did not retain its source head",
+            Some(json!({"candidate_pr": output.pull_request.number})),
+        )
+    })?;
+    let force_intent = if before
+        .analysis
+        .pull_requests
+        .get(&output.pull_request.number)
+        .is_some_and(|candidate| candidate.has_label(FORCE_LABEL))
+    {
+        JoinForceIntent::RemovedStaleGeneration
+    } else {
+        JoinForceIntent::Absent
+    };
+    let ancestry_verified = evidence.rebase_receipt.is_some_and(|receipt| {
+        receipt.pr == output.pull_request.number
+            && receipt.new_head_oid == output.pull_request.head.oid
+            && receipt.new_base_branch == predecessor.branch
+            && receipt.new_base_oid == predecessor.head_oid
+    });
+    let membership_durable = output.pull_request.has_label(ACTIVE_LABEL)
+        && !output.pull_request.has_label(FORCE_LABEL)
+        && output.pull_request.base.name == predecessor.branch
+        && output.pull_request.base.oid == predecessor.head_oid;
+    Ok(JoinReceipt {
+        schema_version: 1,
+        operation_id: output.receipt.operation_id.clone(),
+        repository: repository.clone(),
+        caravan_id: output.caravan_id,
+        candidate_pr: output.pull_request.number,
+        candidate_source_head_oid: source_head,
+        predecessor,
+        default_branch_oid: evidence.default_branch_oid,
+        result: JoinResultReceipt {
+            head_oid: output.pull_request.head.oid.clone(),
+            base_ref: output.pull_request.base.name.clone(),
+            base_oid: output.pull_request.base.oid.clone(),
+            state: output.pull_request.state,
+        },
+        rebase_on_join: context.config.rebase_on_join,
+        ancestry_verified,
+        membership_durable,
+        force_intent,
+        config_fingerprint: membership_config_fingerprint(context),
+        rebase_receipt: evidence.rebase_receipt.cloned(),
+        provider_receipts: output.provider_receipts.clone(),
+    })
+}
+
+fn membership_config_fingerprint(context: &AppContext) -> String {
+    let contract = serde_json::to_vec(&json!({
+        "version": context.config.version,
+        "rebase_on_join": context.config.rebase_on_join,
+        "force_merge": context.config.force_merge,
+        "agent_priority_labels": &context.config.agent_priority_labels,
+    }))
+    .expect("validated config serializes");
+    let hash = contract
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+    format!("fnv1a64:{hash:016x}")
 }
 
 fn attach_rebase_receipt(
@@ -509,12 +728,23 @@ fn join_failed_event(
     )
 }
 
-#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
+#[cfg(test)]
 fn execute(
+    status: StatusOutput,
+    checker: &impl CompatibilityChecker,
+    provider: &impl MembershipProvider,
+    request: MembershipRequest,
+) -> Result<MembershipOutput, AppError> {
+    execute_with_rebase_guard(status, checker, provider, request, None)
+}
+
+#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
+fn execute_with_rebase_guard(
     mut status: StatusOutput,
     checker: &impl CompatibilityChecker,
     provider: &impl MembershipProvider,
     request: MembershipRequest,
+    expected_rebase: Option<&crate::physical_rebase::RebaseReceipt>,
 ) -> Result<MembershipOutput, AppError> {
     if request
         .reason
@@ -565,6 +795,28 @@ fn execute(
     } else {
         None
     };
+    if let Some(rebase) = expected_rebase {
+        let candidate_matches = status.current_pr == Some(rebase.pr);
+        let target_matches = target.as_ref().is_some_and(|target| {
+            target.tail.head.name == rebase.new_base_branch
+                && target.tail.head.oid == rebase.new_base_oid
+        });
+        if !candidate_matches || !target_matches {
+            return Err(AppError::structured(
+                ErrorCategory::Validation,
+                "join_target_moved_after_rebase",
+                "candidate or live caravan tail changed after physical preflight; refusing admission",
+                Some(json!({
+                    "rebase_receipt": rebase,
+                    "current_pr": status.current_pr,
+                    "live_tail": target.as_ref().map(|target| &target.tail),
+                    "mutated_membership": false,
+                    "resumable": true,
+                    "safe_next_action": "rediscover and retry the same atomic join"
+                })),
+            ));
+        }
+    }
     let desired_base = target.as_ref().map_or_else(
         || status.default_branch.clone(),
         |target| target.tail.head.name.clone(),
@@ -682,6 +934,7 @@ fn execute(
         receipt,
         rebase_receipt: None,
         provider_receipts: state.provider_receipts,
+        join_receipt: None,
         pull_request,
         caravan_id,
         events: Vec::new(),
@@ -1582,6 +1835,127 @@ mod tests {
         assert_eq!(event.prs, vec![PrNumber(1), PrNumber(2)]);
         assert_eq!(event.fleet, Some(status.analysis.fleet));
         assert_eq!(event.metadata["error_code"], "candidate_rejected");
+    }
+
+    #[test]
+    fn atomic_join_rejects_live_tail_drift_after_physical_rebase() {
+        let head = pull_request(1, "one", "main", &[ACTIVE_LABEL]);
+        let candidate = pull_request(2, "two", "main", &[]);
+        let provider = FakeProvider::with_pull_requests(vec![head.clone(), candidate.clone()]);
+        let rebase = crate::physical_rebase::RebaseReceipt {
+            pr: candidate.number,
+            branch: candidate.head.name.clone(),
+            old_head_oid: candidate.head.oid.clone(),
+            new_head_oid: candidate.head.oid.clone(),
+            old_base_oid: candidate.base.oid.clone(),
+            new_base_branch: "stale-tail".to_owned(),
+            new_base_oid: crate::model::CommitOid("f".repeat(40)),
+            new_tree_oid: crate::model::CommitOid("e".repeat(40)),
+            commit_count: 1,
+            ci_trigger_workflows: vec![".github/workflows/ci.yml".to_owned()],
+            lease: format!(
+                "--force-with-lease=refs/heads/{}:{}",
+                candidate.head.name, candidate.head.oid
+            ),
+            already_satisfied: false,
+        };
+
+        let error = execute_with_rebase_guard(
+            status(candidate.clone(), vec![head]),
+            &clean,
+            &provider,
+            MembershipRequest {
+                operation: MembershipOperation::Join,
+                create_pr: false,
+                tail_pr: Some(1),
+                head_pr: None,
+                reason: None,
+                priority_label: None,
+                agent_priority_labels: Vec::new(),
+            },
+            Some(&rebase),
+        )
+        .expect_err("tail drift must stop before admission");
+
+        assert_eq!(error.code(), "join_target_moved_after_rebase");
+        assert_eq!(provider.pull_requests.borrow()[&PrNumber(2)], candidate);
+        assert_eq!(error.details().unwrap()["mutated_membership"], false);
+    }
+
+    #[test]
+    fn join_receipt_proves_exact_tail_ancestry_and_stale_force_removal() {
+        let head = pull_request(1, "one", "main", &[ACTIVE_LABEL]);
+        let candidate = pull_request(2, "two", "main", &[FORCE_LABEL]);
+        let before = status(candidate.clone(), vec![head.clone()]);
+        let provider = FakeProvider::with_pull_requests(vec![head.clone(), candidate.clone()]);
+        let output = execute(
+            before.clone(),
+            &clean,
+            &provider,
+            MembershipRequest {
+                operation: MembershipOperation::Join,
+                create_pr: false,
+                tail_pr: Some(1),
+                head_pr: None,
+                reason: None,
+                priority_label: None,
+                agent_priority_labels: Vec::new(),
+            },
+        )
+        .expect("join succeeds");
+        let rebase = crate::physical_rebase::RebaseReceipt {
+            pr: candidate.number,
+            branch: candidate.head.name.clone(),
+            old_head_oid: candidate.head.oid.clone(),
+            new_head_oid: output.pull_request.head.oid.clone(),
+            old_base_oid: candidate.base.oid.clone(),
+            new_base_branch: head.head.name.clone(),
+            new_base_oid: head.head.oid.clone(),
+            new_tree_oid: crate::model::CommitOid("e".repeat(40)),
+            commit_count: 1,
+            ci_trigger_workflows: vec![".github/workflows/ci.yml".to_owned()],
+            lease: format!(
+                "--force-with-lease=refs/heads/{}:{}",
+                candidate.head.name, candidate.head.oid
+            ),
+            already_satisfied: true,
+        };
+        let mut context = AppContext::default();
+        context.config.rebase_on_join = true;
+        let receipt = build_join_receipt(
+            &context,
+            &repository(),
+            &before,
+            JoinReceiptEvidence {
+                predecessor: Some(JoinPredecessorReceipt {
+                    pr: head.number,
+                    branch: head.head.name.clone(),
+                    head_oid: head.head.oid.clone(),
+                }),
+                candidate_source_head_oid: Some(candidate.head.oid),
+                default_branch_oid: before.analysis.fleet.default_branch.oid.clone(),
+                rebase_receipt: Some(&rebase),
+            },
+            &output,
+        )
+        .unwrap();
+
+        assert_eq!(
+            receipt.force_intent,
+            JoinForceIntent::RemovedStaleGeneration
+        );
+        assert!(receipt.ancestry_verified);
+        assert!(receipt.membership_durable);
+        assert_eq!(receipt.predecessor.pr, PrNumber(1));
+        assert_eq!(receipt.result.base_oid, head.head.oid);
+        assert!(receipt.config_fingerprint.starts_with("fnv1a64:"));
+        assert!(receipt.provider_receipts.iter().any(|provider| {
+            provider.kind == MutationKind::RemoveLabel
+                && provider
+                    .before
+                    .as_ref()
+                    .is_some_and(|before| before.has_label(FORCE_LABEL))
+        }));
     }
 
     #[test]

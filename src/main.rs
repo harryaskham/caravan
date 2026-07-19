@@ -889,6 +889,19 @@ fn render_membership(output: &caravan::membership::MembershipOutput) -> String {
             "already satisfied"
         }
     );
+    if let Some(join) = &output.join_receipt {
+        let _ = writeln!(
+            text,
+            "  atomic join v{}: #{} -> #{} at {} (force={:?}, ancestry={}, durable={})",
+            join.schema_version,
+            join.candidate_pr,
+            join.predecessor.pr,
+            join.predecessor.head_oid,
+            join.force_intent,
+            join.ancestry_verified,
+            join.membership_durable
+        );
+    }
     for step in &output.receipt.completed_steps {
         let _ = writeln!(text, "  {:?} {:?}: {}", step.kind, step.state, step.summary);
     }
@@ -1415,14 +1428,17 @@ mod tests {
     }
 
     #[test]
-    fn join_accepts_explicit_tail_target() {
-        let cli =
-            Cli::try_parse_from(["cara", "join", "--tail-pr", "42"]).expect("join target parses");
+    fn join_accepts_remote_candidate_and_explicit_tail() {
+        let cli = Cli::try_parse_from(["cara", "join", "--pr", "43", "--tail-pr", "42"])
+            .expect("remote atomic join parses");
         let Command::Join(input) = cli.command else {
             panic!("expected join");
         };
+        assert_eq!(input.pr, Some(43));
         assert_eq!(input.tail_pr, Some(42));
         assert_eq!(input.head_pr, None);
+        assert!(!input.create_pr);
+        assert!(Cli::try_parse_from(["cara", "join", "--pr", "43", "--create-pr"]).is_err());
     }
 
     #[test]
