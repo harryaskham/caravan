@@ -40,37 +40,173 @@ pub mod model;
 pub const UPDATE_REPO_SLUG: &str = "harryaskham/caravan";
 /// Installed binary name.
 pub const TOOL_NAME: &str = "cara";
-/// Normative command contract.
-pub const SPEC_PATH: &str = "SPEC.md";
+/// Help contract source marker retained for stable JSON/MCP compatibility.
+/// The complete contract is embedded in [`AGENT_HELP`]; no external file is required.
+pub const SPEC_PATH: &str = "embedded";
 
-/// Agent-facing operating instructions returned by `cara help` and the MCP tool.
-pub const AGENT_HELP: &str = r"Caravan is an agent-in-the-loop GitHub merge queue.
+/// Self-contained agent/operator instructions returned by `cara help` and MCP.
+pub const AGENT_HELP: &str = r"Caravan is an agent-in-the-loop GitHub merge queue. GitHub is the durable
+source of truth: every operation rediscovers exact PR, ref, check, label, and
+auto-merge facts; local files are locks, bounded receipts, or disposable
+workspaces, never queue authority.
 
-Safe operating loop:
-1. Run `cara status`; if repository initialization is not ready, run the explicit
-   idempotent `cara init` command and reconcile any reported metadata mismatch.
-2. Inspect the canonical automatic-admission order (explicit agent priority,
-   then immutable PR createdAt) in status or with `cara next-candidate`; never
-   re-sort or leapfrog its first ordered attempt.
-3. Use `cara check --pr N` to preflight the exact remote candidate (optionally against a tail) without checkout or provider mutation, then follow its `new`, `join`, `repair`, `wait`, or `reject` next action.
-4. Run `cara sync` (or `sync --all`) until it either converges or returns one
-   typed decision point.
-5. At a repair decision, use `cara repair start --pr N [--target-pr T]` to
-   enter a Cara-owned exact-head workspace. Resolve only its typed conflicts,
-   stage them, and use `cara repair continue --session ID`; never create a raw
-   nested worktree, update a branch ref, or force-push.
-6. At a CI decision, optionally use `cara sync --rerun-failed` to rerun only
-   exact failed workflow runs. Otherwise repair/push, evict, split, renew, or
-   rejoin; then rerun the same sync.
-7. For an incident/maintenance hold, run explicit `cara pause` with actor and
-   reason. Expiry never resumes it. After recovery, only an audited `cara resume`
-   may revalidate exact facts and restore squash auto-merge.
+CORE MODEL AND INVARIANTS
+- A caravan is a linear ordered PR chain. Its first member is the head and its
+  PR number is the caravan ID.
+- Every active member has the `caravan` label and is open, non-draft, and owned
+  by the base repository. Fork-only heads are rejected.
+- The head targets the default branch. Each child targets its predecessor's
+  branch. Only the head may have squash auto-merge enabled; non-head auto-merge
+  is disabled even if someone enabled it externally.
+- Multiple caravans may exist. Cross-caravan compatibility and the configured
+  admission bound are checked before automatic changes.
+- Automatic admission is deterministic: configured `caravan-priority:*` labels
+  from highest to lowest, then immutable GitHub `createdAt`, then PR number.
+  Never re-sort, skip, or leapfrog the first canonical attempt because it failed.
 
-Caravan does not routinely rebase branches. A link means the child PR targets
-its predecessor branch and is mechanically merge-compatible with it. Only a
-caravan head targets the default branch and has squash auto-merge enabled.
-Never hide an unresolved structured error: its evidence and suggested actions
-are the continuation contract for the user or agent. See SPEC.md for invariants.";
+FIRST USE AND EVERY SAFE TICK
+1. Run `cara status` (prefer `--json` for automation). It reports initialization,
+   effective `rebase_on_join` mode, current/merged branch context, every caravan,
+   canonical admission order, pauses, exact base/head/candidate lineage, CI
+   generation freshness, compatibility, default-branch movement, and problems.
+2. If initialization is not ready, run idempotent `cara init`. Do not hand-create
+   labels or silently overwrite mismatched metadata. Repair the exact reported
+   repository setting, protection, label, permission, or config mismatch.
+3. Inspect `cara next-candidate`. Use `cara check --pr N` to validate the exact
+   remote PR without checkout or mutation. Add `--tail-pr T` (or `--head-pr H`)
+   when proposing a join. Follow the typed `new`, `join`, `repair`, `wait`, or
+   `reject` action from the returned receipt.
+4. Use `cara new`, `renew`, `join`, or `rejoin` only after that preflight.
+   Membership operations are optimistic and resumable; rerun the same command
+   after an indeterminate provider response rather than inventing local state.
+5. Run `cara sync` for the current caravan or `cara sync --all` for the fleet.
+   Continue until it converges, reports waiting CI, or returns one typed decision.
+6. Preserve the complete structured error. Its category, code, exact OIDs,
+   affected PRs, completed steps, provider receipts, suggested actions, and
+   resumable command are the continuation contract. Never replace it with a
+   generic summary or proceed around it manually.
+
+VIRTUAL CHAINS (SAFE DEFAULT)
+With `rebase_on_join: false` or an absent setting, Caravan does not rewrite PR
+history. It maintains the chain through PR base refs and proves mechanical
+compatibility. If a parent head changes and a child no longer applies, sync
+returns a typed conflict and explicitly reports `rebase_on_join=disabled` plus
+the exact config action. This mode is appropriate when force-pushing agent
+branches is not authorized.
+
+PHYSICAL FIXED-POINT CHAINS (`rebase_on_join: true`)
+This opt-in authorizes Cara to rewrite owned PR branches under exact leases. It
+is designed for cumulative, trustworthy parallel CI. If commits are logically:
+
+  A, B, C, D, E
+
+Cara materializes and pushes heads equivalent to:
+
+  A, AB, ABC, ABCD, ABCDE
+
+Thus every child contains the exact planned parent generation. After the serial
+branch rebuild, GitHub can run fresh CI for all rewritten PR heads in parallel;
+old check runs are invalidated and never treated as proof for the new generation.
+
+For membership, Cara prepares one candidate. For `sync --all`, Cara:
+1. selects non-paused caravans and plans each chain head-to-tail;
+2. materializes every rebase exactly once in retained isolated worktrees;
+3. feeds each planned parent OID into its child without pretending that
+   not-yet-pushed OID already exists remotely;
+4. verifies every conflict, workflow trigger, PR precondition, default/workflow
+   OID, old branch head, branch-set disjointness, push permission, and exact
+   force-with-lease before the first write;
+5. disables auto-merge on all selected members only after that global barrier;
+6. applies parent before descendant. A chain is always serial. Only independent,
+   disjoint caravans may apply concurrently, with a bounded worker count;
+7. performs mandatory midpoint GitHub rediscovery, verifies every pushed head,
+   refreshes invalidated CI, and only then runs normal base/CI/auto-merge sync;
+8. performs final rediscovery as the authoritative completion receipt.
+
+A planning conflict writes nothing. An apply-time race may leave an exact
+successfully rebuilt prefix; Cara records that prefix and skips its descendants.
+Never force-rollback it. Rediscover and rerun the same idempotent sync. Merged or
+deleted predecessors are promoted safely using their durable pull-request head
+ref, then the active successor is rebuilt onto the exact default branch and its
+children onto the new successor generations.
+
+Before enabling physical mode in an existing repository:
+- ensure a global `pull_request` workflow has no `branches`/`branches-ignore`
+  filter and includes `opened`, `synchronize`, `reopened`, `edited`, and
+  `labeled` activity types (normally `unlabeled` too);
+- gate jobs on default-base or `caravan` label so child PRs receive CI;
+- canary a disposable or paused caravan: commit `rebase_on_join: true`, run
+  `cara status`, `cara check`, then one `cara sync --all`, and inspect plans,
+  leases, rewritten heads, midpoint facts, and fresh CI;
+- roll back by reverting the config to false. Do not force-push branches back.
+
+CI DECISIONS
+- Empty, expected, queued, or running checks are waiting, never passing.
+- Failed decisions contain bounded run/job/failed-step evidence and exact
+  selected-ref lineage where the workflow emits the supported machine receipt.
+  Raw logs, unrelated lines, and secrets are not retained.
+- A stale run/candidate requires a fresh exact-candidate trigger and is never
+  rerunnable. A current-generation infrastructure failure may be retried with
+  `cara sync --rerun-failed`. A source/test failure requires repair. Cancelled,
+  missing, truncated, or unknown evidence fails closed to wait/fresh-trigger.
+- Rerun only IDs Cara lists. It verifies the exact PR association and head again
+  immediately before requesting failed-job rerun.
+
+REPAIR WORKSPACES; NO RAW GIT SURGERY
+At a conflict/repair decision, use `cara repair start --pr N [--target-pr T]`.
+Cara creates or reuses a provider-cloned exact-head workspace with bounded,
+persisted evidence. Use `cara repair status` to inspect it. Modify only the typed
+conflict paths. Semantic-path edits require an explicit reviewed `repair grant`;
+`repair revoke-grant` restores the recorded pre-grant blobs. Stage reviewed
+changes and run `cara repair continue --session ID`: it verifies the session,
+uses non-force publication, and resumes sync-all. Use `repair abort` only to
+remove a reviewed local session. Never create nested raw worktrees, call
+`update-ref`, merge behind Cara, or force-push a repair branch.
+
+RESHAPING AND EXPLICIT INTENT
+- `cara evict --pr N --reason ...` removes a member and reconnects its child only
+  after exact compatibility proof. `split` makes the selected PR a new head.
+  `renew` and `rejoin` re-evaluate an evicted PR from fresh facts.
+- `caravan-force` is explicit intent to accept non-successful CI, not a general
+  safety bypass. It requires `force_merge: true`, an open non-draft labelled
+  head, exact current default/head compatibility, ADMIN permission, a durable
+  audit comment, and a one-shot squash. It never bypasses textual conflicts,
+  stale facts, ownership, holds, permissions, or lease checks. If CI is already
+  fully successful, normal auto-merge policy applies instead.
+- Use `cara pause` with actor and reason for incidents or maintenance. Pause
+  disables only the exact head auto-merge and preserves topology. Expiry is a
+  warning, never implicit resume. Only `cara resume` may revalidate exact facts,
+  record authorization, and restore policy. A stale hold fails closed.
+
+RECOVERY, LOCKS, AND OBSERVABILITY
+- GitHub is the resume cursor. After timeout, interruption, or partial provider
+  failure, inspect receipts and rerun the same command. Do not guess whether a
+  mutation happened.
+- `cara lock status` reports owner token, PID liveness, checkpoint phase, and
+  provider indeterminacy. Use `lock recover --confirm` only for the typed,
+  verified-stale owner; never delete lock files manually.
+- A dirty worktree or active Git operation blocks checkout-sensitive recovery
+  before provider mutation. Make it safe or use the Cara repair workspace.
+- `cara log` reads the bounded event journal; hooks consume canonical event IDs
+  and must deduplicate retries. Hook failure cannot roll back completed GitHub
+  work; blocking hooks return typed partial receipts.
+- `cara show`, `next`, `prev`, and `van list|next|prev` are navigation surfaces;
+  they never authorize skipping admission or mutation preflight.
+- `--json` and MCP return the same typed envelopes and schemas. Unknown provider
+  values are preserved rather than guessed into success.
+- GitHub credentials are selected statelessly per repository. Cara parses the
+  origin host/owner, first accepts an ambient `GH_TOKEN`/`GITHUB_TOKEN` only if
+  it can read that exact repository, then tries the stored token for the owner
+  login, and finally probes other successful `gh` accounts. Selection is cached
+  only for the process; Cara never runs `gh auth switch`, stores a preferred
+  account in project config, or exposes a token in commands/errors/receipts.
+- `cara self-update status|check|run` is the supported installed-binary update
+  path. A tagged patch release is required before release-only deployments can
+  observe newly landed main-branch behavior.
+
+When in doubt: stop, preserve the structured evidence, make only the suggested
+safe change, and rerun the same Cara command from fresh GitHub facts. This help
+text is the complete operating contract; no external specification is required.";
 
 /// Structured domain error shared by CLI JSON and MCP responses.
 #[derive(Debug, Clone)]
@@ -382,7 +518,7 @@ pub struct LockRecoverInput {
 pub struct HelpOutput {
     /// Normative agent operating instructions.
     pub instructions: String,
-    /// Specification path.
+    /// Stable contract-source marker; all instructions are embedded.
     pub spec: String,
 }
 
@@ -800,9 +936,24 @@ mod tests {
     #[test]
     fn help_describes_the_resumable_sync_loop() {
         let output = help();
-        assert!(output.instructions.contains("decision point"));
-        assert!(output.instructions.contains("rerun the same sync"));
-        assert_eq!(output.spec, "SPEC.md");
+        assert!(output.instructions.contains("typed decision"));
+        assert!(
+            output
+                .instructions
+                .contains("rerun the same idempotent sync")
+        );
+        assert!(output.instructions.contains("A, AB, ABC, ABCD, ABCDE"));
+        assert!(output.instructions.contains("rebase_on_join: true"));
+        assert!(output.instructions.contains("global barrier"));
+        assert!(output.instructions.contains("cara repair start"));
+        assert!(output.instructions.contains("caravan-force"));
+        assert!(
+            output
+                .instructions
+                .contains("no external specification is required")
+        );
+        assert!(!output.instructions.contains("See SPEC.md"));
+        assert_eq!(output.spec, "embedded");
     }
 
     #[test]

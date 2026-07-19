@@ -4,10 +4,11 @@
 //! hermetic while production still uses the installed, authenticated `git` and
 //! `gh` binaries.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -20,6 +21,33 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 // while stderr remains a small evidence stream.
 const MAX_STDOUT_CAPTURE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_STDERR_CAPTURE_BYTES: usize = 64 * 1024;
+const GITHUB_AUTH_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+static GITHUB_AUTH_CACHE: OnceLock<Mutex<HashMap<String, Option<GithubAuthSelection>>>> =
+    OnceLock::new();
+
+#[derive(Clone)]
+enum GithubAuthSelection {
+    Ambient,
+    Token(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GithubRepository {
+    host: String,
+    owner: String,
+    name: String,
+}
+
+impl GithubRepository {
+    fn cache_key(&self) -> String {
+        format!("{}/{}/{}", self.host, self.owner, self.name)
+    }
+
+    fn api_path(&self) -> String {
+        format!("repos/{}/{}", self.owner, self.name)
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct CommandIo {
@@ -84,6 +112,10 @@ impl CommandSpec {
             .get_or_insert_with(|| Box::new(CommandIo::default()))
             .stdin = Some(input.into());
         self
+    }
+
+    fn has_env(&self, name: &str) -> bool {
+        self.io.as_ref().is_some_and(|io| io.env.contains_key(name))
     }
 
     /// Render a diagnostic-only command line without executing a shell.
@@ -227,6 +259,7 @@ pub struct ProcessRunner {
     cwd: Option<PathBuf>,
     timeout: Duration,
     operation_deadline: Option<Instant>,
+    infer_github_auth: bool,
 }
 
 impl Default for ProcessRunner {
@@ -235,6 +268,7 @@ impl Default for ProcessRunner {
             cwd: None,
             timeout: DEFAULT_COMMAND_TIMEOUT,
             operation_deadline: None,
+            infer_github_auth: true,
         }
     }
 }
@@ -253,6 +287,7 @@ impl ProcessRunner {
             cwd: Some(path.as_ref().to_path_buf()),
             timeout: DEFAULT_COMMAND_TIMEOUT,
             operation_deadline: None,
+            infer_github_auth: true,
         }
     }
 
@@ -270,6 +305,25 @@ impl ProcessRunner {
     pub fn with_operation_deadline(mut self, deadline: Instant) -> Self {
         self.operation_deadline = Some(deadline);
         self
+    }
+
+    fn without_github_auth_inference(mut self) -> Self {
+        self.infer_github_auth = false;
+        self
+    }
+
+    fn inferred_github_auth(&self, request: &CommandSpec) -> Option<GithubAuthSelection> {
+        let is_gh = Path::new(&request.program)
+            .file_name()
+            .is_some_and(|name| name == "gh");
+        if !self.infer_github_auth
+            || !is_gh
+            || request.has_env("GH_TOKEN")
+            || request.has_env("GITHUB_TOKEN")
+        {
+            return None;
+        }
+        resolve_github_auth(self.cwd.as_deref(), self.operation_deadline)
     }
 
     fn effective_timeout(&self, request: &CommandSpec) -> Result<Duration, CommandRunError> {
@@ -290,15 +344,217 @@ impl ProcessRunner {
     }
 }
 
+fn resolve_github_auth(
+    cwd: Option<&Path>,
+    operation_deadline: Option<Instant>,
+) -> Option<GithubAuthSelection> {
+    let cwd = cwd?;
+    let runner = ProcessRunner::in_directory(cwd)
+        .with_timeout(GITHUB_AUTH_PROBE_TIMEOUT)
+        .without_github_auth_inference();
+    let runner = operation_deadline.map_or(runner.clone(), |deadline| {
+        runner.with_operation_deadline(deadline)
+    });
+    let remote = runner
+        .run(&CommandSpec::new("git").args(["config", "--get", "remote.origin.url"]))
+        .ok()
+        .filter(CommandOutput::is_success)?;
+    let repository = parse_github_remote(remote.stdout.trim())?;
+    let key = repository.cache_key();
+    let cache = GITHUB_AUTH_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(selection) = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+        .cloned()
+    {
+        return selection;
+    }
+    let selection = resolve_github_auth_uncached(&runner, &repository);
+    cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key, selection.clone());
+    selection
+}
+
+fn resolve_github_auth_uncached(
+    runner: &ProcessRunner,
+    repository: &GithubRepository,
+) -> Option<GithubAuthSelection> {
+    let ambient = std::env::var("GH_TOKEN")
+        .ok()
+        .filter(|token| !token.trim().is_empty())
+        .or_else(|| {
+            std::env::var("GITHUB_TOKEN")
+                .ok()
+                .filter(|token| !token.trim().is_empty())
+        });
+    if ambient
+        .as_deref()
+        .is_some_and(|token| github_token_can_access(runner, repository, token))
+    {
+        return Some(GithubAuthSelection::Ambient);
+    }
+
+    if let Some(token) = github_token_for_login(runner, repository, &repository.owner)
+        && github_token_can_access(runner, repository, &token)
+    {
+        return Some(GithubAuthSelection::Token(token));
+    }
+
+    let status_command = CommandSpec::new("gh")
+        .args([
+            "auth",
+            "status",
+            "--hostname",
+            repository.host.as_str(),
+            "--json",
+            "hosts",
+        ])
+        .env("GH_TOKEN", "")
+        .env("GITHUB_TOKEN", "");
+    let status = runner.run(&status_command).ok();
+    let status_json = status
+        .as_ref()
+        .filter(|output| output.is_success())
+        .map(|output| output.stdout.as_str());
+    for login in github_auth_candidates(repository, status_json)
+        .into_iter()
+        .filter(|login| login != &repository.owner)
+    {
+        if let Some(token) = github_token_for_login(runner, repository, &login)
+            && github_token_can_access(runner, repository, &token)
+        {
+            return Some(GithubAuthSelection::Token(token));
+        }
+    }
+    None
+}
+
+fn github_token_for_login(
+    runner: &ProcessRunner,
+    repository: &GithubRepository,
+    login: &str,
+) -> Option<String> {
+    runner
+        .run(
+            &CommandSpec::new("gh")
+                .args([
+                    "auth",
+                    "token",
+                    "--hostname",
+                    repository.host.as_str(),
+                    "--user",
+                    login,
+                ])
+                .env("GH_TOKEN", "")
+                .env("GITHUB_TOKEN", ""),
+        )
+        .ok()
+        .filter(CommandOutput::is_success)
+        .map(|output| output.stdout.trim().to_owned())
+        .filter(|token| !token.is_empty())
+}
+
+fn github_token_can_access(
+    runner: &ProcessRunner,
+    repository: &GithubRepository,
+    token: &str,
+) -> bool {
+    runner
+        .run(
+            &CommandSpec::new("gh")
+                .args([
+                    "api",
+                    "--hostname",
+                    repository.host.as_str(),
+                    "--silent",
+                    repository.api_path().as_str(),
+                ])
+                .env("GH_TOKEN", token),
+        )
+        .is_ok_and(|output| output.is_success())
+}
+
+fn github_auth_candidates(repository: &GithubRepository, status_json: Option<&str>) -> Vec<String> {
+    let mut candidates = Vec::new();
+    let mut seen = BTreeSet::new();
+    if seen.insert(repository.owner.clone()) {
+        candidates.push(repository.owner.clone());
+    }
+    let Some(accounts) = status_json
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+        .and_then(|value| {
+            value
+                .get("hosts")?
+                .get(&repository.host)?
+                .as_array()
+                .cloned()
+        })
+    else {
+        return candidates;
+    };
+    for active in [true, false] {
+        for account in &accounts {
+            let successful =
+                account.get("state").and_then(serde_json::Value::as_str) == Some("success");
+            let matches_active =
+                account.get("active").and_then(serde_json::Value::as_bool) == Some(active);
+            let login = account
+                .get("login")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if successful && matches_active && !login.is_empty() && seen.insert(login.to_owned()) {
+                candidates.push(login.to_owned());
+            }
+        }
+    }
+    candidates
+}
+
+fn parse_github_remote(remote: &str) -> Option<GithubRepository> {
+    let (host, path) = if let Some(rest) = remote.strip_prefix("ssh://") {
+        let (authority, path) = rest.split_once('/')?;
+        (authority.rsplit('@').next()?, path)
+    } else if let Some(rest) = remote
+        .strip_prefix("https://")
+        .or_else(|| remote.strip_prefix("http://"))
+    {
+        rest.split_once('/')?
+    } else {
+        let (authority, path) = remote.split_once(':')?;
+        (authority.rsplit('@').next()?, path)
+    };
+    let mut parts = path
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .split('/');
+    let owner = parts.next()?;
+    let name = parts.next()?;
+    if owner.is_empty() || name.is_empty() || parts.next().is_some() {
+        return None;
+    }
+    Some(GithubRepository {
+        host: host.to_owned(),
+        owner: owner.to_owned(),
+        name: name.to_owned(),
+    })
+}
+
 impl CommandRunner for ProcessRunner {
     #[allow(clippy::too_many_lines)]
     fn run(&self, request: &CommandSpec) -> Result<CommandOutput, CommandRunError> {
         let timeout = self.effective_timeout(request)?;
+        let github_auth = self.inferred_github_auth(request);
         let mut command = Command::new(&request.program);
         command
             .args(&request.args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some(GithubAuthSelection::Token(token)) = &github_auth {
+            command.env("GH_TOKEN", token);
+        }
         if let Some(io) = &request.io {
             command.envs(&io.env);
             if io.stdin.is_some() {
@@ -489,6 +745,62 @@ mod tests {
     fn diagnostic_rendering_quotes_shell_metacharacters_without_using_a_shell() {
         let command = CommandSpec::new("gh").args(["pr", "list", "--label", "caravan queue"]);
         assert_eq!(command.display(), "gh pr list --label 'caravan queue'");
+    }
+
+    #[test]
+    fn parses_common_github_remote_forms_without_repository_config() {
+        let expected = GithubRepository {
+            host: "github.com".to_owned(),
+            owner: "harryaskham".to_owned(),
+            name: "caravan".to_owned(),
+        };
+        assert_eq!(
+            parse_github_remote("ssh://git@github.com/harryaskham/caravan.git"),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            parse_github_remote("git@github.com:harryaskham/caravan.git"),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            parse_github_remote("https://github.com/harryaskham/caravan.git"),
+            Some(expected)
+        );
+        assert_eq!(parse_github_remote("/tmp/local.git"), None);
+    }
+
+    #[test]
+    fn repository_owner_is_fast_auth_candidate_before_active_fallbacks() {
+        let repository = GithubRepository {
+            host: "github.com".to_owned(),
+            owner: "harryaskham".to_owned(),
+            name: "private-repo".to_owned(),
+        };
+        let status = serde_json::json!({
+            "hosts": {"github.com": [
+                {"state":"success", "active":true, "login":"other-account"},
+                {"state":"success", "active":false, "login":"harryaskham"},
+                {"state":"success", "active":false, "login":"third-account"}
+            ]}
+        });
+
+        assert_eq!(
+            github_auth_candidates(&repository, Some(&status.to_string())),
+            ["harryaskham", "other-account", "third-account"]
+        );
+    }
+
+    #[test]
+    fn command_specific_token_disables_inference_and_is_hidden_from_display() {
+        let request = CommandSpec::new("gh")
+            .args(["api", "repos/owner/private"])
+            .env("GH_TOKEN", "secret-value");
+        assert!(
+            ProcessRunner::in_directory(".")
+                .inferred_github_auth(&request)
+                .is_none()
+        );
+        assert!(!request.display().contains("secret-value"));
     }
 
     #[test]
