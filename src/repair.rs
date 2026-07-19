@@ -307,7 +307,11 @@ fn start_exact(
                 resumed.updated_unix_ms = unix_ms();
                 let reuse_workspace = if paths.workspace.exists() {
                     validate_partial_workspace_path(&paths, &resumed)?;
-                    if partial_workspace_ready(&paths.workspace, provider_git_url) {
+                    if partial_workspace_ready(
+                        &paths.workspace,
+                        provider_git_url,
+                        &resumed.object_cache_path,
+                    ) {
                         true
                     } else {
                         fs::remove_dir_all(&paths.workspace).map_err(|error| {
@@ -1388,16 +1392,24 @@ fn verify_object_cache_identity(repair: &RepairSession) -> Result<(), AppError> 
     Ok(())
 }
 
-fn partial_workspace_ready(workspace: &Path, provider_git_url: &str) -> bool {
+fn partial_workspace_ready(
+    workspace: &Path,
+    provider_git_url: &str,
+    object_cache_path: &str,
+) -> bool {
     let runner = ProcessRunner::in_directory(workspace).with_timeout(Duration::from_secs(10));
     let repository =
         runner.run(&CommandSpec::new("git").args(["rev-parse", "--is-inside-work-tree"]));
     if !repository.is_ok_and(|output| output.is_success() && output.stdout.trim() == "true") {
         return false;
     }
-    runner
+    let provider_matches = runner
         .run(&CommandSpec::new("git").args(["remote", "get-url", "origin"]))
-        .is_ok_and(|output| output.is_success() && output.stdout.trim() == provider_git_url)
+        .is_ok_and(|output| output.is_success() && output.stdout.trim() == provider_git_url);
+    let cache_matches = runner
+        .run(&CommandSpec::new("git").args(["remote", "get-url", "cache"]))
+        .is_ok_and(|output| output.is_success() && output.stdout.trim() == object_cache_path);
+    provider_matches && cache_matches
 }
 
 fn fetch_exact_materialization(
