@@ -98,6 +98,8 @@ pub enum RepairState {
 pub enum RepairPhase {
     #[default]
     Preparing,
+    SeedingObjectCache,
+    ConfiguringProvider,
     Cloning,
     FetchingHead,
     FetchingTarget,
@@ -144,6 +146,12 @@ pub struct RepairSession {
     /// Explicit provider-owned Git URL. Repair never depends on or changes the
     /// caller checkout's possibly internal `origin` configuration.
     pub provider_git_url: String,
+    /// Local canonical/object-cache checkout used only as a content-addressed
+    /// seed. Provider refs are always re-read from `provider_git_url`.
+    #[serde(default)]
+    pub object_cache_path: String,
+    #[serde(default)]
+    pub object_cache_common_dir: String,
     pub config_path: String,
     pub config_fingerprint: String,
     #[serde(default = "default_materialization_timeout_secs")]
@@ -289,25 +297,41 @@ fn start_exact(
                     ));
                 }
                 let mut resumed = existing;
+                resumed.object_cache_path = canonical_repository_path(context)?;
+                resumed.object_cache_common_dir = canonical_git_common_dir(context)?;
                 resumed.config_path = absolute_config_path(context);
                 resumed.config_fingerprint = config_fingerprint(context)?;
                 resumed.materialization_timeout_secs =
                     context.config.repair.materialization_timeout_secs;
                 resumed.last_error = None;
                 resumed.updated_unix_ms = unix_ms();
-                if paths.workspace.exists() {
+                let reuse_workspace = if paths.workspace.exists() {
                     validate_partial_workspace_path(&paths, &resumed)?;
-                    fs::remove_dir_all(&paths.workspace).map_err(|error| {
-                        repair_io_error(
-                            "repair_partial_cleanup_failed",
-                            "could not remove the verified incomplete clone before resume",
-                            &paths.workspace,
-                            &error,
-                        )
-                    })?;
-                }
+                    if partial_workspace_ready(&paths.workspace, provider_git_url) {
+                        true
+                    } else {
+                        fs::remove_dir_all(&paths.workspace).map_err(|error| {
+                            repair_io_error(
+                                "repair_partial_cleanup_failed",
+                                "could not remove the verified incomplete clone before resume",
+                                &paths.workspace,
+                                &error,
+                            )
+                        })?;
+                        false
+                    }
+                } else {
+                    false
+                };
                 write_manifest(&paths.manifest, &resumed)?;
-                return materialize_repair(&paths, candidate, target, resumed, true);
+                return materialize_repair(
+                    &paths,
+                    candidate,
+                    target,
+                    resumed,
+                    true,
+                    reuse_workspace,
+                );
             }
             validate_workspace(&paths, &existing)?;
             return Ok(RepairStartOutput {
@@ -356,6 +380,8 @@ fn start_exact(
         target_pr,
         workspace: paths.workspace.display().to_string(),
         provider_git_url: provider_git_url.to_owned(),
+        object_cache_path: canonical_repository_path(context)?,
+        object_cache_common_dir: canonical_git_common_dir(context)?,
         config_path: absolute_config_path(context),
         config_fingerprint: config_fingerprint(context)?,
         materialization_timeout_secs: context.config.repair.materialization_timeout_secs,
@@ -369,7 +395,7 @@ fn start_exact(
         published_head: None,
     };
     write_manifest(&paths.manifest, &repair)?;
-    materialize_repair(&paths, candidate, target, repair, false)
+    materialize_repair(&paths, candidate, target, repair, false, false)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -379,30 +405,63 @@ fn materialize_repair(
     target: &BranchSnapshot,
     mut repair: RepairSession,
     resumed: bool,
+    reuse_workspace: bool,
 ) -> Result<RepairStartOutput, AppError> {
     let timeout = Duration::from_secs(repair.materialization_timeout_secs);
     let root_runner = ProcessRunner::in_directory(&paths.session_root).with_timeout(timeout);
     let workspace = paths.workspace.to_string_lossy().into_owned();
     let provider_git_url = repair.provider_git_url.clone();
-    run_materialization_phase(&mut repair, paths, RepairPhase::Cloning, timeout, || {
-        require_success(
-            &root_runner,
-            CommandSpec::new("git")
-                .args([
-                    "clone",
-                    "--quiet",
-                    "--no-checkout",
-                    "--origin",
-                    "origin",
-                    provider_git_url.as_str(),
-                    workspace.as_str(),
-                ])
-                .env("GIT_TERMINAL_PROMPT", "0"),
-            "repair_workspace_create_failed",
-            "could not create the isolated provider-owned repair clone",
+    verify_object_cache_identity(&repair)?;
+    if !reuse_workspace {
+        let object_cache_path = repair.object_cache_path.clone();
+        run_materialization_phase(
+            &mut repair,
+            paths,
+            RepairPhase::SeedingObjectCache,
+            timeout,
+            || {
+                require_success(
+                    &root_runner,
+                    CommandSpec::new("git")
+                        .args([
+                            "clone",
+                            "--quiet",
+                            "--shared",
+                            "--no-checkout",
+                            "--origin",
+                            "cache",
+                            object_cache_path.as_str(),
+                            workspace.as_str(),
+                        ])
+                        .env("GIT_TERMINAL_PROMPT", "0"),
+                    "repair_workspace_seed_failed",
+                    "could not seed the isolated repair repository from the canonical object cache",
+                )?;
+                Ok(())
+            },
         )?;
-        Ok(())
-    })?;
+        let workspace_runner = ProcessRunner::in_directory(&paths.workspace).with_timeout(timeout);
+        run_materialization_phase(
+            &mut repair,
+            paths,
+            RepairPhase::ConfiguringProvider,
+            timeout,
+            || {
+                require_success(
+                    &workspace_runner,
+                    CommandSpec::new("git").args([
+                        "remote",
+                        "add",
+                        "origin",
+                        provider_git_url.as_str(),
+                    ]),
+                    "repair_provider_remote_failed",
+                    "could not bind the isolated repair repository to the explicit provider remote",
+                )?;
+                Ok(())
+            },
+        )?;
+    }
 
     let workspace_runner = ProcessRunner::in_directory(&paths.workspace).with_timeout(timeout);
     run_materialization_phase(
@@ -411,12 +470,7 @@ fn materialize_repair(
         RepairPhase::FetchingHead,
         timeout,
         || {
-            crate::compatibility::resolve_branch_snapshot_with_timeout(
-                &paths.workspace,
-                "origin",
-                &candidate.head,
-                timeout,
-            )?;
+            fetch_exact_materialization(&workspace_runner, &provider_git_url, &candidate.head)?;
             Ok(())
         },
     )?;
@@ -426,12 +480,7 @@ fn materialize_repair(
         RepairPhase::FetchingTarget,
         timeout,
         || {
-            crate::compatibility::resolve_branch_snapshot_with_timeout(
-                &paths.workspace,
-                "origin",
-                target,
-                timeout,
-            )?;
+            fetch_exact_materialization(&workspace_runner, &provider_git_url, target)?;
             Ok(())
         },
     )?;
@@ -1269,6 +1318,185 @@ fn repair_paths_for_session(repository: &Path, session: &str) -> Result<RepairPa
     })
 }
 
+fn canonical_repository_path(context: &AppContext) -> Result<String, AppError> {
+    fs::canonicalize(&context.repository_path)
+        .map(|path| path.display().to_string())
+        .map_err(|error| {
+            repair_io_error(
+                "repair_object_cache_invalid",
+                "could not canonicalize the repair object-cache checkout",
+                &context.repository_path,
+                &error,
+            )
+        })
+}
+
+fn canonical_git_common_dir(context: &AppContext) -> Result<String, AppError> {
+    let path = git_common_dir(&context.repository_path)?;
+    fs::canonicalize(&path)
+        .map(|canonical| canonical.display().to_string())
+        .map_err(|error| {
+            repair_io_error(
+                "repair_object_cache_invalid",
+                "could not canonicalize the repair object-cache Git metadata",
+                &path,
+                &error,
+            )
+        })
+}
+
+fn verify_object_cache_identity(repair: &RepairSession) -> Result<(), AppError> {
+    if repair.object_cache_path.is_empty() || repair.object_cache_common_dir.is_empty() {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "repair_object_cache_missing",
+            "repair session does not identify a canonical object-cache checkout",
+            Some(json!({
+                "repair": repair,
+                "next": "rerun the exact repair start from the intended provider repository checkout",
+            })),
+        ));
+    }
+    let cache = fs::canonicalize(&repair.object_cache_path).map_err(|error| {
+        repair_io_error(
+            "repair_object_cache_invalid",
+            "could not resolve the manifested object-cache checkout",
+            Path::new(&repair.object_cache_path),
+            &error,
+        )
+    })?;
+    let common = fs::canonicalize(git_common_dir(&cache)?).map_err(|error| {
+        repair_io_error(
+            "repair_object_cache_invalid",
+            "could not resolve the manifested object-cache Git metadata",
+            Path::new(&repair.object_cache_common_dir),
+            &error,
+        )
+    })?;
+    if common.display().to_string() != repair.object_cache_common_dir {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "repair_object_cache_changed",
+            "repair object-cache Git identity changed after session preparation",
+            Some(json!({
+                "manifested_common_dir": repair.object_cache_common_dir,
+                "actual_common_dir": common,
+                "provider_mutated": false,
+            })),
+        ));
+    }
+    Ok(())
+}
+
+fn partial_workspace_ready(workspace: &Path, provider_git_url: &str) -> bool {
+    let runner = ProcessRunner::in_directory(workspace).with_timeout(Duration::from_secs(10));
+    let repository =
+        runner.run(&CommandSpec::new("git").args(["rev-parse", "--is-inside-work-tree"]));
+    if !repository.is_ok_and(|output| output.is_success() && output.stdout.trim() == "true") {
+        return false;
+    }
+    runner
+        .run(&CommandSpec::new("git").args(["remote", "get-url", "origin"]))
+        .is_ok_and(|output| output.is_success() && output.stdout.trim() == provider_git_url)
+}
+
+fn fetch_exact_materialization(
+    runner: &impl CommandRunner,
+    provider_git_url: &str,
+    snapshot: &BranchSnapshot,
+) -> Result<(), AppError> {
+    let expected = remote_head_oid(runner, provider_git_url, &snapshot.name)?;
+    if expected != snapshot.oid {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "repair_stale_head",
+            "provider branch moved before exact repair materialization",
+            Some(json!({
+                "branch": snapshot.name,
+                "expected_oid": snapshot.oid,
+                "actual_oid": expected,
+                "provider_mutated": false,
+            })),
+        ));
+    }
+    let reference = format!("refs/heads/{}", snapshot.name);
+    require_success(
+        runner,
+        CommandSpec::new("git").args(["check-ref-format", reference.as_str()]),
+        "repair_branch_invalid",
+        "provider returned an invalid repair branch name",
+    )?;
+    let fetch = run(
+        runner,
+        CommandSpec::new("git")
+            .args([
+                "-c",
+                "protocol.version=2",
+                "-c",
+                "core.sshCommand=ssh -oBatchMode=yes -oConnectTimeout=20 -oServerAliveInterval=15 -oServerAliveCountMax=3",
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "--no-write-fetch-head",
+                "--refmap=",
+                "--filter=blob:none",
+                "origin",
+                reference.as_str(),
+            ])
+            .env("GIT_TERMINAL_PROMPT", "0"),
+    )?;
+    if !fetch.is_success() {
+        let transport_disconnect = is_provider_transport_disconnect(&fetch.stderr);
+        return Err(repair_command_failure(
+            if transport_disconnect {
+                "repair_provider_transport_disconnect"
+            } else {
+                "repair_exact_fetch_failed"
+            },
+            if transport_disconnect {
+                "provider transport disconnected during resumable exact-object fetch"
+            } else {
+                "could not fetch the exact repair branch into the resumable object cache"
+            },
+            &fetch,
+            json!({
+                "branch": snapshot.name,
+                "expected_oid": snapshot.oid,
+                "resumable_in_place": true,
+                "provider_mutated": false,
+            }),
+        ));
+    }
+    let after = remote_head_oid(runner, provider_git_url, &snapshot.name)?;
+    if after != snapshot.oid {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "repair_stale_head",
+            "provider branch moved during exact repair materialization",
+            Some(json!({
+                "branch": snapshot.name,
+                "expected_oid": snapshot.oid,
+                "actual_oid": after,
+                "provider_mutated": false,
+            })),
+        ));
+    }
+    let commit = format!("{}^{{commit}}", snapshot.oid.0);
+    require_success(
+        runner,
+        CommandSpec::new("git").args(["cat-file", "-e", commit.as_str()]),
+        "repair_exact_object_missing",
+        "exact repair commit was not materialized after provider fetch",
+    )?;
+    Ok(())
+}
+
+fn is_provider_transport_disconnect(stderr: &str) -> bool {
+    stderr.contains("unexpected disconnect")
+        || stderr.contains("fetch-pack:")
+        || stderr.contains("remote end hung up unexpectedly")
+}
+
 fn git_common_dir(repository: &Path) -> Result<PathBuf, AppError> {
     let runner = ProcessRunner::in_directory(repository);
     let output = require_success(
@@ -1785,11 +2013,38 @@ mod tests {
         );
         assert!(fixture.clone.join("dirty-controller").exists());
         assert!(fixture.clone.join("still-dirty").exists());
-        assert!(
-            Path::new(&output.repair.workspace)
-                .join("shared.txt")
-                .exists()
+        let workspace = Path::new(&output.repair.workspace);
+        assert!(workspace.join("shared.txt").exists());
+        assert_eq!(
+            git(workspace, &["remote", "get-url", "cache"]),
+            fs::canonicalize(&fixture.clone)
+                .unwrap()
+                .display()
+                .to_string()
         );
+        assert_eq!(
+            git(workspace, &["remote", "get-url", "origin"]),
+            fixture.root.path().join("remote.git").display().to_string()
+        );
+    }
+
+    #[test]
+    fn object_cache_git_identity_drift_is_rejected() {
+        let fixture = fixture();
+        let context = context(&fixture.clone);
+        let output = start_exact(
+            &context,
+            &fixture.repository,
+            &fixture.candidate,
+            &fixture.target,
+            None,
+            fixture.root.path().join("remote.git").to_str().unwrap(),
+        )
+        .unwrap();
+        let mut repair = output.repair;
+        repair.object_cache_common_dir = "/different/git/common-dir".to_owned();
+        let error = verify_object_cache_identity(&repair).unwrap_err();
+        assert_eq!(error.code(), "repair_object_cache_changed");
     }
 
     #[test]
@@ -1848,6 +2103,55 @@ mod tests {
         assert_eq!(resumed.repair.phase, RepairPhase::Resolving);
         assert!(resumed.repair.last_error.is_none());
         assert!(paths.workspace.exists());
+    }
+
+    #[test]
+    fn exact_resume_reuses_valid_partial_repository_objects_in_place() {
+        let fixture = fixture();
+        let context = context(&fixture.clone);
+        let output = start_exact(
+            &context,
+            &fixture.repository,
+            &fixture.candidate,
+            &fixture.target,
+            None,
+            fixture.root.path().join("remote.git").to_str().unwrap(),
+        )
+        .unwrap();
+        let paths = repair_paths(&fixture.clone, fixture.candidate.number).unwrap();
+        git(&paths.workspace, &["merge", "--abort"]);
+        let marker = paths.workspace.join(".partial-object-resume-proof");
+        fs::write(&marker, "preserved\n").unwrap();
+        let mut preparing = output.repair;
+        preparing.state = RepairState::Preparing;
+        preparing.phase = RepairPhase::FetchingHead;
+        preparing.last_error = Some(RepairPhaseError {
+            phase: RepairPhase::FetchingHead,
+            code: "repair_command_timeout".to_owned(),
+            message: "simulated sideband disconnect".to_owned(),
+            elapsed_ms: 180_000,
+            timeout_ms: 180_000,
+            process_group_id: Some(42),
+            partial_path: paths.workspace.display().to_string(),
+            next: "resume".to_owned(),
+        });
+        write_manifest(&paths.manifest, &preparing).unwrap();
+
+        let resumed = start_exact(
+            &context,
+            &fixture.repository,
+            &fixture.candidate,
+            &fixture.target,
+            None,
+            fixture.root.path().join("remote.git").to_str().unwrap(),
+        )
+        .unwrap();
+        assert!(resumed.already_exists);
+        assert_eq!(resumed.repair.state, RepairState::Resolving);
+        assert!(
+            marker.exists(),
+            "valid partial repository was recloned instead of resumed"
+        );
     }
 
     #[test]
@@ -2005,6 +2309,19 @@ mod tests {
             &["ls-remote", "origin", "refs/heads/feature"],
         );
         assert_eq!(remote.split_whitespace().next(), Some(moved.as_str()));
+    }
+
+    #[test]
+    fn provider_sideband_disconnect_has_a_distinct_resumable_class() {
+        assert!(is_provider_transport_disconnect(
+            "fetch-pack: unexpected disconnect while reading sideband packet"
+        ));
+        assert!(is_provider_transport_disconnect(
+            "fatal: the remote end hung up unexpectedly"
+        ));
+        assert!(!is_provider_transport_disconnect(
+            "fatal: repository not found"
+        ));
     }
 
     #[test]

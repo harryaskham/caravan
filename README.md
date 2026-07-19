@@ -117,9 +117,12 @@ cara repair status --session pr-1962-<generation>
 cara repair continue --session pr-1962-<generation>
 ```
 
-Repair uses an independent provider-owned clone below Git's common Caravan
-metadata, so a dirty caller checkout, a daemon-internal `origin`, and locally
-diverged PR refs are irrelevant and remain untouched. The manifest persists the
+Repair uses an independent clone below Git's common Caravan metadata. It seeds
+content-addressed objects from the current canonical checkout, binds a separate
+explicit provider `origin`, and minimally fetches the exact recorded head and
+target with blob filtering. A dirty caller worktree, daemon-internal `origin`,
+and locally diverged PR refs are irrelevant and remain untouched; transport
+resume reuses a valid partial repository instead of retransferring it. The manifest persists the
 exact provider head and target, allowed conflict paths, mechanically staged
 baseline, config path, lifecycle state, and publication receipt. Continue
 rejects unstaged/untracked files, unresolved markers, edits outside the typed
@@ -246,7 +249,10 @@ currently implemented.
 children and the complete operator-safe budget for `cara status` (30 seconds by
 default). Network-heavy repair clone/fetch/checkout uses the separately bounded
 `repair.materialization_timeout_secs` (180 seconds by default), and persisted
-repair status reports its exact phase, budget, last error, and resume/abort path.
+repair status reports its exact phase, budget, process group, partial path, last
+error, and resume/abort path. Exact retries reuse verified partial objects after
+a sideband disconnect; changed repository/head/target/provider/config facts
+still refuse rather than trusting the cache.
 Status propagates one absolute deadline through discovery,
 compatibility, and label inventory; every child receives only the remaining
 budget. Timeouts terminate and reap the child process group and return stable
