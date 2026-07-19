@@ -10,7 +10,10 @@ use caravan::{
     AGENT_HELP, AppContext, AppError, CheckInput, CreateInput, EvictInput, JoinInput,
     LockRecoverInput, LockStatusInput, LoopInput, PauseInput, ResumeInput, SplitInput, SyncInput,
     TOOL_NAME, build_router, feedback_config, feedback_configuration_error, feedback_panic_config,
-    repair::{RepairAbortInput, RepairContinueInput, RepairStartInput, RepairStatusInput},
+    repair::{
+        RepairAbortInput, RepairContinueInput, RepairGrantInput, RepairRevokeGrantInput,
+        RepairStartInput, RepairStatusInput,
+    },
     updater_config,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -131,6 +134,10 @@ enum LockCommand {
 enum RepairCommand {
     /// Create or reuse an isolated exact-head repair workspace.
     Start(RepairStartInput),
+    /// Apply reviewed source changes to explicit semantic paths.
+    Grant(RepairGrantInput),
+    /// Revoke semantic grants and restore their pre-grant staged blobs.
+    RevokeGrant(RepairRevokeGrantInput),
     /// Verify, non-force publish, and resume sync-all.
     Continue(RepairContinueInput),
     /// Inspect persisted repair evidence without mutation.
@@ -578,6 +585,47 @@ fn run_repair(cli: &Cli, command: &RepairCommand) -> Result<(), i32> {
                 Err(error) => emit_human_error(error),
             }
         }
+        RepairCommand::Grant(input) => {
+            let result = caravan::repair::grant_paths(&context, input);
+            if cli.json {
+                return emit_result(true, result);
+            }
+            match result {
+                Ok(output) => {
+                    println!(
+                        "repair {} semantic grants: {}",
+                        output.repair.session,
+                        output
+                            .grants
+                            .iter()
+                            .map(|grant| format!("{}@{}", grant.path, grant.source_revision))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    println!("  {}", output.next);
+                    Ok(())
+                }
+                Err(error) => emit_human_error(error),
+            }
+        }
+        RepairCommand::RevokeGrant(input) => {
+            let result = caravan::repair::revoke_grants(&context, input);
+            if cli.json {
+                return emit_result(true, result);
+            }
+            match result {
+                Ok(output) => {
+                    println!(
+                        "repair {} revoked semantic grants: {} provider_mutated={}",
+                        output.repair.session,
+                        output.revoked_paths.join(", "),
+                        output.provider_mutated
+                    );
+                    Ok(())
+                }
+                Err(error) => emit_human_error(error),
+            }
+        }
         RepairCommand::Continue(input) => {
             let result = caravan::repair::continue_session(&context, input);
             if cli.json {
@@ -620,6 +668,24 @@ fn run_repair(cli: &Cli, command: &RepairCommand) -> Result<(), i32> {
                     );
                     if !repair.conflicting_paths.is_empty() {
                         println!("  conflicts: {}", repair.conflicting_paths.join(", "));
+                    }
+                    if !repair.semantic_grants.is_empty() {
+                        println!(
+                            "  semantic grants: {}",
+                            repair
+                                .semantic_grants
+                                .iter()
+                                .map(|grant| format!(
+                                    "{}@{} actor={} expires={} applied={}",
+                                    grant.path,
+                                    grant.source_revision,
+                                    grant.actor,
+                                    grant.expires_unix_ms,
+                                    grant.applied
+                                ))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
                     }
                     if let Some(error) = &repair.last_error {
                         println!(
@@ -1394,6 +1460,30 @@ mod tests {
         };
         assert_eq!(input.pr, 1962);
         assert_eq!(input.target_pr, Some(1972));
+
+        let grant = Cli::try_parse_from([
+            "cara",
+            "repair",
+            "grant",
+            "--session",
+            "pr-1962-deadbeef",
+            "--path",
+            "README.md",
+            "--path",
+            "SPEC.md",
+            "--source-revision",
+            "c915e23100000000000000000000000000000000",
+            "--actor",
+            "operator",
+            "--reason",
+            "restore reviewed shell-safe contracts",
+        ])
+        .expect("repair grant parses");
+        let Command::Repair(RepairCommand::Grant(input)) = grant.command else {
+            panic!("expected repair grant");
+        };
+        assert_eq!(input.paths, ["README.md", "SPEC.md"]);
+        assert_eq!(input.expires_secs, 3600);
 
         let continuation = Cli::try_parse_from([
             "cara",

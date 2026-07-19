@@ -74,6 +74,8 @@ cara renew | cara rejoin
 cara show | cara next | cara prev
 cara sync [--all] [--rerun-failed] | cara loop [--once]
 cara repair start --pr N [--target-pr T]
+cara repair grant --session ID --path P --source-revision SHA --actor A --reason R
+cara repair revoke-grant --session ID --path P --actor A --reason R
 cara repair status --session ID | cara repair continue --session ID
 cara repair abort --session ID --confirm
 cara evict [--pr N] --reason TEXT
@@ -113,9 +115,21 @@ exact Cara-owned session instead:
 cara repair start --pr 1962                 # merge current default
 cara repair start --pr 1959 --target-pr 1962 # merge exact predecessor
 cara repair status --session pr-1962-<generation>
-# edit and stage only the reported conflict paths inside `workspace`
+# Optional semantic restoration from one reviewed source commit; repeated --path
+cara repair grant --session pr-1962-<generation> --path README.md \
+  --source-revision <full-sha> --actor <actor> --reason <reviewed-contract>
+# Resolve/stage typed conflicts only; grant applies its reviewed patch itself
 cara repair continue --session pr-1962-<generation>
 ```
+
+A semantic grant is distinct from a mechanical conflict: it is bounded, expiring,
+and bound to session/repository/head/target, actor/reason, exact one-parent source
+commit, source/base blobs, source patch fingerprint, original index blob, and
+expected merged result blob. Cara three-way applies and stages that reviewed
+source change; continue rejects any later byte drift or ungranted path. Before
+continue, the same granting actor may revoke exact paths; Cara restores and
+stages each pre-grant blob and records the revocation reason without provider
+mutation.
 
 Repair uses an independent clone below Git's common Caravan metadata. It seeds
 content-addressed objects from the current canonical checkout, binds a separate

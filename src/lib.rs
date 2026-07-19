@@ -513,6 +513,20 @@ pub fn build_router() -> ToolRouter<AppContext> {
         |context: &AppContext, input: repair::RepairStartInput| repair::start(context, &input),
     );
     router.add_typed_tool_with_output_schema(
+        "repair_grant",
+        "Apply a bounded reviewed source commit's semantic changes to explicit tracked paths in one exact resolving session. Records actor/reason/source/blob/result/expiry receipts and never mutates provider state.",
+        |context: &AppContext, input: repair::RepairGrantInput| {
+            repair::grant_paths(context, &input)
+        },
+    );
+    router.add_typed_tool_with_output_schema(
+        "repair_revoke_grant",
+        "Revoke exact semantic grants during resolving, restore their pre-grant staged blobs, and record actor/reason. Requires matching grant authority and never mutates provider state.",
+        |context: &AppContext, input: repair::RepairRevokeGrantInput| {
+            repair::revoke_grants(context, &input)
+        },
+    );
+    router.add_typed_tool_with_output_schema(
         "repair_continue",
         "Verify staged conflict resolution stayed inside the typed path scope, recheck the exact provider head, create an exact-parent merge commit, publish by ordinary non-force fast-forward, and resume sync-all from the managed workspace.",
         |context: &AppContext, input: repair::RepairContinueInput| repair::continue_session(context, &input),

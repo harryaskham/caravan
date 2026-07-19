@@ -27,6 +27,10 @@ const REPAIR_GIT_NAME_CONFIG: &str = "user.name=Caravan Repair";
 const REPAIR_GIT_EMAIL_CONFIG: &str = "user.email=caravan-repair@users.noreply.github.com";
 const REPAIR_DIRECTORY: &str = "repair-workspaces";
 const MANIFEST_NAME: &str = "session.json";
+const MAX_SEMANTIC_GRANTS: usize = 8;
+const MAX_GRANT_ACTOR_BYTES: usize = 128;
+const MAX_GRANT_REASON_BYTES: usize = 512;
+const MAX_GRANT_EXPIRY_SECS: u64 = 24 * 60 * 60;
 
 /// Create an exact isolated repair session for one provider PR.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, clap::Args)]
@@ -50,6 +54,55 @@ pub struct RepairContinueInput {
     #[arg(long)]
     #[serde(default)]
     pub no_sync: bool,
+}
+
+/// Apply reviewed semantic source changes to exact paths in one repair session.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, clap::Args)]
+pub struct RepairGrantInput {
+    /// Exact session ID returned by repair start/status.
+    #[arg(long)]
+    pub session: String,
+    /// Repository-relative tracked path; repeat for a bounded reviewed set.
+    #[arg(long = "path", required = true)]
+    pub paths: Vec<String>,
+    /// Reviewed source commit containing the semantic path changes.
+    #[arg(long)]
+    pub source_revision: String,
+    /// Audited operator/agent identity authorizing the semantic restoration.
+    #[arg(long)]
+    pub actor: String,
+    /// Bounded reason/source-contract evidence.
+    #[arg(long)]
+    pub reason: String,
+    /// Grant validity window; continue fails after expiry.
+    #[arg(long, default_value_t = 3600)]
+    #[serde(default = "default_grant_expiry_secs")]
+    pub expires_secs: u64,
+}
+
+fn default_grant_expiry_secs() -> u64 {
+    3600
+}
+
+/// Revoke exact semantic grants and restore their pre-grant staged objects.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, clap::Args)]
+pub struct RepairRevokeGrantInput {
+    #[arg(long)]
+    pub session: String,
+    #[arg(long = "path", required = true)]
+    pub paths: Vec<String>,
+    #[arg(long)]
+    pub actor: String,
+    #[arg(long)]
+    pub reason: String,
+}
+
+/// Local-only semantic grant revocation receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepairRevokeGrantOutput {
+    pub repair: RepairStatusOutput,
+    pub revoked_paths: Vec<String>,
+    pub provider_mutated: bool,
 }
 
 /// Inspect one repair session without changing Git or provider state.
@@ -130,6 +183,24 @@ fn default_materialization_timeout_secs() -> u64 {
     180
 }
 
+/// Exact reviewed semantic-path authorization and resulting staged object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepairPathGrant {
+    pub path: String,
+    pub actor: String,
+    pub reason: String,
+    pub source_revision: CommitOid,
+    pub source_parent: CommitOid,
+    pub source_blob: CommitOid,
+    pub source_parent_blob: CommitOid,
+    pub source_patch_fingerprint: String,
+    pub baseline_oid: String,
+    pub expected_result_oid: String,
+    pub granted_unix_ms: u64,
+    pub expires_unix_ms: u64,
+    pub applied: bool,
+}
+
 /// Stable, secret-free repair session receipt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RepairSession {
@@ -167,6 +238,8 @@ pub struct RepairSession {
     /// Agent edits are allowed only for `conflicting_paths`.
     #[serde(default)]
     pub baseline_index: BTreeMap<String, String>,
+    #[serde(default)]
+    pub semantic_grants: Vec<RepairPathGrant>,
     pub created_unix_ms: u64,
     pub updated_unix_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -197,11 +270,22 @@ pub struct RepairStatusOutput {
     pub conflicting_paths: Vec<String>,
     pub baseline_index_count: usize,
     pub baseline_index_fingerprint: String,
+    #[serde(default)]
+    pub semantic_grants: Vec<RepairPathGrant>,
     pub materialization_timeout_secs: u64,
     pub created_unix_ms: u64,
     pub updated_unix_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub published_head: Option<CommitOid>,
+}
+
+/// Result of applying one bounded reviewed semantic-path grant set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepairGrantOutput {
+    pub repair: RepairStatusOutput,
+    pub grants: Vec<RepairPathGrant>,
+    pub already_applied: bool,
+    pub next: String,
 }
 
 /// Result of preparing an isolated workspace.
@@ -429,6 +513,7 @@ fn start_exact(
         last_error: None,
         conflicting_paths: Vec::new(),
         baseline_index: BTreeMap::new(),
+        semantic_grants: Vec::new(),
         created_unix_ms: now,
         updated_unix_ms: now,
         published_head: None,
@@ -699,6 +784,609 @@ fn record_phase_error(
 
 fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn validate_grant_text(input: &RepairGrantInput) -> Result<(), AppError> {
+    if input.paths.is_empty() || input.paths.len() > MAX_SEMANTIC_GRANTS {
+        return Err(AppError::validation(
+            "repair_grant_path_count_invalid",
+            format!("provide between 1 and {MAX_SEMANTIC_GRANTS} semantic paths"),
+        ));
+    }
+    if input.actor.trim().is_empty()
+        || input.actor.len() > MAX_GRANT_ACTOR_BYTES
+        || input.reason.trim().is_empty()
+        || input.reason.len() > MAX_GRANT_REASON_BYTES
+    {
+        return Err(AppError::validation(
+            "repair_grant_audit_invalid",
+            "semantic grant actor/reason must be non-empty and within bounded lengths",
+        ));
+    }
+    if !(1..=MAX_GRANT_EXPIRY_SECS).contains(&input.expires_secs) {
+        return Err(AppError::validation(
+            "repair_grant_expiry_invalid",
+            format!("semantic grant expiry must be between 1 and {MAX_GRANT_EXPIRY_SECS} seconds"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_grant_path(
+    workspace: &Path,
+    runner: &impl CommandRunner,
+    path: &str,
+) -> Result<(), AppError> {
+    let candidate = Path::new(path);
+    let safe = !path.is_empty()
+        && path.len() <= 512
+        && !path.contains(['\n', '\r', '\0', ':'])
+        && !candidate.is_absolute()
+        && candidate
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+        && ![".git", ".github", ".cacophony", ".caravan"]
+            .iter()
+            .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")));
+    if !safe {
+        return Err(AppError::validation(
+            "repair_grant_path_invalid",
+            format!("semantic grant path `{path}` is unsafe or forbidden"),
+        ));
+    }
+    let full = workspace.join(candidate);
+    let metadata = fs::symlink_metadata(&full).map_err(|error| {
+        repair_io_error(
+            "repair_grant_path_unavailable",
+            "semantic grant path is unavailable",
+            &full,
+            &error,
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(AppError::validation(
+            "repair_grant_path_invalid",
+            format!("semantic grant path `{path}` must be a tracked regular file"),
+        ));
+    }
+    require_success(
+        runner,
+        CommandSpec::new("git").args(["ls-files", "--error-unmatch", "--", path]),
+        "repair_grant_path_untracked",
+        "semantic grant path must already be tracked",
+    )?;
+    let unstaged = run(
+        runner,
+        CommandSpec::new("git").args(["diff", "--quiet", "--", path]),
+    )?;
+    if unstaged.code != Some(0) {
+        return Err(AppError::validation(
+            "repair_grant_path_unstaged",
+            format!("semantic grant path `{path}` has unstaged edits before authorization"),
+        ));
+    }
+    Ok(())
+}
+
+fn index_oid_for_path(runner: &impl CommandRunner, path: &str) -> Result<String, AppError> {
+    let output = require_success(
+        runner,
+        CommandSpec::new("git").args(["ls-files", "--stage", "--", path]),
+        "repair_index_inspection_failed",
+        "could not inspect semantic grant path index identity",
+    )?;
+    let mut entries = output.stdout.lines().filter(|line| !line.trim().is_empty());
+    let line = entries.next().ok_or_else(|| {
+        AppError::validation(
+            "repair_grant_path_untracked",
+            format!("semantic grant path `{path}` has no index entry"),
+        )
+    })?;
+    if entries.next().is_some() {
+        return Err(AppError::validation(
+            "repair_grant_path_unmerged",
+            format!("semantic grant path `{path}` has multiple index stages"),
+        ));
+    }
+    let metadata = line
+        .split_once('\t')
+        .map(|(metadata, _)| metadata)
+        .ok_or_else(|| {
+            AppError::validation(
+                "repair_index_output_invalid",
+                "git ls-files returned an invalid semantic grant entry",
+            )
+        })?;
+    let mut fields = metadata.split_whitespace();
+    let _mode = fields.next();
+    let oid = fields.next().ok_or_else(|| {
+        AppError::validation(
+            "repair_index_output_invalid",
+            "semantic grant entry omitted OID",
+        )
+    })?;
+    if fields.next() != Some("0") {
+        return Err(AppError::validation(
+            "repair_grant_path_unmerged",
+            format!("semantic grant path `{path}` is not at stage zero"),
+        ));
+    }
+    Ok(oid.to_owned())
+}
+
+/// Apply one reviewed, exact-source semantic path grant to a resolving session.
+#[allow(clippy::too_many_lines)]
+pub fn grant_paths(
+    context: &AppContext,
+    input: &RepairGrantInput,
+) -> Result<RepairGrantOutput, AppError> {
+    validate_session_id(&input.session)?;
+    validate_grant_text(input)?;
+    let paths = repair_paths_for_session(&context.repository_path, &input.session)?;
+    let mut repair = read_manifest(&paths.manifest)?;
+    require_session_match(&repair, &input.session)?;
+    validate_workspace(&paths, &repair)?;
+    if repair.state != RepairState::Resolving {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "repair_grant_state_invalid",
+            "semantic paths may be granted only after exact repair materialization reaches resolving",
+            Some(json!({"repair": repair_status_output(&repair)?})),
+        ));
+    }
+    let current_fingerprint = config_fingerprint(context)?;
+    if current_fingerprint != repair.config_fingerprint {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "repair_config_changed",
+            "Caravan config changed after the repair session was prepared",
+            Some(json!({"repair": repair_status_output(&repair)?})),
+        ));
+    }
+    let mut lock = OperationLock::acquire(&context.repository_path, "repair-grant")?;
+    lock.checkpoint(
+        "repair_semantic_grant_preflight",
+        repair_lock_receipt(&repair)?,
+        false,
+    )?;
+    let timeout = Duration::from_secs(context.config.command_timeout_secs);
+    let runner = ProcessRunner::in_directory(&paths.workspace).with_timeout(timeout);
+    verify_remote_head(&runner, &repair.provider_git_url, &repair.head)?;
+    verify_remote_head(&runner, &repair.provider_git_url, &repair.target)?;
+    let unmerged = require_success(
+        &runner,
+        CommandSpec::new("git").args(["ls-files", "-u", "-z"]),
+        "repair_index_inspection_failed",
+        "could not inspect unresolved repair paths before semantic grant",
+    )?;
+    if !unmerged.stdout.is_empty() {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "repair_grant_conflicts_unresolved",
+            "resolve and stage typed mechanical conflicts before granting semantic paths",
+            Some(json!({"repair": repair_status_output(&repair)?})),
+        ));
+    }
+
+    let source_revision = rev_parse(&runner, &input.source_revision)?;
+    let parents = commit_parents(&runner, &source_revision)?;
+    if parents.len() != 1 {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "repair_grant_source_nonlinear",
+            "semantic grant source must have exactly one parent",
+            Some(json!({"source_revision": source_revision, "parents": parents})),
+        ));
+    }
+    let source_parent = parents[0].clone();
+    let now = unix_ms();
+    let expires_unix_ms = now.saturating_add(input.expires_secs.saturating_mul(1000));
+    let unique_paths = input.paths.iter().cloned().collect::<BTreeSet<_>>();
+    if unique_paths.len() != input.paths.len() {
+        return Err(AppError::validation(
+            "repair_grant_duplicate_path",
+            "semantic grant path list contains duplicates",
+        ));
+    }
+    if repair
+        .semantic_grants
+        .len()
+        .saturating_add(unique_paths.len())
+        > MAX_SEMANTIC_GRANTS
+    {
+        return Err(AppError::validation(
+            "repair_grant_limit_exceeded",
+            format!("repair sessions allow at most {MAX_SEMANTIC_GRANTS} semantic grants"),
+        ));
+    }
+
+    let mut proposed = Vec::new();
+    let mut already_applied = true;
+    for path in unique_paths {
+        validate_grant_path(&paths.workspace, &runner, &path)?;
+        let baseline_oid = index_oid_for_path(&runner, &path)?;
+        if let Some(existing) = repair
+            .semantic_grants
+            .iter()
+            .find(|grant| grant.path == path)
+        {
+            if existing.source_revision != source_revision
+                || existing.actor != input.actor
+                || existing.reason != input.reason
+                || existing.expires_unix_ms < now
+            {
+                return Err(AppError::structured(
+                    ErrorCategory::Validation,
+                    "repair_grant_conflict",
+                    format!("path `{path}` already has a different or expired semantic grant"),
+                    Some(json!({"existing": existing})),
+                ));
+            }
+            if baseline_oid == existing.expected_result_oid {
+                proposed.push((existing.clone(), None));
+                continue;
+            }
+            if baseline_oid != existing.baseline_oid {
+                return Err(AppError::structured(
+                    ErrorCategory::Validation,
+                    "repair_grant_path_drift",
+                    format!("path `{path}` changed outside its exact grant receipt"),
+                    Some(json!({"existing": existing, "actual_oid": baseline_oid})),
+                ));
+            }
+            already_applied = false;
+            let merged =
+                semantic_merge_result(&paths, &runner, &path, &source_parent, &source_revision)?;
+            if merged.oid != existing.expected_result_oid {
+                return Err(AppError::structured(
+                    ErrorCategory::Validation,
+                    "repair_grant_result_drift",
+                    "recomputed semantic result differs from persisted grant receipt",
+                    Some(json!({"existing": existing, "actual_result_oid": merged.oid})),
+                ));
+            }
+            proposed.push((existing.clone(), Some(merged.bytes)));
+            continue;
+        }
+        already_applied = false;
+        let source_blob = rev_parse(&runner, &format!("{}:{path}", source_revision.0))?;
+        let source_parent_blob = rev_parse(&runner, &format!("{}:{path}", source_parent.0))?;
+        let patch = require_success(
+            &runner,
+            CommandSpec::new("git").args([
+                "diff",
+                "--binary",
+                source_parent.0.as_str(),
+                source_revision.0.as_str(),
+                "--",
+                path.as_str(),
+            ]),
+            "repair_grant_source_diff_failed",
+            "could not derive reviewed semantic source patch",
+        )?;
+        let merged =
+            semantic_merge_result(&paths, &runner, &path, &source_parent, &source_revision)?;
+        proposed.push((
+            RepairPathGrant {
+                path,
+                actor: input.actor.clone(),
+                reason: input.reason.clone(),
+                source_revision: source_revision.clone(),
+                source_parent: source_parent.clone(),
+                source_blob,
+                source_parent_blob,
+                source_patch_fingerprint: stable_fingerprint(patch.stdout.as_bytes()),
+                baseline_oid,
+                expected_result_oid: merged.oid,
+                granted_unix_ms: now,
+                expires_unix_ms,
+                applied: false,
+            },
+            Some(merged.bytes),
+        ));
+    }
+
+    for (grant, _) in &proposed {
+        if !repair
+            .semantic_grants
+            .iter()
+            .any(|existing| existing.path == grant.path)
+        {
+            repair.semantic_grants.push(grant.clone());
+        }
+    }
+    repair.updated_unix_ms = unix_ms();
+    write_manifest(&paths.manifest, &repair)?;
+
+    for (grant, content) in proposed {
+        if let Some(content) = content {
+            fs::write(paths.workspace.join(&grant.path), content).map_err(|error| {
+                repair_io_error(
+                    "repair_grant_write_failed",
+                    "could not write reviewed semantic merge result",
+                    &paths.workspace.join(&grant.path),
+                    &error,
+                )
+            })?;
+            require_success(
+                &runner,
+                CommandSpec::new("git").args(["add", "--", grant.path.as_str()]),
+                "repair_grant_stage_failed",
+                "could not stage reviewed semantic merge result",
+            )?;
+            let actual = index_oid_for_path(&runner, &grant.path)?;
+            if actual != grant.expected_result_oid {
+                return Err(AppError::structured(
+                    ErrorCategory::Validation,
+                    "repair_grant_result_drift",
+                    "staged semantic result differs from exact grant receipt",
+                    Some(json!({"grant": grant, "actual_result_oid": actual})),
+                ));
+            }
+            let persisted = repair
+                .semantic_grants
+                .iter_mut()
+                .find(|existing| existing.path == grant.path)
+                .expect("grant persisted before apply");
+            persisted.applied = true;
+            repair.updated_unix_ms = unix_ms();
+            write_manifest(&paths.manifest, &repair)?;
+        }
+    }
+
+    lock.checkpoint(
+        "repair_semantic_paths_granted",
+        repair_lock_receipt(&repair)?,
+        false,
+    )?;
+    lock.release()?;
+    let grants = repair
+        .semantic_grants
+        .iter()
+        .filter(|grant| input.paths.contains(&grant.path))
+        .cloned()
+        .collect::<Vec<_>>();
+    Ok(RepairGrantOutput {
+        repair: repair_status_output(&repair)?,
+        grants,
+        already_applied,
+        next: "review the exact grant receipts, then run repair continue without editing any other path".to_owned(),
+    })
+}
+
+/// Revoke exact grants and restore the pre-grant staged blob for each path.
+#[allow(clippy::too_many_lines)]
+pub fn revoke_grants(
+    context: &AppContext,
+    input: &RepairRevokeGrantInput,
+) -> Result<RepairRevokeGrantOutput, AppError> {
+    validate_session_id(&input.session)?;
+    if input.paths.is_empty()
+        || input.paths.len() > MAX_SEMANTIC_GRANTS
+        || input.actor.trim().is_empty()
+        || input.actor.len() > MAX_GRANT_ACTOR_BYTES
+        || input.reason.trim().is_empty()
+        || input.reason.len() > MAX_GRANT_REASON_BYTES
+    {
+        return Err(AppError::validation(
+            "repair_grant_revocation_invalid",
+            "revocation requires bounded paths, actor, and reason",
+        ));
+    }
+    let paths = repair_paths_for_session(&context.repository_path, &input.session)?;
+    let mut repair = read_manifest(&paths.manifest)?;
+    require_session_match(&repair, &input.session)?;
+    validate_workspace(&paths, &repair)?;
+    if repair.state != RepairState::Resolving {
+        return Err(AppError::validation(
+            "repair_grant_state_invalid",
+            "semantic grants may be revoked only while repair is resolving",
+        ));
+    }
+    if config_fingerprint(context)? != repair.config_fingerprint {
+        return Err(AppError::validation(
+            "repair_config_changed",
+            "Caravan config changed after the repair session was prepared",
+        ));
+    }
+    let mut lock = OperationLock::acquire(&context.repository_path, "repair-revoke-grant")?;
+    lock.checkpoint(
+        "repair_semantic_grant_revocation_preflight",
+        repair_lock_receipt(&repair)?,
+        false,
+    )?;
+    let runner = ProcessRunner::in_directory(&paths.workspace)
+        .with_timeout(Duration::from_secs(context.config.command_timeout_secs));
+    verify_remote_head(&runner, &repair.provider_git_url, &repair.head)?;
+    verify_remote_head(&runner, &repair.provider_git_url, &repair.target)?;
+    let unique = input.paths.iter().cloned().collect::<BTreeSet<_>>();
+    if unique.len() != input.paths.len() {
+        return Err(AppError::validation(
+            "repair_grant_duplicate_path",
+            "revocation path list contains duplicates",
+        ));
+    }
+    let mut revoked = Vec::new();
+    for path in unique {
+        let position = repair
+            .semantic_grants
+            .iter()
+            .position(|grant| grant.path == path)
+            .ok_or_else(|| {
+                AppError::validation(
+                    "repair_grant_not_found",
+                    format!("path `{path}` has no semantic grant"),
+                )
+            })?;
+        let grant = repair.semantic_grants[position].clone();
+        if grant.actor != input.actor {
+            return Err(AppError::structured(
+                ErrorCategory::MissingPermission,
+                "repair_grant_authority_mismatch",
+                "grant revocation actor must match the exact granting authority",
+                Some(json!({"grant": grant, "actor": input.actor})),
+            ));
+        }
+        if index_oid_for_path(&runner, &path)? != grant.expected_result_oid {
+            return Err(AppError::structured(
+                ErrorCategory::Validation,
+                "repair_grant_result_drift",
+                "semantic grant result changed before revocation",
+                Some(json!({"grant": grant})),
+            ));
+        }
+        let baseline = require_success(
+            &runner,
+            CommandSpec::new("git").args(["cat-file", "blob", grant.baseline_oid.as_str()]),
+            "repair_grant_baseline_missing",
+            "could not restore semantic grant baseline blob",
+        )?;
+        fs::write(paths.workspace.join(&path), baseline.stdout).map_err(|error| {
+            repair_io_error(
+                "repair_grant_write_failed",
+                "could not restore semantic grant baseline",
+                &paths.workspace.join(&path),
+                &error,
+            )
+        })?;
+        require_success(
+            &runner,
+            CommandSpec::new("git").args(["add", "--", path.as_str()]),
+            "repair_grant_stage_failed",
+            "could not stage restored semantic grant baseline",
+        )?;
+        if index_oid_for_path(&runner, &path)? != grant.baseline_oid {
+            return Err(AppError::validation(
+                "repair_grant_baseline_drift",
+                "restored semantic grant baseline has an unexpected object ID",
+            ));
+        }
+        repair.semantic_grants.remove(position);
+        revoked.push(path);
+        repair.updated_unix_ms = unix_ms();
+        write_manifest(&paths.manifest, &repair)?;
+    }
+    lock.checkpoint(
+        "repair_semantic_grants_revoked",
+        json!({
+            "repair": repair_lock_receipt(&repair)?,
+            "revoked_paths": &revoked,
+            "actor": input.actor,
+            "reason": input.reason,
+        }),
+        false,
+    )?;
+    lock.release()?;
+    Ok(RepairRevokeGrantOutput {
+        repair: repair_status_output(&repair)?,
+        revoked_paths: revoked,
+        provider_mutated: false,
+    })
+}
+
+struct SemanticMergeResult {
+    oid: String,
+    bytes: Vec<u8>,
+}
+
+fn semantic_merge_result(
+    paths: &RepairPaths,
+    runner: &impl CommandRunner,
+    path: &str,
+    source_parent: &CommitOid,
+    source_revision: &CommitOid,
+) -> Result<SemanticMergeResult, AppError> {
+    let temporary = paths.session_root.join(format!(
+        "grant-{}-{}",
+        std::process::id(),
+        stable_fingerprint(path.as_bytes())
+    ));
+    fs::create_dir_all(&temporary).map_err(|error| {
+        repair_io_error(
+            "repair_grant_temp_failed",
+            "could not create semantic grant temporary directory",
+            &temporary,
+            &error,
+        )
+    })?;
+    let current = fs::read(paths.workspace.join(path)).map_err(|error| {
+        repair_io_error(
+            "repair_grant_read_failed",
+            "could not read current semantic path",
+            &paths.workspace.join(path),
+            &error,
+        )
+    })?;
+    let base = require_success(
+        runner,
+        CommandSpec::new("git").args(["show", &format!("{}:{path}", source_parent.0)]),
+        "repair_grant_source_read_failed",
+        "could not read semantic source parent blob",
+    )?;
+    let source = require_success(
+        runner,
+        CommandSpec::new("git").args(["show", &format!("{}:{path}", source_revision.0)]),
+        "repair_grant_source_read_failed",
+        "could not read semantic source blob",
+    )?;
+    let current_path = temporary.join("current");
+    let base_path = temporary.join("base");
+    let source_path = temporary.join("source");
+    fs::write(&current_path, current).map_err(|error| {
+        repair_io_error(
+            "repair_grant_temp_failed",
+            "could not stage current semantic file",
+            &current_path,
+            &error,
+        )
+    })?;
+    fs::write(&base_path, base.stdout).map_err(|error| {
+        repair_io_error(
+            "repair_grant_temp_failed",
+            "could not stage semantic base file",
+            &base_path,
+            &error,
+        )
+    })?;
+    fs::write(&source_path, source.stdout).map_err(|error| {
+        repair_io_error(
+            "repair_grant_temp_failed",
+            "could not stage semantic source file",
+            &source_path,
+            &error,
+        )
+    })?;
+    let merge = run(
+        runner,
+        CommandSpec::new("git").args([
+            "merge-file",
+            "-p",
+            current_path.to_string_lossy().as_ref(),
+            base_path.to_string_lossy().as_ref(),
+            source_path.to_string_lossy().as_ref(),
+        ]),
+    )?;
+    let _ = fs::remove_dir_all(&temporary);
+    if merge.code != Some(0) {
+        return Err(repair_command_failure(
+            "repair_grant_semantic_conflict",
+            "reviewed semantic patch does not merge cleanly into the repair workspace",
+            &merge,
+            json!({"path": path, "provider_mutated": false}),
+        ));
+    }
+    let hash = require_success(
+        runner,
+        CommandSpec::new("git")
+            .args(["hash-object", "-w", "--stdin"])
+            .stdin(merge.stdout.clone()),
+        "repair_grant_hash_failed",
+        "could not hash reviewed semantic merge result",
+    )?;
+    Ok(SemanticMergeResult {
+        oid: hash.stdout.trim().to_owned(),
+        bytes: merge.stdout.into_bytes(),
+    })
 }
 
 /// Verify agent-owned conflict resolution, publish non-force, and resume sync.
@@ -1035,6 +1723,7 @@ fn repair_status_output(repair: &RepairSession) -> Result<RepairStatusOutput, Ap
         conflicting_paths: repair.conflicting_paths.clone(),
         baseline_index_count: repair.baseline_index.len(),
         baseline_index_fingerprint: stable_fingerprint(&baseline),
+        semantic_grants: repair.semantic_grants.clone(),
         materialization_timeout_secs: repair.materialization_timeout_secs,
         created_unix_ms: repair.created_unix_ms,
         updated_unix_ms: repair.updated_unix_ms,
@@ -1060,6 +1749,35 @@ pub fn status(
         validate_workspace(&paths, &repair)?;
     }
     repair_status_output(&repair)
+}
+
+fn allowed_repair_paths(repair: &RepairSession) -> Result<BTreeSet<String>, AppError> {
+    let now = unix_ms();
+    let mut allowed = repair
+        .conflicting_paths
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for grant in &repair.semantic_grants {
+        if !grant.applied {
+            return Err(AppError::structured(
+                ErrorCategory::Validation,
+                "repair_grant_incomplete",
+                format!("semantic grant for `{}` was not fully applied", grant.path),
+                Some(json!({"grant": grant})),
+            ));
+        }
+        if grant.expires_unix_ms < now {
+            return Err(AppError::structured(
+                ErrorCategory::Validation,
+                "repair_grant_expired",
+                format!("semantic grant for `{}` expired", grant.path),
+                Some(json!({"grant": grant, "now_unix_ms": now})),
+            ));
+        }
+        allowed.insert(grant.path.clone());
+    }
+    Ok(allowed)
 }
 
 fn verify_resolution(runner: &impl CommandRunner, repair: &RepairSession) -> Result<(), AppError> {
@@ -1120,13 +1838,25 @@ fn verify_resolution(runner: &impl CommandRunner, repair: &RepairSession) -> Res
         "staged repair still contains conflict markers or whitespace errors",
     )?;
     let current = staged_index(runner)?;
-    let conflicts = repair
-        .conflicting_paths
-        .iter()
-        .cloned()
-        .collect::<BTreeSet<_>>();
+    let allowed = allowed_repair_paths(repair)?;
+    for grant in &repair.semantic_grants {
+        if current.get(&grant.path) != Some(&grant.expected_result_oid) {
+            return Err(AppError::structured(
+                ErrorCategory::Validation,
+                "repair_grant_result_drift",
+                format!(
+                    "semantic grant result for `{}` changed before continue",
+                    grant.path
+                ),
+                Some(json!({
+                    "grant": grant,
+                    "actual_oid": current.get(&grant.path),
+                })),
+            ));
+        }
+    }
     for (path, oid) in &repair.baseline_index {
-        if conflicts.contains(path) {
+        if allowed.contains(path) {
             continue;
         }
         if current.get(path) != Some(oid) {
@@ -1134,7 +1864,7 @@ fn verify_resolution(runner: &impl CommandRunner, repair: &RepairSession) -> Res
         }
     }
     for path in current.keys() {
-        if !repair.baseline_index.contains_key(path) && !conflicts.contains(path) {
+        if !repair.baseline_index.contains_key(path) && !allowed.contains(path) {
             return Err(scope_error(repair, path));
         }
     }
@@ -1142,6 +1872,17 @@ fn verify_resolution(runner: &impl CommandRunner, repair: &RepairSession) -> Res
 }
 
 fn scope_error(repair: &RepairSession, path: &str) -> AppError {
+    let allowed_paths = repair
+        .conflicting_paths
+        .iter()
+        .cloned()
+        .chain(
+            repair
+                .semantic_grants
+                .iter()
+                .map(|grant| grant.path.clone()),
+        )
+        .collect::<BTreeSet<_>>();
     AppError::structured(
         ErrorCategory::Validation,
         "repair_scope_changed",
@@ -1149,7 +1890,7 @@ fn scope_error(repair: &RepairSession, path: &str) -> AppError {
         Some(json!({
             "repair": repair,
             "path": path,
-            "allowed_paths": repair.conflicting_paths,
+            "allowed_paths": allowed_paths,
             "next": "revert unrelated edits in the managed workspace; semantic changes are allowed only for typed conflict paths",
         })),
     )
@@ -1703,6 +2444,7 @@ fn repair_lock_receipt(repair: &RepairSession) -> Result<Value, AppError> {
         "manifest_fingerprint": stable_fingerprint(&encoded),
         "baseline_index_count": repair.baseline_index.len(),
         "conflicting_path_count": repair.conflicting_paths.len(),
+        "semantic_grant_count": repair.semantic_grants.len(),
         "updated_unix_ms": repair.updated_unix_ms,
     }))
 }
@@ -2054,6 +2796,8 @@ mod tests {
         git(&clone, &["checkout", "-b", "main"]);
         fs::write(clone.join("shared.txt"), "base\n").unwrap();
         fs::write(clone.join("stable.txt"), "stable\n").unwrap();
+        fs::write(clone.join("README.md"), "# Base\n").unwrap();
+        fs::write(clone.join("SPEC.md"), "# Contract\n").unwrap();
         git(&clone, &["add", "."]);
         git(&clone, &["commit", "-m", "base"]);
         git(&clone, &["push", "-u", "origin", "main"]);
@@ -2118,6 +2862,28 @@ mod tests {
             config_existed: false,
             config: CaravanConfig::default(),
         }
+    }
+
+    fn semantic_source(fixture: &Fixture) -> CommitOid {
+        git(&fixture.clone, &["checkout", "-b", "semantic-source"]);
+        fs::write(
+            fixture.clone.join("README.md"),
+            "# Base\n\nReviewed shell-safe message body.\n",
+        )
+        .unwrap();
+        fs::write(
+            fixture.clone.join("SPEC.md"),
+            "# Contract\n\nMessage bodies use reviewed files.\n",
+        )
+        .unwrap();
+        git(&fixture.clone, &["add", "README.md", "SPEC.md"]);
+        git(
+            &fixture.clone,
+            &["commit", "-m", "reviewed semantic contracts"],
+        );
+        let source = CommitOid(git(&fixture.clone, &["rev-parse", "HEAD"]));
+        git(&fixture.clone, &["checkout", "feature"]);
+        source
     }
 
     #[test]
@@ -2503,6 +3269,218 @@ mod tests {
         lock.checkpoint("repair_workspace_ready", receipt, false)
             .expect("compact repair receipt fits operation lock cap");
         lock.release().unwrap();
+    }
+
+    #[test]
+    fn audited_semantic_grant_applies_exact_source_paths_idempotently() {
+        let fixture = fixture();
+        let source = semantic_source(&fixture);
+        let context = context(&fixture.clone);
+        let output = start_exact(
+            &context,
+            &fixture.repository,
+            &fixture.candidate,
+            &fixture.target,
+            None,
+            fixture.root.path().join("remote.git").to_str().unwrap(),
+        )
+        .unwrap();
+        let workspace = PathBuf::from(&output.repair.workspace);
+        fs::write(workspace.join("shared.txt"), "resolved\n").unwrap();
+        git(&workspace, &["add", "shared.txt"]);
+        let input = RepairGrantInput {
+            session: output.repair.session.clone(),
+            paths: vec!["README.md".to_owned(), "SPEC.md".to_owned()],
+            source_revision: source.0,
+            actor: "operator".to_owned(),
+            reason: "restore reviewed message-body contracts".to_owned(),
+            expires_secs: 3600,
+        };
+        let granted = grant_paths(&context, &input).unwrap();
+        assert!(!granted.already_applied);
+        assert_eq!(granted.grants.len(), 2);
+        assert!(granted.grants.iter().all(|grant| grant.applied));
+        assert!(
+            fs::read_to_string(workspace.join("README.md"))
+                .unwrap()
+                .contains("Reviewed shell-safe message body")
+        );
+        assert!(
+            fs::read_to_string(workspace.join("SPEC.md"))
+                .unwrap()
+                .contains("Message bodies use reviewed files")
+        );
+        let replay = grant_paths(&context, &input).unwrap();
+        assert!(replay.already_applied);
+
+        let continued = continue_session(
+            &context,
+            &RepairContinueInput {
+                session: input.session,
+                no_sync: true,
+            },
+        )
+        .unwrap();
+        assert!(continued.publication.is_some());
+    }
+
+    #[test]
+    fn semantic_grant_revocation_restores_exact_baseline_without_provider_mutation() {
+        let fixture = fixture();
+        let source = semantic_source(&fixture);
+        let context = context(&fixture.clone);
+        let output = start_exact(
+            &context,
+            &fixture.repository,
+            &fixture.candidate,
+            &fixture.target,
+            None,
+            fixture.root.path().join("remote.git").to_str().unwrap(),
+        )
+        .unwrap();
+        let workspace = PathBuf::from(&output.repair.workspace);
+        fs::write(workspace.join("shared.txt"), "resolved\n").unwrap();
+        git(&workspace, &["add", "shared.txt"]);
+        let input = RepairGrantInput {
+            session: output.repair.session,
+            paths: vec!["README.md".to_owned()],
+            source_revision: source.0,
+            actor: "operator-a".to_owned(),
+            reason: "reviewed contract".to_owned(),
+            expires_secs: 3600,
+        };
+        let granted = grant_paths(&context, &input).unwrap();
+        let grant = granted.grants[0].clone();
+        let wrong_actor = revoke_grants(
+            &context,
+            &RepairRevokeGrantInput {
+                session: input.session.clone(),
+                paths: input.paths.clone(),
+                actor: "operator-b".to_owned(),
+                reason: "wrong authority".to_owned(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(wrong_actor.code(), "repair_grant_authority_mismatch");
+        let revoked = revoke_grants(
+            &context,
+            &RepairRevokeGrantInput {
+                session: input.session,
+                paths: input.paths,
+                actor: "operator-a".to_owned(),
+                reason: "review superseded".to_owned(),
+            },
+        )
+        .unwrap();
+        assert_eq!(revoked.revoked_paths, ["README.md"]);
+        assert!(!revoked.provider_mutated);
+        assert!(revoked.repair.semantic_grants.is_empty());
+        assert_eq!(
+            index_oid_for_path(&ProcessRunner::in_directory(&workspace), "README.md").unwrap(),
+            grant.baseline_oid
+        );
+    }
+
+    #[test]
+    fn semantic_grant_authority_and_expiry_fail_closed() {
+        let fixture = fixture();
+        let source = semantic_source(&fixture);
+        let context = context(&fixture.clone);
+        let output = start_exact(
+            &context,
+            &fixture.repository,
+            &fixture.candidate,
+            &fixture.target,
+            None,
+            fixture.root.path().join("remote.git").to_str().unwrap(),
+        )
+        .unwrap();
+        let workspace = PathBuf::from(&output.repair.workspace);
+        fs::write(workspace.join("shared.txt"), "resolved\n").unwrap();
+        git(&workspace, &["add", "shared.txt"]);
+        let input = RepairGrantInput {
+            session: output.repair.session.clone(),
+            paths: vec!["README.md".to_owned()],
+            source_revision: source.0,
+            actor: "operator-a".to_owned(),
+            reason: "reviewed contract".to_owned(),
+            expires_secs: 3600,
+        };
+        grant_paths(&context, &input).unwrap();
+        let mut wrong_actor = input.clone();
+        wrong_actor.actor = "operator-b".to_owned();
+        let mismatch = grant_paths(&context, &wrong_actor).unwrap_err();
+        assert_eq!(mismatch.code(), "repair_grant_conflict");
+
+        let paths = repair_paths_for_session(&fixture.clone, &input.session).unwrap();
+        let mut repair = read_manifest(&paths.manifest).unwrap();
+        repair.semantic_grants[0].expires_unix_ms = unix_ms().saturating_sub(1);
+        write_manifest(&paths.manifest, &repair).unwrap();
+        let expired = continue_session(
+            &context,
+            &RepairContinueInput {
+                session: input.session,
+                no_sync: true,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(expired.code(), "repair_grant_expired");
+    }
+
+    #[test]
+    fn semantic_grant_does_not_authorize_unlisted_or_unsafe_paths() {
+        let fixture = fixture();
+        let source = semantic_source(&fixture);
+        let context = context(&fixture.clone);
+        let output = start_exact(
+            &context,
+            &fixture.repository,
+            &fixture.candidate,
+            &fixture.target,
+            None,
+            fixture.root.path().join("remote.git").to_str().unwrap(),
+        )
+        .unwrap();
+        let workspace = PathBuf::from(&output.repair.workspace);
+        fs::write(workspace.join("shared.txt"), "resolved\n").unwrap();
+        git(&workspace, &["add", "shared.txt"]);
+        let invalid = grant_paths(
+            &context,
+            &RepairGrantInput {
+                session: output.repair.session.clone(),
+                paths: vec!["../README.md".to_owned()],
+                source_revision: source.0.clone(),
+                actor: "operator".to_owned(),
+                reason: "invalid traversal".to_owned(),
+                expires_secs: 3600,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(invalid.code(), "repair_grant_path_invalid");
+
+        grant_paths(
+            &context,
+            &RepairGrantInput {
+                session: output.repair.session.clone(),
+                paths: vec!["README.md".to_owned(), "SPEC.md".to_owned()],
+                source_revision: source.0,
+                actor: "operator".to_owned(),
+                reason: "reviewed docs".to_owned(),
+                expires_secs: 3600,
+            },
+        )
+        .unwrap();
+        fs::write(workspace.join("stable.txt"), "unauthorized\n").unwrap();
+        git(&workspace, &["add", "stable.txt"]);
+        let error = continue_session(
+            &context,
+            &RepairContinueInput {
+                session: output.repair.session,
+                no_sync: true,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "repair_scope_changed");
     }
 
     #[test]

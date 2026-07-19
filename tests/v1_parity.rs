@@ -32,6 +32,38 @@ fn every_bounded_v1_domain_command_has_a_real_json_operation() {
             &["repair", "status", "--session", "pr-1-parity"],
         ),
         (
+            "repair_grant",
+            &[
+                "repair",
+                "grant",
+                "--session",
+                "pr-1-parity",
+                "--path",
+                "README.md",
+                "--source-revision",
+                "0000000000000000000000000000000000000000",
+                "--actor",
+                "parity",
+                "--reason",
+                "parity audit",
+            ],
+        ),
+        (
+            "repair_revoke_grant",
+            &[
+                "repair",
+                "revoke-grant",
+                "--session",
+                "pr-1-parity",
+                "--path",
+                "README.md",
+                "--actor",
+                "parity",
+                "--reason",
+                "parity revocation",
+            ],
+        ),
+        (
             "repair_continue",
             &["repair", "continue", "--session", "pr-1-parity"],
         ),
@@ -115,6 +147,26 @@ fn every_bounded_mcp_domain_tool_routes_to_the_real_operation() {
             serde_json::json!({ "session": "pr-1-parity" }),
         ),
         (
+            "repair_grant",
+            serde_json::json!({
+                "session": "pr-1-parity",
+                "paths": ["README.md"],
+                "source_revision": "0000000000000000000000000000000000000000",
+                "actor": "parity",
+                "reason": "parity audit",
+                "expires_secs": 3600
+            }),
+        ),
+        (
+            "repair_revoke_grant",
+            serde_json::json!({
+                "session": "pr-1-parity",
+                "paths": ["README.md"],
+                "actor": "parity",
+                "reason": "parity revocation"
+            }),
+        ),
+        (
             "repair_continue",
             serde_json::json!({ "session": "pr-1-parity" }),
         ),
@@ -184,6 +236,8 @@ fn mcp_registry_covers_all_bounded_v1_operations_with_schemas() {
         "prev",
         "sync",
         "repair_start",
+        "repair_grant",
+        "repair_revoke_grant",
         "repair_status",
         "repair_continue",
         "repair_abort",

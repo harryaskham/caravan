@@ -20,7 +20,7 @@ is required or used.
 | chain navigation | `cara next`, `cara prev` | envelope | `next`, `prev` | clean-worktree/exact-head guarded checkout |
 | fleet list/navigation | `cara van list/next/prev` | envelope | `van_list/next/prev` | deterministic PR-number head order |
 | synchronize | `cara sync [--all] [--rerun-failed]` | envelope | `sync` | idempotence, rolling head, typed decisions, safe affected-PR checkout, exact-run rerun, intentional hold skips |
-| managed repair | `cara repair start/status/continue` | envelope | `repair_start`, `repair_status`, `repair_continue` | dirty caller isolation, explicit provider clone, persistent exact-head manifest, typed conflict scope, non-force publication, interruption-safe sync resume |
+| managed repair | `cara repair start/grant/revoke-grant/status/continue/abort` | envelope | `repair_start`, `repair_grant`, `repair_revoke_grant`, `repair_status`, `repair_continue`, `repair_abort` | dirty caller isolation, object-cache/exact-provider materialization, persistent manifest, typed conflict + audited semantic source scope, non-force publication, interruption-safe sync resume |
 | incident hold | `cara pause/resume --head-pr N --actor A [...]` | envelope | `pause`, `resume` | bounded metadata, exact disable/enable preconditions, expiry warning without auto-resume, stale-fact closure |
 | foreground ticks | `cara loop [--once]` | one-shot envelope only | intentionally absent | canonical sync events and bounded hook delivery |
 | eviction | `cara evict [--pr N] --reason TEXT` | envelope | `evict` | safe gap closure, exact receipts and success/failure events |
