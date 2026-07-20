@@ -23,6 +23,7 @@ pub mod read;
 pub mod repair;
 pub mod reshape;
 pub mod sync;
+pub mod web;
 
 use clap::Args;
 use feedback_cli::{FeedbackConfig, FeedbackError, ReportStrategy, Reporter};
@@ -183,6 +184,20 @@ RESHAPING AND EXPLICIT INTENT
   disables only the exact head auto-merge and preserves topology. Expiry is a
   warning, never implicit resume. Only `cara resume` may revalidate exact facts,
   record authorization, and restore policy. A stale hold fails closed.
+
+BUILT-IN WEB OPERATIONS
+- `cara web --repo PATH [--repo PATH ...]` serves a responsive dashboard from
+  assets embedded in the Cara binary. Repository arguments are filesystem
+  paths, never slugs, and are the complete trust boundary for the process.
+- The default listener is loopback-only. Status snapshots refresh on a bounded
+  cadence and show active caravan trails, exact PR generations and CI, open
+  unqueued/rejected PRs with reasons, decisions, pauses, and scheduler health.
+- Use `--read-only` to disable mutation endpoints. Interactive actions use the
+  same typed domain functions, preconditions, operation locks, decisions, and
+  receipts as CLI/JSON/MCP; the web server never shells out to human output.
+- Static HTML, CSS, and JavaScript ship inside `cara`; no CDN or separate web
+  deployment is required. Future opt-in repository discovery must remain
+  explicit and is not performed by the initial path-scoped release.
 
 RECOVERY, LOCKS, AND OBSERVABILITY
 - GitHub is the resume cursor. After timeout, interruption, or partial provider

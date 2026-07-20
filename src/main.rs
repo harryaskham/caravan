@@ -49,6 +49,8 @@ enum Command {
     Init,
     /// Discover the current PR, all caravans, invalid fragments, and decisions.
     Status,
+    /// Serve the embedded multi-repository Caravan operations dashboard.
+    Web(caravan::web::WebInput),
     /// Read the bounded repository event journal, optionally following new records.
     Log(LogCommand),
     /// Return the canonical next priority-then-FIFO admission without mutation.
@@ -246,6 +248,7 @@ fn run(cli: &Cli) -> Result<(), i32> {
     match &cli.command {
         Command::Init => run_init(cli),
         Command::Status => run_status(cli),
+        Command::Web(input) => run_web(cli, input),
         Command::Log(command) => run_log(cli, command),
         Command::NextCandidate => run_next_candidate(cli),
         Command::Check(input) => run_check(cli, input),
@@ -298,6 +301,31 @@ fn run(cli: &Cli) -> Result<(), i32> {
         Command::SelfUpdate(command) => run_self_update(cli.json, command),
         Command::Feedback(command) => run_feedback(cli.json, command),
     }
+}
+
+fn run_web(cli: &Cli, input: &caravan::web::WebInput) -> Result<(), i32> {
+    if cli.config.is_some() {
+        let error = AppError::validation(
+            "web_global_config_unsupported",
+            "cara web loads config from each explicit --repo path; do not pass global --config",
+        );
+        return if cli.json {
+            emit_result::<serde_json::Value, _>(true, Err(error))
+        } else {
+            emit_human_error(error)
+        };
+    }
+    if cli.json {
+        return emit_result::<serde_json::Value, _>(
+            true,
+            Err(AppError::validation(
+                "web_json_mode_unsupported",
+                "cara web is an HTTP server; omit global --json and use /api/v1/state",
+            )),
+        );
+    }
+    caravan::web::serve(input)
+        .map_err(|error| emit_human_error(error).expect_err("web server failure is nonzero"))
 }
 
 fn load_context(cli: &Cli) -> Result<AppContext, i32> {
@@ -1458,6 +1486,32 @@ mod tests {
         assert_eq!(input.head_pr, None);
         assert!(!input.create_pr);
         assert!(Cli::try_parse_from(["cara", "join", "--pr", "43", "--create-pr"]).is_err());
+    }
+
+    #[test]
+    fn web_requires_explicit_repository_paths() {
+        let cli = Cli::try_parse_from([
+            "cara",
+            "web",
+            "--repo",
+            "/tmp/one",
+            "--repo",
+            "/tmp/two",
+            "--listen",
+            "127.0.0.1:4888",
+            "--poll-seconds",
+            "30",
+            "--read-only",
+        ])
+        .expect("web arguments parse");
+        let Command::Web(input) = cli.command else {
+            panic!("expected web command");
+        };
+        assert_eq!(input.repositories.len(), 2);
+        assert_eq!(input.listen.port(), 4888);
+        assert_eq!(input.poll_seconds, 30);
+        assert!(input.read_only);
+        assert!(Cli::try_parse_from(["cara", "web"]).is_err());
     }
 
     #[test]

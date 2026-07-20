@@ -74,6 +74,7 @@ Domain surface:
 ```text
 cara init
 cara status
+cara web --repo PATH [--repo PATH ...] [--read-only]
 cara check [--pr N] [--tail-pr N | --head-pr N]
 cara new [--create-pr]
 cara join [--tail-pr N | --head-pr N] [--create-pr]
@@ -111,6 +112,29 @@ open caravan PR.
 
 Use `cara help` for the agent operating loop and recovery rules. Use `--json`
 for stable `mcp-cli` envelopes.
+
+## Built-in web dashboard
+
+`cara web` serves the primary visual operations surface directly from the Cara
+binary; HTML, CSS, and JavaScript are embedded at compile time, with no CDN or
+separate deployment:
+
+```sh
+cara web --repo /path/to/repository
+cara web --repo ~/src/a --repo ~/src/b --poll-seconds 30 --read-only
+cara web --repo . --listen 127.0.0.1:4774 --open
+```
+
+Repository inputs are explicit filesystem paths rather than slugs because every
+read and mutation remains bound to that exact worktree, config, operation lock,
+and provider identity. The initial server refuses non-loopback listeners,
+canonicalizes and deduplicates paths, periodically returns the same typed status
+used by CLI/JSON/MCP, and applies strict CSP/anti-frame/no-store headers. The
+responsive dashboard renders modern trail-linked caravans, exact PR generations
+and CI, open PRs not enrolled with their mechanical reasons, and current
+problems/decisions. `--read-only` disables action endpoints. Interactive actions
+use same-origin CSRF and the existing typed Cara operations and receipts; they
+never execute arbitrary shell input.
 
 ## Managed sync repair
 

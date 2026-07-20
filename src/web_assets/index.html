@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Cara · Caravan operations</title>
+  <link rel="stylesheet" href="/assets/app.css">
+  <script defer src="/assets/app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#workspace">Skip to caravan workspace</a>
+  <header class="masthead">
+    <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+    <div class="brand-copy">
+      <p class="eyebrow">GitHub merge operations</p>
+      <h1>Cara <span>Caravan Control</span></h1>
+    </div>
+    <div class="masthead-actions">
+      <span id="connection" class="connection" role="status">Connecting</span>
+      <button id="refresh-all" class="button button-primary" type="button">Refresh all</button>
+    </div>
+  </header>
+
+  <main id="workspace" class="workspace" tabindex="-1">
+    <nav class="repo-rail" aria-label="Repositories">
+      <div class="rail-heading">
+        <p class="eyebrow">Explicit paths</p>
+        <h2>Repositories</h2>
+      </div>
+      <div id="repo-tabs" class="repo-tabs" role="tablist" aria-label="Repository views"></div>
+      <div class="rail-note">
+        <span class="trail-knot" aria-hidden="true"></span>
+        <p>Cara reads only paths passed at startup. No ambient repository discovery.</p>
+      </div>
+    </nav>
+
+    <section class="content">
+      <div id="loading" class="loading-panel">
+        <div class="loading-wheel" aria-hidden="true"></div>
+        <p>Surveying the trail…</p>
+      </div>
+      <div id="dashboard" hidden>
+        <section id="repo-overview" class="overview-grid" aria-labelledby="repo-title"></section>
+
+        <section class="section-block" aria-labelledby="caravans-title">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Active topology</p>
+              <h2 id="caravans-title">Caravans</h2>
+            </div>
+            <p class="section-description">Each trail is ordered head to tail. Exact base and head generations remain visible.</p>
+          </div>
+          <div id="caravans" class="caravan-list"></div>
+        </section>
+
+        <section class="split-grid">
+          <div class="section-block compact" aria-labelledby="waiting-title">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Not enrolled</p>
+                <h2 id="waiting-title">Waiting at the rail</h2>
+              </div>
+            </div>
+            <div id="waiting-prs" class="card-stack"></div>
+          </div>
+          <div class="section-block compact" aria-labelledby="decisions-title">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Attention</p>
+                <h2 id="decisions-title">Decisions &amp; blockers</h2>
+              </div>
+            </div>
+            <div id="decisions" class="card-stack"></div>
+          </div>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+  <template id="empty-template"><div class="empty-state"><span aria-hidden="true">◇</span><p></p></div></template>
+</body>
+</html>
