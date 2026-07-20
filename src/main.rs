@@ -2,6 +2,7 @@
 
 use std::fmt::Write as _;
 use std::io;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,7 +27,7 @@ use serde::Serialize;
     name = "cara",
     version,
     about = "Agent-in-the-loop GitHub merge queue",
-    long_about = "Caravan maintains GitHub PRs as labelled, mechanically compatible chains. It is non-interactive: sync either converges or returns one structured decision point for a user or MCP-connected agent.",
+    long_about = "Caravan maintains GitHub PRs as labelled, mechanically compatible chains. Automation is non-interactive: sync either converges or returns one structured decision point. Human TTY membership commands can assist with safe branch, commit, push, and PR creation.",
     arg_required_else_help = true,
     disable_help_subcommand = true
 )]
@@ -252,15 +253,11 @@ fn run(cli: &Cli) -> Result<(), i32> {
         Command::Log(command) => run_log(cli, command),
         Command::NextCandidate => run_next_candidate(cli),
         Command::Check(input) => run_check(cli, input),
-        Command::New(input) => {
-            run_membership(cli, |context| caravan::membership::new(context, input))
-        }
+        Command::New(input) => run_create_membership(cli, input),
         Command::Renew(input) => {
             run_membership(cli, |context| caravan::membership::renew(context, input))
         }
-        Command::Join(input) => {
-            run_membership(cli, |context| caravan::membership::join(context, input))
-        }
+        Command::Join(input) => run_join_membership(cli, input),
         Command::Rejoin(input) => {
             run_membership(cli, |context| caravan::membership::rejoin(context, input))
         }
@@ -493,6 +490,239 @@ fn run_show(cli: &Cli) -> Result<(), i32> {
     match result {
         Ok(output) => {
             print!("{}", render_show(&output));
+            Ok(())
+        }
+        Err(error) => emit_human_error(error),
+    }
+}
+
+fn run_create_membership(cli: &Cli, input: &CreateInput) -> Result<(), i32> {
+    let context = load_context(cli)?;
+    let mut effective = input.clone();
+    let mut result = caravan::membership::new(&context, &effective);
+    if should_offer_pr_creation(cli, &result) {
+        if let Err(error) = prepare_interactive_pr(&context) {
+            return emit_human_error(error);
+        }
+        effective.create_pr = true;
+        result = caravan::membership::new(&context, &effective);
+    }
+    emit_membership_result(cli, result)
+}
+
+fn run_join_membership(cli: &Cli, input: &JoinInput) -> Result<(), i32> {
+    let context = load_context(cli)?;
+    let mut effective = input.clone();
+    let mut result = caravan::membership::join(&context, &effective);
+    if effective.pr.is_none() && should_offer_pr_creation(cli, &result) {
+        if let Err(error) = prepare_interactive_pr(&context) {
+            return emit_human_error(error);
+        }
+        effective.create_pr = true;
+        result = caravan::membership::join(&context, &effective);
+    }
+    emit_membership_result(cli, result)
+}
+
+fn should_offer_pr_creation(
+    cli: &Cli,
+    result: &Result<caravan::membership::MembershipOutput, AppError>,
+) -> bool {
+    if cli.json || !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return false;
+    }
+    result.as_ref().is_err_and(|error| {
+        matches!(
+            error.code().as_str(),
+            "current_pr_not_found"
+                | "create_pr_on_default_branch"
+                | "historical_current_pr_missing_caravan_label"
+        )
+    })
+}
+
+fn prepare_interactive_pr(context: &AppContext) -> Result<(), AppError> {
+    let branch = git_stdout(context, &["branch", "--show-current"])?;
+    if branch.is_empty() {
+        return Err(AppError::validation(
+            "interactive_pr_detached_head",
+            "interactive PR creation requires a named branch",
+        ));
+    }
+    let default_branch = git_stdout(
+        context,
+        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+    )
+    .ok()
+    .and_then(|value| value.rsplit('/').next().map(ToOwned::to_owned))
+    .filter(|value| !value.is_empty())
+    .unwrap_or_else(|| "main".to_owned());
+    if branch == default_branch {
+        prepare_topic_branch(context)?;
+    }
+    if git_stdout(context, &["rev-parse", "--abbrev-ref", "@{upstream}"]).is_err() {
+        if !confirm(
+            "Current branch is not published. Push it to origin now?",
+            true,
+        )? {
+            return Err(AppError::validation(
+                "interactive_pr_push_declined",
+                "branch push was declined; publish it and rerun the same command",
+            ));
+        }
+        git_run(context, &["push", "-u", "origin", "HEAD"])?;
+    }
+    if !confirm(
+        "No open PR exists for this branch. Create one with commit-derived GitHub defaults?",
+        true,
+    )? {
+        return Err(AppError::validation(
+            "interactive_pr_creation_declined",
+            "PR creation was declined; rerun with --create-pr when ready",
+        ));
+    }
+    Ok(())
+}
+
+fn prepare_topic_branch(context: &AppContext) -> Result<(), AppError> {
+    let status = git_stdout(context, &["status", "--short"])?;
+    if status.trim().is_empty() {
+        let default = format!("cara/work-{}", unix_seconds());
+        let branch = prompt_value("You are on the default branch. New topic branch", &default)?;
+        git_run(context, &["switch", "-c", &branch])?;
+        return Err(AppError::validation(
+            "interactive_topic_branch_created",
+            format!(
+                "created topic branch `{branch}`, but there are no changes to commit yet; make or stage the intended changes, then rerun the same Cara command"
+            ),
+        ));
+    }
+    eprintln!("Changes on the default branch:\n{status}");
+    if !confirm(
+        "Create a topic branch, stage all listed changes, and commit them?",
+        true,
+    )? {
+        return Err(AppError::validation(
+            "interactive_commit_declined",
+            "automatic branch/commit preparation was declined",
+        ));
+    }
+    let message = prompt_value("Commit message", "Prepare pull request")?;
+    let default_branch = format!("cara/{}", slugify(&message));
+    let branch = prompt_value("Topic branch", &default_branch)?;
+    git_run(context, &["switch", "-c", &branch])?;
+    git_run(context, &["add", "-A"])?;
+    git_run(context, &["commit", "-m", &message])?;
+    Ok(())
+}
+
+fn prompt_value(label: &str, default: &str) -> Result<String, AppError> {
+    eprint!("{label} [{default}]: ");
+    io::Write::flush(&mut io::stderr())
+        .map_err(|error| AppError::validation("interactive_prompt_failed", error.to_string()))?;
+    let mut value = String::new();
+    io::stdin()
+        .read_line(&mut value)
+        .map_err(|error| AppError::validation("interactive_prompt_failed", error.to_string()))?;
+    let value = value.trim();
+    Ok(if value.is_empty() {
+        default.to_owned()
+    } else {
+        value.to_owned()
+    })
+}
+
+fn confirm(prompt: &str, default_yes: bool) -> Result<bool, AppError> {
+    let suffix = if default_yes { "[Y/n]" } else { "[y/N]" };
+    eprint!("{prompt} {suffix}: ");
+    io::Write::flush(&mut io::stderr())
+        .map_err(|error| AppError::validation("interactive_prompt_failed", error.to_string()))?;
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .map_err(|error| AppError::validation("interactive_prompt_failed", error.to_string()))?;
+    let answer = answer.trim();
+    if answer.is_empty() {
+        return Ok(default_yes);
+    }
+    Ok(matches!(answer.to_ascii_lowercase().as_str(), "y" | "yes"))
+}
+
+fn git_stdout(context: &AppContext, args: &[&str]) -> Result<String, AppError> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(&context.repository_path)
+        .output()
+        .map_err(|error| AppError::validation("interactive_git_failed", error.to_string()))?;
+    if !output.status.success() {
+        return Err(AppError::validation(
+            "interactive_git_failed",
+            format!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn git_run(context: &AppContext, args: &[&str]) -> Result<(), AppError> {
+    let status = std::process::Command::new("git")
+        .args(args)
+        .current_dir(&context.repository_path)
+        .status()
+        .map_err(|error| AppError::validation("interactive_git_failed", error.to_string()))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(AppError::validation(
+            "interactive_git_failed",
+            format!("git {} failed", args.join(" ")),
+        ))
+    }
+}
+
+fn slugify(value: &str) -> String {
+    let slug = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let slug = slug
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .take(6)
+        .collect::<Vec<_>>()
+        .join("-");
+    if slug.is_empty() {
+        format!("work-{}", unix_seconds())
+    } else {
+        slug
+    }
+}
+
+fn unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+fn emit_membership_result(
+    cli: &Cli,
+    result: Result<caravan::membership::MembershipOutput, AppError>,
+) -> Result<(), i32> {
+    if cli.json {
+        return emit_result(true, result);
+    }
+    match result {
+        Ok(output) => {
+            print!("{}", render_membership(&output));
             Ok(())
         }
         Err(error) => emit_human_error(error),
@@ -819,6 +1049,54 @@ fn render_loop_tick(output: &caravan::loop_runner::LoopTickOutput) -> String {
 }
 
 #[allow(clippy::too_many_lines)]
+fn terminal_output() -> bool {
+    !cfg!(test)
+        && io::stdout().is_terminal()
+        && std::env::var_os("TERM").is_none_or(|term| term != "dumb")
+}
+
+fn color_output() -> bool {
+    terminal_output() && std::env::var_os("NO_COLOR").is_none()
+}
+
+fn styled(code: &str, value: impl AsRef<str>) -> String {
+    if color_output() {
+        format!("\x1b[{code}m{}\x1b[0m", value.as_ref())
+    } else {
+        value.as_ref().to_owned()
+    }
+}
+
+fn heading(value: impl AsRef<str>) -> String {
+    styled("1;36", value)
+}
+
+fn success(value: impl AsRef<str>) -> String {
+    styled("1;32", value)
+}
+
+fn warning(value: impl AsRef<str>) -> String {
+    styled("1;33", value)
+}
+
+fn failure(value: impl AsRef<str>) -> String {
+    styled("1;31", value)
+}
+
+fn dim(value: impl AsRef<str>) -> String {
+    styled("2", value)
+}
+
+fn pr_link(number: caravan::model::PrNumber, title: &str, url: &str) -> String {
+    let label = format!("#{number} {title}");
+    if terminal_output() && !url.is_empty() {
+        format!("\x1b]8;;{url}\x1b\\{label}\x1b]8;;\x1b\\")
+    } else {
+        label
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 fn render_sync(output: &caravan::sync::SyncOutput) -> String {
     let caravans = output
         .synchronized_caravans
@@ -826,17 +1104,18 @@ fn render_sync(output: &caravan::sync::SyncOutput) -> String {
         .map(|number| format!("#{number}"))
         .collect::<Vec<_>>()
         .join(", ");
+    let state = if output.receipt.changed {
+        success("changed")
+    } else {
+        success("already converged")
+    };
     let mut text = format!(
-        "sync: {} — {}\n",
-        if output.receipt.changed {
-            "changed"
-        } else {
-            "already converged"
-        },
+        "{}  {state}  {}\n",
+        heading("SYNC"),
         if caravans.is_empty() {
-            "no caravans".to_owned()
+            dim("no caravans")
         } else {
-            format!("caravans {caravans}")
+            styled("1;35", format!("caravans {caravans}"))
         }
     );
     let _ = writeln!(
@@ -940,16 +1219,20 @@ fn render_sync(output: &caravan::sync::SyncOutput) -> String {
 }
 
 fn render_membership(output: &caravan::membership::MembershipOutput) -> String {
+    let state = if output.receipt.changed {
+        success("changed")
+    } else {
+        dim("already satisfied")
+    };
     let mut text = format!(
-        "{}: PR #{} in caravan #{} ({})\n",
-        output.receipt.operation,
-        output.pull_request.number,
-        output.caravan_id,
-        if output.receipt.changed {
-            "changed"
-        } else {
-            "already satisfied"
-        }
+        "{}  {}  in {}  {state}\n",
+        heading(output.receipt.operation.clone().to_uppercase()),
+        pr_link(
+            output.pull_request.number,
+            &output.pull_request.title,
+            &output.pull_request.url,
+        ),
+        styled("1;35", format!("caravan #{}", output.caravan_id)),
     );
     if let Some(join) = &output.join_receipt {
         let _ = writeln!(
@@ -984,16 +1267,17 @@ fn append_hook_deliveries(text: &mut String, deliveries: &[caravan::hooks::HookD
 #[allow(clippy::too_many_lines)]
 fn render_status(output: &caravan::read::StatusOutput) -> String {
     let mut text = String::new();
+    let health = if output.healthy {
+        success("healthy")
+    } else {
+        failure("needs attention")
+    };
     let _ = writeln!(
         text,
-        "{} @ {} — {}",
+        "{}  {} @ {}  {health}",
+        heading("CARAVAN"),
         output.repository,
         output.default_branch,
-        if output.healthy {
-            "healthy"
-        } else {
-            "needs attention"
-        }
     );
     let current = output
         .current_pr
@@ -1059,7 +1343,12 @@ fn render_status(output: &caravan::read::StatusOutput) -> String {
         output.auto_admission.max_github_requests_per_tick,
         output.auto_admission.max_duration_secs,
     );
-    let _ = writeln!(text, "caravans: {}", output.analysis.fleet.caravans.len());
+    let _ = writeln!(
+        text,
+        "\n{}  {}",
+        heading("CARAVANS"),
+        dim(format!("{} active", output.analysis.fleet.caravans.len()))
+    );
     if let Some(previous) = &output.previous_default_oid {
         let _ = writeln!(text, "previous observed default: {previous}");
     }
@@ -1088,10 +1377,19 @@ fn render_status(output: &caravan::read::StatusOutput) -> String {
         let chain = caravan
             .members
             .iter()
-            .map(|number| format!("#{number}"))
+            .map(|number| {
+                output.analysis.pull_requests.get(number).map_or_else(
+                    || format!("#{number}"),
+                    |pull| pr_link(*number, &pull.title, &pull.url),
+                )
+            })
             .collect::<Vec<_>>()
-            .join(" -> ");
-        let _ = writeln!(text, "  #{}: {chain}", caravan.id);
+            .join(&dim("  →  "));
+        let _ = writeln!(
+            text,
+            "  {}  {chain}",
+            styled("1;35", format!("van #{}", caravan.id))
+        );
     }
     if output.merge_candidates_truncated > 0 {
         let _ = writeln!(
@@ -1137,19 +1435,39 @@ fn render_status(output: &caravan::read::StatusOutput) -> String {
         }
     }
     if !output.admission.candidates.is_empty() {
-        let _ = writeln!(text, "automatic admission (priority then FIFO):");
+        let _ = writeln!(text, "\n{}", heading("WAITING AT THE RAIL"));
         for candidate in &output.admission.candidates {
-            let _ = writeln!(text, "  #{}: {}", candidate.pr, candidate.reason);
+            let label = output
+                .analysis
+                .pull_requests
+                .get(&candidate.pr)
+                .map_or_else(
+                    || format!("#{}", candidate.pr),
+                    |pull| pr_link(candidate.pr, &pull.title, &pull.url),
+                );
+            let _ = writeln!(text, "  {label}\n    {}", dim(&candidate.reason));
         }
     }
     for skipped in &output.admission.skipped {
         let _ = writeln!(text, "~ admission #{}: {}", skipped.pr, skipped.reason);
     }
     for rejected in &output.admission.rejected {
-        let _ = writeln!(text, "! admission #{}: {}", rejected.pr, rejected.reason);
+        let _ = writeln!(
+            text,
+            "{} admission #{}: {}",
+            warning("!"),
+            rejected.pr,
+            rejected.reason
+        );
     }
     for problem in &output.analysis.fleet.problems {
-        let _ = writeln!(text, "! {:?}: {}", problem.kind, problem.message);
+        let _ = writeln!(
+            text,
+            "{} {:?}: {}",
+            failure("!"),
+            problem.kind,
+            problem.message
+        );
     }
     text
 }
@@ -1226,15 +1544,20 @@ fn render_show(output: &caravan::read::ShowOutput) -> String {
 }
 
 fn render_check(output: &caravan::read::CheckOutput) -> String {
+    let eligibility = if output.eligible {
+        success("eligible")
+    } else {
+        failure("not eligible")
+    };
     let mut text = format!(
-        "check: {} ({:?}) — PR #{} [{}@{} -> {}@{}]; next: {:?}",
-        if output.eligible {
-            "eligible"
-        } else {
-            "not eligible"
-        },
-        output.mode,
-        output.current_pr,
+        "{}  {}  {eligibility}  {}\n  {}@{}  →  {}@{}\n  next: {:?}",
+        heading("CHECK"),
+        pr_link(
+            output.current_pr,
+            &output.candidate.title,
+            &output.candidate.url,
+        ),
+        dim(format!("{:?}", output.mode)),
         output.candidate.head.name,
         output.candidate.head.oid,
         output.candidate.base.name,
@@ -1693,10 +2016,19 @@ mod tests {
             pauses: Vec::new(),
         };
         let rendered = render_status(&output);
-        assert!(rendered.contains("harryaskham/caravan @ main — healthy"));
+        assert!(rendered.contains("CARAVAN  harryaskham/caravan @ main  healthy"));
         assert!(rendered.contains("current: feature (no open PR)"));
         assert!(rendered.contains("rebase_on_join=disabled"));
         assert!(rendered.contains("set `rebase_on_join: true`"));
         assert!(!rendered.contains("\"analysis\""));
+    }
+
+    #[test]
+    fn interactive_branch_slug_has_sane_bounded_defaults() {
+        assert_eq!(
+            slugify("Fix: sync the Really Great Queue!"),
+            "fix-sync-the-really-great-queue"
+        );
+        assert!(slugify("---").starts_with("work-"));
     }
 }

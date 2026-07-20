@@ -442,7 +442,13 @@ fn execute_locked(
             + std::time::Duration::from_secs(context.config.sync.max_duration_secs)
     });
     let mut status = candidate_pr.map_or_else(
-        || read::status_with_deadline_and_budget(context, operation_deadline, github_budget),
+        || {
+            if request.create_pr {
+                read::status_for_pr_creation(context, operation_deadline, github_budget)
+            } else {
+                read::status_with_deadline_and_budget(context, operation_deadline, github_budget)
+            }
+        },
         |number| {
             read::status_for_remote_candidate_with_deadline(
                 context,
@@ -465,7 +471,7 @@ fn execute_locked(
     let repository = status.repository.clone();
     let failure_status = status.clone();
     let default_branch_oid = status.analysis.fleet.default_branch.oid.clone();
-    let candidate_source_head_oid = status
+    let mut candidate_source_head_oid = status
         .current_pr
         .and_then(|number| status.analysis.pull_requests.get(&number))
         .map(|candidate| candidate.head.oid.clone());
@@ -482,12 +488,74 @@ fn execute_locked(
             head_oid: target.tail.head.oid.clone(),
         });
     let mut force_invalidation = None;
+    let mut creation_state = None;
     let rebase_receipt = if context.config.rebase_on_join {
         if request.create_pr && status.current_pr.is_none() {
-            return Err(AppError::validation(
-                "rebase_requires_existing_pr",
-                "rebase_on_join requires an existing discovered PR so no provider write precedes the complete rewrite preflight",
-            ));
+            let current_branch = status.current_branch.clone().ok_or_else(|| {
+                AppError::validation(
+                    "current_branch_not_found",
+                    "--create-pr requires a named non-default current branch",
+                )
+            })?;
+            if current_branch == status.default_branch {
+                return Err(AppError::structured(
+                    ErrorCategory::Validation,
+                    "create_pr_on_default_branch",
+                    "cannot create a pull request directly from the default branch",
+                    Some(json!({
+                        "branch": current_branch,
+                        "default_branch": status.default_branch,
+                        "safe_next_action": "create a topic branch, commit the intended changes, then rerun the same command"
+                    })),
+                ));
+            }
+            let desired_base = initial_join_target.as_ref().map_or_else(
+                || status.default_branch.clone(),
+                |target| target.tail.head.name.clone(),
+            );
+            let mut state = ExecutionState::new(request.operation);
+            crate::initialization::require_ready(&status.initialization)?;
+            preflight_repository(
+                &provider,
+                &status.repository,
+                &status.default_branch,
+                request.operation,
+                &request.agent_priority_labels,
+                context.config.sync.actions.join_unlabelled_prs,
+                &state,
+            )?;
+            let receipt = provider
+                .create_pull_request(
+                    &status.repository,
+                    &CreatePullRequestInput {
+                        head: current_branch,
+                        base: desired_base,
+                        draft: false,
+                    },
+                )
+                .map_err(|error| mutation_error(&error, &state))?;
+            let created = receipt.after.clone();
+            candidate_source_head_oid = Some(created.head.oid.clone());
+            state.record(
+                receipt,
+                "created pull request before exact physical join preflight",
+            );
+            creation_state = Some(state);
+            status =
+                read::status_with_deadline_and_budget(context, operation_deadline, github_budget)?;
+            if status.current_pr != Some(created.number) {
+                return Err(AppError::structured(
+                    ErrorCategory::ExecutionFailure,
+                    "created_pr_rediscovery_failed",
+                    "created pull request was not the current branch PR after exact rediscovery",
+                    Some(json!({
+                        "created_pr": created.number,
+                        "current_pr": status.current_pr,
+                        "resumable": true,
+                        "safe_next_action": "inspect the preserved open PR and rerun the same membership command"
+                    })),
+                ));
+            }
         }
         let number = status.current_pr.ok_or_else(|| {
             AppError::validation(
@@ -638,6 +706,15 @@ fn execute_locked(
         }
         Err(error) => return Err(error),
     };
+    if let Some(mut created) = creation_state {
+        created.steps.append(&mut output.receipt.completed_steps);
+        output.receipt.completed_steps = created.steps;
+        output.receipt.changed = true;
+        created
+            .provider_receipts
+            .append(&mut output.provider_receipts);
+        output.provider_receipts = created.provider_receipts;
+    }
     if let Some(mut invalidation) = force_invalidation {
         invalidation
             .steps

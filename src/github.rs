@@ -32,6 +32,9 @@ pub struct DiscoveryOptions {
     pub open_limit: usize,
     /// Maximum recently updated merged labelled PRs to fetch.
     pub merged_limit: usize,
+    /// Treat one exact merged unlabelled branch generation as ancestry evidence
+    /// for an explicitly requested fresh PR creation.
+    pub allow_unlabelled_historical_pr_creation: bool,
 }
 
 impl Default for DiscoveryOptions {
@@ -40,6 +43,7 @@ impl Default for DiscoveryOptions {
             label: "caravan".to_owned(),
             open_limit: 1_000,
             merged_limit: 100,
+            allow_unlabelled_historical_pr_creation: false,
         }
     }
 }
@@ -1362,7 +1366,14 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
             return Err(fail("closed_unmerged"));
         }
         if !historical.has_label(&self.options.label) {
-            return Err(fail("missing_caravan_label"));
+            if !self.options.allow_unlabelled_historical_pr_creation {
+                return Err(fail("missing_caravan_label"));
+            }
+            if historical.cross_repository || historical.head.repository != *repository {
+                return Err(fail("fork_only_head"));
+            }
+            self.validate_reused_historical_head(repository, branch, historical)?;
+            return Ok(None);
         }
         if historical.cross_repository || historical.head.repository != *repository {
             return Err(fail("fork_only_head"));
@@ -1428,6 +1439,37 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
                 }
             }
         }
+    }
+
+    fn validate_reused_historical_head(
+        &self,
+        repository: &RepositoryId,
+        branch: &str,
+        historical: &model::PullRequestSnapshot,
+    ) -> Result<(), DiscoveryError> {
+        let fail = |reason| DiscoveryError::HistoricalCurrentPullRequest {
+            reason,
+            branch: branch.to_owned(),
+            candidates: vec![historical.number.0],
+        };
+        let local_oid = self.command_text(current_head_oid_command())?;
+        let remote: GitRefJson = self.json(historical_head_command(&repository.slug(), branch))?;
+        if local_oid == historical.head.oid.0 || remote.object.sha == historical.head.oid.0 {
+            return Err(fail("unchanged_merged_head"));
+        }
+        if local_oid != remote.object.sha {
+            return Err(fail("unpublished_generation"));
+        }
+        let ancestry = self.runner.run(&CommandSpec::new("git").args([
+            "merge-base",
+            "--is-ancestor",
+            historical.head.oid.0.as_str(),
+            local_oid.as_str(),
+        ]))?;
+        if !ancestry.is_success() {
+            return Err(fail("historical_head_not_ancestor"));
+        }
+        Ok(())
     }
 
     fn validate_historical_head(
@@ -2885,6 +2927,37 @@ mod tests {
                 ..
             }
         ));
+        discovery.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn explicit_pr_creation_accepts_one_advanced_unlabelled_merged_branch() {
+        let unlabelled =
+            merged_pr_json().replace(r#""labels":[{"name":"caravan"}]"#, r#""labels":[]"#);
+        let mut calls = historical_discovery_calls("[]", unlabelled);
+        calls.extend([
+            (
+                current_head_oid_command(),
+                CommandOutput::success("new-head\n"),
+            ),
+            (
+                historical_head_command("acme/widgets", "old-head"),
+                CommandOutput::success(r#"{"object":{"sha":"new-head"}}"#),
+            ),
+            (
+                CommandSpec::new("git").args(["merge-base", "--is-ancestor", "head-9", "new-head"]),
+                CommandOutput::success(""),
+            ),
+        ]);
+        let discovery =
+            GitHubDiscovery::new(FakeRunner::new(calls)).with_options(DiscoveryOptions {
+                allow_unlabelled_historical_pr_creation: true,
+                ..DiscoveryOptions::default()
+            });
+        let snapshot = discovery
+            .discover()
+            .expect("advanced historical branch is fresh PR ancestry");
+        assert_eq!(snapshot.current_pr, None);
         discovery.runner.assert_exhausted();
     }
 

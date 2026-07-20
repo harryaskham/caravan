@@ -94,7 +94,11 @@ A dangling base is reconciled when it belongs to a just-merged labelled predeces
 
 ## 5. Command contract
 
-All commands are non-interactive.
+JSON, MCP, hooks, loops, and non-TTY CLI calls are non-interactive. Human CLI
+membership commands may provide a terminal-only branch/commit/publish/PR
+assistant; it is never active under JSON/MCP or without a controlling TTY, and
+every Git/provider mutation remains confirmed and subject to the same exact
+preconditions.
 
 ### Repository initialization
 
@@ -150,9 +154,11 @@ Remote `--pr` preflight must select the canonical first priority/FIFO attempt. A
 - `cara renew [--create-pr]` — reevaluate an evicted current PR as a new caravan.
 - `cara rejoin [--tail-pr N | --head-pr N] [--create-pr]` — reevaluate an evicted current PR and append it.
 
-Without a current PR, these commands fail unless `--create-pr` is set. Creation uses the non-interactive equivalent of `gh pr create --fill` and then continues.
+Without a current PR, automation fails unless `--create-pr` is set. Creation uses the non-interactive equivalent of `gh pr create --fill` and then continues. In a human TTY, `new` and local `join` offer that continuation automatically. They publish an unpublished topic branch only after confirmation. When invoked from the default branch, the assistant displays the complete short status and may, after confirmation, create a topic branch, stage all displayed changes, commit with an editable default message, push, create the PR, and resume. A clean default branch can only become a new topic branch; Cara explains that a real commit is required and never fabricates an empty change. `NO_COLOR` suppresses ANSI styling; terminal OSC-8 PR links and titles are presentation-only and never enter JSON/MCP.
 
 `join`/`rejoin` without a target succeed only when exactly one valid caravan tail exists; otherwise they return candidate tails and require an explicit target.
+
+An explicit create on a branch previously used by exactly one same-repository merged unlabelled PR may proceed only when the current local and provider branch agree on a new head, the historical head is its ancestor, and the new generation differs from the merged head. The merged PR remains untouched and unlabelled. Multiple historical PRs, unchanged/unpublished generations, non-ancestry, deleted branches, and forks fail closed. Plain membership without create retains strict historical-navigation refusal.
 
 `new`/`join` reject active or evicted PRs, closed PRs, PRs with auto-merge already enabled, and stale/incompatible graphs. `renew`/`rejoin` additionally remove `caravan-evicted` only after all other preconditions pass.
 

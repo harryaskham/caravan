@@ -430,11 +430,31 @@ pub(crate) fn status_with_deadline(
 }
 
 /// Status with one shared exact authenticated GitHub request budget.
-#[allow(clippy::too_many_lines)]
 pub(crate) fn status_with_deadline_and_budget(
     context: &AppContext,
     operation_deadline: std::time::Instant,
     github_budget: Option<&crate::command::GithubRequestBudget>,
+) -> Result<StatusOutput, AppError> {
+    status_with_discovery_options(context, operation_deadline, github_budget, false)
+}
+
+/// Explicit PR-creation discovery permits one safe, advanced, unlabelled
+/// historical branch generation to be treated as ancestry rather than current
+/// membership. Ordinary status/navigation keeps the strict historical rule.
+pub(crate) fn status_for_pr_creation(
+    context: &AppContext,
+    operation_deadline: std::time::Instant,
+    github_budget: Option<&crate::command::GithubRequestBudget>,
+) -> Result<StatusOutput, AppError> {
+    status_with_discovery_options(context, operation_deadline, github_budget, true)
+}
+
+#[allow(clippy::too_many_lines)]
+fn status_with_discovery_options(
+    context: &AppContext,
+    operation_deadline: std::time::Instant,
+    github_budget: Option<&crate::command::GithubRequestBudget>,
+    allow_unlabelled_historical_pr_creation: bool,
 ) -> Result<StatusOutput, AppError> {
     // Sharing one absolute deadline prevents a large repository from
     // multiplying its budget by provider and compatibility subprocess count.
@@ -447,7 +467,12 @@ pub(crate) fn status_with_deadline_and_budget(
     let provider_runner = github_budget.map_or(provider_runner.clone(), |budget| {
         provider_runner.with_github_request_budget(budget.clone())
     });
-    let discovery = GitHubDiscovery::new(provider_runner.clone());
+    let discovery = GitHubDiscovery::new(provider_runner.clone()).with_options(
+        crate::github::DiscoveryOptions {
+            allow_unlabelled_historical_pr_creation,
+            ..crate::github::DiscoveryOptions::default()
+        },
+    );
     let snapshot = discovery.discover().map_err(|error| {
         let mapped =
             if let DiscoveryError::Runner(CommandRunError::Timeout { command, .. }) = &error {

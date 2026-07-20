@@ -103,6 +103,22 @@ cara feedback status | report
 
 `cara next-candidate` selects the canonical priority/FIFO attempt. Preflight that exact provider candidate with `cara check --pr N` (and optionally `--tail-pr T` or `--head-pr H`) without checking out or mutating a branch, base, label, or auto-merge state. The receipt includes the canonical provider candidate identity/freshness evidence, exact head/base repository and OIDs, draft/labels/auto-merge facts, enrollment and canonical-order state, pairwise conflict paths, and a mechanical `new`, `join`, `repair`, `wait`, or `reject` continuation. Provider/ref races fail closed, and a rejected first attempt is never silently leapfrogged.
 
+Human CLI output is terminal-aware: concise sectioned layouts use color when
+stdout is a TTY, honor `NO_COLOR`, and render PR numbers/titles as OSC-8 GitHub
+links where supported. JSON/MCP remains unstyled and stable for `jq` and agents.
+
+For `cara new` and local `cara join`, `--create-pr` remains the deterministic
+noninteractive contract. In an interactive terminal, a missing PR now offers to
+publish the current topic branch and create a commit-derived PR automatically.
+If invoked from the default branch with changes, Cara shows the exact changed
+paths and, after confirmation, creates a named topic branch, stages and commits
+the listed changes, publishes it, creates the PR, and resumes membership. On a
+clean default branch it creates the requested topic branch and tells the user to
+make a commit before rerunning; no empty PR is invented. Advanced same-repository
+branches with one merged historical PR are safe fresh-generation ancestry for
+an explicit create, while ambiguous reuse, unchanged old heads, unpushed heads,
+forks, and provider races still fail closed.
+
 First use is always explicit: run `cara status`, then `cara init`. Init atomically
 creates `.caravan/config.yaml` only when absent, verifies repository permission,
 default-branch protection, and squash auto-merge policy, and creates only the
