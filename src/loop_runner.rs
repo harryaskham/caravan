@@ -149,7 +149,19 @@ fn ready_unqueued_events(output: &SyncOutput) -> Vec<CaravanEvent> {
         );
         metadata.insert(
             "rejection_policy".to_owned(),
-            serde_json::json!("fail closed without automatic leapfrogging"),
+            serde_json::json!(if output.auto_admission.enabled {
+                "sync-owned greedy admission may persist an exact generation-bound skip before considering a later candidate"
+            } else {
+                "fail closed without automatic leapfrogging"
+            }),
+        );
+        metadata.insert(
+            "auto_admission".to_owned(),
+            serde_json::json!({
+                "enabled": output.auto_admission.enabled,
+                "heuristic_version": output.auto_admission.heuristic_version,
+                "continuation": output.auto_admission.continuation,
+            }),
         );
         metadata.insert(
             "admission_reason".to_owned(),
@@ -208,6 +220,7 @@ mod tests {
                     completed_steps: Vec::new(),
                     changed: false,
                 },
+                auto_admission: crate::sync::AutoAdmissionOutput::default(),
                 scheduler_status: crate::sync::SyncSchedulerStatus {
                     schema_version: 1,
                     disposition: crate::sync::SchedulerDisposition::Healthy,
@@ -243,6 +256,7 @@ mod tests {
                     timing: None,
                     repository: repository.clone(),
                     rebase_on_join: crate::read::RebaseOnJoinStatus::default(),
+                    auto_admission: crate::read::AutoAdmissionStatus::default(),
                     default_branch: "main".to_owned(),
                     current_branch: None,
                     current_pr: None,
@@ -252,6 +266,7 @@ mod tests {
                         policy: "priority then FIFO".to_owned(),
                         priority_labels: Vec::new(),
                         candidates: Vec::new(),
+                        skipped: Vec::new(),
                         rejected: Vec::new(),
                         next_candidate: None,
                     },

@@ -28,11 +28,15 @@ use crate::model::{
 };
 use crate::operation_lock::{OperationLock, OperationLockRecovery};
 use crate::read::{self, StatusOutput};
-use crate::{AppContext, AppError, SyncInput};
+use crate::{AppContext, AppError, CheckInput, SyncInput};
 
-const MAX_SYNC_OPERATION_SECS: u64 = 150;
-const SYNC_BUDGET_MULTIPLIER: u64 = 5;
+const MAX_SYNC_OPERATION_SECS: u64 = 3_600;
 const MAX_PARALLEL_REBASE_CHAINS: usize = 2;
+const AUTO_ADMISSION_SKIP_LABEL: &str = "caravan-join-skipped";
+const AUTO_ADMISSION_SKIP_PREFIX: &str = "<!-- caravan-auto-join-skip-receipt:";
+const MAX_AUTO_ADMISSION_COMMENT_BYTES: usize = 60 * 1024;
+/// Evolvable deterministic best-effort queue heuristic exposed in receipts.
+pub const AUTO_ADMISSION_HEURISTIC_VERSION: &str = "priority_fifo_greedy_v1";
 
 /// One observed rolling-head transition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -193,10 +197,195 @@ pub struct SyncFailureSchedulerStatus {
     pub error_code: String,
 }
 
+/// Why one bounded automatic-admission phase stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoAdmissionContinuation {
+    Disabled,
+    RequiresSyncAll,
+    Complete,
+    CandidateBudgetExhausted,
+    MutationBudgetExhausted,
+    GithubRequestBudgetExhausted,
+    DeadlineExhausted,
+    RejectedCanonicalCandidate,
+}
+
+/// Exact live tail generation considered by the greedy heuristic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AutoAdmissionTailGeneration {
+    pub caravan_id: PrNumber,
+    pub tail_pr: PrNumber,
+    pub branch: String,
+    pub head_oid: crate::model::CommitOid,
+    /// Active or expired explicit hold; stale holds do not freeze admission.
+    pub held: bool,
+}
+
+/// Durable generation-bound explanation for one best-effort skip.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AutoJoinSkipReceipt {
+    pub schema_version: u32,
+    pub repository: RepositoryId,
+    pub candidate_pr: PrNumber,
+    pub candidate_head: crate::model::BranchSnapshot,
+    pub candidate_base: crate::model::BranchSnapshot,
+    pub default_branch: crate::model::BranchSnapshot,
+    #[serde(default)]
+    pub tested_tails: Vec<AutoAdmissionTailGeneration>,
+    pub config_fingerprint: String,
+    pub heuristic_version: String,
+    #[serde(default)]
+    pub compatibility_reasons: Vec<String>,
+    pub actor: String,
+    pub observed_unix_secs: u64,
+    /// Deterministic hash with this field omitted.
+    pub evidence_hash: String,
+}
+
+impl AutoJoinSkipReceipt {
+    fn finalize_hash(mut self) -> Self {
+        self.evidence_hash.clear();
+        let material = serde_json::to_vec(&self).expect("skip receipt serializes");
+        self.evidence_hash = crate::membership::fnv1a64(&material);
+        self
+    }
+
+    fn hash_is_valid(&self) -> bool {
+        let mut material = self.clone();
+        let expected = material.evidence_hash.clone();
+        material.evidence_hash.clear();
+        serde_json::to_vec(&material)
+            .ok()
+            .is_some_and(|bytes| crate::membership::fnv1a64(&bytes) == expected)
+    }
+
+    fn marker(&self) -> String {
+        let encoded =
+            hex_encode(&serde_json::to_vec(self).expect("validated skip receipt serializes"));
+        format!("{AUTO_ADMISSION_SKIP_PREFIX}{encoded} -->")
+    }
+
+    fn comment_body(&self) -> String {
+        format!(
+            "{}\n### Cara automatic admission skip\n\nPR #{} was not mechanically compatible with any deterministic target under `{}`. This evidence is bound to the exact candidate/default/tail/config generations and becomes stale automatically when any bound fact changes. Manual `cara new`, `join`, or `rejoin` remains authoritative.\n\n- **Evidence:** `{}`\n- **Exact compatibility findings:** {} (encoded in the receipt marker)\n",
+            self.marker(),
+            self.candidate_pr,
+            self.heuristic_version,
+            self.evidence_hash,
+            self.compatibility_reasons.len(),
+        )
+    }
+
+    fn from_comment(body: &str) -> Option<Self> {
+        let start = body.find(AUTO_ADMISSION_SKIP_PREFIX)? + AUTO_ADMISSION_SKIP_PREFIX.len();
+        let remainder = &body[start..];
+        let end = remainder.find(" -->")?;
+        let bytes = hex_decode(&remainder[..end])?;
+        let receipt: Self = serde_json::from_slice(&bytes).ok()?;
+        receipt.hash_is_valid().then_some(receipt)
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    output
+}
+
+fn hex_decode(input: &str) -> Option<Vec<u8>> {
+    if input.len() % 2 != 0 {
+        return None;
+    }
+    input
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair).ok()?;
+            u8::from_str_radix(pair, 16).ok()
+        })
+        .collect()
+}
+
+/// One exact successful sync-owned membership mutation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AutoAdmissionJoinReceipt {
+    pub candidate_pr: PrNumber,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_tail: Option<PrNumber>,
+    pub membership: crate::membership::MembershipOutput,
+}
+
+/// Stable bounded result of the opt-in greedy auto-admission phase.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AutoAdmissionOutput {
+    pub enabled: bool,
+    pub heuristic_version: String,
+    pub continuation: AutoAdmissionContinuation,
+    pub candidates_considered: u32,
+    pub mutations_used: u32,
+    pub mutation_limit: u32,
+    pub github_requests_used: u32,
+    pub github_request_limit: u32,
+    #[serde(default)]
+    pub joins: Vec<AutoAdmissionJoinReceipt>,
+    #[serde(default)]
+    pub skips: Vec<AutoJoinSkipReceipt>,
+    #[serde(default)]
+    pub remaining_candidates: Vec<PrNumber>,
+}
+
+impl Default for AutoAdmissionOutput {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            heuristic_version: AUTO_ADMISSION_HEURISTIC_VERSION.to_owned(),
+            continuation: AutoAdmissionContinuation::Disabled,
+            candidates_considered: 0,
+            mutations_used: 0,
+            mutation_limit: 0,
+            github_requests_used: 0,
+            github_request_limit: 0,
+            joins: Vec::new(),
+            skips: Vec::new(),
+            remaining_candidates: Vec::new(),
+        }
+    }
+}
+
+impl AutoAdmissionOutput {
+    fn disabled(context: &AppContext, all: bool) -> Self {
+        let enabled = context.config.sync.actions.join_unlabelled_prs;
+        Self {
+            enabled,
+            heuristic_version: AUTO_ADMISSION_HEURISTIC_VERSION.to_owned(),
+            continuation: if enabled && !all {
+                AutoAdmissionContinuation::RequiresSyncAll
+            } else {
+                AutoAdmissionContinuation::Disabled
+            },
+            candidates_considered: 0,
+            mutations_used: 0,
+            mutation_limit: context.config.sync.max_mutations_per_tick,
+            github_requests_used: 0,
+            github_request_limit: context.config.sync.max_github_requests_per_tick,
+            joins: Vec::new(),
+            skips: Vec::new(),
+            remaining_candidates: Vec::new(),
+        }
+    }
+}
+
 /// Stable result of one converged synchronization tick.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SyncOutput {
     pub receipt: OperationReceipt,
+    /// Opt-in sync-owned best-effort admission receipts and continuation.
+    #[serde(default)]
+    pub auto_admission: AutoAdmissionOutput,
     /// Explicit no-wake/decision status for external deterministic schedulers.
     pub scheduler_status: SyncSchedulerStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -289,11 +478,32 @@ pub trait SyncProvider {
         expected: &PullRequestPrecondition,
     ) -> Result<GitHubMutationReceipt, MutationError>;
 
+    fn add_label(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+        label: &str,
+    ) -> Result<GitHubMutationReceipt, MutationError>;
+
     fn remove_label(
         &self,
         repository: &RepositoryId,
         expected: &PullRequestPrecondition,
         label: &str,
+    ) -> Result<GitHubMutationReceipt, MutationError>;
+
+    fn pull_request_comment_bodies(
+        &self,
+        repository: &RepositoryId,
+        number: PrNumber,
+    ) -> Result<Vec<String>, MutationError>;
+
+    fn ensure_marked_comment(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+        marker: &str,
+        body: &str,
     ) -> Result<GitHubMutationReceipt, MutationError>;
 
     fn failed_runs_for_pull_request(
@@ -398,6 +608,15 @@ impl<R: crate::command::CommandRunner> SyncProvider for GitHubMutationAdapter<R>
         self.disable_auto_merge(repository, expected)
     }
 
+    fn add_label(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+        label: &str,
+    ) -> Result<GitHubMutationReceipt, MutationError> {
+        self.add_label(repository, expected, label)
+    }
+
     fn remove_label(
         &self,
         repository: &RepositoryId,
@@ -405,6 +624,24 @@ impl<R: crate::command::CommandRunner> SyncProvider for GitHubMutationAdapter<R>
         label: &str,
     ) -> Result<GitHubMutationReceipt, MutationError> {
         self.remove_label(repository, expected, label)
+    }
+
+    fn pull_request_comment_bodies(
+        &self,
+        repository: &RepositoryId,
+        number: PrNumber,
+    ) -> Result<Vec<String>, MutationError> {
+        self.pull_request_comment_bodies(repository, number)
+    }
+
+    fn ensure_marked_comment(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+        marker: &str,
+        body: &str,
+    ) -> Result<GitHubMutationReceipt, MutationError> {
+        self.ensure_marked_comment(repository, expected, marker, body)
     }
 
     fn failed_runs_for_pull_request(
@@ -490,8 +727,8 @@ fn sync_operation_budget(context: &AppContext) -> Duration {
     Duration::from_secs(
         context
             .config
-            .command_timeout_secs
-            .saturating_mul(SYNC_BUDGET_MULTIPLIER)
+            .sync
+            .max_duration_secs
             .min(MAX_SYNC_OPERATION_SECS),
     )
 }
@@ -533,7 +770,11 @@ fn prepare_physical_chains(
     operation_deadline: Instant,
 ) -> Result<(Vec<PreparedChain>, SyncProgress), AppError> {
     let selected = selected_unpaused_caravans(status, all)?;
-    let progress = SyncProgress::new(status, selected.iter().map(|caravan| caravan.id).collect());
+    let progress = SyncProgress::new(
+        status,
+        selected.iter().map(|caravan| caravan.id).collect(),
+        context.config.sync.max_mutations_per_tick,
+    );
     preflight_repository(provider, status, &progress)?;
     validate_rebase_preflight_graph(status, &selected, &progress)?;
     let timeout = Duration::from_secs(context.config.command_timeout_secs);
@@ -700,7 +941,11 @@ fn verify_physical_write_barrier(
                 .map_err(|error| {
                     mutation_error(
                         &error,
-                        &SyncProgress::new(status, Vec::new()),
+                        &SyncProgress::new(
+                            status,
+                            Vec::new(),
+                            context.config.sync.max_mutations_per_tick,
+                        ),
                         Some(prepared.plan.pr),
                     )
                 })?;
@@ -753,6 +998,7 @@ fn invalidate_rewritten_force_intents(
                 "not applicable: force intent is removed before branch history changes".to_owned(),
             admission_priority_basis: "not applicable: caravan order is unchanged".to_owned(),
         };
+        progress.ensure_mutation_capacity(1)?;
         let receipt = provider
             .remove_label(
                 &status.repository,
@@ -769,6 +1015,7 @@ fn invalidate_rewritten_force_intents(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn apply_physical_chains(
     status: &StatusOutput,
     provider: &impl SyncProvider,
@@ -797,6 +1044,17 @@ fn apply_physical_chains(
             }
         }
     }
+    let planned_branch_writes = u32::try_from(
+        outcome
+            .plans
+            .iter()
+            .filter(|plan| !plan.already_satisfied)
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
+    progress
+        .ensure_mutation_capacity(planned_branch_writes)
+        .map_err(|error| attach_physical_rebuild(error, &outcome))?;
     outcome
         .provider_receipts
         .clone_from(&progress.provider_receipts);
@@ -1298,13 +1556,17 @@ fn sync_with_lock(
         false,
     )?;
     let timeout = Duration::from_secs(context.config.command_timeout_secs);
+    let github_budget =
+        crate::command::GithubRequestBudget::new(context.config.sync.max_github_requests_per_tick);
     let initial_status_started = Instant::now();
-    let mut status = read::status_with_deadline(context, operation_deadline)?;
+    let mut status =
+        read::status_with_deadline_and_budget(context, operation_deadline, Some(&github_budget))?;
     let initial_status_elapsed = initial_status_started.elapsed();
     crate::initialization::require_ready(&status.initialization)?;
     let runner = crate::command::ProcessRunner::in_directory(&context.repository_path)
         .with_timeout(timeout)
-        .with_operation_deadline(operation_deadline);
+        .with_operation_deadline(operation_deadline)
+        .with_github_request_budget(github_budget.clone());
     // A decision can require an exact branch checkout. Prove checkout safety
     // before the first provider mutation so a dirty worktree can never turn a
     // partially-mutated sync into an unrepairable decision receipt.
@@ -1350,8 +1612,12 @@ fn sync_with_lock(
             }),
             false,
         )?;
-        let midpoint = read::status_with_deadline(context, operation_deadline)
-            .map_err(|error| attach_physical_rebuild(error, &physical_rebuild))?;
+        let midpoint = read::status_with_deadline_and_budget(
+            context,
+            operation_deadline,
+            Some(&github_budget),
+        )
+        .map_err(|error| attach_physical_rebuild(error, &physical_rebuild))?;
         for receipt in &physical_rebuild.receipts {
             let observed = midpoint
                 .analysis
@@ -1400,12 +1666,25 @@ fn sync_with_lock(
         }),
         true,
     )?;
-    let mut progress = execute(
+    let physical_mutations = u32::try_from(
+        physical_rebuild
+            .steps
+            .iter()
+            .filter(|step| step.state == MutationStepState::Completed)
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
+    let mut progress = execute_bounded(
         &status,
         &provider,
         input.all,
         input.rerun_failed,
         context.config.force_merge,
+        context
+            .config
+            .sync
+            .max_mutations_per_tick
+            .saturating_sub(physical_mutations),
     )?;
     if context.config.rebase_on_join {
         physical_rebuild.steps.append(&mut progress.steps);
@@ -1416,6 +1695,7 @@ fn sync_with_lock(
         progress.provider_receipts = physical_rebuild.provider_receipts;
         progress.rebase_plans = physical_rebuild.plans;
         progress.rebase_receipts = physical_rebuild.receipts;
+        progress.mutation_limit = context.config.sync.max_mutations_per_tick;
     }
     let convergence_elapsed = convergence_started.elapsed();
     lock.checkpoint(
@@ -1432,7 +1712,12 @@ fn sync_with_lock(
     // A fresh graph is the authoritative completion receipt. It detects a
     // default-branch or fleet change that raced after the preflight proof.
     let final_status_started = Instant::now();
-    let final_status = read::status_with_deadline(context, operation_deadline).map_err(|error| {
+    let mut final_status = read::status_with_deadline_and_budget(
+        context,
+        operation_deadline,
+        Some(&github_budget),
+    )
+    .map_err(|error| {
         AppError::structured(
             error.category(),
             if error.category() == ErrorCategory::Timeout {
@@ -1454,7 +1739,6 @@ fn sync_with_lock(
             })),
         )
     })?;
-    let final_status_elapsed = final_status_started.elapsed();
     if let Some(problem) = final_status.analysis.fleet.problems.first() {
         return Err(decision_error(
             &decision_for_problem(problem, &final_status, &progress),
@@ -1462,6 +1746,80 @@ fn sync_with_lock(
         ));
     }
 
+    let mut auto_admission = AutoAdmissionOutput::disabled(context, input.all);
+    if context.config.sync.actions.join_unlabelled_prs && input.all {
+        lock.checkpoint(
+            "automatic_admission_in_flight",
+            json!({
+                "heuristic_version": AUTO_ADMISSION_HEURISTIC_VERSION,
+                "candidate_limit": context.config.sync.max_candidates_per_tick,
+                "mutation_limit": context.config.sync.max_mutations_per_tick,
+                "github_request_limit": github_budget.limit(),
+                "existing_fleet_converged": true,
+            }),
+            true,
+        )?;
+        let (admitted_status, admission) = run_auto_admission(
+            context,
+            final_status,
+            &provider,
+            &mut progress,
+            operation_deadline,
+            &github_budget,
+        )
+        .map_err(|error| {
+            attach_auto_admission_progress(&error, context, &progress, &github_budget)
+        })?;
+        final_status = admitted_status;
+        auto_admission = admission;
+
+        // Membership operations leave exact provider state, but a final normal
+        // convergence pass owns CI observation and rolling-head invariants for
+        // newly admitted members under the same lock and deadline.
+        if !auto_admission.joins.is_empty() {
+            let post_admission = execute_bounded(
+                &final_status,
+                &provider,
+                true,
+                input.rerun_failed,
+                context.config.force_merge,
+                context
+                    .config
+                    .sync
+                    .max_mutations_per_tick
+                    .saturating_sub(completed_mutation_count(&progress)),
+            )
+            .map_err(|error| {
+                attach_auto_admission_progress(&error, context, &progress, &github_budget)
+            })?;
+            merge_sync_progress(&mut progress, post_admission);
+            final_status = read::status_with_deadline_and_budget(
+                context,
+                operation_deadline,
+                Some(&github_budget),
+            )?;
+            if let Some(problem) = final_status.analysis.fleet.problems.first() {
+                return Err(decision_error(
+                    &decision_for_problem(problem, &final_status, &progress),
+                    &progress,
+                ));
+            }
+        }
+        auto_admission.github_requests_used = github_budget.used();
+        auto_admission.mutations_used = completed_mutation_count(&progress);
+        lock.checkpoint(
+            "automatic_admission_complete",
+            json!({
+                "auto_admission": &auto_admission,
+                "provider_state": sync_checkpoint_evidence(&progress),
+            }),
+            false,
+        )?;
+    }
+
+    auto_admission.github_requests_used = github_budget.used();
+    auto_admission.mutations_used = completed_mutation_count(&progress);
+    let final_status_elapsed = final_status_started.elapsed();
     lock.checkpoint("completed", sync_checkpoint_evidence(&progress), false)?;
 
     let scheduler_status = successful_scheduler_status(
@@ -1472,6 +1830,7 @@ fn sync_with_lock(
     );
     Ok(SyncOutput {
         receipt: progress.operation_receipt(),
+        auto_admission,
         scheduler_status,
         timing: Some(SyncTiming {
             deadline_ms: duration_millis(operation_deadline.saturating_duration_since(started)),
@@ -1493,6 +1852,650 @@ fn sync_with_lock(
         hook_deliveries: Vec::new(),
         status: final_status,
     })
+}
+
+fn attach_auto_admission_progress(
+    error: &AppError,
+    context: &AppContext,
+    progress: &SyncProgress,
+    github_budget: &crate::command::GithubRequestBudget,
+) -> AppError {
+    let mut details = error.details().unwrap_or_else(|| json!({}));
+    if let Some(object) = details.as_object_mut() {
+        object.insert(
+            "auto_admission".to_owned(),
+            json!({
+                "enabled": true,
+                "heuristic_version": AUTO_ADMISSION_HEURISTIC_VERSION,
+                "operation_receipt": progress.operation_receipt(),
+                "provider_receipts": progress.provider_receipts,
+                "rebase_receipts": progress.rebase_receipts,
+                "github_requests_used": github_budget.used(),
+                "github_request_limit": github_budget.limit(),
+                "mutations_used": completed_mutation_count(progress),
+                "mutation_limit": context.config.sync.max_mutations_per_tick,
+                "resumable": true,
+                "next": "rerun the same bounded `cara sync --all` tick; fresh provider state is the cursor",
+            }),
+        );
+    }
+    AppError::structured(
+        error.category(),
+        error.code(),
+        error.message(),
+        Some(details),
+    )
+}
+
+fn completed_mutation_count(progress: &SyncProgress) -> u32 {
+    u32::try_from(
+        progress
+            .steps
+            .iter()
+            .filter(|step| step.state == MutationStepState::Completed)
+            .count(),
+    )
+    .unwrap_or(u32::MAX)
+}
+
+fn merge_sync_progress(target: &mut SyncProgress, mut source: SyncProgress) {
+    target.steps.append(&mut source.steps);
+    target
+        .provider_receipts
+        .append(&mut source.provider_receipts);
+    target.rebase_plans.append(&mut source.rebase_plans);
+    target.rebase_receipts.append(&mut source.rebase_receipts);
+    target.paused_caravans.append(&mut source.paused_caravans);
+    target
+        .head_advancements
+        .append(&mut source.head_advancements);
+    target.events.append(&mut source.events);
+    for observation in source.ci {
+        target.ci.retain(|existing| existing.pr != observation.pr);
+        target.ci.push(observation);
+    }
+    target
+        .synchronized_caravans
+        .append(&mut source.synchronized_caravans);
+    target.synchronized_caravans.sort_unstable();
+    target.synchronized_caravans.dedup();
+    target.current = source.current;
+    target.merge_candidates = source.merge_candidates;
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_auto_admission(
+    context: &AppContext,
+    mut status: StatusOutput,
+    provider: &impl SyncProvider,
+    progress: &mut SyncProgress,
+    operation_deadline: Instant,
+    github_budget: &crate::command::GithubRequestBudget,
+) -> Result<(StatusOutput, AutoAdmissionOutput), AppError> {
+    let mut output = AutoAdmissionOutput {
+        enabled: true,
+        heuristic_version: AUTO_ADMISSION_HEURISTIC_VERSION.to_owned(),
+        continuation: AutoAdmissionContinuation::Complete,
+        candidates_considered: 0,
+        mutations_used: completed_mutation_count(progress),
+        mutation_limit: context.config.sync.max_mutations_per_tick,
+        github_requests_used: github_budget.used(),
+        github_request_limit: github_budget.limit(),
+        joins: Vec::new(),
+        skips: Vec::new(),
+        remaining_candidates: Vec::new(),
+    };
+    progress.current = status.analysis.pull_requests.clone();
+    progress.merge_candidates = status
+        .merge_candidates
+        .iter()
+        .cloned()
+        .map(|candidate| (candidate.pr, candidate))
+        .collect();
+
+    let checker = crate::graph::GitCompatibilityChecker::new(&context.repository_path, "origin")
+        .with_timeout(Duration::from_secs(context.config.command_timeout_secs))
+        .with_operation_deadline(operation_deadline);
+    let mut validated_skips = BTreeSet::new();
+
+    // Revalidate persisted skips without recomputing compatibility. Exact
+    // candidate/default/tail/config generations are enough to prove whether the
+    // old heuristic receipt remains current.
+    loop {
+        if Instant::now() >= operation_deadline {
+            output.continuation = AutoAdmissionContinuation::DeadlineExhausted;
+            break;
+        }
+        if github_budget.used() >= github_budget.limit() {
+            output.continuation = AutoAdmissionContinuation::GithubRequestBudgetExhausted;
+            break;
+        }
+        let next = status
+            .admission
+            .skipped
+            .iter()
+            .find(|candidate| !validated_skips.contains(&candidate.pr))
+            .cloned();
+        let Some(skipped) = next else {
+            break;
+        };
+        let comments = provider
+            .pull_request_comment_bodies(&status.repository, skipped.pr)
+            .map_err(|error| mutation_error(&error, progress, Some(skipped.pr)))?;
+        let retained = comments
+            .iter()
+            .rev()
+            .find_map(|body| AutoJoinSkipReceipt::from_comment(body));
+        if retained
+            .as_ref()
+            .is_some_and(|receipt| skip_receipt_matches(context, &status, receipt))
+        {
+            let receipt = retained.expect("checked as present");
+            validated_skips.insert(skipped.pr);
+            output.skips.push(receipt);
+            progress.already(
+                MutationKind::Comment,
+                skipped.pr,
+                "generation-bound automatic admission skip remains exact",
+            );
+            continue;
+        }
+
+        if !has_mutation_capacity(context, progress, 2) {
+            output.continuation = AutoAdmissionContinuation::MutationBudgetExhausted;
+            break;
+        }
+        let candidate = status
+            .analysis
+            .pull_requests
+            .get(&skipped.pr)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::validation(
+                    "auto_admission_candidate_missing",
+                    format!("skipped candidate #{} disappeared", skipped.pr),
+                )
+            })?;
+        let old_hash = retained
+            .as_ref()
+            .map_or("missing", |receipt| receipt.evidence_hash.as_str());
+        let marker = format!(
+            "<!-- caravan-auto-join-skip-invalidated:{}:{}:{} -->",
+            skipped.pr, candidate.head.oid, old_hash,
+        );
+        let body = format!(
+            "{marker}\n### Cara automatic admission skip invalidated\n\nThe prior skip evidence `{old_hash}` no longer matches the candidate, default, tail, config, or heuristic generation. The candidate is eligible for a fresh bounded retry.\n"
+        );
+        let comment = provider
+            .ensure_marked_comment(
+                &status.repository,
+                &PullRequestPrecondition::from(&candidate),
+                &marker,
+                &body,
+            )
+            .map_err(|error| mutation_error(&error, progress, Some(skipped.pr)))?;
+        record_marked_comment(
+            progress,
+            comment,
+            skipped.pr,
+            "posted stale-skip invalidation authorization",
+        );
+        let removed = provider
+            .remove_label(
+                &status.repository,
+                &progress.precondition(skipped.pr),
+                AUTO_ADMISSION_SKIP_LABEL,
+            )
+            .map_err(|error| mutation_error(&error, progress, Some(skipped.pr)))?;
+        progress.record(
+            removed,
+            "removed stale generation-bound automatic admission skip",
+        );
+        status = read::status_with_deadline_and_budget(
+            context,
+            operation_deadline,
+            Some(github_budget),
+        )?;
+        progress.current = status.analysis.pull_requests.clone();
+        progress.merge_candidates = status
+            .merge_candidates
+            .iter()
+            .cloned()
+            .map(|candidate| (candidate.pr, candidate))
+            .collect();
+    }
+
+    while output.continuation == AutoAdmissionContinuation::Complete {
+        if Instant::now() >= operation_deadline {
+            output.continuation = AutoAdmissionContinuation::DeadlineExhausted;
+            break;
+        }
+        if github_budget.used() >= github_budget.limit() {
+            output.continuation = AutoAdmissionContinuation::GithubRequestBudgetExhausted;
+            break;
+        }
+        if output.candidates_considered >= context.config.sync.max_candidates_per_tick {
+            if !status.admission.candidates.is_empty() || !status.admission.rejected.is_empty() {
+                output.continuation = AutoAdmissionContinuation::CandidateBudgetExhausted;
+            }
+            break;
+        }
+        let Some(next_pr) = status.admission.next_candidate else {
+            break;
+        };
+        let Some(candidate_order) = status
+            .admission
+            .candidates
+            .iter()
+            .find(|candidate| candidate.pr == next_pr)
+            .cloned()
+        else {
+            output.continuation = AutoAdmissionContinuation::RejectedCanonicalCandidate;
+            break;
+        };
+        let candidate = status
+            .analysis
+            .pull_requests
+            .get(&next_pr)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::validation(
+                    "auto_admission_candidate_missing",
+                    format!("canonical candidate #{next_pr} disappeared"),
+                )
+            })?;
+        output.candidates_considered += 1;
+        let evaluation = evaluate_auto_candidate(&status, &candidate, &checker)?;
+
+        if matches!(evaluation.target, AutoCandidateTarget::Skip) {
+            if !has_mutation_capacity(context, progress, 2) {
+                output.continuation = AutoAdmissionContinuation::MutationBudgetExhausted;
+                break;
+            }
+            let receipt = AutoJoinSkipReceipt {
+                schema_version: 1,
+                repository: status.repository.clone(),
+                candidate_pr: candidate.number,
+                candidate_head: candidate.head.clone(),
+                candidate_base: candidate.base.clone(),
+                default_branch: status.analysis.fleet.default_branch.clone(),
+                tested_tails: evaluation.tested_tails,
+                config_fingerprint: auto_admission_config_fingerprint(context),
+                heuristic_version: AUTO_ADMISSION_HEURISTIC_VERSION.to_owned(),
+                compatibility_reasons: evaluation.reasons,
+                actor: "cara sync automatic admission".to_owned(),
+                observed_unix_secs: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                evidence_hash: String::new(),
+            }
+            .finalize_hash();
+            persist_auto_skip(provider, progress, &status.repository, &receipt)?;
+            output.skips.push(receipt);
+        } else {
+            let target_tail = match evaluation.target {
+                AutoCandidateTarget::New => None,
+                AutoCandidateTarget::Join(tail) => Some(tail),
+                AutoCandidateTarget::Skip => unreachable!("checked above"),
+            };
+            let conservative_membership_bound =
+                u32::try_from(context.config.agent_priority_labels.len().saturating_mul(2) + 12)
+                    .unwrap_or(u32::MAX);
+            if !has_mutation_capacity(context, progress, conservative_membership_bound) {
+                output.continuation = AutoAdmissionContinuation::MutationBudgetExhausted;
+                break;
+            }
+            let membership = crate::membership::auto_admit_locked(
+                context,
+                candidate.number,
+                target_tail,
+                candidate_order.priority_label,
+                operation_deadline,
+                github_budget,
+            )?;
+            append_membership_progress(progress, &membership);
+            output.joins.push(AutoAdmissionJoinReceipt {
+                candidate_pr: candidate.number,
+                target_tail,
+                membership,
+            });
+        }
+
+        status = read::status_with_deadline_and_budget(
+            context,
+            operation_deadline,
+            Some(github_budget),
+        )?;
+        progress.current = status.analysis.pull_requests.clone();
+        progress.merge_candidates = status
+            .merge_candidates
+            .iter()
+            .cloned()
+            .map(|candidate| (candidate.pr, candidate))
+            .collect();
+    }
+
+    output.mutations_used = completed_mutation_count(progress);
+    output.github_requests_used = github_budget.used();
+    output.remaining_candidates = status
+        .admission
+        .candidates
+        .iter()
+        .map(|candidate| candidate.pr)
+        .chain(
+            status
+                .admission
+                .rejected
+                .iter()
+                .map(|candidate| candidate.pr),
+        )
+        .collect();
+    Ok((status, output))
+}
+
+fn has_mutation_capacity(context: &AppContext, progress: &SyncProgress, reserve: u32) -> bool {
+    completed_mutation_count(progress).saturating_add(reserve)
+        <= context.config.sync.max_mutations_per_tick
+}
+
+fn append_membership_progress(
+    progress: &mut SyncProgress,
+    membership: &crate::membership::MembershipOutput,
+) {
+    progress
+        .steps
+        .extend(membership.receipt.completed_steps.iter().cloned());
+    progress
+        .provider_receipts
+        .extend(membership.provider_receipts.iter().cloned());
+    if let Some(receipt) = &membership.rebase_receipt {
+        progress.steps.push(MutationStep {
+            kind: MutationKind::RebaseBranch,
+            state: if receipt.already_satisfied {
+                MutationStepState::AlreadySatisfied
+            } else {
+                MutationStepState::Completed
+            },
+            pr: Some(receipt.pr),
+            summary: if receipt.already_satisfied {
+                "automatic admission candidate already had exact target ancestry".to_owned()
+            } else {
+                "automatic admission rebased candidate under exact force-with-lease".to_owned()
+            },
+        });
+        progress.rebase_receipts.push(receipt.clone());
+    }
+    progress.events.extend(membership.events.iter().cloned());
+    progress.current.insert(
+        membership.pull_request.number,
+        membership.pull_request.clone(),
+    );
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoCandidateTarget {
+    New,
+    Join(PrNumber),
+    Skip,
+}
+
+struct AutoCandidateEvaluation {
+    target: AutoCandidateTarget,
+    tested_tails: Vec<AutoAdmissionTailGeneration>,
+    reasons: Vec<String>,
+}
+
+fn evaluate_auto_candidate(
+    status: &StatusOutput,
+    candidate: &PullRequestSnapshot,
+    checker: &impl crate::graph::CompatibilityChecker,
+) -> Result<AutoCandidateEvaluation, AppError> {
+    let mut virtual_status = status.clone();
+    virtual_status.current_pr = Some(candidate.number);
+    if let Some(virtual_candidate) = virtual_status
+        .analysis
+        .pull_requests
+        .get_mut(&candidate.number)
+    {
+        virtual_candidate.labels.remove(AUTO_ADMISSION_SKIP_LABEL);
+    }
+    let tails = current_tail_generations(status);
+    if tails.is_empty() {
+        let output = check_auto_target(&virtual_status, &CheckInput::default(), checker)?;
+        if output.eligible {
+            return Ok(AutoCandidateEvaluation {
+                target: AutoCandidateTarget::New,
+                tested_tails: tails,
+                reasons: Vec::new(),
+            });
+        }
+        return Ok(AutoCandidateEvaluation {
+            target: AutoCandidateTarget::Skip,
+            tested_tails: tails,
+            reasons: check_reasons(&output),
+        });
+    }
+
+    let mut reasons = Vec::new();
+    for tail in &tails {
+        if tail.held {
+            reasons.push(format!(
+                "tail #{}: caravan #{} is intentionally held",
+                tail.tail_pr, tail.caravan_id
+            ));
+            continue;
+        }
+        let output = check_auto_target(
+            &virtual_status,
+            &CheckInput {
+                pr: None,
+                tail_pr: Some(tail.tail_pr.0),
+                head_pr: None,
+            },
+            checker,
+        )?;
+        if output.eligible {
+            return Ok(AutoCandidateEvaluation {
+                target: AutoCandidateTarget::Join(tail.tail_pr),
+                tested_tails: tails,
+                reasons,
+            });
+        }
+        reasons.extend(
+            check_reasons(&output)
+                .into_iter()
+                .map(|reason| format!("tail #{}: {reason}", tail.tail_pr)),
+        );
+    }
+    Ok(AutoCandidateEvaluation {
+        target: AutoCandidateTarget::Skip,
+        tested_tails: tails,
+        reasons,
+    })
+}
+
+fn check_auto_target(
+    status: &StatusOutput,
+    input: &CheckInput,
+    checker: &impl crate::graph::CompatibilityChecker,
+) -> Result<crate::read::CheckOutput, AppError> {
+    match crate::read::check_analysis(status, input, checker) {
+        Ok(output) => Ok(output),
+        Err(error) if error.code() == "check_failed" => error
+            .details()
+            .and_then(|details| serde_json::from_value(details).ok())
+            .ok_or(error),
+        Err(error) => Err(error),
+    }
+}
+
+fn check_reasons(output: &crate::read::CheckOutput) -> Vec<String> {
+    let mut reasons = output
+        .problems
+        .iter()
+        .map(|problem| problem.message.clone())
+        .collect::<Vec<_>>();
+    reasons.extend(
+        output
+            .compatibility
+            .iter()
+            .filter(|report| report.outcome != CompatibilityOutcome::Clean)
+            .map(|report| {
+                format!(
+                    "{}@{} -> {}@{} = {:?}; paths=[{}]",
+                    report.candidate.name,
+                    report.candidate.oid,
+                    report.target.name,
+                    report.target.oid,
+                    report.outcome,
+                    report.conflicting_paths.join(","),
+                )
+            }),
+    );
+    if reasons.is_empty() {
+        reasons.push(format!(
+            "candidate preflight returned {:?}",
+            output.next_action
+        ));
+    }
+    reasons.sort();
+    reasons.dedup();
+    reasons
+}
+
+fn current_tail_generations(status: &StatusOutput) -> Vec<AutoAdmissionTailGeneration> {
+    status
+        .analysis
+        .fleet
+        .caravans
+        .iter()
+        .filter_map(|caravan| {
+            let tail_pr = caravan.tail()?;
+            let tail = status.analysis.pull_requests.get(&tail_pr)?;
+            Some(AutoAdmissionTailGeneration {
+                caravan_id: caravan.id,
+                tail_pr,
+                branch: tail.head.name.clone(),
+                head_oid: tail.head.oid.clone(),
+                held: status.pauses.iter().any(|pause| {
+                    pause.state != crate::pause::PauseState::Stale
+                        && pause.record.caravan_head == caravan.id
+                }),
+            })
+        })
+        .collect()
+}
+
+fn auto_admission_config_fingerprint(context: &AppContext) -> String {
+    let material = serde_json::to_vec(&json!({
+        "version": context.config.version,
+        "rebase_on_join": context.config.rebase_on_join,
+        "agent_priority_labels": &context.config.agent_priority_labels,
+        "sync": &context.config.sync,
+    }))
+    .expect("validated config serializes");
+    crate::membership::fnv1a64(&material)
+}
+
+fn skip_receipt_matches(
+    context: &AppContext,
+    status: &StatusOutput,
+    receipt: &AutoJoinSkipReceipt,
+) -> bool {
+    let Some(candidate) = status.analysis.pull_requests.get(&receipt.candidate_pr) else {
+        return false;
+    };
+    receipt.schema_version == 1
+        && receipt.hash_is_valid()
+        && receipt.repository == status.repository
+        && receipt.candidate_head == candidate.head
+        && receipt.candidate_base == candidate.base
+        && receipt.default_branch == status.analysis.fleet.default_branch
+        && receipt.tested_tails == current_tail_generations(status)
+        && receipt.config_fingerprint == auto_admission_config_fingerprint(context)
+        && receipt.heuristic_version == AUTO_ADMISSION_HEURISTIC_VERSION
+}
+
+fn persist_auto_skip(
+    provider: &impl SyncProvider,
+    progress: &mut SyncProgress,
+    repository: &RepositoryId,
+    receipt: &AutoJoinSkipReceipt,
+) -> Result<(), AppError> {
+    let marker = receipt.marker();
+    let body = receipt.comment_body();
+    if body.len() > MAX_AUTO_ADMISSION_COMMENT_BYTES {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "auto_admission_skip_receipt_too_large",
+            "the exact generation-bound skip receipt exceeds GitHub's bounded comment budget",
+            Some(json!({
+                "candidate_pr": receipt.candidate_pr,
+                "evidence_hash": receipt.evidence_hash,
+                "comment_bytes": body.len(),
+                "max_comment_bytes": MAX_AUTO_ADMISSION_COMMENT_BYTES,
+                "mutated": false,
+                "next": "reduce the active caravan/tail surface or admit/repair the candidate manually; Cara will not truncate skip authority",
+            })),
+        ));
+    }
+    let candidate = progress
+        .current
+        .get(&receipt.candidate_pr)
+        .cloned()
+        .ok_or_else(|| {
+            AppError::validation(
+                "auto_admission_candidate_missing",
+                format!(
+                    "candidate #{} disappeared before skip",
+                    receipt.candidate_pr
+                ),
+            )
+        })?;
+    if !candidate.has_label(AUTO_ADMISSION_SKIP_LABEL) {
+        let labelled = provider
+            .add_label(
+                repository,
+                &PullRequestPrecondition::from(&candidate),
+                AUTO_ADMISSION_SKIP_LABEL,
+            )
+            .map_err(|error| mutation_error(&error, progress, Some(receipt.candidate_pr)))?;
+        progress.record(labelled, "added generation-bound automatic admission skip");
+    }
+    let comment = provider
+        .ensure_marked_comment(
+            repository,
+            &progress.precondition(receipt.candidate_pr),
+            &marker,
+            &body,
+        )
+        .map_err(|error| mutation_error(&error, progress, Some(receipt.candidate_pr)))?;
+    record_marked_comment(
+        progress,
+        comment,
+        receipt.candidate_pr,
+        "posted durable automatic admission skip receipt",
+    );
+    Ok(())
+}
+
+fn record_marked_comment(
+    progress: &mut SyncProgress,
+    receipt: GitHubMutationReceipt,
+    pr: PrNumber,
+    summary: &str,
+) {
+    let already = receipt
+        .provider_output
+        .as_deref()
+        .is_some_and(|output| output.starts_with("existing GitHub comment"));
+    if already {
+        progress.already(MutationKind::Comment, pr, "marked comment already present");
+        progress.current.insert(pr, receipt.after);
+    } else {
+        progress.record(receipt, summary);
+    }
 }
 
 fn attach_lock_recovery(
@@ -1518,12 +2521,24 @@ fn attach_lock_recovery(
     )
 }
 
+#[cfg(test)]
 fn execute(
     status: &StatusOutput,
     provider: &impl SyncProvider,
     all: bool,
     rerun_failed: bool,
     force_merge: bool,
+) -> Result<SyncProgress, AppError> {
+    execute_bounded(status, provider, all, rerun_failed, force_merge, u32::MAX)
+}
+
+fn execute_bounded(
+    status: &StatusOutput,
+    provider: &impl SyncProvider,
+    all: bool,
+    rerun_failed: bool,
+    force_merge: bool,
+    mutation_limit: u32,
 ) -> Result<SyncProgress, AppError> {
     let mut caravans = select_caravans(status, all)?;
     let paused_caravans = status
@@ -1543,7 +2558,7 @@ fn execute(
             .any(|pause| pause.record.caravan_head == caravan.id)
     });
     let synchronized_caravans = caravans.iter().map(|caravan| caravan.id).collect();
-    let mut progress = SyncProgress::new(status, synchronized_caravans);
+    let mut progress = SyncProgress::new(status, synchronized_caravans, mutation_limit);
     progress.paused_caravans = paused_caravans;
     for pause in &progress.paused_caravans {
         progress.steps.push(MutationStep {
@@ -1750,6 +2765,7 @@ fn force_merge_head(
     for number in caravan.members.iter().skip(1).copied() {
         progress.ensure_auto_merge_disabled(provider, &status.repository, number)?;
     }
+    progress.ensure_mutation_capacity(1)?;
     let receipt =
         match provider.admin_squash_merge(&status.repository, &progress.precondition(head)) {
             Ok(receipt) => receipt,
@@ -2565,10 +3581,15 @@ struct SyncProgress {
     events: Vec<CaravanEvent>,
     current: BTreeMap<PrNumber, PullRequestSnapshot>,
     merge_candidates: BTreeMap<PrNumber, MergeCandidateIdentity>,
+    mutation_limit: u32,
 }
 
 impl SyncProgress {
-    fn new(status: &StatusOutput, synchronized_caravans: Vec<PrNumber>) -> Self {
+    fn new(
+        status: &StatusOutput,
+        synchronized_caravans: Vec<PrNumber>,
+        mutation_limit: u32,
+    ) -> Self {
         Self {
             operation_id: OperationId::new(),
             repository: status.repository.clone(),
@@ -2588,6 +3609,7 @@ impl SyncProgress {
                 .cloned()
                 .map(|candidate| (candidate.pr, candidate))
                 .collect(),
+            mutation_limit,
         }
     }
 
@@ -2609,6 +3631,31 @@ impl SyncProgress {
                 .get(&number)
                 .expect("sync member has current PR facts"),
         )
+    }
+
+    fn ensure_mutation_capacity(&self, reserve: u32) -> Result<(), AppError> {
+        let used = completed_mutation_count(self);
+        if used.saturating_add(reserve) <= self.mutation_limit {
+            return Ok(());
+        }
+        Err(AppError::structured(
+            ErrorCategory::ExecutionFailure,
+            "sync_mutation_budget_exhausted",
+            format!(
+                "the sync mutation budget is exhausted ({used}/{} used; {reserve} required)",
+                self.mutation_limit
+            ),
+            Some(json!({
+                "used": used,
+                "limit": self.mutation_limit,
+                "required": reserve,
+                "operation_receipt": self.operation_receipt(),
+                "provider_receipts": self.provider_receipts,
+                "rebase_receipts": self.rebase_receipts,
+                "resumable": true,
+                "next": "rerun the same bounded sync tick to continue from fresh provider state",
+            })),
+        ))
     }
 
     fn record(&mut self, receipt: GitHubMutationReceipt, summary: &str) {
@@ -2743,6 +3790,7 @@ impl SyncProgress {
         run_ids: &[u64],
     ) -> Result<(), AppError> {
         for run_id in run_ids {
+            self.ensure_mutation_capacity(1)?;
             let receipt = provider
                 .rerun_failed_run(repository, &self.precondition(number), *run_id)
                 .map_err(|error| mutation_error(&error, self, Some(number)))?;
@@ -2761,6 +3809,7 @@ impl SyncProgress {
         number: PrNumber,
         audit: &ControlLabelAudit,
     ) -> Result<(), AppError> {
+        self.ensure_mutation_capacity(1)?;
         let receipt = provider
             .ensure_control_label_comment(repository, &self.precondition(number), audit)
             .map_err(|error| comment_mutation_error(&error, self, number))?;
@@ -2796,6 +3845,7 @@ impl SyncProgress {
             );
             return Ok(());
         }
+        self.ensure_mutation_capacity(1)?;
         let receipt = provider
             .set_base(repository, &self.precondition(number), base)
             .map_err(|error| mutation_error(&error, self, Some(number)))?;
@@ -2826,6 +3876,7 @@ impl SyncProgress {
             );
             return Ok(());
         }
+        self.ensure_mutation_capacity(1)?;
         let receipt = provider
             .disable_auto_merge(repository, &self.precondition(number))
             .map_err(|error| mutation_error(&error, self, Some(number)))?;
@@ -2849,11 +3900,13 @@ impl SyncProgress {
             return Ok(());
         }
         if auto_merge.enabled {
+            self.ensure_mutation_capacity(1)?;
             let receipt = provider
                 .disable_auto_merge(repository, &self.precondition(number))
                 .map_err(|error| mutation_error(&error, self, Some(number)))?;
             self.record(receipt, "disabled non-squash auto-merge on head");
         }
+        self.ensure_mutation_capacity(1)?;
         let receipt = provider
             .enable_squash_auto_merge(repository, &self.precondition(number))
             .map_err(|error| mutation_error(&error, self, Some(number)))?;
@@ -3012,6 +4065,7 @@ mod tests {
         admin_permission: bool,
         branch_head: RefCell<crate::model::CommitOid>,
         audits: RefCell<Vec<ControlLabelAudit>>,
+        comments: RefCell<BTreeMap<PrNumber, Vec<String>>>,
     }
 
     impl FakeProvider {
@@ -3034,6 +4088,7 @@ mod tests {
                 admin_permission: true,
                 branch_head: RefCell::new(branch("main").oid),
                 audits: RefCell::new(Vec::new()),
+                comments: RefCell::new(BTreeMap::new()),
             }
         }
 
@@ -3178,6 +4233,17 @@ mod tests {
             })
         }
 
+        fn add_label(
+            &self,
+            _repository: &RepositoryId,
+            expected: &PullRequestPrecondition,
+            label: &str,
+        ) -> Result<GitHubMutationReceipt, MutationError> {
+            self.mutate(expected, MutationKind::AddLabel, |pull_request| {
+                pull_request.labels.insert(label.to_owned());
+            })
+        }
+
         fn remove_label(
             &self,
             _repository: &RepositoryId,
@@ -3187,6 +4253,45 @@ mod tests {
             self.mutate(expected, MutationKind::RemoveLabel, |pull_request| {
                 pull_request.labels.remove(label);
             })
+        }
+
+        fn pull_request_comment_bodies(
+            &self,
+            _repository: &RepositoryId,
+            number: PrNumber,
+        ) -> Result<Vec<String>, MutationError> {
+            Ok(self
+                .comments
+                .borrow()
+                .get(&number)
+                .cloned()
+                .unwrap_or_default())
+        }
+
+        fn ensure_marked_comment(
+            &self,
+            _repository: &RepositoryId,
+            expected: &PullRequestPrecondition,
+            marker: &str,
+            body: &str,
+        ) -> Result<GitHubMutationReceipt, MutationError> {
+            let already = self
+                .comments
+                .borrow()
+                .get(&expected.number)
+                .is_some_and(|comments| comments.iter().any(|item| item.contains(marker)));
+            if !already {
+                self.comments
+                    .borrow_mut()
+                    .entry(expected.number)
+                    .or_default()
+                    .push(body.to_owned());
+            }
+            let mut receipt = self.mutate(expected, MutationKind::Comment, |_| {})?;
+            if already {
+                receipt.provider_output = Some(format!("existing GitHub comment {marker}"));
+            }
+            Ok(receipt)
         }
 
         fn failed_runs_for_pull_request(
@@ -3500,6 +4605,7 @@ mod tests {
             timing: None,
             repository: repository(),
             rebase_on_join: crate::read::RebaseOnJoinStatus::default(),
+            auto_admission: crate::read::AutoAdmissionStatus::default(),
             default_branch: "main".to_owned(),
             current_branch: snapshot.current_branch,
             current_pr: snapshot.current_pr,
@@ -3538,6 +4644,237 @@ mod tests {
                 AutoMergeState::disabled(),
             ),
         ]
+    }
+
+    #[test]
+    fn greedy_planner_forms_empty_fleet_then_uses_first_compatible_tail() {
+        let mut candidate = pull_request(
+            9,
+            "candidate",
+            "main",
+            PullRequestState::Open,
+            AutoMergeState::disabled(),
+        );
+        candidate.labels.clear();
+        let empty = status(vec![candidate.clone()], Some(candidate.number), &clean);
+        let evaluation =
+            evaluate_auto_candidate(&empty, &candidate, &clean).expect("empty fleet preflight");
+        assert_eq!(evaluation.target, AutoCandidateTarget::New);
+        assert!(evaluation.tested_tails.is_empty());
+        assert!(evaluation.reasons.is_empty());
+
+        let first = pull_request(
+            1,
+            "first",
+            "main",
+            PullRequestState::Open,
+            AutoMergeState::squash(),
+        );
+        let second = pull_request(
+            2,
+            "second",
+            "main",
+            PullRequestState::Open,
+            AutoMergeState::squash(),
+        );
+        let fleet = status(
+            vec![first, second, candidate.clone()],
+            Some(candidate.number),
+            &clean,
+        );
+        let checker = |candidate_branch: &BranchSnapshot,
+                       target: &BranchSnapshot|
+         -> Result<CompatibilityReport, AppError> {
+            Ok(CompatibilityReport {
+                candidate: candidate_branch.clone(),
+                target: target.clone(),
+                outcome: if target.name == "first" {
+                    CompatibilityOutcome::Conflict
+                } else {
+                    CompatibilityOutcome::Clean
+                },
+                conflicting_paths: if target.name == "first" {
+                    vec!["src/lib.rs".to_owned()]
+                } else {
+                    Vec::new()
+                },
+                diagnostic: None,
+            })
+        };
+        let evaluation =
+            evaluate_auto_candidate(&fleet, &candidate, &checker).expect("tail preflight");
+        assert_eq!(evaluation.target, AutoCandidateTarget::Join(PrNumber(2)));
+        assert_eq!(
+            evaluation
+                .tested_tails
+                .iter()
+                .map(|tail| tail.tail_pr)
+                .collect::<Vec<_>>(),
+            [PrNumber(1), PrNumber(2)]
+        );
+        assert!(
+            evaluation
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("tail #1"))
+        );
+    }
+
+    #[test]
+    fn skip_receipt_round_trips_and_invalidates_on_generation_change() {
+        let active = pull_request(
+            1,
+            "head",
+            "main",
+            PullRequestState::Open,
+            AutoMergeState::squash(),
+        );
+        let mut candidate = pull_request(
+            9,
+            "candidate",
+            "main",
+            PullRequestState::Open,
+            AutoMergeState::disabled(),
+        );
+        candidate.labels.clear();
+        candidate
+            .labels
+            .insert(AUTO_ADMISSION_SKIP_LABEL.to_owned());
+        let status = status(
+            vec![active, candidate.clone()],
+            Some(candidate.number),
+            &clean,
+        );
+        let context = AppContext::default();
+        let receipt = AutoJoinSkipReceipt {
+            schema_version: 1,
+            repository: status.repository.clone(),
+            candidate_pr: candidate.number,
+            candidate_head: candidate.head.clone(),
+            candidate_base: candidate.base.clone(),
+            default_branch: status.analysis.fleet.default_branch.clone(),
+            tested_tails: current_tail_generations(&status),
+            config_fingerprint: auto_admission_config_fingerprint(&context),
+            heuristic_version: AUTO_ADMISSION_HEURISTIC_VERSION.to_owned(),
+            compatibility_reasons: vec!["tail #1: conflict".to_owned()],
+            actor: "cara sync automatic admission".to_owned(),
+            observed_unix_secs: 1,
+            evidence_hash: String::new(),
+        }
+        .finalize_hash();
+
+        let parsed = AutoJoinSkipReceipt::from_comment(&receipt.comment_body())
+            .expect("receipt marker decodes");
+        assert_eq!(parsed, receipt);
+        assert!(skip_receipt_matches(&context, &status, &receipt));
+
+        let mut moved = status.clone();
+        moved
+            .analysis
+            .pull_requests
+            .get_mut(&candidate.number)
+            .unwrap()
+            .head
+            .oid = CommitOid("moved".repeat(8));
+        assert!(!skip_receipt_matches(&context, &moved, &receipt));
+
+        let mut tail_moved = status.clone();
+        tail_moved
+            .analysis
+            .pull_requests
+            .get_mut(&PrNumber(1))
+            .unwrap()
+            .head
+            .oid = CommitOid("tailmoved".repeat(5));
+        assert!(!skip_receipt_matches(&context, &tail_moved, &receipt));
+
+        let mut config_changed = context.clone();
+        config_changed.config.sync.max_candidates_per_tick += 1;
+        assert!(!skip_receipt_matches(&config_changed, &status, &receipt));
+    }
+
+    #[test]
+    fn persist_skip_is_idempotent_and_manual_membership_can_consume_the_label() {
+        let mut candidate = pull_request(
+            9,
+            "candidate",
+            "main",
+            PullRequestState::Open,
+            AutoMergeState::disabled(),
+        );
+        candidate.labels.clear();
+        let status = status(vec![candidate.clone()], Some(candidate.number), &clean);
+        let provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
+        let mut progress = SyncProgress::new(&status, Vec::new(), u32::MAX);
+        let receipt = AutoJoinSkipReceipt {
+            schema_version: 1,
+            repository: status.repository.clone(),
+            candidate_pr: candidate.number,
+            candidate_head: candidate.head.clone(),
+            candidate_base: candidate.base.clone(),
+            default_branch: status.analysis.fleet.default_branch.clone(),
+            tested_tails: Vec::new(),
+            config_fingerprint: auto_admission_config_fingerprint(&AppContext::default()),
+            heuristic_version: AUTO_ADMISSION_HEURISTIC_VERSION.to_owned(),
+            compatibility_reasons: vec!["default conflict".to_owned()],
+            actor: "cara sync automatic admission".to_owned(),
+            observed_unix_secs: 1,
+            evidence_hash: String::new(),
+        }
+        .finalize_hash();
+
+        persist_auto_skip(&provider, &mut progress, &repository(), &receipt).unwrap();
+        persist_auto_skip(&provider, &mut progress, &repository(), &receipt).unwrap();
+
+        assert!(provider.pulls.borrow()[&candidate.number].has_label(AUTO_ADMISSION_SKIP_LABEL));
+        assert_eq!(provider.comments.borrow()[&candidate.number].len(), 1);
+        assert_eq!(
+            provider
+                .calls
+                .borrow()
+                .iter()
+                .filter(|kind| **kind == MutationKind::AddLabel)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn oversized_skip_receipt_fails_before_label_mutation() {
+        let mut candidate = pull_request(
+            9,
+            "candidate",
+            "main",
+            PullRequestState::Open,
+            AutoMergeState::disabled(),
+        );
+        candidate.labels.clear();
+        let status = status(vec![candidate.clone()], Some(candidate.number), &clean);
+        let provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
+        let mut progress = SyncProgress::new(&status, Vec::new(), u32::MAX);
+        let receipt = AutoJoinSkipReceipt {
+            schema_version: 1,
+            repository: status.repository.clone(),
+            candidate_pr: candidate.number,
+            candidate_head: candidate.head.clone(),
+            candidate_base: candidate.base.clone(),
+            default_branch: status.analysis.fleet.default_branch.clone(),
+            tested_tails: Vec::new(),
+            config_fingerprint: auto_admission_config_fingerprint(&AppContext::default()),
+            heuristic_version: AUTO_ADMISSION_HEURISTIC_VERSION.to_owned(),
+            compatibility_reasons: vec!["x".repeat(MAX_AUTO_ADMISSION_COMMENT_BYTES)],
+            actor: "cara sync automatic admission".to_owned(),
+            observed_unix_secs: 1,
+            evidence_hash: String::new(),
+        }
+        .finalize_hash();
+
+        let error = persist_auto_skip(&provider, &mut progress, &repository(), &receipt)
+            .expect_err("oversized authority must not be truncated");
+
+        assert_eq!(error.code(), "auto_admission_skip_receipt_too_large");
+        assert!(provider.calls.borrow().is_empty());
+        assert!(!provider.pulls.borrow()[&candidate.number].has_label(AUTO_ADMISSION_SKIP_LABEL));
     }
 
     #[test]
@@ -3622,7 +4959,7 @@ mod tests {
     fn stale_provider_precondition_retries_without_waking_a_repair_actor() {
         let pulls = healthy_chain();
         let status = status(pulls.clone(), Some(PrNumber(1)), &clean);
-        let progress = SyncProgress::new(&status, vec![PrNumber(1)]);
+        let progress = SyncProgress::new(&status, vec![PrNumber(1)], u32::MAX);
         let expected = PullRequestPrecondition::from(&pulls[0]);
         let mut actual_pull = pulls[0].clone();
         actual_pull.head.oid = CommitOid("moved-head".to_owned());
@@ -3991,7 +5328,7 @@ mod tests {
             lease: format!("refs/heads/{}:{}", old_head.name, old_head.oid),
             already_satisfied: false,
         };
-        let mut progress = SyncProgress::new(&status, vec![PrNumber(1)]);
+        let mut progress = SyncProgress::new(&status, vec![PrNumber(1)], u32::MAX);
 
         invalidate_rewritten_force_intents(&status, &provider, &[plan], &mut progress)
             .expect("old-generation force intent is invalidated before rewrite");
@@ -4034,7 +5371,7 @@ mod tests {
             lease: format!("refs/heads/{}:{}", head.name, head.oid),
             already_satisfied: true,
         };
-        let mut progress = SyncProgress::new(&status, vec![PrNumber(1)]);
+        let mut progress = SyncProgress::new(&status, vec![PrNumber(1)], u32::MAX);
 
         invalidate_rewritten_force_intents(&status, &provider, &[plan], &mut progress)
             .expect("unchanged generation retains explicit force intent");
@@ -4073,7 +5410,7 @@ mod tests {
             lease: format!("refs/heads/{}:{}", head.name, head.oid),
             already_satisfied: false,
         };
-        let mut progress = SyncProgress::new(&initial_status, vec![PrNumber(1)]);
+        let mut progress = SyncProgress::new(&initial_status, vec![PrNumber(1)], u32::MAX);
         invalidate_rewritten_force_intents(&initial_status, &provider, &[plan], &mut progress)
             .expect("old-generation force is consumed");
 
@@ -4277,13 +5614,13 @@ mod tests {
     }
 
     #[test]
-    fn whole_sync_budget_is_bounded_below_the_client_ceiling() {
+    fn whole_sync_budget_uses_the_explicit_validated_wall_clock_bound() {
         let mut context = AppContext::default();
-        assert_eq!(sync_operation_budget(&context), Duration::from_secs(150));
-        context.config.command_timeout_secs = 10;
-        assert_eq!(sync_operation_budget(&context), Duration::from_secs(50));
-        context.config.command_timeout_secs = 100;
-        assert_eq!(sync_operation_budget(&context), Duration::from_secs(150));
+        assert_eq!(sync_operation_budget(&context), Duration::from_secs(120));
+        context.config.sync.max_duration_secs = 10;
+        assert_eq!(sync_operation_budget(&context), Duration::from_secs(10));
+        context.config.sync.max_duration_secs = 3_600;
+        assert_eq!(sync_operation_budget(&context), Duration::from_secs(3_600));
     }
 
     #[test]
@@ -4519,10 +5856,32 @@ mod tests {
     }
 
     #[test]
+    fn mutation_budget_stops_before_the_next_provider_write() {
+        let pulls = healthy_chain();
+        let status = status(pulls.clone(), Some(PrNumber(1)), &clean);
+        let provider = FakeProvider::with_pull_requests(pulls);
+        let mut progress = SyncProgress::new(&status, vec![PrNumber(1)], 1);
+        progress.steps.push(MutationStep {
+            kind: MutationKind::Comment,
+            state: MutationStepState::Completed,
+            pr: Some(PrNumber(1)),
+            summary: "prior mutation".to_owned(),
+        });
+
+        let error = progress
+            .ensure_auto_merge_disabled(&provider, &repository(), PrNumber(1))
+            .expect_err("budget exhaustion must precede a provider write");
+
+        assert_eq!(error.code(), "sync_mutation_budget_exhausted");
+        assert!(provider.calls.borrow().is_empty());
+        assert_eq!(error.details().unwrap()["used"], 1);
+    }
+
+    #[test]
     fn mutation_timeout_preserves_category_and_completed_steps() {
         let pulls = healthy_chain();
         let status = status(pulls, Some(PrNumber(1)), &clean);
-        let mut progress = SyncProgress::new(&status, vec![PrNumber(1)]);
+        let mut progress = SyncProgress::new(&status, vec![PrNumber(1)], u32::MAX);
         progress.steps.push(MutationStep {
             kind: MutationKind::SetBase,
             state: MutationStepState::Completed,

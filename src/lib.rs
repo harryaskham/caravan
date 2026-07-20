@@ -63,7 +63,8 @@ CORE MODEL AND INVARIANTS
   admission bound are checked before automatic changes.
 - Automatic admission is deterministic: configured `caravan-priority:*` labels
   from highest to lowest, then immutable GitHub `createdAt`, then PR number.
-  Never re-sort, skip, or leapfrog the first canonical attempt because it failed.
+  Never re-sort, skip, or leapfrog the first canonical attempt because it failed,
+  except under the explicit sync-owned generation-bound greedy policy below.
 
 FIRST USE AND EVERY SAFE TICK
 1. Run `cara status` (prefer `--json` for automation). It reports initialization,
@@ -88,6 +89,13 @@ FIRST USE AND EVERY SAFE TICK
    command after an indeterminate provider response rather than inventing state.
 5. Run `cara sync` for the current caravan or `cara sync --all` for the fleet.
    Continue until it converges, reports waiting CI, or returns one typed decision.
+   With `sync.actions.join_unlabelled_prs: true`, only sync-all also grows the
+   fleet after existing caravans converge: `priority_fifo_greedy_v1` tries
+   canonical candidates and deterministic live tails, joins the first compatible
+   target, and records exact generation-bound `caravan-join-skipped` evidence
+   before considering a later candidate. Manual membership consumes that label.
+   The same path powers `loop` and `loop --once`; every tick reports exact
+   candidate/mutation/GitHub/wall bounds, joins, skips, remaining work, and continuation.
 6. Preserve the complete structured error. Its category, code, exact OIDs,
    affected PRs, completed steps, provider receipts, suggested actions, and
    resumable command are the continuation contract. Never replace it with a
@@ -146,6 +154,22 @@ Before enabling physical mode in an existing repository:
   `cara status`, `cara check`, then one `cara sync --all`, and inspect plans,
   leases, rewritten heads, midpoint facts, and fresh CI;
 - roll back by reverting the config to false. Do not force-push branches back.
+
+SYNC-OWNED GREEDY ADMISSION
+- The policy is disabled by default and requires both `sync --all` and
+  `sync.actions.join_unlabelled_prs: true`. Targeted sync never grows the fleet.
+- Existing graph/provider/CI/semantic/operator decisions stop before admission;
+  waiting CI and intentional holds remain structurally valid.
+- Candidates use configured priority then immutable FIFO; caravans use existing
+  deterministic order. The first compatible tail wins. This is deliberately
+  best-effort, not a global optimum.
+- An incompatible exact generation gets `caravan-join-skipped` and a GitHub
+  comment binding candidate head/base, default, all tested tails, config,
+  reasons, heuristic, actor, and time. Unchanged evidence is not retried.
+  Candidate/default/tail/config/heuristic changes invalidate the skip.
+- One tick holds the operation lock and an absolute deadline, counts every
+  authenticated `gh` subprocess, and stops at configured candidate/mutation
+  bounds. Rediscovery follows every mutation; exact retries resume idempotently.
 
 CI DECISIONS
 - Empty, expected, queued, or running checks are waiting, never passing.
@@ -666,7 +690,7 @@ pub fn build_router() -> ToolRouter<AppContext> {
     );
     router.add_typed_tool_with_output_schema(
         "sync",
-        "Idempotently synchronize one or all caravans under optimistic preconditions. Intentionally paused caravans return stable no-op receipts and are skipped by sync-all.",
+        "Idempotently synchronize one or all caravans under optimistic preconditions. With strict config opt-in, sync-all greedily admits canonical unlabelled candidates after the existing fleet converges, persisting generation-bound skip receipts under exact wall/GitHub/candidate/mutation bounds.",
         |context: &AppContext, input: SyncInput| sync::sync(context, &input),
     );
     router.add_typed_tool_with_output_schema(

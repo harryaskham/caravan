@@ -27,6 +27,17 @@ GitHub is authoritative for automatic admission. `.caravan/config.yaml` lists `a
 
 An operator may override this automatic order for an explicit canary selection only by supplying a non-empty reason and recording that reason as a comment on the selected PR. A canary override does not alter the automatic policy or the canonical order subsequently reported by Caravan.
 
+The strict opt-in `sync.actions.join_unlabelled_prs` policy is the one automatic
+exception to no-leapfrog admission. After the existing fleet converges, sync
+uses `priority_fifo_greedy_v1` to try canonical candidates and existing caravan
+tails in deterministic order. A candidate incompatible with every target is
+labelled `caravan-join-skipped` and receives a durable generation-bound comment,
+then later candidates may be considered. The skip binds repository, candidate
+head/base, default generation, every tested tail generation, config fingerprint,
+compatibility reasons, heuristic version, actor, and time. Unchanged evidence is
+not retried; any bound generation/config/heuristic change invalidates and removes
+the skip. Explicit `new`/`join`/`rejoin` always consumes the advisory skip label.
+
 Caravan v1 requires member head branches to exist in the base repository: GitHub cannot target a PR at a fork-only branch.
 
 ## 2. Graph invariants
@@ -100,8 +111,10 @@ All commands are non-interactive.
 - Init preflights repository write capability, squash auto-merge support, and
   default-branch protection with a required check or review policy. It creates
   `caravan` (`5319E7`, active member), `caravan-evicted` (`B60205`, evicted
-  member), and `caravan-force` (`D93F0B`, operator force exception), plus every
-  configured `agent_priority_labels` entry in configured order. Priority-label
+  member), and `caravan-force` (`D93F0B`, operator force exception). When
+  `sync.actions.join_unlabelled_prs` is enabled it also requires
+  `caravan-join-skipped` (`6F42C1`, generation-bound optimiser skip). Every
+  configured `agent_priority_labels` entry follows in configured order. Priority-label
   colors come from the stable rank palette `B60205`, `D93F0B`, `FBCA04`,
   `0E8A16`, `1D76DB`, `5319E7` (cycling for additional ranks), and descriptions
   identify the one-based rank and highest-priority direction.
@@ -145,7 +158,7 @@ Without a current PR, these commands fail unless `--create-pr` is set. Creation 
 
 A new caravan applies `caravan`, targets the default branch, verifies fleet compatibility, and enables squash auto-merge. Joining retargets the PR to the tail branch, applies `caravan`, disables auto-merge, and verifies the resulting fleet. Membership commands accept `--reason TEXT` and `--priority-label LABEL`; an explicit label must exactly match a configured `agent_priority_labels` entry, while omission records FIFO admission.
 
-Every successful mutation of `caravan`, `caravan-evicted`, `caravan-force`, or a configured priority label is completed by a durable PR comment. The comment records operation, before/after labels, actor and reason source, exact compatibility and clean-squash evidence where applicable, and explicit configured label/rank or canonical FIFO basis. A deterministic `caravan-control-label-audit` HTML marker fingerprints operation, PR/head, and the before→after control-label transition; GitHub-visible latest-transition evidence deduplicates partial retries without conflating a later transition on the same head. Comment failure after labels changed returns `github_comment_failed` with completed receipts and a resumable rerun instruction; it is never reported as full success.
+Every successful mutation of `caravan`, `caravan-evicted`, `caravan-force`, `caravan-join-skipped`, or a configured priority label is completed by a durable PR comment. The comment records operation, before/after labels, actor and reason source, exact compatibility and clean-squash evidence where applicable, and explicit configured label/rank or canonical FIFO basis. A deterministic `caravan-control-label-audit` HTML marker fingerprints operation, PR/head, and the before→after control-label transition; GitHub-visible latest-transition evidence deduplicates partial retries without conflating a later transition on the same head. Comment failure after labels changed returns `github_comment_failed` with completed receipts and a resumable rerun instruction; it is never reported as full success.
 
 ### Navigation
 
@@ -221,9 +234,16 @@ A sync tick:
 8. Enforce auto-merge on the head and off on all non-heads.
 9. Recheck cross-caravan head/tail compatibility.
 10. Emit events/hooks for observed transitions.
-11. Return a stable health snapshot or the first decision point.
+11. When `sync --all` auto-admission is enabled, rediscover and greedily admit
+    canonical unlabelled candidates only after steps 1–10 converge. Empty fleets
+    form a head; non-empty fleets use the first compatible deterministic tail.
+    Incompatible exact generations receive a durable skip and later candidates
+    may be considered.
+12. Re-run normal convergence for admitted members and return exact joins,
+    skips, remaining candidates, safety-budget usage, continuation, and the
+    stable health snapshot or first decision point.
 
-Already-correct steps are no-ops. Rerunning after interruption resumes from rediscovered GitHub state rather than a local cursor.
+Already-correct steps are no-ops. Rerunning after interruption resumes from rediscovered GitHub state rather than a local cursor. Auto-admission is disabled by default and targeted `sync` never grows the fleet. The whole `sync --all` tick shares one operation lock, absolute wall-clock deadline, authenticated `gh` request counter, candidate limit, and mutation limit. It rediscovers after every provider mutation; budget exhaustion returns a resumable continuation rather than leapfrogging or guessing. `loop` and `loop --once` call this exact path. Hosted automation uses bounded once-ticks from PR/check/workflow/default-branch events and a schedule, not one unbounded hosted process.
 
 Sync never invents an agent decision. Every successful bounded tick returns a versioned scheduler projection over the fresh final discovery: exact default branch generation, each selected caravan's root/tail/member head and base generations, observed CI disposition, intentional holds, and one `healthy`, `waiting_ci`, or `held` state. These successful states always carry `wake_class=none`; fresh, empty, expected, queued, or running checks remain `waiting_ci` and do not wake a repair actor.
 

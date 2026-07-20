@@ -29,6 +29,7 @@ use crate::{AppContext, AppError, CheckInput, CreateInput, JoinInput};
 const ACTIVE_LABEL: &str = "caravan";
 const EVICTED_LABEL: &str = "caravan-evicted";
 const FORCE_LABEL: &str = "caravan-force";
+const SKIPPED_LABEL: &str = "caravan-join-skipped";
 const REQUIRED_LABELS: [&str; 3] = [ACTIVE_LABEL, EVICTED_LABEL, FORCE_LABEL];
 
 /// Membership command kind.
@@ -363,13 +364,59 @@ pub fn rejoin(context: &AppContext, input: &JoinInput) -> Result<MembershipOutpu
     )
 }
 
-#[allow(clippy::too_many_lines)]
 fn execute_live(
     context: &AppContext,
     request: &MembershipRequest,
     candidate_pr: Option<u64>,
 ) -> Result<MembershipOutput, AppError> {
     let _lock = OperationLock::acquire(&context.repository_path, request.operation.name())?;
+    execute_locked(context, request, candidate_pr, None, None, true)
+}
+
+/// Run one exact sync-owned new/join while the caller retains the repository lock.
+pub(crate) fn auto_admit_locked(
+    context: &AppContext,
+    candidate_pr: PrNumber,
+    tail_pr: Option<PrNumber>,
+    priority_label: Option<String>,
+    operation_deadline: std::time::Instant,
+    github_budget: &crate::command::GithubRequestBudget,
+) -> Result<MembershipOutput, AppError> {
+    let operation = if tail_pr.is_some() {
+        MembershipOperation::Join
+    } else {
+        MembershipOperation::New
+    };
+    execute_locked(
+        context,
+        &MembershipRequest {
+            operation,
+            create_pr: false,
+            tail_pr: tail_pr.map(|number| number.0),
+            head_pr: None,
+            reason: Some(format!(
+                "sync-owned automatic admission using {}",
+                crate::sync::AUTO_ADMISSION_HEURISTIC_VERSION
+            )),
+            priority_label,
+            agent_priority_labels: context.config.agent_priority_labels.clone(),
+        },
+        Some(candidate_pr.0),
+        Some(operation_deadline),
+        Some(github_budget),
+        false,
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn execute_locked(
+    context: &AppContext,
+    request: &MembershipRequest,
+    candidate_pr: Option<u64>,
+    operation_deadline: Option<std::time::Instant>,
+    github_budget: Option<&crate::command::GithubRequestBudget>,
+    dispatch_hooks: bool,
+) -> Result<MembershipOutput, AppError> {
     if candidate_pr.is_some() && request.create_pr {
         return Err(AppError::validation(
             "remote_candidate_create_conflict",
@@ -390,15 +437,31 @@ fn execute_live(
         ));
     }
     let timeout = std::time::Duration::from_secs(context.config.command_timeout_secs);
+    let operation_deadline = operation_deadline.unwrap_or_else(|| {
+        std::time::Instant::now()
+            + std::time::Duration::from_secs(context.config.sync.max_duration_secs)
+    });
     let mut status = candidate_pr.map_or_else(
-        || read::status(context),
-        |number| read::status_for_remote_candidate(context, PrNumber(number)),
+        || read::status_with_deadline_and_budget(context, operation_deadline, github_budget),
+        |number| {
+            read::status_for_remote_candidate_with_deadline(
+                context,
+                PrNumber(number),
+                operation_deadline,
+                github_budget,
+            )
+        },
     )?;
-    let checker =
-        GitCompatibilityChecker::new(&context.repository_path, "origin").with_timeout(timeout);
-    let provider = GitHubMutationAdapter::new(
-        crate::command::ProcessRunner::in_directory(&context.repository_path).with_timeout(timeout),
-    );
+    let checker = GitCompatibilityChecker::new(&context.repository_path, "origin")
+        .with_timeout(timeout)
+        .with_operation_deadline(operation_deadline);
+    let provider_runner = crate::command::ProcessRunner::in_directory(&context.repository_path)
+        .with_timeout(timeout)
+        .with_operation_deadline(operation_deadline);
+    let provider_runner = github_budget.map_or(provider_runner.clone(), |budget| {
+        provider_runner.with_github_request_budget(budget.clone())
+    });
+    let provider = GitHubMutationAdapter::new(provider_runner);
     let repository = status.repository.clone();
     let failure_status = status.clone();
     let default_branch_oid = status.analysis.fleet.default_branch.oid.clone();
@@ -478,6 +541,7 @@ fn execute_live(
             &status.default_branch,
             request.operation,
             &request.agent_priority_labels,
+            context.config.sync.actions.join_unlabelled_prs,
             &preflight_state,
         )?;
         validate_operation_shape(&candidate, request, &desired_base)?;
@@ -495,7 +559,8 @@ fn execute_live(
             },
             crate::physical_rebase::PlannedBase::Remote(target.clone()),
             &status.analysis.fleet.default_branch,
-            crate::physical_rebase::RebaseExecutionBudget::new(timeout),
+            crate::physical_rebase::RebaseExecutionBudget::new(timeout)
+                .with_deadline(operation_deadline),
         )?;
         if candidate.has_label(FORCE_LABEL) && !prepared.plan.already_satisfied {
             let mut invalidation = ExecutionState::new(request.operation);
@@ -514,8 +579,15 @@ fn execute_live(
         // GitHub is authoritative after a push. Never apply base/label changes
         // against the stale pre-rewrite PR snapshot.
         status = candidate_pr.map_or_else(
-            || read::status(context),
-            |candidate| read::status_for_remote_candidate(context, PrNumber(candidate)),
+            || read::status_with_deadline_and_budget(context, operation_deadline, github_budget),
+            |candidate| {
+                read::status_for_remote_candidate_with_deadline(
+                    context,
+                    PrNumber(candidate),
+                    operation_deadline,
+                    github_budget,
+                )
+            },
         )?;
         let observed = status.analysis.pull_requests.get(&number).ok_or_else(|| {
             AppError::structured(
@@ -545,6 +617,7 @@ fn execute_live(
         &provider,
         request.clone(),
         rebase_receipt.as_ref(),
+        context.config.sync.actions.join_unlabelled_prs,
     )
     .map_err(|error| {
         attach_force_invalidation(
@@ -557,8 +630,11 @@ fn execute_live(
         Err(error) if request.operation.is_join() => {
             let event = join_failed_event(&failure_status, request, &error);
             let error = hooks::attach_events(error, std::slice::from_ref(&event));
-            let deliveries = hooks::dispatch_events(context, std::slice::from_ref(&event))?;
-            return Err(hooks::attach_deliveries(error, &deliveries));
+            if dispatch_hooks {
+                let deliveries = hooks::dispatch_events(context, std::slice::from_ref(&event))?;
+                return Err(hooks::attach_deliveries(error, &deliveries));
+            }
+            return Err(error);
         }
         Err(error) => return Err(error),
     };
@@ -618,7 +694,9 @@ fn execute_live(
         ]),
     );
     output.events.push(event);
-    output.hook_deliveries = hooks::dispatch_events(context, &output.events)?;
+    if dispatch_hooks {
+        output.hook_deliveries = hooks::dispatch_events(context, &output.events)?;
+    }
     Ok(output)
 }
 
@@ -701,7 +779,7 @@ fn build_join_receipt(
     Ok(receipt)
 }
 
-fn fnv1a64(bytes: &[u8]) -> String {
+pub(crate) fn fnv1a64(bytes: &[u8]) -> String {
     let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
         (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
     });
@@ -714,6 +792,7 @@ fn membership_config_fingerprint(context: &AppContext) -> String {
         "rebase_on_join": context.config.rebase_on_join,
         "force_merge": context.config.force_merge,
         "agent_priority_labels": &context.config.agent_priority_labels,
+        "sync": &context.config.sync,
     }))
     .expect("validated config serializes");
     fnv1a64(&contract)
@@ -837,7 +916,7 @@ fn execute(
     provider: &impl MembershipProvider,
     request: MembershipRequest,
 ) -> Result<MembershipOutput, AppError> {
-    execute_with_rebase_guard(status, checker, provider, request, None)
+    execute_with_rebase_guard(status, checker, provider, request, None, false)
 }
 
 #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
@@ -847,6 +926,7 @@ fn execute_with_rebase_guard(
     provider: &impl MembershipProvider,
     request: MembershipRequest,
     expected_rebase: Option<&crate::physical_rebase::RebaseReceipt>,
+    require_auto_admission_skip: bool,
 ) -> Result<MembershipOutput, AppError> {
     if request
         .reason
@@ -873,6 +953,7 @@ fn execute_with_rebase_guard(
         &status.default_branch,
         request.operation,
         &request.agent_priority_labels,
+        require_auto_admission_skip,
         &state,
     )?;
     let desired_priority_label = request.priority_label.as_deref().map(str::trim);
@@ -999,6 +1080,9 @@ fn execute_with_rebase_guard(
 
     state.ensure_base(provider, &status.repository, &desired_base)?;
     state.ensure_label_absent(provider, &status.repository, FORCE_LABEL)?;
+    // A generation-bound automatic skip is advisory only; every explicit
+    // membership operation is a manual override and consumes it.
+    state.ensure_label_absent(provider, &status.repository, SKIPPED_LABEL)?;
     for label in &request.agent_priority_labels {
         if Some(label.as_str()) != desired_priority_label {
             state.ensure_label_absent(provider, &status.repository, label)?;
@@ -1243,12 +1327,13 @@ fn preflight_repository(
     default_branch: &str,
     operation: MembershipOperation,
     priority_labels: &[String],
+    require_auto_admission_skip: bool,
     state: &ExecutionState,
 ) -> Result<(), AppError> {
     let labels = provider
         .repository_labels(repository)
         .map_err(|error| mutation_error(&error, state))?;
-    require_labels(repository, &labels)?;
+    require_labels(repository, &labels, require_auto_admission_skip)?;
     let missing_priorities: Vec<_> = priority_labels
         .iter()
         .filter(|label| !labels.contains(*label))
@@ -1296,11 +1381,16 @@ fn preflight_repository(
     Ok(())
 }
 
-fn require_labels(repository: &RepositoryId, labels: &BTreeSet<String>) -> Result<(), AppError> {
+fn require_labels(
+    repository: &RepositoryId,
+    labels: &BTreeSet<String>,
+    require_auto_admission_skip: bool,
+) -> Result<(), AppError> {
     let missing: Vec<_> = REQUIRED_LABELS
         .iter()
-        .filter(|label| !labels.contains(**label))
         .copied()
+        .chain(require_auto_admission_skip.then_some(SKIPPED_LABEL))
+        .filter(|label| !labels.contains(*label))
         .collect();
     if missing.is_empty() {
         return Ok(());
@@ -1312,7 +1402,7 @@ fn require_labels(repository: &RepositoryId, labels: &BTreeSet<String>) -> Resul
         Some(json!({
             "repository": repository,
             "missing_labels": missing,
-            "next": "create caravan, caravan-evicted, and caravan-force labels, then rerun the same command",
+            "next": "run `cara init` to create the fixed labels required by the active config, then rerun the same command",
         })),
     ))
 }
@@ -1606,6 +1696,31 @@ fn comment_error(error: &MutationError, state: &ExecutionState) -> AppError {
 }
 
 fn mutation_error(error: &MutationError, state: &ExecutionState) -> AppError {
+    if let MutationError::Provider(DiscoveryError::Runner(
+        CommandRunError::GithubRequestBudgetExceeded {
+            command,
+            limit,
+            used,
+        },
+    )) = error
+    {
+        return AppError::structured(
+            ErrorCategory::ExecutionFailure,
+            "github_request_budget_exhausted",
+            error.to_string(),
+            Some(json!({
+                "stage": "github_mutation",
+                "command": command.display(),
+                "limit": limit,
+                "used": used,
+                "operation_id": state.operation_id,
+                "completed_steps": state.steps,
+                "provider_receipts": state.provider_receipts,
+                "resumable": true,
+                "next": "rerun the same bounded sync tick to continue from fresh provider state",
+            })),
+        );
+    }
     if let MutationError::Provider(DiscoveryError::Runner(CommandRunError::Timeout {
         command,
         timeout_ms,
@@ -1888,6 +2003,7 @@ mod tests {
             timing: None,
             repository: repository(),
             rebase_on_join: crate::read::RebaseOnJoinStatus::default(),
+            auto_admission: crate::read::AutoAdmissionStatus::default(),
             default_branch: "main".to_owned(),
             current_branch: snapshot.current_branch,
             current_pr: snapshot.current_pr,
@@ -1978,6 +2094,7 @@ mod tests {
                 agent_priority_labels: Vec::new(),
             },
             Some(&rebase),
+            false,
         )
         .expect_err("tail drift must stop before admission");
 
@@ -2094,6 +2211,33 @@ mod tests {
         assert_eq!(output.pull_request.auto_merge, AutoMergeState::squash());
         assert_eq!(output.caravan_id, PrNumber(1));
         assert!(output.receipt.changed);
+    }
+
+    #[test]
+    fn explicit_membership_consumes_advisory_auto_admission_skip() {
+        let candidate = pull_request(1, "one", "main", &[SKIPPED_LABEL]);
+        let provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
+        let output = execute(
+            status(candidate, Vec::new()),
+            &clean,
+            &provider,
+            MembershipRequest {
+                operation: MembershipOperation::New,
+                create_pr: false,
+                tail_pr: None,
+                head_pr: None,
+                reason: Some("manual override".to_owned()),
+                priority_label: None,
+                agent_priority_labels: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        assert!(output.pull_request.has_label(ACTIVE_LABEL));
+        assert!(!output.pull_request.has_label(SKIPPED_LABEL));
+        assert!(output.receipt.completed_steps.iter().any(|step| {
+            step.kind == MutationKind::RemoveLabel && step.state == MutationStepState::Completed
+        }));
     }
 
     #[test]

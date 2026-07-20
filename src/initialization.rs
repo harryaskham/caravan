@@ -32,7 +32,10 @@ fn required_label(name: &str, color: &str, description: impl Into<String>) -> Re
 /// Complete deterministic label policy: fixed membership labels followed by
 /// configured highest-to-lowest admission-priority labels.
 #[must_use]
-pub fn required_labels(priority_labels: &[String]) -> Vec<RequiredLabel> {
+pub fn required_labels(
+    priority_labels: &[String],
+    include_auto_admission_skip: bool,
+) -> Vec<RequiredLabel> {
     const PRIORITY_COLORS: [&str; 6] = ["B60205", "D93F0B", "FBCA04", "0E8A16", "1D76DB", "5319E7"];
     let mut labels = vec![
         required_label("caravan", "5319E7", "Active member of a Caravan PR chain"),
@@ -47,6 +50,13 @@ pub fn required_labels(priority_labels: &[String]) -> Vec<RequiredLabel> {
             "Allow configured force handling for known CI failures",
         ),
     ];
+    if include_auto_admission_skip {
+        labels.push(required_label(
+            "caravan-join-skipped",
+            "6F42C1",
+            "Generation-bound best-effort automatic admission skip",
+        ));
+    }
     labels.extend(priority_labels.iter().enumerate().map(|(rank, name)| {
         required_label(
             name,
@@ -63,7 +73,7 @@ pub fn required_labels(priority_labels: &[String]) -> Vec<RequiredLabel> {
 const LEGACY_ACTIVE_COLOR: &str = "1D76DB";
 const LEGACY_ACTIVE_DESCRIPTION: &str = "Active member of a Caravan merge chain";
 
-const DEFAULT_CONFIG: &str = "version: 1\nforce_merge: false\nrebase_on_join: false\nagent_priority_labels:\n  - caravan-priority:high\n  - caravan-priority:normal\n  - caravan-priority:low\ncommand_timeout_secs: 30\nrepair:\n  materialization_timeout_secs: 180\nloop:\n  interval_secs: 60\njournal:\n  max_bytes: 8388608\n  max_archives: 3\nhooks: {}\n";
+const DEFAULT_CONFIG: &str = "version: 1\nforce_merge: false\nrebase_on_join: false\nagent_priority_labels:\n  - caravan-priority:high\n  - caravan-priority:normal\n  - caravan-priority:low\ncommand_timeout_secs: 30\nrepair:\n  materialization_timeout_secs: 180\nsync:\n  actions:\n    join_unlabelled_prs: false\n  max_candidates_per_tick: 8\n  max_mutations_per_tick: 64\n  max_github_requests_per_tick: 256\n  max_duration_secs: 120\nloop:\n  interval_secs: 60\njournal:\n  max_bytes: 8388608\n  max_archives: 3\nhooks: {}\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -194,6 +204,7 @@ impl<R: crate::command::CommandRunner> InitializationProvider for GitHubMutation
 pub fn inspect_labels(
     labels: &[RepositoryLabel],
     priority_labels: &[String],
+    include_auto_admission_skip: bool,
 ) -> InitializationStatus {
     let by_name: BTreeMap<_, _> = labels
         .iter()
@@ -201,7 +212,7 @@ pub fn inspect_labels(
         .collect();
     let mut missing = Vec::new();
     let mut mismatched = Vec::new();
-    for required in required_labels(priority_labels) {
+    for required in required_labels(priority_labels, include_auto_admission_skip) {
         match by_name.get(required.name.as_str()) {
             None => missing.push(required.name.clone()),
             Some(actual) if !label_matches(actual, &required) => {
@@ -309,7 +320,10 @@ pub fn init_with_provider(
         ));
     }
 
-    let required = required_labels(&context.config.agent_priority_labels);
+    let required = required_labels(
+        &context.config.agent_priority_labels,
+        context.config.sync.actions.join_unlabelled_prs,
+    );
     let initial = provider.labels(repository).map_err(provider_error)?;
     reject_mismatches(repository, &initial, &required)?;
     let mut receipts = Vec::new();
@@ -651,7 +665,10 @@ mod tests {
     }
 
     fn required() -> Vec<RequiredLabel> {
-        required_labels(&crate::config::CaravanConfig::default().agent_priority_labels)
+        required_labels(
+            &crate::config::CaravanConfig::default().agent_priority_labels,
+            false,
+        )
     }
 
     fn repository() -> RepositoryId {
@@ -732,6 +749,26 @@ mod tests {
                 .iter()
                 .all(|receipt| receipt.state == ResourceState::AlreadyPresent)
         );
+    }
+
+    #[test]
+    fn auto_admission_opt_in_initializes_the_skip_label() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = FakeProvider::new(Vec::new());
+        let mut context = context(&directory);
+        context.config.rebase_on_join = true;
+        context.config.sync.actions.join_unlabelled_prs = true;
+
+        let output = init_with_provider(&context, &repository(), "main", &provider).unwrap();
+
+        assert_eq!(output.labels.len(), 7);
+        let skip = output
+            .labels
+            .iter()
+            .find(|label| label.name == "caravan-join-skipped")
+            .expect("opt-in label");
+        assert_eq!(skip.color, "6F42C1");
+        assert_eq!(skip.state, ResourceState::Created);
     }
 
     #[test]
@@ -886,6 +923,7 @@ mod tests {
             inspect_labels(
                 &labels,
                 &crate::config::CaravanConfig::default().agent_priority_labels,
+                false,
             )
             .ready
         );
@@ -991,7 +1029,7 @@ mod tests {
             },
         ];
         let priorities = crate::config::CaravanConfig::default().agent_priority_labels;
-        let status = inspect_labels(&labels, &priorities);
+        let status = inspect_labels(&labels, &priorities, false);
         assert!(!status.ready);
         assert_eq!(
             status.missing_labels,

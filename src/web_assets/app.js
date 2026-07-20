@@ -151,6 +151,8 @@
     if (hasLabel(pr, "caravan-evicted")) return "Explicitly evicted; use renew or rejoin after fresh validation.";
     const rejection = status?.admission?.rejected?.find((item) => item.pr === pr.number);
     if (rejection) return rejection.reason;
+    const skipped = status?.admission?.skipped?.find((item) => item.pr === pr.number);
+    if (skipped) return skipped.reason;
     const candidate = status?.admission?.candidates?.find((item) => item.pr === pr.number);
     if (candidate) return candidate.reason;
     if (!hasLabel(pr, "caravan")) return "Not enrolled. It must pass exact remote candidate and compatibility preflight.";

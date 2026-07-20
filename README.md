@@ -48,6 +48,12 @@ after the same check passes.
   reports admin permission. Cara-owned physical rewrites consume and audit any
   force label bound to the old head; the new generation requires a fresh
   operator label, while routine membership never carries force intent.
+- Optional sync-owned auto-admission is strictly opt-in. After the existing
+  fleet converges, `sync --all` considers unlabelled PRs in configured-priority
+  then immutable-FIFO order and greedily joins the first compatible live tail.
+  Incompatible generations receive `caravan-join-skipped` plus a durable exact
+  evidence receipt; unchanged generations are not retried, while candidate,
+  default, tail, config, or heuristic changes invalidate the skip automatically.
 
 ## V1 command surface
 
@@ -100,7 +106,9 @@ cara feedback status | report
 First use is always explicit: run `cara status`, then `cara init`. Init atomically
 creates `.caravan/config.yaml` only when absent, verifies repository permission,
 default-branch protection, and squash auto-merge policy, and creates only the
-three canonical labels. It never overwrites an existing config or label and
+three fixed control labels (`caravan`, `caravan-evicted`, and `caravan-force`),
+the opt-in `caravan-join-skipped` label when greedy admission is enabled, and
+configured priority labels. It never overwrites an existing config or label and
 never mutates a pull request. Repeated init calls are verification-only no-ops.
 If label metadata differs, reconcile it manually and retry. The legacy active
 label `1D76DB` / `Active member of a Caravan merge chain` is explicitly
@@ -263,6 +271,13 @@ rebase_on_join: false
 command_timeout_secs: 30
 repair:
   materialization_timeout_secs: 180
+sync:
+  actions:
+    join_unlabelled_prs: false
+  max_candidates_per_tick: 8
+  max_mutations_per_tick: 64
+  max_github_requests_per_tick: 256
+  max_duration_secs: 120
 loop:
   interval_secs: 60
 journal:
@@ -306,6 +321,22 @@ fresh pending CI before widening the rollout. Roll back by reverting the config
 to `rebase_on_join: false`. Do **not** force-push branches back: any successfully
 applied prefix is authoritative and the resumable recovery is rediscovery plus
 the same idempotent sync.
+
+With `sync.actions.join_unlabelled_prs: true`, only `sync --all` and the
+identical `loop`/`loop --once` path grow the fleet. Existing caravans always
+reconcile first; a real graph, provider, compatibility, CI, or operator decision
+stops before admission. The `priority_fifo_greedy_v1` heuristic considers
+caravans in their existing deterministic order and candidates in canonical
+priority/FIFO order. It is best-effort rather than globally optimal: the first
+compatible tail wins. When no tail works (or the empty fleet candidate cannot
+form a head), Cara records exact candidate head/base, default, all tested tail
+generations, compatibility reasons, config fingerprint, actor/time, and
+heuristic version in a GitHub comment and adds `caravan-join-skipped`. Manual
+`new`/`join`/`rejoin` consumes that advisory label. One tick is bounded by the
+configured wall-clock, authenticated `gh` request, candidate, and mutation
+limits and returns exact joins, skips, remaining candidates, and continuation.
+Hosted automation should run bounded `cara loop --once` ticks from PR/check,
+workflow, default-branch, and scheduled events rather than one unbounded job.
 
 This proves cumulative *tree content*, not stable GitHub check identity. Because
 Caravan heads currently squash-merge, retargeting a child after its parent lands

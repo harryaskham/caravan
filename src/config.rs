@@ -18,6 +18,10 @@ pub const DEFAULT_CONFIG_PATH: &str = ".caravan/config.yaml";
 const MAX_INTERVAL_SECS: u64 = 86_400;
 const MAX_COMMAND_TIMEOUT_SECS: u64 = 3_600;
 const MAX_HOOK_TIMEOUT_SECS: u64 = 86_400;
+const MAX_SYNC_CANDIDATES_PER_TICK: u32 = 100;
+const MAX_SYNC_MUTATIONS_PER_TICK: u32 = 1_000;
+const MAX_SYNC_GITHUB_REQUESTS_PER_TICK: u32 = 10_000;
+const MAX_SYNC_DURATION_SECS: u64 = 3_600;
 
 fn config_version() -> u32 {
     CONFIG_VERSION
@@ -45,6 +49,22 @@ fn default_journal_max_bytes() -> u64 {
 
 fn default_journal_max_archives() -> u32 {
     3
+}
+
+fn default_sync_max_candidates_per_tick() -> u32 {
+    8
+}
+
+fn default_sync_max_mutations_per_tick() -> u32 {
+    64
+}
+
+fn default_sync_max_github_requests_per_tick() -> u32 {
+    256
+}
+
+fn default_sync_max_duration_secs() -> u64 {
+    120
 }
 
 fn default_agent_priority_labels() -> Vec<String> {
@@ -105,6 +125,41 @@ impl Default for RepairConfig {
     }
 }
 
+/// Explicit sync-owned provider actions. Every action is disabled by default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct SyncActionsConfig {
+    /// Greedily admit eligible unlabelled PRs after existing caravans converge.
+    pub join_unlabelled_prs: bool,
+}
+
+/// Whole-tick safety bounds for reconciliation and optional automatic admission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct SyncConfig {
+    pub actions: SyncActionsConfig,
+    /// Maximum fresh candidate generations considered by one `sync --all` tick.
+    pub max_candidates_per_tick: u32,
+    /// Maximum completed provider/branch mutations retained by one tick.
+    pub max_mutations_per_tick: u32,
+    /// Maximum authenticated `gh` subprocesses issued by one tick.
+    pub max_github_requests_per_tick: u32,
+    /// Absolute wall-clock ceiling for one complete sync tick.
+    pub max_duration_secs: u64,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            actions: SyncActionsConfig::default(),
+            max_candidates_per_tick: default_sync_max_candidates_per_tick(),
+            max_mutations_per_tick: default_sync_max_mutations_per_tick(),
+            max_github_requests_per_tick: default_sync_max_github_requests_per_tick(),
+            max_duration_secs: default_sync_max_duration_secs(),
+        }
+    }
+}
+
 /// One shell hook policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
@@ -144,6 +199,7 @@ pub struct CaravanConfig {
     /// Hard deadline for each lightweight Git or GitHub CLI subprocess.
     pub command_timeout_secs: u64,
     pub repair: RepairConfig,
+    pub sync: SyncConfig,
     #[serde(rename = "loop")]
     pub loop_config: LoopConfig,
     pub journal: JournalConfig,
@@ -159,6 +215,7 @@ impl Default for CaravanConfig {
             agent_priority_labels: default_agent_priority_labels(),
             command_timeout_secs: default_command_timeout_secs(),
             repair: RepairConfig::default(),
+            sync: SyncConfig::default(),
             loop_config: LoopConfig::default(),
             journal: JournalConfig::default(),
             hooks: BTreeMap::new(),
@@ -254,6 +311,33 @@ impl CaravanConfig {
         if !(1..=MAX_COMMAND_TIMEOUT_SECS).contains(&self.repair.materialization_timeout_secs) {
             return Err(ConfigError::Validation(format!(
                 "repair.materialization_timeout_secs must be between 1 and {MAX_COMMAND_TIMEOUT_SECS}"
+            )));
+        }
+        if self.sync.actions.join_unlabelled_prs && !self.rebase_on_join {
+            return Err(ConfigError::Validation(
+                "sync.actions.join_unlabelled_prs requires rebase_on_join: true".to_owned(),
+            ));
+        }
+        if !(1..=MAX_SYNC_CANDIDATES_PER_TICK).contains(&self.sync.max_candidates_per_tick) {
+            return Err(ConfigError::Validation(format!(
+                "sync.max_candidates_per_tick must be between 1 and {MAX_SYNC_CANDIDATES_PER_TICK}"
+            )));
+        }
+        if !(1..=MAX_SYNC_MUTATIONS_PER_TICK).contains(&self.sync.max_mutations_per_tick) {
+            return Err(ConfigError::Validation(format!(
+                "sync.max_mutations_per_tick must be between 1 and {MAX_SYNC_MUTATIONS_PER_TICK}"
+            )));
+        }
+        if !(1..=MAX_SYNC_GITHUB_REQUESTS_PER_TICK)
+            .contains(&self.sync.max_github_requests_per_tick)
+        {
+            return Err(ConfigError::Validation(format!(
+                "sync.max_github_requests_per_tick must be between 1 and {MAX_SYNC_GITHUB_REQUESTS_PER_TICK}"
+            )));
+        }
+        if !(1..=MAX_SYNC_DURATION_SECS).contains(&self.sync.max_duration_secs) {
+            return Err(ConfigError::Validation(format!(
+                "sync.max_duration_secs must be between 1 and {MAX_SYNC_DURATION_SECS}"
             )));
         }
         if !(1..=MAX_INTERVAL_SECS).contains(&self.loop_config.interval_secs) {
@@ -402,6 +486,11 @@ mod tests {
         );
         assert_eq!(config.command_timeout_secs, 30);
         assert_eq!(config.repair.materialization_timeout_secs, 180);
+        assert!(!config.sync.actions.join_unlabelled_prs);
+        assert_eq!(config.sync.max_candidates_per_tick, 8);
+        assert_eq!(config.sync.max_mutations_per_tick, 64);
+        assert_eq!(config.sync.max_github_requests_per_tick, 256);
+        assert_eq!(config.sync.max_duration_secs, 120);
         assert_eq!(config.loop_config.interval_secs, 60);
         assert!(config.hooks.is_empty());
     }
@@ -416,6 +505,13 @@ rebase_on_join: true
 command_timeout_secs: 45
 repair:
   materialization_timeout_secs: 240
+sync:
+  actions:
+    join_unlabelled_prs: true
+  max_candidates_per_tick: 5
+  max_mutations_per_tick: 40
+  max_github_requests_per_tick: 200
+  max_duration_secs: 90
 loop:
   interval_secs: 10
 hooks:
@@ -430,6 +526,11 @@ hooks:
         assert!(config.rebase_on_join);
         assert_eq!(config.command_timeout_secs, 45);
         assert_eq!(config.repair.materialization_timeout_secs, 240);
+        assert!(config.sync.actions.join_unlabelled_prs);
+        assert_eq!(config.sync.max_candidates_per_tick, 5);
+        assert_eq!(config.sync.max_mutations_per_tick, 40);
+        assert_eq!(config.sync.max_github_requests_per_tick, 200);
+        assert_eq!(config.sync.max_duration_secs, 90);
         let hook = config.hook(EventKind::SyncFailed).expect("hook");
         assert_eq!(hook.command, "./scripts/on-sync-failed");
         assert_eq!(hook.timeout_secs, 45);
@@ -449,6 +550,11 @@ hooks:
         )
         .unwrap_err();
         assert_eq!(repair.code(), "config_parse_failed");
+        let sync = CaravanConfig::parse(
+            "version: 1\nsync:\n  actions:\n    join_unlabelled_prs: true\n    surprise: true\n",
+        )
+        .unwrap_err();
+        assert_eq!(sync.code(), "config_parse_failed");
         let hook = CaravanConfig::parse(
             "version: 1\nhooks:\n  sync_failed:\n    command: echo hi\n    surprise: true\n",
         )
@@ -476,6 +582,15 @@ hooks:
     }
 
     #[test]
+    fn automatic_admission_requires_physical_atomic_join() {
+        let error =
+            CaravanConfig::parse("version: 1\nsync:\n  actions:\n    join_unlabelled_prs: true\n")
+                .unwrap_err();
+        assert_eq!(error.code(), "invalid_config");
+        assert!(error.to_string().contains("requires rebase_on_join"));
+    }
+
+    #[test]
     fn versions_intervals_and_hooks_are_validated() {
         assert_eq!(
             CaravanConfig::parse("version: 2\n").unwrap_err().code(),
@@ -489,6 +604,30 @@ hooks:
         );
         assert_eq!(
             CaravanConfig::parse("version: 1\nrepair:\n  materialization_timeout_secs: 0\n",)
+                .unwrap_err()
+                .code(),
+            "invalid_config"
+        );
+        assert_eq!(
+            CaravanConfig::parse("version: 1\nsync:\n  max_candidates_per_tick: 0\n")
+                .unwrap_err()
+                .code(),
+            "invalid_config"
+        );
+        assert_eq!(
+            CaravanConfig::parse("version: 1\nsync:\n  max_mutations_per_tick: 0\n")
+                .unwrap_err()
+                .code(),
+            "invalid_config"
+        );
+        assert_eq!(
+            CaravanConfig::parse("version: 1\nsync:\n  max_github_requests_per_tick: 0\n")
+                .unwrap_err()
+                .code(),
+            "invalid_config"
+        );
+        assert_eq!(
+            CaravanConfig::parse("version: 1\nsync:\n  max_duration_secs: 0\n")
                 .unwrap_err()
                 .code(),
             "invalid_config"

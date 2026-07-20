@@ -245,7 +245,7 @@ pub fn control_label_marker(
             .filter(|label| {
                 matches!(
                     label.as_str(),
-                    "caravan" | "caravan-evicted" | "caravan-force"
+                    "caravan" | "caravan-evicted" | "caravan-force" | "caravan-join-skipped"
                 ) || label.starts_with("caravan-priority:")
             })
             .cloned()
@@ -695,6 +695,50 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
                 &audit.body(),
             ))?;
             trimmed_provider_output(&output).or(Some(marker))
+        };
+        let after = self.refetch_pull_request(repository, expected.number)?;
+        Ok(GitHubMutationReceipt {
+            kind: MutationKind::Comment,
+            before: Some(before),
+            after,
+            provider_output,
+        })
+    }
+
+    /// Return bounded GitHub-visible PR comment bodies in provider order.
+    pub fn pull_request_comment_bodies(
+        &self,
+        repository: &RepositoryId,
+        number: PrNumber,
+    ) -> Result<Vec<String>, MutationError> {
+        let pages: Vec<Vec<IssueCommentJson>> =
+            self.json(issue_comments_command(repository, number))?;
+        Ok(pages
+            .into_iter()
+            .flatten()
+            .map(|comment| comment.body)
+            .collect())
+    }
+
+    /// Post one deterministically marked comment, or prove it already exists.
+    pub fn ensure_marked_comment(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+        marker: &str,
+        body: &str,
+    ) -> Result<GitHubMutationReceipt, MutationError> {
+        let before = self.verify_precondition(repository, expected)?;
+        let comments = self.pull_request_comment_bodies(repository, expected.number)?;
+        let provider_output = if comments.iter().any(|comment| comment.contains(marker)) {
+            Some(format!("existing GitHub comment {marker}"))
+        } else {
+            let output = self.checked(comment_pull_request_command(
+                repository,
+                expected.number,
+                body,
+            ))?;
+            trimmed_provider_output(&output).or_else(|| Some(marker.to_owned()))
         };
         let after = self.refetch_pull_request(repository, expected.number)?;
         Ok(GitHubMutationReceipt {
@@ -3230,6 +3274,45 @@ mod tests {
 
         let receipt = adapter
             .ensure_control_label_comment(&repository, &expected, &audit)
+            .unwrap();
+
+        assert!(
+            receipt
+                .provider_output
+                .unwrap()
+                .starts_with("existing GitHub comment")
+        );
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn generic_marked_comment_dedupes_exact_skip_receipt() {
+        let repository = repository();
+        let expected = precondition(12);
+        let pull = pr_object_json(12, "feature/widget", "acme/widgets");
+        let marker = "<!-- caravan-auto-join-skip-receipt:abcd -->";
+        let comments = serde_json::to_string(&vec![vec![serde_json::json!({
+            "body": format!("{marker}\nexisting receipt"),
+        })]])
+        .unwrap();
+        let runner = FakeRunner::new(vec![
+            (
+                pull_request_command(&repository, "12"),
+                CommandOutput::success(pull.clone()),
+            ),
+            (
+                issue_comments_command(&repository, PrNumber(12)),
+                CommandOutput::success(comments),
+            ),
+            (
+                pull_request_command(&repository, "12"),
+                CommandOutput::success(pull),
+            ),
+        ]);
+        let adapter = GitHubMutationAdapter::new(runner);
+
+        let receipt = adapter
+            .ensure_marked_comment(&repository, &expected, marker, "replacement")
             .unwrap();
 
         assert!(

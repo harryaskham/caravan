@@ -847,6 +847,21 @@ fn render_sync(output: &caravan::sync::SyncOutput) -> String {
         output.scheduler_status.rebase_on_join,
         output.scheduler_status.reason,
     );
+    let _ = writeln!(
+        text,
+        "  auto-admission: enabled={} heuristic={} continuation={:?} considered={} joins={} skips={} mutations={}/{} github={}/{} remaining={}",
+        output.auto_admission.enabled,
+        output.auto_admission.heuristic_version,
+        output.auto_admission.continuation,
+        output.auto_admission.candidates_considered,
+        output.auto_admission.joins.len(),
+        output.auto_admission.skips.len(),
+        output.auto_admission.mutations_used,
+        output.auto_admission.mutation_limit,
+        output.auto_admission.github_requests_used,
+        output.auto_admission.github_request_limit,
+        output.auto_admission.remaining_candidates.len(),
+    );
     if !output.scheduler_status.waiting_prs.is_empty() {
         let waiting = output
             .scheduler_status
@@ -1034,6 +1049,16 @@ fn render_status(output: &caravan::read::StatusOutput) -> String {
     if let Some(action) = &output.rebase_on_join.required_action {
         let _ = writeln!(text, "  action: {action}");
     }
+    let _ = writeln!(
+        text,
+        "auto-admission={} heuristic={} candidates={} mutations={} github={} duration={}s",
+        output.auto_admission.enabled,
+        output.auto_admission.heuristic_version,
+        output.auto_admission.max_candidates_per_tick,
+        output.auto_admission.max_mutations_per_tick,
+        output.auto_admission.max_github_requests_per_tick,
+        output.auto_admission.max_duration_secs,
+    );
     let _ = writeln!(text, "caravans: {}", output.analysis.fleet.caravans.len());
     if let Some(previous) = &output.previous_default_oid {
         let _ = writeln!(text, "previous observed default: {previous}");
@@ -1116,6 +1141,9 @@ fn render_status(output: &caravan::read::StatusOutput) -> String {
         for candidate in &output.admission.candidates {
             let _ = writeln!(text, "  #{}: {}", candidate.pr, candidate.reason);
         }
+    }
+    for skipped in &output.admission.skipped {
+        let _ = writeln!(text, "~ admission #{}: {}", skipped.pr, skipped.reason);
     }
     for rejected in &output.admission.rejected {
         let _ = writeln!(text, "! admission #{}: {}", rejected.pr, rejected.reason);
@@ -1637,6 +1665,7 @@ mod tests {
             timing: None,
             repository: repository.clone(),
             rebase_on_join: caravan::read::RebaseOnJoinStatus::default(),
+            auto_admission: caravan::read::AutoAdmissionStatus::default(),
             default_branch: "main".to_owned(),
             current_branch: Some("feature".to_owned()),
             current_pr: None,
@@ -1646,6 +1675,7 @@ mod tests {
                 policy: "priority then FIFO".to_owned(),
                 priority_labels: Vec::new(),
                 candidates: Vec::new(),
+                skipped: Vec::new(),
                 rejected: Vec::new(),
                 next_candidate: None,
             },

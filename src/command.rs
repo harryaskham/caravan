@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -182,6 +183,15 @@ impl CommandOutput {
 /// Failure to start a subprocess or decode its output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandRunError {
+    /// The shared authenticated GitHub subprocess budget was exhausted.
+    GithubRequestBudgetExceeded {
+        /// Command which would have exceeded the bound.
+        command: CommandSpec,
+        /// Configured maximum authenticated `gh` subprocesses.
+        limit: u32,
+        /// Requests already reserved by this operation.
+        used: u32,
+    },
     /// The executable could not be started or waited for.
     Spawn {
         /// Requested command.
@@ -216,6 +226,15 @@ pub enum CommandRunError {
 impl std::fmt::Display for CommandRunError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::GithubRequestBudgetExceeded {
+                command,
+                limit,
+                used,
+            } => write!(
+                formatter,
+                "`{}` would exceed the GitHub request budget ({used}/{limit} already used)",
+                command.display()
+            ),
             Self::Spawn { command, message } => {
                 write!(
                     formatter,
@@ -258,12 +277,53 @@ pub trait CommandRunner {
     }
 }
 
+/// Shared exact bound for authenticated `gh` subprocesses in one operation.
+#[derive(Debug, Clone)]
+pub struct GithubRequestBudget {
+    limit: u32,
+    used: Arc<AtomicU32>,
+}
+
+impl GithubRequestBudget {
+    #[must_use]
+    pub fn new(limit: u32) -> Self {
+        Self {
+            limit,
+            used: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    fn reserve(&self, command: &CommandSpec) -> Result<(), CommandRunError> {
+        self.used
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+                (used < self.limit).then_some(used + 1)
+            })
+            .map(|_| ())
+            .map_err(|used| CommandRunError::GithubRequestBudgetExceeded {
+                command: command.clone(),
+                limit: self.limit,
+                used,
+            })
+    }
+
+    #[must_use]
+    pub fn used(&self) -> u32 {
+        self.used.load(Ordering::SeqCst)
+    }
+
+    #[must_use]
+    pub const fn limit(&self) -> u32 {
+        self.limit
+    }
+}
+
 /// Production subprocess runner.
 #[derive(Debug, Clone)]
 pub struct ProcessRunner {
     cwd: Option<PathBuf>,
     timeout: Duration,
     operation_deadline: Option<Instant>,
+    github_request_budget: Option<GithubRequestBudget>,
     infer_github_auth: bool,
     github_api_telemetry: Arc<Mutex<crate::model::GitHubApiTelemetry>>,
 }
@@ -274,6 +334,7 @@ impl Default for ProcessRunner {
             cwd: None,
             timeout: DEFAULT_COMMAND_TIMEOUT,
             operation_deadline: None,
+            github_request_budget: None,
             infer_github_auth: true,
             github_api_telemetry: Arc::new(Mutex::new(crate::model::GitHubApiTelemetry::default())),
         }
@@ -294,6 +355,7 @@ impl ProcessRunner {
             cwd: Some(path.as_ref().to_path_buf()),
             timeout: DEFAULT_COMMAND_TIMEOUT,
             operation_deadline: None,
+            github_request_budget: None,
             infer_github_auth: true,
             github_api_telemetry: Arc::new(Mutex::new(crate::model::GitHubApiTelemetry::default())),
         }
@@ -321,6 +383,13 @@ impl ProcessRunner {
     #[must_use]
     pub fn with_operation_deadline(mut self, deadline: Instant) -> Self {
         self.operation_deadline = Some(deadline);
+        self
+    }
+
+    /// Share one exact authenticated `gh` request budget across runners.
+    #[must_use]
+    pub fn with_github_request_budget(mut self, budget: GithubRequestBudget) -> Self {
+        self.github_request_budget = Some(budget);
         self
     }
 
@@ -640,6 +709,14 @@ fn is_gh_request(request: &CommandSpec) -> bool {
 impl CommandRunner for ProcessRunner {
     #[allow(clippy::too_many_lines)]
     fn run(&self, request: &CommandSpec) -> Result<CommandOutput, CommandRunError> {
+        let is_gh = Path::new(&request.program)
+            .file_name()
+            .is_some_and(|name| name == "gh");
+        if is_gh {
+            if let Some(budget) = &self.github_request_budget {
+                budget.reserve(request)?;
+            }
+        }
         let timeout = self.effective_timeout(request)?;
         let github_auth = self.inferred_github_auth(request);
         self.record_github_request(request, github_auth.as_ref());
@@ -960,6 +1037,34 @@ mod tests {
         assert!(output.stderr.contains("wrapper diagnostic"));
         assert!(output.stderr.contains('\u{1}'));
         assert!(!output.stdout.contains("wrapper diagnostic"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_github_request_budget_is_exact_across_cloned_runners() {
+        let directory = tempfile::tempdir().unwrap();
+        let gh = directory.path().join("gh");
+        std::os::unix::fs::symlink("/usr/bin/true", &gh).unwrap();
+        let budget = GithubRequestBudget::new(1);
+        let first = ProcessRunner::new().with_github_request_budget(budget.clone());
+        let second = ProcessRunner::new().with_github_request_budget(budget.clone());
+
+        first
+            .run(&CommandSpec::new(gh.display().to_string()))
+            .expect("first gh command is inside the bound");
+        let error = second
+            .run(&CommandSpec::new(gh.display().to_string()))
+            .expect_err("second gh command must fail before spawning");
+
+        assert!(matches!(
+            error,
+            CommandRunError::GithubRequestBudgetExceeded {
+                limit: 1,
+                used: 1,
+                ..
+            }
+        ));
+        assert_eq!(budget.used(), 1);
     }
 
     #[test]

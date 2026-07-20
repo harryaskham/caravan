@@ -83,6 +83,9 @@ pub struct StatusOutput {
     /// Explicitly reports enabled/disabled physical chain-rebuild policy.
     #[serde(default)]
     pub rebase_on_join: RebaseOnJoinStatus,
+    /// Exact sync-owned automatic-admission policy and safety bounds.
+    #[serde(default)]
+    pub auto_admission: AutoAdmissionStatus,
     pub default_branch: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_branch: Option<String>,
@@ -110,6 +113,30 @@ pub struct StatusTiming {
 
 /// One selectable PR in canonical priority-then-FIFO order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AutoAdmissionStatus {
+    pub enabled: bool,
+    pub heuristic_version: String,
+    pub max_candidates_per_tick: u32,
+    pub max_mutations_per_tick: u32,
+    pub max_github_requests_per_tick: u32,
+    pub max_duration_secs: u64,
+}
+
+impl Default for AutoAdmissionStatus {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            heuristic_version: crate::sync::AUTO_ADMISSION_HEURISTIC_VERSION.to_owned(),
+            max_candidates_per_tick: 0,
+            max_mutations_per_tick: 0,
+            max_github_requests_per_tick: 0,
+            max_duration_secs: 0,
+        }
+    }
+}
+
+/// One selectable PR in canonical priority-then-FIFO order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AdmissionCandidate {
     pub pr: PrNumber,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -118,6 +145,19 @@ pub struct AdmissionCandidate {
     pub priority_rank: Option<usize>,
     /// Immutable GitHub creation timestamp used as the FIFO key. Legacy or
     /// synthetic snapshots may omit it and deterministically fall back to PR number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    pub reason: String,
+}
+
+/// One ready-looking PR excluded from automation because priority metadata is unsafe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SkippedAdmissionCandidate {
+    pub pr: PrNumber,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority_rank: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
     pub reason: String,
@@ -141,6 +181,9 @@ pub struct AdmissionStatus {
     pub priority_labels: Vec<String>,
     /// Ordered highest priority first, then immutable provider creation time.
     pub candidates: Vec<AdmissionCandidate>,
+    /// Exact generations carrying the sync-owned best-effort skip label.
+    #[serde(default)]
+    pub skipped: Vec<SkippedAdmissionCandidate>,
     #[serde(default)]
     pub rejected: Vec<RejectedAdmissionCandidate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -383,6 +426,16 @@ pub(crate) fn status_with_deadline(
     context: &AppContext,
     operation_deadline: std::time::Instant,
 ) -> Result<StatusOutput, AppError> {
+    status_with_deadline_and_budget(context, operation_deadline, None)
+}
+
+/// Status with one shared exact authenticated GitHub request budget.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn status_with_deadline_and_budget(
+    context: &AppContext,
+    operation_deadline: std::time::Instant,
+    github_budget: Option<&crate::command::GithubRequestBudget>,
+) -> Result<StatusOutput, AppError> {
     // Sharing one absolute deadline prevents a large repository from
     // multiplying its budget by provider and compatibility subprocess count.
     let started = std::time::Instant::now();
@@ -391,6 +444,9 @@ pub(crate) fn status_with_deadline(
     let provider_runner = crate::command::ProcessRunner::in_directory(&context.repository_path)
         .with_timeout(child_timeout)
         .with_operation_deadline(operation_deadline);
+    let provider_runner = github_budget.map_or(provider_runner.clone(), |budget| {
+        provider_runner.with_github_request_budget(budget.clone())
+    });
     let discovery = GitHubDiscovery::new(provider_runner.clone());
     let snapshot = discovery.discover().map_err(|error| {
         let mapped =
@@ -455,8 +511,11 @@ pub(crate) fn status_with_deadline(
             };
             attach_provider_api(&mapped, &provider_runner.github_api_telemetry())
         })?;
-    let mut initialization =
-        crate::initialization::inspect_labels(&labels, &context.config.agent_priority_labels);
+    let mut initialization = crate::initialization::inspect_labels(
+        &labels,
+        &context.config.agent_priority_labels,
+        context.config.sync.actions.join_unlabelled_prs,
+    );
     if !context.config_existed {
         initialization.ready = false;
         initialization.next = Some("run `cara init` to atomically create .caravan/config.yaml and verify repository readiness".to_owned());
@@ -486,6 +545,14 @@ pub(crate) fn status_with_deadline(
         timing: None,
         repository: snapshot.repository,
         rebase_on_join: rebase_on_join_status(context),
+        auto_admission: AutoAdmissionStatus {
+            enabled: context.config.sync.actions.join_unlabelled_prs,
+            heuristic_version: crate::sync::AUTO_ADMISSION_HEURISTIC_VERSION.to_owned(),
+            max_candidates_per_tick: context.config.sync.max_candidates_per_tick,
+            max_mutations_per_tick: context.config.sync.max_mutations_per_tick,
+            max_github_requests_per_tick: context.config.sync.max_github_requests_per_tick,
+            max_duration_secs: context.config.sync.max_duration_secs,
+        },
         default_branch: snapshot.default_branch.name,
         current_branch: snapshot.current_branch,
         current_pr: snapshot.current_pr,
@@ -544,7 +611,7 @@ pub fn next_candidate(context: &AppContext) -> Result<NextCandidateOutput, AppEr
     Ok(NextCandidateOutput {
         provider_api: status.provider_api,
         repository: status.repository,
-        attempt_contract: "ordered admission attempt only; run `cara check --pr N` for this exact first candidate; on rejection fail closed and retry after GitHub state changes rather than leapfrogging".to_owned(),
+        attempt_contract: "ordered manual admission attempt only; run `cara check --pr N` for this exact first candidate; on rejection fail closed rather than leapfrogging. The separate opt-in sync-owned greedy policy may persist an exact generation-bound mechanical skip before considering a later candidate".to_owned(),
         admission: status.admission,
     })
 }
@@ -559,6 +626,7 @@ pub fn resolve_admission(analysis: &GraphAnalysis, priority_labels: &[String]) -
         .map(|(rank, label)| (label.as_str(), rank))
         .collect();
     let mut candidates = Vec::new();
+    let mut skipped = Vec::new();
     let mut rejected = Vec::new();
 
     for number in &analysis.fleet.unqueued {
@@ -621,6 +689,16 @@ pub fn resolve_admission(analysis: &GraphAnalysis, priority_labels: &[String]) -
         }
 
         let created_at = pull_request.created_at.clone();
+        if pull_request.has_label("caravan-join-skipped") {
+            skipped.push(SkippedAdmissionCandidate {
+                pr: *number,
+                priority_label: configured.first().map(|(label, _)| (*label).clone()),
+                priority_rank: configured.first().map(|(_, rank)| rank + 1),
+                created_at,
+                reason: "generation-bound automatic admission skip; sync revalidates exact evidence before retrying".to_owned(),
+            });
+            continue;
+        }
         let fifo_reason = created_at.as_ref().map_or_else(
             || format!("provider created_at missing; deterministic PR number #{number} fallback"),
             |created_at| {
@@ -669,6 +747,14 @@ pub fn resolve_admission(analysis: &GraphAnalysis, priority_labels: &[String]) -
             candidate.pr,
         )
     });
+    skipped.sort_by_key(|candidate| {
+        (
+            candidate.priority_rank.unwrap_or(priority_labels.len() + 1),
+            candidate.created_at.is_none(),
+            candidate.created_at.clone().unwrap_or_default(),
+            candidate.pr,
+        )
+    });
     rejected.sort_by_key(|candidate| {
         (
             candidate.priority_rank.unwrap_or(priority_labels.len() + 1),
@@ -703,6 +789,7 @@ pub fn resolve_admission(analysis: &GraphAnalysis, priority_labels: &[String]) -
         policy: "ordered admission attempts: explicit agent priority label (configured high to low), then FIFO by immutable provider created_at ascending with PR number ascending as equal-time tie-break; missing created_at falls back deterministically to PR number after timestamped peers; never LIFO; check/new preflight required and rejection never causes automatic leapfrogging".to_owned(),
         priority_labels: priority_labels.to_vec(),
         candidates,
+        skipped,
         rejected,
         next_candidate,
     }
@@ -811,7 +898,19 @@ pub(crate) fn status_for_remote_candidate(
     context: &AppContext,
     number: PrNumber,
 ) -> Result<StatusOutput, AppError> {
-    let mut status = status(context)?;
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(context.config.command_timeout_secs);
+    status_for_remote_candidate_with_deadline(context, number, deadline, None)
+}
+
+/// Bind one exact remote candidate under a caller-owned deadline and GitHub budget.
+pub(crate) fn status_for_remote_candidate_with_deadline(
+    context: &AppContext,
+    number: PrNumber,
+    operation_deadline: std::time::Instant,
+    github_budget: Option<&crate::command::GithubRequestBudget>,
+) -> Result<StatusOutput, AppError> {
+    let mut status = status_with_deadline_and_budget(context, operation_deadline, github_budget)?;
     // Re-read the selected provider PR after fleet discovery. Comparing the
     // complete snapshot closes the discovery/refetch race before exact Git
     // revision checks; merge compatibility subsequently verifies refs both
@@ -819,7 +918,11 @@ pub(crate) fn status_for_remote_candidate(
     let provider_runner = crate::command::ProcessRunner::in_directory(&context.repository_path)
         .with_timeout(std::time::Duration::from_secs(
             context.config.command_timeout_secs,
-        ));
+        ))
+        .with_operation_deadline(operation_deadline);
+    let provider_runner = github_budget.map_or(provider_runner.clone(), |budget| {
+        provider_runner.with_github_request_budget(budget.clone())
+    });
     let provider = crate::github::GitHubMutationAdapter::new(provider_runner.clone());
     let fresh = provider
         .refetch_pull_request(&status.repository, number)
@@ -1369,6 +1472,26 @@ fn eligible_or_error(
 }
 
 fn discovery_error(error: &DiscoveryError) -> AppError {
+    if let DiscoveryError::Runner(CommandRunError::GithubRequestBudgetExceeded {
+        command,
+        limit,
+        used,
+    }) = error
+    {
+        return AppError::structured(
+            ErrorCategory::ExecutionFailure,
+            "github_request_budget_exhausted",
+            error.to_string(),
+            Some(json!({
+                "command": command.display(),
+                "limit": limit,
+                "used": used,
+                "retryable": true,
+                "mutated": false,
+                "safe_next_action": "rerun the same bounded sync tick to continue from fresh provider state",
+            })),
+        );
+    }
     if let DiscoveryError::Runner(CommandRunError::Timeout {
         command,
         timeout_ms,
@@ -1600,6 +1723,7 @@ mod tests {
             timing: None,
             repository: repository(),
             rebase_on_join: RebaseOnJoinStatus::default(),
+            auto_admission: AutoAdmissionStatus::default(),
             default_branch: "main".to_owned(),
             current_branch: snapshot.current_branch,
             current_pr: snapshot.current_pr,
@@ -1867,6 +1991,28 @@ mod tests {
         let admission = resolve_admission(&status.analysis, &labels);
         assert_eq!(admission.next_candidate, Some(PrNumber(20)));
         assert_eq!(admission.candidates[0].priority_rank, Some(1));
+    }
+
+    #[test]
+    fn generation_bound_skip_is_excluded_without_blocking_later_candidates() {
+        let mut skipped = pr(10, "skipped", "main", false);
+        skipped.labels.insert("caravan-join-skipped".to_owned());
+        let later = pr(20, "later", "main", false);
+        let status = status(skipped, vec![later]);
+        let labels = crate::config::CaravanConfig::default().agent_priority_labels;
+        let admission = resolve_admission(&status.analysis, &labels);
+
+        assert_eq!(admission.skipped.len(), 1);
+        assert_eq!(admission.skipped[0].pr, PrNumber(10));
+        assert_eq!(admission.next_candidate, Some(PrNumber(20)));
+        assert_eq!(
+            admission
+                .candidates
+                .iter()
+                .map(|candidate| candidate.pr)
+                .collect::<Vec<_>>(),
+            [PrNumber(20)]
+        );
     }
 
     #[test]

@@ -21,6 +21,11 @@ Canonical labels:
 | `caravan` | `5319E7` | `Active member of a Caravan PR chain` |
 | `caravan-evicted` | `B60205` | `Removed from a Caravan chain pending renew or rejoin` |
 | `caravan-force` | `D93F0B` | `Allow configured force handling for known CI failures` |
+| `caravan-join-skipped` | `6F42C1` | `Generation-bound best-effort automatic admission skip` |
+
+The first three labels are always required. `caravan-join-skipped` is required
+and initialized only when `sync.actions.join_unlabelled_prs` is enabled, so an
+upgrade with the action disabled does not disrupt existing repositories.
 
 For repositories created by earlier Caravan versions, the active label
 `1D76DB` / `Active member of a Caravan merge chain` is also an exact compatible
