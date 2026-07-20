@@ -1044,7 +1044,11 @@ mod tests {
     fn shared_github_request_budget_is_exact_across_cloned_runners() {
         let directory = tempfile::tempdir().unwrap();
         let gh = directory.path().join("gh");
-        std::os::unix::fs::symlink("/usr/bin/true", &gh).unwrap();
+        let true_binary = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|directory| directory.join("true"))
+            .find(|candidate| candidate.is_file())
+            .expect("true is available on the hermetic test PATH");
+        std::os::unix::fs::symlink(true_binary, &gh).unwrap();
         let budget = GithubRequestBudget::new(1);
         let first = ProcessRunner::new().with_github_request_budget(budget.clone());
         let second = ProcessRunner::new().with_github_request_budget(budget.clone());
