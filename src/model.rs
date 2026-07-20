@@ -194,6 +194,52 @@ impl PullRequestSnapshot {
     }
 }
 
+/// Latest provider rate-limit evidence observed during one Cara operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GitHubRateLimit {
+    pub cost: u64,
+    pub remaining: u64,
+    pub reset_at: String,
+}
+
+/// Secret-free authenticated GitHub command telemetry for one operation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GitHubApiTelemetry {
+    pub authenticated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_source: Option<String>,
+    pub calls: u64,
+    pub graphql_calls: u64,
+    pub rest_calls: u64,
+    pub gh_cli_calls: u64,
+    pub cache_hits: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_age_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit: Option<GitHubRateLimit>,
+}
+
+impl GitHubApiTelemetry {
+    /// Merge telemetry from another runner used by the same bounded operation.
+    pub fn merge(&mut self, other: Self) {
+        self.authenticated |= other.authenticated;
+        if other.auth_source.is_some() {
+            self.auth_source = other.auth_source;
+        }
+        self.calls = self.calls.saturating_add(other.calls);
+        self.graphql_calls = self.graphql_calls.saturating_add(other.graphql_calls);
+        self.rest_calls = self.rest_calls.saturating_add(other.rest_calls);
+        self.gh_cli_calls = self.gh_cli_calls.saturating_add(other.gh_cli_calls);
+        self.cache_hits = self.cache_hits.saturating_add(other.cache_hits);
+        if other.cache_age_ms.is_some() {
+            self.cache_age_ms = other.cache_age_ms;
+        }
+        if other.rate_limit.is_some() {
+            self.rate_limit = other.rate_limit;
+        }
+    }
+}
+
 /// Complete discovery result before graph policy is applied.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RepositorySnapshot {

@@ -8,10 +8,10 @@ is required or used.
 
 | SPEC operation | Human CLI | `--json` | MCP tool | Checked behavior |
 |---|---|---|---|---|
-| repository inspection | `cara status` | envelope | `status` | live discovery, graph, PR/check facts, initialization, canonical priority-then-FIFO attempts |
+| repository inspection | `cara status` | envelope | `status` | live discovery, graph, PR/check facts, initialization, canonical priority-then-FIFO attempts, authenticated GitHub call/rate-budget telemetry |
 | event journal | `cara log` / `cara log -f` | bounded envelope / NDJSON follow | bounded `log` only | common-Git storage, filters, exact IDs, hook receipts, locking, rotation, torn-tail recovery |
 | next admission | `cara next-candidate` | envelope | `next_candidate` | nonmutating canonical first attempt; membership preflight remains required and rejection cannot leapfrog; invalid labels fail closed |
-| eligibility / remote preflight | `cara check [--pr N] [--tail-pr N\|--head-pr N]` | envelope | `check` | exact provider candidate receipt, active/new/join modes, canonical fail-closed selection, stale-head rejection, next action; target forms exclusive |
+| eligibility / remote preflight | `cara check [--pr N] [--tail-pr N\|--head-pr N]` | envelope | `check` | exact provider candidate receipt, active/new/join modes, canonical fail-closed selection, stale-head rejection, next action, provider-call/rate telemetry; target forms exclusive |
 | create caravan | `cara new [--create-pr]` | envelope | `new` | live preflight, label/base, squash auto-merge |
 | renew evicted | `cara renew [--create-pr]` | envelope | `renew` | evicted/force labels removed only after preflight |
 | join tail | `cara join [...]` | envelope | `join` | explicit/dynamic tail, resumable exact receipts |
@@ -19,7 +19,7 @@ is required or used.
 | current caravan | `cara show` | envelope | `show` | whole chain and highlighted position |
 | chain navigation | `cara next`, `cara prev` | envelope | `next`, `prev` | clean-worktree/exact-head guarded checkout |
 | fleet list/navigation | `cara van list/next/prev` | envelope | `van_list/next/prev` | deterministic PR-number head order |
-| synchronize | `cara sync [--all] [--rerun-failed]` | envelope | `sync` | idempotence, rolling head, exact root/tail/member scheduler generations, healthy/waiting/held no-wake status, retry-vs-external-decision wake class, safe affected-PR checkout, exact-run rerun, intentional hold skips |
+| synchronize | `cara sync [--all] [--rerun-failed]` | envelope | `sync` | idempotence, rolling head, exact root/tail/member scheduler generations, authenticated provider budget, healthy/waiting/held no-wake status, retry-vs-external-decision wake class, safe affected-PR checkout, exact-run rerun, intentional hold skips |
 | managed repair | `cara repair start/grant/revoke-grant/status/continue/abort` | envelope | `repair_start`, `repair_grant`, `repair_revoke_grant`, `repair_status`, `repair_continue`, `repair_abort` | dirty caller isolation, object-cache/exact-provider materialization, persistent manifest, typed conflict + audited semantic source scope, non-force publication, interruption-safe sync resume |
 | incident hold | `cara pause/resume --head-pr N --actor A [...]` | envelope | `pause`, `resume` | bounded metadata, exact disable/enable preconditions, expiry warning without auto-resume, stale-fact closure |
 | foreground ticks | `cara loop [--once]` | one-shot envelope only | intentionally absent | canonical sync events and bounded hook delivery |

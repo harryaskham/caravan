@@ -1552,7 +1552,7 @@ fn merge_candidates_command(
         .collect::<Vec<_>>()
         .join(" ");
     let query = format!(
-        "query($owner:String!,$name:String!) {{ repository(owner:$owner,name:$name) {{ {aliases} defaultBranchRef {{ target {{ ... on Commit {{ history(first:20) {{ nodes {{ oid committedDate author {{ name user {{ login }} }} associatedPullRequests(first:5) {{ nodes {{ number labels(first:20) {{ nodes {{ name }} }} }} }} }} }} }} }} }} }} }}"
+        "query($owner:String!,$name:String!) {{ rateLimit {{ cost remaining resetAt }} repository(owner:$owner,name:$name) {{ {aliases} defaultBranchRef {{ target {{ ... on Commit {{ history(first:20) {{ nodes {{ oid committedDate author {{ name user {{ login }} }} associatedPullRequests(first:5) {{ nodes {{ number labels(first:20) {{ nodes {{ name }} }} }} }} }} }} }} }} }} }} }}"
     );
     CommandSpec::new("gh").args([
         "api".to_owned(),

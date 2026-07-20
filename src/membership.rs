@@ -1186,6 +1186,7 @@ fn preflight_eligibility(
             ));
         }
         return Ok(CheckOutput {
+            provider_api: status.provider_api.clone(),
             rebase_on_join: status.rebase_on_join.clone(),
             mode: if request.operation.is_join() {
                 read::CheckMode::JoinTail
@@ -1879,6 +1880,7 @@ mod tests {
         };
         let analysis = analyze(&snapshot, &clean).unwrap();
         StatusOutput {
+            provider_api: crate::model::GitHubApiTelemetry::default(),
             merge_candidates: Vec::new(),
             merge_candidates_truncated: 0,
             previous_default_oid: None,

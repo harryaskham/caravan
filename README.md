@@ -179,6 +179,30 @@ workspaces are preserved rather than deleted. After inspecting status, an
 operator can explicitly remove abandoned local state with `repair abort
 --session ID --confirm`; abort never changes provider state.
 
+## GitHub authentication and API budgets
+
+Cara's `gh` subprocesses are authenticated. An explicit `GH_TOKEN` or
+`GITHUB_TOKEN` is used directly; otherwise Cara selects a repository-accessible
+account from `gh auth` and injects its token without printing it. Explicit
+ambient tokens are validated by the first real provider request rather than a
+redundant per-process REST probe.
+
+Status, check, sync, loop, JSON, and MCP receipts expose secret-free provider
+telemetry: authenticated source class, total/GraphQL/REST/gh-CLI call counts,
+and the latest GraphQL cost/remaining/reset evidence. The merge-candidate query
+collects `rateLimit` in-band, so observing budget costs no extra request. Set
+`CARA_GITHUB_AUTH_KIND=github_app_installation` beside an installation token to
+make that non-secret identity explicit in receipts.
+
+For automation, prefer one event-driven Cara loop/controller over independent
+agent polling. A GitHub App installation token gives a separate least-privilege
+installation bucket and webhook identity, but does not replace query batching,
+generation-aware caching, adaptive backoff, or exact provider re-reads before
+mutation. In GitHub Actions, mint the short-lived token with the repository's
+approved GitHub App token action, export it as `GH_TOKEN`, and run bounded
+`cara loop --once` ticks from PR/check/default-branch events plus a schedule.
+Never store app private keys or access tokens in `.caravan/config.yaml`.
+
 ## Releases and self-update
 
 Version tags publish update-compatible `cara` binaries for `x86_64-linux`,

@@ -449,6 +449,7 @@ fn virtual_status(
     let analysis = crate::graph::derive(&snapshot);
     let admission = crate::read::resolve_admission(&analysis, &status.admission.priority_labels);
     StatusOutput {
+        provider_api: status.provider_api.clone(),
         merge_candidates: Vec::new(),
         merge_candidates_truncated: 0,
         previous_default_oid: None,
@@ -960,6 +961,7 @@ mod tests {
         };
         let analysis = crate::graph::analyze(&snapshot, &Clean).unwrap();
         StatusOutput {
+            provider_api: crate::model::GitHubApiTelemetry::default(),
             merge_candidates: Vec::new(),
             merge_candidates_truncated: 0,
             previous_default_oid: None,

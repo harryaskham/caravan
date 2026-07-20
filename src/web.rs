@@ -467,7 +467,10 @@ fn refresh_repository_locked(repository: &RepositoryEntry) {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         snapshot.refreshing = true;
     }
-    let result = crate::read::status(&repository.context);
+    // Coalesce duplicate poll/manual refreshes inside this long-lived process.
+    // Mutating action paths invalidate this cache and retain their own exact
+    // provider preflight, so cached status is never mutation authority.
+    let result = crate::read::status_cached(&repository.context, Duration::from_secs(5));
     let mut snapshot = repository
         .snapshot
         .lock()
@@ -566,6 +569,7 @@ fn handle_refresh(
             "unknown repository",
         );
     };
+    crate::read::invalidate_status_cache(&repository.context);
     refresh_repository(repository);
     let snapshot = repository
         .snapshot

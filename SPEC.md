@@ -58,6 +58,23 @@ The default branch may move independently. A caravan head that no longer merges 
 
 ## 4. Discovery and identity
 
+Provider access is authenticated. Cara accepts an explicit ambient
+`GH_TOKEN`/`GITHUB_TOKEN`, otherwise resolves a repository-accessible `gh auth`
+account and injects that token only into provider subprocesses. Tokens and
+credentials never enter command diagnostics, JSON/MCP receipts, hooks, or the
+journal. An explicit ambient token is validated by the first real provider
+request rather than an additional per-process access probe.
+
+Every bounded provider operation accumulates secret-free API telemetry: auth
+source class, total GraphQL/REST/gh-CLI calls, and the latest GraphQL
+cost/remaining/reset observation. Queries collect rate-limit evidence in-band.
+A GitHub App installation token is accepted through the same ambient-token path
+and may identify its source through a non-secret runtime hint; app secrets never
+belong in repository config. Automation should use one event-driven loop,
+coalesce wakes, reuse one exact discovery snapshot within a tick, back off near
+reset, and retain exact fresh reads before mutation. Cache data is never
+provider mutation authority.
+
 `cara` discovers the base repository, default branch, current local branch, PRs, labels, bases, head revisions, auto-merge state, and checks through `git` and authenticated `gh`/GitHub APIs.
 
 Graph identity is derived each run. No UUID is persisted. A hook receives the complete relevant graph snapshot so a changing head/ID is explicit.

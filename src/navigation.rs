@@ -744,6 +744,7 @@ mod tests {
             .map(|pull_request| (pull_request.number, pull_request))
             .collect();
         StatusOutput {
+            provider_api: crate::model::GitHubApiTelemetry::default(),
             merge_candidates: Vec::new(),
             merge_candidates_truncated: 0,
             previous_default_oid: None,

@@ -3492,6 +3492,7 @@ mod tests {
         };
         let analysis = graph::analyze(&snapshot, checker).expect("analysis");
         StatusOutput {
+            provider_api: crate::model::GitHubApiTelemetry::default(),
             merge_candidates: Vec::new(),
             merge_candidates_truncated: 0,
             previous_default_oid: None,

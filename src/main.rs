@@ -1003,6 +1003,34 @@ fn render_status(output: &caravan::read::StatusOutput) -> String {
             .map_or_else(String::new, |next| format!(" — {next}"))
     );
     let _ = writeln!(text, "rebase_on_join={}", output.rebase_on_join.state);
+    let rate = output.provider_api.rate_limit.as_ref().map_or_else(
+        || "rate=unavailable".to_owned(),
+        |rate| {
+            format!(
+                "rate={} remaining, cost={}, reset={}",
+                rate.remaining, rate.cost, rate.reset_at
+            )
+        },
+    );
+    let _ = writeln!(
+        text,
+        "github: {} calls (graphql={}, rest={}, gh-cli={}) auth={} cache_hits={} cache_age_ms={} {}",
+        output.provider_api.calls,
+        output.provider_api.graphql_calls,
+        output.provider_api.rest_calls,
+        output.provider_api.gh_cli_calls,
+        output
+            .provider_api
+            .auth_source
+            .as_deref()
+            .unwrap_or("unknown"),
+        output.provider_api.cache_hits,
+        output
+            .provider_api
+            .cache_age_ms
+            .map_or_else(|| "n/a".to_owned(), |age| age.to_string()),
+        rate,
+    );
     if let Some(action) = &output.rebase_on_join.required_action {
         let _ = writeln!(text, "  action: {action}");
     }
@@ -1601,6 +1629,7 @@ mod tests {
             oid: caravan::model::CommitOid("0".repeat(40)),
         };
         let output = caravan::read::StatusOutput {
+            provider_api: caravan::model::GitHubApiTelemetry::default(),
             merge_candidates: Vec::new(),
             merge_candidates_truncated: 0,
             previous_default_oid: None,

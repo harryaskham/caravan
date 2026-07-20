@@ -1,8 +1,10 @@
 //! Live read-only command implementations: status, show, and check.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
-use mcp_cli::ErrorCategory;
+use mcp_cli::{ErrorCategory, StructuredError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -62,6 +64,9 @@ fn rebase_on_join_status(context: &AppContext) -> RebaseOnJoinStatus {
 /// Repository-wide live Caravan status.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct StatusOutput {
+    /// Authenticated provider-call counts and latest rate-limit evidence.
+    #[serde(default)]
+    pub provider_api: crate::model::GitHubApiTelemetry,
     /// Bounded, secret-free provider identity and lineage for active members.
     #[serde(default)]
     pub merge_candidates: Vec<crate::model::MergeCandidateIdentity>,
@@ -145,6 +150,8 @@ pub struct AdmissionStatus {
 /// Dedicated read-only result for deterministic admission coordination.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct NextCandidateOutput {
+    #[serde(default)]
+    pub provider_api: crate::model::GitHubApiTelemetry,
     pub repository: RepositoryId,
     /// Ordering is selection-only: the chosen PR must still pass `check`/`new`
     /// preflight and a failure must not cause an automatic leapfrog.
@@ -200,6 +207,8 @@ pub enum CandidateNextAction {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CheckOutput {
     #[serde(default)]
+    pub provider_api: crate::model::GitHubApiTelemetry,
+    #[serde(default)]
     pub rebase_on_join: RebaseOnJoinStatus,
     pub mode: CheckMode,
     /// Candidate PR (named `current_pr` for backwards-compatible JSON).
@@ -228,6 +237,139 @@ pub struct CheckOutput {
     pub initialization: crate::initialization::InitializationStatus,
 }
 
+struct CachedStatus {
+    inserted: Instant,
+    output: StatusOutput,
+}
+
+static STATUS_CACHE: OnceLock<Mutex<HashMap<String, CachedStatus>>> = OnceLock::new();
+const MAX_STATUS_CACHE_ENTRIES: usize = 64;
+const STATUS_CACHE_RETENTION: Duration = Duration::from_secs(3_600);
+
+struct CachedLabels {
+    inserted: Instant,
+    labels: Vec<crate::github::RepositoryLabel>,
+}
+
+static LABEL_CACHE: OnceLock<Mutex<HashMap<String, CachedLabels>>> = OnceLock::new();
+const LABEL_CACHE_MAX_AGE: Duration = Duration::from_secs(600);
+
+fn status_cache_key(context: &AppContext) -> String {
+    let config = serde_json::to_vec(&context.config).unwrap_or_default();
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in config {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{}:{hash:016x}", context.repository_path.display())
+}
+
+/// Return a short-lived read-only status snapshot for polling surfaces.
+///
+/// Mutating operations never call this function: exact preflight and provider
+/// rereads remain authoritative. The cache only coalesces duplicate dashboard
+/// or controller refreshes inside one long-lived Cara process.
+pub(crate) fn status_cached(
+    context: &AppContext,
+    max_age: Duration,
+) -> Result<StatusOutput, AppError> {
+    let key = status_cache_key(context);
+    let cache = STATUS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let guard = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cached) = guard.get(&key) {
+            let age = cached.inserted.elapsed();
+            if age <= max_age {
+                let mut output = cached.output.clone();
+                output.provider_api.cache_hits = output.provider_api.cache_hits.saturating_add(1);
+                output.provider_api.cache_age_ms =
+                    Some(u64::try_from(age.as_millis()).unwrap_or(u64::MAX));
+                return Ok(output);
+            }
+        }
+    }
+    let output = status(context)?;
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.retain(|_, cached| cached.inserted.elapsed() <= STATUS_CACHE_RETENTION);
+    if guard.len() >= MAX_STATUS_CACHE_ENTRIES {
+        if let Some(oldest) = guard
+            .iter()
+            .min_by_key(|(_, cached)| cached.inserted)
+            .map(|(key, _)| key.clone())
+        {
+            guard.remove(&oldest);
+        }
+    }
+    guard.insert(
+        key,
+        CachedStatus {
+            inserted: Instant::now(),
+            output: output.clone(),
+        },
+    );
+    Ok(output)
+}
+
+/// Invalidate one repository's read-only polling cache after an explicit action.
+pub(crate) fn invalidate_status_cache(context: &AppContext) {
+    if let Some(cache) = STATUS_CACHE.get() {
+        cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&status_cache_key(context));
+    }
+}
+
+fn repository_labels_cached<R: crate::command::CommandRunner>(
+    provider: &crate::github::GitHubMutationAdapter<R>,
+    repository: &RepositoryId,
+) -> Result<(Vec<crate::github::RepositoryLabel>, bool), crate::github::MutationError> {
+    let key = repository.slug();
+    let cache = LABEL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let guard = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cached) = guard.get(&key)
+            && cached.inserted.elapsed() <= LABEL_CACHE_MAX_AGE
+        {
+            return Ok((cached.labels.clone(), true));
+        }
+    }
+    let labels = provider.repository_label_definitions(repository)?;
+    cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            key,
+            CachedLabels {
+                inserted: Instant::now(),
+                labels: labels.clone(),
+            },
+        );
+    Ok((labels, false))
+}
+
+fn attach_provider_api(
+    error: &AppError,
+    provider_api: &crate::model::GitHubApiTelemetry,
+) -> AppError {
+    let mut details = error.details().unwrap_or_else(|| json!({}));
+    if let Some(object) = details.as_object_mut() {
+        object.insert("provider_api".to_owned(), json!(provider_api));
+    }
+    AppError::structured(
+        error.category(),
+        error.code(),
+        error.message(),
+        Some(details),
+    )
+}
+
 /// Discover and validate the real current repository without mutation.
 pub fn status(context: &AppContext) -> Result<StatusOutput, AppError> {
     let budget = std::time::Duration::from_secs(context.config.command_timeout_secs);
@@ -246,22 +388,23 @@ pub(crate) fn status_with_deadline(
     let started = std::time::Instant::now();
     let operation_budget = operation_deadline.saturating_duration_since(started);
     let child_timeout = std::time::Duration::from_secs(context.config.command_timeout_secs);
-    let discovery = GitHubDiscovery::new(
-        crate::command::ProcessRunner::in_directory(&context.repository_path)
-            .with_timeout(child_timeout)
-            .with_operation_deadline(operation_deadline),
-    );
+    let provider_runner = crate::command::ProcessRunner::in_directory(&context.repository_path)
+        .with_timeout(child_timeout)
+        .with_operation_deadline(operation_deadline);
+    let discovery = GitHubDiscovery::new(provider_runner.clone());
     let snapshot = discovery.discover().map_err(|error| {
-        if let DiscoveryError::Runner(CommandRunError::Timeout { command, .. }) = &error {
-            discovery_timeout_error(
-                &error,
-                discovery_phase(command),
-                started.elapsed(),
-                operation_budget,
-            )
-        } else {
-            discovery_error(&error)
-        }
+        let mapped =
+            if let DiscoveryError::Runner(CommandRunError::Timeout { command, .. }) = &error {
+                discovery_timeout_error(
+                    &error,
+                    discovery_phase(command),
+                    started.elapsed(),
+                    operation_budget,
+                )
+            } else {
+                discovery_error(&error)
+            };
+        attach_provider_api(&mapped, &provider_runner.github_api_telemetry())
     })?;
     let discovery_elapsed = started.elapsed();
     let checker = GitCompatibilityChecker::new(&context.repository_path, "origin")
@@ -288,33 +431,29 @@ pub(crate) fn status_with_deadline(
         }
     })?;
     let analysis_elapsed = started.elapsed();
-    let label_provider = crate::github::GitHubMutationAdapter::new(
-        crate::command::ProcessRunner::in_directory(&context.repository_path)
-            .with_timeout(child_timeout)
-            .with_operation_deadline(operation_deadline),
-    );
-    let labels = label_provider
-        .repository_label_definitions(&snapshot.repository)
+    let label_provider = crate::github::GitHubMutationAdapter::new(provider_runner.clone());
+    let (labels, label_cache_hit) = repository_labels_cached(&label_provider, &snapshot.repository)
         .map_err(|error| {
-            if let crate::github::MutationError::Provider(provider) = &error {
-                if matches!(
+            let mapped = if let crate::github::MutationError::Provider(provider) = &error
+                && matches!(
                     provider,
                     DiscoveryError::Runner(CommandRunError::Timeout { .. })
                 ) {
-                    return discovery_timeout_error(
-                        provider,
-                        "repository_label_inventory",
-                        started.elapsed(),
-                        operation_budget,
-                    );
-                }
-            }
-            AppError::structured(
-                mcp_cli::ErrorCategory::ExecutionFailure,
-                "repository_initialization_inventory_failed",
-                error.to_string(),
-                Some(json!({"next": "repair GitHub read access and rerun `cara status`"})),
-            )
+                discovery_timeout_error(
+                    provider,
+                    "repository_label_inventory",
+                    started.elapsed(),
+                    operation_budget,
+                )
+            } else {
+                AppError::structured(
+                    mcp_cli::ErrorCategory::ExecutionFailure,
+                    "repository_initialization_inventory_failed",
+                    error.to_string(),
+                    Some(json!({"next": "repair GitHub read access and rerun `cara status`"})),
+                )
+            };
+            attach_provider_api(&mapped, &provider_runner.github_api_telemetry())
         })?;
     let mut initialization =
         crate::initialization::inspect_labels(&labels, &context.config.agent_priority_labels);
@@ -324,7 +463,22 @@ pub(crate) fn status_with_deadline(
     }
     let admission = resolve_admission(&analysis, &context.config.agent_priority_labels);
     let labels_elapsed = started.elapsed();
+    let mut provider_api = provider_runner.github_api_telemetry();
+    if label_cache_hit {
+        provider_api.cache_hits = provider_api.cache_hits.saturating_add(1);
+        provider_api.cache_age_ms = LABEL_CACHE
+            .get()
+            .and_then(|cache| {
+                cache.lock().ok().and_then(|cache| {
+                    cache
+                        .get(&snapshot.repository.slug())
+                        .map(|entry| entry.inserted.elapsed())
+                })
+            })
+            .map(|age| u64::try_from(age.as_millis()).unwrap_or(u64::MAX));
+    }
     let mut output = StatusOutput {
+        provider_api,
         merge_candidates: snapshot.merge_candidates,
         merge_candidates_truncated: snapshot.merge_candidates_truncated,
         previous_default_oid: snapshot.previous_default_oid,
@@ -388,6 +542,7 @@ pub(crate) fn status_with_deadline(
 pub fn next_candidate(context: &AppContext) -> Result<NextCandidateOutput, AppError> {
     let status = status(context)?;
     Ok(NextCandidateOutput {
+        provider_api: status.provider_api,
         repository: status.repository,
         attempt_contract: "ordered admission attempt only; run `cara check --pr N` for this exact first candidate; on rejection fail closed and retry after GitHub state changes rather than leapfrogging".to_owned(),
         admission: status.admission,
@@ -661,11 +816,11 @@ pub(crate) fn status_for_remote_candidate(
     // complete snapshot closes the discovery/refetch race before exact Git
     // revision checks; merge compatibility subsequently verifies refs both
     // before and after its fetch.
-    let provider = crate::github::GitHubMutationAdapter::new(
-        crate::command::ProcessRunner::in_directory(&context.repository_path).with_timeout(
-            std::time::Duration::from_secs(context.config.command_timeout_secs),
-        ),
-    );
+    let provider_runner = crate::command::ProcessRunner::in_directory(&context.repository_path)
+        .with_timeout(std::time::Duration::from_secs(
+            context.config.command_timeout_secs,
+        ));
+    let provider = crate::github::GitHubMutationAdapter::new(provider_runner.clone());
     let fresh = provider
         .refetch_pull_request(&status.repository, number)
         .map_err(|error| {
@@ -683,18 +838,17 @@ pub(crate) fn status_for_remote_candidate(
         )
     })?;
     require_fresh_candidate(discovered, &fresh)?;
-    let identity = GitHubDiscovery::new(
-        crate::command::ProcessRunner::in_directory(&context.repository_path).with_timeout(
-            std::time::Duration::from_secs(context.config.command_timeout_secs),
-        ),
-    )
-    .merge_candidate_identity(&status.repository, &fresh)
-    .map_err(|error| discovery_error(&error))?;
+    let identity = GitHubDiscovery::new(provider_runner.clone())
+        .merge_candidate_identity(&status.repository, &fresh)
+        .map_err(|error| discovery_error(&error))?;
     status
         .merge_candidates
         .retain(|candidate| candidate.pr != number);
     status.merge_candidates.push(identity);
     status.current_pr = Some(number);
+    status
+        .provider_api
+        .merge(provider_runner.github_api_telemetry());
     Ok(status)
 }
 
@@ -796,6 +950,7 @@ pub fn check_analysis(
         }
         let eligible = status.healthy && active_problems.is_empty();
         let output = CheckOutput {
+            provider_api: status.provider_api.clone(),
             rebase_on_join: status.rebase_on_join.clone(),
             mode: CheckMode::ActiveCaravan,
             current_pr,
@@ -884,6 +1039,7 @@ pub fn check_analysis(
         );
         return eligible_or_error(
             CheckOutput {
+                provider_api: status.provider_api.clone(),
                 rebase_on_join: status.rebase_on_join.clone(),
                 mode: CheckMode::NewCaravan,
                 current_pr,
@@ -969,6 +1125,7 @@ pub fn check_analysis(
     );
     eligible_or_error(
         CheckOutput {
+            provider_api: status.provider_api.clone(),
             rebase_on_join: status.rebase_on_join.clone(),
             mode: CheckMode::JoinTail,
             current_pr,
@@ -1344,8 +1501,28 @@ fn discovery_timeout_error(
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    #[derive(Clone)]
+    struct LabelRunner(Arc<AtomicUsize>);
+
+    impl crate::command::CommandRunner for LabelRunner {
+        fn run(
+            &self,
+            _command: &crate::command::CommandSpec,
+        ) -> Result<crate::command::CommandOutput, crate::command::CommandRunError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::command::CommandOutput {
+                code: Some(0),
+                stdout: r#"[{"name":"caravan","color":"5319E7","description":"Active"}]"#
+                    .to_owned(),
+                stderr: String::new(),
+            })
+        }
+    }
     use crate::model::{AutoMergeState, BranchSnapshot, CommitOid, PullRequestState};
 
     fn repository() -> RepositoryId {
@@ -1415,6 +1592,7 @@ mod tests {
         let checker = clean_checker;
         let analysis = analyze(&snapshot, &checker).unwrap();
         StatusOutput {
+            provider_api: crate::model::GitHubApiTelemetry::default(),
             merge_candidates: Vec::new(),
             merge_candidates_truncated: 0,
             previous_default_oid: None,
@@ -1844,6 +2022,58 @@ mod tests {
         assert!(!output.eligible);
         assert_eq!(output.next_action, CandidateNextAction::Wait);
         assert_eq!(output.candidate.number, PrNumber(9));
+    }
+
+    #[test]
+    fn repository_label_inventory_is_cached_without_becoming_mutation_state() {
+        let repository = repository();
+        if let Some(cache) = LABEL_CACHE.get() {
+            cache.lock().unwrap().remove(&repository.slug());
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = crate::github::GitHubMutationAdapter::new(LabelRunner(Arc::clone(&calls)));
+        let (first, first_hit) = repository_labels_cached(&provider, &repository).unwrap();
+        let (second, second_hit) = repository_labels_cached(&provider, &repository).unwrap();
+        assert!(!first_hit);
+        assert!(second_hit);
+        assert_eq!(first, second);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn short_lived_status_cache_reports_hits_and_invalidates_exact_repository() {
+        let directory = tempfile::tempdir().unwrap();
+        let context = crate::AppContext {
+            repository_path: directory.path().to_path_buf(),
+            config_path: directory.path().join(".caravan/config.yaml"),
+            config_existed: false,
+            config: crate::config::CaravanConfig::default(),
+        };
+        let key = status_cache_key(&context);
+        let expected = status(pr(9, "nine", "main", false), Vec::new());
+        STATUS_CACHE
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .insert(
+                key.clone(),
+                CachedStatus {
+                    inserted: Instant::now(),
+                    output: expected,
+                },
+            );
+        let cached = status_cached(&context, Duration::from_secs(5)).unwrap();
+        assert_eq!(cached.provider_api.cache_hits, 1);
+        assert!(cached.provider_api.cache_age_ms.is_some());
+        invalidate_status_cache(&context);
+        assert!(
+            !STATUS_CACHE
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .contains_key(&key)
+        );
     }
 
     #[test]

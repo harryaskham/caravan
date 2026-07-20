@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -251,6 +251,11 @@ impl std::error::Error for CommandRunError {}
 pub trait CommandRunner {
     /// Execute a subprocess request and capture all output.
     fn run(&self, command: &CommandSpec) -> Result<CommandOutput, CommandRunError>;
+
+    /// Return secret-free GitHub API telemetry accumulated by this runner.
+    fn github_api_telemetry(&self) -> crate::model::GitHubApiTelemetry {
+        crate::model::GitHubApiTelemetry::default()
+    }
 }
 
 /// Production subprocess runner.
@@ -260,6 +265,7 @@ pub struct ProcessRunner {
     timeout: Duration,
     operation_deadline: Option<Instant>,
     infer_github_auth: bool,
+    github_api_telemetry: Arc<Mutex<crate::model::GitHubApiTelemetry>>,
 }
 
 impl Default for ProcessRunner {
@@ -269,6 +275,7 @@ impl Default for ProcessRunner {
             timeout: DEFAULT_COMMAND_TIMEOUT,
             operation_deadline: None,
             infer_github_auth: true,
+            github_api_telemetry: Arc::new(Mutex::new(crate::model::GitHubApiTelemetry::default())),
         }
     }
 }
@@ -288,7 +295,17 @@ impl ProcessRunner {
             timeout: DEFAULT_COMMAND_TIMEOUT,
             operation_deadline: None,
             infer_github_auth: true,
+            github_api_telemetry: Arc::new(Mutex::new(crate::model::GitHubApiTelemetry::default())),
         }
+    }
+
+    /// Read the secret-free GitHub API telemetry shared by runner clones.
+    #[must_use]
+    pub fn github_api_telemetry(&self) -> crate::model::GitHubApiTelemetry {
+        self.github_api_telemetry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Override the hard deadline for every command run by this instance.
@@ -324,6 +341,76 @@ impl ProcessRunner {
             return None;
         }
         resolve_github_auth(self.cwd.as_deref(), self.operation_deadline)
+    }
+
+    fn record_github_request(&self, request: &CommandSpec, auth: Option<&GithubAuthSelection>) {
+        if !is_gh_request(request) {
+            return;
+        }
+        let mut telemetry = self
+            .github_api_telemetry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        telemetry.calls = telemetry.calls.saturating_add(1);
+        let is_api = request
+            .args
+            .first()
+            .is_some_and(|argument| argument == "api");
+        let is_graphql = is_api && request.args.iter().any(|argument| argument == "graphql");
+        if is_graphql {
+            telemetry.graphql_calls = telemetry.graphql_calls.saturating_add(1);
+        } else if is_api {
+            telemetry.rest_calls = telemetry.rest_calls.saturating_add(1);
+        } else {
+            telemetry.gh_cli_calls = telemetry.gh_cli_calls.saturating_add(1);
+        }
+        let explicit = request.has_env("GH_TOKEN") || request.has_env("GITHUB_TOKEN");
+        telemetry.authenticated = explicit || auth.is_some();
+        telemetry.auth_source = Some(if explicit {
+            "explicit_command_token".to_owned()
+        } else {
+            match auth {
+                Some(GithubAuthSelection::Ambient) => std::env::var("CARA_GITHUB_AUTH_KIND")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| "ambient_token".to_owned()),
+                Some(GithubAuthSelection::Token(_)) => "gh_auth_account".to_owned(),
+                None => "gh_default_or_unauthenticated".to_owned(),
+            }
+        });
+    }
+
+    fn record_github_response(&self, request: &CommandSpec, output: &CommandOutput) {
+        if !is_gh_request(request) || !output.is_success() {
+            return;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&output.stdout) else {
+            return;
+        };
+        let rate = value
+            .get("data")
+            .and_then(|data| data.get("rateLimit"))
+            .or_else(|| value.get("rateLimit"));
+        let Some(rate) = rate else {
+            return;
+        };
+        let Some(cost) = rate.get("cost").and_then(serde_json::Value::as_u64) else {
+            return;
+        };
+        let Some(remaining) = rate.get("remaining").and_then(serde_json::Value::as_u64) else {
+            return;
+        };
+        let Some(reset_at) = rate.get("resetAt").and_then(serde_json::Value::as_str) else {
+            return;
+        };
+        self.github_api_telemetry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .rate_limit = Some(crate::model::GitHubRateLimit {
+            cost,
+            remaining,
+            reset_at: reset_at.to_owned(),
+        });
     }
 
     fn effective_timeout(&self, request: &CommandSpec) -> Result<Duration, CommandRunError> {
@@ -390,10 +477,12 @@ fn resolve_github_auth_uncached(
                 .ok()
                 .filter(|token| !token.trim().is_empty())
         });
-    if ambient
-        .as_deref()
-        .is_some_and(|token| github_token_can_access(runner, repository, token))
-    {
+    // An explicitly supplied ambient token is already an operator/runner
+    // choice. Let the first real provider request validate it rather than
+    // spending one REST request per short-lived Cara process on a redundant
+    // access probe. Account fallback still probes because it must choose among
+    // potentially unrelated gh logins.
+    if ambient.is_some() {
         return Some(GithubAuthSelection::Ambient);
     }
 
@@ -542,11 +631,18 @@ fn parse_github_remote(remote: &str) -> Option<GithubRepository> {
     })
 }
 
+fn is_gh_request(request: &CommandSpec) -> bool {
+    Path::new(&request.program)
+        .file_name()
+        .is_some_and(|name| name == "gh")
+}
+
 impl CommandRunner for ProcessRunner {
     #[allow(clippy::too_many_lines)]
     fn run(&self, request: &CommandSpec) -> Result<CommandOutput, CommandRunError> {
         let timeout = self.effective_timeout(request)?;
         let github_auth = self.inferred_github_auth(request);
+        self.record_github_request(request, github_auth.as_ref());
         let mut command = Command::new(&request.program);
         command
             .args(&request.args)
@@ -656,11 +752,17 @@ impl CommandRunner for ProcessRunner {
             message: error.to_string(),
         })?;
 
-        Ok(CommandOutput {
+        let output = CommandOutput {
             code: status.code(),
             stdout,
             stderr,
-        })
+        };
+        self.record_github_response(request, &output);
+        Ok(output)
+    }
+
+    fn github_api_telemetry(&self) -> crate::model::GitHubApiTelemetry {
+        self.github_api_telemetry()
     }
 }
 
@@ -801,6 +903,31 @@ mod tests {
                 .is_none()
         );
         assert!(!request.display().contains("secret-value"));
+    }
+
+    #[test]
+    fn github_telemetry_counts_calls_and_extracts_graphql_budget() {
+        let runner = ProcessRunner::new();
+        let request = CommandSpec::new("gh").args(["api", "graphql"]);
+        runner.record_github_request(&request, Some(&GithubAuthSelection::Ambient));
+        runner.record_github_response(
+            &request,
+            &CommandOutput {
+                code: Some(0),
+                stdout: r#"{"data":{"rateLimit":{"cost":17,"remaining":4983,"resetAt":"2026-07-20T20:00:00Z"}}}"#.to_owned(),
+                stderr: String::new(),
+            },
+        );
+        let telemetry = runner.github_api_telemetry();
+        assert!(telemetry.authenticated);
+        assert_eq!(telemetry.auth_source.as_deref(), Some("ambient_token"));
+        assert_eq!(telemetry.calls, 1);
+        assert_eq!(telemetry.graphql_calls, 1);
+        assert_eq!(telemetry.rest_calls, 0);
+        assert_eq!(telemetry.gh_cli_calls, 0);
+        let rate = telemetry.rate_limit.expect("rate telemetry");
+        assert_eq!(rate.cost, 17);
+        assert_eq!(rate.remaining, 4_983);
     }
 
     #[test]
