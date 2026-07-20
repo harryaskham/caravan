@@ -63,6 +63,13 @@ pub enum PlannedRangeBase {
     RemoteBranch {
         branch: BranchSnapshot,
     },
+    /// Provider-retained old base generation after the same default branch
+    /// advanced. The old commit is verified as an ancestor of `current` rather
+    /// than incorrectly requiring the moving branch ref to equal the old OID.
+    HistoricalTargetBranch {
+        branch: BranchSnapshot,
+        current: BranchSnapshot,
+    },
     PullRequestHead {
         pr: PrNumber,
         branch: BranchSnapshot,
@@ -72,7 +79,32 @@ pub enum PlannedRangeBase {
 impl PlannedRangeBase {
     fn branch(&self) -> &BranchSnapshot {
         match self {
-            Self::RemoteBranch { branch } | Self::PullRequestHead { branch, .. } => branch,
+            Self::RemoteBranch { branch }
+            | Self::HistoricalTargetBranch { branch, .. }
+            | Self::PullRequestHead { branch, .. } => branch,
+        }
+    }
+}
+
+/// Select an exact candidate range boundary for a live remote target.
+///
+/// GitHub's PR base OID is the candidate's retained lower range boundary, but
+/// the named default branch can legitimately advance before the next sync. In
+/// that case, bind both generations explicitly instead of treating the old OID
+/// as the current remote branch lease.
+#[must_use]
+pub fn range_base_for_remote_target(
+    candidate: &PullRequestSnapshot,
+    target: &BranchSnapshot,
+) -> PlannedRangeBase {
+    if candidate.base.name == target.name && candidate.base.oid != target.oid {
+        PlannedRangeBase::HistoricalTargetBranch {
+            branch: candidate.base.clone(),
+            current: target.clone(),
+        }
+    } else {
+        PlannedRangeBase::RemoteBranch {
+            branch: candidate.base.clone(),
         }
     }
 }
@@ -138,9 +170,7 @@ pub fn rewrite_candidate(
         repository_path,
         repository,
         candidate,
-        PlannedRangeBase::RemoteBranch {
-            branch: candidate.base.clone(),
-        },
+        range_base_for_remote_target(candidate, new_base),
         PlannedBase::Remote(new_base.clone()),
         workflow_source,
         RebaseExecutionBudget::new(timeout),
@@ -175,6 +205,15 @@ pub fn prepare_candidate(
             json!({"pr": candidate.number, "resumable": true}),
         ));
     }
+    if let PlannedRangeBase::HistoricalTargetBranch { current, .. } = &range_source
+        && (current != target || current.repository != *repository)
+    {
+        return Err(decision(
+            "rebase_historical_target_mismatch",
+            "historical target range must bind the exact current remote target generation",
+            json!({"pr": candidate.number, "historical_target": current, "target": target, "resumable": true}),
+        ));
+    }
     validate_branch(&candidate.head.name)?;
     for oid in [
         &candidate.head.oid,
@@ -191,12 +230,6 @@ pub fn prepare_candidate(
         budget.operation_deadline,
     );
     fetch_exact(&runner, "origin", &candidate.head)?;
-    match &range_source {
-        PlannedRangeBase::RemoteBranch { branch } => fetch_exact(&runner, "origin", branch)?,
-        PlannedRangeBase::PullRequestHead { pr, branch } => {
-            fetch_exact_pull_request_head(&runner, "origin", *pr, branch)?;
-        }
-    }
     match &new_base {
         PlannedBase::Remote(branch)
             if branch.name != candidate.base.name || branch.oid != candidate.base.oid =>
@@ -216,6 +249,15 @@ pub fn prepare_candidate(
             )?;
         }
         PlannedBase::Remote(_) => {}
+    }
+    match &range_source {
+        PlannedRangeBase::RemoteBranch { branch } => fetch_exact(&runner, "origin", branch)?,
+        PlannedRangeBase::HistoricalTargetBranch { branch, current } => {
+            retain_historical_target_base(&runner, branch, current)?;
+        }
+        PlannedRangeBase::PullRequestHead { pr, branch } => {
+            fetch_exact_pull_request_head(&runner, "origin", *pr, branch)?;
+        }
     }
     if workflow_source.name != candidate.base.name || workflow_source.oid != candidate.base.oid {
         fetch_exact(&runner, "origin", workflow_source)?;
@@ -621,6 +663,53 @@ fn fetch_exact_pull_request_head(
     Ok(())
 }
 
+fn retain_historical_target_base(
+    runner: &impl CommandRunner,
+    historical: &BranchSnapshot,
+    current: &BranchSnapshot,
+) -> Result<(), AppError> {
+    let object = run(
+        runner,
+        CommandSpec::new("git").args(["cat-file", "-e", &format!("{}^{{commit}}", historical.oid)]),
+    )?;
+    if !object.is_success() {
+        return Err(decision(
+            "rebase_historical_base_missing",
+            "the provider-retained old target generation is unavailable after fetching the current target branch",
+            json!({
+                "branch": historical.name,
+                "historical_oid": historical.oid,
+                "current_oid": current.oid,
+                "resumable": true,
+                "next": "rediscover provider state; do not guess or weaken the lease"
+            }),
+        ));
+    }
+    let ancestry = run(
+        runner,
+        CommandSpec::new("git").args([
+            "merge-base",
+            "--is-ancestor",
+            historical.oid.0.as_str(),
+            current.oid.0.as_str(),
+        ]),
+    )?;
+    if !ancestry.is_success() {
+        return Err(decision(
+            "rebase_target_history_changed",
+            "the current target branch is not a descendant of the PR's retained base generation",
+            json!({
+                "branch": historical.name,
+                "historical_oid": historical.oid,
+                "current_oid": current.oid,
+                "resumable": true,
+                "next": "inspect the default-branch rewrite and rediscover before retrying"
+            }),
+        ));
+    }
+    Ok(())
+}
+
 fn fetch_exact(
     runner: &impl CommandRunner,
     remote: &str,
@@ -971,6 +1060,127 @@ mod tests {
                 &fixture.new_main.0,
                 &receipt.new_head_oid.0,
             ],
+        );
+    }
+
+    #[test]
+    fn external_default_advance_refreshes_range_without_weakening_head_lease() {
+        let fixture = fixture();
+        let mut candidate = PullRequestSnapshot {
+            number: crate::model::PrNumber(7),
+            title: "candidate".to_owned(),
+            url: "https://example.invalid/7".to_owned(),
+            state: PullRequestState::Open,
+            draft: false,
+            head: branch(&fixture.repository, "feature", &fixture.feature),
+            // GitHub retains the PR's old base generation even though the
+            // moving default ref has advanced to `new_main`.
+            base: branch(&fixture.repository, "main", &fixture.old_main),
+            cross_repository: false,
+            labels: BTreeSet::new(),
+            auto_merge: AutoMergeState::disabled(),
+            checks: Vec::new(),
+            created_at: None,
+            merged_at: None,
+            updated_at: None,
+        };
+        let current_default = branch(&fixture.repository, "main", &fixture.new_main);
+
+        let first = rewrite_candidate(
+            &fixture.clone,
+            &fixture.repository,
+            &candidate,
+            &current_default,
+            &current_default,
+            Duration::from_secs(10),
+        )
+        .expect("fresh sync retains the historical boundary and rebases");
+        assert_eq!(first.old_base_oid, fixture.old_main);
+        assert_eq!(first.new_base_oid, fixture.new_main);
+        assert_eq!(
+            first.lease,
+            format!("--force-with-lease=refs/heads/feature:{}", fixture.feature)
+        );
+        assert_eq!(
+            git(
+                &fixture.clone,
+                &["ls-remote", "origin", "refs/heads/feature"]
+            )
+            .split_whitespace()
+            .next(),
+            Some(first.new_head_oid.0.as_str())
+        );
+
+        // Provider rediscovery after the first push observes the fresh exact
+        // head and current default. The same sync is then an idempotent no-op,
+        // not an impossible stale-default retry loop.
+        candidate.head.oid = first.new_head_oid.clone();
+        candidate.base.oid = fixture.new_main.clone();
+        let second = rewrite_candidate(
+            &fixture.clone,
+            &fixture.repository,
+            &candidate,
+            &current_default,
+            &current_default,
+            Duration::from_secs(10),
+        )
+        .expect("rediscovery makes the second sync resumable");
+        assert!(second.already_satisfied);
+        assert_eq!(second.old_head_oid, first.new_head_oid);
+        assert_eq!(second.new_head_oid, first.new_head_oid);
+    }
+
+    #[test]
+    fn rewritten_default_history_is_not_treated_as_a_normal_advance() {
+        let fixture = fixture();
+        git(&fixture.clone, &["checkout", "--orphan", "rewritten-main"]);
+        git(&fixture.clone, &["rm", "-rf", "."]);
+        std::fs::write(fixture.clone.join("replacement"), "replacement\n").unwrap();
+        git(&fixture.clone, &["add", "replacement"]);
+        git(&fixture.clone, &["commit", "-m", "rewrite main"]);
+        let rewritten = CommitOid(git(&fixture.clone, &["rev-parse", "HEAD"]));
+        git(
+            &fixture.clone,
+            &["push", "--force", "origin", "HEAD:refs/heads/main"],
+        );
+        git(&fixture.clone, &["checkout", "feature"]);
+        let candidate = PullRequestSnapshot {
+            number: crate::model::PrNumber(7),
+            title: "candidate".to_owned(),
+            url: "https://example.invalid/7".to_owned(),
+            state: PullRequestState::Open,
+            draft: false,
+            head: branch(&fixture.repository, "feature", &fixture.feature),
+            base: branch(&fixture.repository, "main", &fixture.old_main),
+            cross_repository: false,
+            labels: BTreeSet::new(),
+            auto_merge: AutoMergeState::disabled(),
+            checks: Vec::new(),
+            created_at: None,
+            merged_at: None,
+            updated_at: None,
+        };
+        let error = rewrite_candidate(
+            &fixture.clone,
+            &fixture.repository,
+            &candidate,
+            &branch(&fixture.repository, "main", &rewritten),
+            &branch(&fixture.repository, "main", &rewritten),
+            Duration::from_secs(10),
+        )
+        .expect_err("force-rewritten default is a decision, not an advance");
+        assert_eq!(
+            mcp_cli::StructuredError::code(&error),
+            "rebase_target_history_changed"
+        );
+        assert_eq!(
+            git(
+                &fixture.clone,
+                &["ls-remote", "origin", "refs/heads/feature"]
+            )
+            .split_whitespace()
+            .next(),
+            Some(fixture.feature.0.as_str())
         );
     }
 

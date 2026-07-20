@@ -622,9 +622,7 @@ fn execute_locked(
             &context.repository_path,
             &repository,
             &candidate,
-            crate::physical_rebase::PlannedRangeBase::RemoteBranch {
-                branch: candidate.base.clone(),
-            },
+            crate::physical_rebase::range_base_for_remote_target(&candidate, &target),
             crate::physical_rebase::PlannedBase::Remote(target.clone()),
             &status.analysis.fleet.default_branch,
             crate::physical_rebase::RebaseExecutionBudget::new(timeout)

@@ -793,8 +793,11 @@ fn prepare_physical_chains(
                 .expect("selected caravan member has provider facts");
             let range_source = if index == 0 {
                 predecessor.map_or_else(
-                    || crate::physical_rebase::PlannedRangeBase::RemoteBranch {
-                        branch: candidate.base.clone(),
+                    || {
+                        crate::physical_rebase::range_base_for_remote_target(
+                            candidate,
+                            &status.analysis.fleet.default_branch,
+                        )
                     },
                     |merged| crate::physical_rebase::PlannedRangeBase::PullRequestHead {
                         pr: merged.number,
