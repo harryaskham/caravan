@@ -138,11 +138,16 @@ read and mutation remains bound to that exact worktree, config, operation lock,
 and provider identity. The initial server refuses non-loopback listeners,
 canonicalizes and deduplicates paths, periodically returns the same typed status
 used by CLI/JSON/MCP, and applies strict CSP/anti-frame/no-store headers. The
-responsive dashboard renders modern trail-linked caravans, exact PR generations
-and CI, open PRs not enrolled with their mechanical reasons, and current
-problems/decisions. `--read-only` disables action endpoints. Interactive actions
-use same-origin CSRF and the existing typed Cara operations and receipts; they
-never execute arbitrary shell input.
+responsive one-page dashboard renders trail-linked caravans, linked GitHub PRs,
+exact generations and check failures, unenrolled PR reasons, and current
+problems/decisions. Bounded inner lists keep fleet topology and attention queues
+visible without an unbounded page. The Evidence drawer retains the latest typed
+action receipt, CI lineage diagnostics, canonical events, and hook delivery
+outcomes; the Config drawer shows the effective parsed policy with hook commands
+redacted. `--read-only` leaves read-only preflight available but disables every
+mutating control. Interactive actions use same-origin CSRF, exact snapshot
+sequences, and existing typed Cara operations and receipts; they never execute
+arbitrary shell input.
 
 ## Managed sync repair
 

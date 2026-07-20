@@ -35,7 +35,7 @@ use crate::{
 const INDEX_HTML: &str = include_str!("web_assets/index.html");
 const APP_CSS: &str = include_str!("web_assets/app.css");
 const APP_JS: &str = include_str!("web_assets/app.js");
-const WEB_SCHEMA_VERSION: u32 = 1;
+const WEB_SCHEMA_VERSION: u32 = 2;
 const MIN_POLL_SECONDS: u64 = 2;
 const MAX_POLL_SECONDS: u64 = 3_600;
 const SERVER_TICK: Duration = Duration::from_millis(250);
@@ -94,11 +94,28 @@ pub struct WebRepositorySnapshot {
     pub path: String,
     pub config_path: String,
     pub config_existed: bool,
+    /// Effective parsed configuration with hook command bodies redacted.
+    pub effective_config: serde_json::Value,
     pub refreshed_unix_ms: u64,
     pub refresh_sequence: u64,
     pub refreshing: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<StatusOutput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<WebError>,
+    /// Most recent bounded typed action result, retained for operational evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_action: Option<WebActionRecord>,
+}
+
+/// Bounded action evidence retained with the repository snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WebActionRecord {
+    pub completed_unix_ms: u64,
+    pub action: String,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<WebError>,
 }
@@ -429,6 +446,7 @@ fn load_repositories(paths: &[PathBuf]) -> Result<Vec<Arc<RepositoryEntry>>, App
                 config_existed,
                 config,
             };
+            let effective_config = redacted_config(&context.config)?;
             let id = format!("repo-{}", index + 1);
             Ok(Arc::new(RepositoryEntry {
                 id: id.clone(),
@@ -438,17 +456,44 @@ fn load_repositories(paths: &[PathBuf]) -> Result<Vec<Arc<RepositoryEntry>>, App
                     path: canonical.display().to_string(),
                     config_path: config_path.display().to_string(),
                     config_existed,
+                    effective_config,
                     refreshed_unix_ms: 0,
                     refresh_sequence: 0,
                     refreshing: false,
                     status: None,
                     error: None,
+                    last_action: None,
                 }),
                 refresh_lock: Mutex::new(()),
                 action_lock: Mutex::new(()),
             }))
         })
         .collect()
+}
+
+fn redacted_config(config: &CaravanConfig) -> Result<serde_json::Value, AppError> {
+    let mut value = serde_json::to_value(config).map_err(|error| {
+        AppError::structured(
+            ErrorCategory::ExecutionFailure,
+            "web_config_encode_failed",
+            error.to_string(),
+            None,
+        )
+    })?;
+    if let Some(hooks) = value
+        .get_mut("hooks")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for hook in hooks.values_mut() {
+            if let Some(command) = hook
+                .as_object_mut()
+                .and_then(|object| object.get_mut("command"))
+            {
+                *command = serde_json::Value::String("<configured; redacted>".to_owned());
+            }
+        }
+    }
+    Ok(value)
 }
 
 fn refresh_repository(repository: &RepositoryEntry) {
@@ -656,12 +701,31 @@ fn handle_action(
     }
     let action_name = action_request.action.name().to_owned();
     let result = run_action(&repository.context, action_request.action);
+    let action_record = match &result {
+        Ok(result) => WebActionRecord {
+            completed_unix_ms: unix_ms(),
+            action: action_name.clone(),
+            ok: true,
+            result: Some(result.clone()),
+            error: None,
+        },
+        Err(error) => WebActionRecord {
+            completed_unix_ms: unix_ms(),
+            action: action_name.clone(),
+            ok: false,
+            result: None,
+            error: Some(WebError::from_app(error)),
+        },
+    };
     refresh_repository_locked(repository);
-    let snapshot = repository
-        .snapshot
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
+    let snapshot = {
+        let mut snapshot = repository
+            .snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        snapshot.last_action = Some(action_record);
+        snapshot.clone()
+    };
     match result {
         Ok(result) => json_response(
             StatusCode(200),
@@ -912,11 +976,40 @@ mod tests {
     }
 
     #[test]
+    fn effective_web_config_redacts_hook_commands() {
+        let mut config = CaravanConfig::default();
+        config.hooks.insert(
+            crate::model::EventKind::HeadAdvanced,
+            crate::config::HookConfig {
+                command: "notify --token secret-value".to_owned(),
+                timeout_secs: 12,
+                blocking: true,
+            },
+        );
+        let value = redacted_config(&config).unwrap();
+        let encoded = serde_json::to_string(&value).unwrap();
+        assert!(!encoded.contains("secret-value"));
+        assert_eq!(
+            value["hooks"]["head_advanced"]["command"],
+            "<configured; redacted>"
+        );
+        assert_eq!(value["hooks"]["head_advanced"]["blocking"], true);
+    }
+
+    #[test]
     fn embedded_assets_are_self_contained() {
         assert!(INDEX_HTML.contains("/assets/app.css"));
         assert!(INDEX_HTML.contains("/assets/app.js"));
         assert!(!INDEX_HTML.contains("https://"));
         assert!(!APP_CSS.contains("url(http"));
-        assert!(!APP_JS.contains("https://"));
+        assert!(!APP_JS.contains("cdn."));
+        assert!(!APP_JS.contains("import("));
+        assert!(APP_JS.contains("https://github.com/"));
+        assert!(INDEX_HTML.contains("id=\"show-config\""));
+        assert!(INDEX_HTML.contains("id=\"show-evidence\""));
+        assert!(!INDEX_HTML.contains("Surveying the trail"));
+        assert!(!INDEX_HTML.contains("ambient repository discovery"));
+        assert!(APP_JS.contains("target=\"_blank\" rel=\"noopener noreferrer\""));
+        assert!(APP_JS.contains("last_action"));
     }
 }
