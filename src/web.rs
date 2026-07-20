@@ -6,9 +6,10 @@
 //! status implementation used by CLI/JSON/MCP.
 
 use std::collections::BTreeSet;
+use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -22,7 +23,14 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 use crate::config::{CaravanConfig, DEFAULT_CONFIG_PATH};
 use crate::read::StatusOutput;
-use crate::{AppContext, AppError};
+use crate::repair::{
+    RepairAbortInput, RepairContinueInput, RepairGrantInput, RepairRevokeGrantInput,
+    RepairStartInput, RepairStatusInput,
+};
+use crate::{
+    AppContext, AppError, CheckInput, CreateInput, EvictInput, JoinInput, PauseInput, ResumeInput,
+    SplitInput, SyncInput,
+};
 
 const INDEX_HTML: &str = include_str!("web_assets/index.html");
 const APP_CSS: &str = include_str!("web_assets/app.css");
@@ -31,6 +39,8 @@ const WEB_SCHEMA_VERSION: u32 = 1;
 const MIN_POLL_SECONDS: u64 = 2;
 const MAX_POLL_SECONDS: u64 = 3_600;
 const SERVER_TICK: Duration = Duration::from_millis(250);
+const MAX_REQUEST_BODY_BYTES: u64 = 1024 * 1024;
+const MAX_CONCURRENT_REQUESTS: usize = 32;
 
 /// Start a local dashboard over one or more explicit repository paths.
 #[derive(Debug, Clone, Args)]
@@ -107,11 +117,81 @@ pub struct WebState {
     pub repositories: Vec<WebRepositorySnapshot>,
 }
 
+/// Exact-snapshot action request accepted by the same-origin web API.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WebActionRequest {
+    pub expected_refresh_sequence: u64,
+    #[serde(flatten)]
+    pub action: WebAction,
+}
+
+/// Strict typed Cara operations exposed by the dashboard.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "action", content = "input", rename_all = "snake_case")]
+pub enum WebAction {
+    Check(CheckInput),
+    Sync(SyncInput),
+    Join(JoinInput),
+    Rejoin(JoinInput),
+    New(CreateInput),
+    Renew(CreateInput),
+    Split(SplitInput),
+    Evict(EvictInput),
+    Pause(PauseInput),
+    Resume(ResumeInput),
+    RepairStart(RepairStartInput),
+    RepairContinue(RepairContinueInput),
+    RepairStatus(RepairStatusInput),
+    RepairAbort(RepairAbortInput),
+    RepairGrant(RepairGrantInput),
+    RepairRevokeGrant(RepairRevokeGrantInput),
+}
+
+impl WebAction {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Check(_) => "check",
+            Self::Sync(_) => "sync",
+            Self::Join(_) => "join",
+            Self::Rejoin(_) => "rejoin",
+            Self::New(_) => "new",
+            Self::Renew(_) => "renew",
+            Self::Split(_) => "split",
+            Self::Evict(_) => "evict",
+            Self::Pause(_) => "pause",
+            Self::Resume(_) => "resume",
+            Self::RepairStart(_) => "repair_start",
+            Self::RepairContinue(_) => "repair_continue",
+            Self::RepairStatus(_) => "repair_status",
+            Self::RepairAbort(_) => "repair_abort",
+            Self::RepairGrant(_) => "repair_grant",
+            Self::RepairRevokeGrant(_) => "repair_revoke_grant",
+        }
+    }
+
+    fn mutates(&self) -> bool {
+        !matches!(self, Self::Check(_) | Self::RepairStatus(_))
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WebActionResponse {
+    ok: bool,
+    repository_id: String,
+    action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    result: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<WebError>,
+    snapshot: WebRepositorySnapshot,
+}
+
 struct RepositoryEntry {
     id: String,
     context: AppContext,
     snapshot: Mutex<WebRepositorySnapshot>,
     refresh_lock: Mutex<()>,
+    action_lock: Mutex<()>,
 }
 
 struct Dashboard {
@@ -122,6 +202,15 @@ struct Dashboard {
     started_unix_ms: u64,
     repositories: Vec<Arc<RepositoryEntry>>,
     stopping: AtomicBool,
+    active_requests: AtomicUsize,
+}
+
+struct RequestActivity<'a>(&'a AtomicUsize);
+
+impl Drop for RequestActivity<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Dashboard {
@@ -175,6 +264,7 @@ pub fn serve(input: &WebInput) -> Result<(), AppError> {
         started_unix_ms: unix_ms(),
         repositories: load_repositories(&input.repositories)?,
         stopping: AtomicBool::new(false),
+        active_requests: AtomicUsize::new(0),
     });
     dashboard.refresh_all();
 
@@ -217,7 +307,24 @@ pub fn serve(input: &WebInput) -> Result<(), AppError> {
 
     while !dashboard.stopping.load(Ordering::Relaxed) {
         match server.recv_timeout(SERVER_TICK) {
-            Ok(Some(request)) => handle_request(request, &dashboard),
+            Ok(Some(request)) => {
+                if dashboard.active_requests.fetch_add(1, Ordering::SeqCst)
+                    >= MAX_CONCURRENT_REQUESTS
+                {
+                    dashboard.active_requests.fetch_sub(1, Ordering::SeqCst);
+                    let _ = request.respond(error_response(
+                        StatusCode(503),
+                        "web_request_limit",
+                        "too many concurrent dashboard requests",
+                    ));
+                    continue;
+                }
+                let state = Arc::clone(&dashboard);
+                thread::spawn(move || {
+                    let _activity = RequestActivity(&state.active_requests);
+                    handle_request(request, &state);
+                });
+            }
             Ok(None) => {}
             Err(error) => {
                 dashboard.stopping.store(true, Ordering::SeqCst);
@@ -338,6 +445,7 @@ fn load_repositories(paths: &[PathBuf]) -> Result<Vec<Arc<RepositoryEntry>>, App
                     error: None,
                 }),
                 refresh_lock: Mutex::new(()),
+                action_lock: Mutex::new(()),
             }))
         })
         .collect()
@@ -348,6 +456,10 @@ fn refresh_repository(repository: &RepositoryEntry) {
         .refresh_lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    refresh_repository_locked(repository);
+}
+
+fn refresh_repository_locked(repository: &RepositoryEntry) {
     {
         let mut snapshot = repository
             .snapshot
@@ -394,7 +506,7 @@ fn sleep_until_stopped(stopping: &AtomicBool, duration: Duration) -> bool {
     stopping.load(Ordering::Relaxed)
 }
 
-fn handle_request(request: Request, dashboard: &Dashboard) {
+fn handle_request(mut request: Request, dashboard: &Dashboard) {
     let method = request.method().clone();
     let path = request.url().split('?').next().unwrap_or("/").to_owned();
     let response = match (method, path.as_str()) {
@@ -417,25 +529,7 @@ fn handle_request(request: Request, dashboard: &Dashboard) {
             handle_refresh(&request, dashboard, path)
         }
         (Method::Post, path) if path.ends_with("/action") => {
-            if !csrf_valid(&request, &dashboard.csrf_token) {
-                error_response(
-                    StatusCode(403),
-                    "web_csrf_invalid",
-                    "missing or invalid X-Cara-CSRF",
-                )
-            } else if dashboard.read_only {
-                error_response(
-                    StatusCode(403),
-                    "web_read_only",
-                    "mutation endpoints are disabled",
-                )
-            } else {
-                error_response(
-                    StatusCode(501),
-                    "web_action_not_implemented",
-                    "the typed mutation API lands in the next dashboard slice",
-                )
-            }
+            handle_action(&mut request, dashboard, path)
         }
         _ => error_response(
             StatusCode(404),
@@ -479,6 +573,156 @@ fn handle_refresh(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     json_response(StatusCode(200), &snapshot)
+}
+
+#[allow(clippy::too_many_lines)]
+fn handle_action(
+    request: &mut Request,
+    dashboard: &Dashboard,
+    path: &str,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    if !csrf_valid(request, &dashboard.csrf_token) {
+        return error_response(
+            StatusCode(403),
+            "web_csrf_invalid",
+            "missing or invalid X-Cara-CSRF",
+        );
+    }
+    let Some(id) = repository_id_from_path(path, "action") else {
+        return error_response(
+            StatusCode(404),
+            "web_repository_not_found",
+            "unknown repository",
+        );
+    };
+    let Some(repository) = dashboard.repository(id) else {
+        return error_response(
+            StatusCode(404),
+            "web_repository_not_found",
+            "unknown repository",
+        );
+    };
+    let mut body = Vec::new();
+    let read = request
+        .as_reader()
+        .take(MAX_REQUEST_BODY_BYTES.saturating_add(1))
+        .read_to_end(&mut body);
+    if let Err(error) = read {
+        return error_response(StatusCode(400), "web_body_read_failed", &error.to_string());
+    }
+    if u64::try_from(body.len()).unwrap_or(u64::MAX) > MAX_REQUEST_BODY_BYTES {
+        return error_response(
+            StatusCode(413),
+            "web_body_too_large",
+            "action request exceeds the one MiB body limit",
+        );
+    }
+    let action_request = match serde_json::from_slice::<WebActionRequest>(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            return error_response(StatusCode(400), "web_action_invalid", &error.to_string());
+        }
+    };
+    if dashboard.read_only && action_request.action.mutates() {
+        return error_response(
+            StatusCode(403),
+            "web_read_only",
+            "mutation endpoints are disabled",
+        );
+    }
+    let _action = repository
+        .action_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _refresh = repository
+        .refresh_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let actual_sequence = repository
+        .snapshot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .refresh_sequence;
+    if actual_sequence != action_request.expected_refresh_sequence {
+        return error_response(
+            StatusCode(409),
+            "web_snapshot_stale",
+            "repository snapshot changed; refresh and review exact facts before retrying",
+        );
+    }
+    let action_name = action_request.action.name().to_owned();
+    let result = run_action(&repository.context, action_request.action);
+    refresh_repository_locked(repository);
+    let snapshot = repository
+        .snapshot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    match result {
+        Ok(result) => json_response(
+            StatusCode(200),
+            &WebActionResponse {
+                ok: true,
+                repository_id: repository.id.clone(),
+                action: action_name,
+                result: Some(result),
+                error: None,
+                snapshot,
+            },
+        ),
+        Err(error) => json_response(
+            StatusCode(409),
+            &WebActionResponse {
+                ok: false,
+                repository_id: repository.id.clone(),
+                action: action_name,
+                result: None,
+                error: Some(WebError::from_app(&error)),
+                snapshot,
+            },
+        ),
+    }
+}
+
+fn run_action(context: &AppContext, action: WebAction) -> Result<serde_json::Value, AppError> {
+    match action {
+        WebAction::Check(input) => serialize_action(crate::read::check(context, &input)),
+        WebAction::Sync(input) => serialize_action(crate::sync::sync(context, &input)),
+        WebAction::Join(input) => serialize_action(crate::membership::join(context, &input)),
+        WebAction::Rejoin(input) => serialize_action(crate::membership::rejoin(context, &input)),
+        WebAction::New(input) => serialize_action(crate::membership::new(context, &input)),
+        WebAction::Renew(input) => serialize_action(crate::membership::renew(context, &input)),
+        WebAction::Split(input) => serialize_action(crate::reshape::split(context, &input)),
+        WebAction::Evict(input) => serialize_action(crate::reshape::evict(context, &input)),
+        WebAction::Pause(input) => serialize_action(crate::pause::pause(context, &input)),
+        WebAction::Resume(input) => serialize_action(crate::pause::resume(context, &input)),
+        WebAction::RepairStart(input) => serialize_action(crate::repair::start(context, &input)),
+        WebAction::RepairContinue(input) => {
+            serialize_action(crate::repair::continue_session(context, &input))
+        }
+        WebAction::RepairStatus(input) => serialize_action(crate::repair::status(context, &input)),
+        WebAction::RepairAbort(input) => serialize_action(crate::repair::abort(context, &input)),
+        WebAction::RepairGrant(input) => {
+            serialize_action(crate::repair::grant_paths(context, &input))
+        }
+        WebAction::RepairRevokeGrant(input) => {
+            serialize_action(crate::repair::revoke_grants(context, &input))
+        }
+    }
+}
+
+fn serialize_action<T: Serialize>(
+    result: Result<T, AppError>,
+) -> Result<serde_json::Value, AppError> {
+    let output = result?;
+    serde_json::to_value(output).map_err(|error| {
+        AppError::structured(
+            ErrorCategory::ExecutionFailure,
+            "web_action_encode_failed",
+            error.to_string(),
+            None,
+        )
+    })
 }
 
 fn repository_id_from_path<'a>(path: &'a str, operation: &str) -> Option<&'a str> {
@@ -631,6 +875,36 @@ mod tests {
                 .err()
                 .expect("duplicate path fails");
         assert_eq!(error.code(), "web_repository_duplicate");
+    }
+
+    #[test]
+    fn web_actions_are_strictly_tagged_and_classified() {
+        let check: WebActionRequest = serde_json::from_value(json!({
+            "expected_refresh_sequence": 7,
+            "action": "check",
+            "input": {"pr": 42, "tail_pr": 41}
+        }))
+        .unwrap();
+        assert_eq!(check.expected_refresh_sequence, 7);
+        assert_eq!(check.action.name(), "check");
+        assert!(!check.action.mutates());
+
+        let sync: WebActionRequest = serde_json::from_value(json!({
+            "expected_refresh_sequence": 8,
+            "action": "sync",
+            "input": {"all": true, "rerun_failed": false}
+        }))
+        .unwrap();
+        assert_eq!(sync.action.name(), "sync");
+        assert!(sync.action.mutates());
+        assert!(
+            serde_json::from_value::<WebActionRequest>(json!({
+                "expected_refresh_sequence": 1,
+                "action": "shell",
+                "input": {"command": "rm -rf"}
+            }))
+            .is_err()
+        );
     }
 
     #[test]

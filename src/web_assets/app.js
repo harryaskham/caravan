@@ -99,6 +99,11 @@
       <article class="overview-card"><span class="metric-label">Problems</span><strong class="metric">${problems.length}</strong><p>${state.read_only ? "Read-only dashboard" : "Actions require exact receipts"}</p></article>`;
   }
 
+  function actionButton(label, action, input, tone = "") {
+    const disabled = state?.read_only ? "disabled" : "";
+    return `<button type="button" class="mini-action ${tone}" data-web-action="${escapeHtml(action)}" data-web-input="${escapeHtml(JSON.stringify(input))}" ${disabled}>${escapeHtml(label)}</button>`;
+  }
+
   function renderPrCard(pr, index) {
     if (!pr) return `<article class="pr-card"><p>Provider snapshot unavailable</p></article>`;
     const [ciText, ciTone] = checkTone(pr.checks);
@@ -110,6 +115,11 @@
       <div class="branch-line"><span>head</span><code title="${escapeHtml(pr.head?.name)}">${escapeHtml(pr.head?.name)}@${shortOid(pr.head?.oid)}</code></div>
       <div class="branch-line"><span>base</span><code title="${escapeHtml(pr.base?.name)}">${escapeHtml(pr.base?.name)}@${shortOid(pr.base?.oid)}</code></div>
       <div class="badges">${badge(ciText, ciTone)}${auto}${force}</div>
+      <div class="card-actions">
+        ${actionButton("Check", "check", { pr: pr.number })}
+        ${index > 0 ? actionButton("Split here", "split", { pr: pr.number }) : ""}
+        ${actionButton("Evict", "evict", { pr: pr.number, reason: "Cara web operator eviction" }, "danger")}
+      </div>
     </article>`;
   }
 
@@ -126,7 +136,10 @@
       return `<article class="caravan">
         <header class="caravan-header">
           <div class="caravan-title"><h3>Caravan #${caravan.id}</h3><span>${members.length} ${members.length === 1 ? "member" : "members"}</span></div>
-          <div class="badges">${head?.auto_merge?.enabled ? badge("Head armed", "good") : badge("Head not armed", "warn")}</div>
+          <div class="caravan-tools">
+            <div class="badges">${head?.auto_merge?.enabled ? badge("Head armed", "good") : badge("Head not armed", "warn")}</div>
+            ${actionButton("Sync fleet", "sync", { all: true, rerun_failed: false })}
+          </div>
         </header>
         <div class="trail">${members.map(renderPrCard).join("")}</div>
       </article>`;
@@ -152,12 +165,18 @@
       ui.waiting.innerHTML = empty("Every visible open pull request is enrolled, or no candidates are currently open.");
       return;
     }
+    const firstCaravan = status?.analysis?.fleet?.caravans?.[0];
+    const tail = firstCaravan?.members?.at(-1);
     ui.waiting.innerHTML = waiting.map((pr) => `
       <article class="queue-card">
         <div class="pr-kicker"><span class="pr-number">PR #${pr.number}</span>${pr.draft ? badge("Draft") : badge("Open", "info")}</div>
         <h3>${escapeHtml(pr.title || `Pull request #${pr.number}`)}</h3>
         <p><span class="mono">${escapeHtml(pr.head?.name)}@${shortOid(pr.head?.oid)}</span> → <span class="mono">${escapeHtml(pr.base?.name)}</span></p>
         <p class="reason">${escapeHtml(reasonForPr(status, pr))}</p>
+        <div class="card-actions">
+          ${actionButton("Preflight", "check", { pr: pr.number, ...(tail ? { tail_pr: tail } : {}) })}
+          ${tail ? actionButton("Join tail", "join", { pr: pr.number, tail_pr: tail, create_pr: false, reason: "Cara web canonical admission", priority_label: null }, "primary") : ""}
+        </div>
       </article>`).join("");
   }
 
@@ -223,6 +242,38 @@
     }
   }
 
+  async function performAction(action, input, button) {
+    const repo = state?.repositories?.find((item) => item.id === selectedRepo);
+    if (!repo || state.read_only) return;
+    const destructive = ["evict", "split", "repair_abort"].includes(action);
+    if (destructive && !window.confirm(`Run ${action.replaceAll("_", " ")} against ${repoName(repo)} using the current exact snapshot?`)) return;
+    button.disabled = true;
+    try {
+      const response = await fetch(`/api/v1/repos/${encodeURIComponent(repo.id)}/action`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Cara-CSRF": state.csrf_token,
+          Accept: "application/json",
+        },
+        body: JSON.stringify({
+          expected_refresh_sequence: repo.refresh_sequence,
+          action,
+          input,
+        }),
+      });
+      const payload = await response.json();
+      if (!payload.ok) throw new Error(payload.error?.message || `${action} failed`);
+      toast(`${action.replaceAll("_", " ")} completed with an exact Cara receipt`);
+      await fetchState();
+    } catch (error) {
+      toast(error.message);
+      await fetchState({ quiet: true });
+    } finally {
+      button.disabled = false;
+    }
+  }
+
   async function refreshAll() {
     if (!state) return fetchState();
     ui.refresh.disabled = true;
@@ -241,6 +292,13 @@
   }
 
   ui.refresh.addEventListener("click", refreshAll);
+  ui.dashboard.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-web-action]");
+    if (!button) return;
+    let input = {};
+    try { input = JSON.parse(button.dataset.webInput || "{}"); } catch { toast("Invalid embedded action payload"); return; }
+    performAction(button.dataset.webAction, input, button);
+  });
   fetchState();
   setInterval(() => fetchState({ quiet: true }), 5000);
 })();

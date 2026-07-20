@@ -117,6 +117,7 @@ button:focus-visible, [role="tab"]:focus-visible, a:focus-visible {
 .caravan-title { display: flex; align-items: baseline; gap: 10px; }
 .caravan-title h3 { margin: 0; font: 600 1.18rem/1 var(--font-display); }
 .caravan-title span { color: var(--ink-soft); font-size: .72rem; }
+.caravan-tools { display: flex; align-items: center; gap: 12px; }
 .trail { position: relative; display: flex; align-items: stretch; gap: 24px; padding: 26px 24px 30px; overflow-x: auto; }
 .trail::before { content: ""; position: absolute; top: 67px; left: 55px; right: 55px; height: 2px; background: repeating-linear-gradient(90deg, var(--paper-deep) 0 7px, transparent 7px 13px); }
 .pr-card { position: relative; z-index: 1; flex: 0 0 245px; min-height: 168px; padding: 16px; background: #fffdf8; border: 1px solid rgba(74,62,47,.17); border-radius: 14px; box-shadow: 0 8px 24px rgba(46,37,26,.08); }
@@ -142,6 +143,12 @@ button:focus-visible, [role="tab"]:focus-visible, a:focus-visible {
 .queue-card h3, .decision-card h3 { margin: 0 0 6px; font: 600 .98rem/1.25 var(--font-display); }
 .queue-card p, .decision-card p { margin: 0; color: var(--ink-soft); font-size: .73rem; line-height: 1.45; }
 .reason { margin-top: 10px !important; padding-top: 9px; border-top: 1px dashed var(--line); color: var(--rust-dark) !important; }
+.card-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 13px; padding-top: 10px; border-top: 1px solid var(--line); }
+.mini-action { padding: 5px 8px; border: 1px solid var(--line); border-radius: 7px; background: transparent; color: var(--ink-soft); font-size: .65rem; font-weight: 700; cursor: pointer; }
+.mini-action:hover { color: var(--ink); background: rgba(255,255,255,.6); }
+.mini-action.primary { color: white; background: var(--sage); border-color: var(--sage); }
+.mini-action.danger { color: var(--danger); }
+.mini-action:disabled { opacity: .4; cursor: not-allowed; }
 .empty-state { display: grid; place-items: center; min-height: 125px; color: var(--ink-soft); text-align: center; }
 .empty-state span { font-size: 1.7rem; color: var(--gold); }
 .empty-state p { margin: 8px 0 0; font-size: .76rem; }
