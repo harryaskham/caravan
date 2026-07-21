@@ -107,7 +107,21 @@
           program = "${caravan}/bin/cara";
         };
 
-        checks.default = caravan;
+        checks = {
+          default = caravan;
+          workflow-lint = pkgs.runCommand "caravan-workflow-lint" {
+            nativeBuildInputs = [
+              pkgs.actionlint
+              pkgs.shellcheck
+            ];
+          } ''
+            cp -R ${lib.cleanSource ./.} source
+            chmod -R u+w source
+            cd source
+            ./scripts/check-workflows.sh
+            touch "$out"
+          '';
+        };
 
         devShells.default = pkgs.mkShell {
           inputsFrom = [ caravan ];
@@ -120,6 +134,8 @@
             rust-analyzer
             git
             gh
+            actionlint
+            shellcheck
           ];
         };
 

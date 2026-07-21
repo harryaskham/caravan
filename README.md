@@ -71,6 +71,7 @@ Development surfaces:
 
 ```sh
 nix develop
+./scripts/check-workflows.sh  # pinned actionlint + shellcheck
 cargo test
 cargo run -- help
 cargo run -- mcp tools
@@ -78,6 +79,11 @@ cargo run -- mcp stdio
 cargo run -- self-update status
 cargo run -- feedback status
 ```
+
+The default development shell pins `actionlint` and `shellcheck`; the same
+`scripts/check-workflows.sh` command is a Nix flake check. Custom self-hosted
+runner labels live in `.github/actionlint.yaml`, so workflow validation needs no
+ad hoc nixpkgs fetch or machine-global linter installation.
 
 Domain surface:
 

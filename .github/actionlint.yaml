@@ -2,5 +2,7 @@ self-hosted-runner:
   labels:
     - azure-ephemeral
     - aarch64-darwin
+    - nix
+    - x86_64-linux
 
 config-variables: null

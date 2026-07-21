@@ -499,6 +499,6 @@ The first skeleton establishes:
 - clap command shape and agent-oriented help;
 - shared typed CLI/MCP contracts and structured not-implemented decision errors;
 - `mcp-cli`, `updatable-cli`, and `feedback-cli` integration;
-- Nix build/dev shell, CI, and baseline tests.
+- Nix build/dev shell, CI, and baseline tests, including pinned `actionlint`/`shellcheck` workflow validation through `scripts/check-workflows.sh`.
 
 Subsequent beads implement GitHub discovery, graph validation, compatibility, mutations, sync/CI, hooks/loop, and recovery behavior without changing this contract silently.
