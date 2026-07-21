@@ -31,6 +31,9 @@ const MAX_SEMANTIC_GRANTS: usize = 8;
 const MAX_GRANT_ACTOR_BYTES: usize = 128;
 const MAX_GRANT_REASON_BYTES: usize = 512;
 const MAX_GRANT_EXPIRY_SECS: u64 = 24 * 60 * 60;
+const MAX_AGENT_EDIT_PATHS: usize = 64;
+const MAX_AGENT_EDIT_PATH_BYTES: usize = 4 * 1024;
+const MAX_AGENT_EDIT_DIFF_BYTES: usize = 1024 * 1024;
 
 /// Create an exact isolated repair session for one provider PR.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, clap::Args)]
@@ -50,6 +53,10 @@ pub struct RepairContinueInput {
     /// Session ID returned by `cara repair start`.
     #[arg(long)]
     pub session: String,
+    /// Exact authorized agent identity when session-level edits were used.
+    #[arg(long)]
+    #[serde(default)]
+    pub actor: Option<String>,
     /// Publish the repair but do not immediately resume `sync --all`.
     #[arg(long)]
     #[serde(default)]
@@ -82,6 +89,60 @@ pub struct RepairGrantInput {
 
 fn default_grant_expiry_secs() -> u64 {
     3600
+}
+
+/// Authorize one audited agent to make bounded arbitrary repository edits.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, clap::Args)]
+pub struct RepairAuthorizeAgentEditsInput {
+    #[arg(long)]
+    pub session: String,
+    #[arg(long)]
+    pub actor: String,
+    #[arg(long)]
+    pub reason: String,
+    #[arg(long, default_value_t = 3600)]
+    #[serde(default = "default_grant_expiry_secs")]
+    pub expires_secs: u64,
+}
+
+/// Exact session-level authority for agent-owned repository edits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepairAgentEditAuthorization {
+    pub session: String,
+    pub repository: RepositoryId,
+    pub pr: PrNumber,
+    pub head_oid: CommitOid,
+    pub target_oid: CommitOid,
+    pub config_fingerprint: String,
+    pub manifest_fingerprint: String,
+    pub actor: String,
+    pub reason: String,
+    pub authorized_unix_ms: u64,
+    pub expires_unix_ms: u64,
+}
+
+/// Complete bounded file scope and content fingerprint verified before commit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepairAgentEditReceipt {
+    pub actor: String,
+    pub reason: String,
+    pub paths: Vec<String>,
+    pub path_count: usize,
+    pub path_fingerprint: String,
+    pub diff_fingerprint: String,
+    pub diff_bytes: usize,
+    pub staged_index_fingerprint: String,
+    pub verified_unix_ms: u64,
+    pub fresh_ci_required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepairAuthorizeAgentEditsOutput {
+    pub repair: RepairStatusOutput,
+    pub authorization: RepairAgentEditAuthorization,
+    pub already_authorized: bool,
+    pub provider_mutated: bool,
+    pub next: String,
 }
 
 /// Revoke exact semantic grants and restore their pre-grant staged objects.
@@ -235,11 +296,15 @@ pub struct RepairSession {
     #[serde(default)]
     pub conflicting_paths: Vec<String>,
     /// Stage-zero index entries created mechanically by the initial merge.
-    /// Agent edits are allowed only for `conflicting_paths`.
+    /// Narrow edits use conflicts/grants; broad edits require exact session-level authorization.
     #[serde(default)]
     pub baseline_index: BTreeMap<String, String>,
     #[serde(default)]
     pub semantic_grants: Vec<RepairPathGrant>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_edit_authorization: Option<RepairAgentEditAuthorization>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_edit_receipt: Option<RepairAgentEditReceipt>,
     pub created_unix_ms: u64,
     pub updated_unix_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -272,6 +337,10 @@ pub struct RepairStatusOutput {
     pub baseline_index_fingerprint: String,
     #[serde(default)]
     pub semantic_grants: Vec<RepairPathGrant>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_edit_authorization: Option<RepairAgentEditAuthorization>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_edit_receipt: Option<RepairAgentEditReceipt>,
     pub materialization_timeout_secs: u64,
     pub created_unix_ms: u64,
     pub updated_unix_ms: u64,
@@ -307,6 +376,9 @@ pub struct RepairPublicationReceipt {
     pub parents: Vec<CommitOid>,
     pub force: bool,
     pub remote_verified: bool,
+    pub fresh_ci_required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_edit_receipt: Option<RepairAgentEditReceipt>,
 }
 
 /// Result of a verified repair continuation.
@@ -514,6 +586,8 @@ fn start_exact(
         conflicting_paths: Vec::new(),
         baseline_index: BTreeMap::new(),
         semantic_grants: Vec::new(),
+        agent_edit_authorization: None,
+        agent_edit_receipt: None,
         created_unix_ms: now,
         updated_unix_ms: now,
         published_head: None,
@@ -784,6 +858,131 @@ fn record_phase_error(
 
 fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn repair_manifest_fingerprint(repair: &RepairSession) -> Result<String, AppError> {
+    serde_json::to_vec(repair)
+        .map(|encoded| stable_fingerprint(&encoded))
+        .map_err(|error| {
+            AppError::structured(
+                ErrorCategory::SerializationError,
+                "repair_manifest_fingerprint_failed",
+                error.to_string(),
+                None,
+            )
+        })
+}
+
+/// Authorize one exact agent identity to stage arbitrary bounded repository edits.
+#[allow(clippy::too_many_lines)]
+pub fn authorize_agent_edits(
+    context: &AppContext,
+    input: &RepairAuthorizeAgentEditsInput,
+) -> Result<RepairAuthorizeAgentEditsOutput, AppError> {
+    validate_session_id(&input.session)?;
+    if input.actor.trim().is_empty()
+        || input.actor.len() > MAX_GRANT_ACTOR_BYTES
+        || input.reason.trim().is_empty()
+        || input.reason.len() > MAX_GRANT_REASON_BYTES
+        || !(1..=MAX_GRANT_EXPIRY_SECS).contains(&input.expires_secs)
+    {
+        return Err(AppError::validation(
+            "repair_agent_edit_authorization_invalid",
+            "authorization requires bounded non-empty actor/reason and an expiry within 24 hours",
+        ));
+    }
+    let paths = repair_paths_for_session(&context.repository_path, &input.session)?;
+    let mut repair = read_manifest(&paths.manifest)?;
+    require_session_match(&repair, &input.session)?;
+    validate_workspace(&paths, &repair)?;
+    if repair.state != RepairState::Resolving {
+        return Err(AppError::validation(
+            "repair_agent_edit_state_invalid",
+            "agent edits may be authorized only while the repair is resolving",
+        ));
+    }
+    let current_fingerprint = config_fingerprint(context)?;
+    if current_fingerprint != repair.config_fingerprint {
+        return Err(AppError::validation(
+            "repair_config_changed",
+            "Caravan config changed after the repair session was prepared",
+        ));
+    }
+    let mut lock =
+        OperationLock::acquire(&context.repository_path, "repair-authorize-agent-edits")?;
+    lock.checkpoint(
+        "repair_agent_edit_authorization_preflight",
+        repair_lock_receipt(&repair)?,
+        false,
+    )?;
+    let runner = ProcessRunner::in_directory(&paths.workspace)
+        .with_timeout(Duration::from_secs(context.config.command_timeout_secs));
+    verify_remote_head(&runner, &repair.provider_git_url, &repair.head)?;
+    verify_remote_head(&runner, &repair.provider_git_url, &repair.target)?;
+    let now = unix_ms();
+    if let Some(existing) = &repair.agent_edit_authorization
+        && existing.actor == input.actor
+        && existing.reason == input.reason
+        && existing.expires_unix_ms >= now
+        && existing.head_oid == repair.head.oid
+        && existing.target_oid == repair.target.oid
+        && existing.config_fingerprint == repair.config_fingerprint
+    {
+        let output = RepairAuthorizeAgentEditsOutput {
+            repair: repair_status_output(&repair)?,
+            authorization: existing.clone(),
+            already_authorized: true,
+            provider_mutated: false,
+            next: "make and stage only reviewed repository-content edits in the managed workspace, then continue with the same --actor".to_owned(),
+        };
+        lock.release()?;
+        return Ok(output);
+    }
+    if let Some(existing) = &repair.agent_edit_authorization
+        && existing.expires_unix_ms >= now
+    {
+        return Err(AppError::structured(
+            ErrorCategory::MissingPermission,
+            "repair_agent_edit_authorization_conflict",
+            "a different unexpired agent-edit authorization already exists",
+            Some(json!({"authorization": existing})),
+        ));
+    }
+    let authorization = RepairAgentEditAuthorization {
+        session: repair.session.clone(),
+        repository: repair.repository.clone(),
+        pr: repair.pr,
+        head_oid: repair.head.oid.clone(),
+        target_oid: repair.target.oid.clone(),
+        config_fingerprint: repair.config_fingerprint.clone(),
+        manifest_fingerprint: repair_manifest_fingerprint(&repair)?,
+        actor: input.actor.clone(),
+        reason: input.reason.clone(),
+        authorized_unix_ms: now,
+        expires_unix_ms: now.saturating_add(input.expires_secs.saturating_mul(1000)),
+    };
+    repair.agent_edit_authorization = Some(authorization.clone());
+    repair.agent_edit_receipt = None;
+    repair.updated_unix_ms = unix_ms();
+    write_manifest(&paths.manifest, &repair)?;
+    lock.checkpoint(
+        "repair_agent_edits_authorized",
+        json!({
+            "repair": repair_lock_receipt(&repair)?,
+            "actor": authorization.actor,
+            "expires_unix_ms": authorization.expires_unix_ms,
+            "provider_mutated": false,
+        }),
+        false,
+    )?;
+    lock.release()?;
+    Ok(RepairAuthorizeAgentEditsOutput {
+        repair: repair_status_output(&repair)?,
+        authorization,
+        already_authorized: false,
+        provider_mutated: false,
+        next: "make and stage reviewed repository-content edits in the managed workspace, then run repair continue with the same --actor".to_owned(),
+    })
 }
 
 fn validate_grant_text(input: &RepairGrantInput) -> Result<(), AppError> {
@@ -1443,6 +1642,8 @@ pub fn continue_session(
                 parents: vec![repair.head.oid.clone(), repair.target.oid.clone()],
                 force: false,
                 remote_verified: true,
+                fresh_ci_required: true,
+                agent_edit_receipt: repair.agent_edit_receipt.clone(),
             });
         return resume_or_return(context, input, &paths, repair, publication);
     }
@@ -1461,7 +1662,21 @@ pub fn continue_session(
         RepairState::Preparing => unreachable!("preparing state returned above"),
         RepairState::Resolving => {
             if try_rev_parse(&runner, "MERGE_HEAD")?.is_some() {
-                verify_resolution(&runner, &repair)?;
+                if let Some(receipt) = verify_resolution(&runner, &repair, input.actor.as_deref())?
+                {
+                    repair.agent_edit_receipt = Some(receipt);
+                    repair.updated_unix_ms = unix_ms();
+                    write_manifest(&paths.manifest, &repair)?;
+                    lock.checkpoint(
+                        "repair_agent_edits_verified",
+                        json!({
+                            "repair": repair_lock_receipt(&repair)?,
+                            "agent_edit_receipt": repair.agent_edit_receipt,
+                            "provider_mutated": false,
+                        }),
+                        false,
+                    )?;
+                }
                 verify_remote_head(&runner, &repair.provider_git_url, &repair.head)?;
                 require_success(
                     &runner,
@@ -1587,6 +1802,8 @@ pub fn continue_session(
         parents,
         force: false,
         remote_verified: true,
+        fresh_ci_required: true,
+        agent_edit_receipt: repair.agent_edit_receipt.clone(),
     };
     repair.state = RepairState::Published;
     repair.phase = RepairPhase::Published;
@@ -1724,6 +1941,8 @@ fn repair_status_output(repair: &RepairSession) -> Result<RepairStatusOutput, Ap
         baseline_index_count: repair.baseline_index.len(),
         baseline_index_fingerprint: stable_fingerprint(&baseline),
         semantic_grants: repair.semantic_grants.clone(),
+        agent_edit_authorization: repair.agent_edit_authorization.clone(),
+        agent_edit_receipt: repair.agent_edit_receipt.clone(),
         materialization_timeout_secs: repair.materialization_timeout_secs,
         created_unix_ms: repair.created_unix_ms,
         updated_unix_ms: repair.updated_unix_ms,
@@ -1780,7 +1999,140 @@ fn allowed_repair_paths(repair: &RepairSession) -> Result<BTreeSet<String>, AppE
     Ok(allowed)
 }
 
-fn verify_resolution(runner: &impl CommandRunner, repair: &RepairSession) -> Result<(), AppError> {
+fn staged_paths(runner: &impl CommandRunner) -> Result<BTreeSet<String>, AppError> {
+    let output = require_success(
+        runner,
+        CommandSpec::new("git").args(["diff", "--cached", "--name-only", "--no-renames", "-z"]),
+        "repair_index_inspection_failed",
+        "could not inspect complete staged repair scope",
+    )?;
+    Ok(nul_paths(&output.stdout)?.into_iter().collect())
+}
+
+fn index_mode_for_path(
+    runner: &impl CommandRunner,
+    path: &str,
+) -> Result<Option<String>, AppError> {
+    let output = require_success(
+        runner,
+        CommandSpec::new("git").args(["ls-files", "--stage", "--", path]),
+        "repair_index_inspection_failed",
+        "could not inspect staged repair path mode",
+    )?;
+    Ok(output
+        .stdout
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .and_then(|line| line.split_whitespace().next())
+        .map(str::to_owned))
+}
+
+fn validate_agent_edit_path(runner: &impl CommandRunner, path: &str) -> Result<(), AppError> {
+    let candidate = Path::new(path);
+    let safe = !path.is_empty()
+        && path.len() <= 512
+        && !path.contains(['\n', '\r', '\0'])
+        && !candidate.is_absolute()
+        && candidate
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+        && path != ".git"
+        && !path.starts_with(".git/");
+    if !safe {
+        return Err(AppError::validation(
+            "repair_agent_edit_path_forbidden",
+            format!("agent edit path `{path}` is outside safe repository content"),
+        ));
+    }
+    let basename = candidate
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let secret_extension = candidate
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            ["pem", "key", "p12"]
+                .iter()
+                .any(|blocked| extension.eq_ignore_ascii_case(blocked))
+        });
+    let secret = basename == ".env"
+        || basename.starts_with(".env.")
+        || matches!(
+            basename.as_str(),
+            "id_rsa" | "id_ed25519" | "credentials" | "credentials.json" | ".npmrc" | ".pypirc"
+        )
+        || secret_extension;
+    if secret {
+        return Err(AppError::validation(
+            "repair_agent_edit_secret_forbidden",
+            format!("agent edit path `{path}` resembles an operational secret"),
+        ));
+    }
+    if let Some(mode) = index_mode_for_path(runner, path)?
+        && mode != "100644"
+        && mode != "100755"
+    {
+        return Err(AppError::validation(
+            "repair_agent_edit_mode_forbidden",
+            format!(
+                "agent edit path `{path}` must be a regular staged file or deletion, not mode {mode}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_agent_edit_authorization<'a>(
+    repair: &'a RepairSession,
+    actor: Option<&str>,
+) -> Result<&'a RepairAgentEditAuthorization, AppError> {
+    let authorization = repair.agent_edit_authorization.as_ref().ok_or_else(|| {
+        AppError::structured(
+            ErrorCategory::MissingPermission,
+            "repair_agent_edit_authorization_required",
+            "staged paths outside conflict/grant scope require an audited agent-edit authorization",
+            Some(json!({"repair": repair_status_output(repair).ok()})),
+        )
+    })?;
+    if authorization.expires_unix_ms < unix_ms() {
+        return Err(AppError::structured(
+            ErrorCategory::MissingPermission,
+            "repair_agent_edit_authorization_expired",
+            "agent-edit authorization expired before verification",
+            Some(json!({"authorization": authorization})),
+        ));
+    }
+    if actor != Some(authorization.actor.as_str()) {
+        return Err(AppError::structured(
+            ErrorCategory::MissingPermission,
+            "repair_agent_edit_authority_mismatch",
+            "repair continue actor must exactly match the authorized agent",
+            Some(json!({"authorized_actor": authorization.actor, "provided_actor": actor})),
+        ));
+    }
+    if authorization.session != repair.session
+        || authorization.repository != repair.repository
+        || authorization.pr != repair.pr
+        || authorization.head_oid != repair.head.oid
+        || authorization.target_oid != repair.target.oid
+        || authorization.config_fingerprint != repair.config_fingerprint
+    {
+        return Err(AppError::validation(
+            "repair_agent_edit_authorization_drift",
+            "repair identity drifted from the exact agent-edit authorization",
+        ));
+    }
+    Ok(authorization)
+}
+
+#[allow(clippy::too_many_lines)]
+fn verify_resolution(
+    runner: &impl CommandRunner,
+    repair: &RepairSession,
+    actor: Option<&str>,
+) -> Result<Option<RepairAgentEditReceipt>, AppError> {
     let merge_head = rev_parse(runner, "MERGE_HEAD")?;
     if merge_head != repair.target.oid {
         return Err(AppError::structured(
@@ -1855,8 +2207,104 @@ fn verify_resolution(runner: &impl CommandRunner, repair: &RepairSession) -> Res
             ));
         }
     }
+    let changed = staged_paths(runner)?;
+    let broad_paths = changed
+        .iter()
+        .filter(|path| {
+            !allowed.contains(*path)
+                && repair
+                    .baseline_index
+                    .get(*path)
+                    .is_none_or(|baseline| current.get(*path) != Some(baseline))
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let agent_edit_receipt = if broad_paths.is_empty() {
+        None
+    } else {
+        let authorization = verify_agent_edit_authorization(repair, actor)?;
+        if broad_paths.len() > MAX_AGENT_EDIT_PATHS {
+            return Err(AppError::validation(
+                "repair_agent_edit_path_limit_exceeded",
+                format!(
+                    "agent edit scope has {} paths; maximum is {MAX_AGENT_EDIT_PATHS}",
+                    broad_paths.len()
+                ),
+            ));
+        }
+        let path_bytes_total = broad_paths.iter().map(String::len).sum::<usize>();
+        if path_bytes_total > MAX_AGENT_EDIT_PATH_BYTES {
+            return Err(AppError::validation(
+                "repair_agent_edit_path_bytes_exceeded",
+                format!(
+                    "agent edit path scope is {path_bytes_total} bytes; maximum is {MAX_AGENT_EDIT_PATH_BYTES}"
+                ),
+            ));
+        }
+        for path in &broad_paths {
+            validate_agent_edit_path(runner, path)?;
+        }
+        let mut arguments = vec![
+            "diff".to_owned(),
+            "--cached".to_owned(),
+            "--binary".to_owned(),
+            "--no-color".to_owned(),
+            "--no-ext-diff".to_owned(),
+            "--no-renames".to_owned(),
+            "--".to_owned(),
+        ];
+        arguments.extend(broad_paths.iter().cloned());
+        let diff = require_success(
+            runner,
+            CommandSpec::new("git").args(arguments),
+            "repair_agent_edit_diff_failed",
+            "could not capture authorized staged edit evidence",
+        )?;
+        if diff.stdout.len() > MAX_AGENT_EDIT_DIFF_BYTES {
+            return Err(AppError::validation(
+                "repair_agent_edit_diff_too_large",
+                format!(
+                    "authorized staged diff is {} bytes; maximum is {MAX_AGENT_EDIT_DIFF_BYTES}",
+                    diff.stdout.len()
+                ),
+            ));
+        }
+        let paths = broad_paths.iter().cloned().collect::<Vec<_>>();
+        let path_bytes = serde_json::to_vec(&paths).map_err(|error| {
+            AppError::structured(
+                ErrorCategory::SerializationError,
+                "repair_agent_edit_receipt_failed",
+                error.to_string(),
+                None,
+            )
+        })?;
+        let staged = paths
+            .iter()
+            .map(|path| (path.clone(), current.get(path).cloned()))
+            .collect::<BTreeMap<_, _>>();
+        let staged_bytes = serde_json::to_vec(&staged).map_err(|error| {
+            AppError::structured(
+                ErrorCategory::SerializationError,
+                "repair_agent_edit_receipt_failed",
+                error.to_string(),
+                None,
+            )
+        })?;
+        Some(RepairAgentEditReceipt {
+            actor: authorization.actor.clone(),
+            reason: authorization.reason.clone(),
+            path_count: paths.len(),
+            paths,
+            path_fingerprint: stable_fingerprint(&path_bytes),
+            diff_fingerprint: stable_fingerprint(diff.stdout.as_bytes()),
+            diff_bytes: diff.stdout.len(),
+            staged_index_fingerprint: stable_fingerprint(&staged_bytes),
+            verified_unix_ms: unix_ms(),
+            fresh_ci_required: true,
+        })
+    };
     for (path, oid) in &repair.baseline_index {
-        if allowed.contains(path) {
+        if allowed.contains(path) || broad_paths.contains(path) {
             continue;
         }
         if current.get(path) != Some(oid) {
@@ -1864,11 +2312,14 @@ fn verify_resolution(runner: &impl CommandRunner, repair: &RepairSession) -> Res
         }
     }
     for path in current.keys() {
-        if !repair.baseline_index.contains_key(path) && !allowed.contains(path) {
+        if !repair.baseline_index.contains_key(path)
+            && !allowed.contains(path)
+            && !broad_paths.contains(path)
+        {
             return Err(scope_error(repair, path));
         }
     }
-    Ok(())
+    Ok(agent_edit_receipt)
 }
 
 fn scope_error(repair: &RepairSession, path: &str) -> AppError {
@@ -1891,7 +2342,7 @@ fn scope_error(repair: &RepairSession, path: &str) -> AppError {
             "repair": repair,
             "path": path,
             "allowed_paths": allowed_paths,
-            "next": "revert unrelated edits in the managed workspace; semantic changes are allowed only for typed conflict paths",
+            "next": "revert unrelated edits, use an exact semantic grant, or obtain session-level agent-edit authorization before continuing",
         })),
     )
 }
@@ -2445,6 +2896,12 @@ fn repair_lock_receipt(repair: &RepairSession) -> Result<Value, AppError> {
         "baseline_index_count": repair.baseline_index.len(),
         "conflicting_path_count": repair.conflicting_paths.len(),
         "semantic_grant_count": repair.semantic_grants.len(),
+        "agent_edit_authorized": repair.agent_edit_authorization.is_some(),
+        "agent_edit_actor": repair.agent_edit_authorization.as_ref().map(|authorization| &authorization.actor),
+        "agent_edit_expires_unix_ms": repair.agent_edit_authorization.as_ref().map(|authorization| authorization.expires_unix_ms),
+        "agent_edit_path_count": repair.agent_edit_receipt.as_ref().map_or(0, |receipt| receipt.path_count),
+        "agent_edit_path_fingerprint": repair.agent_edit_receipt.as_ref().map(|receipt| &receipt.path_fingerprint),
+        "agent_edit_diff_fingerprint": repair.agent_edit_receipt.as_ref().map(|receipt| &receipt.diff_fingerprint),
         "updated_unix_ms": repair.updated_unix_ms,
     }))
 }
@@ -3122,11 +3579,126 @@ mod tests {
         fs::write(workspace.join("stable.txt"), "unrelated\n").unwrap();
         git(&workspace, &["add", "shared.txt", "stable.txt"]);
         let runner = ProcessRunner::in_directory(&workspace);
-        let error = verify_resolution(&runner, &output.repair).unwrap_err();
+        let error = verify_resolution(&runner, &output.repair, None).unwrap_err();
         assert_eq!(
             mcp_cli::StructuredError::code(&error),
-            "repair_scope_changed"
+            "repair_agent_edit_authorization_required"
         );
+    }
+
+    #[test]
+    fn audited_agent_authorization_allows_bounded_repository_edits_and_receipts() {
+        let fixture = fixture();
+        let context = context(&fixture.clone);
+        let output = start_exact(
+            &context,
+            &fixture.repository,
+            &fixture.candidate,
+            &fixture.target,
+            None,
+            fixture.root.path().join("remote.git").to_str().unwrap(),
+        )
+        .unwrap();
+        let workspace = PathBuf::from(&output.repair.workspace);
+        fs::write(workspace.join("shared.txt"), "resolved\n").unwrap();
+        fs::write(workspace.join("stable.txt"), "agent repair\n").unwrap();
+        fs::write(workspace.join("agent-added.txt"), "reviewed addition\n").unwrap();
+        git(
+            &workspace,
+            &["add", "shared.txt", "stable.txt", "agent-added.txt"],
+        );
+        git(&workspace, &["rm", "SPEC.md"]);
+        let authorization = authorize_agent_edits(
+            &context,
+            &RepairAuthorizeAgentEditsInput {
+                session: output.repair.session.clone(),
+                actor: "caco-merger".to_owned(),
+                reason: "repair exact CI and semantic decision".to_owned(),
+                expires_secs: 3600,
+            },
+        )
+        .unwrap();
+        assert!(!authorization.already_authorized);
+        assert!(!authorization.provider_mutated);
+        let replay = authorize_agent_edits(
+            &context,
+            &RepairAuthorizeAgentEditsInput {
+                session: output.repair.session.clone(),
+                actor: "caco-merger".to_owned(),
+                reason: "repair exact CI and semantic decision".to_owned(),
+                expires_secs: 3600,
+            },
+        )
+        .unwrap();
+        assert!(replay.already_authorized);
+
+        let mismatch = continue_session(
+            &context,
+            &RepairContinueInput {
+                session: output.repair.session.clone(),
+                actor: Some("other-agent".to_owned()),
+                no_sync: true,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(mismatch.code(), "repair_agent_edit_authority_mismatch");
+
+        let continued = continue_session(
+            &context,
+            &RepairContinueInput {
+                session: output.repair.session,
+                actor: Some("caco-merger".to_owned()),
+                no_sync: true,
+            },
+        )
+        .unwrap();
+        let publication = continued.publication.expect("published");
+        let receipt = publication.agent_edit_receipt.expect("agent edit receipt");
+        assert_eq!(receipt.actor, "caco-merger");
+        assert_eq!(receipt.paths, ["SPEC.md", "agent-added.txt", "stable.txt"]);
+        assert_eq!(receipt.path_count, 3);
+        assert!(receipt.diff_bytes > 0);
+        assert!(receipt.fresh_ci_required);
+        assert!(publication.fresh_ci_required);
+    }
+
+    #[test]
+    fn audited_agent_authorization_rejects_staged_operational_secrets() {
+        let fixture = fixture();
+        let context = context(&fixture.clone);
+        let output = start_exact(
+            &context,
+            &fixture.repository,
+            &fixture.candidate,
+            &fixture.target,
+            None,
+            fixture.root.path().join("remote.git").to_str().unwrap(),
+        )
+        .unwrap();
+        let workspace = PathBuf::from(&output.repair.workspace);
+        fs::write(workspace.join("shared.txt"), "resolved\n").unwrap();
+        fs::write(workspace.join(".env"), "TOKEN=secret\n").unwrap();
+        git(&workspace, &["add", "shared.txt", ".env"]);
+        authorize_agent_edits(
+            &context,
+            &RepairAuthorizeAgentEditsInput {
+                session: output.repair.session.clone(),
+                actor: "caco-merger".to_owned(),
+                reason: "repair source".to_owned(),
+                expires_secs: 3600,
+            },
+        )
+        .unwrap();
+        let error = continue_session(
+            &context,
+            &RepairContinueInput {
+                session: output.repair.session,
+                actor: Some("caco-merger".to_owned()),
+                no_sync: true,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "repair_agent_edit_secret_forbidden");
     }
 
     #[test]
@@ -3165,6 +3737,7 @@ mod tests {
             &context,
             &RepairContinueInput {
                 session: output.repair.session,
+                actor: None,
                 no_sync: true,
             },
         )
@@ -3216,6 +3789,7 @@ mod tests {
             &context,
             &RepairContinueInput {
                 session: output.repair.session,
+                actor: None,
                 no_sync: true,
             },
         )
@@ -3317,6 +3891,7 @@ mod tests {
             &context,
             &RepairContinueInput {
                 session: input.session,
+                actor: None,
                 no_sync: true,
             },
         )
@@ -3420,6 +3995,7 @@ mod tests {
             &context,
             &RepairContinueInput {
                 session: input.session,
+                actor: None,
                 no_sync: true,
             },
         )
@@ -3476,11 +4052,12 @@ mod tests {
             &context,
             &RepairContinueInput {
                 session: output.repair.session,
+                actor: None,
                 no_sync: true,
             },
         )
         .unwrap_err();
-        assert_eq!(error.code(), "repair_scope_changed");
+        assert_eq!(error.code(), "repair_agent_edit_authorization_required");
     }
 
     #[test]
@@ -3570,6 +4147,7 @@ mod tests {
             &context,
             &RepairContinueInput {
                 session: output.repair.session,
+                actor: None,
                 no_sync: true,
             },
         )

@@ -10,6 +10,7 @@ fn cara_in(directory: &std::path::Path, arguments: &[&str]) -> Output {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn every_bounded_v1_domain_command_has_a_real_json_operation() {
     let temp = tempfile::tempdir().expect("temp directory");
     let commands: &[(&str, &[&str])] = &[
@@ -30,6 +31,19 @@ fn every_bounded_v1_domain_command_has_a_real_json_operation() {
         (
             "repair_status",
             &["repair", "status", "--session", "pr-1-parity"],
+        ),
+        (
+            "repair_authorize_agent_edits",
+            &[
+                "repair",
+                "authorize-agent-edits",
+                "--session",
+                "pr-1-parity",
+                "--actor",
+                "parity",
+                "--reason",
+                "parity agent repair",
+            ],
         ),
         (
             "repair_grant",
@@ -147,6 +161,15 @@ fn every_bounded_mcp_domain_tool_routes_to_the_real_operation() {
             serde_json::json!({ "session": "pr-1-parity" }),
         ),
         (
+            "repair_authorize_agent_edits",
+            serde_json::json!({
+                "session": "pr-1-parity",
+                "actor": "parity",
+                "reason": "parity agent repair",
+                "expires_secs": 3600
+            }),
+        ),
+        (
             "repair_grant",
             serde_json::json!({
                 "session": "pr-1-parity",
@@ -236,6 +259,7 @@ fn mcp_registry_covers_all_bounded_v1_operations_with_schemas() {
         "prev",
         "sync",
         "repair_start",
+        "repair_authorize_agent_edits",
         "repair_grant",
         "repair_revoke_grant",
         "repair_status",

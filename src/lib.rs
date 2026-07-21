@@ -186,11 +186,15 @@ CI DECISIONS
 REPAIR WORKSPACES; NO RAW GIT SURGERY
 At a conflict/repair decision, use `cara repair start --pr N [--target-pr T]`.
 Cara creates or reuses a provider-cloned exact-head workspace with bounded,
-persisted evidence. Use `cara repair status` to inspect it. Modify only the typed
-conflict paths. Semantic-path edits require an explicit reviewed `repair grant`;
-`repair revoke-grant` restores the recorded pre-grant blobs. Stage reviewed
-changes and run `cara repair continue --session ID`: it verifies the session,
-uses non-force publication, and resumes sync-all. Use `repair abort` only to
+persisted evidence. Use `cara repair status` to inspect it. Typed conflicts and
+semantic grants remain narrow deterministic scopes. After a typed semantic/CI
+decision, `repair authorize-agent-edits --actor A --reason R` may authorize one
+exact identity for bounded repository-content edits; continue requires the same
+actor and records complete path/staged-index/diff fingerprints. Secret-like,
+symlink/gitlink, unstaged/untracked, out-of-scope, and drifted edits fail closed.
+`repair revoke-grant` restores recorded pre-grant blobs. Stage reviewed changes
+and run `cara repair continue --session ID [--actor A]`: it verifies the session,
+uses non-force publication, requires fresh CI, and resumes sync-all. Use `repair abort` only to
 remove a reviewed local session. Never create nested raw worktrees, call
 `update-ref`, merge behind Cara, or force-push a repair branch.
 
@@ -701,6 +705,13 @@ pub fn build_router() -> ToolRouter<AppContext> {
         "repair_start",
         "Create or reuse a Cara-owned isolated exact-head workspace for one typed sync repair. Starts a non-committing exact-target merge without changing the caller checkout, provider branch, labels, or bases.",
         |context: &AppContext, input: repair::RepairStartInput| repair::start(context, &input),
+    );
+    router.add_typed_tool_with_output_schema(
+        "repair_authorize_agent_edits",
+        "Authorize one exact agent identity to make bounded arbitrary repository-content edits in an exact resolving session. Binds repository/PR/head/target/config/session/actor/reason/expiry, never mutates provider state, and requires complete staged diff receipts at continue.",
+        |context: &AppContext, input: repair::RepairAuthorizeAgentEditsInput| {
+            repair::authorize_agent_edits(context, &input)
+        },
     );
     router.add_typed_tool_with_output_schema(
         "repair_grant",

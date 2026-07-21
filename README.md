@@ -92,6 +92,7 @@ cara renew | cara rejoin
 cara show | cara next | cara prev
 cara sync [--all] [--rerun-failed] | cara loop [--once]
 cara repair start --pr N [--target-pr T]
+cara repair authorize-agent-edits --session ID --actor A --reason R
 cara repair grant --session ID --path P --source-revision SHA --actor A --reason R
 cara repair revoke-grant --session ID --path P --actor A --reason R
 cara repair status --session ID | cara repair continue --session ID
@@ -179,12 +180,25 @@ exact Cara-owned session instead:
 cara repair start --pr 1962                 # merge current default
 cara repair start --pr 1959 --target-pr 1962 # merge exact predecessor
 cara repair status --session pr-1962-<generation>
-# Optional semantic restoration from one reviewed source commit; repeated --path
+# For a typed semantic/CI decision, authorize one exact agent identity
+cara repair authorize-agent-edits --session pr-1962-<generation> \
+  --actor caco-merger --reason <reviewed-decision>
+# Optional narrower deterministic restoration from one reviewed source commit
 cara repair grant --session pr-1962-<generation> --path README.md \
   --source-revision <full-sha> --actor <actor> --reason <reviewed-contract>
-# Resolve/stage typed conflicts only; grant applies its reviewed patch itself
-cara repair continue --session pr-1962-<generation>
+# Resolve/stage reviewed edits; broad edits must use the authorized actor
+cara repair continue --session pr-1962-<generation> --actor caco-merger
 ```
+
+A session-level agent-edit authorization is bound to exact repository, PR,
+provider head, target, config, session manifest, actor, reason, and expiry. It
+lets that agent add, modify, rename, or delete ordinary repository files in the
+isolated workspace after a typed semantic/CI decision. Continue still rejects
+unstaged/untracked files, unresolved conflicts, Git internals, symlinks/gitlinks,
+secret-like paths, identity drift, excess path/diff bounds, and actor mismatch.
+Before commit it records the complete bounded path list plus path, staged-index,
+and binary-diff fingerprints; publication is non-force and explicitly requires
+fresh CI.
 
 A semantic grant is distinct from a mechanical conflict: it is bounded, expiring,
 and bound to session/repository/head/target, actor/reason, exact one-parent source

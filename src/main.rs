@@ -12,8 +12,8 @@ use caravan::{
     LockRecoverInput, LockStatusInput, LoopInput, PauseInput, ResumeInput, SplitInput, SyncInput,
     TOOL_NAME, build_router, feedback_config, feedback_configuration_error, feedback_panic_config,
     repair::{
-        RepairAbortInput, RepairContinueInput, RepairGrantInput, RepairRevokeGrantInput,
-        RepairStartInput, RepairStatusInput,
+        RepairAbortInput, RepairAuthorizeAgentEditsInput, RepairContinueInput, RepairGrantInput,
+        RepairRevokeGrantInput, RepairStartInput, RepairStatusInput,
     },
     updater_config,
 };
@@ -137,6 +137,8 @@ enum LockCommand {
 enum RepairCommand {
     /// Create or reuse an isolated exact-head repair workspace.
     Start(RepairStartInput),
+    /// Authorize one exact agent to edit bounded repository content.
+    AuthorizeAgentEdits(RepairAuthorizeAgentEditsInput),
     /// Apply reviewed source changes to explicit semantic paths.
     Grant(RepairGrantInput),
     /// Revoke semantic grants and restore their pre-grant staged blobs.
@@ -843,6 +845,26 @@ fn run_repair(cli: &Cli, command: &RepairCommand) -> Result<(), i32> {
                 Err(error) => emit_human_error(error),
             }
         }
+        RepairCommand::AuthorizeAgentEdits(input) => {
+            let result = caravan::repair::authorize_agent_edits(&context, input);
+            if cli.json {
+                return emit_result(true, result);
+            }
+            match result {
+                Ok(output) => {
+                    println!(
+                        "repair {} authorized agent edits: actor={} expires={} provider_mutated={}",
+                        output.repair.session,
+                        output.authorization.actor,
+                        output.authorization.expires_unix_ms,
+                        output.provider_mutated
+                    );
+                    println!("  {}", output.next);
+                    Ok(())
+                }
+                Err(error) => emit_human_error(error),
+            }
+        }
         RepairCommand::Grant(input) => {
             let result = caravan::repair::grant_paths(&context, input);
             if cli.json {
@@ -943,6 +965,24 @@ fn run_repair(cli: &Cli, command: &RepairCommand) -> Result<(), i32> {
                                 ))
                                 .collect::<Vec<_>>()
                                 .join(", ")
+                        );
+                    }
+                    if let Some(authorization) = &repair.agent_edit_authorization {
+                        println!(
+                            "  agent edits: actor={} expires={} reason={}",
+                            authorization.actor,
+                            authorization.expires_unix_ms,
+                            authorization.reason
+                        );
+                    }
+                    if let Some(receipt) = &repair.agent_edit_receipt {
+                        println!(
+                            "  verified agent diff: paths={} path_fp={} diff_fp={} bytes={} fresh_ci_required={}",
+                            receipt.path_count,
+                            receipt.path_fingerprint,
+                            receipt.diff_fingerprint,
+                            receipt.diff_bytes,
+                            receipt.fresh_ci_required
                         );
                     }
                     if let Some(error) = &repair.last_error {
@@ -1929,6 +1969,24 @@ mod tests {
         assert_eq!(input.pr, 1962);
         assert_eq!(input.target_pr, Some(1972));
 
+        let authorization = Cli::try_parse_from([
+            "cara",
+            "repair",
+            "authorize-agent-edits",
+            "--session",
+            "pr-1962-deadbeef",
+            "--actor",
+            "caco-merger",
+            "--reason",
+            "repair CI",
+        ])
+        .expect("repair agent authorization parses");
+        let Command::Repair(RepairCommand::AuthorizeAgentEdits(input)) = authorization.command
+        else {
+            panic!("expected repair agent authorization");
+        };
+        assert_eq!(input.actor, "caco-merger");
+
         let grant = Cli::try_parse_from([
             "cara",
             "repair",
@@ -1959,12 +2017,15 @@ mod tests {
             "continue",
             "--session",
             "pr-1962-deadbeef",
+            "--actor",
+            "caco-merger",
         ])
         .expect("repair continue parses");
         let Command::Repair(RepairCommand::Continue(input)) = continuation.command else {
             panic!("expected repair continue");
         };
         assert_eq!(input.session, "pr-1962-deadbeef");
+        assert_eq!(input.actor.as_deref(), Some("caco-merger"));
         assert!(!input.no_sync);
     }
 
