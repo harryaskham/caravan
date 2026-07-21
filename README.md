@@ -177,6 +177,9 @@ separate deployment:
 cara web --repo /path/to/repository
 cara web --repo ~/src/a --repo ~/src/b --poll-seconds 30 --read-only
 cara web --repo . --listen 127.0.0.1:4774 --open
+CARA_GITHUB_WEBHOOK_SECRET=... cara web --repo . \
+  --github-webhook-secret-env CARA_GITHUB_WEBHOOK_SECRET \
+  --github-installation-id 12345 --webhook-sync
 ```
 
 Repository inputs are explicit filesystem paths rather than slugs because every
@@ -200,6 +203,23 @@ the same repository are refused. `--read-only` leaves read-only preflight availa
 mutating control. Interactive actions use same-origin CSRF, exact snapshot
 sequences, and existing typed Cara operations and receipts; they never execute
 arbitrary shell input.
+
+An optional `POST /api/v1/webhooks/github` endpoint accepts GitHub App webhooks
+only when an HMAC secret environment variable and exact installation ID are
+configured. It verifies `X-Hub-Signature-256`, installation, explicit repository,
+and bounded delivery/event IDs; delivery IDs are durably deduplicated under
+common Git state. Default-branch pushes, PR lifecycle changes, and check/workflow
+updates coalesce into a fresh status refresh or one bounded `sync --all` action
+with `--webhook-sync`. Payloads are wake hints only: Cara always rediscovers
+provider truth under its normal lock/budgets. Polling remains a low-frequency
+reconciliation fallback; webhook counters are secret-free dashboard state. Use a
+TLS reverse proxy/tunnel to the loopback listener and never store the webhook
+secret in `.caravan/config.yaml`. Configure the GitHub App for JSON delivery and
+subscribe to **Push**, **Pull request**, **Pull request review**, **Check run**,
+**Check suite**, **Status**, and **Workflow run** events; read-only Metadata,
+Contents, Pull requests, Checks, Commit statuses, and Actions permissions are
+sufficient for delivery. The ordinary Cara/GitHub credential—not the webhook
+payload—still authorizes any `--webhook-sync` provider mutation.
 
 ## Managed sync repair
 

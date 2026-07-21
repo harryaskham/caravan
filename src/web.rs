@@ -6,19 +6,22 @@
 //! status implementation used by CLI/JSON/MCP.
 
 use std::collections::{BTreeSet, VecDeque};
-use std::io::Read;
+use std::fs;
+use std::io::{Read, Write as IoWrite};
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::Args;
+use hmac::{Hmac, Mac};
 use mcp_cli::{ErrorCategory, StructuredError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::Sha256;
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 use crate::config::{CaravanConfig, DEFAULT_CONFIG_PATH};
@@ -35,15 +38,20 @@ use crate::{
 const INDEX_HTML: &str = include_str!("web_assets/index.html");
 const APP_CSS: &str = include_str!("web_assets/app.css");
 const APP_JS: &str = include_str!("web_assets/app.js");
-const WEB_SCHEMA_VERSION: u32 = 3;
+const WEB_SCHEMA_VERSION: u32 = 4;
 const MIN_POLL_SECONDS: u64 = 2;
 const MAX_POLL_SECONDS: u64 = 3_600;
+const DEFAULT_POLL_SECONDS: u64 = 15;
+const WEBHOOK_FALLBACK_POLL_SECONDS: u64 = 300;
 const SERVER_TICK: Duration = Duration::from_millis(250);
 const MAX_REQUEST_BODY_BYTES: u64 = 1024 * 1024;
 const MAX_CONCURRENT_REQUESTS: usize = 32;
 const MAX_ACTION_HISTORY: usize = 20;
 const JOURNAL_SNAPSHOT_LIMIT: usize = 50;
 const MAX_WEB_JOURNAL_BYTES: usize = 512 * 1024;
+const MAX_WEBHOOK_DELIVERIES: usize = 1_000;
+const MAX_WEBHOOK_STATE_BYTES: u64 = 256 * 1024;
+type WebhookHmac = Hmac<Sha256>;
 
 /// Start a local dashboard over one or more explicit repository paths.
 #[derive(Debug, Clone, Args)]
@@ -57,7 +65,7 @@ pub struct WebInput {
     pub listen: SocketAddr,
 
     /// Seconds between bounded status refresh passes.
-    #[arg(long, default_value_t = 15, value_name = "SECONDS")]
+    #[arg(long, default_value_t = DEFAULT_POLL_SECONDS, value_name = "SECONDS")]
     pub poll_seconds: u64,
 
     /// Disable every mutation endpoint while retaining refresh/status views.
@@ -67,6 +75,18 @@ pub struct WebInput {
     /// Open the dashboard in the platform browser after binding.
     #[arg(long)]
     pub open: bool,
+
+    /// Environment variable containing the GitHub webhook HMAC secret.
+    #[arg(long, value_name = "ENV")]
+    pub github_webhook_secret_env: Option<String>,
+
+    /// Exact GitHub App installation ID accepted by the webhook endpoint.
+    #[arg(long, requires = "github_webhook_secret_env")]
+    pub github_installation_id: Option<u64>,
+
+    /// Run one bounded sync-all tick for accepted webhook wakes; otherwise refresh only.
+    #[arg(long, requires = "github_webhook_secret_env")]
+    pub webhook_sync: bool,
 }
 
 /// Secret-free error projection retained beside the most recent snapshot.
@@ -163,6 +183,22 @@ pub struct WebActionJob {
     pub refresh_sequence: Option<u64>,
 }
 
+/// Secret-free webhook receiver health and bounded counters.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct WebhookStatus {
+    pub enabled: bool,
+    pub sync_enabled: bool,
+    pub accepted: u64,
+    pub deduplicated: u64,
+    pub rejected: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_event: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_delivery: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_received_unix_ms: Option<u64>,
+}
+
 /// Stable dashboard state returned to the embedded application.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WebState {
@@ -172,6 +208,7 @@ pub struct WebState {
     pub listen: String,
     pub poll_seconds: u64,
     pub read_only: bool,
+    pub webhook: WebhookStatus,
     /// Same-origin token required as `X-Cara-CSRF` on POST requests.
     pub csrf_token: String,
     pub repositories: Vec<WebRepositorySnapshot>,
@@ -246,6 +283,9 @@ struct RepositoryEntry {
     refresh_lock: Mutex<()>,
     action_lock: Mutex<()>,
     actions: Mutex<VecDeque<WebActionJob>>,
+    webhook_deliveries: Mutex<VecDeque<String>>,
+    webhook_delivery_path: PathBuf,
+    webhook_sync_pending: AtomicBool,
 }
 
 struct Dashboard {
@@ -255,6 +295,10 @@ struct Dashboard {
     csrf_token: String,
     started_unix_ms: u64,
     repositories: Vec<Arc<RepositoryEntry>>,
+    webhook_secret: Option<Vec<u8>>,
+    webhook_installation_id: Option<u64>,
+    webhook_sync: bool,
+    webhook_status: Mutex<WebhookStatus>,
     stopping: AtomicBool,
     active_requests: AtomicUsize,
 }
@@ -276,6 +320,11 @@ impl Dashboard {
             listen: self.listen.to_string(),
             poll_seconds: self.poll_seconds,
             read_only: self.read_only,
+            webhook: self
+                .webhook_status
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
             csrf_token: self.csrf_token.clone(),
             repositories: self
                 .repositories
@@ -312,13 +361,28 @@ impl Dashboard {
 /// Serve until SIGINT/SIGTERM sets the foreground stop flag.
 pub fn serve(input: &WebInput) -> Result<(), AppError> {
     validate_input(input)?;
+    let webhook_secret = load_webhook_secret(input)?;
+    let webhook_enabled = webhook_secret.is_some();
+    let poll_seconds = if webhook_enabled && input.poll_seconds == DEFAULT_POLL_SECONDS {
+        WEBHOOK_FALLBACK_POLL_SECONDS
+    } else {
+        input.poll_seconds
+    };
     let dashboard = Arc::new(Dashboard {
         listen: input.listen,
-        poll_seconds: input.poll_seconds,
+        poll_seconds,
         read_only: input.read_only,
         csrf_token: uuid::Uuid::now_v7().to_string(),
         started_unix_ms: unix_ms(),
         repositories: load_repositories(&input.repositories)?,
+        webhook_secret,
+        webhook_installation_id: input.github_installation_id,
+        webhook_sync: input.webhook_sync,
+        webhook_status: Mutex::new(WebhookStatus {
+            enabled: webhook_enabled,
+            sync_enabled: input.webhook_sync,
+            ..WebhookStatus::default()
+        }),
         stopping: AtomicBool::new(false),
         active_requests: AtomicUsize::new(0),
     });
@@ -398,6 +462,32 @@ pub fn serve(input: &WebInput) -> Result<(), AppError> {
     Ok(())
 }
 
+fn load_webhook_secret(input: &WebInput) -> Result<Option<Vec<u8>>, AppError> {
+    input
+        .github_webhook_secret_env
+        .as_ref()
+        .map(|name| {
+            std::env::var(name)
+                .map_err(|_| {
+                    AppError::validation(
+                        "webhook_secret_unavailable",
+                        format!("webhook secret environment variable `{name}` is unset"),
+                    )
+                })
+                .and_then(|secret| {
+                    if secret.len() < 16 {
+                        Err(AppError::validation(
+                            "webhook_secret_invalid",
+                            "webhook secret must contain at least 16 bytes",
+                        ))
+                    } else {
+                        Ok(secret.into_bytes())
+                    }
+                })
+        })
+        .transpose()
+}
+
 fn validate_input(input: &WebInput) -> Result<(), AppError> {
     if !is_loopback(input.listen.ip()) {
         return Err(AppError::structured(
@@ -414,6 +504,28 @@ fn validate_input(input: &WebInput) -> Result<(), AppError> {
         return Err(AppError::validation(
             "web_poll_interval_invalid",
             format!("--poll-seconds must be between {MIN_POLL_SECONDS} and {MAX_POLL_SECONDS}"),
+        ));
+    }
+    if input.webhook_sync && input.read_only {
+        return Err(AppError::validation(
+            "webhook_sync_read_only_conflict",
+            "--webhook-sync cannot be enabled with --read-only",
+        ));
+    }
+    if input.github_webhook_secret_env.is_some() && input.github_installation_id.is_none() {
+        return Err(AppError::validation(
+            "webhook_installation_required",
+            "webhook receiver requires --github-installation-id",
+        ));
+    }
+    if input
+        .github_webhook_secret_env
+        .as_deref()
+        .is_some_and(|name| name.trim().is_empty())
+    {
+        return Err(AppError::validation(
+            "webhook_secret_env_invalid",
+            "webhook secret environment variable name must be non-empty",
         ));
     }
     if input.repositories.is_empty() {
@@ -487,6 +599,8 @@ fn load_repositories(paths: &[PathBuf]) -> Result<Vec<Arc<RepositoryEntry>>, App
             };
             let effective_config = redacted_config(&context.config)?;
             let id = format!("repo-{}", index + 1);
+            let webhook_delivery_path = webhook_delivery_path(&canonical)?;
+            let webhook_deliveries = load_webhook_deliveries(&webhook_delivery_path);
             Ok(Arc::new(RepositoryEntry {
                 id: id.clone(),
                 context,
@@ -508,9 +622,117 @@ fn load_repositories(paths: &[PathBuf]) -> Result<Vec<Arc<RepositoryEntry>>, App
                 refresh_lock: Mutex::new(()),
                 action_lock: Mutex::new(()),
                 actions: Mutex::new(VecDeque::new()),
+                webhook_deliveries: Mutex::new(webhook_deliveries),
+                webhook_delivery_path,
+                webhook_sync_pending: AtomicBool::new(false),
             }))
         })
         .collect()
+}
+
+fn webhook_delivery_path(repository: &Path) -> Result<PathBuf, AppError> {
+    let dot_git = repository.join(".git");
+    let common = if dot_git.is_dir() {
+        dot_git
+    } else {
+        let output = std::process::Command::new("git")
+            .args(["rev-parse", "--git-common-dir"])
+            .current_dir(repository)
+            .output()
+            .map_err(|error| {
+                AppError::validation("webhook_state_unavailable", error.to_string())
+            })?;
+        if !output.status.success() {
+            return Err(AppError::validation(
+                "webhook_state_unavailable",
+                String::from_utf8_lossy(&output.stderr).trim(),
+            ));
+        }
+        let common = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if PathBuf::from(&common).is_absolute() {
+            PathBuf::from(common)
+        } else {
+            repository.join(common)
+        }
+    };
+    let directory = common.join("caravan/webhooks");
+    fs::create_dir_all(&directory)
+        .map_err(|error| AppError::validation("webhook_state_unavailable", error.to_string()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).map_err(|error| {
+            AppError::validation("webhook_state_unavailable", error.to_string())
+        })?;
+    }
+    Ok(directory.join("deliveries.log"))
+}
+
+fn load_webhook_deliveries(path: &Path) -> VecDeque<String> {
+    let Ok(file) = fs::File::open(path) else {
+        return VecDeque::new();
+    };
+    let mut content = String::new();
+    if file
+        .take(MAX_WEBHOOK_STATE_BYTES)
+        .read_to_string(&mut content)
+        .is_err()
+    {
+        return VecDeque::new();
+    }
+    content
+        .lines()
+        .filter(|line| !line.is_empty() && line.len() <= 128)
+        .rev()
+        .take(MAX_WEBHOOK_DELIVERIES)
+        .map(str::to_owned)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
+fn record_webhook_delivery(repository: &RepositoryEntry, delivery: &str) -> Result<bool, AppError> {
+    persist_webhook_delivery(
+        &repository.webhook_delivery_path,
+        &repository.webhook_deliveries,
+        delivery,
+    )
+}
+
+fn persist_webhook_delivery(
+    path: &Path,
+    delivery_log: &Mutex<VecDeque<String>>,
+    delivery: &str,
+) -> Result<bool, AppError> {
+    let mut deliveries = delivery_log
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if deliveries.iter().any(|existing| existing == delivery) {
+        return Ok(true);
+    }
+    deliveries.push_back(delivery.to_owned());
+    let rewrite = deliveries.len() > MAX_WEBHOOK_DELIVERIES;
+    if rewrite {
+        deliveries.pop_front();
+    }
+    let write = if rewrite {
+        let body = deliveries.iter().cloned().collect::<Vec<_>>().join("\n") + "\n";
+        fs::write(path, body)
+    } else {
+        let mut options = fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options
+            .open(path)
+            .and_then(|mut file| writeln!(file, "{delivery}"))
+    };
+    write.map_err(|error| AppError::validation("webhook_state_write_failed", error.to_string()))?;
+    Ok(false)
 }
 
 fn action_jobs_with_checkpoint(repository: &RepositoryEntry) -> Vec<WebActionJob> {
@@ -699,6 +921,7 @@ fn handle_request(mut request: Request, dashboard: &Dashboard) {
                 "started_unix_ms": dashboard.started_unix_ms,
             }),
         ),
+        (Method::Post, "/api/v1/webhooks/github") => handle_github_webhook(&mut request, dashboard),
         (Method::Post, path) if path.ends_with("/refresh") => {
             handle_refresh(&request, dashboard, path)
         }
@@ -712,6 +935,276 @@ fn handle_request(mut request: Request, dashboard: &Dashboard) {
         ),
     };
     let _ = request.respond(response);
+}
+
+#[allow(clippy::too_many_lines)]
+fn handle_github_webhook(
+    request: &mut Request,
+    dashboard: &Dashboard,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    let Some(secret) = dashboard.webhook_secret.as_deref() else {
+        return error_response(
+            StatusCode(404),
+            "webhook_disabled",
+            "GitHub webhook receiver is not enabled",
+        );
+    };
+    let signature = request_header(request, "X-Hub-Signature-256").unwrap_or_default();
+    let delivery = request_header(request, "X-GitHub-Delivery").unwrap_or_default();
+    let event = request_header(request, "X-GitHub-Event").unwrap_or_default();
+    let valid_delivery = !delivery.is_empty()
+        && delivery.len() <= 128
+        && delivery
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-');
+    if !valid_delivery || event.is_empty() || event.len() > 64 {
+        record_webhook_rejection(dashboard);
+        return error_response(
+            StatusCode(400),
+            "webhook_headers_invalid",
+            "GitHub webhook delivery/event headers are missing or invalid",
+        );
+    }
+    let mut body = Vec::new();
+    let read = request
+        .as_reader()
+        .take(MAX_REQUEST_BODY_BYTES.saturating_add(1))
+        .read_to_end(&mut body);
+    if let Err(error) = read {
+        record_webhook_rejection(dashboard);
+        return error_response(
+            StatusCode(400),
+            "webhook_body_read_failed",
+            &error.to_string(),
+        );
+    }
+    if u64::try_from(body.len()).unwrap_or(u64::MAX) > MAX_REQUEST_BODY_BYTES {
+        record_webhook_rejection(dashboard);
+        return error_response(
+            StatusCode(413),
+            "webhook_body_too_large",
+            "webhook payload exceeds the one MiB body limit",
+        );
+    }
+    if !valid_webhook_signature(secret, &body, &signature) {
+        record_webhook_rejection(dashboard);
+        return error_response(
+            StatusCode(401),
+            "webhook_signature_invalid",
+            "GitHub webhook HMAC verification failed",
+        );
+    }
+    let payload = match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            record_webhook_rejection(dashboard);
+            return error_response(StatusCode(400), "webhook_json_invalid", &error.to_string());
+        }
+    };
+    let installation = payload
+        .get("installation")
+        .and_then(|value| value.get("id"))
+        .and_then(serde_json::Value::as_u64);
+    if installation != dashboard.webhook_installation_id {
+        record_webhook_rejection(dashboard);
+        return error_response(
+            StatusCode(403),
+            "webhook_installation_mismatch",
+            "webhook installation does not match the configured GitHub App installation",
+        );
+    }
+    let repository_slug = payload
+        .get("repository")
+        .and_then(|value| value.get("full_name"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let Some(repository) = dashboard.repositories.iter().find(|repository| {
+        repository
+            .snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .status
+            .as_ref()
+            .is_some_and(|status| status.repository.slug() == repository_slug)
+    }) else {
+        record_webhook_rejection(dashboard);
+        return error_response(
+            StatusCode(404),
+            "webhook_repository_unknown",
+            "webhook repository is not one of the explicit dashboard repositories",
+        );
+    };
+    let duplicate = match record_webhook_delivery(repository, &delivery) {
+        Ok(duplicate) => duplicate,
+        Err(error) => {
+            return error_response(StatusCode(500), error.code().as_str(), &error.message());
+        }
+    };
+    if duplicate {
+        let mut status = dashboard
+            .webhook_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        status.deduplicated = status.deduplicated.saturating_add(1);
+        return json_response(
+            StatusCode(200),
+            &json!({"ok": true, "accepted": false, "deduplicated": true, "delivery": delivery}),
+        );
+    }
+    let default_branch = repository
+        .snapshot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .status
+        .as_ref()
+        .map(|status| status.default_branch.clone())
+        .unwrap_or_default();
+    let wake = webhook_event_is_wake(&event, &payload, &default_branch);
+    let mut coalesced = false;
+    if wake {
+        if dashboard.webhook_sync {
+            coalesced = !enqueue_webhook_sync(repository);
+        } else {
+            crate::read::invalidate_status_cache(&repository.context);
+            refresh_repository(repository);
+        }
+    }
+    {
+        let mut status = dashboard
+            .webhook_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        status.accepted = status.accepted.saturating_add(1);
+        status.last_event = Some(event.clone());
+        status.last_delivery = Some(delivery.clone());
+        status.last_received_unix_ms = Some(unix_ms());
+    }
+    json_response(
+        StatusCode(202),
+        &json!({
+            "ok": true,
+            "accepted": true,
+            "wake": wake,
+            "sync": dashboard.webhook_sync && wake,
+            "coalesced": coalesced,
+            "event": event,
+            "delivery": delivery,
+            "repository": repository_slug,
+        }),
+    )
+}
+
+fn request_header(request: &Request, name: &'static str) -> Option<String> {
+    request
+        .headers()
+        .iter()
+        .find(|header| header.field.equiv(name))
+        .map(|header| header.value.as_str().to_owned())
+}
+
+fn valid_webhook_signature(secret: &[u8], body: &[u8], signature: &str) -> bool {
+    let Some(hex) = signature.strip_prefix("sha256=") else {
+        return false;
+    };
+    if hex.len() != 64 {
+        return false;
+    }
+    let mut bytes = [0_u8; 32];
+    for (index, pair) in hex.as_bytes().chunks_exact(2).enumerate() {
+        let Some(high) = (pair[0] as char).to_digit(16) else {
+            return false;
+        };
+        let Some(low) = (pair[1] as char).to_digit(16) else {
+            return false;
+        };
+        bytes[index] = u8::try_from((high << 4) | low).unwrap_or_default();
+    }
+    WebhookHmac::new_from_slice(secret).is_ok_and(|mut mac| {
+        mac.update(body);
+        mac.verify_slice(&bytes).is_ok()
+    })
+}
+
+fn webhook_event_is_wake(event: &str, payload: &serde_json::Value, default_branch: &str) -> bool {
+    match event {
+        "push" => payload
+            .get("ref")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|reference| reference == format!("refs/heads/{default_branch}")),
+        "pull_request" => payload
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|action| {
+                matches!(
+                    action,
+                    "opened"
+                        | "synchronize"
+                        | "edited"
+                        | "labeled"
+                        | "unlabeled"
+                        | "closed"
+                        | "reopened"
+                        | "ready_for_review"
+                        | "converted_to_draft"
+                )
+            }),
+        "pull_request_review" => payload
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|action| matches!(action, "submitted" | "edited" | "dismissed")),
+        "check_run" | "check_suite" | "workflow_run" | "status" => true,
+        _ => false,
+    }
+}
+
+fn record_webhook_rejection(dashboard: &Dashboard) {
+    let mut status = dashboard
+        .webhook_status
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    status.rejected = status.rejected.saturating_add(1);
+}
+
+fn enqueue_webhook_sync(repository: &Arc<RepositoryEntry>) -> bool {
+    let expected_refresh_sequence = repository
+        .snapshot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .refresh_sequence;
+    let id = uuid::Uuid::now_v7().to_string();
+    let job = WebActionJob {
+        id: id.clone(),
+        action: "sync".to_owned(),
+        expected_refresh_sequence,
+        state: WebActionJobState::Queued,
+        started_unix_ms: unix_ms(),
+        updated_unix_ms: unix_ms(),
+        phase: "webhook_queued".to_owned(),
+        checkpoint: None,
+        error: None,
+        refresh_sequence: None,
+    };
+    if enqueue_action_job(repository, job).is_err() {
+        repository
+            .webhook_sync_pending
+            .store(true, Ordering::SeqCst);
+        return false;
+    }
+    let repository = Arc::clone(repository);
+    thread::spawn(move || {
+        execute_action_job(
+            &repository,
+            &id,
+            WebActionRequest {
+                expected_refresh_sequence,
+                action: WebAction::Sync(SyncInput {
+                    all: true,
+                    rerun_failed: false,
+                }),
+            },
+        );
+    });
+    true
 }
 
 fn handle_refresh(
@@ -860,7 +1353,7 @@ fn handle_action(
     )
 }
 
-fn execute_action_job(repository: &RepositoryEntry, id: &str, request: WebActionRequest) {
+fn execute_action_job(repository: &Arc<RepositoryEntry>, id: &str, request: WebActionRequest) {
     update_action_job(repository, id, |job| {
         job.state = WebActionJobState::Running;
         "waiting_for_repository_lock".clone_into(&mut job.phase);
@@ -951,6 +1444,12 @@ fn execute_action_job(repository: &RepositoryEntry, id: &str, request: WebAction
             }
         }
     });
+    if repository
+        .webhook_sync_pending
+        .swap(false, Ordering::SeqCst)
+    {
+        let _ = enqueue_webhook_sync(repository);
+    }
 }
 
 fn run_action(context: &AppContext, action: WebAction) -> Result<serde_json::Value, AppError> {
@@ -1103,6 +1602,9 @@ mod tests {
             poll_seconds: 15,
             read_only: true,
             open: false,
+            github_webhook_secret_env: None,
+            github_installation_id: None,
+            webhook_sync: false,
         };
         assert_eq!(
             validate_input(&input).unwrap_err().code(),
@@ -1114,6 +1616,85 @@ mod tests {
             validate_input(&input).unwrap_err().code(),
             "web_poll_interval_invalid"
         );
+    }
+
+    #[test]
+    fn webhook_configuration_requires_installation_and_mutation_mode() {
+        let mut input = WebInput {
+            repositories: vec![PathBuf::from(".")],
+            listen: "127.0.0.1:4774".parse().unwrap(),
+            poll_seconds: 15,
+            read_only: false,
+            open: false,
+            github_webhook_secret_env: Some("CARA_TEST_SECRET".to_owned()),
+            github_installation_id: None,
+            webhook_sync: false,
+        };
+        assert_eq!(
+            validate_input(&input).unwrap_err().code(),
+            "webhook_installation_required"
+        );
+        input.github_installation_id = Some(42);
+        input.read_only = true;
+        input.webhook_sync = true;
+        assert_eq!(
+            validate_input(&input).unwrap_err().code(),
+            "webhook_sync_read_only_conflict"
+        );
+    }
+
+    #[test]
+    fn webhook_hmac_and_event_selection_are_exact() {
+        let secret = b"reviewed-webhook-secret";
+        let body = br#"{"repository":{"full_name":"owner/repo"}}"#;
+        let mut mac = WebhookHmac::new_from_slice(secret).unwrap();
+        mac.update(body);
+        let signature_hex =
+            mac.finalize()
+                .into_bytes()
+                .iter()
+                .fold(String::new(), |mut output, byte| {
+                    use std::fmt::Write as _;
+                    write!(output, "{byte:02x}").unwrap();
+                    output
+                });
+        let signature = format!("sha256={signature_hex}");
+        assert!(valid_webhook_signature(secret, body, &signature));
+        assert!(!valid_webhook_signature(secret, b"changed", &signature));
+        assert!(webhook_event_is_wake(
+            "push",
+            &json!({"ref": "refs/heads/main"}),
+            "main"
+        ));
+        assert!(!webhook_event_is_wake(
+            "push",
+            &json!({"ref": "refs/heads/topic"}),
+            "main"
+        ));
+        assert!(webhook_event_is_wake(
+            "pull_request",
+            &json!({"action": "synchronize"}),
+            "main"
+        ));
+        assert!(!webhook_event_is_wake("ping", &json!({}), "main"));
+    }
+
+    #[test]
+    fn webhook_delivery_ids_are_durable_private_and_deduplicated() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("deliveries.log");
+        let deliveries = Mutex::new(VecDeque::new());
+        assert!(!persist_webhook_delivery(&path, &deliveries, "delivery-1").unwrap());
+        assert!(persist_webhook_delivery(&path, &deliveries, "delivery-1").unwrap());
+        assert_eq!(load_webhook_deliveries(&path), ["delivery-1".to_owned()]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 
     #[test]
@@ -1180,6 +1761,18 @@ mod tests {
             .expect_err("one repository action at a time");
         assert_eq!(conflict.id, "job-100");
         assert!(!conflict.state.terminal());
+    }
+
+    #[test]
+    fn webhook_bursts_coalesce_behind_an_active_action() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join(".git")).unwrap();
+        let repositories = load_repositories(&[directory.path().to_path_buf()]).unwrap();
+        let repository = &repositories[0];
+        enqueue_action_job(repository, test_job(1, WebActionJobState::Running)).unwrap();
+        assert!(!enqueue_webhook_sync(repository));
+        assert!(repository.webhook_sync_pending.load(Ordering::SeqCst));
+        assert_eq!(action_jobs_with_checkpoint(repository).len(), 1);
     }
 
     #[test]

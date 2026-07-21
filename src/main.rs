@@ -2334,6 +2334,24 @@ mod tests {
         assert_eq!(input.poll_seconds, 30);
         assert!(input.read_only);
         assert!(Cli::try_parse_from(["cara", "web"]).is_err());
+
+        let cli = Cli::try_parse_from([
+            "cara",
+            "web",
+            "--repo",
+            "/tmp/one",
+            "--github-webhook-secret-env",
+            "CARA_GITHUB_WEBHOOK_SECRET",
+            "--github-installation-id",
+            "42",
+            "--webhook-sync",
+        ])
+        .expect("webhook arguments parse");
+        let Command::Web(input) = cli.command else {
+            panic!("expected web command");
+        };
+        assert_eq!(input.github_installation_id, Some(42));
+        assert!(input.webhook_sync);
     }
 
     #[test]

@@ -240,6 +240,18 @@ Resume is operator/agent initiated only. Before enabling squash auto-merge it re
 - `cara mcp tools` — print MCP tool metadata.
 - `cara self-update status|check|run` — `updatable-cli` release flow.
 - feedback MCP tools — `feedback-cli` reporting and status.
+- `cara web --repo PATH...` — loopback path-scoped dashboard, typed actions/plans/progress/journal, and optional authenticated GitHub webhook wake receiver.
+
+The webhook endpoint is disabled unless an operator supplies a secret environment
+variable name and exact GitHub App installation ID. It bounds the body and
+headers, verifies `X-Hub-Signature-256` in constant time, matches one explicit
+repository, and durably deduplicates delivery IDs in common Git state. Accepted
+default push, PR lifecycle, check-suite/check-run, and workflow-run events trigger
+a coalesced status refresh or one configured bounded sync-all action. Webhooks
+are never provider authority: every wake performs fresh discovery and ordinary
+lock/budget/precondition enforcement. Invalid/unknown events mutate nothing;
+periodic polling remains fallback reconciliation. Secrets never enter config,
+status, journal, logs, or receipts.
 
 ## 6. Sync algorithm
 

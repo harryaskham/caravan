@@ -122,10 +122,14 @@
     const waiting = prValues(status).filter((pr) => openPr(pr) && !activeMembers.has(pr.number));
     const updated = repo.refreshed_unix_ms ? new Date(repo.refreshed_unix_ms).toLocaleTimeString() : "Never";
     const mode = status?.rebase_on_join?.state ?? "unknown";
+    const webhook = state?.webhook;
+    const webhookText = webhook?.enabled
+      ? `webhook ${webhook.sync_enabled ? "sync" : "refresh"} · ${webhook.accepted} accepted · ${webhook.deduplicated} deduped · ${webhook.rejected} rejected`
+      : "webhook disabled";
     ui.overview.innerHTML = `
       <article class="overview-card primary">
         <div><p class="eyebrow">${repo.config_existed ? "Configured repository" : "Default policy"}</p><h2 id="repo-title">${escapeHtml(repoName(repo))}</h2></div>
-        <p>Updated ${escapeHtml(updated)} · physical chains ${escapeHtml(mode)}</p>
+        <p>Updated ${escapeHtml(updated)} · physical chains ${escapeHtml(mode)} · ${escapeHtml(webhookText)}</p>
       </article>
       <article class="overview-card"><span class="metric-label">Caravans</span><strong class="metric">${caravans.length}</strong><p>${activeMembers.size} PRs</p></article>
       <article class="overview-card"><span class="metric-label">Waiting</span><strong class="metric">${waiting.length}</strong><p>not enrolled</p></article>

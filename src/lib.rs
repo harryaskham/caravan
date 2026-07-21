@@ -240,6 +240,10 @@ BUILT-IN WEB OPERATIONS
 - Static HTML, CSS, and JavaScript ship inside `cara`; no CDN or separate web
   deployment is required. Future opt-in repository discovery must remain
   explicit and is not performed by the initial path-scoped release.
+- Optional GitHub App webhooks require an HMAC secret environment variable and
+  exact installation ID. Signed explicit-repository deliveries are durably
+  deduped and coalesced into refresh or bounded sync-all wakes; they are never
+  provider truth, and polling remains fallback reconciliation.
 
 RECOVERY, LOCKS, AND OBSERVABILITY
 - GitHub is the resume cursor. After timeout, interruption, or partial provider
