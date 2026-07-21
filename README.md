@@ -131,6 +131,8 @@ branches with one merged historical PR are safe fresh-generation ancestry for
 an explicit create, while ambiguous reuse, unchanged old heads, unpushed heads,
 forks, and provider races still fail closed.
 
+With `rebase_on_join: true`, all successful membership operations expose one exact `join_receipt`. For root `new`/`renew`, predecessor PR `0` denotes the live default branch and its exact branch/OID; root ancestry, physical rebase, durable membership, provider receipts, force absence, configuration fingerprint, and receipt hash are validated just like tail `join`/`rejoin` (bd-d15ba3).
+
 Cara first resolves the current Git worktree root, so every command behaves the
 same from the root or any nested directory. Default `.caravan/config.yaml`,
 locks, journal, repair state, and init writes are rooted there. A relative

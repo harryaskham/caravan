@@ -142,7 +142,8 @@ pub struct MembershipOutput {
     /// Exact provider before/after facts for every completed remote mutation.
     #[serde(default)]
     pub provider_receipts: Vec<GitHubMutationReceipt>,
-    /// Present only for join/rejoin; stable checkout-free integration contract.
+    /// Stable exact-admission receipt for new/renew/join/rejoin. Root admissions
+    /// encode the default branch as predecessor `pr=0` (bd-d15ba3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub join_receipt: Option<JoinReceipt>,
     pub pull_request: PullRequestSnapshot,
@@ -497,13 +498,24 @@ fn execute_locked(
         .is_join()
         .then(|| resolve_join_target(&status, request))
         .transpose()?;
-    let selected_predecessor = initial_join_target
-        .as_ref()
-        .map(|target| JoinPredecessorReceipt {
-            pr: target.tail.number,
-            branch: target.tail.head.name.clone(),
-            head_oid: target.tail.head.oid.clone(),
-        });
+    let selected_predecessor = initial_join_target.as_ref().map_or_else(
+        || {
+            Some(JoinPredecessorReceipt {
+                // A root has no predecessor PR. Zero is the durable sentinel;
+                // branch/OID carry the authoritative default-branch identity.
+                pr: PrNumber(0),
+                branch: status.default_branch.clone(),
+                head_oid: default_branch_oid.clone(),
+            })
+        },
+        |target| {
+            Some(JoinPredecessorReceipt {
+                pr: target.tail.number,
+                branch: target.tail.head.name.clone(),
+                head_oid: target.tail.head.oid.clone(),
+            })
+        },
+    );
     let mut force_invalidation = None;
     let mut creation_state = None;
     let rebase_receipt = if context.config.rebase_on_join {
@@ -760,7 +772,7 @@ fn execute_locked(
     } else {
         EventKind::CaravanCreated
     };
-    if request.operation.is_join() {
+    if request.operation.is_join() || context.config.rebase_on_join {
         let join_receipt = build_join_receipt(
             context,
             &repository,
@@ -773,13 +785,13 @@ fn execute_locked(
             },
             &output,
         )?;
-        if candidate_pr.is_some()
+        if context.config.rebase_on_join
             && (!join_receipt.ancestry_verified || !join_receipt.membership_durable)
         {
             return Err(AppError::structured(
                 ErrorCategory::ExecutionFailure,
-                "atomic_join_receipt_incomplete",
-                "checkout-free join completed without exact ancestry and durable membership proof",
+                "atomic_membership_receipt_incomplete",
+                "membership completed without exact ancestry and durable membership proof",
                 Some(json!({"join_receipt": join_receipt, "resumable": true})),
             ));
         }
@@ -824,7 +836,7 @@ fn build_join_receipt(
         AppError::structured(
             ErrorCategory::ExecutionFailure,
             "join_receipt_predecessor_missing",
-            "successful join did not retain its exact predecessor receipt",
+            "successful membership operation did not retain its exact predecessor receipt",
             Some(json!({"candidate_pr": output.pull_request.number})),
         )
     })?;
@@ -832,7 +844,7 @@ fn build_join_receipt(
         AppError::structured(
             ErrorCategory::ExecutionFailure,
             "join_receipt_source_missing",
-            "successful join did not retain its source head",
+            "successful membership operation did not retain its source head",
             Some(json!({"candidate_pr": output.pull_request.number})),
         )
     })?;

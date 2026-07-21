@@ -574,6 +574,74 @@ fn join_receipt_proves_exact_tail_ancestry_and_stale_force_removal() {
 }
 
 #[test]
+fn root_new_receipt_uses_default_branch_predecessor_bd_d15ba3() {
+    let candidate = pull_request(1, "one", "main", &[]);
+    let before = status(candidate.clone(), Vec::new());
+    let provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
+    let output = execute(
+        before.clone(),
+        &clean,
+        &provider,
+        MembershipRequest {
+            operation: MembershipOperation::New,
+            create_pr: false,
+            tail_pr: None,
+            head_pr: None,
+            reason: None,
+            priority_label: None,
+            agent_priority_labels: Vec::new(),
+        },
+    )
+    .expect("root new succeeds");
+    let default = before.analysis.fleet.default_branch.clone();
+    let rebase = crate::physical_rebase::RebaseReceipt {
+        pr: candidate.number,
+        branch: candidate.head.name.clone(),
+        old_head_oid: candidate.head.oid.clone(),
+        new_head_oid: output.pull_request.head.oid.clone(),
+        old_base_oid: candidate.base.oid.clone(),
+        new_base_branch: default.name.clone(),
+        new_base_oid: default.oid.clone(),
+        new_tree_oid: crate::model::CommitOid("e".repeat(40)),
+        commit_count: 1,
+        merge_topology: None,
+        ci_trigger_workflows: vec![".github/workflows/ci.yml".to_owned()],
+        lease: format!(
+            "--force-with-lease=refs/heads/{}:{}",
+            candidate.head.name, candidate.head.oid
+        ),
+        already_satisfied: true,
+    };
+    let mut context = AppContext::default();
+    context.config.rebase_on_join = true;
+    let receipt = build_join_receipt(
+        &context,
+        &repository(),
+        &before,
+        JoinReceiptEvidence {
+            predecessor: Some(JoinPredecessorReceipt {
+                pr: PrNumber(0),
+                branch: default.name.clone(),
+                head_oid: default.oid.clone(),
+            }),
+            candidate_source_head_oid: Some(candidate.head.oid),
+            default_branch_oid: default.oid.clone(),
+            rebase_receipt: Some(&rebase),
+        },
+        &output,
+    )
+    .unwrap();
+
+    assert_eq!(receipt.predecessor.pr, PrNumber(0));
+    assert_eq!(receipt.predecessor.branch, "main");
+    assert_eq!(receipt.predecessor.head_oid, default.oid);
+    assert_eq!(receipt.result.base_ref, "main");
+    assert!(receipt.ancestry_verified);
+    assert!(receipt.membership_durable);
+    assert!(receipt.receipt_hash.starts_with("fnv1a64:"));
+}
+
+#[test]
 fn new_applies_active_label_and_squash_auto_merge() {
     let candidate = pull_request(1, "one", "main", &[]);
     let provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
