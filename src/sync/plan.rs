@@ -71,7 +71,7 @@ pub fn plan_sync(context: &AppContext, input: &SyncInput) -> Result<SyncPlanOutp
             .collect();
         if !selected.is_empty() {
             preflight_repository(&provider, &status, &progress)?;
-            validate_graph(&status, &selected, &progress)?;
+            validate_graph(&status, &selected, &progress, context.config.force_merge)?;
         }
         (Vec::new(), progress)
     };

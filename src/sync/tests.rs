@@ -1451,6 +1451,147 @@ fn force_merge_requires_config_before_provider_attempt() {
 }
 
 #[test]
+fn force_head_with_auto_merge_off_uses_direct_admin_squash_without_auto_arm() {
+    let mut pulls = healthy_chain();
+    pulls.truncate(1);
+    pulls[0].labels.insert("caravan-force".to_owned());
+    pulls[0].checks = vec![check("build-test", CheckState::Failure, Some(31))];
+    pulls[0].auto_merge = AutoMergeState::disabled();
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    // If force handling ever tries to arm native auto-merge, model an immediate
+    // provider-side merge/race as a hard failure. The audited admin squash must
+    // be the only merge primitive reached.
+    provider.fail_once(MutationKind::EnableAutoMerge);
+    let initial_status = status(pulls, Some(PrNumber(1)), &clean);
+    assert!(
+        initial_status
+            .analysis
+            .fleet
+            .problems
+            .iter()
+            .any(|problem| {
+                problem.kind == GraphProblemKind::AutoMergeInvariant
+                    && problem.prs == vec![PrNumber(1)]
+            })
+    );
+
+    let progress = execute(&initial_status, &provider, false, false, true)
+        .expect("disabled force head reaches direct admin squash");
+
+    assert_eq!(
+        *provider.calls.borrow(),
+        vec![MutationKind::Comment, MutationKind::SquashMerge]
+    );
+    assert_eq!(
+        progress.current[&PrNumber(1)].state,
+        PullRequestState::Merged
+    );
+    assert_eq!(progress.events[0].kind, EventKind::ForceMergeAttempted);
+
+    let final_pulls = provider.pulls.borrow().values().cloned().collect();
+    let final_status = status(final_pulls, None, &clean);
+    assert!(first_blocking_completion_problem(&final_status, &progress, true).is_none());
+    let calls_before_replay = provider.calls.borrow().len();
+    let replay = execute(&final_status, &provider, true, false, true)
+        .expect("post-merge all-sync replay is a no-op");
+    assert!(replay.provider_receipts.is_empty());
+    assert_eq!(provider.calls.borrow().len(), calls_before_replay);
+}
+
+#[test]
+fn unrelated_disabled_force_head_does_not_block_targeted_force_sync() {
+    let mut unrelated = pull_request(
+        1,
+        "one",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    unrelated.labels.insert("caravan-force".to_owned());
+    unrelated.checks = vec![check("build-test", CheckState::Failure, Some(41))];
+    let mut selected = pull_request(
+        2,
+        "two",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    selected.labels.insert("caravan-force".to_owned());
+    selected.checks = vec![check("build-test", CheckState::Failure, Some(42))];
+    let pulls = vec![unrelated, selected];
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    let initial_status = status(pulls, Some(PrNumber(2)), &clean);
+    let selected_caravan = initial_status
+        .analysis
+        .fleet
+        .containing(PrNumber(2))
+        .expect("selected caravan")
+        .clone();
+    let preflight_progress = SyncProgress::new(&initial_status, vec![PrNumber(2)], u32::MAX);
+    validate_rebase_preflight_graph(
+        &initial_status,
+        std::slice::from_ref(&selected_caravan),
+        &preflight_progress,
+        true,
+    )
+    .expect("physical preflight scopes the unrelated force gap");
+
+    let progress = execute(&initial_status, &provider, false, false, true)
+        .expect("unrelated force gap does not block selected force head");
+
+    assert_eq!(progress.ci.len(), 1);
+    assert_eq!(progress.ci[0].pr, PrNumber(2));
+    assert_eq!(
+        provider.pulls.borrow()[&PrNumber(1)].state,
+        PullRequestState::Open
+    );
+    assert_eq!(
+        provider.pulls.borrow()[&PrNumber(2)].state,
+        PullRequestState::Merged
+    );
+    assert_eq!(
+        *provider.calls.borrow(),
+        vec![MutationKind::Comment, MutationKind::SquashMerge]
+    );
+
+    let final_pulls = provider.pulls.borrow().values().cloned().collect();
+    let final_status = status(final_pulls, Some(PrNumber(2)), &clean);
+    assert!(final_status.analysis.fleet.problems.iter().any(|problem| {
+        problem.kind == GraphProblemKind::AutoMergeInvariant && problem.prs == vec![PrNumber(1)]
+    }));
+    assert!(first_blocking_completion_problem(&final_status, &progress, true).is_none());
+}
+
+#[test]
+fn unrelated_auto_merge_gap_without_force_policy_still_fails_closed() {
+    let unrelated = pull_request(
+        1,
+        "one",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    let mut selected = pull_request(
+        2,
+        "two",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    selected.labels.insert("caravan-force".to_owned());
+    selected.checks = vec![check("build-test", CheckState::Failure, Some(43))];
+    let pulls = vec![unrelated, selected];
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    let initial_status = status(pulls, Some(PrNumber(2)), &clean);
+
+    let error = execute(&initial_status, &provider, false, false, true)
+        .expect_err("an unrelated ordinary head invariant stays strict");
+
+    assert_eq!(error.code(), "invalid_graph");
+    assert!(provider.calls.borrow().is_empty());
+}
+
+#[test]
 fn stale_forced_head_stops_before_admin_attempt() {
     let mut pulls = healthy_chain();
     pulls.truncate(1);
@@ -1791,6 +1932,7 @@ fn passing_checks_with_stale_force_label_use_normal_auto_merge() {
 #[test]
 fn successful_force_merge_is_one_shot_and_advances_child() {
     let mut pulls = healthy_chain();
+    pulls[0].auto_merge = AutoMergeState::disabled();
     pulls[0].labels.insert("caravan-force".to_owned());
     pulls[0].checks = vec![check("build-test", CheckState::Failure, Some(50))];
     pulls[1].labels.insert("caravan-force".to_owned());

@@ -916,7 +916,7 @@ fn prepare_physical_chains(
         context.config.sync.max_mutations_per_tick,
     );
     preflight_repository(provider, status, &progress)?;
-    validate_rebase_preflight_graph(status, &selected, &progress)?;
+    validate_rebase_preflight_graph(status, &selected, &progress, context.config.force_merge)?;
     let timeout = Duration::from_secs(context.config.command_timeout_secs);
     let mut chains = Vec::with_capacity(selected.len());
     for caravan in selected {
@@ -1019,6 +1019,7 @@ fn validate_rebase_preflight_graph(
     status: &StatusOutput,
     selected: &[Caravan],
     progress: &SyncProgress,
+    force_merge: bool,
 ) -> Result<(), AppError> {
     for problem in &status.analysis.fleet.problems {
         let auto_merge = problem.kind == GraphProblemKind::AutoMergeInvariant
@@ -1041,7 +1042,13 @@ fn validate_rebase_preflight_graph(
                                 || problem.prs.as_slice() == [pair[1], pair[0]]
                         }))
             });
-        if auto_merge || advancement || rebase {
+        let deferred_force_head = force_head_auto_merge_gap(status, problem, force_merge)
+            .is_some_and(|number| {
+                !selected
+                    .iter()
+                    .any(|caravan| caravan.members.contains(&number))
+            });
+        if auto_merge || advancement || rebase || deferred_force_head {
             continue;
         }
         return Err(decision_error(
@@ -1583,7 +1590,9 @@ fn sync_with_lock(
             })),
         )
     })?;
-    if let Some(problem) = final_status.analysis.fleet.problems.first() {
+    if let Some(problem) =
+        first_blocking_completion_problem(&final_status, &progress, context.config.force_merge)
+    {
         return Err(decision_error(
             &decision_for_problem(problem, &final_status, &progress),
             &progress,
@@ -1642,7 +1651,11 @@ fn sync_with_lock(
                 operation_deadline,
                 Some(&github_budget),
             )?;
-            if let Some(problem) = final_status.analysis.fleet.problems.first() {
+            if let Some(problem) = first_blocking_completion_problem(
+                &final_status,
+                &progress,
+                context.config.force_merge,
+            ) {
                 return Err(decision_error(
                     &decision_for_problem(problem, &final_status, &progress),
                     &progress,
@@ -2446,7 +2459,7 @@ fn execute_bounded(
     }
 
     preflight_repository(provider, status, &progress)?;
-    validate_graph(status, &caravans, &progress)?;
+    validate_graph(status, &caravans, &progress, force_merge)?;
 
     for caravan in &caravans {
         reconcile_caravan(
@@ -3398,6 +3411,7 @@ fn validate_graph(
     status: &StatusOutput,
     selected: &[Caravan],
     progress: &SyncProgress,
+    force_merge: bool,
 ) -> Result<(), AppError> {
     for problem in &status.analysis.fleet.problems {
         let correctable_auto_merge = problem.kind == GraphProblemKind::AutoMergeInvariant
@@ -3408,7 +3422,13 @@ fn validate_graph(
             });
         let correctable_advancement = problem.kind == GraphProblemKind::DanglingBase
             && recoverable_dangling_problem(status, selected, problem);
-        if correctable_auto_merge || correctable_advancement {
+        let deferred_force_head = force_head_auto_merge_gap(status, problem, force_merge)
+            .is_some_and(|number| {
+                !selected
+                    .iter()
+                    .any(|caravan| caravan.members.contains(&number))
+            });
+        if correctable_auto_merge || correctable_advancement || deferred_force_head {
             continue;
         }
         return Err(decision_error(
@@ -3417,6 +3437,55 @@ fn validate_graph(
         ));
     }
     Ok(())
+}
+
+/// A force-labelled head with native auto-merge disabled is an explicit,
+/// repairable force-policy state, but only while the configured force path is
+/// available. Non-squash auto-merge and every structural problem remain fatal.
+fn force_head_auto_merge_gap(
+    status: &StatusOutput,
+    problem: &GraphProblem,
+    force_merge: bool,
+) -> Option<PrNumber> {
+    if !force_merge || problem.kind != GraphProblemKind::AutoMergeInvariant {
+        return None;
+    }
+    let [number] = problem.prs.as_slice() else {
+        return None;
+    };
+    let pull_request = status.analysis.pull_requests.get(number)?;
+    let caravan = status.analysis.fleet.containing(*number)?;
+    (caravan.head() == Some(*number)
+        && pull_request.state == PullRequestState::Open
+        && !pull_request.draft
+        && pull_request.has_label("caravan-force")
+        && !pull_request.auto_merge.enabled)
+        .then_some(*number)
+}
+
+/// Final rediscovery may retain an unrelated force head which this targeted
+/// tick deliberately did not observe or mutate. A selected head (or any head
+/// whose non-force CI path was observed) must still converge exactly.
+fn first_blocking_completion_problem<'a>(
+    status: &'a StatusOutput,
+    progress: &SyncProgress,
+    force_merge: bool,
+) -> Option<&'a GraphProblem> {
+    status.analysis.fleet.problems.iter().find(|problem| {
+        let Some(number) = force_head_auto_merge_gap(status, problem, force_merge) else {
+            return true;
+        };
+        let observation = progress.ci.iter().find(|item| item.pr == number);
+        let attempted = progress.events.iter().any(|event| {
+            event.kind == EventKind::ForceMergeAttempted && event.prs.contains(&number)
+        });
+        let safely_deferred = match observation {
+            None => true,
+            Some(item) if item.disposition == CiDisposition::Forced => !attempted,
+            Some(_) => false,
+        };
+        !safely_deferred
+    })
 }
 
 fn recoverable_dangling_problem(
