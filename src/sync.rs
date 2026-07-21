@@ -2473,7 +2473,11 @@ fn sync_with_lock(
             .collect::<Vec<_>>();
         lock.checkpoint(
             "physical_rebase_global_preflight_complete",
-            json!({"rebase_plans": plans, "provider_writes": 0, "branch_writes": 0}),
+            json!({
+                "rebase_plans": checkpoint_rebase_plans(&plans),
+                "provider_writes": 0,
+                "branch_writes": 0
+            }),
             false,
         )?;
         let mut progress = progress;
@@ -2482,9 +2486,9 @@ fn sync_with_lock(
         lock.checkpoint(
             "physical_rebase_applied",
             json!({
-                "rebase_plans": &physical_rebuild.plans,
-                "rebase_receipts": &physical_rebuild.receipts,
-                "provider_receipts": &physical_rebuild.provider_receipts,
+                "rebase_plans": checkpoint_rebase_plans(&physical_rebuild.plans),
+                "rebase_receipts": checkpoint_rebase_receipts(&physical_rebuild.receipts),
+                "provider_receipts": checkpoint_provider_receipts(&physical_rebuild.provider_receipts),
             }),
             false,
         )?;
@@ -2686,7 +2690,7 @@ fn sync_with_lock(
         lock.checkpoint(
             "automatic_admission_complete",
             json!({
-                "auto_admission": &auto_admission,
+                "auto_admission": checkpoint_auto_admission(&auto_admission),
                 "provider_state": sync_checkpoint_evidence(&progress),
             }),
             false,
@@ -3691,22 +3695,207 @@ fn head_is_conflict_free_with_default(status: &StatusOutput, head: &PullRequestS
     })
 }
 
-fn sync_checkpoint_evidence(progress: &SyncProgress) -> Value {
+const LOCK_CHECKPOINT_SAMPLE_LIMIT: usize = 4;
+
+fn checkpoint_hash(value: &impl Serialize) -> String {
+    let bytes = serde_json::to_vec(value).expect("checkpoint evidence serializes");
+    crate::membership::fnv1a64(&bytes)
+}
+
+fn bounded_checkpoint_sequence(values: Vec<Value>) -> Value {
+    let count = values.len();
+    let hash = checkpoint_hash(&values);
+    let sample = if count <= LOCK_CHECKPOINT_SAMPLE_LIMIT {
+        values
+    } else {
+        values
+            .iter()
+            .take(LOCK_CHECKPOINT_SAMPLE_LIMIT / 2)
+            .chain(values.iter().skip(count - LOCK_CHECKPOINT_SAMPLE_LIMIT / 2))
+            .cloned()
+            .collect()
+    };
     json!({
-        "operation_receipt": progress.operation_receipt(),
-        "rebase_plans": progress.rebase_plans,
-        "rebase_receipts": progress.rebase_receipts,
-        "provider_receipts": progress.provider_receipts.iter().map(|receipt| json!({
-            "kind": receipt.kind,
-            "before": receipt.before.as_ref().map(PullRequestPrecondition::from),
-            "after": PullRequestPrecondition::from(&receipt.after),
-        })).collect::<Vec<_>>(),
-        "events": progress.events.iter().map(|event| json!({
-            "event_id": event.event_id,
-            "kind": event.kind,
-            "prs": event.prs,
-        })).collect::<Vec<_>>(),
-        "recovery": "rediscover provider state and replay the same idempotent sync",
+        "count": count,
+        "hash": hash,
+        "sample": sample,
+        "truncated": count.saturating_sub(LOCK_CHECKPOINT_SAMPLE_LIMIT),
+        "sample_policy": "first_two_last_two",
+    })
+}
+
+fn compact_precondition(precondition: &PullRequestPrecondition) -> Value {
+    json!({
+        "number": precondition.number,
+        "state": precondition.state,
+        "head_oid": precondition.head_oid,
+        "base_ref": precondition.base_ref,
+        "base_oid": precondition.base_oid,
+        "labels": {
+            "count": precondition.labels.len(),
+            "hash": checkpoint_hash(&precondition.labels),
+        },
+        "checks": {
+            "count": precondition.checks.len(),
+            "hash": checkpoint_hash(&precondition.checks),
+        },
+        "auto_merge": precondition.auto_merge,
+    })
+}
+
+fn checkpoint_rebase_plans(plans: &[crate::physical_rebase::RebasePlan]) -> Value {
+    bounded_checkpoint_sequence(
+        plans
+            .iter()
+            .map(|plan| {
+                json!({
+                    "pr": plan.pr,
+                    "branch": plan.branch,
+                    "old_head_oid": plan.old_head_oid,
+                    "old_base_oid": plan.old_base_oid,
+                    "range_source": plan.range_source,
+                    "new_base": plan.new_base,
+                    "new_head_oid": plan.new_head_oid,
+                    "new_tree_oid": plan.new_tree_oid,
+                    "commit_count": plan.commit_count,
+                    "ci_trigger_workflow_count": plan.ci_trigger_workflows.len(),
+                    "ci_trigger_workflows_hash": checkpoint_hash(&plan.ci_trigger_workflows),
+                    "lease": plan.lease,
+                    "already_satisfied": plan.already_satisfied,
+                })
+            })
+            .collect(),
+    )
+}
+
+fn checkpoint_rebase_receipts(receipts: &[crate::physical_rebase::RebaseReceipt]) -> Value {
+    bounded_checkpoint_sequence(
+        receipts
+            .iter()
+            .map(|receipt| {
+                json!({
+                    "pr": receipt.pr,
+                    "branch": receipt.branch,
+                    "old_head_oid": receipt.old_head_oid,
+                    "new_head_oid": receipt.new_head_oid,
+                    "old_base_oid": receipt.old_base_oid,
+                    "new_base_branch": receipt.new_base_branch,
+                    "new_base_oid": receipt.new_base_oid,
+                    "new_tree_oid": receipt.new_tree_oid,
+                    "commit_count": receipt.commit_count,
+                    "lease": receipt.lease,
+                    "already_satisfied": receipt.already_satisfied,
+                })
+            })
+            .collect(),
+    )
+}
+
+fn checkpoint_provider_receipts(receipts: &[GitHubMutationReceipt]) -> Value {
+    bounded_checkpoint_sequence(
+        receipts
+            .iter()
+            .map(|receipt| {
+                json!({
+                    "kind": receipt.kind,
+                    "before": receipt
+                        .before
+                        .as_ref()
+                        .map(PullRequestPrecondition::from)
+                        .as_ref()
+                        .map(compact_precondition),
+                    "after": compact_precondition(&PullRequestPrecondition::from(&receipt.after)),
+                })
+            })
+            .collect(),
+    )
+}
+
+fn checkpoint_steps(steps: &[MutationStep]) -> Value {
+    bounded_checkpoint_sequence(
+        steps
+            .iter()
+            .map(|step| {
+                json!({
+                    "kind": step.kind,
+                    "state": step.state,
+                    "pr": step.pr,
+                    "summary_hash": checkpoint_hash(&step.summary),
+                })
+            })
+            .collect(),
+    )
+}
+
+fn checkpoint_events(events: &[CaravanEvent]) -> Value {
+    bounded_checkpoint_sequence(
+        events
+            .iter()
+            .map(|event| {
+                json!({
+                    "event_id": event.event_id,
+                    "kind": event.kind,
+                    "caravan_id": event.caravan_id,
+                    "prs": bounded_checkpoint_sequence(
+                        event.prs.iter().map(|pr| json!(pr)).collect()
+                    ),
+                })
+            })
+            .collect(),
+    )
+}
+
+fn checkpoint_auto_admission(output: &AutoAdmissionOutput) -> Value {
+    json!({
+        "enabled": output.enabled,
+        "heuristic_version": output.heuristic_version,
+        "continuation": output.continuation,
+        "candidates_considered": output.candidates_considered,
+        "mutations_used": output.mutations_used,
+        "mutation_limit": output.mutation_limit,
+        "github_requests_used": output.github_requests_used,
+        "github_request_limit": output.github_request_limit,
+        "joins": bounded_checkpoint_sequence(output.joins.iter().map(|join| json!({
+            "candidate_pr": join.candidate_pr,
+            "target_tail": join.target_tail,
+            "operation_id": join.membership.receipt.operation_id,
+            "changed": join.membership.receipt.changed,
+            "join_receipt_hash": join.membership.join_receipt.as_ref().map(|receipt| &receipt.receipt_hash),
+        })).collect()),
+        "skips": bounded_checkpoint_sequence(output.skips.iter().map(|skip| json!({
+            "candidate_pr": skip.candidate_pr,
+            "evidence_hash": skip.evidence_hash,
+        })).collect()),
+        "remaining_candidates": bounded_checkpoint_sequence(
+            output.remaining_candidates.iter().map(|pr| json!(pr)).collect()
+        ),
+    })
+}
+
+fn sync_checkpoint_evidence(progress: &SyncProgress) -> Value {
+    let affected_prs = progress
+        .steps
+        .iter()
+        .filter_map(|step| step.pr)
+        .chain(progress.rebase_plans.iter().map(|plan| plan.pr))
+        .chain(progress.rebase_receipts.iter().map(|receipt| receipt.pr))
+        .collect::<BTreeSet<_>>();
+    json!({
+        "schema_version": 2,
+        "operation": {
+            "operation_id": progress.operation_id,
+            "name": "sync",
+            "changed": progress.operation_receipt().changed,
+        },
+        "affected_prs": bounded_checkpoint_sequence(
+            affected_prs.into_iter().map(|pr| json!(pr)).collect()
+        ),
+        "steps": checkpoint_steps(&progress.steps),
+        "rebase_plans": checkpoint_rebase_plans(&progress.rebase_plans),
+        "rebase_receipts": checkpoint_rebase_receipts(&progress.rebase_receipts),
+        "provider_receipts": checkpoint_provider_receipts(&progress.provider_receipts),
+        "events": checkpoint_events(&progress.events),
+        "recovery": "rediscover provider state and replay the same idempotent sync; hashes bind complete omitted evidence",
     })
 }
 
@@ -6746,6 +6935,111 @@ mod tests {
             details["lock_recovery"]["removed_owner"]["checkpoint"]["phase"],
             "decision_checkout_in_flight"
         );
+    }
+
+    #[test]
+    fn sync_lock_checkpoint_stays_bounded_for_large_fleet_receipts() {
+        let pulls = healthy_chain();
+        let status = status(pulls.clone(), Some(PrNumber(1)), &clean);
+        let mut progress = SyncProgress::new(&status, vec![PrNumber(1)], u32::MAX);
+        let template = pulls[0].clone();
+        for index in 0..1_000_u64 {
+            let pr = PrNumber(index + 1);
+            progress.steps.push(MutationStep {
+                kind: MutationKind::SetBase,
+                state: MutationStepState::Completed,
+                pr: Some(pr),
+                summary: "large historical step evidence ".repeat(32),
+            });
+            progress
+                .rebase_plans
+                .push(crate::physical_rebase::RebasePlan {
+                    pr,
+                    branch: format!("feature-{index}"),
+                    old_head_oid: CommitOid(format!("old-{index}")),
+                    old_base_oid: CommitOid(format!("base-{index}")),
+                    range_source: crate::physical_rebase::PlannedRangeBase::RemoteBranch {
+                        branch: branch(&format!("base-{index}")),
+                    },
+                    new_base: crate::physical_rebase::PlannedBase::Remote(branch(&format!(
+                        "target-{index}"
+                    ))),
+                    new_head_oid: CommitOid(format!("new-{index}")),
+                    new_tree_oid: CommitOid(format!("tree-{index}")),
+                    commit_count: 1,
+                    ci_trigger_workflows: (0..32)
+                        .map(|workflow| format!(".github/workflows/{workflow}.yml"))
+                        .collect(),
+                    lease: format!("--force-with-lease=refs/heads/feature-{index}:old-{index}"),
+                    already_satisfied: false,
+                });
+            progress
+                .rebase_receipts
+                .push(crate::physical_rebase::RebaseReceipt {
+                    pr,
+                    branch: format!("feature-{index}"),
+                    old_head_oid: CommitOid(format!("old-{index}")),
+                    new_head_oid: CommitOid(format!("new-{index}")),
+                    old_base_oid: CommitOid(format!("base-{index}")),
+                    new_base_branch: format!("target-{index}"),
+                    new_base_oid: CommitOid(format!("target-oid-{index}")),
+                    new_tree_oid: CommitOid(format!("tree-{index}")),
+                    commit_count: 1,
+                    ci_trigger_workflows: Vec::new(),
+                    lease: format!("--force-with-lease=refs/heads/feature-{index}:old-{index}"),
+                    already_satisfied: false,
+                });
+            let mut after = template.clone();
+            after.number = pr;
+            after.labels = (0..64).map(|label| format!("label-{label}")).collect();
+            after.checks = (0..64)
+                .map(|check| CheckSnapshot {
+                    name: format!("check-{check}"),
+                    state: CheckState::Success,
+                    provider_state: Some("SUCCESS".to_owned()),
+                    details_url: None,
+                })
+                .collect();
+            progress.provider_receipts.push(GitHubMutationReceipt {
+                kind: MutationKind::SetBase,
+                before: Some(after.clone()),
+                after,
+                provider_output: Some("large provider output".repeat(64)),
+            });
+            progress.events.push(progress.event(
+                EventKind::HeadAdvanced,
+                Some(pr),
+                vec![pr; 64],
+                Some("large event reason".repeat(64)),
+                BTreeMap::new(),
+            ));
+        }
+
+        let evidence = sync_checkpoint_evidence(&progress);
+        let encoded = serde_json::to_vec(&evidence).unwrap();
+
+        assert!(encoded.len() < 12 * 1024, "{} bytes", encoded.len());
+        assert_eq!(evidence["schema_version"], 2);
+        for key in [
+            "affected_prs",
+            "steps",
+            "rebase_plans",
+            "rebase_receipts",
+            "provider_receipts",
+            "events",
+        ] {
+            assert_eq!(evidence[key]["count"], 1_000, "{key}");
+            assert_eq!(evidence[key]["sample"].as_array().unwrap().len(), 4);
+            assert_eq!(evidence[key]["truncated"], 996);
+            assert!(
+                evidence[key]["hash"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("fnv1a64:")
+            );
+        }
+        assert_eq!(evidence["rebase_plans"]["sample"][0]["pr"], 1);
+        assert_eq!(evidence["rebase_plans"]["sample"][3]["pr"], 1_000);
     }
 
     #[test]

@@ -438,7 +438,7 @@ receipt policy.
 
 ## 10. Concurrency and idempotency
 
-One local process at a time may mutate a repository, enforced by an operation lock under Git metadata. Read-only commands may run concurrently.
+One local process at a time may mutate a repository, enforced by an operation lock under Git metadata. Read-only commands may run concurrently. The owner file remains below 16 KiB even for large fleets: sync checkpoints store schema-versioned counts, complete deterministic hashes, and bounded first/last samples of affected PRs, steps, plans, receipts, and events rather than embedding unbounded histories. The latest provider preconditions remain in the tail sample; GitHub rediscovery is still recovery authority and hashes bind omitted evidence.
 
 No local lock can serialize distributed machines. Every mutation therefore carries optimistic preconditions over PR number, head SHA, base ref/SHA, labels, state, and auto-merge state. A mismatch aborts with `stale_precondition`; the caller rediscover/reruns rather than overwriting concurrent work.
 

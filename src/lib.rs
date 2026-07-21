@@ -247,7 +247,10 @@ RECOVERY, LOCKS, AND OBSERVABILITY
   fingerprint and exact repair/reshape/evict/strategy choices rather than
   repeating the unchanged tick.
 - `cara lock status` reports owner token, PID liveness, checkpoint phase, and
-  provider indeterminacy. Use `lock recover --confirm` only for the typed,
+  provider indeterminacy. Sync checkpoint evidence is always bounded below the
+  owner-file limit: complete counts/hashes plus first/last samples preserve
+  recovery context without embedding unbounded plans, receipts, or events.
+  Use `lock recover --confirm` only for the typed,
   verified-stale owner; never delete lock files manually.
 - A dirty worktree or active Git operation blocks checkout-sensitive recovery
   before provider mutation. Make it safe or use the Cara repair workspace.

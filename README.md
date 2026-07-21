@@ -152,7 +152,10 @@ compatible and preserved. See [`docs/first-use.md`](docs/first-use.md).
 open caravan PR.
 
 Use `cara help` for the agent operating loop and recovery rules. Use `--json`
-for stable `mcp-cli` envelopes.
+for stable `mcp-cli` envelopes. Operation-lock owner files stay below 16 KiB:
+large syncs retain schema-versioned counts, deterministic hashes, and bounded
+first/last samples instead of copying full plan/receipt/event histories into the
+lock; GitHub rediscovery remains recovery authority.
 
 ## Built-in web dashboard
 
