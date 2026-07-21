@@ -256,9 +256,11 @@ and bound to session/repository/head/target, actor/reason, exact one-parent sour
 commit, source/base blobs, source patch fingerprint, original index blob, and
 expected merged result blob. Cara three-way applies and stages that reviewed
 source change; continue rejects any later byte drift or ungranted path. Before
-continue, the same granting actor may revoke exact paths; Cara restores and
-stages each pre-grant blob and records the revocation reason without provider
-mutation.
+continue, the same granting actor may revoke exact paths; Cara preflights the
+whole set, restores and stages each pre-grant blob, and records durable bounded
+revocation receipts without provider mutation. Grant and revoke reconcile exact
+receipt/index states after interruption, including a staged result or restored
+baseline whose final manifest publication did not complete.
 
 Repair uses an independent clone below Git's common Caravan metadata. It seeds
 content-addressed objects from the current canonical checkout, binds a separate

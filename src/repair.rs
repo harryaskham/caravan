@@ -262,6 +262,18 @@ pub struct RepairPathGrant {
     pub applied: bool,
 }
 
+/// Durable proof that one exact semantic grant was restored and revoked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepairPathGrantRevocation {
+    pub path: String,
+    pub actor: String,
+    pub reason: String,
+    pub source_revision: CommitOid,
+    pub baseline_oid: String,
+    pub expected_result_oid: String,
+    pub revoked_unix_ms: u64,
+}
+
 /// Stable, secret-free repair session receipt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RepairSession {
@@ -301,6 +313,8 @@ pub struct RepairSession {
     pub baseline_index: BTreeMap<String, String>,
     #[serde(default)]
     pub semantic_grants: Vec<RepairPathGrant>,
+    #[serde(default)]
+    pub semantic_grant_revocations: Vec<RepairPathGrantRevocation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_edit_authorization: Option<RepairAgentEditAuthorization>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -337,6 +351,8 @@ pub struct RepairStatusOutput {
     pub baseline_index_fingerprint: String,
     #[serde(default)]
     pub semantic_grants: Vec<RepairPathGrant>,
+    #[serde(default)]
+    pub semantic_grant_revocations: Vec<RepairPathGrantRevocation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_edit_authorization: Option<RepairAgentEditAuthorization>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -586,6 +602,7 @@ fn start_exact(
         conflicting_paths: Vec::new(),
         baseline_index: BTreeMap::new(),
         semantic_grants: Vec::new(),
+        semantic_grant_revocations: Vec::new(),
         agent_edit_authorization: None,
         agent_edit_receipt: None,
         created_unix_ms: now,
@@ -1187,12 +1204,16 @@ pub fn grant_paths(
             "semantic grant path list contains duplicates",
         ));
     }
-    if repair
-        .semantic_grants
-        .len()
-        .saturating_add(unique_paths.len())
-        > MAX_SEMANTIC_GRANTS
-    {
+    let new_grant_count = unique_paths
+        .iter()
+        .filter(|path| {
+            !repair
+                .semantic_grants
+                .iter()
+                .any(|grant| grant.path == path.as_str())
+        })
+        .count();
+    if repair.semantic_grants.len().saturating_add(new_grant_count) > MAX_SEMANTIC_GRANTS {
         return Err(AppError::validation(
             "repair_grant_limit_exceeded",
             format!("repair sessions allow at most {MAX_SEMANTIC_GRANTS} semantic grants"),
@@ -1222,10 +1243,15 @@ pub fn grant_paths(
                 ));
             }
             if baseline_oid == existing.expected_result_oid {
-                proposed.push((existing.clone(), None));
+                let mut reconciled = existing.clone();
+                if !reconciled.applied {
+                    already_applied = false;
+                    reconciled.applied = true;
+                }
+                proposed.push((reconciled, None));
                 continue;
             }
-            if baseline_oid != existing.baseline_oid {
+            if baseline_oid != existing.baseline_oid || existing.applied {
                 return Err(AppError::structured(
                     ErrorCategory::Validation,
                     "repair_grant_path_drift",
@@ -1286,11 +1312,13 @@ pub fn grant_paths(
     }
 
     for (grant, _) in &proposed {
-        if !repair
+        if let Some(existing) = repair
             .semantic_grants
-            .iter()
-            .any(|existing| existing.path == grant.path)
+            .iter_mut()
+            .find(|existing| existing.path == grant.path)
         {
+            existing.clone_from(grant);
+        } else {
             repair.semantic_grants.push(grant.clone());
         }
     }
@@ -1328,10 +1356,10 @@ pub fn grant_paths(
                 .find(|existing| existing.path == grant.path)
                 .expect("grant persisted before apply");
             persisted.applied = true;
-            repair.updated_unix_ms = unix_ms();
-            write_manifest(&paths.manifest, &repair)?;
         }
     }
+    repair.updated_unix_ms = unix_ms();
+    write_manifest(&paths.manifest, &repair)?;
 
     lock.checkpoint(
         "repair_semantic_paths_granted",
@@ -1351,6 +1379,15 @@ pub fn grant_paths(
         already_applied,
         next: "review the exact grant receipts, then run repair continue without editing any other path".to_owned(),
     })
+}
+
+enum RevocationPlan {
+    Restore {
+        grant: RepairPathGrant,
+        baseline: String,
+    },
+    Finalize(RepairPathGrant),
+    Already,
 }
 
 /// Revoke exact grants and restore the pre-grant staged blob for each path.
@@ -1405,19 +1442,33 @@ pub fn revoke_grants(
             "revocation path list contains duplicates",
         ));
     }
-    let mut revoked = Vec::new();
-    for path in unique {
-        let position = repair
+
+    // Validate the whole request before touching any path. A later authority,
+    // drift, object, or provider failure therefore leaves every grant intact.
+    let mut plans = Vec::with_capacity(unique.len());
+    for path in &unique {
+        let actual_oid = index_oid_for_path(&runner, path)?;
+        let Some(grant) = repair
             .semantic_grants
             .iter()
-            .position(|grant| grant.path == path)
-            .ok_or_else(|| {
-                AppError::validation(
+            .find(|grant| grant.path == *path)
+            .cloned()
+        else {
+            let already = repair.semantic_grant_revocations.iter().any(|revocation| {
+                revocation.path == *path
+                    && revocation.actor == input.actor
+                    && revocation.reason == input.reason
+                    && revocation.baseline_oid == actual_oid
+            });
+            if !already {
+                return Err(AppError::validation(
                     "repair_grant_not_found",
-                    format!("path `{path}` has no semantic grant"),
-                )
-            })?;
-        let grant = repair.semantic_grants[position].clone();
+                    format!("path `{path}` has no exact active or revoked semantic grant"),
+                ));
+            }
+            plans.push((path.clone(), RevocationPlan::Already));
+            continue;
+        };
         if grant.actor != input.actor {
             return Err(AppError::structured(
                 ErrorCategory::MissingPermission,
@@ -1426,42 +1477,97 @@ pub fn revoke_grants(
                 Some(json!({"grant": grant, "actor": input.actor})),
             ));
         }
-        if index_oid_for_path(&runner, &path)? != grant.expected_result_oid {
+        if actual_oid == grant.expected_result_oid {
+            let baseline = require_success(
+                &runner,
+                CommandSpec::new("git").args(["cat-file", "blob", grant.baseline_oid.as_str()]),
+                "repair_grant_baseline_missing",
+                "could not restore semantic grant baseline blob",
+            )?;
+            plans.push((
+                path.clone(),
+                RevocationPlan::Restore {
+                    grant,
+                    baseline: baseline.stdout,
+                },
+            ));
+        } else if actual_oid == grant.baseline_oid {
+            // The index restore completed but the final manifest publication did
+            // not. Keep the receipt as authority and finish publication below.
+            plans.push((path.clone(), RevocationPlan::Finalize(grant)));
+        } else {
             return Err(AppError::structured(
                 ErrorCategory::Validation,
                 "repair_grant_result_drift",
-                "semantic grant result changed before revocation",
-                Some(json!({"grant": grant})),
+                "semantic grant result changed outside its exact revocation states",
+                Some(json!({"grant": grant, "actual_oid": actual_oid})),
             ));
         }
-        let baseline = require_success(
-            &runner,
-            CommandSpec::new("git").args(["cat-file", "blob", grant.baseline_oid.as_str()]),
-            "repair_grant_baseline_missing",
-            "could not restore semantic grant baseline blob",
-        )?;
-        fs::write(paths.workspace.join(&path), baseline.stdout).map_err(|error| {
-            repair_io_error(
-                "repair_grant_write_failed",
-                "could not restore semantic grant baseline",
-                &paths.workspace.join(&path),
-                &error,
-            )
-        })?;
-        require_success(
-            &runner,
-            CommandSpec::new("git").args(["add", "--", path.as_str()]),
-            "repair_grant_stage_failed",
-            "could not stage restored semantic grant baseline",
-        )?;
-        if index_oid_for_path(&runner, &path)? != grant.baseline_oid {
+    }
+
+    for (path, plan) in &plans {
+        if let RevocationPlan::Restore { grant, baseline } = plan {
+            fs::write(paths.workspace.join(path), baseline).map_err(|error| {
+                repair_io_error(
+                    "repair_grant_write_failed",
+                    "could not restore semantic grant baseline",
+                    &paths.workspace.join(path),
+                    &error,
+                )
+            })?;
+            require_success(
+                &runner,
+                CommandSpec::new("git").args(["add", "--", path.as_str()]),
+                "repair_grant_stage_failed",
+                "could not stage restored semantic grant baseline",
+            )?;
+            if index_oid_for_path(&runner, path)? != grant.baseline_oid {
+                return Err(AppError::validation(
+                    "repair_grant_baseline_drift",
+                    "restored semantic grant baseline has an unexpected object ID",
+                ));
+            }
+        }
+    }
+
+    let mut manifest_changed = false;
+    for (path, plan) in &plans {
+        let grant = match plan {
+            RevocationPlan::Restore { grant, .. } | RevocationPlan::Finalize(grant) => grant,
+            RevocationPlan::Already => continue,
+        };
+        if index_oid_for_path(&runner, path)? != grant.baseline_oid {
             return Err(AppError::validation(
                 "repair_grant_baseline_drift",
-                "restored semantic grant baseline has an unexpected object ID",
+                "semantic grant baseline moved before revocation publication",
             ));
         }
-        repair.semantic_grants.remove(position);
-        revoked.push(path);
+        repair.semantic_grants.retain(|active| active.path != *path);
+        repair
+            .semantic_grant_revocations
+            .retain(|revocation| revocation.path != *path);
+        repair
+            .semantic_grant_revocations
+            .push(RepairPathGrantRevocation {
+                path: path.clone(),
+                actor: input.actor.clone(),
+                reason: input.reason.clone(),
+                source_revision: grant.source_revision.clone(),
+                baseline_oid: grant.baseline_oid.clone(),
+                expected_result_oid: grant.expected_result_oid.clone(),
+                revoked_unix_ms: unix_ms(),
+            });
+        manifest_changed = true;
+    }
+    if repair.semantic_grant_revocations.len() > MAX_SEMANTIC_GRANTS {
+        let remove = repair
+            .semantic_grant_revocations
+            .len()
+            .saturating_sub(MAX_SEMANTIC_GRANTS);
+        repair.semantic_grant_revocations.drain(..remove);
+    }
+    let revoked = unique.into_iter().collect::<Vec<_>>();
+    if manifest_changed {
         repair.updated_unix_ms = unix_ms();
         write_manifest(&paths.manifest, &repair)?;
     }
@@ -1941,6 +2047,7 @@ fn repair_status_output(repair: &RepairSession) -> Result<RepairStatusOutput, Ap
         baseline_index_count: repair.baseline_index.len(),
         baseline_index_fingerprint: stable_fingerprint(&baseline),
         semantic_grants: repair.semantic_grants.clone(),
+        semantic_grant_revocations: repair.semantic_grant_revocations.clone(),
         agent_edit_authorization: repair.agent_edit_authorization.clone(),
         agent_edit_receipt: repair.agent_edit_receipt.clone(),
         materialization_timeout_secs: repair.materialization_timeout_secs,
@@ -2896,6 +3003,7 @@ fn repair_lock_receipt(repair: &RepairSession) -> Result<Value, AppError> {
         "baseline_index_count": repair.baseline_index.len(),
         "conflicting_path_count": repair.conflicting_paths.len(),
         "semantic_grant_count": repair.semantic_grants.len(),
+        "semantic_grant_revocation_count": repair.semantic_grant_revocations.len(),
         "agent_edit_authorized": repair.agent_edit_authorization.is_some(),
         "agent_edit_actor": repair.agent_edit_authorization.as_ref().map(|authorization| &authorization.actor),
         "agent_edit_expires_unix_ms": repair.agent_edit_authorization.as_ref().map(|authorization| authorization.expires_unix_ms),
@@ -3900,6 +4008,48 @@ mod tests {
     }
 
     #[test]
+    fn semantic_grant_recovers_staged_result_before_applied_manifest_publication() {
+        let fixture = fixture();
+        let source = semantic_source(&fixture);
+        let context = context(&fixture.clone);
+        let output = start_exact(
+            &context,
+            &fixture.repository,
+            &fixture.candidate,
+            &fixture.target,
+            None,
+            fixture.root.path().join("remote.git").to_str().unwrap(),
+        )
+        .unwrap();
+        let workspace = PathBuf::from(&output.repair.workspace);
+        fs::write(workspace.join("shared.txt"), "resolved\n").unwrap();
+        git(&workspace, &["add", "shared.txt"]);
+        let input = RepairGrantInput {
+            session: output.repair.session,
+            paths: vec!["README.md".to_owned()],
+            source_revision: source.0,
+            actor: "operator".to_owned(),
+            reason: "recover exact staged result".to_owned(),
+            expires_secs: 3600,
+        };
+        let granted = grant_paths(&context, &input).unwrap();
+        let expected = granted.grants[0].expected_result_oid.clone();
+        let paths = repair_paths_for_session(&fixture.clone, &input.session).unwrap();
+        let mut interrupted = read_manifest(&paths.manifest).unwrap();
+        interrupted.semantic_grants[0].applied = false;
+        write_manifest(&paths.manifest, &interrupted).unwrap();
+
+        let recovered = grant_paths(&context, &input).unwrap();
+        assert!(!recovered.already_applied);
+        assert!(recovered.grants[0].applied);
+        assert_eq!(
+            index_oid_for_path(&ProcessRunner::in_directory(&workspace), "README.md").unwrap(),
+            expected
+        );
+        assert!(read_manifest(&paths.manifest).unwrap().semantic_grants[0].applied);
+    }
+
+    #[test]
     fn semantic_grant_revocation_restores_exact_baseline_without_provider_mutation() {
         let fixture = fixture();
         let source = semantic_source(&fixture);
@@ -3937,16 +4087,13 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(wrong_actor.code(), "repair_grant_authority_mismatch");
-        let revoked = revoke_grants(
-            &context,
-            &RepairRevokeGrantInput {
-                session: input.session,
-                paths: input.paths,
-                actor: "operator-a".to_owned(),
-                reason: "review superseded".to_owned(),
-            },
-        )
-        .unwrap();
+        let revoke_input = RepairRevokeGrantInput {
+            session: input.session,
+            paths: input.paths,
+            actor: "operator-a".to_owned(),
+            reason: "review superseded".to_owned(),
+        };
+        let revoked = revoke_grants(&context, &revoke_input).unwrap();
         assert_eq!(revoked.revoked_paths, ["README.md"]);
         assert!(!revoked.provider_mutated);
         assert!(revoked.repair.semantic_grants.is_empty());
@@ -3954,6 +4101,108 @@ mod tests {
             index_oid_for_path(&ProcessRunner::in_directory(&workspace), "README.md").unwrap(),
             grant.baseline_oid
         );
+        let replay = revoke_grants(&context, &revoke_input).unwrap();
+        assert_eq!(replay.revoked_paths, ["README.md"]);
+        assert_eq!(replay.repair.semantic_grant_revocations.len(), 1);
+    }
+
+    #[test]
+    fn semantic_grant_revocation_preflights_whole_set_and_recovers_partial_restore() {
+        let fixture = fixture();
+        let source = semantic_source(&fixture);
+        let context = context(&fixture.clone);
+        let output = start_exact(
+            &context,
+            &fixture.repository,
+            &fixture.candidate,
+            &fixture.target,
+            None,
+            fixture.root.path().join("remote.git").to_str().unwrap(),
+        )
+        .unwrap();
+        let workspace = PathBuf::from(&output.repair.workspace);
+        fs::write(workspace.join("shared.txt"), "resolved\n").unwrap();
+        git(&workspace, &["add", "shared.txt"]);
+        let grant_input = RepairGrantInput {
+            session: output.repair.session,
+            paths: vec!["README.md".to_owned(), "SPEC.md".to_owned()],
+            source_revision: source.0,
+            actor: "operator".to_owned(),
+            reason: "reviewed docs".to_owned(),
+            expires_secs: 3600,
+        };
+        let granted = grant_paths(&context, &grant_input).unwrap();
+        let readme = granted
+            .grants
+            .iter()
+            .find(|grant| grant.path == "README.md")
+            .unwrap()
+            .clone();
+        let spec = granted
+            .grants
+            .iter()
+            .find(|grant| grant.path == "SPEC.md")
+            .unwrap()
+            .clone();
+        let paths = repair_paths_for_session(&fixture.clone, &grant_input.session).unwrap();
+
+        let mut mismatched = read_manifest(&paths.manifest).unwrap();
+        mismatched
+            .semantic_grants
+            .iter_mut()
+            .find(|grant| grant.path == "SPEC.md")
+            .unwrap()
+            .actor = "different-actor".to_owned();
+        write_manifest(&paths.manifest, &mismatched).unwrap();
+        let revoke_input = RepairRevokeGrantInput {
+            session: grant_input.session,
+            paths: grant_input.paths,
+            actor: "operator".to_owned(),
+            reason: "replace reviewed source".to_owned(),
+        };
+        let mismatch = revoke_grants(&context, &revoke_input).unwrap_err();
+        assert_eq!(mismatch.code(), "repair_grant_authority_mismatch");
+        let runner = ProcessRunner::in_directory(&workspace);
+        assert_eq!(
+            index_oid_for_path(&runner, "README.md").unwrap(),
+            readme.expected_result_oid
+        );
+        assert_eq!(
+            index_oid_for_path(&runner, "SPEC.md").unwrap(),
+            spec.expected_result_oid
+        );
+
+        mismatched
+            .semantic_grants
+            .iter_mut()
+            .find(|grant| grant.path == "SPEC.md")
+            .unwrap()
+            .actor = "operator".to_owned();
+        write_manifest(&paths.manifest, &mismatched).unwrap();
+        let baseline = require_success(
+            &runner,
+            CommandSpec::new("git").args(["cat-file", "blob", readme.baseline_oid.as_str()]),
+            "test_baseline_missing",
+            "test baseline unavailable",
+        )
+        .unwrap();
+        fs::write(workspace.join("README.md"), baseline.stdout).unwrap();
+        git(&workspace, &["add", "README.md"]);
+
+        let revoked = revoke_grants(&context, &revoke_input).unwrap();
+        assert_eq!(revoked.revoked_paths, ["README.md", "SPEC.md"]);
+        assert!(revoked.repair.semantic_grants.is_empty());
+        assert_eq!(revoked.repair.semantic_grant_revocations.len(), 2);
+        assert_eq!(
+            index_oid_for_path(&runner, "README.md").unwrap(),
+            readme.baseline_oid
+        );
+        assert_eq!(
+            index_oid_for_path(&runner, "SPEC.md").unwrap(),
+            spec.baseline_oid
+        );
+        let replay = revoke_grants(&context, &revoke_input).unwrap();
+        assert_eq!(replay.revoked_paths, ["README.md", "SPEC.md"]);
     }
 
     #[test]
