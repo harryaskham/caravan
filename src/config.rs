@@ -387,6 +387,10 @@ pub struct LoadedConfig {
 /// Config discovery, parsing, and validation errors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigError {
+    RepositoryNotFound {
+        path: PathBuf,
+        message: String,
+    },
     Read {
         path: PathBuf,
         message: String,
@@ -417,6 +421,9 @@ impl ConfigError {
 impl std::fmt::Display for ConfigError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::RepositoryNotFound { path, message } => {
+                write!(formatter, "repository {}: {message}", path.display())
+            }
             Self::Read { path, message } => {
                 write!(formatter, "read {}: {message}", path.display())
             }
@@ -442,6 +449,7 @@ impl StructuredError for ConfigError {
 
     fn code(&self) -> String {
         match self {
+            Self::RepositoryNotFound { .. } => "repository_not_found",
             Self::Read { .. } => "config_read_failed",
             Self::Parse { .. } => "config_parse_failed",
             Self::UnsupportedVersion { .. } => "unsupported_config_version",
@@ -456,6 +464,11 @@ impl StructuredError for ConfigError {
 
     fn details(&self) -> Option<Value> {
         match self {
+            Self::RepositoryNotFound { path, .. } => Some(json!({
+                "path": path,
+                "mutated": false,
+                "safe_next_action": "run Cara from inside a non-bare Git worktree"
+            })),
             Self::Read { path, .. } => Some(json!({ "path": path })),
             Self::Parse { path, .. } => path.as_ref().map(|path| json!({ "path": path })),
             Self::UnsupportedVersion { found, supported } => {

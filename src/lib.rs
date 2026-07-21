@@ -3,7 +3,8 @@
 //! Every bounded v1 domain tool is backed by the same GitHub-facing operation
 //! used by the human and JSON CLI surfaces.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub mod ci;
 pub mod command;
@@ -32,6 +33,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::command::CommandRunner;
 use crate::config::{CaravanConfig, ConfigError};
 
 pub mod config;
@@ -67,6 +69,8 @@ CORE MODEL AND INVARIANTS
   except under the explicit sync-owned generation-bound greedy policy below.
 
 FIRST USE AND EVERY SAFE TICK
+Cara resolves one exact Git worktree root before config or mutation, so nested
+invocations share root config/state; outside a non-bare worktree writes nothing.
 1. Run `cara status` (prefer `--json` for automation). It reports initialization,
    effective `rebase_on_join` mode, current/merged branch context, every caravan,
    canonical admission order, pauses, exact base/head/candidate lineage, CI
@@ -344,16 +348,83 @@ pub struct AppContext {
 }
 
 impl AppContext {
-    /// Resolve and validate repository configuration once for an MCP session.
-    pub fn load(path: Option<&std::path::Path>) -> Result<Self, ConfigError> {
-        let loaded = CaravanConfig::load_or_default(path)?;
+    /// Resolve and validate repository/config identity once for a CLI/MCP session.
+    /// Default config is rooted at the exact Git worktree, never ambient cwd.
+    pub fn load(path: Option<&Path>) -> Result<Self, ConfigError> {
+        let invocation_directory =
+            std::env::current_dir().map_err(|error| ConfigError::RepositoryNotFound {
+                path: PathBuf::from("."),
+                message: error.to_string(),
+            })?;
+        Self::load_from_directory(&invocation_directory, path)
+    }
+
+    fn load_from_directory(
+        invocation_directory: &Path,
+        path: Option<&Path>,
+    ) -> Result<Self, ConfigError> {
+        // Preserve explicit-config parse precedence for stable machine errors:
+        // a malformed requested file is reported even before repository lookup.
+        let explicit_config = path
+            .map(|explicit| {
+                let resolved = if explicit.is_absolute() {
+                    explicit.to_path_buf()
+                } else {
+                    invocation_directory.join(explicit)
+                };
+                CaravanConfig::load_or_default(Some(&resolved))
+                    .map(|loaded| (resolved, loaded.existed, loaded.config))
+            })
+            .transpose()?;
+        let repository_path = resolve_repository_root(invocation_directory)?;
+        let (config_path, config_existed, config) = if let Some(explicit) = explicit_config {
+            // A relative --config is relative to invocation cwd, not silently
+            // rebased to repository root. Store it absolute so downstream
+            // safety checks cannot reinterpret it against repository_path.
+            explicit
+        } else {
+            let relative = PathBuf::from(config::DEFAULT_CONFIG_PATH);
+            let resolved = repository_path.join(&relative);
+            if resolved.exists() {
+                (relative, true, CaravanConfig::load(&resolved)?)
+            } else {
+                (relative, false, CaravanConfig::default())
+            }
+        };
         Ok(Self {
-            repository_path: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            config_path: loaded.path,
-            config_existed: loaded.existed,
-            config: loaded.config,
+            repository_path,
+            config_path,
+            config_existed,
+            config,
         })
     }
+}
+
+fn resolve_repository_root(directory: &Path) -> Result<PathBuf, ConfigError> {
+    let runner =
+        command::ProcessRunner::in_directory(directory).with_timeout(Duration::from_secs(5));
+    let request = command::CommandSpec::new("git").args(["rev-parse", "--show-toplevel"]);
+    let output = runner
+        .run(&request)
+        .map_err(|error| ConfigError::RepositoryNotFound {
+            path: directory.to_path_buf(),
+            message: error.to_string(),
+        })?;
+    if !output.is_success() || output.stdout.trim().is_empty() {
+        let stderr = output.stderr.trim();
+        return Err(ConfigError::RepositoryNotFound {
+            path: directory.to_path_buf(),
+            message: if stderr.is_empty() {
+                "not inside a non-bare Git worktree".to_owned()
+            } else {
+                stderr.to_owned()
+            },
+        });
+    }
+    std::fs::canonicalize(output.stdout.trim()).map_err(|error| ConfigError::RepositoryNotFound {
+        path: PathBuf::from(output.stdout.trim()),
+        message: error.to_string(),
+    })
 }
 
 impl Default for AppContext {
@@ -1009,6 +1080,66 @@ pub fn feedback_destination() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn git(directory: &Path, arguments: &[&str]) {
+        let status = std::process::Command::new("git")
+            .current_dir(directory)
+            .args(arguments)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {arguments:?}");
+    }
+
+    #[test]
+    fn nested_context_resolves_one_repository_root_and_default_config() {
+        let directory = tempfile::tempdir().unwrap();
+        git(directory.path(), &["init"]);
+        let nested = directory.path().join("a directory/inside");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(directory.path().join(".caravan")).unwrap();
+        std::fs::write(
+            directory.path().join(config::DEFAULT_CONFIG_PATH),
+            "version: 1\n",
+        )
+        .unwrap();
+
+        let context = AppContext::load_from_directory(&nested, None).unwrap();
+        assert_eq!(
+            context.repository_path,
+            directory.path().canonicalize().unwrap()
+        );
+        assert_eq!(
+            context.config_path,
+            PathBuf::from(config::DEFAULT_CONFIG_PATH)
+        );
+        assert!(context.config_existed);
+        assert!(!nested.join(".caravan").exists());
+    }
+
+    #[test]
+    fn relative_explicit_config_remains_relative_to_invocation_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        git(directory.path(), &["init"]);
+        let nested = directory.path().join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("cara.yaml"), "version: 1\n").unwrap();
+
+        let context =
+            AppContext::load_from_directory(&nested, Some(Path::new("cara.yaml"))).unwrap();
+        assert_eq!(context.config_path, nested.join("cara.yaml"));
+        assert_eq!(
+            context.repository_path,
+            directory.path().canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn outside_git_is_typed_and_writes_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let error = AppContext::load_from_directory(directory.path(), None).unwrap_err();
+        assert_eq!(error.code(), "repository_not_found");
+        assert!(!directory.path().join(".caravan").exists());
+    }
 
     #[test]
     fn help_describes_the_resumable_sync_loop() {

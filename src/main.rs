@@ -1752,6 +1752,17 @@ where
 }
 
 fn run_evict(cli: &Cli, input: &EvictInput) -> Result<(), i32> {
+    if input.reason.trim().is_empty() {
+        let error = AppError::validation(
+            "eviction_reason_required",
+            "eviction requires a non-empty --reason",
+        );
+        return if cli.json {
+            emit_result::<serde_json::Value, _>(true, Err(error))
+        } else {
+            emit_human_error(error)
+        };
+    }
     let context = load_context(cli)?;
     let result = caravan::reshape::evict(&context, input);
     if cli.json {
@@ -1860,10 +1871,6 @@ fn run_mcp(command: &McpCommand, config_path: Option<&std::path::Path>) -> Resul
         },
         build_router(),
     );
-    let context = AppContext::load(config_path).map_err(|error| {
-        eprintln!("cara: {error}");
-        2
-    })?;
     match command {
         McpCommand::Tools => {
             serde_json::to_writer_pretty(io::stdout().lock(), &server.tool_metadata())
@@ -1871,10 +1878,16 @@ fn run_mcp(command: &McpCommand, config_path: Option<&std::path::Path>) -> Resul
             println!();
             Ok(())
         }
-        McpCommand::Stdio => server.serve_stdio(&context).map_err(|error| {
-            eprintln!("mcp error: {error}");
-            1
-        }),
+        McpCommand::Stdio => {
+            let context = AppContext::load(config_path).map_err(|error| {
+                eprintln!("cara: {error}");
+                2
+            })?;
+            server.serve_stdio(&context).map_err(|error| {
+                eprintln!("mcp error: {error}");
+                1
+            })
+        }
     }
 }
 

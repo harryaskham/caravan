@@ -125,6 +125,12 @@ branches with one merged historical PR are safe fresh-generation ancestry for
 an explicit create, while ambiguous reuse, unchanged old heads, unpushed heads,
 forks, and provider races still fail closed.
 
+Cara first resolves the current Git worktree root, so every command behaves the
+same from the root or any nested directory. Default `.caravan/config.yaml`,
+locks, journal, repair state, and init writes are rooted there. A relative
+explicit `--config` remains relative to the invocation directory and is stored
+as an absolute identity; outside a non-bare worktree fails without writing.
+
 First use is always explicit: run `cara status`, then `cara init`. Init atomically
 creates `.caravan/config.yaml` only when absent, verifies repository permission,
 default-branch protection, and squash auto-merge policy, and creates only the

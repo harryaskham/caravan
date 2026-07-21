@@ -86,6 +86,8 @@ coalesce wakes, reuse one exact discovery snapshot within a tick, back off near
 reset, and retain exact fresh reads before mutation. Cache data is never
 provider mutation authority.
 
+Before config discovery or any mutation, `cara` resolves the exact non-bare Git worktree root with a bounded noninteractive Git query. Root and nested invocations share that repository identity, default `.caravan/config.yaml`, locks, journal, repair state, status cache, and domain behavior. Linked worktrees retain their own worktree root while common-Git state uses Git's common directory. A relative explicit `--config` remains relative to the invocation directory and is converted to an absolute identity; outside Git and bare repositories return `repository_not_found` and write nothing.
+
 `cara` discovers the base repository, default branch, current local branch, PRs, labels, bases, head revisions, auto-merge state, and checks through `git` and authenticated `gh`/GitHub APIs.
 
 Graph identity is derived each run. No UUID is persisted. A hook receives the complete relevant graph snapshot so a changing head/ID is explicit.
