@@ -106,7 +106,10 @@ invocations share root config/state; outside a non-bare worktree writes nothing.
    target, and records exact generation-bound `caravan-join-skipped` evidence
    before considering a later candidate. Manual membership consumes that label.
    The same path powers `loop` and `loop --once`; every tick reports exact
-   candidate/mutation/GitHub/wall bounds, joins, skips, remaining work, and continuation.
+   candidate/mutation/GitHub/wall bounds, joins, skips, remaining work, and
+   continuation. Fleet scanning never starts a candidate below its reserved
+   exact-Git budget; selected remote PRs reuse fresh fleet facts and receive a
+   new bounded deadline for refetch, compatibility, physical Git, and mutation.
 7. Preserve the complete structured error. Its category, code, exact OIDs,
    affected PRs, completed steps, provider receipts, suggested actions, and
    resumable command are the continuation contract. Never replace it with a

@@ -271,12 +271,14 @@ A sync tick:
     canonical unlabelled candidates only after steps 1–10 converge. Empty fleets
     form a head; non-empty fleets use the first compatible deterministic tail.
     Incompatible exact generations receive a durable skip and later candidates
-    may be considered.
+    may be considered. Before beginning another candidate, preserve a bounded
+    nonzero exact-Git reserve; exhaustion returns continuation without starting
+    a doomed final fetch.
 12. Re-run normal convergence for admitted members and return exact joins,
     skips, remaining candidates, safety-budget usage, continuation, and the
     stable health snapshot or first decision point.
 
-Already-correct steps are no-ops. Rerunning after interruption resumes from rediscovered GitHub state rather than a local cursor. Auto-admission is disabled by default and targeted `sync` never grows the fleet. The whole `sync --all` tick shares one operation lock, absolute wall-clock deadline, authenticated `gh` request counter, candidate limit, and mutation limit. It rediscovers after every provider mutation; budget exhaustion returns a resumable continuation rather than leapfrogging or guessing. `loop` and `loop --once` call this exact path. Hosted automation uses bounded once-ticks from PR/check/workflow/default-branch events and a schedule, not one unbounded hosted process.
+Already-correct steps are no-ops. Rerunning after interruption resumes from rediscovered GitHub state rather than a local cursor. Auto-admission is disabled by default and targeted `sync` never grows the fleet. Fleet scanning shares one operation lock, absolute wall-clock deadline, authenticated `gh` request counter, candidate limit, and mutation limit. A selected exact candidate receives an independent bounded `command_timeout_secs` deadline for provider refetch, merge identity, compatibility/physical Git, mutation, and post-mutation rediscovery; sync-owned admission reuses the already-fresh fleet snapshot instead of repeating unrelated cross-caravan analysis. Exact candidate receipts expose reserved and remaining milliseconds. Provider/head/base drift still fails closed, and a post-mutation refresh cannot inherit an exhausted pre-admission deadline. Budget exhaustion returns a resumable continuation rather than leapfrogging or guessing. `loop` and `loop --once` call this exact path. Hosted automation uses bounded once-ticks from PR/check/workflow/default-branch events and a schedule, not one unbounded hosted process.
 
 Sync never invents an agent decision. Every successful bounded tick returns a versioned scheduler projection over the fresh final discovery: exact default branch generation, each selected caravan's root/tail/member head and base generations, observed CI disposition, intentional holds, and one `healthy`, `waiting_ci`, or `held` state. These successful states always carry `wake_class=none`; fresh, empty, expected, queued, or running checks remain `waiting_ci` and do not wake a repair actor.
 

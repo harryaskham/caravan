@@ -378,12 +378,13 @@ fn execute_live(
     candidate_pr: Option<u64>,
 ) -> Result<MembershipOutput, AppError> {
     let _lock = OperationLock::acquire(&context.repository_path, request.operation.name())?;
-    execute_locked(context, request, candidate_pr, None, None, true)
+    execute_locked(context, request, candidate_pr, None, None, None, true)
 }
 
 /// Run one exact sync-owned new/join while the caller retains the repository lock.
 pub(crate) fn auto_admit_locked(
     context: &AppContext,
+    status: StatusOutput,
     candidate_pr: PrNumber,
     tail_pr: Option<PrNumber>,
     priority_label: Option<String>,
@@ -412,6 +413,7 @@ pub(crate) fn auto_admit_locked(
         Some(candidate_pr.0),
         Some(operation_deadline),
         Some(github_budget),
+        Some(status),
         false,
     )
 }
@@ -423,6 +425,7 @@ fn execute_locked(
     candidate_pr: Option<u64>,
     operation_deadline: Option<std::time::Instant>,
     github_budget: Option<&crate::command::GithubRequestBudget>,
+    preloaded_status: Option<StatusOutput>,
     dispatch_hooks: bool,
 ) -> Result<MembershipOutput, AppError> {
     if candidate_pr.is_some() && request.create_pr {
@@ -445,28 +448,34 @@ fn execute_locked(
         ));
     }
     let timeout = std::time::Duration::from_secs(context.config.command_timeout_secs);
-    let operation_deadline = operation_deadline.unwrap_or_else(|| {
+    let mut operation_deadline = operation_deadline.unwrap_or_else(|| {
         std::time::Instant::now()
             + std::time::Duration::from_secs(context.config.sync.max_duration_secs)
     });
-    let mut status = candidate_pr.map_or_else(
-        || {
-            if request.create_pr {
-                read::status_for_pr_creation(context, operation_deadline, github_budget)
-            } else {
-                read::status_with_deadline_and_budget(context, operation_deadline, github_budget)
-            }
-        },
-        |number| {
+    let mut status = if let Some(number) = candidate_pr {
+        let bound = if let Some(status) = preloaded_status {
+            read::bind_remote_candidate_from_status(
+                context,
+                status,
+                PrNumber(number),
+                github_budget,
+            )?
+        } else {
             read::status_for_remote_candidate_with_deadline(
                 context,
                 PrNumber(number),
                 operation_deadline,
                 github_budget,
-            )
-        },
-    )?;
-    let checker = GitCompatibilityChecker::new(&context.repository_path, "origin")
+            )?
+        };
+        operation_deadline = bound.exact_deadline;
+        bound.status
+    } else if request.create_pr {
+        read::status_for_pr_creation(context, operation_deadline, github_budget)?
+    } else {
+        read::status_with_deadline_and_budget(context, operation_deadline, github_budget)?
+    };
+    let mut checker = GitCompatibilityChecker::new(&context.repository_path, "origin")
         .with_timeout(timeout)
         .with_operation_deadline(operation_deadline);
     let provider_runner = crate::command::ProcessRunner::in_directory(&context.repository_path)
@@ -475,7 +484,7 @@ fn execute_locked(
     let provider_runner = github_budget.map_or(provider_runner.clone(), |budget| {
         provider_runner.with_github_request_budget(budget.clone())
     });
-    let provider = GitHubMutationAdapter::new(provider_runner);
+    let mut provider = GitHubMutationAdapter::new(provider_runner);
     let repository = status.repository.clone();
     let failure_status = status.clone();
     let default_branch_oid = status.analysis.fleet.default_branch.oid.clone();
@@ -652,17 +661,31 @@ fn execute_locked(
             .map_err(|error| attach_force_invalidation(error, force_invalidation.as_ref()))?;
         // GitHub is authoritative after a push. Never apply base/label changes
         // against the stale pre-rewrite PR snapshot.
-        status = candidate_pr.map_or_else(
-            || read::status_with_deadline_and_budget(context, operation_deadline, github_budget),
-            |candidate| {
-                read::status_for_remote_candidate_with_deadline(
-                    context,
-                    PrNumber(candidate),
-                    operation_deadline,
-                    github_budget,
-                )
-            },
-        )?;
+        if let Some(candidate) = candidate_pr {
+            let rediscovery_deadline = std::time::Instant::now() + timeout;
+            let bound = read::status_for_remote_candidate_with_deadline(
+                context,
+                PrNumber(candidate),
+                rediscovery_deadline,
+                github_budget,
+            )?;
+            operation_deadline = bound.exact_deadline;
+            status = bound.status;
+            checker = GitCompatibilityChecker::new(&context.repository_path, "origin")
+                .with_timeout(timeout)
+                .with_operation_deadline(operation_deadline);
+            let provider_runner =
+                crate::command::ProcessRunner::in_directory(&context.repository_path)
+                    .with_timeout(timeout)
+                    .with_operation_deadline(operation_deadline);
+            let provider_runner = github_budget.map_or(provider_runner.clone(), |budget| {
+                provider_runner.with_github_request_budget(budget.clone())
+            });
+            provider = GitHubMutationAdapter::new(provider_runner);
+        } else {
+            status =
+                read::status_with_deadline_and_budget(context, operation_deadline, github_budget)?;
+        }
         let observed = status.analysis.pull_requests.get(&number).ok_or_else(|| {
             AppError::structured(
                 ErrorCategory::ExecutionFailure,

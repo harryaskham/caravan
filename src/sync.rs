@@ -47,6 +47,7 @@ const MAX_PARALLEL_REBASE_CHAINS: usize = 2;
 const AUTO_ADMISSION_SKIP_LABEL: &str = "caravan-join-skipped";
 const AUTO_ADMISSION_SKIP_PREFIX: &str = "<!-- caravan-auto-join-skip-receipt:";
 const MAX_AUTO_ADMISSION_COMMENT_BYTES: usize = 60 * 1024;
+const MAX_RESERVED_CANDIDATE_BUDGET_SECS: u64 = 30;
 /// Evolvable deterministic best-effort queue heuristic exposed in receipts.
 pub const AUTO_ADMISSION_HEURISTIC_VERSION: &str = "priority_fifo_greedy_v1";
 
@@ -342,6 +343,10 @@ pub struct AutoAdmissionOutput {
     pub mutation_limit: u32,
     pub github_requests_used: u32,
     pub github_request_limit: u32,
+    /// Minimum wall-clock budget reserved before starting exact candidate Git work.
+    pub candidate_budget_reserved_ms: u64,
+    /// Wall-clock budget still available at the end of this admission phase.
+    pub candidate_budget_remaining_ms: u64,
     #[serde(default)]
     pub joins: Vec<AutoAdmissionJoinReceipt>,
     #[serde(default)]
@@ -361,6 +366,8 @@ impl Default for AutoAdmissionOutput {
             mutation_limit: 0,
             github_requests_used: 0,
             github_request_limit: 0,
+            candidate_budget_reserved_ms: 0,
+            candidate_budget_remaining_ms: 0,
             joins: Vec::new(),
             skips: Vec::new(),
             remaining_candidates: Vec::new(),
@@ -384,6 +391,8 @@ impl AutoAdmissionOutput {
             mutation_limit: context.config.sync.max_mutations_per_tick,
             github_requests_used: 0,
             github_request_limit: context.config.sync.max_github_requests_per_tick,
+            candidate_budget_reserved_ms: duration_millis(reserved_candidate_budget(context)),
+            candidate_budget_remaining_ms: 0,
             joins: Vec::new(),
             skips: Vec::new(),
             remaining_candidates: Vec::new(),
@@ -1758,6 +1767,15 @@ fn merge_sync_progress(target: &mut SyncProgress, mut source: SyncProgress) {
     target.merge_candidates = source.merge_candidates;
 }
 
+fn reserved_candidate_budget(context: &AppContext) -> Duration {
+    Duration::from_secs(
+        context
+            .config
+            .command_timeout_secs
+            .clamp(1, MAX_RESERVED_CANDIDATE_BUDGET_SECS),
+    )
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_auto_admission(
     context: &AppContext,
@@ -1776,6 +1794,10 @@ fn run_auto_admission(
         mutation_limit: context.config.sync.max_mutations_per_tick,
         github_requests_used: github_budget.used(),
         github_request_limit: github_budget.limit(),
+        candidate_budget_reserved_ms: duration_millis(reserved_candidate_budget(context)),
+        candidate_budget_remaining_ms: duration_millis(
+            operation_deadline.saturating_duration_since(Instant::now()),
+        ),
         joins: Vec::new(),
         skips: Vec::new(),
         remaining_candidates: Vec::new(),
@@ -1939,9 +1961,16 @@ fn run_auto_admission(
                     format!("canonical candidate #{next_pr} disappeared"),
                 )
             })?;
+        let remaining = operation_deadline.saturating_duration_since(Instant::now());
+        output.candidate_budget_remaining_ms = duration_millis(remaining);
+        if remaining < reserved_candidate_budget(context) {
+            output.continuation = AutoAdmissionContinuation::DeadlineExhausted;
+            break;
+        }
         output.candidates_considered += 1;
         let evaluation = evaluate_auto_candidate(&status, &candidate, &checker)?;
 
+        let mut admitted_this_iteration = false;
         if matches!(evaluation.target, AutoCandidateTarget::Skip) {
             if !has_mutation_capacity(context, progress, 2) {
                 output.continuation = AutoAdmissionContinuation::MutationBudgetExhausted;
@@ -1983,6 +2012,7 @@ fn run_auto_admission(
             }
             let membership = crate::membership::auto_admit_locked(
                 context,
+                status.clone(),
                 candidate.number,
                 target_tail,
                 candidate_order.priority_label,
@@ -1990,6 +2020,7 @@ fn run_auto_admission(
                 github_budget,
             )?;
             append_membership_progress(progress, &membership);
+            admitted_this_iteration = true;
             output.joins.push(AutoAdmissionJoinReceipt {
                 candidate_pr: candidate.number,
                 target_tail,
@@ -1997,11 +2028,16 @@ fn run_auto_admission(
             });
         }
 
-        status = read::status_with_deadline_and_budget(
-            context,
-            operation_deadline,
-            Some(github_budget),
-        )?;
+        let refresh_deadline = if admitted_this_iteration {
+            std::cmp::max(
+                operation_deadline,
+                Instant::now() + Duration::from_secs(context.config.command_timeout_secs),
+            )
+        } else {
+            operation_deadline
+        };
+        status =
+            read::status_with_deadline_and_budget(context, refresh_deadline, Some(github_budget))?;
         progress.current = status.analysis.pull_requests.clone();
         progress.merge_candidates = status
             .merge_candidates
@@ -2013,6 +2049,8 @@ fn run_auto_admission(
 
     output.mutations_used = completed_mutation_count(progress);
     output.github_requests_used = github_budget.used();
+    output.candidate_budget_remaining_ms =
+        duration_millis(operation_deadline.saturating_duration_since(Instant::now()));
     output.remaining_candidates = status
         .admission
         .candidates
@@ -2810,6 +2848,8 @@ fn checkpoint_auto_admission(output: &AutoAdmissionOutput) -> Value {
         "mutation_limit": output.mutation_limit,
         "github_requests_used": output.github_requests_used,
         "github_request_limit": output.github_request_limit,
+        "candidate_budget_reserved_ms": output.candidate_budget_reserved_ms,
+        "candidate_budget_remaining_ms": output.candidate_budget_remaining_ms,
         "joins": bounded_checkpoint_sequence(output.joins.iter().map(|join| json!({
             "candidate_pr": join.candidate_pr,
             "target_tail": join.target_tail,

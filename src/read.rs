@@ -918,6 +918,16 @@ pub fn check(context: &AppContext, input: &CheckInput) -> Result<CheckOutput, Ap
     check_analysis(&status, input, &checker)
 }
 
+fn duration_millis(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// One fleet snapshot with a fresh deadline reserved for exact candidate work.
+pub(crate) struct BoundRemoteCandidateStatus {
+    pub status: StatusOutput,
+    pub exact_deadline: std::time::Instant,
+}
+
 /// Discover the fleet and bind one exact remote candidate without checkout mutation.
 pub(crate) fn status_for_remote_candidate(
     context: &AppContext,
@@ -925,26 +935,38 @@ pub(crate) fn status_for_remote_candidate(
 ) -> Result<StatusOutput, AppError> {
     let deadline = std::time::Instant::now()
         + std::time::Duration::from_secs(context.config.command_timeout_secs);
-    status_for_remote_candidate_with_deadline(context, number, deadline, None)
+    Ok(status_for_remote_candidate_with_deadline(context, number, deadline, None)?.status)
 }
 
-/// Bind one exact remote candidate under a caller-owned deadline and GitHub budget.
+/// Discover under the caller's fleet deadline, then reserve a fresh exact-candidate budget.
 pub(crate) fn status_for_remote_candidate_with_deadline(
     context: &AppContext,
     number: PrNumber,
-    operation_deadline: std::time::Instant,
+    discovery_deadline: std::time::Instant,
     github_budget: Option<&crate::command::GithubRequestBudget>,
-) -> Result<StatusOutput, AppError> {
-    let mut status = status_with_deadline_and_budget(context, operation_deadline, github_budget)?;
+) -> Result<BoundRemoteCandidateStatus, AppError> {
+    let status = status_with_deadline_and_budget(context, discovery_deadline, github_budget)?;
+    bind_remote_candidate_from_status(context, status, number, github_budget)
+}
+
+/// Bind one selected PR from already-discovered fleet facts under a fresh budget.
+/// This avoids repeating unrelated fleet compatibility during sync-owned admission.
+pub(crate) fn bind_remote_candidate_from_status(
+    context: &AppContext,
+    mut status: StatusOutput,
+    number: PrNumber,
+    github_budget: Option<&crate::command::GithubRequestBudget>,
+) -> Result<BoundRemoteCandidateStatus, AppError> {
+    let exact_budget = std::time::Duration::from_secs(context.config.command_timeout_secs);
+    let exact_started = std::time::Instant::now();
+    let exact_deadline = exact_started + exact_budget;
     // Re-read the selected provider PR after fleet discovery. Comparing the
     // complete snapshot closes the discovery/refetch race before exact Git
     // revision checks; merge compatibility subsequently verifies refs both
     // before and after its fetch.
     let provider_runner = crate::command::ProcessRunner::in_directory(&context.repository_path)
-        .with_timeout(std::time::Duration::from_secs(
-            context.config.command_timeout_secs,
-        ))
-        .with_operation_deadline(operation_deadline);
+        .with_timeout(exact_budget)
+        .with_operation_deadline(exact_deadline);
     let provider_runner = github_budget.map_or(provider_runner.clone(), |budget| {
         provider_runner.with_github_request_budget(budget.clone())
     });
@@ -952,13 +974,36 @@ pub(crate) fn status_for_remote_candidate_with_deadline(
     let fresh = provider
         .refetch_pull_request(&status.repository, number)
         .map_err(|error| {
+            let timeout = matches!(
+                &error,
+                crate::github::MutationError::Provider(DiscoveryError::Runner(
+                    CommandRunError::Timeout { .. }
+                ))
+            );
             AppError::structured(
-                ErrorCategory::ExecutionFailure,
-                "candidate_refetch_failed",
+                if timeout {
+                    ErrorCategory::Timeout
+                } else {
+                    ErrorCategory::ExecutionFailure
+                },
+                if timeout {
+                    "candidate_refetch_timeout"
+                } else {
+                    "candidate_refetch_failed"
+                },
                 error.to_string(),
-                Some(json!({"pr": number, "safe_next_action": "retry the read-only preflight"})),
+                Some(json!({
+                    "stage": "exact_candidate",
+                    "phase": "provider_refetch",
+                    "pr": number,
+                    "elapsed_ms": duration_millis(exact_started.elapsed()),
+                    "deadline_ms": duration_millis(exact_budget),
+                    "safe_next_action": "retry the read-only exact-candidate preflight",
+                    "mutated": false,
+                })),
             )
         })?;
+    let refetch_elapsed = exact_started.elapsed();
     let discovered = status.analysis.pull_requests.get(&number).ok_or_else(|| {
         AppError::validation(
             "candidate_not_found",
@@ -977,7 +1022,30 @@ pub(crate) fn status_for_remote_candidate_with_deadline(
     status
         .provider_api
         .merge(provider_runner.github_api_telemetry());
-    Ok(status)
+    let exact_elapsed = exact_started.elapsed();
+    let timing = status.timing.get_or_insert_with(|| StatusTiming {
+        deadline_ms: 0,
+        total_ms: 0,
+        phases_ms: std::collections::BTreeMap::new(),
+    });
+    timing.deadline_ms = timing
+        .deadline_ms
+        .saturating_add(duration_millis(exact_budget));
+    timing.total_ms = timing
+        .total_ms
+        .saturating_add(duration_millis(exact_elapsed));
+    timing.phases_ms.insert(
+        "exact_candidate_provider_refetch".to_owned(),
+        duration_millis(refetch_elapsed),
+    );
+    timing.phases_ms.insert(
+        "exact_candidate_merge_identity".to_owned(),
+        duration_millis(exact_elapsed.saturating_sub(refetch_elapsed)),
+    );
+    Ok(BoundRemoteCandidateStatus {
+        status,
+        exact_deadline,
+    })
 }
 
 fn require_fresh_candidate(

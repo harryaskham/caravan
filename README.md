@@ -456,8 +456,13 @@ generations, compatibility reasons, config fingerprint, actor/time, and
 heuristic version in a GitHub comment and adds `caravan-join-skipped`. Manual
 `new`/`join`/`rejoin` consumes that advisory label. One tick is bounded by the
 configured wall-clock, authenticated `gh` request, candidate, and mutation
-limits and returns exact joins, skips, remaining candidates, and continuation.
-Hosted automation should run bounded `cara loop --once` ticks from PR/check,
+limits. Cara will not start another automatic candidate when less than a real
+bounded exact-Git reserve remains; the receipt exposes reserved/remaining
+milliseconds and leaves that candidate for a later tick. Once selected,
+sync-owned membership reuses the already-discovered fleet snapshot and receives
+a fresh exact-candidate deadline instead of re-running unrelated fleet
+compatibility. The result returns exact joins, skips, remaining candidates, and
+continuation. Hosted automation should run bounded `cara loop --once` ticks from PR/check,
 workflow, default-branch, and scheduled events rather than one unbounded job.
 
 This proves cumulative *tree content*, not stable GitHub check identity. Because
@@ -492,7 +497,13 @@ Discovery performs one bounded all-open PR query containing current check
 rollups, derives the current PR and caravan-labelled members from that snapshot,
 and uses a separate bounded merged-history query that deliberately omits check
 rollups. Provider command count therefore remains constant as open PR count
-grows; compatibility subprocesses share the same whole-status deadline.
+grows; compatibility subprocesses share the same whole-status deadline. Explicit
+remote `check/new/join/rejoin --pr` first completes that bounded fleet discovery,
+then re-reads and binds only the selected PR under a fresh
+`command_timeout_secs` deadline. Its status timing adds
+`exact_candidate_provider_refetch` and `exact_candidate_merge_identity`; later
+compatibility, physical Git, provider mutation, and post-rewrite rediscovery use
+the independently reserved exact deadline and still refuse any head/base drift.
 
 Hooks receive one versioned `CaravanEvent` JSON object on stdin plus non-secret
 `CARA_EVENT`, `CARA_EVENT_ID`, `CARA_OPERATION_ID`, `CARA_REPOSITORY`,

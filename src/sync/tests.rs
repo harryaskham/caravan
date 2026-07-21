@@ -924,6 +924,51 @@ fn skip_receipt_round_trips_and_invalidates_on_generation_change() {
 }
 
 #[test]
+fn forty_candidate_auto_admission_preserves_nonzero_exact_git_budget() {
+    let mut candidates = (1..=40)
+        .map(|number| {
+            let mut candidate = pull_request(
+                number,
+                &format!("candidate-{number}"),
+                "main",
+                PullRequestState::Open,
+                AutoMergeState::disabled(),
+            );
+            candidate.labels.clear();
+            candidate
+        })
+        .collect::<Vec<_>>();
+    let provider = FakeProvider::with_pull_requests(candidates.clone());
+    let status = status(std::mem::take(&mut candidates), None, &clean);
+    let mut context = AppContext::default();
+    context.config.sync.actions.join_unlabelled_prs = true;
+    context.config.command_timeout_secs = 30;
+    context.config.sync.max_candidates_per_tick = 40;
+    let mut progress = SyncProgress::new(&status, Vec::new(), u32::MAX);
+    let github_budget = crate::command::GithubRequestBudget::new(100);
+
+    let (_status, output) = run_auto_admission(
+        &context,
+        status,
+        &provider,
+        &mut progress,
+        Instant::now() + Duration::from_secs(5),
+        &github_budget,
+    )
+    .unwrap();
+
+    assert_eq!(
+        output.continuation,
+        AutoAdmissionContinuation::DeadlineExhausted
+    );
+    assert_eq!(output.candidates_considered, 0);
+    assert_eq!(output.candidate_budget_reserved_ms, 30_000);
+    assert!(output.candidate_budget_remaining_ms <= 5_000);
+    assert_eq!(output.remaining_candidates.len(), 40);
+    assert!(provider.calls.borrow().is_empty());
+}
+
+#[test]
 fn persist_skip_is_idempotent_and_manual_membership_can_consume_the_label() {
     let mut candidate = pull_request(
         9,
