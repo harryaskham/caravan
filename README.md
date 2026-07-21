@@ -458,7 +458,10 @@ currently implemented.
 
 `command_timeout_secs` is the hard ceiling for lightweight `git` or `gh`
 children and the complete operator-safe budget for `cara status` (30 seconds by
-default). Network-heavy repair clone/fetch/checkout uses the separately bounded
+default). Stdout and stderr have independent hard capture bounds; exceeding one
+returns `command_output_limit` with exact total/limit bytes and separate bounded
+prefix/suffix evidence before JSON decoding, never a misleading malformed-JSON
+error. Network-heavy repair clone/fetch/checkout uses the separately bounded
 `repair.materialization_timeout_secs` (180 seconds by default), and persisted
 repair status reports its exact phase, budget, process group, partial path, last
 error, and resume/abort path. Exact retries reuse verified partial objects after

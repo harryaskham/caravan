@@ -22,6 +22,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 // while stderr remains a small evidence stream.
 const MAX_STDOUT_CAPTURE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_STDERR_CAPTURE_BYTES: usize = 64 * 1024;
+const OUTPUT_LIMIT_EVIDENCE_BYTES: usize = 4 * 1024;
 const GITHUB_AUTH_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 static GITHUB_AUTH_CACHE: OnceLock<Mutex<HashMap<String, Option<GithubAuthSelection>>>> =
@@ -180,6 +181,16 @@ impl CommandOutput {
     }
 }
 
+/// Bounded prefix/suffix evidence for one completely drained child stream.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct StreamCaptureEvidence {
+    pub limit_bytes: usize,
+    pub total_bytes: u64,
+    pub truncated: bool,
+    pub prefix: String,
+    pub suffix: String,
+}
+
 /// Failure to start a subprocess or decode its output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandRunError {
@@ -207,6 +218,17 @@ pub enum CommandRunError {
         stream: &'static str,
         /// Decoder error text.
         message: String,
+    },
+    /// One or both completely drained output streams exceeded their independent bound.
+    OutputLimit {
+        /// Requested command.
+        command: CommandSpec,
+        /// Child exit status, retained even though output cannot be consumed safely.
+        code: Option<i32>,
+        /// Independently bounded stdout evidence.
+        stdout: Box<StreamCaptureEvidence>,
+        /// Independently bounded stderr evidence.
+        stderr: Box<StreamCaptureEvidence>,
     },
     /// The child exceeded its hard deadline and was terminated and reaped.
     Timeout {
@@ -250,6 +272,20 @@ impl std::fmt::Display for CommandRunError {
                 formatter,
                 "`{}` emitted invalid UTF-8 on {stream}: {message}",
                 command.display()
+            ),
+            Self::OutputLimit {
+                command,
+                stdout,
+                stderr,
+                ..
+            } => write!(
+                formatter,
+                "`{}` exceeded its output capture bound (stdout {}/{}, stderr {}/{})",
+                command.display(),
+                stdout.total_bytes,
+                stdout.limit_bytes,
+                stderr.total_bytes,
+                stderr.limit_bytes,
             ),
             Self::Timeout {
                 command,
@@ -325,6 +361,8 @@ pub struct ProcessRunner {
     operation_deadline: Option<Instant>,
     github_request_budget: Option<GithubRequestBudget>,
     infer_github_auth: bool,
+    stdout_capture_limit: usize,
+    stderr_capture_limit: usize,
     github_api_telemetry: Arc<Mutex<crate::model::GitHubApiTelemetry>>,
 }
 
@@ -336,6 +374,8 @@ impl Default for ProcessRunner {
             operation_deadline: None,
             github_request_budget: None,
             infer_github_auth: true,
+            stdout_capture_limit: MAX_STDOUT_CAPTURE_BYTES,
+            stderr_capture_limit: MAX_STDERR_CAPTURE_BYTES,
             github_api_telemetry: Arc::new(Mutex::new(crate::model::GitHubApiTelemetry::default())),
         }
     }
@@ -357,6 +397,8 @@ impl ProcessRunner {
             operation_deadline: None,
             github_request_budget: None,
             infer_github_auth: true,
+            stdout_capture_limit: MAX_STDOUT_CAPTURE_BYTES,
+            stderr_capture_limit: MAX_STDERR_CAPTURE_BYTES,
             github_api_telemetry: Arc::new(Mutex::new(crate::model::GitHubApiTelemetry::default())),
         }
     }
@@ -383,6 +425,14 @@ impl ProcessRunner {
     #[must_use]
     pub fn with_operation_deadline(mut self, deadline: Instant) -> Self {
         self.operation_deadline = Some(deadline);
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn with_capture_limits(mut self, stdout: usize, stderr: usize) -> Self {
+        self.stdout_capture_limit = stdout.max(1);
+        self.stderr_capture_limit = stderr.max(1);
         self
     }
 
@@ -759,8 +809,10 @@ impl CommandRunner for ProcessRunner {
             });
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
-        let stdout_reader = thread::spawn(move || capture(stdout, MAX_STDOUT_CAPTURE_BYTES));
-        let stderr_reader = thread::spawn(move || capture(stderr, MAX_STDERR_CAPTURE_BYTES));
+        let stdout_limit = self.stdout_capture_limit;
+        let stderr_limit = self.stderr_capture_limit;
+        let stdout_reader = thread::spawn(move || capture(stdout, stdout_limit));
+        let stderr_reader = thread::spawn(move || capture(stderr, stderr_limit));
         let deadline = Instant::now() + timeout;
 
         let (status, timed_out) = loop {
@@ -814,20 +866,30 @@ impl CommandRunner for ProcessRunner {
                 command: request.clone(),
                 process_group_id: Some(child_process_group),
                 timeout_ms: duration_millis(timeout),
-                stdout: String::from_utf8_lossy(&stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                stdout: stdout.diagnostic_text(),
+                stderr: stderr.diagnostic_text(),
             });
         }
-        let stdout = String::from_utf8(stdout).map_err(|error| CommandRunError::InvalidUtf8 {
-            command: request.clone(),
-            stream: "stdout",
-            message: error.to_string(),
-        })?;
-        let stderr = String::from_utf8(stderr).map_err(|error| CommandRunError::InvalidUtf8 {
-            command: request.clone(),
-            stream: "stderr",
-            message: error.to_string(),
-        })?;
+        if stdout.truncated || stderr.truncated {
+            return Err(CommandRunError::OutputLimit {
+                command: request.clone(),
+                code: status.code(),
+                stdout: Box::new(stdout.evidence(self.stdout_capture_limit)),
+                stderr: Box::new(stderr.evidence(self.stderr_capture_limit)),
+            });
+        }
+        let stdout =
+            String::from_utf8(stdout.bytes).map_err(|error| CommandRunError::InvalidUtf8 {
+                command: request.clone(),
+                stream: "stdout",
+                message: error.to_string(),
+            })?;
+        let stderr =
+            String::from_utf8(stderr.bytes).map_err(|error| CommandRunError::InvalidUtf8 {
+                command: request.clone(),
+                stream: "stderr",
+                message: error.to_string(),
+            })?;
 
         let output = CommandOutput {
             code: status.code(),
@@ -843,31 +905,80 @@ impl CommandRunner for ProcessRunner {
     }
 }
 
-fn capture(mut stream: impl Read, limit: usize) -> std::io::Result<Vec<u8>> {
+struct CapturedStream {
+    bytes: Vec<u8>,
+    suffix: Vec<u8>,
+    total_bytes: u64,
+    truncated: bool,
+}
+
+impl CapturedStream {
+    fn evidence(&self, limit_bytes: usize) -> StreamCaptureEvidence {
+        StreamCaptureEvidence {
+            limit_bytes,
+            total_bytes: self.total_bytes,
+            truncated: self.truncated,
+            prefix: String::from_utf8_lossy(
+                &self.bytes[..self.bytes.len().min(OUTPUT_LIMIT_EVIDENCE_BYTES)],
+            )
+            .into_owned(),
+            suffix: String::from_utf8_lossy(&self.suffix).into_owned(),
+        }
+    }
+
+    fn diagnostic_text(&self) -> String {
+        let evidence = self.evidence(self.bytes.len());
+        if self.total_bytes <= u64::try_from(self.bytes.len()).unwrap_or(u64::MAX) {
+            return String::from_utf8_lossy(&self.bytes).into_owned();
+        }
+        format!(
+            "{}\n...[{} bytes omitted]...\n{}",
+            evidence.prefix,
+            self.total_bytes.saturating_sub(
+                u64::try_from(evidence.prefix.len() + evidence.suffix.len()).unwrap_or(u64::MAX)
+            ),
+            evidence.suffix
+        )
+    }
+}
+
+fn capture(mut stream: impl Read, limit: usize) -> std::io::Result<CapturedStream> {
     let mut captured = Vec::new();
+    let mut suffix = Vec::new();
+    let mut total_bytes = 0_u64;
     let mut buffer = [0_u8; 8 * 1024];
-    let mut truncated = false;
     loop {
         let count = stream.read(&mut buffer)?;
         if count == 0 {
             break;
         }
+        total_bytes = total_bytes.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
         let remaining = limit.saturating_sub(captured.len());
         let retained = remaining.min(count);
         captured.extend_from_slice(&buffer[..retained]);
-        truncated |= retained < count;
+        if count >= OUTPUT_LIMIT_EVIDENCE_BYTES {
+            suffix.clear();
+            suffix.extend_from_slice(&buffer[count - OUTPUT_LIMIT_EVIDENCE_BYTES..count]);
+        } else {
+            suffix.extend_from_slice(&buffer[..count]);
+            if suffix.len() > OUTPUT_LIMIT_EVIDENCE_BYTES {
+                suffix.drain(..suffix.len() - OUTPUT_LIMIT_EVIDENCE_BYTES);
+            }
+        }
     }
-    if truncated {
-        captured.extend_from_slice(b"\n...[truncated]");
-    }
-    Ok(captured)
+    Ok(CapturedStream {
+        truncated: total_bytes > u64::try_from(limit).unwrap_or(u64::MAX),
+        bytes: captured,
+        suffix,
+        total_bytes,
+    })
 }
 
 fn join_capture(
-    handle: thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    handle: thread::JoinHandle<std::io::Result<CapturedStream>>,
     request: &CommandSpec,
     stream: &'static str,
-) -> Result<Vec<u8>, CommandRunError> {
+) -> Result<CapturedStream, CommandRunError> {
     handle
         .join()
         .map_err(|_| CommandRunError::Spawn {
@@ -1037,6 +1148,56 @@ mod tests {
         assert!(output.stderr.contains("wrapper diagnostic"));
         assert!(output.stderr.contains('\u{1}'));
         assert!(!output.stdout.contains("wrapper diagnostic"));
+    }
+
+    #[test]
+    fn output_limit_is_typed_with_independent_prefix_suffix_evidence() {
+        let error = ProcessRunner::new()
+            .with_capture_limits(32, 24)
+            .run(&CommandSpec::new("sh").args([
+                "-c",
+                "printf 'stdout-BEGIN-'; printf '%080d' 0; printf -- '-stdout-END'; printf 'stderr-BEGIN-' >&2; printf '%060d' 0 >&2; printf -- '-stderr-END' >&2",
+            ]))
+            .expect_err("both streams exceed independent bounds");
+        let CommandRunError::OutputLimit {
+            code,
+            stdout,
+            stderr,
+            ..
+        } = error
+        else {
+            panic!("expected output limit");
+        };
+        assert_eq!(code, Some(0));
+        assert!(stdout.truncated);
+        assert!(stderr.truncated);
+        assert_eq!(stdout.limit_bytes, 32);
+        assert_eq!(stderr.limit_bytes, 24);
+        assert!(stdout.total_bytes > 32);
+        assert!(stderr.total_bytes > 24);
+        assert!(stdout.prefix.starts_with("stdout-BEGIN-"));
+        assert!(stdout.suffix.ends_with("-stdout-END"));
+        assert!(stderr.prefix.starts_with("stderr-BEGIN-"));
+        assert!(stderr.suffix.ends_with("-stderr-END"));
+        assert!(!stdout.prefix.contains("stderr"));
+    }
+
+    #[test]
+    fn stderr_limit_does_not_truncate_or_reclassify_stdout() {
+        let error = ProcessRunner::new()
+            .with_capture_limits(64, 8)
+            .run(&CommandSpec::new("sh").args([
+                "-c",
+                "printf valid-json; printf 'diagnostic-that-is-too-long' >&2",
+            ]))
+            .expect_err("stderr alone exceeds its independent bound");
+        let CommandRunError::OutputLimit { stdout, stderr, .. } = error else {
+            panic!("expected output limit");
+        };
+        assert!(!stdout.truncated);
+        assert_eq!(stdout.prefix, "valid-json");
+        assert!(stderr.truncated);
+        assert_eq!(stderr.limit_bytes, 8);
     }
 
     #[cfg(unix)]

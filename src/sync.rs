@@ -5018,11 +5018,39 @@ fn comment_mutation_error(
     )
 }
 
+#[allow(clippy::too_many_lines)]
 fn mutation_error(
     error: &MutationError,
     progress: &SyncProgress,
     affected_pr: Option<PrNumber>,
 ) -> AppError {
+    if let MutationError::Provider(DiscoveryError::Runner(CommandRunError::OutputLimit {
+        command,
+        code,
+        stdout,
+        stderr,
+    })) = error
+    {
+        return AppError::structured(
+            ErrorCategory::ExecutionFailure,
+            "command_output_limit",
+            error.to_string(),
+            Some(json!({
+                "stage": "github_mutation_output",
+                "command": command.display(),
+                "exit_code": code,
+                "stdout": stdout,
+                "stderr": stderr,
+                "streams_combined": false,
+                "operation_receipt": progress.operation_receipt(),
+                "provider_receipts": progress.provider_receipts,
+                "events": progress.events,
+                "affected_pr": affected_pr,
+                "resumable": true,
+                "next": "reduce provider output, rediscover, and rerun the same `cara sync` command",
+            })),
+        );
+    }
     if let MutationError::Provider(DiscoveryError::Runner(CommandRunError::Timeout {
         command,
         timeout_ms,

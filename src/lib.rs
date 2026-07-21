@@ -272,7 +272,10 @@ RECOVERY, LOCKS, AND OBSERVABILITY
 - `cara show`, `next`, `prev`, and `van list|next|prev` are navigation surfaces;
   they never authorize skipping admission or mutation preflight.
 - `--json` and MCP return the same typed envelopes and schemas. Unknown provider
-  values are preserved rather than guessed into success.
+  values are preserved rather than guessed into success. A subprocess exceeding
+  its independent stdout/stderr capture bound returns `command_output_limit`
+  with total bytes and bounded separate prefix/suffix evidence; truncated JSON
+  is never passed to a decoder or misreported as malformed provider data.
 - GitHub credentials are selected statelessly per repository. Cara parses the
   origin host/owner, first accepts an ambient `GH_TOKEN`/`GITHUB_TOKEN` only if
   it can read that exact repository, then tries the stored token for the owner

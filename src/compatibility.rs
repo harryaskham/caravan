@@ -509,6 +509,30 @@ where
 }
 
 fn command_run_error(error: &CommandRunError) -> AppError {
+    if let CommandRunError::OutputLimit {
+        command,
+        code,
+        stdout,
+        stderr,
+    } = error
+    {
+        return AppError::structured(
+            ErrorCategory::ExecutionFailure,
+            "command_output_limit",
+            error.to_string(),
+            Some(json!({
+                "stage": "git_compatibility_output",
+                "command": command.display(),
+                "exit_code": code,
+                "stdout": stdout,
+                "stderr": stderr,
+                "streams_combined": false,
+                "mutated": false,
+                "resumable": true,
+                "next": "reduce the Git output/query and retry from exact revisions",
+            })),
+        );
+    }
     if let CommandRunError::Timeout {
         command,
         timeout_ms,

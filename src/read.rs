@@ -1496,7 +1496,32 @@ fn eligible_or_error(
     ))
 }
 
+#[allow(clippy::too_many_lines)]
 fn discovery_error(error: &DiscoveryError) -> AppError {
+    if let DiscoveryError::Runner(CommandRunError::OutputLimit {
+        command,
+        code,
+        stdout,
+        stderr,
+    }) = error
+    {
+        return AppError::structured(
+            ErrorCategory::ExecutionFailure,
+            "command_output_limit",
+            error.to_string(),
+            Some(json!({
+                "stage": "github_command_output",
+                "command": command.display(),
+                "exit_code": code,
+                "stdout": stdout,
+                "stderr": stderr,
+                "streams_combined": false,
+                "mutated": false,
+                "resumable": true,
+                "safe_next_action": "reduce the bounded provider query/output, then retry; do not parse truncated JSON",
+            })),
+        );
+    }
     if let DiscoveryError::Runner(CommandRunError::GithubRequestBudgetExceeded {
         command,
         limit,
@@ -1892,6 +1917,36 @@ mod tests {
         assert_eq!(details["streams_combined"], false);
         assert_eq!(details["stderr"], "wrapper diagnostic\u{1}");
         assert!(details["stdout"].as_str().unwrap().contains("bad"));
+    }
+
+    #[test]
+    fn provider_output_limit_is_typed_before_json_decode() {
+        let error = discovery_error(&DiscoveryError::Runner(CommandRunError::OutputLimit {
+            command: crate::command::CommandSpec::new("gh").args(["pr", "list"]),
+            code: Some(0),
+            stdout: Box::new(crate::command::StreamCaptureEvidence {
+                limit_bytes: 32,
+                total_bytes: 100,
+                truncated: true,
+                prefix: "[{\"number\":".to_owned(),
+                suffix: "}]".to_owned(),
+            }),
+            stderr: Box::new(crate::command::StreamCaptureEvidence {
+                limit_bytes: 16,
+                total_bytes: 0,
+                truncated: false,
+                prefix: String::new(),
+                suffix: String::new(),
+            }),
+        }));
+
+        assert_eq!(error.code(), "command_output_limit");
+        let details = error.details().unwrap();
+        assert_eq!(details["stage"], "github_command_output");
+        assert_eq!(details["stdout"]["total_bytes"], 100);
+        assert_eq!(details["stdout"]["limit_bytes"], 32);
+        assert_eq!(details["streams_combined"], false);
+        assert_eq!(details["mutated"], false);
     }
 
     #[test]

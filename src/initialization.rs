@@ -641,6 +641,32 @@ fn mismatch_error(
 
 #[allow(clippy::needless_pass_by_value)]
 fn provider_error(error: MutationError) -> AppError {
+    if let MutationError::Provider(crate::github::DiscoveryError::Runner(
+        crate::command::CommandRunError::OutputLimit {
+            command,
+            code,
+            stdout,
+            stderr,
+        },
+    )) = &error
+    {
+        return AppError::structured(
+            ErrorCategory::ExecutionFailure,
+            "command_output_limit",
+            error.to_string(),
+            Some(json!({
+                "stage": "repository_initialization_provider_output",
+                "command": command.display(),
+                "exit_code": code,
+                "stdout": stdout,
+                "stderr": stderr,
+                "streams_combined": false,
+                "mutated": false,
+                "resumable": true,
+                "next": "reduce provider output and rerun `cara init`; do not parse truncated JSON",
+            })),
+        );
+    }
     AppError::structured(
         ErrorCategory::ExecutionFailure,
         "repository_initialization_provider_failed",

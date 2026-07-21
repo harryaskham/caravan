@@ -321,7 +321,12 @@ No approval hook or interactive reason is required. Before accepting the externa
 
 ## 8. Decision points and errors
 
-Every failure is typed and machine-readable through CLI JSON and MCP. A repair decision includes, when relevant:
+Every failure is typed and machine-readable through CLI JSON and MCP. Child
+stdout and stderr have independent hard capture bounds. Exceeding either returns
+`command_output_limit` before provider JSON decoding, with exit status, exact
+total/limit bytes, and separate bounded prefix/suffix evidence for both streams;
+truncated JSON is never mislabeled as malformed provider output. A repair
+decision includes, when relevant:
 
 - repository and default-branch revisions;
 - caravan ID and full ordered PR graph;

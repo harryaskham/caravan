@@ -1811,6 +1811,32 @@ fn comment_error(error: &MutationError, state: &ExecutionState) -> AppError {
 }
 
 fn mutation_error(error: &MutationError, state: &ExecutionState) -> AppError {
+    if let MutationError::Provider(DiscoveryError::Runner(CommandRunError::OutputLimit {
+        command,
+        code,
+        stdout,
+        stderr,
+    })) = error
+    {
+        return AppError::structured(
+            ErrorCategory::ExecutionFailure,
+            "command_output_limit",
+            error.to_string(),
+            Some(json!({
+                "stage": "github_mutation_output",
+                "command": command.display(),
+                "exit_code": code,
+                "stdout": stdout,
+                "stderr": stderr,
+                "streams_combined": false,
+                "operation_id": state.operation_id,
+                "completed_steps": state.steps,
+                "provider_receipts": state.provider_receipts,
+                "resumable": true,
+                "next": format!("reduce provider output, rediscover, and rerun `cara {}`", state.operation.name()),
+            })),
+        );
+    }
     if let MutationError::Provider(DiscoveryError::Runner(
         CommandRunError::GithubRequestBudgetExceeded {
             command,
