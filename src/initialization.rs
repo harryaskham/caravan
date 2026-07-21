@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use mcp_cli::ErrorCategory;
 use schemars::JsonSchema;
@@ -133,6 +134,9 @@ pub struct RepositoryPreflightReceipt {
 pub struct InitOutput {
     pub repository: RepositoryId,
     pub ready: bool,
+    /// Fresh provider budgets checked before the first label mutation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limits: Option<crate::model::GitHubRateLimits>,
     pub config: ConfigReceipt,
     pub repository_preflight: RepositoryPreflightReceipt,
     pub labels: Vec<LabelReceipt>,
@@ -143,6 +147,10 @@ pub trait InitializationProvider {
     /// or verify moving PR/default-branch object IDs.
     fn repository_identity(&self) -> Result<(RepositoryId, String), MutationError>;
     fn labels(&self, repository: &RepositoryId) -> Result<Vec<RepositoryLabel>, MutationError>;
+    fn rate_limits(
+        &self,
+        repository: &RepositoryId,
+    ) -> Result<crate::model::GitHubRateLimits, MutationError>;
     fn permission(&self, repository: &RepositoryId) -> Result<String, MutationError>;
     fn allows_auto_merge(&self, repository: &RepositoryId) -> Result<bool, MutationError>;
     fn branch_is_protected(
@@ -168,6 +176,12 @@ impl<R: crate::command::CommandRunner> InitializationProvider for GitHubMutation
     }
     fn labels(&self, repository: &RepositoryId) -> Result<Vec<RepositoryLabel>, MutationError> {
         self.repository_label_definitions(repository)
+    }
+    fn rate_limits(
+        &self,
+        _repository: &RepositoryId,
+    ) -> Result<crate::model::GitHubRateLimits, MutationError> {
+        self.rate_limits()
     }
     fn permission(&self, repository: &RepositoryId) -> Result<String, MutationError> {
         self.repository_permission(repository)
@@ -259,6 +273,73 @@ pub fn init(context: &AppContext) -> Result<InitOutput, AppError> {
     init_with_provider(context, &repository, &default_branch, &provider)
 }
 
+fn required_label_core_budget(required: &[RequiredLabel], current: &[RepositoryLabel]) -> u64 {
+    let missing = required
+        .iter()
+        .filter(|required| !current.iter().any(|label| label.name == required.name))
+        .count();
+    if missing == 0 {
+        return 0;
+    }
+    // Every required label is reread before its step. A missing label then
+    // needs create + authoritative reread; retain one extra reread plus one
+    // safety request for an indeterminate concurrent-create response.
+    u64::try_from(required.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(u64::try_from(missing).unwrap_or(u64::MAX).saturating_mul(3))
+        .saturating_add(1)
+}
+
+fn require_label_mutation_budget(
+    repository: &RepositoryId,
+    required: &[RequiredLabel],
+    current: &[RepositoryLabel],
+    limits: &crate::model::GitHubRateLimits,
+) -> Result<(), AppError> {
+    let required_requests = required_label_core_budget(required, current);
+    if required_requests == 0 || limits.core.remaining >= required_requests {
+        return Ok(());
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let pending_labels = required
+        .iter()
+        .filter(|required| !current.iter().any(|label| label.name == required.name))
+        .map(|label| label.name.clone())
+        .collect::<Vec<_>>();
+    let completed_labels = required
+        .iter()
+        .filter_map(|required| {
+            current
+                .iter()
+                .find(|label| label.name == required.name)
+                .filter(|actual| label_matches(actual, required))
+                .map(|actual| label_receipt_actual(actual, ResourceState::AlreadyPresent))
+        })
+        .collect::<Vec<_>>();
+    Err(AppError::structured(
+        ErrorCategory::Timeout,
+        "github_rest_rate_limit_wait",
+        "GitHub REST core budget is too low for bounded repository-label initialization",
+        Some(json!({
+            "repository": repository,
+            "resource": "core",
+            "rate_limit": limits.core,
+            "graphql_rate_limit": limits.graphql,
+            "required_requests": required_requests,
+            "pending_labels": pending_labels,
+            "completed_labels": completed_labels,
+            "mutation": false,
+            "retryable": true,
+            "reset_unix_secs": limits.core.reset_unix_secs,
+            "retry_after_secs": limits.core.reset_unix_secs.saturating_sub(now),
+            "next": "wait until the reported REST core reset, then rerun the same idempotent `cara init`; do not hot-loop or bypass label metadata checks",
+        })),
+    ))
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn init_with_provider(
     context: &AppContext,
@@ -326,6 +407,14 @@ pub fn init_with_provider(
     );
     let initial = provider.labels(repository).map_err(provider_error)?;
     reject_mismatches(repository, &initial, &required)?;
+    let required_core_requests = required_label_core_budget(&required, &initial);
+    let rate_limits = if required_core_requests == 0 {
+        None
+    } else {
+        let limits = provider.rate_limits(repository).map_err(provider_error)?;
+        require_label_mutation_budget(repository, &required, &initial, &limits)?;
+        Some(limits)
+    };
     let mut receipts = Vec::new();
     for required in &required {
         let current = provider.labels(repository).map_err(provider_error)?;
@@ -369,6 +458,7 @@ pub fn init_with_provider(
     Ok(InitOutput {
         repository: repository.clone(),
         ready: true,
+        rate_limits,
         config,
         repository_preflight: RepositoryPreflightReceipt {
             permission,
@@ -589,6 +679,8 @@ mod tests {
         auto_merge: bool,
         protected: bool,
         policy_ready: bool,
+        rate_limits: crate::model::GitHubRateLimits,
+        rate_probes: Mutex<u32>,
         fail_create_once: Mutex<bool>,
     }
 
@@ -600,6 +692,21 @@ mod tests {
                 auto_merge: true,
                 protected: true,
                 policy_ready: true,
+                rate_limits: crate::model::GitHubRateLimits {
+                    core: crate::model::GitHubRestRateLimit {
+                        limit: 5_000,
+                        used: 0,
+                        remaining: 5_000,
+                        reset_unix_secs: u64::MAX,
+                    },
+                    graphql: Some(crate::model::GitHubRestRateLimit {
+                        limit: 5_000,
+                        used: 0,
+                        remaining: 5_000,
+                        reset_unix_secs: u64::MAX,
+                    }),
+                },
+                rate_probes: Mutex::new(0),
                 fail_create_once: Mutex::new(false),
             }
         }
@@ -611,6 +718,13 @@ mod tests {
         }
         fn labels(&self, _: &RepositoryId) -> Result<Vec<RepositoryLabel>, MutationError> {
             Ok(self.labels.lock().unwrap().clone())
+        }
+        fn rate_limits(
+            &self,
+            _: &RepositoryId,
+        ) -> Result<crate::model::GitHubRateLimits, MutationError> {
+            *self.rate_probes.lock().unwrap() += 1;
+            Ok(self.rate_limits.clone())
         }
         fn permission(&self, _: &RepositoryId) -> Result<String, MutationError> {
             Ok(self.permission.to_owned())
@@ -685,6 +799,76 @@ mod tests {
             config_existed: false,
             config: crate::config::CaravanConfig::default(),
         }
+    }
+
+    #[test]
+    fn exhausted_rest_budget_stops_before_label_mutation_with_reset_receipt() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut provider = FakeProvider::new(Vec::new());
+        let reset = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 60;
+        provider.rate_limits.core.used = 5_003;
+        provider.rate_limits.core.remaining = 0;
+        provider.rate_limits.core.reset_unix_secs = reset;
+        provider.rate_limits.graphql.as_mut().unwrap().remaining = 4_999;
+
+        let error = init_with_provider(&context(&directory), &repository(), "main", &provider)
+            .expect_err("exhausted REST budget must stop before label creation");
+
+        assert_eq!(error.code(), "github_rest_rate_limit_wait");
+        let details = error.details().unwrap();
+        assert_eq!(details["resource"], "core");
+        assert_eq!(details["rate_limit"]["remaining"], 0);
+        assert_eq!(details["graphql_rate_limit"]["remaining"], 4_999);
+        assert_eq!(details["mutation"], false);
+        assert_eq!(details["reset_unix_secs"], reset);
+        assert!(details["retry_after_secs"].as_u64().unwrap() <= 60);
+        assert_eq!(*provider.rate_probes.lock().unwrap(), 1);
+        assert!(provider.labels.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn near_threshold_rest_budget_is_conservative_and_exact() {
+        let required_labels = required();
+        let required_requests = required_label_core_budget(&required_labels, &[]);
+
+        let low_directory = tempfile::tempdir().unwrap();
+        let mut low = FakeProvider::new(Vec::new());
+        low.rate_limits.core.remaining = required_requests - 1;
+        let error = init_with_provider(&context(&low_directory), &repository(), "main", &low)
+            .expect_err("one request below the bound must wait");
+        assert_eq!(error.code(), "github_rest_rate_limit_wait");
+        assert!(low.labels.lock().unwrap().is_empty());
+
+        let exact_directory = tempfile::tempdir().unwrap();
+        let mut exact = FakeProvider::new(Vec::new());
+        exact.rate_limits.core.remaining = required_requests;
+        let output = init_with_provider(&context(&exact_directory), &repository(), "main", &exact)
+            .expect("the exact conservative bound permits initialization");
+        assert!(output.ready);
+        assert_eq!(output.labels.len(), required_labels.len());
+        assert_eq!(
+            output.rate_limits.unwrap().core.remaining,
+            required_requests
+        );
+    }
+
+    #[test]
+    fn fully_initialized_repository_needs_no_rate_probe() {
+        let directory = tempfile::tempdir().unwrap();
+        let labels = required().iter().map(canonical).collect();
+        let mut provider = FakeProvider::new(labels);
+        provider.rate_limits.core.remaining = 0;
+
+        let output = init_with_provider(&context(&directory), &repository(), "main", &provider)
+            .expect("verification-only init uses no mutation budget");
+
+        assert!(output.ready);
+        assert!(output.rate_limits.is_none());
+        assert_eq!(*provider.rate_probes.lock().unwrap(), 0);
     }
 
     #[test]

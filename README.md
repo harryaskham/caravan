@@ -137,7 +137,12 @@ default-branch protection, and squash auto-merge policy, and creates only the
 three fixed control labels (`caravan`, `caravan-evicted`, and `caravan-force`),
 the opt-in `caravan-join-skipped` label when greedy admission is enabled, and
 configured priority labels. It never overwrites an existing config or label and
-never mutates a pull request. Repeated init calls are verification-only no-ops.
+never mutates a pull request. Repeated init calls are verification-only no-ops. Before creating any missing
+label, init reads the REST core rate-limit resource and requires a conservative
+budget for every bounded create/reread step. An exhausted or near-threshold
+budget returns `github_rest_rate_limit_wait` with exact core/GraphQL evidence,
+reset time/delay, completed/pending labels, and `mutation=false`; wait for reset
+rather than hot-looping. A fully initialized repository performs no rate probe.
 If label metadata differs, reconcile it manually and retry. The legacy active
 label `1D76DB` / `Active member of a Caravan merge chain` is explicitly
 compatible and preserved. See [`docs/first-use.md`](docs/first-use.md).

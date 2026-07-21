@@ -567,6 +567,15 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
         Ok(permission.viewer_permission)
     }
 
+    /// Read exact REST core and GraphQL rate-limit resources before mutation.
+    pub fn rate_limits(&self) -> Result<model::GitHubRateLimits, MutationError> {
+        let response: RateLimitResponseJson = self.json(rate_limit_command())?;
+        Ok(model::GitHubRateLimits {
+            core: response.resources.core.into(),
+            graphql: response.resources.graphql.map(Into::into),
+        })
+    }
+
     /// Create one repository label. Callers must re-read exact metadata after
     /// this command because provider timeout and concurrent creation are
     /// intentionally treated as indeterminate.
@@ -1886,6 +1895,10 @@ fn repository_labels_command(repository: &RepositoryId) -> CommandSpec {
     ])
 }
 
+fn rate_limit_command() -> CommandSpec {
+    CommandSpec::new("gh").args(["api", "rate_limit"])
+}
+
 fn create_repository_label_command(
     repository: &RepositoryId,
     name: &str,
@@ -2258,6 +2271,37 @@ struct RepositorySettingsJson {
 #[serde(rename_all = "camelCase")]
 struct RepositoryPermissionJson {
     viewer_permission: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RateLimitResponseJson {
+    resources: RateLimitResourcesJson,
+}
+
+#[derive(Debug, Deserialize)]
+struct RateLimitResourcesJson {
+    core: RateLimitResourceJson,
+    #[serde(default)]
+    graphql: Option<RateLimitResourceJson>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RateLimitResourceJson {
+    limit: u64,
+    used: u64,
+    remaining: u64,
+    reset: u64,
+}
+
+impl From<RateLimitResourceJson> for model::GitHubRestRateLimit {
+    fn from(resource: RateLimitResourceJson) -> Self {
+        Self {
+            limit: resource.limit,
+            used: resource.used,
+            remaining: resource.remaining,
+            reset_unix_secs: resource.reset,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -3758,6 +3802,26 @@ mod tests {
         assert!(!policy.strict_status_checks);
         assert_eq!(policy.required_approving_review_count, 2);
         assert!(policy.ready());
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn rate_limit_probe_preserves_core_and_graphql_resources() {
+        let runner = FakeRunner::new(vec![(
+            rate_limit_command(),
+            CommandOutput::success(
+                r#"{"resources":{"core":{"limit":5000,"used":5003,"remaining":0,"reset":1784584831},"graphql":{"limit":5000,"used":1,"remaining":4999,"reset":1784584800},"search":{"limit":30,"used":0,"remaining":30,"reset":1784584800}}}"#,
+            ),
+        )]);
+        let adapter = GitHubMutationAdapter::new(runner);
+
+        let limits = adapter.rate_limits().unwrap();
+
+        assert_eq!(limits.core.limit, 5_000);
+        assert_eq!(limits.core.used, 5_003);
+        assert_eq!(limits.core.remaining, 0);
+        assert_eq!(limits.core.reset_unix_secs, 1_784_584_831);
+        assert_eq!(limits.graphql.unwrap().remaining, 4_999);
         adapter.runner.assert_exhausted();
     }
 

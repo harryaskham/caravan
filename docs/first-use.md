@@ -9,10 +9,14 @@
    - verifies repository `WRITE` (or stronger) permission, squash auto-merge,
      and protected default-branch check/review policy;
    - creates missing canonical labels and verifies every result.
-3. Resolve a reported metadata mismatch manually. Cara never overwrites an
+3. If GitHub REST core budget is too low for every bounded label create/reread,
+   init returns `github_rest_rate_limit_wait` before provider mutation. Use its
+   exact reset/delay and pending/completed-label receipt; do not hot-loop. A
+   verification-only init with all exact labels present skips this probe.
+4. Resolve a reported metadata mismatch manually. Cara never overwrites an
    operator-owned label. Rerun `cara init`; retries and concurrent creation are
    safe and converge by exact re-read.
-4. Run `cara status` again, then use `new`, `join`, or `sync`.
+5. Run `cara status` again, then use `new`, `join`, or `sync`.
 
 Canonical labels:
 

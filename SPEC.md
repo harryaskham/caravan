@@ -124,6 +124,14 @@ preconditions.
   colors come from the stable rank palette `B60205`, `D93F0B`, `FBCA04`,
   `0E8A16`, `1D76DB`, `5319E7` (cycling for additional ranks), and descriptions
   identify the one-based rank and highest-priority direction.
+- Before the first missing-label mutation, init reads the authenticated GitHub
+  `rate_limit` resources and distinguishes REST `core` from GraphQL. It requires
+  a conservative request budget for all planned create and authoritative reread
+  steps. If core remaining is insufficient, init returns typed
+  `github_rest_rate_limit_wait` evidence with limit/used/remaining/reset,
+  retry delay, completed/pending labels, and `mutation=false`; it does not issue
+  a label create, wake repair, or encourage hot-looping. Verification-only init
+  with every exact label present needs no rate probe.
 - Exact existing labels no-op. The historical active-label definition
   `1D76DB` / `Active member of a Caravan merge chain` is also compatible and
   preserved byte-for-byte; receipts report its actual metadata. No other

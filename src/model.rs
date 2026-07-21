@@ -202,6 +202,23 @@ pub struct GitHubRateLimit {
     pub reset_at: String,
 }
 
+/// One GitHub REST rate-limit resource returned by `GET /rate_limit`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GitHubRestRateLimit {
+    pub limit: u64,
+    pub used: u64,
+    pub remaining: u64,
+    pub reset_unix_secs: u64,
+}
+
+/// Relevant REST and GraphQL budgets used before initialization mutations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GitHubRateLimits {
+    pub core: GitHubRestRateLimit,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graphql: Option<GitHubRestRateLimit>,
+}
+
 /// Secret-free authenticated GitHub command telemetry for one operation.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct GitHubApiTelemetry {
