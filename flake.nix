@@ -79,7 +79,7 @@
 
         caravan = pkgs.rustPlatform.buildRustPackage {
           pname = "caravan";
-          version = "0.0.5";
+          version = "0.0.6";
           src = caravanSrc;
 
           cargoLock.lockFile = "${caravanSrc}/Cargo.lock";
@@ -118,7 +118,7 @@
             cp -R ${lib.cleanSource ./.} source
             chmod -R u+w source
             cd source
-            ./scripts/check-workflows.sh
+            ${pkgs.bash}/bin/bash ./scripts/check-workflows.sh
             touch "$out"
           '';
         };
