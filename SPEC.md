@@ -218,6 +218,7 @@ Splitting retargets the selected non-head to the default branch, making it a new
 - `cara pause --head-pr N --actor A --reason R` — place an explicit incident or maintenance hold on one exact caravan and disable only its head auto-merge.
 - `cara resume --head-pr N --actor A` — explicitly revalidate and release that hold.
 - `cara loop` — repeatedly run `sync --all` at the configured interval.
+- `cara loop --manual [--shell COMMAND]` — CLI-only human controller. At an exact `external_decision`, persist private bounded decision JSON, release the operation lock, inherit the controlling TTY in a safe affected/repair workspace, and run `$SHELL -i` or the explicit command. Zero exit triggers fresh rediscovery and another exact tick; nonzero stops with evidence. Refuse JSON/MCP/non-TTY use.
 
 `loop` is a lightweight foreground daemon. It keeps no authority beyond GitHub and performs the same idempotent ticks as direct `sync --all` calls.
 
@@ -360,7 +361,7 @@ torn-final-record recovery make this an audit surface only; it is never queue
 state or cursor authority. Journal I/O errors report that completed provider
 mutations were not rolled back.
 
-Hooks may coordinate arbitrarily complex external workflows. Caravan does not wait for an agent protocol or hold a distributed lock. A decision-point sync always stops after firing its hook. Routine `retry_tick`, `waiting_ci`, and `held` outcomes do not fire the repair-wake hook; only `external_decision` does. A coordinator that outlives the hook process must own an external lock/dedupe record; repeated external-decision ticks may invoke the hook again, and the hook must no-op while that coordination is active.
+Hooks may coordinate arbitrarily complex external workflows. They remain noninteractive commands with JSON on stdin; manual TTY decision handling is a separate loop mode. Caravan does not wait for an agent protocol or hold a distributed lock. A decision-point sync always stops after firing its hook. Routine `retry_tick`, `waiting_ci`, and `held` outcomes do not fire the repair-wake hook; only `external_decision` does. A coordinator that outlives the hook process must own an external lock/dedupe record; repeated external-decision ticks may invoke the hook again, and the hook must no-op while that coordination is active.
 
 Each hook has a timeout and `blocking` policy. Best-effort hook failure is reported but does not roll back a completed GitHub mutation. Blocking hook failure returns `hook_failure`; it still cannot roll back already-completed remote mutations.
 

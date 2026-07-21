@@ -50,6 +50,14 @@ fn human_domain_error_exits_nonzero() {
 }
 
 #[test]
+fn manual_loop_refuses_json_and_noninteractive_use() {
+    let output = cara(&["--json", "loop", "--once", "--manual"]);
+    assert!(!output.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["error"]["code"], "manual_loop_json_unsupported");
+}
+
+#[test]
 fn json_config_error_keeps_the_machine_envelope() {
     let temp = tempfile::tempdir().expect("temp directory");
     let config = temp.path().join("invalid.yaml");

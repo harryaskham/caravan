@@ -91,7 +91,7 @@ cara join [--tail-pr N | --head-pr N] [--create-pr]
 cara renew | cara rejoin
 cara show | cara next | cara prev
 cara plan sync [--all] [--rerun-failed]
-cara sync [--all] [--rerun-failed] | cara loop [--once]
+cara sync [--all] [--rerun-failed] | cara loop [--once] [--manual --shell COMMAND]
 cara repair start --pr N [--target-pr T]
 cara repair authorize-agent-edits --session ID --actor A --reason R
 cara repair grant --session ID --path P --source-revision SHA --actor A --reason R
@@ -150,6 +150,16 @@ compatible and preserved. See [`docs/first-use.md`](docs/first-use.md).
 `cara van next` on the default branch enters the first caravan head; ordinary
 `cara next` remains chain-local and requires the current branch to map to an
 open caravan PR.
+
+For human flow testing, `cara loop --manual [--shell 'zsh -i']` runs normal
+sync-all ticks and opens a real inherited-TTY shell only at an
+`external_decision`. Cara writes the complete bounded decision to a private
+file and exports `CARA_DECISION_FILE`, `CARA_DECISION_CODE`, and
+`CARA_REPOSITORY_PATH`; the shell starts in a safe affected/repair workspace
+when available. Exiting zero never claims success—it causes exact provider
+rediscovery and another tick. Nonzero exits preserve evidence and stop. Manual
+mode is refused for JSON/MCP/non-TTY use; production hooks remain noninteractive
+machine orchestration.
 
 Use `cara help` for the agent operating loop and recovery rules. Use `--json`
 for stable `mcp-cli` envelopes. Operation-lock owner files stay below 16 KiB:

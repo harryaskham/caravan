@@ -87,7 +87,8 @@ pub fn run(
     )
 }
 
-fn tick(context: &AppContext) -> Result<LoopTickOutput, AppError> {
+/// Run one canonical sync-all tick including ordinary hook delivery.
+pub fn tick(context: &AppContext) -> Result<LoopTickOutput, AppError> {
     match crate::sync::sync(
         context,
         &SyncInput {

@@ -205,8 +205,11 @@ actor and records complete path/staged-index/diff fingerprints. Secret-like,
 symlink/gitlink, unstaged/untracked, out-of-scope, and drifted edits fail closed.
 `repair revoke-grant` restores recorded pre-grant blobs. Stage reviewed changes
 and run `cara repair continue --session ID [--actor A]`: it verifies the session,
-uses non-force publication, requires fresh CI, and resumes sync-all. Use `repair abort` only to
-remove a reviewed local session. Never create nested raw worktrees, call
+uses non-force publication, requires fresh CI, and resumes sync-all. For human
+flow testing, `cara loop --manual [--shell 'zsh -i']` opens a real TTY only at
+external decisions, exports a private `CARA_DECISION_FILE`, releases the lock,
+and always rediscovers after shell success; it is never JSON/MCP/hook behavior.
+Use `repair abort` only to remove a reviewed local session. Never create nested raw worktrees, call
 `update-ref`, merge behind Cara, or force-push a repair branch.
 
 RESHAPING AND EXPLICIT INTENT
@@ -613,6 +616,16 @@ pub struct LoopInput {
     #[arg(long)]
     #[serde(default)]
     pub once: bool,
+
+    /// CLI-only human controller: open an interactive shell at external decisions, then rediscover and retry.
+    #[arg(long)]
+    #[serde(default)]
+    pub manual: bool,
+
+    /// Interactive command for --manual; defaults to `$SHELL -i`.
+    #[arg(long, value_name = "COMMAND", requires = "manual")]
+    #[serde(default)]
+    pub shell: Option<String>,
 }
 
 fn default_lock_stale_after_secs() -> u64 {

@@ -1,11 +1,13 @@
 //! `cara` command-line entry point.
 
 use std::fmt::Write as _;
+use std::fs;
 use std::io;
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use caravan::{
     AGENT_HELP, AppContext, AppError, CheckInput, CreateInput, EvictInput, JoinInput,
@@ -1081,6 +1083,25 @@ fn run_lock(cli: &Cli, command: &LockCommand) -> Result<(), i32> {
 }
 
 fn run_loop(cli: &Cli, input: &LoopInput) -> Result<(), i32> {
+    if input.manual {
+        if cli.json {
+            return emit_result::<serde_json::Value, _>(
+                true,
+                Err(AppError::validation(
+                    "manual_loop_json_unsupported",
+                    "manual decision mode requires an interactive human terminal and is not a JSON/MCP surface",
+                )),
+            );
+        }
+        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+            return emit_human_error(AppError::validation(
+                "manual_loop_tty_required",
+                "manual decision mode requires a controlling TTY",
+            ));
+        }
+        let context = load_context(cli)?;
+        return run_manual_loop(&context, input);
+    }
     if cli.json && !input.once {
         return emit_result::<serde_json::Value, _>(
             true,
@@ -1104,6 +1125,281 @@ fn run_loop(cli: &Cli, input: &LoopInput) -> Result<(), i32> {
             Ok(())
         }
         Err(error) => emit_human_error(error),
+    }
+}
+
+fn run_manual_loop(context: &AppContext, input: &LoopInput) -> Result<(), i32> {
+    let interval = Duration::from_secs(
+        input
+            .interval_secs
+            .unwrap_or(context.config.loop_config.interval_secs),
+    );
+    if interval.is_zero() {
+        return emit_human_error(AppError::validation(
+            "invalid_loop_interval",
+            "loop interval must be at least one second",
+        ));
+    }
+    loop {
+        match caravan::loop_runner::tick(context) {
+            Ok(output) => {
+                print!("{}", render_loop_tick(&output));
+                if input.once {
+                    return Ok(());
+                }
+                std::thread::sleep(interval);
+            }
+            Err(error) if manual_external_decision(&error) => {
+                if let Err(error) = run_manual_decision_shell(context, input, &error) {
+                    return emit_human_error(error);
+                }
+                // Shell success is not resolution authority. Rediscover and
+                // rerun the exact tick immediately.
+            }
+            Err(error) => return emit_human_error(error),
+        }
+    }
+}
+
+fn manual_external_decision(error: &AppError) -> bool {
+    error
+        .details()
+        .and_then(|details| {
+            details
+                .get("scheduler_status")?
+                .get("wake_class")?
+                .as_str()
+                .map(str::to_owned)
+        })
+        .as_deref()
+        == Some("external_decision")
+}
+
+fn run_manual_decision_shell(
+    context: &AppContext,
+    input: &LoopInput,
+    error: &AppError,
+) -> Result<(), AppError> {
+    let (decision_file, common_dir) = persist_manual_decision(context, error)?;
+    let working_directory = manual_decision_working_directory(context, error, &common_dir);
+    let command = input.shell.clone().unwrap_or_else(|| {
+        format!(
+            "{} -i",
+            std::env::var("SHELL").unwrap_or_else(|_| "sh".to_owned())
+        )
+    });
+    eprintln!(
+        "{} external decision {}\n  evidence: {}\n  cwd: {}\n  shell: {}",
+        heading("MANUAL"),
+        error.code(),
+        decision_file.display(),
+        working_directory.display(),
+        command
+    );
+    let details = error.details().unwrap_or(serde_json::Value::Null);
+    let event_id = find_string_field(&details, "event_id").unwrap_or_default();
+    let operation_id = find_string_field(&details, "operation_id").unwrap_or_default();
+    let repair_session = find_string_field(&details, "session").unwrap_or_default();
+    let prs = collect_pr_numbers(&details)
+        .into_iter()
+        .map(|pr| pr.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let status = std::process::Command::new("sh")
+        .args(["-lc", &command])
+        .current_dir(&working_directory)
+        .env("CARA_DECISION_FILE", &decision_file)
+        .env("CARA_DECISION_CODE", error.code())
+        .env("CARA_REPOSITORY_PATH", &context.repository_path)
+        .env("CARA_EVENT_ID", event_id)
+        .env("CARA_OPERATION_ID", operation_id)
+        .env("CARA_PRS", prs)
+        .env("CARA_REPAIR_SESSION", repair_session)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .map_err(|spawn| {
+            AppError::validation(
+                "manual_decision_shell_failed",
+                format!("could not launch manual decision shell: {spawn}"),
+            )
+        })?;
+    if !status.success() {
+        return Err(AppError::validation(
+            "manual_decision_shell_exit",
+            format!(
+                "manual shell exited with {}; evidence remains at {}",
+                status
+                    .code()
+                    .map_or_else(|| "signal".to_owned(), |code| code.to_string()),
+                decision_file.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn persist_manual_decision(
+    context: &AppContext,
+    error: &AppError,
+) -> Result<(PathBuf, PathBuf), AppError> {
+    let common = git_stdout(context, &["rev-parse", "--git-common-dir"])?;
+    let common = if Path::new(&common).is_absolute() {
+        PathBuf::from(common)
+    } else {
+        context.repository_path.join(common)
+    };
+    let common = common
+        .canonicalize()
+        .map_err(|io| AppError::validation("manual_decision_state_failed", io.to_string()))?;
+    let directory = common.join("caravan/manual-decisions");
+    fs::create_dir_all(&directory)
+        .map_err(|io| AppError::validation("manual_decision_state_failed", io.to_string()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+            .map_err(|io| AppError::validation("manual_decision_state_failed", io.to_string()))?;
+    }
+    let id = uuid::Uuid::now_v7().to_string();
+    let path = directory.join(format!("decision-{id}.json"));
+    let payload = serde_json::json!({
+        "schema_version": 1,
+        "decision_id": id,
+        "created_unix_ms": SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |value| u64::try_from(value.as_millis()).unwrap_or(u64::MAX)),
+        "repository_path": context.repository_path,
+        "error": {
+            "category": error.category(),
+            "code": error.code(),
+            "message": error.message(),
+            "details": error.details(),
+        }
+    });
+    let encoded = serde_json::to_vec_pretty(&payload).map_err(|encode| {
+        AppError::validation("manual_decision_state_failed", encode.to_string())
+    })?;
+    if encoded.len() > 1024 * 1024 {
+        return Err(AppError::validation(
+            "manual_decision_evidence_too_large",
+            "manual decision evidence exceeds the one-megabyte bound",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|io| AppError::validation("manual_decision_state_failed", io.to_string()))?;
+        file.write_all(&encoded)
+            .map_err(|io| AppError::validation("manual_decision_state_failed", io.to_string()))?;
+    }
+    #[cfg(not(unix))]
+    fs::write(&path, encoded)
+        .map_err(|io| AppError::validation("manual_decision_state_failed", io.to_string()))?;
+    prune_manual_decisions(&directory, 20);
+    Ok((path, common))
+}
+
+fn prune_manual_decisions(directory: &Path, keep: usize) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    let mut files = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            Some((modified, entry.path()))
+        })
+        .collect::<Vec<_>>();
+    files.sort_by_key(|(modified, _)| *modified);
+    let remove = files.len().saturating_sub(keep);
+    for (_, path) in files.into_iter().take(remove) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn manual_decision_working_directory(
+    context: &AppContext,
+    error: &AppError,
+    common_dir: &Path,
+) -> PathBuf {
+    let candidate = error
+        .details()
+        .as_ref()
+        .and_then(find_workspace_path)
+        .and_then(|path| PathBuf::from(path).canonicalize().ok());
+    candidate
+        .filter(|path| path.starts_with(&context.repository_path) || path.starts_with(common_dir))
+        .filter(|path| path.is_dir())
+        .unwrap_or_else(|| context.repository_path.clone())
+}
+
+fn find_string_field(value: &serde_json::Value, field: &str) -> Option<String> {
+    match value {
+        serde_json::Value::Object(object) => object
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| {
+                object
+                    .values()
+                    .find_map(|value| find_string_field(value, field))
+            }),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .find_map(|value| find_string_field(value, field)),
+        _ => None,
+    }
+}
+
+fn collect_pr_numbers(value: &serde_json::Value) -> std::collections::BTreeSet<u64> {
+    fn visit(value: &serde_json::Value, output: &mut std::collections::BTreeSet<u64>) {
+        match value {
+            serde_json::Value::Object(object) => {
+                if let Some(pr) = object.get("pr").and_then(serde_json::Value::as_u64) {
+                    if output.len() < 64 {
+                        output.insert(pr);
+                    }
+                }
+                if let Some(prs) = object.get("prs").and_then(serde_json::Value::as_array) {
+                    for pr in prs.iter().filter_map(serde_json::Value::as_u64) {
+                        if output.len() < 64 {
+                            output.insert(pr);
+                        }
+                    }
+                }
+                for child in object.values() {
+                    visit(child, output);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for child in values {
+                    visit(child, output);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut output = std::collections::BTreeSet::new();
+    visit(value, &mut output);
+    output
+}
+
+fn find_workspace_path(value: &serde_json::Value) -> Option<&str> {
+    match value {
+        serde_json::Value::Object(object) => {
+            if let Some(path) = object.get("workspace").and_then(serde_json::Value::as_str) {
+                return Some(path);
+            }
+            object.values().find_map(find_workspace_path)
+        }
+        serde_json::Value::Array(values) => values.iter().find_map(find_workspace_path),
+        _ => None,
     }
 }
 
@@ -2189,6 +2485,79 @@ mod tests {
         assert!(rendered.contains("rebase_on_join=disabled"));
         assert!(rendered.contains("set `rebase_on_join: true`"));
         assert!(!rendered.contains("\"analysis\""));
+    }
+
+    #[test]
+    fn manual_decision_file_is_private_and_bounded_to_git_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(directory.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let context = caravan::AppContext {
+            repository_path: directory.path().canonicalize().unwrap(),
+            config_path: PathBuf::from(".caravan/config.yaml"),
+            config_existed: false,
+            config: caravan::config::CaravanConfig::default(),
+        };
+        let error = AppError::validation("manual-test", "decision evidence");
+        let (path, common) = persist_manual_decision(&context, &error).unwrap();
+        assert!(path.starts_with(common.join("caravan/manual-decisions")));
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(value["error"]["code"], "manual-test");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn manual_shell_inherits_context_and_zero_exit_requests_rediscovery() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(directory.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let context = caravan::AppContext {
+            repository_path: directory.path().canonicalize().unwrap(),
+            config_path: PathBuf::from(".caravan/config.yaml"),
+            config_existed: false,
+            config: caravan::config::CaravanConfig::default(),
+        };
+        let input = LoopInput {
+            interval_secs: None,
+            once: true,
+            manual: true,
+            shell: Some(
+                "test -f \"$CARA_DECISION_FILE\" && test \"$CARA_DECISION_CODE\" = manual-test && test \"$PWD\" = \"$CARA_REPOSITORY_PATH\""
+                    .to_owned(),
+            ),
+        };
+        run_manual_decision_shell(
+            &context,
+            &input,
+            &AppError::validation("manual-test", "decision"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn nested_workspace_evidence_is_discovered() {
+        let evidence = serde_json::json!({
+            "decision": {"evidence": {"repair": {"workspace": "/tmp/exact-repair"}}}
+        });
+        assert_eq!(find_workspace_path(&evidence), Some("/tmp/exact-repair"));
     }
 
     #[test]
