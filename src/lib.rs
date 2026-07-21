@@ -234,9 +234,13 @@ BUILT-IN WEB OPERATIONS
 - The default listener is loopback-only. Status snapshots refresh on a bounded
   cadence and show active caravan trails, exact PR generations and CI, open
   unqueued/rejected PRs with reasons, decisions, pauses, and scheduler health.
-- Use `--read-only` to disable mutation endpoints. Interactive actions use the
-  same typed domain functions, preconditions, operation locks, decisions, and
-  receipts as CLI/JSON/MCP; the web server never shells out to human output.
+- Use `--read-only` to disable mutation endpoints. Accepted actions bind the
+  reviewed refresh sequence and a deterministic mutation-authority fingerprint.
+  Poll/webhook refreshes coalesce behind active jobs; identical provider/config
+  facts tolerate sequence-only drift, while changed fingerprints fail before
+  mutation with exact expected/actual evidence. Interactive actions use the same
+  typed domain functions, preconditions, operation locks, decisions, and receipts
+  as CLI/JSON/MCP; the web server never shells out to human output.
   Long actions return an action ID immediately, continue under one repository
   lock across browser disconnects, and expose bounded durable checkpoint phases,
   terminal receipts, and the newest Cara event/hook journal records.

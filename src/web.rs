@@ -21,10 +21,11 @@ use mcp_cli::{ErrorCategory, StructuredError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 use crate::config::{CaravanConfig, DEFAULT_CONFIG_PATH};
+use crate::model::PullRequestPrecondition;
 use crate::read::StatusOutput;
 use crate::repair::{
     RepairAbortInput, RepairContinueInput, RepairGrantInput, RepairRevokeGrantInput,
@@ -38,7 +39,7 @@ use crate::{
 const INDEX_HTML: &str = include_str!("web_assets/index.html");
 const APP_CSS: &str = include_str!("web_assets/app.css");
 const APP_JS: &str = include_str!("web_assets/app.js");
-const WEB_SCHEMA_VERSION: u32 = 4;
+const WEB_SCHEMA_VERSION: u32 = 5;
 const MIN_POLL_SECONDS: u64 = 2;
 const MAX_POLL_SECONDS: u64 = 3_600;
 const DEFAULT_POLL_SECONDS: u64 = 15;
@@ -171,6 +172,11 @@ pub struct WebActionJob {
     pub id: String,
     pub action: String,
     pub expected_refresh_sequence: u64,
+    /// Exact mutation-authority facts reviewed when the action was accepted.
+    pub expected_mutation_fingerprint: String,
+    /// Fresh authority fingerprint observed after action/refresh locks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_mutation_fingerprint: Option<String>,
     pub state: WebActionJobState,
     pub started_unix_ms: u64,
     pub updated_unix_ms: u64,
@@ -274,6 +280,11 @@ impl WebAction {
             Self::Check(_) | Self::PlanSync(_) | Self::RepairStatus(_)
         )
     }
+}
+
+struct AcceptedWebAction {
+    request: WebActionRequest,
+    expected_mutation_fingerprint: String,
 }
 
 struct RepositoryEntry {
@@ -815,6 +826,133 @@ fn redacted_config(config: &CaravanConfig) -> Result<serde_json::Value, AppError
     Ok(value)
 }
 
+fn mutation_authority_fingerprint(
+    context: &AppContext,
+    snapshot: &WebRepositorySnapshot,
+) -> Option<String> {
+    let status = snapshot.status.as_ref()?;
+    if snapshot.error.is_some() {
+        return None;
+    }
+    let pull_requests = status
+        .analysis
+        .pull_requests
+        .iter()
+        .map(|(number, pull_request)| {
+            json!({
+                "number": number,
+                "precondition": PullRequestPrecondition::from(pull_request),
+            })
+        })
+        .collect::<Vec<_>>();
+    let merge_candidates = status
+        .merge_candidates
+        .iter()
+        .map(|candidate| {
+            json!({
+                "pr": candidate.pr,
+                "base": candidate.base,
+                "head": candidate.head,
+                "synthetic": candidate.synthetic,
+                "freshness": candidate.freshness,
+                "auto_merge": candidate.auto_merge,
+            })
+        })
+        .collect::<Vec<_>>();
+    let material = serde_json::to_vec(&json!({
+        "schema_version": 1,
+        "repository_path": context.repository_path,
+        "config_path": context.config_path,
+        "config_existed": context.config_existed,
+        "config": context.config,
+        "repository": status.repository,
+        "default_branch": status.analysis.fleet.default_branch,
+        "current_branch": status.current_branch,
+        "current_pr": status.current_pr,
+        "pull_requests": pull_requests,
+        "caravans": status.analysis.fleet.caravans,
+        "unqueued": status.analysis.fleet.unqueued,
+        "problems": status.analysis.fleet.problems,
+        "compatibility": status.analysis.compatibility,
+        "initialization": status.initialization,
+        "pauses": status.pauses,
+        "merge_candidates": merge_candidates,
+    }))
+    .ok()?;
+    Some(format!("sha256:{:x}", Sha256::digest(material)))
+}
+
+fn action_authority(repository: &RepositoryEntry) -> (u64, Option<String>) {
+    let snapshot = repository
+        .snapshot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    (
+        snapshot.refresh_sequence,
+        mutation_authority_fingerprint(&repository.context, &snapshot),
+    )
+}
+
+fn fresh_action_authority(
+    repository: &RepositoryEntry,
+    expected_refresh_sequence: u64,
+) -> (u64, Option<String>) {
+    let observed_sequence = repository
+        .snapshot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .refresh_sequence;
+    if observed_sequence != expected_refresh_sequence {
+        // A queued poll/webhook refresh may have advanced only the dashboard
+        // sequence. Force one fresh provider read under the retained refresh
+        // lock before deciding whether mutation authority actually changed.
+        crate::read::invalidate_status_cache(&repository.context);
+        refresh_repository_locked(repository);
+    }
+    action_authority(repository)
+}
+
+fn validate_action_authority(
+    expected_refresh_sequence: u64,
+    expected_fingerprint: &str,
+    actual_refresh_sequence: u64,
+    actual_fingerprint: Option<String>,
+) -> Result<String, AppError> {
+    let Some(actual_fingerprint) = actual_fingerprint else {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "web_snapshot_unavailable",
+            "fresh repository mutation-authority facts are unavailable",
+            Some(json!({
+                "expected_refresh_sequence": expected_refresh_sequence,
+                "actual_refresh_sequence": actual_refresh_sequence,
+                "expected_mutation_fingerprint": expected_fingerprint,
+                "actual_mutation_fingerprint": null,
+                "mutated": false,
+                "safe_next_action": "wait for a successful status refresh, review it, then submit a new typed action"
+            })),
+        ));
+    };
+    if actual_refresh_sequence == expected_refresh_sequence
+        || actual_fingerprint == expected_fingerprint
+    {
+        return Ok(actual_fingerprint);
+    }
+    Err(AppError::structured(
+        ErrorCategory::Validation,
+        "web_snapshot_stale",
+        "mutation-sensitive repository facts changed before the queued action acquired its lock",
+        Some(json!({
+            "expected_refresh_sequence": expected_refresh_sequence,
+            "actual_refresh_sequence": actual_refresh_sequence,
+            "expected_mutation_fingerprint": expected_fingerprint,
+            "actual_mutation_fingerprint": actual_fingerprint,
+            "mutated": false,
+            "safe_next_action": "review the fresh snapshot and changed authority fingerprint, then submit a new typed action"
+        })),
+    ))
+}
+
 fn bound_web_journal(mut output: crate::journal::LogOutput) -> crate::journal::LogOutput {
     while output.records.len() > 1
         && serde_json::to_vec(&output).map_or(usize::MAX, |bytes| bytes.len())
@@ -830,12 +968,31 @@ fn bound_web_journal(mut output: crate::journal::LogOutput) -> crate::journal::L
     output
 }
 
-fn refresh_repository(repository: &RepositoryEntry) {
+fn has_active_action(repository: &RepositoryEntry) -> bool {
+    repository
+        .actions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|job| !job.state.terminal())
+}
+
+/// Refresh only when no accepted action owns the repository mutation window.
+/// A worker performs one authoritative post-action refresh, so polling and
+/// webhook refreshes safely coalesce behind queued/running work.
+fn refresh_repository(repository: &RepositoryEntry) -> bool {
+    if has_active_action(repository) {
+        return false;
+    }
     let _refresh = repository
         .refresh_lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if has_active_action(repository) {
+        return false;
+    }
     refresh_repository_locked(repository);
+    true
 }
 
 fn refresh_repository_locked(repository: &RepositoryEntry) {
@@ -1066,7 +1223,7 @@ fn handle_github_webhook(
             coalesced = !enqueue_webhook_sync(repository);
         } else {
             crate::read::invalidate_status_cache(&repository.context);
-            refresh_repository(repository);
+            coalesced = !refresh_repository(repository);
         }
     }
     {
@@ -1166,16 +1323,20 @@ fn record_webhook_rejection(dashboard: &Dashboard) {
 }
 
 fn enqueue_webhook_sync(repository: &Arc<RepositoryEntry>) -> bool {
-    let expected_refresh_sequence = repository
-        .snapshot
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .refresh_sequence;
+    let (expected_refresh_sequence, expected_mutation_fingerprint) = action_authority(repository);
+    let Some(expected_mutation_fingerprint) = expected_mutation_fingerprint else {
+        repository
+            .webhook_sync_pending
+            .store(true, Ordering::SeqCst);
+        return false;
+    };
     let id = uuid::Uuid::now_v7().to_string();
     let job = WebActionJob {
         id: id.clone(),
         action: "sync".to_owned(),
         expected_refresh_sequence,
+        expected_mutation_fingerprint: expected_mutation_fingerprint.clone(),
+        actual_mutation_fingerprint: None,
         state: WebActionJobState::Queued,
         started_unix_ms: unix_ms(),
         updated_unix_ms: unix_ms(),
@@ -1195,12 +1356,15 @@ fn enqueue_webhook_sync(repository: &Arc<RepositoryEntry>) -> bool {
         execute_action_job(
             &repository,
             &id,
-            WebActionRequest {
-                expected_refresh_sequence,
-                action: WebAction::Sync(SyncInput {
-                    all: true,
-                    rerun_failed: false,
-                }),
+            AcceptedWebAction {
+                request: WebActionRequest {
+                    expected_refresh_sequence,
+                    action: WebAction::Sync(SyncInput {
+                        all: true,
+                        rerun_failed: false,
+                    }),
+                },
+                expected_mutation_fingerprint,
             },
         );
     });
@@ -1298,11 +1462,7 @@ fn handle_action(
             "mutation endpoints are disabled",
         );
     }
-    let actual_sequence = repository
-        .snapshot
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .refresh_sequence;
+    let (actual_sequence, expected_mutation_fingerprint) = action_authority(repository);
     if actual_sequence != action_request.expected_refresh_sequence {
         return error_response(
             StatusCode(409),
@@ -1310,12 +1470,21 @@ fn handle_action(
             "repository snapshot changed; refresh and review exact facts before retrying",
         );
     }
+    let Some(expected_mutation_fingerprint) = expected_mutation_fingerprint else {
+        return error_response(
+            StatusCode(409),
+            "web_snapshot_unavailable",
+            "repository mutation-authority facts are unavailable; wait for a successful refresh",
+        );
+    };
     let action_name = action_request.action.name().to_owned();
     let action_id = uuid::Uuid::now_v7().to_string();
     let job = WebActionJob {
         id: action_id.clone(),
         action: action_name,
         expected_refresh_sequence: action_request.expected_refresh_sequence,
+        expected_mutation_fingerprint: expected_mutation_fingerprint.clone(),
+        actual_mutation_fingerprint: None,
         state: WebActionJobState::Queued,
         started_unix_ms: unix_ms(),
         updated_unix_ms: unix_ms(),
@@ -1340,7 +1509,16 @@ fn handle_action(
     let repository = Arc::clone(repository);
     let repository_id = repository.id.clone();
     let worker_id = action_id.clone();
-    thread::spawn(move || execute_action_job(&repository, &worker_id, action_request));
+    thread::spawn(move || {
+        execute_action_job(
+            &repository,
+            &worker_id,
+            AcceptedWebAction {
+                request: action_request,
+                expected_mutation_fingerprint,
+            },
+        );
+    });
     json_response(
         StatusCode(202),
         &json!({
@@ -1353,7 +1531,11 @@ fn handle_action(
     )
 }
 
-fn execute_action_job(repository: &Arc<RepositoryEntry>, id: &str, request: WebActionRequest) {
+fn execute_action_job(repository: &Arc<RepositoryEntry>, id: &str, accepted: AcceptedWebAction) {
+    let AcceptedWebAction {
+        request,
+        expected_mutation_fingerprint,
+    } = accepted;
     update_action_job(repository, id, |job| {
         job.state = WebActionJobState::Running;
         "waiting_for_repository_lock".clone_into(&mut job.phase);
@@ -1369,28 +1551,25 @@ fn execute_action_job(repository: &Arc<RepositoryEntry>, id: &str, request: WebA
     update_action_job(repository, id, |job| {
         "validating_exact_snapshot".clone_into(&mut job.phase);
     });
-    let actual_sequence = repository
-        .snapshot
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .refresh_sequence;
-    let result = if actual_sequence == request.expected_refresh_sequence {
-        update_action_job(repository, id, |job| {
-            "domain_operation_in_flight".clone_into(&mut job.phase);
-        });
-        run_action(&repository.context, request.action)
-    } else {
-        Err(AppError::structured(
-            ErrorCategory::Validation,
-            "web_snapshot_stale",
-            "repository snapshot changed before the queued action acquired its lock",
-            Some(json!({
-                "expected_refresh_sequence": request.expected_refresh_sequence,
-                "actual_refresh_sequence": actual_sequence,
-                "mutated": false,
-                "safe_next_action": "review the fresh snapshot, then submit a new typed action"
-            })),
-        ))
+    let (actual_sequence, actual_mutation_fingerprint) =
+        fresh_action_authority(repository, request.expected_refresh_sequence);
+    update_action_job(repository, id, |job| {
+        job.actual_mutation_fingerprint
+            .clone_from(&actual_mutation_fingerprint);
+    });
+    let result = match validate_action_authority(
+        request.expected_refresh_sequence,
+        &expected_mutation_fingerprint,
+        actual_sequence,
+        actual_mutation_fingerprint,
+    ) {
+        Ok(_actual_fingerprint) => {
+            update_action_job(repository, id, |job| {
+                "domain_operation_in_flight".clone_into(&mut job.phase);
+            });
+            run_action(&repository.context, request.action)
+        }
+        Err(error) => Err(error),
     };
     crate::read::invalidate_status_cache(&repository.context);
     update_action_job(repository, id, |job| {
@@ -1728,11 +1907,82 @@ mod tests {
         assert_eq!(error.code(), "web_repository_duplicate");
     }
 
+    fn authority_status(head_oid: &str) -> StatusOutput {
+        let repository = crate::model::RepositoryId {
+            owner: "owner".to_owned(),
+            name: "repo".to_owned(),
+        };
+        let branch = |name: &str, oid: &str| crate::model::BranchSnapshot {
+            repository: repository.clone(),
+            name: name.to_owned(),
+            oid: crate::model::CommitOid(oid.to_owned()),
+        };
+        let pull_request = crate::model::PullRequestSnapshot {
+            number: crate::model::PrNumber(1),
+            title: "candidate".to_owned(),
+            url: "https://example.invalid/1".to_owned(),
+            state: crate::model::PullRequestState::Open,
+            draft: false,
+            head: branch("feature", head_oid),
+            base: branch("main", "main-oid"),
+            cross_repository: false,
+            labels: BTreeSet::new(),
+            auto_merge: crate::model::AutoMergeState::disabled(),
+            checks: Vec::new(),
+            created_at: Some("2026-01-01T00:00:00Z".to_owned()),
+            merged_at: None,
+            updated_at: None,
+        };
+        let analysis = crate::graph::GraphAnalysis {
+            fleet: crate::model::CaravanFleet {
+                repository: repository.clone(),
+                default_branch: branch("main", "main-oid"),
+                caravans: Vec::new(),
+                unqueued: vec![pull_request.number],
+                problems: Vec::new(),
+            },
+            pull_requests: std::collections::BTreeMap::from([(pull_request.number, pull_request)]),
+            compatibility: Vec::new(),
+        };
+        let admission = crate::read::resolve_admission(&analysis, &[]);
+        StatusOutput {
+            provider_api: crate::model::GitHubApiTelemetry::default(),
+            merge_candidates: Vec::new(),
+            merge_candidates_truncated: 0,
+            previous_default_oid: None,
+            default_branch_movements: Vec::new(),
+            timing: None,
+            repository,
+            rebase_on_join: crate::read::RebaseOnJoinStatus::default(),
+            auto_admission: crate::read::AutoAdmissionStatus::default(),
+            default_branch: "main".to_owned(),
+            current_branch: Some("feature".to_owned()),
+            current_pr: Some(crate::model::PrNumber(1)),
+            healthy: true,
+            initialization: crate::initialization::InitializationStatus::default(),
+            analysis,
+            pauses: Vec::new(),
+            admission,
+        }
+    }
+
+    fn set_authority_snapshot(repository: &RepositoryEntry, sequence: u64, status: StatusOutput) {
+        let mut snapshot = repository
+            .snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        snapshot.refresh_sequence = sequence;
+        snapshot.status = Some(status);
+        snapshot.error = None;
+    }
+
     fn test_job(id: usize, state: WebActionJobState) -> WebActionJob {
         WebActionJob {
             id: format!("job-{id}"),
             action: "sync".to_owned(),
             expected_refresh_sequence: 1,
+            expected_mutation_fingerprint: "sha256:test".to_owned(),
+            actual_mutation_fingerprint: None,
             state,
             started_unix_ms: 1,
             updated_unix_ms: 1,
@@ -1761,6 +2011,94 @@ mod tests {
             .expect_err("one repository action at a time");
         assert_eq!(conflict.id, "job-100");
         assert!(!conflict.state.terminal());
+    }
+
+    #[test]
+    fn harmless_refresh_sequence_drift_keeps_accepted_action_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join(".git")).unwrap();
+        let repositories = load_repositories(&[directory.path().to_path_buf()]).unwrap();
+        let repository = &repositories[0];
+        set_authority_snapshot(repository, 7, authority_status("head-a"));
+        let (_, expected) = action_authority(repository);
+        let expected = expected.unwrap();
+
+        {
+            let mut snapshot = repository
+                .snapshot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            snapshot.refresh_sequence = 8;
+            snapshot.refreshed_unix_ms = 999;
+            snapshot.status.as_mut().unwrap().provider_api.calls = 42;
+        }
+        let (actual_sequence, actual) = action_authority(repository);
+        let actual = actual.unwrap();
+
+        assert_eq!(expected, actual);
+        assert_eq!(
+            validate_action_authority(7, &expected, actual_sequence, Some(actual)).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn provider_fact_drift_still_fails_before_dashboard_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join(".git")).unwrap();
+        let repositories = load_repositories(&[directory.path().to_path_buf()]).unwrap();
+        let repository = &repositories[0];
+        set_authority_snapshot(repository, 7, authority_status("head-a"));
+        let (_, expected) = action_authority(repository);
+        let expected = expected.unwrap();
+
+        set_authority_snapshot(repository, 8, authority_status("head-b"));
+        let (actual_sequence, actual) = action_authority(repository);
+        let actual = actual.unwrap();
+        let error = validate_action_authority(7, &expected, actual_sequence, Some(actual.clone()))
+            .expect_err("changed provider head invalidates accepted authority");
+
+        assert_eq!(error.code(), "web_snapshot_stale");
+        let details = error.details().unwrap();
+        assert_eq!(details["expected_mutation_fingerprint"], expected);
+        assert_eq!(details["actual_mutation_fingerprint"], actual);
+        assert_eq!(details["mutated"], false);
+    }
+
+    #[test]
+    fn polling_refresh_coalesces_behind_an_accepted_action() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join(".git")).unwrap();
+        let repositories = load_repositories(&[directory.path().to_path_buf()]).unwrap();
+        let repository = &repositories[0];
+        set_authority_snapshot(repository, 7, authority_status("head-a"));
+        enqueue_action_job(repository, test_job(1, WebActionJobState::Queued)).unwrap();
+
+        assert!(!refresh_repository(repository));
+        assert_eq!(
+            repository
+                .snapshot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .refresh_sequence,
+            7
+        );
+    }
+
+    #[test]
+    fn action_authority_evidence_survives_state_reconnect() {
+        let mut job = test_job(1, WebActionJobState::Failed);
+        job.expected_mutation_fingerprint = "sha256:expected".to_owned();
+        job.actual_mutation_fingerprint = Some("sha256:actual".to_owned());
+        let encoded = serde_json::to_vec(&job).unwrap();
+        let decoded: WebActionJob = serde_json::from_slice(&encoded).unwrap();
+
+        assert_eq!(decoded.expected_mutation_fingerprint, "sha256:expected");
+        assert_eq!(
+            decoded.actual_mutation_fingerprint.as_deref(),
+            Some("sha256:actual")
+        );
+        assert_eq!(decoded.state, WebActionJobState::Failed);
     }
 
     #[test]
