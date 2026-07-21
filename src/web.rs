@@ -5,7 +5,7 @@
 //! web dependencies occur. Domain reads still flow through the same typed Cara
 //! status implementation used by CLI/JSON/MCP.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -35,12 +35,15 @@ use crate::{
 const INDEX_HTML: &str = include_str!("web_assets/index.html");
 const APP_CSS: &str = include_str!("web_assets/app.css");
 const APP_JS: &str = include_str!("web_assets/app.js");
-const WEB_SCHEMA_VERSION: u32 = 2;
+const WEB_SCHEMA_VERSION: u32 = 3;
 const MIN_POLL_SECONDS: u64 = 2;
 const MAX_POLL_SECONDS: u64 = 3_600;
 const SERVER_TICK: Duration = Duration::from_millis(250);
 const MAX_REQUEST_BODY_BYTES: u64 = 1024 * 1024;
 const MAX_CONCURRENT_REQUESTS: usize = 32;
+const MAX_ACTION_HISTORY: usize = 20;
+const JOURNAL_SNAPSHOT_LIMIT: usize = 50;
+const MAX_WEB_JOURNAL_BYTES: usize = 512 * 1024;
 
 /// Start a local dashboard over one or more explicit repository paths.
 #[derive(Debug, Clone, Args)]
@@ -106,6 +109,12 @@ pub struct WebRepositorySnapshot {
     /// Most recent bounded typed action result, retained for operational evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_action: Option<WebActionRecord>,
+    /// Bounded durable Cara event/hook journal snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal: Option<crate::journal::LogOutput>,
+    /// Bounded in-memory action jobs, newest last.
+    #[serde(default)]
+    pub actions: Vec<WebActionJob>,
 }
 
 /// Bounded action evidence retained with the repository snapshot.
@@ -118,6 +127,40 @@ pub struct WebActionRecord {
     pub result: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<WebError>,
+}
+
+/// Lifecycle state for one asynchronous dashboard action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WebActionJobState {
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+}
+
+impl WebActionJobState {
+    fn terminal(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed)
+    }
+}
+
+/// Bounded progress and terminal evidence for one typed action.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WebActionJob {
+    pub id: String,
+    pub action: String,
+    pub expected_refresh_sequence: u64,
+    pub state: WebActionJobState,
+    pub started_unix_ms: u64,
+    pub updated_unix_ms: u64,
+    pub phase: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<crate::operation_lock::OperationLockCheckpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<WebError>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_sequence: Option<u64>,
 }
 
 /// Stable dashboard state returned to the embedded application.
@@ -196,24 +239,13 @@ impl WebAction {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct WebActionResponse {
-    ok: bool,
-    repository_id: String,
-    action: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    result: Option<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    error: Option<WebError>,
-    snapshot: WebRepositorySnapshot,
-}
-
 struct RepositoryEntry {
     id: String,
     context: AppContext,
     snapshot: Mutex<WebRepositorySnapshot>,
     refresh_lock: Mutex<()>,
     action_lock: Mutex<()>,
+    actions: Mutex<VecDeque<WebActionJob>>,
 }
 
 struct Dashboard {
@@ -249,11 +281,13 @@ impl Dashboard {
                 .repositories
                 .iter()
                 .map(|repository| {
-                    repository
+                    let mut snapshot = repository
                         .snapshot
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .clone()
+                        .clone();
+                    snapshot.actions = action_jobs_with_checkpoint(repository);
+                    snapshot
                 })
                 .collect(),
         }
@@ -468,12 +502,70 @@ fn load_repositories(paths: &[PathBuf]) -> Result<Vec<Arc<RepositoryEntry>>, App
                     status: None,
                     error: None,
                     last_action: None,
+                    journal: None,
+                    actions: Vec::new(),
                 }),
                 refresh_lock: Mutex::new(()),
                 action_lock: Mutex::new(()),
+                actions: Mutex::new(VecDeque::new()),
             }))
         })
         .collect()
+}
+
+fn action_jobs_with_checkpoint(repository: &RepositoryEntry) -> Vec<WebActionJob> {
+    let mut jobs = repository
+        .actions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    if let Some(job) = jobs.iter_mut().rev().find(|job| !job.state.terminal())
+        && let Ok(lock) = crate::operation_lock::inspect_lock(
+            &repository.context.repository_path,
+            crate::operation_lock::DEFAULT_STALE_AFTER,
+        )
+        && let Some(checkpoint) = lock.owner.and_then(|owner| owner.checkpoint)
+    {
+        job.phase.clone_from(&checkpoint.phase);
+        job.updated_unix_ms = checkpoint.updated_unix_ms;
+        job.checkpoint = Some(checkpoint);
+    }
+    jobs
+}
+
+fn enqueue_action_job(
+    repository: &RepositoryEntry,
+    job: WebActionJob,
+) -> Result<(), Box<WebActionJob>> {
+    let mut jobs = repository
+        .actions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(active) = jobs.iter().rev().find(|job| !job.state.terminal()) {
+        return Err(Box::new(active.clone()));
+    }
+    while jobs.len() >= MAX_ACTION_HISTORY {
+        jobs.pop_front();
+    }
+    jobs.push_back(job);
+    Ok(())
+}
+
+fn update_action_job(
+    repository: &RepositoryEntry,
+    id: &str,
+    update: impl FnOnce(&mut WebActionJob),
+) {
+    let mut jobs = repository
+        .actions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(job) = jobs.iter_mut().find(|job| job.id == id) {
+        update(job);
+        job.updated_unix_ms = unix_ms();
+    }
 }
 
 fn redacted_config(config: &CaravanConfig) -> Result<serde_json::Value, AppError> {
@@ -501,6 +593,21 @@ fn redacted_config(config: &CaravanConfig) -> Result<serde_json::Value, AppError
     Ok(value)
 }
 
+fn bound_web_journal(mut output: crate::journal::LogOutput) -> crate::journal::LogOutput {
+    while output.records.len() > 1
+        && serde_json::to_vec(&output).map_or(usize::MAX, |bytes| bytes.len())
+            > MAX_WEB_JOURNAL_BYTES
+    {
+        output.records.remove(0);
+        output.truncated = true;
+    }
+    if serde_json::to_vec(&output).map_or(usize::MAX, |bytes| bytes.len()) > MAX_WEB_JOURNAL_BYTES {
+        output.records.clear();
+        output.truncated = true;
+    }
+    output
+}
+
 fn refresh_repository(repository: &RepositoryEntry) {
     let _refresh = repository
         .refresh_lock
@@ -521,6 +628,17 @@ fn refresh_repository_locked(repository: &RepositoryEntry) {
     // Mutating action paths invalidate this cache and retain their own exact
     // provider preflight, so cached status is never mutation authority.
     let result = crate::read::status_cached(&repository.context, Duration::from_secs(5));
+    let journal = crate::journal::snapshot(
+        &repository.context,
+        &crate::journal::LogInput {
+            limit: JOURNAL_SNAPSHOT_LIMIT,
+            kind: None,
+            pr: None,
+            since: None,
+            until: None,
+        },
+    )
+    .map(bound_web_journal);
     let mut snapshot = repository
         .snapshot
         .lock()
@@ -528,6 +646,9 @@ fn refresh_repository_locked(repository: &RepositoryEntry) {
     snapshot.refresh_sequence = snapshot.refresh_sequence.saturating_add(1);
     snapshot.refreshed_unix_ms = unix_ms();
     snapshot.refreshing = false;
+    if let Ok(journal) = journal {
+        snapshot.journal = Some(journal);
+    }
     match result {
         Ok(status) => {
             snapshot.status = Some(status);
@@ -684,14 +805,6 @@ fn handle_action(
             "mutation endpoints are disabled",
         );
     }
-    let _action = repository
-        .action_lock
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _refresh = repository
-        .refresh_lock
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let actual_sequence = repository
         .snapshot
         .lock()
@@ -705,56 +818,139 @@ fn handle_action(
         );
     }
     let action_name = action_request.action.name().to_owned();
-    let result = run_action(&repository.context, action_request.action);
+    let action_id = uuid::Uuid::now_v7().to_string();
+    let job = WebActionJob {
+        id: action_id.clone(),
+        action: action_name,
+        expected_refresh_sequence: action_request.expected_refresh_sequence,
+        state: WebActionJobState::Queued,
+        started_unix_ms: unix_ms(),
+        updated_unix_ms: unix_ms(),
+        phase: "queued".to_owned(),
+        checkpoint: None,
+        error: None,
+        refresh_sequence: None,
+    };
+    if let Err(active) = enqueue_action_job(repository, job.clone()) {
+        return json_response(
+            StatusCode(409),
+            &json!({
+                "ok": false,
+                "error": {
+                    "code": "web_action_in_progress",
+                    "message": "one typed action is already active for this repository"
+                },
+                "job": active,
+            }),
+        );
+    }
+    let repository = Arc::clone(repository);
+    let repository_id = repository.id.clone();
+    let worker_id = action_id.clone();
+    thread::spawn(move || execute_action_job(&repository, &worker_id, action_request));
+    json_response(
+        StatusCode(202),
+        &json!({
+            "ok": true,
+            "accepted": true,
+            "repository_id": repository_id,
+            "action_id": action_id,
+            "job": job,
+        }),
+    )
+}
+
+fn execute_action_job(repository: &RepositoryEntry, id: &str, request: WebActionRequest) {
+    update_action_job(repository, id, |job| {
+        job.state = WebActionJobState::Running;
+        "waiting_for_repository_lock".clone_into(&mut job.phase);
+    });
+    let _action = repository
+        .action_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _refresh = repository
+        .refresh_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    update_action_job(repository, id, |job| {
+        "validating_exact_snapshot".clone_into(&mut job.phase);
+    });
+    let actual_sequence = repository
+        .snapshot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .refresh_sequence;
+    let result = if actual_sequence == request.expected_refresh_sequence {
+        update_action_job(repository, id, |job| {
+            "domain_operation_in_flight".clone_into(&mut job.phase);
+        });
+        run_action(&repository.context, request.action)
+    } else {
+        Err(AppError::structured(
+            ErrorCategory::Validation,
+            "web_snapshot_stale",
+            "repository snapshot changed before the queued action acquired its lock",
+            Some(json!({
+                "expected_refresh_sequence": request.expected_refresh_sequence,
+                "actual_refresh_sequence": actual_sequence,
+                "mutated": false,
+                "safe_next_action": "review the fresh snapshot, then submit a new typed action"
+            })),
+        ))
+    };
+    crate::read::invalidate_status_cache(&repository.context);
+    update_action_job(repository, id, |job| {
+        "post_action_refresh".clone_into(&mut job.phase);
+    });
+    refresh_repository_locked(repository);
+    let action_name = {
+        let jobs = repository
+            .actions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        jobs.iter()
+            .find(|job| job.id == id)
+            .map_or_else(|| "unknown".to_owned(), |job| job.action.clone())
+    };
     let action_record = match &result {
         Ok(result) => WebActionRecord {
             completed_unix_ms: unix_ms(),
-            action: action_name.clone(),
+            action: action_name,
             ok: true,
             result: Some(result.clone()),
             error: None,
         },
         Err(error) => WebActionRecord {
             completed_unix_ms: unix_ms(),
-            action: action_name.clone(),
+            action: action_name,
             ok: false,
             result: None,
             error: Some(WebError::from_app(error)),
         },
     };
-    refresh_repository_locked(repository);
-    let snapshot = {
+    let refresh_sequence = {
         let mut snapshot = repository
             .snapshot
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         snapshot.last_action = Some(action_record);
-        snapshot.clone()
+        snapshot.refresh_sequence
     };
-    match result {
-        Ok(result) => json_response(
-            StatusCode(200),
-            &WebActionResponse {
-                ok: true,
-                repository_id: repository.id.clone(),
-                action: action_name,
-                result: Some(result),
-                error: None,
-                snapshot,
-            },
-        ),
-        Err(error) => json_response(
-            StatusCode(409),
-            &WebActionResponse {
-                ok: false,
-                repository_id: repository.id.clone(),
-                action: action_name,
-                result: None,
-                error: Some(WebError::from_app(&error)),
-                snapshot,
-            },
-        ),
-    }
+    update_action_job(repository, id, |job| {
+        job.refresh_sequence = Some(refresh_sequence);
+        match result {
+            Ok(_result) => {
+                job.state = WebActionJobState::Succeeded;
+                "completed".clone_into(&mut job.phase);
+            }
+            Err(error) => {
+                job.state = WebActionJobState::Failed;
+                "failed".clone_into(&mut job.phase);
+                job.error = Some(WebError::from_app(&error));
+            }
+        }
+    });
 }
 
 fn run_action(context: &AppContext, action: WebAction) -> Result<serde_json::Value, AppError> {
@@ -951,6 +1147,96 @@ mod tests {
         assert_eq!(error.code(), "web_repository_duplicate");
     }
 
+    fn test_job(id: usize, state: WebActionJobState) -> WebActionJob {
+        WebActionJob {
+            id: format!("job-{id}"),
+            action: "sync".to_owned(),
+            expected_refresh_sequence: 1,
+            state,
+            started_unix_ms: 1,
+            updated_unix_ms: 1,
+            phase: "test".to_owned(),
+            checkpoint: None,
+            error: None,
+            refresh_sequence: None,
+        }
+    }
+
+    #[test]
+    fn action_jobs_are_serial_and_history_is_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join(".git")).unwrap();
+        let repositories = load_repositories(&[directory.path().to_path_buf()]).unwrap();
+        let repository = &repositories[0];
+        for id in 0..(MAX_ACTION_HISTORY + 5) {
+            enqueue_action_job(repository, test_job(id, WebActionJobState::Succeeded)).unwrap();
+        }
+        let jobs = action_jobs_with_checkpoint(repository);
+        assert_eq!(jobs.len(), MAX_ACTION_HISTORY);
+        assert_eq!(jobs.first().unwrap().id, "job-5");
+
+        enqueue_action_job(repository, test_job(100, WebActionJobState::Running)).unwrap();
+        let conflict = enqueue_action_job(repository, test_job(101, WebActionJobState::Queued))
+            .expect_err("one repository action at a time");
+        assert_eq!(conflict.id, "job-100");
+        assert!(!conflict.state.terminal());
+    }
+
+    #[test]
+    fn web_journal_projection_is_byte_bounded() {
+        let event = crate::hooks::event(
+            crate::model::EventKind::SyncFailed,
+            crate::model::OperationId::new(),
+            crate::model::RepositoryId {
+                owner: "owner".to_owned(),
+                name: "repo".to_owned(),
+            },
+            None,
+            Vec::new(),
+            None,
+            Some("x".repeat(MAX_WEB_JOURNAL_BYTES + 1)),
+            std::collections::BTreeMap::new(),
+        );
+        let bounded = bound_web_journal(crate::journal::LogOutput {
+            records: vec![crate::journal::JournalRecord::Event { version: 1, event }],
+            limit: 1,
+            matching_records: 1,
+            truncated: false,
+        });
+        assert!(bounded.records.is_empty());
+        assert!(bounded.truncated);
+        assert!(serde_json::to_vec(&bounded).unwrap().len() < MAX_WEB_JOURNAL_BYTES);
+    }
+
+    #[test]
+    fn active_action_surfaces_durable_operation_checkpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("git")
+            .current_dir(directory.path())
+            .args(["init", "--quiet"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let repositories = load_repositories(&[directory.path().to_path_buf()]).unwrap();
+        let repository = &repositories[0];
+        enqueue_action_job(repository, test_job(1, WebActionJobState::Running)).unwrap();
+        let mut lock = crate::operation_lock::OperationLock::acquire(directory.path(), "sync")
+            .expect("test lock");
+        lock.checkpoint(
+            "provider_convergence_in_flight",
+            json!({"pr": 42, "completed_steps": 3}),
+            true,
+        )
+        .unwrap();
+
+        let jobs = action_jobs_with_checkpoint(repository);
+        assert_eq!(jobs[0].phase, "provider_convergence_in_flight");
+        let checkpoint = jobs[0].checkpoint.as_ref().expect("checkpoint");
+        assert_eq!(checkpoint.evidence["pr"], 42);
+        assert!(checkpoint.provider_state_indeterminate);
+        lock.release().unwrap();
+    }
+
     #[test]
     fn web_actions_are_strictly_tagged_and_classified() {
         let check: WebActionRequest = serde_json::from_value(json!({
@@ -1027,5 +1313,7 @@ mod tests {
         assert!(APP_JS.contains("target=\"_blank\" rel=\"noopener noreferrer\""));
         assert!(APP_JS.contains("last_action"));
         assert!(APP_JS.contains("plan_sync"));
+        assert!(APP_JS.contains("Action progress"));
+        assert!(APP_JS.contains("Journal receipt"));
     }
 }

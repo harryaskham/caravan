@@ -55,9 +55,10 @@
   }
 
   function setBusy(busy) {
-    ui.activity.hidden = !busy;
-    ui.refresh.disabled = busy;
-    ui.connection.setAttribute("aria-busy", String(busy));
+    const actionBusy = selected()?.actions?.some((job) => ["queued", "running"].includes(job.state)) ?? false;
+    ui.activity.hidden = !(busy || actionBusy);
+    ui.refresh.disabled = busy || actionBusy;
+    ui.connection.setAttribute("aria-busy", String(busy || actionBusy));
   }
 
   function repoName(repo) {
@@ -132,8 +133,9 @@
   }
 
   function actionButton(label, action, input, tone = "", mutates = true) {
-    const disabled = state?.read_only && mutates;
-    const title = disabled ? "Disabled by --read-only" : `Run typed ${action.replaceAll("_", " ")} action`;
+    const actionBusy = selected()?.actions?.some((job) => ["queued", "running"].includes(job.state)) ?? false;
+    const disabled = actionBusy || (state?.read_only && mutates);
+    const title = actionBusy ? "Another repository action is in progress" : disabled ? "Disabled by --read-only" : `Run typed ${action.replaceAll("_", " ")} action`;
     return `<button type="button" class="mini-action ${tone}" data-web-action="${escapeHtml(action)}" data-web-input="${escapeHtml(JSON.stringify(input))}" data-mutates="${mutates}" title="${escapeHtml(title)}" ${disabled ? "disabled" : ""}>${escapeHtml(label)}</button>`;
   }
 
@@ -269,7 +271,10 @@
     const events = result?.events ?? [];
     const deliveries = result?.hook_deliveries ?? [];
     const hooks = repo.effective_config?.hooks ?? {};
+    const jobs = [...(repo.actions ?? [])].reverse();
+    const journal = repo.journal?.records ?? [];
     const sections = [];
+    if (jobs.length) sections.push(`<section class="inspector-section"><h3>Action progress</h3>${jobs.map((job) => `<article class="evidence-card ${job.state === "failed" ? "bad" : ""}"><div class="evidence-title"><strong>${escapeHtml(job.action)}</strong>${badge(job.state, job.state === "succeeded" ? "good" : job.state === "failed" ? "bad" : "warn")}</div><p>${escapeHtml(job.phase)} · ${new Date(job.updated_unix_ms).toLocaleTimeString()}</p>${job.checkpoint ? `<details open><summary>Durable checkpoint</summary><pre>${escapeHtml(JSON.stringify(job.checkpoint, null, 2))}</pre></details>` : ""}${job.error ? `<p>${escapeHtml(job.error.code)}: ${escapeHtml(job.error.message)}</p>` : ""}</article>`).join("")}</section>`);
     if (action) sections.push(`<section class="inspector-section"><h3>Last action · ${escapeHtml(action.action)}</h3>
       <p>${new Date(action.completed_unix_ms).toLocaleString()} · ${action.ok ? badge("Completed", "good") : badge("Failed", "bad")}</p>
       ${action.error ? `<article class="evidence-card bad"><strong>${escapeHtml(action.error.code)}</strong><p>${escapeHtml(action.error.message)}</p><details><summary>Structured continuation</summary><pre>${escapeHtml(JSON.stringify(action.error.details ?? {}, null, 2))}</pre></details></article>` : ""}
@@ -281,7 +286,8 @@
     sections.push(`<section class="inspector-section"><h3>Events &amp; hooks</h3>
       ${events.length ? events.map((event) => `<article class="evidence-card"><div class="evidence-title"><strong>${escapeHtml(event.kind)}</strong><code>${escapeHtml(event.event_id)}</code></div><p>${escapeHtml(event.reason || `PRs ${(event.prs ?? []).join(", ")}`)}</p></article>`).join("") : ""}
       ${deliveries.length ? deliveries.map((delivery) => `<article class="evidence-card"><div class="evidence-title"><strong>${escapeHtml(delivery.kind)}</strong>${badge(delivery.state, normalized(delivery.state) === "succeeded" ? "good" : "bad")}</div><p>${delivery.blocking ? "Blocking" : "Best effort"} · exit ${escapeHtml(delivery.exit_code ?? "none")} · stdout ${delivery.stdout_bytes} B · stderr ${delivery.stderr_bytes} B</p></article>`).join("") : ""}
-      ${!events.length && !deliveries.length ? empty("Run a typed action to retain its event and hook receipts") : ""}
+      ${journal.length ? journal.slice().reverse().map((record) => { const event = record.event; const delivery = record.delivery; return `<article class="evidence-card"><div class="evidence-title"><strong>${escapeHtml(event?.kind || record.kind || "journal")}</strong>${delivery ? badge(delivery.state, normalized(delivery.state) === "succeeded" ? "good" : "bad") : badge("event", "info")}</div><p>${escapeHtml(event?.reason || (event?.prs?.length ? `PRs ${event.prs.join(", ")}` : record.timestamp || "durable Cara journal"))}</p><details><summary>Journal receipt</summary><pre>${escapeHtml(JSON.stringify(record, null, 2))}</pre></details></article>`; }).join("") : ""}
+      ${!events.length && !deliveries.length && !journal.length ? empty("No durable Cara journal records yet") : ""}
       <details class="hook-config"><summary>${Object.keys(hooks).length} configured hook policies</summary><pre>${escapeHtml(JSON.stringify(hooks, null, 2))}</pre></details>
     </section>`);
     ui.inspectorContent.innerHTML = sections.join("");
@@ -313,7 +319,9 @@
     ui.dashboard.hidden = false;
     ui.plan.hidden = false;
     ui.sync.hidden = false;
-    ui.sync.disabled = state.read_only;
+    const actionBusy = repo.actions?.some((job) => ["queued", "running"].includes(job.state)) ?? false;
+    ui.plan.disabled = actionBusy;
+    ui.sync.disabled = actionBusy || state.read_only;
     ui.evidence.hidden = false;
     ui.config.hidden = false;
     renderTabs();
@@ -367,12 +375,12 @@
         body: JSON.stringify({ expected_refresh_sequence: repo.refresh_sequence, action, input }),
       });
       const payload = await response.json();
-      if (payload.snapshot) Object.assign(repo, payload.snapshot);
+      if (!payload.ok) throw new Error(payload.error?.message || `${action} was not accepted`);
+      repo.actions = [...(repo.actions ?? []), payload.job];
       render();
       openInspector("evidence");
-      if (!payload.ok) throw new Error(payload.error?.message || `${action} failed`);
-      toast(`${action.replaceAll("_", " ")} completed`);
-      await fetchState({ quiet: true });
+      toast(`${action.replaceAll("_", " ")} started`);
+      await pollAction(repo.id, payload.action_id);
     } catch (error) {
       toast(error.message);
       await fetchState({ quiet: true });
@@ -381,6 +389,22 @@
       if (button) button.disabled = state.read_only && button.dataset.mutates !== "false";
       setBusy(false);
     }
+  }
+
+  async function pollAction(repositoryId, actionId) {
+    for (let attempt = 0; attempt < 2400; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 750));
+      await fetchState({ quiet: true });
+      const repo = state?.repositories?.find((item) => item.id === repositoryId);
+      const job = repo?.actions?.find((item) => item.id === actionId);
+      if (!job) continue;
+      openInspector("evidence");
+      if (["succeeded", "failed"].includes(job.state)) {
+        toast(job.state === "succeeded" ? `${job.action.replaceAll("_", " ")} completed` : job.error?.message || `${job.action} failed`);
+        return;
+      }
+    }
+    toast("Action is still running; progress remains available in Evidence");
   }
 
   async function refreshAll() {

@@ -179,7 +179,11 @@ ordered exact actions and rediscovery barriers before Apply. Bounded inner lists
 visible without an unbounded page. The Evidence drawer retains the latest typed
 action receipt, CI lineage diagnostics, canonical events, and hook delivery
 outcomes; the Config drawer shows the effective parsed policy with hook commands
-redacted. `--read-only` leaves read-only preflight available but disables every
+redacted. Mutating requests are accepted as bounded per-repository action jobs,
+so the browser can reconnect and poll durable operation-lock checkpoints while a
+long sync, split, evict, join, or repair continues. Evidence includes a bounded
+Cara event/hook journal and terminal typed receipt; concurrent actions against
+the same repository are refused. `--read-only` leaves read-only preflight available but disables every
 mutating control. Interactive actions use same-origin CSRF, exact snapshot
 sequences, and existing typed Cara operations and receipts; they never execute
 arbitrary shell input.
