@@ -741,6 +741,8 @@ struct PreparedChain {
 #[derive(Default)]
 struct PhysicalRebuildOutcome {
     repository: Option<RepositoryId>,
+    caravan_id: Option<PrNumber>,
+    affected_prs: Vec<PrNumber>,
     plans: Vec<crate::physical_rebase::RebasePlan>,
     receipts: Vec<crate::physical_rebase::RebaseReceipt>,
     provider_receipts: Vec<GitHubMutationReceipt>,
@@ -762,6 +764,7 @@ fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+#[allow(clippy::too_many_lines)]
 fn prepare_physical_chains(
     context: &AppContext,
     status: &StatusOutput,
@@ -835,6 +838,8 @@ fn prepare_physical_chains(
                         error,
                         &PhysicalRebuildOutcome {
                             repository: Some(status.repository.clone()),
+                            caravan_id: Some(caravan.id),
+                            affected_prs: vec![*number],
                             plans,
                             ..PhysicalRebuildOutcome::default()
                         },
@@ -853,7 +858,7 @@ fn prepare_physical_chains(
     if let Err(error) =
         verify_physical_write_barrier(context, status, provider, &chains, operation_deadline)
     {
-        let plans = chains
+        let plans: Vec<crate::physical_rebase::RebasePlan> = chains
             .iter()
             .flat_map(|chain| chain.members.iter().map(|item| item.plan.clone()))
             .collect();
@@ -861,6 +866,10 @@ fn prepare_physical_chains(
             error,
             &PhysicalRebuildOutcome {
                 repository: Some(status.repository.clone()),
+                affected_prs: plans
+                    .iter()
+                    .map(|plan: &crate::physical_rebase::RebasePlan| plan.pr)
+                    .collect(),
                 plans,
                 ..PhysicalRebuildOutcome::default()
             },
@@ -1031,6 +1040,8 @@ fn apply_physical_chains(
         .collect::<Vec<_>>();
     let mut outcome = PhysicalRebuildOutcome {
         repository: Some(status.repository.clone()),
+        caravan_id: (chains.len() == 1).then_some(chains[0].caravan.id),
+        affected_prs: plans.iter().map(|plan| plan.pr).collect(),
         plans,
         ..PhysicalRebuildOutcome::default()
     };
@@ -1154,6 +1165,8 @@ fn attach_physical_rebuild(error: AppError, outcome: &PhysicalRebuildOutcome) ->
     let mut details = error.details().unwrap_or_else(|| json!({}));
     if let Some(object) = details.as_object_mut() {
         object.insert("repository".to_owned(), json!(outcome.repository));
+        object.insert("caravan_id".to_owned(), json!(outcome.caravan_id));
+        object.insert("affected_prs".to_owned(), json!(outcome.affected_prs));
         object.insert("rebase_plans".to_owned(), json!(outcome.plans));
         object.insert("rebase_receipts".to_owned(), json!(outcome.receipts));
         object.insert(
@@ -1162,10 +1175,35 @@ fn attach_physical_rebuild(error: AppError, outcome: &PhysicalRebuildOutcome) ->
         );
         object.insert("completed_steps".to_owned(), json!(outcome.steps));
         object.insert("resumable".to_owned(), json!(true));
+        let deterministic_history_decision = matches!(
+            error.code().as_str(),
+            "rebase_nonlinear_range"
+                | "rebase_range_ambiguous"
+                | "rebase_empty_patch_range"
+                | "rebase_target_history_changed"
+                | "rebase_repository_not_owned"
+                | "rebase_historical_target_mismatch"
+        );
         object.insert(
             "next".to_owned(),
-            json!("rediscover provider state and rerun `cara sync --all`"),
+            json!(if deterministic_history_decision {
+                "the unchanged exact generation cannot succeed by retry: inspect the reported topology and explicitly repair/reshape/evict, use an audited merge-preserving strategy, or change the candidate head before rerunning"
+            } else {
+                "rediscover provider state and rerun `cara sync --all`"
+            }),
         );
+        if deterministic_history_decision {
+            object.insert("retryable".to_owned(), json!(false));
+            object.insert(
+                "suggested_actions".to_owned(),
+                json!([
+                    "inspect the exact candidate/base/default topology and merge OIDs",
+                    "repair, reshape, or evict the affected PR through a reviewed first-party operation",
+                    "use an explicit audited merge-preserving rewrite strategy when available",
+                    "rerun only after the candidate head, target generation, config, or supported strategy changes"
+                ]),
+            );
+        }
     }
     AppError::structured(
         error.category(),
@@ -1391,6 +1429,12 @@ fn scheduler_failure_status(error: &AppError) -> SyncFailureSchedulerStatus {
         None if matches!(
             error_code.as_str(),
             "rebase_conflict"
+                | "rebase_nonlinear_range"
+                | "rebase_range_ambiguous"
+                | "rebase_empty_patch_range"
+                | "rebase_target_history_changed"
+                | "rebase_repository_not_owned"
+                | "rebase_historical_target_mismatch"
                 | "rebase_midpoint_head_stale"
                 | "rebase_midpoint_pr_missing"
                 | "rebase_prepared_object_changed"
@@ -1433,6 +1477,22 @@ fn scheduler_failure_status(error: &AppError) -> SyncFailureSchedulerStatus {
     }
 }
 
+fn scheduler_decision_fingerprint(error: &AppError) -> String {
+    let details = error.details().unwrap_or_else(|| json!({}));
+    let material = serde_json::to_vec(&json!({
+        "error_code": error.code(),
+        "repository": details.get("repository"),
+        "caravan_id": details.get("caravan_id"),
+        "affected_prs": details.get("affected_prs"),
+        "pr": details.get("pr"),
+        "merge_oids": details.get("merge_oids"),
+        "rebase_plans": details.get("rebase_plans"),
+        "decision": details.get("decision"),
+    }))
+    .expect("scheduler fingerprint material serializes");
+    crate::membership::fnv1a64(&material)
+}
+
 fn attach_scheduler_failure(
     error: &AppError,
     scheduler_status: &SyncFailureSchedulerStatus,
@@ -1440,6 +1500,12 @@ fn attach_scheduler_failure(
     let mut details = error.details().unwrap_or_else(|| json!({}));
     if let Some(object) = details.as_object_mut() {
         object.insert("scheduler_status".to_owned(), json!(scheduler_status));
+        if scheduler_status.wake_class == SchedulerWakeClass::ExternalDecision {
+            object.insert(
+                "decision_fingerprint".to_owned(),
+                json!(scheduler_decision_fingerprint(error)),
+            );
+        }
     } else {
         details = json!({
             "original_details": details,
@@ -1478,6 +1544,13 @@ fn sync_failed_event(error: &AppError) -> Option<CaravanEvent> {
                     "scheduler_status".to_owned(),
                     details.get("scheduler_status").cloned().unwrap_or_default(),
                 ),
+                (
+                    "decision_fingerprint".to_owned(),
+                    details
+                        .get("decision_fingerprint")
+                        .cloned()
+                        .unwrap_or_default(),
+                ),
             ]),
         ));
     }
@@ -1492,6 +1565,18 @@ fn sync_failed_event(error: &AppError) -> Option<CaravanEvent> {
     let repository =
         serde_json::from_value::<RepositoryId>(details.get("repository")?.clone()).ok()?;
     let mut prs = BTreeSet::new();
+    if let Some(pr) = details
+        .get("pr")
+        .and_then(|value| serde_json::from_value::<PrNumber>(value.clone()).ok())
+    {
+        prs.insert(pr);
+    }
+    if let Some(affected) = details
+        .get("affected_prs")
+        .and_then(|value| serde_json::from_value::<Vec<PrNumber>>(value.clone()).ok())
+    {
+        prs.extend(affected);
+    }
     if let Some(plans) = details.get("rebase_plans").and_then(|value| {
         serde_json::from_value::<Vec<crate::physical_rebase::RebasePlan>>(value.clone()).ok()
     }) {
@@ -1502,11 +1587,14 @@ fn sync_failed_event(error: &AppError) -> Option<CaravanEvent> {
     }) {
         prs.extend(receipts.into_iter().map(|receipt| receipt.pr));
     }
+    let caravan_id = details
+        .get("caravan_id")
+        .and_then(|value| serde_json::from_value::<PrNumber>(value.clone()).ok());
     Some(hooks::event(
         EventKind::SyncFailed,
         hooks::operation_id_from_error(error),
         repository,
-        None,
+        caravan_id,
         prs.into_iter().collect(),
         None,
         Some(error.message()),
@@ -1516,6 +1604,13 @@ fn sync_failed_event(error: &AppError) -> Option<CaravanEvent> {
             (
                 "provider_invariant".to_owned(),
                 json!(details.get("rebase_receipts").is_some()),
+            ),
+            (
+                "decision_fingerprint".to_owned(),
+                details
+                    .get("decision_fingerprint")
+                    .cloned()
+                    .unwrap_or_default(),
             ),
         ]),
     ))
@@ -5009,6 +5104,90 @@ mod tests {
             event.metadata["scheduler_status"]["wake_class"],
             "external_decision"
         );
+    }
+
+    #[test]
+    fn nonlinear_range_is_a_stable_external_decision_with_exact_context() {
+        let raw = AppError::structured(
+            ErrorCategory::Validation,
+            "rebase_nonlinear_range",
+            "candidate-only history contains merge commits",
+            Some(json!({
+                "pr": PrNumber(2),
+                "merge_oids": ["merge-a", "merge-b"],
+                "completed_steps": [],
+                "provider_receipts": [],
+                "rebase_plans": [],
+                "rebase_receipts": [],
+            })),
+        );
+        let physical = attach_physical_rebuild(
+            raw,
+            &PhysicalRebuildOutcome {
+                repository: Some(repository()),
+                caravan_id: Some(PrNumber(1)),
+                affected_prs: vec![PrNumber(2)],
+                ..PhysicalRebuildOutcome::default()
+            },
+        );
+        let scheduler = scheduler_failure_status(&physical);
+        assert_eq!(
+            scheduler.disposition,
+            SchedulerDisposition::ExternalDecision
+        );
+        assert_eq!(scheduler.wake_class, SchedulerWakeClass::ExternalDecision);
+        assert!(!scheduler.retryable);
+
+        let attached = attach_scheduler_failure(&physical, &scheduler);
+        let first_fingerprint = attached.details().unwrap()["decision_fingerprint"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let repeated = attach_scheduler_failure(&physical, &scheduler);
+        assert_eq!(
+            repeated.details().unwrap()["decision_fingerprint"],
+            first_fingerprint
+        );
+        let event = sync_failed_event(&attached).expect("external decision event");
+        assert_eq!(event.caravan_id, Some(PrNumber(1)));
+        assert_eq!(event.prs, vec![PrNumber(2)]);
+        assert_eq!(event.metadata["decision_fingerprint"], first_fingerprint);
+        let details = attached.details().unwrap();
+        assert_eq!(details["retryable"], false);
+        assert!(
+            details["next"]
+                .as_str()
+                .unwrap()
+                .contains("cannot succeed by retry")
+        );
+        assert_eq!(details["completed_steps"], json!([]));
+        assert_eq!(details["provider_receipts"], json!([]));
+    }
+
+    #[test]
+    fn unsupported_exact_range_shapes_are_never_retry_ticks() {
+        for code in [
+            "rebase_nonlinear_range",
+            "rebase_range_ambiguous",
+            "rebase_empty_patch_range",
+            "rebase_target_history_changed",
+            "rebase_repository_not_owned",
+            "rebase_historical_target_mismatch",
+        ] {
+            let error = AppError::structured(
+                ErrorCategory::Validation,
+                code,
+                "exact range decision",
+                Some(json!({"repository": repository(), "pr": PrNumber(7)})),
+            );
+            let scheduler = scheduler_failure_status(&error);
+            assert_eq!(
+                scheduler.wake_class,
+                SchedulerWakeClass::ExternalDecision,
+                "{code}"
+            );
+            assert!(!scheduler.retryable, "{code}");
+        }
     }
 
     #[test]

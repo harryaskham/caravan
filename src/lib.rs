@@ -226,7 +226,11 @@ BUILT-IN WEB OPERATIONS
 RECOVERY, LOCKS, AND OBSERVABILITY
 - GitHub is the resume cursor. After timeout, interruption, or partial provider
   failure, inspect receipts and rerun the same command. Do not guess whether a
-  mutation happened.
+  mutation happened. Only genuine provider-generation races are `retry_tick`.
+  Deterministic unsupported physical histories such as nonlinear, ambiguous, or
+  empty candidate ranges are non-retryable external decisions: use their stable
+  fingerprint and exact repair/reshape/evict/strategy choices rather than
+  repeating the unchanged tick.
 - `cara lock status` reports owner token, PID liveness, checkpoint phase, and
   provider indeterminacy. Use `lock recover --confirm` only for the typed,
   verified-stale owner; never delete lock files manually.
