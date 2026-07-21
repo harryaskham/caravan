@@ -75,6 +75,9 @@ invocations share root config/state; outside a non-bare worktree writes nothing.
    effective `rebase_on_join` mode, current/merged branch context, every caravan,
    canonical admission order, pauses, exact base/head/candidate lineage, CI
    generation freshness, compatibility, default-branch movement, and problems.
+   Reused branch text selects a fresh PR only for one exact OPEN same-repository
+   local/remote/provider head with no retained Caravan membership conflict;
+   ambiguity, forks, or OID drift stop.
 2. If initialization is not ready, run idempotent `cara init`. Do not hand-create
    labels or silently overwrite mismatched metadata. Repair the exact reported
    repository setting, protection, label, permission, or config mismatch.

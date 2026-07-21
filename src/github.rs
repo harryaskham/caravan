@@ -1342,6 +1342,7 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
     /// The returned number is the active rolling successor, not the merged PR;
     /// callers can recover the predecessor from `current_branch` and the
     /// included merged snapshots for explicit receipts.
+    #[allow(clippy::too_many_lines)]
     fn resolve_historical_current_pr(
         &self,
         repository: &RepositoryId,
@@ -1358,6 +1359,13 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
         if history.is_empty() {
             return Ok(None);
         }
+
+        if let Some(current) =
+            self.resolve_exact_open_reused_branch(repository, branch, &history)?
+        {
+            return Ok(Some((current.clone(), Some(current.number))));
+        }
+
         if history.len() != 1 {
             return Err(DiscoveryError::HistoricalCurrentPullRequest {
                 reason: "branch_reuse_ambiguous",
@@ -1448,6 +1456,53 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
                 }
             }
         }
+    }
+
+    fn resolve_exact_open_reused_branch(
+        &self,
+        repository: &RepositoryId,
+        branch: &str,
+        history: &[model::PullRequestSnapshot],
+    ) -> Result<Option<model::PullRequestSnapshot>, DiscoveryError> {
+        // The bounded all-open rollup can omit a recently opened PR when a
+        // repository is at its provider limit. Before treating branch text as
+        // retained merged history, give one exact open same-repository head
+        // precedence. Duplicate open reuse remains ambiguous even when only one
+        // candidate happens to match the local OID.
+        let open = history
+            .iter()
+            .filter(|pull| pull.state == model::PullRequestState::Open)
+            .cloned()
+            .collect::<Vec<_>>();
+        if open.is_empty() {
+            return Ok(None);
+        }
+        let open_candidates = open.iter().map(|pull| pull.number.0).collect::<Vec<_>>();
+        let fail = |reason| DiscoveryError::HistoricalCurrentPullRequest {
+            reason,
+            branch: branch.to_owned(),
+            candidates: open_candidates.clone(),
+        };
+        if open.len() != 1 {
+            return Err(fail("open_branch_reuse_ambiguous"));
+        }
+        let current = &open[0];
+        if current.cross_repository || current.head.repository != *repository {
+            return Err(fail("fork_only_open_head"));
+        }
+        let local_oid = self.command_text(current_head_oid_command())?;
+        let remote: GitRefJson = self.json(historical_head_command(&repository.slug(), branch))?;
+        if current.head.oid.0 != local_oid || remote.object.sha != local_oid {
+            return Err(fail("exact_open_head_mismatch"));
+        }
+        let conflicting_history = history.iter().any(|pull| {
+            pull.number != current.number
+                && (pull.has_label(&self.options.label) || pull.has_label("caravan-evicted"))
+        });
+        if conflicting_history {
+            return Err(fail("historical_membership_conflict"));
+        }
+        Ok(Some(current.clone()))
     }
 
     fn validate_reused_historical_head(
@@ -3002,6 +3057,138 @@ mod tests {
             .discover()
             .expect("advanced historical branch is fresh PR ancestry");
         assert_eq!(snapshot.current_pr, None);
+        discovery.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn unique_exact_open_head_precedes_unlabelled_merged_branch_history() {
+        let historical =
+            merged_pr_json().replace(r#""labels":[{"name":"caravan"}]"#, r#""labels":[]"#);
+        let open = pr_list_json(12, "old-head", "acme/widgets", false)
+            .replace(r#""labels":[{"name":"caravan"}]"#, r#""labels":[]"#);
+        let history = format!(
+            "[{},{}]",
+            &historical[1..historical.len() - 1],
+            &open[1..open.len() - 1]
+        );
+        let mut calls = historical_discovery_calls("[]", history);
+        calls.extend([
+            (
+                current_head_oid_command(),
+                CommandOutput::success("head-12\n"),
+            ),
+            (
+                historical_head_command("acme/widgets", "old-head"),
+                CommandOutput::success(r#"{"object":{"sha":"head-12"}}"#),
+            ),
+        ]);
+        let discovery = GitHubDiscovery::new(FakeRunner::new(calls));
+
+        let snapshot = discovery
+            .discover()
+            .expect("one exact open generation wins over old branch text");
+
+        assert_eq!(snapshot.current_pr, Some(PrNumber(12)));
+        let current = snapshot
+            .pull_requests
+            .iter()
+            .find(|pull| pull.number == PrNumber(12))
+            .expect("exact open PR retained");
+        assert_eq!(current.state, model::PullRequestState::Open);
+        discovery.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn multiple_open_reuses_remain_ambiguous_before_oid_checks() {
+        let first = pr_list_json(12, "old-head", "acme/widgets", false);
+        let second = pr_list_json(13, "old-head", "acme/widgets", false);
+        let history = format!(
+            "[{},{}]",
+            &first[1..first.len() - 1],
+            &second[1..second.len() - 1]
+        );
+        let calls = historical_discovery_calls("[]", history);
+        let discovery = GitHubDiscovery::new(FakeRunner::new(calls));
+
+        let error = discovery
+            .discover()
+            .expect_err("duplicate open reuse is unsafe");
+
+        assert!(matches!(
+            error,
+            DiscoveryError::HistoricalCurrentPullRequest {
+                reason: "open_branch_reuse_ambiguous",
+                ..
+            }
+        ));
+        discovery.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn unique_open_reuse_refuses_provider_remote_head_mismatch() {
+        let open = pr_list_json(12, "old-head", "acme/widgets", false)
+            .replace(r#""labels":[{"name":"caravan"}]"#, r#""labels":[]"#);
+        let mut calls = historical_discovery_calls("[]", open);
+        calls.extend([
+            (
+                current_head_oid_command(),
+                CommandOutput::success("head-12\n"),
+            ),
+            (
+                historical_head_command("acme/widgets", "old-head"),
+                CommandOutput::success(r#"{"object":{"sha":"different-head"}}"#),
+            ),
+        ]);
+        let discovery = GitHubDiscovery::new(FakeRunner::new(calls));
+
+        let error = discovery
+            .discover()
+            .expect_err("remote branch movement invalidates reused head identity");
+
+        assert!(matches!(
+            error,
+            DiscoveryError::HistoricalCurrentPullRequest {
+                reason: "exact_open_head_mismatch",
+                ..
+            }
+        ));
+        discovery.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn exact_open_reuse_refuses_conflicting_historical_membership() {
+        let historical = merged_pr_json();
+        let open = pr_list_json(12, "old-head", "acme/widgets", false)
+            .replace(r#""labels":[{"name":"caravan"}]"#, r#""labels":[]"#);
+        let history = format!(
+            "[{},{}]",
+            &historical[1..historical.len() - 1],
+            &open[1..open.len() - 1]
+        );
+        let mut calls = historical_discovery_calls("[]", history);
+        calls.extend([
+            (
+                current_head_oid_command(),
+                CommandOutput::success("head-12\n"),
+            ),
+            (
+                historical_head_command("acme/widgets", "old-head"),
+                CommandOutput::success(r#"{"object":{"sha":"head-12"}}"#),
+            ),
+        ]);
+        let discovery = GitHubDiscovery::new(FakeRunner::new(calls));
+
+        let error = discovery
+            .discover()
+            .expect_err("retained caravan branch history remains authoritative");
+
+        assert!(matches!(
+            error,
+            DiscoveryError::HistoricalCurrentPullRequest {
+                reason: "historical_membership_conflict",
+                ..
+            }
+        ));
         discovery.runner.assert_exhausted();
     }
 

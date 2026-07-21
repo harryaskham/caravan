@@ -495,8 +495,12 @@ without an outer shell timeout.
 
 Discovery performs one bounded all-open PR query containing current check
 rollups, derives the current PR and caravan-labelled members from that snapshot,
-and uses a separate bounded merged-history query that deliberately omits check
-rollups. Provider command count therefore remains constant as open PR count
+and uses a separate bounded branch-history query that deliberately omits check
+rollups. If the bounded open rollup omitted a reused branch, one unique exact
+OPEN same-repository PR may take precedence over older unlabelled history only
+when its local, remote-ref, and provider head OIDs all match. Multiple open
+reuses, forks, OID mismatch, or older `caravan`/`caravan-evicted` membership
+history still fail closed. Provider command count therefore remains constant as open PR count
 grows; compatibility subprocesses share the same whole-status deadline. Explicit
 remote `check/new/join/rejoin --pr` first completes that bounded fleet discovery,
 then re-reads and binds only the selected PR under a fresh
