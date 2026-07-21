@@ -381,7 +381,13 @@ always expose the effective mode and config path; a disabled sync conflict gives
 the exact `rebase_on_join: true` project-config action instead of implying a
 manual hand-rebase.
 
-When enabled, membership rebases one candidate-only linear range.
+When enabled, membership rebases one candidate-only linear range. Post-rewrite
+provider rediscovery is operation-specific: `join`/`rejoin` require the exact
+live tail named by the rebase receipt; `new`/`renew` require the exact current
+default branch generation and no inferred membership tail. A new caravan has no
+join target by design. Candidate-head/default/tail or unexpected-membership drift
+returns `join_target_moved_after_rebase` or `new_target_moved_after_rebase` with
+`mutated_membership=false` before label/base/auto-merge writes.
 `sync --all` plans each selected caravan head-to-tail from exact discovered
 facts: the head targets the exact default OID and every descendant targets the
 retained, simulated new head of its parent. Rebase objects are materialized once

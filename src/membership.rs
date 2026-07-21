@@ -1054,26 +1054,7 @@ fn execute_with_rebase_guard(
         None
     };
     if let Some(rebase) = expected_rebase {
-        let candidate_matches = status.current_pr == Some(rebase.pr);
-        let target_matches = target.as_ref().is_some_and(|target| {
-            target.tail.head.name == rebase.new_base_branch
-                && target.tail.head.oid == rebase.new_base_oid
-        });
-        if !candidate_matches || !target_matches {
-            return Err(AppError::structured(
-                ErrorCategory::Validation,
-                "join_target_moved_after_rebase",
-                "candidate or live caravan tail changed after physical preflight; refusing admission",
-                Some(json!({
-                    "rebase_receipt": rebase,
-                    "current_pr": status.current_pr,
-                    "live_tail": target.as_ref().map(|target| &target.tail),
-                    "mutated_membership": false,
-                    "resumable": true,
-                    "safe_next_action": "rediscover and retry the same atomic join"
-                })),
-            ));
-        }
+        validate_post_rebase_target(&status, &request, target.as_ref(), rebase)?;
     }
     let desired_base = target.as_ref().map_or_else(
         || status.default_branch.clone(),
@@ -1207,6 +1188,65 @@ fn execute_with_rebase_guard(
 struct JoinTarget {
     caravan: Caravan,
     tail: PullRequestSnapshot,
+}
+
+fn validate_post_rebase_target(
+    status: &StatusOutput,
+    request: &MembershipRequest,
+    target: Option<&JoinTarget>,
+    rebase: &crate::physical_rebase::RebaseReceipt,
+) -> Result<(), AppError> {
+    let live_candidate = status.analysis.pull_requests.get(&rebase.pr);
+    let candidate_matches = status.current_pr == Some(rebase.pr)
+        && live_candidate.is_some_and(|candidate| candidate.head.oid == rebase.new_head_oid);
+    let live_default = &status.analysis.fleet.default_branch;
+    let candidate_caravan = status.analysis.fleet.containing(rebase.pr);
+    let target_matches = if request.operation.is_join() {
+        target.is_some_and(|target| {
+            target.tail.head.name == rebase.new_base_branch
+                && target.tail.head.oid == rebase.new_base_oid
+        })
+    } else {
+        target.is_none()
+            && candidate_caravan.is_none()
+            && status.default_branch == rebase.new_base_branch
+            && live_default.name == rebase.new_base_branch
+            && live_default.oid == rebase.new_base_oid
+    };
+    if candidate_matches && target_matches {
+        return Ok(());
+    }
+
+    let join = request.operation.is_join();
+    Err(AppError::structured(
+        ErrorCategory::Validation,
+        if join {
+            "join_target_moved_after_rebase"
+        } else {
+            "new_target_moved_after_rebase"
+        },
+        if join {
+            "candidate or live caravan tail changed after physical preflight; refusing admission"
+        } else {
+            "candidate, default branch, or membership topology changed after physical preflight; refusing new caravan admission"
+        },
+        Some(json!({
+            "operation": request.operation,
+            "rebase_receipt": rebase,
+            "current_pr": status.current_pr,
+            "live_candidate": live_candidate,
+            "live_tail": target.map(|target| &target.tail),
+            "live_default": live_default,
+            "candidate_caravan": candidate_caravan,
+            "mutated_membership": false,
+            "resumable": true,
+            "safe_next_action": if join {
+                "rediscover and retry the same atomic join"
+            } else {
+                "rediscover and retry the same atomic new/renew operation against the current default branch"
+            }
+        })),
+    ))
 }
 
 fn resolve_join_target(
@@ -2093,6 +2133,29 @@ mod tests {
         }
     }
 
+    fn rebase_receipt(
+        candidate: &PullRequestSnapshot,
+        new_base: &BranchSnapshot,
+    ) -> crate::physical_rebase::RebaseReceipt {
+        crate::physical_rebase::RebaseReceipt {
+            pr: candidate.number,
+            branch: candidate.head.name.clone(),
+            old_head_oid: candidate.head.oid.clone(),
+            new_head_oid: candidate.head.oid.clone(),
+            old_base_oid: candidate.base.oid.clone(),
+            new_base_branch: new_base.name.clone(),
+            new_base_oid: new_base.oid.clone(),
+            new_tree_oid: CommitOid("tree-oid".to_owned()),
+            commit_count: 1,
+            ci_trigger_workflows: vec![".github/workflows/ci.yml".to_owned()],
+            lease: format!(
+                "--force-with-lease=refs/heads/{}:{}",
+                candidate.head.name, candidate.head.oid
+            ),
+            already_satisfied: true,
+        }
+    }
+
     #[allow(clippy::unnecessary_wraps)]
     fn clean(
         candidate: &BranchSnapshot,
@@ -2130,6 +2193,136 @@ mod tests {
         assert_eq!(event.prs, vec![PrNumber(1), PrNumber(2)]);
         assert_eq!(event.fleet, Some(status.analysis.fleet));
         assert_eq!(event.metadata["error_code"], "candidate_rejected");
+    }
+
+    #[test]
+    fn atomic_new_and_renew_accept_exact_default_without_a_join_tail() {
+        for (operation, labels) in [
+            (MembershipOperation::New, Vec::<&str>::new()),
+            (MembershipOperation::Renew, vec![EVICTED_LABEL]),
+        ] {
+            let candidate = pull_request(2, "two", "main", &labels);
+            let status = status(candidate.clone(), Vec::new());
+            let provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
+            let rebase = rebase_receipt(&candidate, &status.analysis.fleet.default_branch);
+
+            let output = execute_with_rebase_guard(
+                status,
+                &clean,
+                &provider,
+                MembershipRequest {
+                    operation,
+                    create_pr: false,
+                    tail_pr: None,
+                    head_pr: None,
+                    reason: None,
+                    priority_label: None,
+                    agent_priority_labels: Vec::new(),
+                },
+                Some(&rebase),
+                false,
+            )
+            .expect("new/renew uses the exact default target and no join tail");
+
+            assert!(output.pull_request.has_label(ACTIVE_LABEL));
+            assert!(!output.pull_request.has_label(EVICTED_LABEL));
+            assert_eq!(output.pull_request.auto_merge, AutoMergeState::squash());
+            assert_eq!(output.pull_request.base, status_default(&rebase));
+        }
+    }
+
+    #[test]
+    fn atomic_new_rejects_head_default_and_membership_races_before_mutation() {
+        let candidate = pull_request(2, "two", "main", &[]);
+        let initial = status(candidate.clone(), Vec::new());
+        let rebase = rebase_receipt(&candidate, &initial.analysis.fleet.default_branch);
+
+        let mut moved_head = candidate.clone();
+        moved_head.head.oid = CommitOid("moved-head-oid".to_owned());
+        let moved_provider = FakeProvider::with_pull_requests(vec![moved_head.clone()]);
+        let error = execute_with_rebase_guard(
+            status(moved_head.clone(), Vec::new()),
+            &clean,
+            &moved_provider,
+            MembershipRequest {
+                operation: MembershipOperation::New,
+                create_pr: false,
+                tail_pr: None,
+                head_pr: None,
+                reason: None,
+                priority_label: None,
+                agent_priority_labels: Vec::new(),
+            },
+            Some(&rebase),
+            false,
+        )
+        .expect_err("changed candidate head invalidates physical preflight");
+        assert_eq!(error.code(), "new_target_moved_after_rebase");
+        assert!(error.details().unwrap()["mutated_membership"] == false);
+        assert_eq!(
+            moved_provider.pull_requests.borrow()[&PrNumber(2)],
+            moved_head
+        );
+
+        let mut moved_default = initial.clone();
+        moved_default.analysis.fleet.default_branch.oid = CommitOid("new-main-oid".to_owned());
+        let default_provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
+        let error = execute_with_rebase_guard(
+            moved_default,
+            &clean,
+            &default_provider,
+            MembershipRequest {
+                operation: MembershipOperation::New,
+                create_pr: false,
+                tail_pr: None,
+                head_pr: None,
+                reason: None,
+                priority_label: None,
+                agent_priority_labels: Vec::new(),
+            },
+            Some(&rebase),
+            false,
+        )
+        .expect_err("changed default invalidates physical preflight");
+        assert_eq!(error.code(), "new_target_moved_after_rebase");
+        assert!(default_provider.pull_requests.borrow()[&PrNumber(2)] == candidate);
+
+        let enrolled = pull_request(2, "two", "main", &[ACTIVE_LABEL]);
+        let enrolled_provider = FakeProvider::with_pull_requests(vec![enrolled.clone()]);
+        let error = execute_with_rebase_guard(
+            status(enrolled.clone(), Vec::new()),
+            &clean,
+            &enrolled_provider,
+            MembershipRequest {
+                operation: MembershipOperation::New,
+                create_pr: false,
+                tail_pr: None,
+                head_pr: None,
+                reason: None,
+                priority_label: None,
+                agent_priority_labels: Vec::new(),
+            },
+            Some(&rebase),
+            false,
+        )
+        .expect_err("unexpected membership invalidates new admission");
+        assert_eq!(error.code(), "new_target_moved_after_rebase");
+        assert_eq!(
+            error.details().unwrap()["candidate_caravan"]["id"],
+            PrNumber(2).0
+        );
+        assert_eq!(
+            enrolled_provider.pull_requests.borrow()[&PrNumber(2)],
+            enrolled
+        );
+    }
+
+    fn status_default(receipt: &crate::physical_rebase::RebaseReceipt) -> BranchSnapshot {
+        BranchSnapshot {
+            repository: repository(),
+            name: receipt.new_base_branch.clone(),
+            oid: receipt.new_base_oid.clone(),
+        }
     }
 
     #[test]

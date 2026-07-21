@@ -330,8 +330,13 @@ hooks:
 ```
 
 Cumulative mode rejects fork heads, stale leases, empty/ambiguous ranges, and
-candidate-only merge commits. Membership rewrites one candidate; `cara sync
---all` builds every selected caravan head-to-tail, feeding each retained planned
+candidate-only merge commits. Membership rewrites one candidate. After the
+mandatory provider rediscovery, `join`/`rejoin` require the exact live tail from
+the rebase receipt, while `new`/`renew` require the exact current default and no
+inferred candidate membership; a new caravan correctly has no join tail.
+Candidate-head/default/tail drift stops before membership writes with an
+operation-specific resumable receipt. `cara sync --all` builds every selected
+caravan head-to-tail, feeding each retained planned
 head into its child. It materializes each generation exactly once in a retained
 detached worktree, then verifies every conflict, PR precondition, remote head,
 dry-run permission, and exact lease across the complete plan before the first

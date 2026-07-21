@@ -79,10 +79,14 @@ FIRST USE AND EVERY SAFE TICK
    when proposing a join. Follow the typed `new`, `join`, `repair`, `wait`, or
    `reject` action from the returned receipt.
 4. Use `cara new`, `renew`, `join`, or `rejoin` only after that preflight.
-   For checkout-free orchestration, `cara join --pr N --tail-pr T` requires
-   `rebase_on_join: true`: it holds the repository operation lock, re-reads the
-   canonical live tail, rebases the exact candidate onto that tail, re-reads
-   provider facts, refuses admission if the tail moved, sets the provider base,
+   With `rebase_on_join: true`, post-rewrite rediscovery is operation-specific:
+   join/rejoin require the exact live tail, while new/renew require the exact
+   current default generation and deliberately no join tail. Candidate-head,
+   default, tail, or unexpected-membership drift stops before membership writes.
+   For checkout-free orchestration, `cara join --pr N --tail-pr T` holds the
+   repository operation lock, re-reads the canonical live tail, rebases the
+   exact candidate onto that tail, re-reads provider facts, refuses admission
+   if the tail moved, sets the provider base,
    and returns a versioned exact join receipt. Routine join accepts no force
    option and proves any stale-generation `caravan-force` intent was absent or
    removed. Membership operations are optimistic and resumable; rerun the same
