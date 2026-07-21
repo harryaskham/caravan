@@ -11,6 +11,7 @@
     connection: document.querySelector("#connection"),
     activity: document.querySelector("#activity"),
     refresh: document.querySelector("#refresh-all"),
+    plan: document.querySelector("#plan-sync"),
     sync: document.querySelector("#sync-all"),
     evidence: document.querySelector("#show-evidence"),
     config: document.querySelector("#show-config"),
@@ -180,7 +181,7 @@
           <div class="caravan-title"><h3>Caravan #${caravan.id}</h3><span>${members.length} ${members.length === 1 ? "member" : "members"}</span></div>
           <div class="caravan-tools">
             <div class="badges">${pause ? badge("Paused", "warn") : head?.auto_merge?.enabled ? badge("Head armed", "good") : badge("Head not armed", "warn")}</div>
-            <div class="inline-actions">${actionButton("Sync", "sync", { all: true, rerun_failed: false }, "primary")}${holdAction}</div>
+            <div class="inline-actions">${actionButton("Plan", "plan_sync", { all: true, rerun_failed: false }, "", false)}${actionButton("Sync", "sync", { all: true, rerun_failed: false }, "primary")}${holdAction}</div>
           </div>
         </header>
         <div class="trail">${members.map(renderPrCard).join("")}</div>
@@ -272,6 +273,7 @@
     if (action) sections.push(`<section class="inspector-section"><h3>Last action · ${escapeHtml(action.action)}</h3>
       <p>${new Date(action.completed_unix_ms).toLocaleString()} · ${action.ok ? badge("Completed", "good") : badge("Failed", "bad")}</p>
       ${action.error ? `<article class="evidence-card bad"><strong>${escapeHtml(action.error.code)}</strong><p>${escapeHtml(action.error.message)}</p><details><summary>Structured continuation</summary><pre>${escapeHtml(JSON.stringify(action.error.details ?? {}, null, 2))}</pre></details></article>` : ""}
+      ${result?.mutated === false && result?.actions ? `<article class="evidence-card plan-summary"><div class="evidence-title"><strong>No-write sync plan</strong>${badge(result.plan_hash || "exact", "info")}</div><p>${result.actions.length} ordered actions · ${result.decisions?.length ?? 0} decisions · provider writes ${result.provider_writes}</p></article>${result.actions.map((item) => `<article class="evidence-card"><div class="evidence-title"><strong>${item.order}. ${escapeHtml(item.kind)}</strong>${badge(item.state, item.state === "would_mutate" ? "warn" : item.state === "would_stop" ? "bad" : "info")}</div><p>${escapeHtml(item.reason)}</p>${item.pr ? `<p>PR #${item.pr}${item.caravan_id ? ` · caravan #${item.caravan_id}` : ""}</p>` : ""}<details><summary>Exact precondition &amp; target</summary><pre>${escapeHtml(JSON.stringify({expected: item.expected, target: item.target, phase: item.phase}, null, 2))}</pre></details></article>`).join("")}${(result.decisions ?? []).map((item) => `<article class="evidence-card bad"><strong>${escapeHtml(item.code)}</strong><p>${escapeHtml(item.reason)}</p><p>Next: ${escapeHtml(item.next)}</p></article>`).join("")}` : ""}
       ${actionDiagnostics.join("")}
       ${result?.scheduler_status ? `<article class="evidence-card"><strong>Scheduler</strong><p>${escapeHtml(result.scheduler_status.disposition)} · ${escapeHtml(result.scheduler_status.reason)}</p></article>` : ""}
     </section>`);
@@ -309,6 +311,7 @@
     const hasCaravans = (repo.status?.analysis?.fleet?.caravans ?? []).length > 0;
     ui.dashboard.classList.toggle("no-caravans", !hasCaravans);
     ui.dashboard.hidden = false;
+    ui.plan.hidden = false;
     ui.sync.hidden = false;
     ui.sync.disabled = state.read_only;
     ui.evidence.hidden = false;
@@ -398,6 +401,7 @@
   }
 
   ui.refresh.addEventListener("click", refreshAll);
+  ui.plan.addEventListener("click", () => performAction("plan_sync", { all: true, rerun_failed: false }, ui.plan));
   ui.sync.addEventListener("click", () => performAction("sync", { all: true, rerun_failed: false }, ui.sync));
   ui.evidence.addEventListener("click", () => openInspector("evidence"));
   ui.config.addEventListener("click", () => openInspector("config"));

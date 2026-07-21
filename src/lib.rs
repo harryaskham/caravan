@@ -91,7 +91,10 @@ FIRST USE AND EVERY SAFE TICK
    option and proves any stale-generation `caravan-force` intent was absent or
    removed. Membership operations are optimistic and resumable; rerun the same
    command after an indeterminate provider response rather than inventing state.
-5. Run `cara sync` for the current caravan or `cara sync --all` for the fleet.
+5. Run `cara plan sync` (usually `--all`) to inspect the exact current
+   physical/conflict/lease and first auto-admission plan with zero provider
+   writes. Review ordered actions, no-ops, decisions, and rediscovery barriers.
+6. Run `cara sync` for the current caravan or `cara sync --all` for the fleet.
    Continue until it converges, reports waiting CI, or returns one typed decision.
    With `sync.actions.join_unlabelled_prs: true`, only sync-all also grows the
    fleet after existing caravans converge: `priority_fifo_greedy_v1` tries
@@ -100,7 +103,7 @@ FIRST USE AND EVERY SAFE TICK
    before considering a later candidate. Manual membership consumes that label.
    The same path powers `loop` and `loop --once`; every tick reports exact
    candidate/mutation/GitHub/wall bounds, joins, skips, remaining work, and continuation.
-6. Preserve the complete structured error. Its category, code, exact OIDs,
+7. Preserve the complete structured error. Its category, code, exact OIDs,
    affected PRs, completed steps, provider receipts, suggested actions, and
    resumable command are the continuation contract. Never replace it with a
    generic summary or proceed around it manually.
@@ -706,6 +709,11 @@ pub fn build_router() -> ToolRouter<AppContext> {
         |context: &AppContext, input: SyncInput| sync::sync(context, &input),
     );
     router.add_typed_tool_with_output_schema(
+        "plan_sync",
+        "Build the exact current sync/auto-admission plan through physical conflict and lease dry-run preflight without any provider write. Returns ordered actions, exact preconditions, no-ops, decisions, first admission target, rediscovery barriers, and mutated=false.",
+        |context: &AppContext, input: SyncInput| sync::plan_sync(context, &input),
+    );
+    router.add_typed_tool_with_output_schema(
         "repair_start",
         "Create or reuse a Cara-owned isolated exact-head workspace for one typed sync repair. Starts a non-committing exact-target merge without changing the caller checkout, provider branch, labels, or bases.",
         |context: &AppContext, input: repair::RepairStartInput| repair::start(context, &input),
@@ -1058,6 +1066,7 @@ mod tests {
             "show",
             "next",
             "prev",
+            "plan_sync",
             "sync",
             "evict",
             "split",
@@ -1077,6 +1086,23 @@ mod tests {
                 "missing {expected}"
             );
         }
+    }
+
+    #[test]
+    fn plan_tool_schema_exposes_no_write_receipt() {
+        let tools =
+            serde_json::to_value(build_router().tool_metadata()).expect("tool metadata serializes");
+        let plan = tools
+            .as_array()
+            .expect("metadata array")
+            .iter()
+            .find(|tool| tool["name"] == "plan_sync")
+            .expect("plan_sync tool");
+        let encoded = serde_json::to_string(plan).expect("plan metadata serializes");
+        assert!(encoded.contains("mutated"));
+        assert!(encoded.contains("provider_writes"));
+        assert!(encoded.contains("auto_admission"));
+        assert!(encoded.contains("plan_hash"));
     }
 
     #[test]

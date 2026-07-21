@@ -26,6 +26,7 @@ fn every_bounded_v1_domain_command_has_a_real_json_operation() {
         ("show", &["show"]),
         ("next", &["next"]),
         ("prev", &["prev"]),
+        ("plan_sync", &["plan", "sync", "--all", "--rerun-failed"]),
         ("sync", &["sync", "--all", "--rerun-failed"]),
         ("repair_start", &["repair", "start", "--pr", "1"]),
         (
@@ -128,6 +129,7 @@ fn every_bounded_v1_domain_command_has_a_real_json_operation() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn every_bounded_mcp_domain_tool_routes_to_the_real_operation() {
     let temp = tempfile::tempdir().expect("temp directory");
     let context = caravan::AppContext {
@@ -151,6 +153,10 @@ fn every_bounded_mcp_domain_tool_routes_to_the_real_operation() {
         ("show", serde_json::json!({})),
         ("next", serde_json::json!({})),
         ("prev", serde_json::json!({})),
+        (
+            "plan_sync",
+            serde_json::json!({ "all": true, "rerun_failed": true }),
+        ),
         (
             "sync",
             serde_json::json!({ "all": true, "rerun_failed": true }),
@@ -257,6 +263,7 @@ fn mcp_registry_covers_all_bounded_v1_operations_with_schemas() {
         "show",
         "next",
         "prev",
+        "plan_sync",
         "sync",
         "repair_start",
         "repair_authorize_agent_edits",

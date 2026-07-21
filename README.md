@@ -90,6 +90,7 @@ cara new [--create-pr]
 cara join [--tail-pr N | --head-pr N] [--create-pr]
 cara renew | cara rejoin
 cara show | cara next | cara prev
+cara plan sync [--all] [--rerun-failed]
 cara sync [--all] [--rerun-failed] | cara loop [--once]
 cara repair start --pr N [--target-pr T]
 cara repair authorize-agent-edits --session ID --actor A --reason R
@@ -161,7 +162,9 @@ canonicalizes and deduplicates paths, periodically returns the same typed status
 used by CLI/JSON/MCP, and applies strict CSP/anti-frame/no-store headers. The
 responsive one-page dashboard renders trail-linked caravans, linked GitHub PRs,
 exact generations and check failures, unenrolled PR reasons, and current
-problems/decisions. Bounded inner lists keep fleet topology and attention queues
+problems/decisions. `Plan sync` runs the same fresh physical/conflict/lease and
+first auto-admission selection preflight without provider writes, then renders
+ordered exact actions and rediscovery barriers before Apply. Bounded inner lists keep fleet topology and attention queues
 visible without an unbounded page. The Evidence drawer retains the latest typed
 action receipt, CI lineage diagnostics, canonical events, and hook delivery
 outcomes; the Config drawer shows the effective parsed policy with hook commands

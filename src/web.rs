@@ -147,6 +147,7 @@ pub struct WebActionRequest {
 #[serde(tag = "action", content = "input", rename_all = "snake_case")]
 pub enum WebAction {
     Check(CheckInput),
+    PlanSync(SyncInput),
     Sync(SyncInput),
     Join(JoinInput),
     Rejoin(JoinInput),
@@ -168,6 +169,7 @@ impl WebAction {
     fn name(&self) -> &'static str {
         match self {
             Self::Check(_) => "check",
+            Self::PlanSync(_) => "plan_sync",
             Self::Sync(_) => "sync",
             Self::Join(_) => "join",
             Self::Rejoin(_) => "rejoin",
@@ -187,7 +189,10 @@ impl WebAction {
     }
 
     fn mutates(&self) -> bool {
-        !matches!(self, Self::Check(_) | Self::RepairStatus(_))
+        !matches!(
+            self,
+            Self::Check(_) | Self::PlanSync(_) | Self::RepairStatus(_)
+        )
     }
 }
 
@@ -755,6 +760,7 @@ fn handle_action(
 fn run_action(context: &AppContext, action: WebAction) -> Result<serde_json::Value, AppError> {
     match action {
         WebAction::Check(input) => serialize_action(crate::read::check(context, &input)),
+        WebAction::PlanSync(input) => serialize_action(crate::sync::plan_sync(context, &input)),
         WebAction::Sync(input) => serialize_action(crate::sync::sync(context, &input)),
         WebAction::Join(input) => serialize_action(crate::membership::join(context, &input)),
         WebAction::Rejoin(input) => serialize_action(crate::membership::rejoin(context, &input)),
@@ -965,6 +971,14 @@ mod tests {
         .unwrap();
         assert_eq!(sync.action.name(), "sync");
         assert!(sync.action.mutates());
+        let plan: WebActionRequest = serde_json::from_value(json!({
+            "expected_refresh_sequence": 8,
+            "action": "plan_sync",
+            "input": {"all": true, "rerun_failed": false}
+        }))
+        .unwrap();
+        assert_eq!(plan.action.name(), "plan_sync");
+        assert!(!plan.action.mutates());
         assert!(
             serde_json::from_value::<WebActionRequest>(json!({
                 "expected_refresh_sequence": 1,
@@ -1005,11 +1019,13 @@ mod tests {
         assert!(!APP_JS.contains("cdn."));
         assert!(!APP_JS.contains("import("));
         assert!(APP_JS.contains("https://github.com/"));
+        assert!(INDEX_HTML.contains("id=\"plan-sync\""));
         assert!(INDEX_HTML.contains("id=\"show-config\""));
         assert!(INDEX_HTML.contains("id=\"show-evidence\""));
         assert!(!INDEX_HTML.contains("Surveying the trail"));
         assert!(!INDEX_HTML.contains("ambient repository discovery"));
         assert!(APP_JS.contains("target=\"_blank\" rel=\"noopener noreferrer\""));
         assert!(APP_JS.contains("last_action"));
+        assert!(APP_JS.contains("plan_sync"));
     }
 }

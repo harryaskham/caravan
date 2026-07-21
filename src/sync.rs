@@ -32,6 +32,7 @@ use crate::{AppContext, AppError, CheckInput, SyncInput};
 
 const MAX_SYNC_OPERATION_SECS: u64 = 3_600;
 const MAX_PARALLEL_REBASE_CHAINS: usize = 2;
+const MAX_SYNC_PLAN_ACTIONS: usize = 512;
 const AUTO_ADMISSION_SKIP_LABEL: &str = "caravan-join-skipped";
 const AUTO_ADMISSION_SKIP_PREFIX: &str = "<!-- caravan-auto-join-skip-receipt:";
 const MAX_AUTO_ADMISSION_COMMENT_BYTES: usize = 60 * 1024;
@@ -379,6 +380,122 @@ impl AutoAdmissionOutput {
     }
 }
 
+/// Phase in which a no-write sync plan action would occur.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncPlanPhase {
+    PhysicalPreflight,
+    ProviderConvergence,
+    AutoAdmission,
+    Rediscovery,
+}
+
+/// Whether an exact planned action writes, is already satisfied, or requires
+/// fresh facts after an earlier planned generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncPlanActionState {
+    WouldMutate,
+    AlreadySatisfied,
+    ReadOnlyObservation,
+    DeferredUntilRediscovery,
+    WouldStop,
+}
+
+/// One ordered, bounded action in an exact no-provider-write sync plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SyncPlanAction {
+    pub order: u32,
+    pub phase: SyncPlanPhase,
+    pub state: SyncPlanActionState,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr: Option<PrNumber>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caravan_id: Option<PrNumber>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected: Option<PullRequestPrecondition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<Value>,
+    pub reason: String,
+}
+
+/// Exact first auto-admission attempt that can be proven without applying an
+/// earlier provider generation. Later candidates always require rediscovery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SyncAutoAdmissionPlan {
+    pub enabled: bool,
+    pub heuristic_version: String,
+    pub continuation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_pr: Option<PrNumber>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_tail: Option<PrNumber>,
+    #[serde(default)]
+    pub tested_tails: Vec<AutoAdmissionTailGeneration>,
+    #[serde(default)]
+    pub compatibility_reasons: Vec<String>,
+}
+
+/// One deterministic no-write stop or decision surfaced by planning.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SyncPlanDecision {
+    pub code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr: Option<PrNumber>,
+    pub reason: String,
+    pub next: String,
+}
+
+/// Stable exact sync plan. `mutated` and `provider_writes` are invariantly zero.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SyncPlanOutput {
+    pub schema_version: u32,
+    pub mutated: bool,
+    pub provider_writes: u32,
+    pub local_ephemeral_preflight: bool,
+    pub repository: RepositoryId,
+    pub default_branch: crate::model::BranchSnapshot,
+    pub all: bool,
+    pub plan_hash: String,
+    #[serde(default)]
+    pub selected_caravans: Vec<PrNumber>,
+    #[serde(default)]
+    pub physical_rebase_plans: Vec<crate::physical_rebase::RebasePlan>,
+    #[serde(default)]
+    pub ci: Vec<CiObservation>,
+    #[serde(default)]
+    pub actions: Vec<SyncPlanAction>,
+    pub auto_admission: SyncAutoAdmissionPlan,
+    #[serde(default)]
+    pub decisions: Vec<SyncPlanDecision>,
+    #[serde(default)]
+    pub would_emit_events: Vec<EventKind>,
+    pub github_requests_used: u32,
+    pub status: StatusOutput,
+}
+
+impl SyncPlanOutput {
+    fn finalize_hash(mut self) -> Self {
+        let material = serde_json::to_vec(&json!({
+            "schema_version": self.schema_version,
+            "repository": &self.repository,
+            "default_branch": &self.default_branch,
+            "all": self.all,
+            "selected_caravans": &self.selected_caravans,
+            "physical_rebase_plans": &self.physical_rebase_plans,
+            "ci": &self.ci,
+            "actions": &self.actions,
+            "auto_admission": &self.auto_admission,
+            "decisions": &self.decisions,
+            "would_emit_events": &self.would_emit_events,
+        }))
+        .expect("sync plan hash material serializes");
+        self.plan_hash = crate::membership::fnv1a64(&material);
+        self
+    }
+}
+
 /// Stable result of one converged synchronization tick.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SyncOutput {
@@ -720,6 +837,667 @@ pub fn sync(context: &AppContext, input: &SyncInput) -> Result<SyncOutput, AppEr
             let deliveries = hooks::dispatch_events(context, &events)?;
             Err(hooks::attach_deliveries(error, &deliveries))
         }
+    }
+}
+
+/// Build an exact, bounded sync plan without invoking any provider mutation.
+#[allow(clippy::too_many_lines)]
+pub fn plan_sync(context: &AppContext, input: &SyncInput) -> Result<SyncPlanOutput, AppError> {
+    let _lock = OperationLock::acquire(&context.repository_path, "plan-sync")?;
+    let started = Instant::now();
+    let operation_deadline = started + sync_operation_budget(context);
+    let github_budget =
+        crate::command::GithubRequestBudget::new(context.config.sync.max_github_requests_per_tick);
+    let status =
+        read::status_with_deadline_and_budget(context, operation_deadline, Some(&github_budget))?;
+    crate::initialization::require_ready(&status.initialization)?;
+    let timeout = Duration::from_secs(context.config.command_timeout_secs);
+    let runner = crate::command::ProcessRunner::in_directory(&context.repository_path)
+        .with_timeout(timeout)
+        .with_operation_deadline(operation_deadline)
+        .with_github_request_budget(github_budget.clone());
+    crate::navigation::ensure_safe_worktree(
+        &context.repository_path,
+        &context.config_path,
+        &runner,
+    )?;
+    let provider = GitHubMutationAdapter::new(runner);
+    let selected = selected_unpaused_caravans(&status, input.all)?;
+    let selected_ids = selected
+        .iter()
+        .map(|caravan| caravan.id)
+        .collect::<Vec<_>>();
+    let (physical_rebase_plans, mut progress) = if context.config.rebase_on_join {
+        let (prepared, progress) =
+            prepare_physical_chains(context, &status, input.all, &provider, operation_deadline)?;
+        let plans = prepared
+            .iter()
+            .flat_map(|chain| chain.members.iter().map(|item| item.plan.clone()))
+            .collect::<Vec<_>>();
+        drop(prepared);
+        (plans, progress)
+    } else {
+        let mut progress = SyncProgress::new(
+            &status,
+            selected_ids.clone(),
+            context.config.sync.max_mutations_per_tick,
+        );
+        progress.paused_caravans = status
+            .pauses
+            .iter()
+            .filter(|pause| {
+                pause.state != crate::pause::PauseState::Stale
+                    && status
+                        .analysis
+                        .fleet
+                        .caravans
+                        .iter()
+                        .any(|caravan| caravan.id == pause.record.caravan_head)
+            })
+            .cloned()
+            .collect();
+        if !selected.is_empty() {
+            preflight_repository(&provider, &status, &progress)?;
+            validate_graph(&status, &selected, &progress)?;
+        }
+        (Vec::new(), progress)
+    };
+
+    let mut actions = Vec::new();
+    let mut decisions = Vec::new();
+    let mut would_emit_events = Vec::new();
+    for plan in &physical_rebase_plans {
+        push_plan_action(
+            &mut actions,
+            SyncPlanAction {
+                order: 0,
+                phase: SyncPlanPhase::PhysicalPreflight,
+                state: if plan.already_satisfied {
+                    SyncPlanActionState::AlreadySatisfied
+                } else {
+                    SyncPlanActionState::WouldMutate
+                },
+                kind: "rebase_branch".to_owned(),
+                pr: Some(plan.pr),
+                caravan_id: selected
+                    .iter()
+                    .find(|caravan| caravan.members.contains(&plan.pr))
+                    .map(|caravan| caravan.id),
+                expected: status
+                    .analysis
+                    .pull_requests
+                    .get(&plan.pr)
+                    .map(PullRequestPrecondition::from),
+                target: Some(json!({
+                    "branch": planned_base_snapshot(&plan.new_base).name,
+                    "oid": planned_base_snapshot(&plan.new_base).oid,
+                    "new_head_oid": plan.new_head_oid,
+                    "lease": plan.lease,
+                })),
+                reason: if plan.already_satisfied {
+                    "exact cumulative ancestry is already satisfied".to_owned()
+                } else {
+                    "exact retained generation passed conflict and dry-run lease preflight"
+                        .to_owned()
+                },
+            },
+        )?;
+    }
+    let has_physical_write = physical_rebase_plans
+        .iter()
+        .any(|plan| !plan.already_satisfied);
+    for pause in &status.pauses {
+        if pause.state != crate::pause::PauseState::Stale {
+            push_plan_action(
+                &mut actions,
+                SyncPlanAction {
+                    order: 0,
+                    phase: SyncPlanPhase::ProviderConvergence,
+                    state: SyncPlanActionState::AlreadySatisfied,
+                    kind: "hold_caravan".to_owned(),
+                    pr: Some(pause.record.caravan_head),
+                    caravan_id: Some(pause.record.caravan_head),
+                    expected: None,
+                    target: None,
+                    reason: format!("explicit {:?} hold prevents sync mutation", pause.state),
+                },
+            )?;
+        }
+    }
+
+    for caravan in &selected {
+        plan_caravan_convergence(
+            &status,
+            &provider,
+            caravan,
+            input,
+            context.config.force_merge,
+            has_physical_write,
+            &mut progress,
+            &mut actions,
+            &mut decisions,
+            &mut would_emit_events,
+        )?;
+    }
+
+    let auto_admission = plan_auto_admission(
+        context,
+        &status,
+        input,
+        has_physical_write || !decisions.is_empty(),
+        operation_deadline,
+        &mut actions,
+        &mut would_emit_events,
+    )?;
+    would_emit_events.sort();
+    would_emit_events.dedup();
+    let output = SyncPlanOutput {
+        schema_version: 1,
+        mutated: false,
+        provider_writes: 0,
+        local_ephemeral_preflight: context.config.rebase_on_join,
+        repository: status.repository.clone(),
+        default_branch: status.analysis.fleet.default_branch.clone(),
+        all: input.all,
+        plan_hash: String::new(),
+        selected_caravans: selected_ids,
+        physical_rebase_plans,
+        ci: progress.ci,
+        actions,
+        auto_admission,
+        decisions,
+        would_emit_events,
+        github_requests_used: github_budget.used(),
+        status,
+    };
+    Ok(output.finalize_hash())
+}
+
+fn push_plan_action(
+    actions: &mut Vec<SyncPlanAction>,
+    mut action: SyncPlanAction,
+) -> Result<(), AppError> {
+    if actions.len() >= MAX_SYNC_PLAN_ACTIONS {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "sync_plan_action_limit",
+            "sync plan exceeded its bounded action limit",
+            Some(json!({"limit": MAX_SYNC_PLAN_ACTIONS, "mutated": false})),
+        ));
+    }
+    action.order = u32::try_from(actions.len() + 1).unwrap_or(u32::MAX);
+    actions.push(action);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn plan_caravan_convergence(
+    status: &StatusOutput,
+    provider: &impl SyncProvider,
+    caravan: &Caravan,
+    input: &SyncInput,
+    force_merge: bool,
+    deferred: bool,
+    progress: &mut SyncProgress,
+    actions: &mut Vec<SyncPlanAction>,
+    decisions: &mut Vec<SyncPlanDecision>,
+    would_emit_events: &mut Vec<EventKind>,
+) -> Result<(), AppError> {
+    let head = caravan.head().expect("caravan head");
+    let head_snapshot = status
+        .analysis
+        .pull_requests
+        .get(&head)
+        .expect("selected head has provider facts");
+    let expected = Some(PullRequestPrecondition::from(head_snapshot));
+    let base_satisfied = head_snapshot.base.name == status.default_branch;
+    push_plan_action(
+        actions,
+        SyncPlanAction {
+            order: 0,
+            phase: SyncPlanPhase::ProviderConvergence,
+            state: if base_satisfied {
+                SyncPlanActionState::AlreadySatisfied
+            } else if deferred {
+                SyncPlanActionState::DeferredUntilRediscovery
+            } else {
+                SyncPlanActionState::WouldMutate
+            },
+            kind: "set_base".to_owned(),
+            pr: Some(head),
+            caravan_id: Some(caravan.id),
+            expected: expected.clone(),
+            target: Some(
+                json!({"branch": status.default_branch, "oid": status.analysis.fleet.default_branch.oid}),
+            ),
+            reason: if base_satisfied {
+                "caravan head already targets the current default branch".to_owned()
+            } else {
+                "caravan head must target the exact current default branch".to_owned()
+            },
+        },
+    )?;
+    if merged_predecessor(status, caravan).is_some() {
+        would_emit_events.push(EventKind::HeadAdvanced);
+    }
+    if deferred {
+        for number in caravan.members.iter().copied() {
+            let current = &status.analysis.pull_requests[&number];
+            push_plan_action(
+                actions,
+                SyncPlanAction {
+                    order: 0,
+                    phase: SyncPlanPhase::Rediscovery,
+                    state: SyncPlanActionState::DeferredUntilRediscovery,
+                    kind: "observe_ci".to_owned(),
+                    pr: Some(number),
+                    caravan_id: Some(caravan.id),
+                    expected: Some(PullRequestPrecondition::from(current)),
+                    target: None,
+                    reason: "planned branch rewrite changes the CI generation; fresh checks must be observed after apply"
+                        .to_owned(),
+                },
+            )?;
+        }
+        for number in caravan.members.iter().skip(1).copied() {
+            let current = &status.analysis.pull_requests[&number];
+            push_plan_action(
+                actions,
+                SyncPlanAction {
+                    order: 0,
+                    phase: SyncPlanPhase::Rediscovery,
+                    state: SyncPlanActionState::DeferredUntilRediscovery,
+                    kind: "disable_auto_merge".to_owned(),
+                    pr: Some(number),
+                    caravan_id: Some(caravan.id),
+                    expected: Some(PullRequestPrecondition::from(current)),
+                    target: Some(json!({"enabled": false})),
+                    reason:
+                        "revalidate the rewritten generation before repairing non-head auto-merge"
+                            .to_owned(),
+                },
+            )?;
+        }
+        push_plan_action(
+            actions,
+            SyncPlanAction {
+                order: 0,
+                phase: SyncPlanPhase::Rediscovery,
+                state: SyncPlanActionState::DeferredUntilRediscovery,
+                kind: "enable_squash_auto_merge".to_owned(),
+                pr: Some(head),
+                caravan_id: Some(caravan.id),
+                expected,
+                target: Some(json!({"enabled": true, "merge_method": "squash"})),
+                reason:
+                    "revalidate rewritten head CI and provider facts before enabling auto-merge"
+                        .to_owned(),
+            },
+        )?;
+        return Ok(());
+    }
+
+    let mut forced_head = false;
+    let mut stopped = false;
+    for number in caravan.members.iter().copied() {
+        let observation = progress.observe_ci(provider, &status.repository, number)?;
+        let disposition = observation.disposition;
+        progress.ci.push(observation.clone());
+        push_plan_action(
+            actions,
+            SyncPlanAction {
+                order: 0,
+                phase: SyncPlanPhase::ProviderConvergence,
+                state: SyncPlanActionState::ReadOnlyObservation,
+                kind: "observe_ci".to_owned(),
+                pr: Some(number),
+                caravan_id: Some(caravan.id),
+                expected: status
+                    .analysis
+                    .pull_requests
+                    .get(&number)
+                    .map(PullRequestPrecondition::from),
+                target: Some(json!({
+                    "disposition": disposition,
+                    "rerunnable_run_ids": observation.rerunnable_run_ids,
+                })),
+                reason: "fresh checks and bounded workflow diagnostics are read without mutation"
+                    .to_owned(),
+            },
+        )?;
+        if disposition == CiDisposition::Failed {
+            if input.rerun_failed && !observation.rerunnable_run_ids.is_empty() {
+                push_plan_action(
+                    actions,
+                    SyncPlanAction {
+                        order: 0,
+                        phase: SyncPlanPhase::ProviderConvergence,
+                        state: if deferred {
+                            SyncPlanActionState::DeferredUntilRediscovery
+                        } else {
+                            SyncPlanActionState::WouldMutate
+                        },
+                        kind: "rerun_failed_jobs".to_owned(),
+                        pr: Some(number),
+                        caravan_id: Some(caravan.id),
+                        expected: None,
+                        target: Some(json!({"run_ids": observation.rerunnable_run_ids})),
+                        reason:
+                            "only exact current-generation infrastructure failures are rerunnable"
+                                .to_owned(),
+                    },
+                )?;
+            }
+            decisions.push(SyncPlanDecision {
+                code: "ci_failed".to_owned(),
+                pr: Some(number),
+                reason: "sync would stop at this exact failed CI generation".to_owned(),
+                next: "repair source/test failures or rerun only listed infrastructure runs, then plan again"
+                    .to_owned(),
+            });
+            stopped = true;
+            break;
+        }
+        forced_head |= number == head && disposition == CiDisposition::Forced;
+    }
+    if stopped {
+        return Ok(());
+    }
+    if forced_head {
+        let mechanically_allowed = force_allowed(status, head_snapshot, force_merge);
+        let permission = if mechanically_allowed {
+            Some(
+                provider
+                    .viewer_permission(&status.repository)
+                    .map_err(|error| mutation_error(&error, progress, Some(head)))?,
+            )
+        } else {
+            None
+        };
+        let can_force = mechanically_allowed && permission.as_deref() == Some("ADMIN");
+        push_plan_action(
+            actions,
+            SyncPlanAction {
+                order: 0,
+                phase: SyncPlanPhase::ProviderConvergence,
+                state: if can_force && !deferred {
+                    SyncPlanActionState::WouldMutate
+                } else if deferred {
+                    SyncPlanActionState::DeferredUntilRediscovery
+                } else {
+                    SyncPlanActionState::WouldStop
+                },
+                kind: "force_squash_merge".to_owned(),
+                pr: Some(head),
+                caravan_id: Some(caravan.id),
+                expected,
+                target: Some(json!({"merge_method": "squash", "permission": permission})),
+                reason: "explicit exact-generation caravan-force intent requires configured policy and fresh ADMIN preflight"
+                    .to_owned(),
+            },
+        )?;
+        if can_force {
+            would_emit_events.push(EventKind::ForceMergeAttempted);
+            would_emit_events.push(EventKind::ForceMergeCompleted);
+        } else {
+            decisions.push(SyncPlanDecision {
+                code: "force_merge_denied".to_owned(),
+                pr: Some(head),
+                reason: "force intent lacks configured policy, exact clean compatibility, or ADMIN permission"
+                    .to_owned(),
+                next: "repair the exact policy/permission evidence or remove stale force intent, then plan again"
+                    .to_owned(),
+            });
+        }
+        return Ok(());
+    }
+
+    for number in caravan.members.iter().skip(1).copied() {
+        let current = &status.analysis.pull_requests[&number];
+        push_plan_action(
+            actions,
+            SyncPlanAction {
+                order: 0,
+                phase: SyncPlanPhase::ProviderConvergence,
+                state: if !current.auto_merge.enabled {
+                    SyncPlanActionState::AlreadySatisfied
+                } else if deferred {
+                    SyncPlanActionState::DeferredUntilRediscovery
+                } else {
+                    SyncPlanActionState::WouldMutate
+                },
+                kind: "disable_auto_merge".to_owned(),
+                pr: Some(number),
+                caravan_id: Some(caravan.id),
+                expected: Some(PullRequestPrecondition::from(current)),
+                target: Some(json!({"enabled": false})),
+                reason: "only the caravan head may have squash auto-merge enabled".to_owned(),
+            },
+        )?;
+    }
+    push_plan_action(
+        actions,
+        SyncPlanAction {
+            order: 0,
+            phase: SyncPlanPhase::ProviderConvergence,
+            state: if head_snapshot.auto_merge.enabled {
+                SyncPlanActionState::AlreadySatisfied
+            } else if deferred {
+                SyncPlanActionState::DeferredUntilRediscovery
+            } else {
+                SyncPlanActionState::WouldMutate
+            },
+            kind: "enable_squash_auto_merge".to_owned(),
+            pr: Some(head),
+            caravan_id: Some(caravan.id),
+            expected: Some(PullRequestPrecondition::from(head_snapshot)),
+            target: Some(json!({"enabled": true, "merge_method": "squash"})),
+            reason: "healthy caravan head is the sole auto-merge candidate".to_owned(),
+        },
+    )?;
+    Ok(())
+}
+
+fn force_allowed(status: &StatusOutput, head: &PullRequestSnapshot, force_merge: bool) -> bool {
+    force_merge
+        && head.state == PullRequestState::Open
+        && !head.draft
+        && head.has_label("caravan-force")
+        && head_is_conflict_free_with_default(status, head)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_auto_admission(
+    context: &AppContext,
+    status: &StatusOutput,
+    input: &SyncInput,
+    requires_rediscovery: bool,
+    operation_deadline: Instant,
+    actions: &mut Vec<SyncPlanAction>,
+    would_emit_events: &mut Vec<EventKind>,
+) -> Result<SyncAutoAdmissionPlan, AppError> {
+    let checker = crate::graph::GitCompatibilityChecker::new(&context.repository_path, "origin")
+        .with_timeout(Duration::from_secs(context.config.command_timeout_secs))
+        .with_operation_deadline(operation_deadline);
+    plan_auto_admission_with_checker(
+        context,
+        status,
+        input,
+        requires_rediscovery,
+        actions,
+        would_emit_events,
+        &checker,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn plan_auto_admission_with_checker(
+    context: &AppContext,
+    status: &StatusOutput,
+    input: &SyncInput,
+    requires_rediscovery: bool,
+    actions: &mut Vec<SyncPlanAction>,
+    would_emit_events: &mut Vec<EventKind>,
+    checker: &impl crate::graph::CompatibilityChecker,
+) -> Result<SyncAutoAdmissionPlan, AppError> {
+    let enabled = context.config.sync.actions.join_unlabelled_prs;
+    let mut output = SyncAutoAdmissionPlan {
+        enabled,
+        heuristic_version: AUTO_ADMISSION_HEURISTIC_VERSION.to_owned(),
+        continuation: if enabled && !input.all {
+            "requires_sync_all".to_owned()
+        } else if enabled {
+            "complete".to_owned()
+        } else {
+            "disabled".to_owned()
+        },
+        candidate_pr: None,
+        target_tail: None,
+        tested_tails: Vec::new(),
+        compatibility_reasons: Vec::new(),
+    };
+    if !enabled || !input.all {
+        return Ok(output);
+    }
+    if requires_rediscovery {
+        "replan_after_existing_fleet_convergence".clone_into(&mut output.continuation);
+        push_plan_action(
+            actions,
+            SyncPlanAction {
+                order: 0,
+                phase: SyncPlanPhase::Rediscovery,
+                state: SyncPlanActionState::DeferredUntilRediscovery,
+                kind: "rediscover_before_auto_admission".to_owned(),
+                pr: None,
+                caravan_id: None,
+                expected: None,
+                target: None,
+                reason: "auto-admission target generations are not guessed across earlier planned writes or decisions"
+                    .to_owned(),
+            },
+        )?;
+        return Ok(output);
+    }
+    let Some(candidate_pr) = status.admission.next_candidate else {
+        if let Some(rejected) = status.admission.rejected.first()
+            && let Some(candidate) = status.analysis.pull_requests.get(&rejected.pr)
+        {
+            output.candidate_pr = Some(rejected.pr);
+            "rejected_canonical_candidate".clone_into(&mut output.continuation);
+            output.compatibility_reasons = vec![rejected.reason.clone()];
+            push_plan_action(
+                actions,
+                SyncPlanAction {
+                    order: 0,
+                    phase: SyncPlanPhase::AutoAdmission,
+                    state: SyncPlanActionState::WouldStop,
+                    kind: "reject_canonical_candidate".to_owned(),
+                    pr: Some(rejected.pr),
+                    caravan_id: None,
+                    expected: Some(PullRequestPrecondition::from(candidate)),
+                    target: None,
+                    reason: rejected.reason.clone(),
+                },
+            )?;
+        }
+        return Ok(output);
+    };
+    let Some(candidate) = status.analysis.pull_requests.get(&candidate_pr) else {
+        return Err(AppError::validation(
+            "sync_plan_candidate_missing",
+            format!("canonical candidate #{candidate_pr} disappeared from exact status"),
+        ));
+    };
+    if !status
+        .admission
+        .candidates
+        .iter()
+        .any(|candidate| candidate.pr == candidate_pr)
+    {
+        output.candidate_pr = Some(candidate_pr);
+        "rejected_canonical_candidate".clone_into(&mut output.continuation);
+        output.compatibility_reasons = status
+            .admission
+            .rejected
+            .iter()
+            .find(|candidate| candidate.pr == candidate_pr)
+            .map_or_else(Vec::new, |candidate| vec![candidate.reason.clone()]);
+        push_plan_action(
+            actions,
+            SyncPlanAction {
+                order: 0,
+                phase: SyncPlanPhase::AutoAdmission,
+                state: SyncPlanActionState::WouldStop,
+                kind: "reject_canonical_candidate".to_owned(),
+                pr: Some(candidate_pr),
+                caravan_id: None,
+                expected: Some(PullRequestPrecondition::from(candidate)),
+                target: None,
+                reason: output.compatibility_reasons.join(" · "),
+            },
+        )?;
+        return Ok(output);
+    }
+    let evaluation = evaluate_auto_candidate(status, candidate, checker)?;
+    output.candidate_pr = Some(candidate_pr);
+    output.tested_tails.clone_from(&evaluation.tested_tails);
+    output.compatibility_reasons.clone_from(&evaluation.reasons);
+    let (kind, target_tail, reason, events) = match evaluation.target {
+        AutoCandidateTarget::New => (
+            "auto_admission_new",
+            None,
+            "canonical candidate would form a new caravan",
+            vec![EventKind::CaravanCreated],
+        ),
+        AutoCandidateTarget::Join(tail) => (
+            "auto_admission_join",
+            Some(tail),
+            "canonical candidate would join the first exact compatible tail",
+            vec![EventKind::PrJoined],
+        ),
+        AutoCandidateTarget::Skip => (
+            "persist_auto_admission_skip",
+            None,
+            "no deterministic compatible target; exact generation-bound skip would be recorded",
+            Vec::new(),
+        ),
+    };
+    output.target_tail = target_tail;
+    "replan_after_first_admission".clone_into(&mut output.continuation);
+    would_emit_events.extend(events);
+    push_plan_action(
+        actions,
+        SyncPlanAction {
+            order: 0,
+            phase: SyncPlanPhase::AutoAdmission,
+            state: SyncPlanActionState::WouldMutate,
+            kind: kind.to_owned(),
+            pr: Some(candidate_pr),
+            caravan_id: target_tail.and_then(|tail| {
+                status
+                    .analysis
+                    .fleet
+                    .containing(tail)
+                    .map(|caravan| caravan.id)
+            }),
+            expected: Some(PullRequestPrecondition::from(candidate)),
+            target: Some(json!({
+                "tail_pr": target_tail,
+                "tested_tails": evaluation.tested_tails,
+                "compatibility_reasons": evaluation.reasons,
+            })),
+            reason: reason.to_owned(),
+        },
+    )?;
+    Ok(output)
+}
+
+fn planned_base_snapshot(
+    base: &crate::physical_rebase::PlannedBase,
+) -> &crate::model::BranchSnapshot {
+    match base {
+        crate::physical_rebase::PlannedBase::Remote(branch)
+        | crate::physical_rebase::PlannedBase::Simulated(branch) => branch,
     }
 }
 
@@ -4742,6 +5520,181 @@ mod tests {
                 AutoMergeState::disabled(),
             ),
         ]
+    }
+
+    #[test]
+    fn no_write_caravan_plan_records_actions_without_provider_mutation() {
+        let pulls = healthy_chain();
+        let status = status(pulls.clone(), Some(PrNumber(1)), &clean);
+        let provider = FakeProvider::with_pull_requests(pulls);
+        let caravan = status.analysis.fleet.caravans[0].clone();
+        let mut progress = SyncProgress::new(&status, vec![caravan.id], 20);
+        let mut actions = Vec::new();
+        let mut decisions = Vec::new();
+        let mut events = Vec::new();
+
+        plan_caravan_convergence(
+            &status,
+            &provider,
+            &caravan,
+            &SyncInput {
+                all: true,
+                rerun_failed: false,
+            },
+            false,
+            false,
+            &mut progress,
+            &mut actions,
+            &mut decisions,
+            &mut events,
+        )
+        .expect("planning reads but never mutates");
+
+        assert!(provider.calls.borrow().is_empty());
+        assert!(decisions.is_empty());
+        assert_eq!(progress.ci.len(), 3);
+        assert!(actions.iter().any(|action| action.kind == "set_base"));
+        assert!(actions.iter().any(|action| action.kind == "observe_ci"));
+        assert!(actions.iter().any(|action| {
+            action.kind == "enable_squash_auto_merge"
+                && action.state == SyncPlanActionState::AlreadySatisfied
+        }));
+        assert!(actions.iter().all(|action| {
+            action.state != SyncPlanActionState::WouldMutate
+                && action.state != SyncPlanActionState::WouldStop
+        }));
+    }
+
+    #[test]
+    fn no_write_auto_admission_plans_only_first_exact_candidate() {
+        let mut candidate = pull_request(
+            9,
+            "candidate",
+            "main",
+            PullRequestState::Open,
+            AutoMergeState::disabled(),
+        );
+        candidate.labels.clear();
+        let status = status(vec![candidate.clone()], Some(candidate.number), &clean);
+        let mut context = AppContext::default();
+        context.config.rebase_on_join = true;
+        context.config.sync.actions.join_unlabelled_prs = true;
+        let mut actions = Vec::new();
+        let mut events = Vec::new();
+
+        let plan = plan_auto_admission_with_checker(
+            &context,
+            &status,
+            &SyncInput {
+                all: true,
+                rerun_failed: false,
+            },
+            false,
+            &mut actions,
+            &mut events,
+            &clean,
+        )
+        .expect("canonical candidate is planned without mutation");
+
+        assert_eq!(plan.candidate_pr, Some(candidate.number));
+        assert_eq!(plan.target_tail, None);
+        assert_eq!(plan.continuation, "replan_after_first_admission");
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, "auto_admission_new");
+        assert_eq!(actions[0].state, SyncPlanActionState::WouldMutate);
+        assert_eq!(events, vec![EventKind::CaravanCreated]);
+    }
+
+    #[test]
+    fn no_write_auto_admission_never_leapfrogs_rejected_canonical_candidate() {
+        let mut candidate = pull_request(
+            9,
+            "candidate",
+            "main",
+            PullRequestState::Open,
+            AutoMergeState::disabled(),
+        );
+        candidate.labels.clear();
+        candidate
+            .labels
+            .insert("caravan-priority:unknown".to_owned());
+        let status = status(vec![candidate.clone()], Some(candidate.number), &clean);
+        let mut context = AppContext::default();
+        context.config.rebase_on_join = true;
+        context.config.sync.actions.join_unlabelled_prs = true;
+        let mut actions = Vec::new();
+        let mut events = Vec::new();
+        let plan = plan_auto_admission_with_checker(
+            &context,
+            &status,
+            &SyncInput {
+                all: true,
+                rerun_failed: false,
+            },
+            false,
+            &mut actions,
+            &mut events,
+            &clean,
+        )
+        .expect("rejection is a no-write plan result");
+        assert_eq!(plan.candidate_pr, Some(candidate.number));
+        assert_eq!(plan.continuation, "rejected_canonical_candidate");
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, "reject_canonical_candidate");
+        assert_eq!(actions[0].state, SyncPlanActionState::WouldStop);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn plan_hash_binds_exact_actions_not_telemetry() {
+        let status = status(healthy_chain(), Some(PrNumber(1)), &clean);
+        let base = SyncPlanOutput {
+            schema_version: 1,
+            mutated: false,
+            provider_writes: 0,
+            local_ephemeral_preflight: false,
+            repository: status.repository.clone(),
+            default_branch: status.analysis.fleet.default_branch.clone(),
+            all: true,
+            plan_hash: String::new(),
+            selected_caravans: vec![PrNumber(1)],
+            physical_rebase_plans: Vec::new(),
+            ci: Vec::new(),
+            actions: vec![SyncPlanAction {
+                order: 1,
+                phase: SyncPlanPhase::ProviderConvergence,
+                state: SyncPlanActionState::AlreadySatisfied,
+                kind: "set_base".to_owned(),
+                pr: Some(PrNumber(1)),
+                caravan_id: Some(PrNumber(1)),
+                expected: None,
+                target: Some(json!({"branch": "main"})),
+                reason: "already exact".to_owned(),
+            }],
+            auto_admission: SyncAutoAdmissionPlan {
+                enabled: false,
+                heuristic_version: AUTO_ADMISSION_HEURISTIC_VERSION.to_owned(),
+                continuation: "disabled".to_owned(),
+                candidate_pr: None,
+                target_tail: None,
+                tested_tails: Vec::new(),
+                compatibility_reasons: Vec::new(),
+            },
+            decisions: Vec::new(),
+            would_emit_events: Vec::new(),
+            github_requests_used: 1,
+            status,
+        };
+        let first = base.clone().finalize_hash();
+        let mut telemetry_changed = base.clone();
+        telemetry_changed.github_requests_used = 99;
+        telemetry_changed.status.provider_api.calls = 99;
+        let second = telemetry_changed.finalize_hash();
+        assert_eq!(first.plan_hash, second.plan_hash);
+
+        let mut changed = base;
+        changed.actions[0].reason = "different exact action".to_owned();
+        assert_ne!(first.plan_hash, changed.finalize_hash().plan_hash);
     }
 
     #[test]

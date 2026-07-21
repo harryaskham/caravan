@@ -193,6 +193,9 @@ Splitting retargets the selected non-head to the default branch, making it a new
 
 ### Synchronization
 
+- `cara plan sync` / `cara plan sync --all` — run fresh physical conflict,
+  dry-run lease, CI, convergence, and first auto-admission selection preflight
+  without provider writes; return ordered exact actions and rediscovery barriers.
 - `cara sync` — synchronize the current caravan.
 - `cara sync --all` — synchronize every non-paused caravan in deterministic head order.
 - `cara repair start --pr N [--target-pr T]` — create or reuse a durable isolated provider-owned workspace at PR `N`'s exact head, and start an exact-target non-committing merge. The target is current default when omitted.
@@ -435,7 +438,7 @@ Multi-step remote mutations are not atomic. Errors report completed steps. The g
 
 ## 11. MCP contract
 
-The CLI and MCP tools share typed inputs, outputs, and domain errors. MCP exposes bounded single operations (`status`, `log`, `check`, `new`, `join`, `sync`, `evict`, and peers), not the unbounded `loop` or `log --follow` processes. An agent implements a long-lived loop by scheduling repeated `sync --all` calls or by running `cara loop` externally.
+The CLI and MCP tools share typed inputs, outputs, and domain errors. MCP exposes bounded single operations (`status`, `log`, `check`, `new`, `join`, `plan_sync`, `sync`, `evict`, and peers), not the unbounded `loop` or `log --follow` processes. An agent implements a long-lived loop by scheduling repeated `sync --all` calls or by running `cara loop` externally.
 
 Tool descriptions must explain preconditions, side effects, decision-point behavior, and safe recovery. Self-update and feedback registrars are included in the same router.
 

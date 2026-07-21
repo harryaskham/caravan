@@ -78,6 +78,9 @@ enum Command {
     Resume(ResumeInput),
     /// Idempotently synchronize one or all caravans until a decision point.
     Sync(SyncInput),
+    /// Preview exact domain operations without provider mutation.
+    #[command(subcommand)]
+    Plan(PlanCommand),
     /// Prepare, inspect, or continue a Cara-owned isolated repair workspace.
     #[command(subcommand)]
     Repair(RepairCommand),
@@ -131,6 +134,12 @@ enum LockCommand {
     Status(LockStatusInput),
     /// Remove only a verified-stale lock after explicit confirmation.
     Recover(LockRecoverInput),
+}
+
+#[derive(Debug, Subcommand)]
+enum PlanCommand {
+    /// Plan sync and first auto-admission through the no-write preflight barrier.
+    Sync(SyncInput),
 }
 
 #[derive(Debug, Subcommand)]
@@ -277,6 +286,7 @@ fn run(cli: &Cli) -> Result<(), i32> {
         Command::Pause(input) => run_pause(cli, input),
         Command::Resume(input) => run_resume(cli, input),
         Command::Sync(input) => run_sync(cli, input),
+        Command::Plan(command) => run_plan(cli, command),
         Command::Repair(command) => run_repair(cli, command),
         Command::Evict(input) => run_evict(cli, input),
         Command::Split(input) => run_split(cli, input),
@@ -812,6 +822,25 @@ fn run_sync(cli: &Cli, input: &SyncInput) -> Result<(), i32> {
     }
 }
 
+fn run_plan(cli: &Cli, command: &PlanCommand) -> Result<(), i32> {
+    let context = load_context(cli)?;
+    match command {
+        PlanCommand::Sync(input) => {
+            let result = caravan::sync::plan_sync(&context, input);
+            if cli.json {
+                return emit_result(true, result);
+            }
+            match result {
+                Ok(output) => {
+                    print!("{}", render_sync_plan(&output));
+                    Ok(())
+                }
+                Err(error) => emit_human_error(error),
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_repair(cli: &Cli, command: &RepairCommand) -> Result<(), i32> {
     let context = load_context(cli)?;
@@ -1134,6 +1163,60 @@ fn pr_link(number: caravan::model::PrNumber, title: &str, url: &str) -> String {
     } else {
         label
     }
+}
+
+#[allow(clippy::too_many_lines)]
+fn render_sync_plan(output: &caravan::sync::SyncPlanOutput) -> String {
+    let mut text = format!(
+        "{}  {}  repository {}  plan {}\n",
+        heading("PLAN SYNC"),
+        success("NO PROVIDER WRITES"),
+        output.repository,
+        output.plan_hash
+    );
+    let _ = writeln!(
+        text,
+        "  default {}@{} · caravans {} · github reads {}",
+        output.default_branch.name,
+        output.default_branch.oid,
+        output.selected_caravans.len(),
+        output.github_requests_used
+    );
+    for action in &output.actions {
+        let subject = action
+            .pr
+            .map_or_else(|| "fleet".to_owned(), |pr| format!("PR #{pr}"));
+        let _ = writeln!(
+            text,
+            "  {:>2}. {:?}/{:?} {} {} — {}",
+            action.order, action.phase, action.state, subject, action.kind, action.reason
+        );
+    }
+    let _ = writeln!(
+        text,
+        "  auto-admission: enabled={} candidate={} tail={} continuation={}",
+        output.auto_admission.enabled,
+        output
+            .auto_admission
+            .candidate_pr
+            .map_or_else(|| "none".to_owned(), |pr| format!("#{pr}")),
+        output
+            .auto_admission
+            .target_tail
+            .map_or_else(|| "none".to_owned(), |pr| format!("#{pr}")),
+        output.auto_admission.continuation,
+    );
+    for decision in &output.decisions {
+        let _ = writeln!(
+            text,
+            "  {} {} — {}; next: {}",
+            warning("DECISION"),
+            decision.code,
+            decision.reason,
+            decision.next
+        );
+    }
+    text
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1905,6 +1988,17 @@ mod tests {
         assert_eq!(input.head_pr, None);
         assert!(!input.create_pr);
         assert!(Cli::try_parse_from(["cara", "join", "--pr", "43", "--create-pr"]).is_err());
+    }
+
+    #[test]
+    fn plan_sync_parses_as_read_only_nested_command() {
+        let cli = Cli::try_parse_from(["cara", "plan", "sync", "--all", "--rerun-failed"])
+            .expect("plan sync parses");
+        let Command::Plan(PlanCommand::Sync(input)) = cli.command else {
+            panic!("expected plan sync");
+        };
+        assert!(input.all);
+        assert!(input.rerun_failed);
     }
 
     #[test]
