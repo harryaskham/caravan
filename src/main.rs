@@ -12,12 +12,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use caravan::{
     AGENT_HELP, AppContext, AppError, CheckInput, CreateInput, EvictInput, JoinInput,
     LockRecoverInput, LockStatusInput, LoopInput, PauseInput, ResumeInput, SplitInput, SyncInput,
-    TOOL_NAME, build_router, feedback_config, feedback_configuration_error, feedback_panic_config,
+    TOOL_NAME, active_updater_config, build_router, feedback_config, feedback_configuration_error,
+    feedback_panic_config,
     repair::{
         RepairAbortInput, RepairAuthorizeAgentEditsInput, RepairContinueInput, RepairGrantInput,
         RepairRevokeGrantInput, RepairStartInput, RepairStatusInput,
     },
-    updater_config,
+    self_update_check, self_update_run, self_update_status,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use feedback_cli::{FeedbackEvent, FeedbackKind, Reporter, Severity};
@@ -249,7 +250,9 @@ fn main() {
     let cli = Cli::parse();
     let panic_feedback = feedback_panic_config(cli.json);
     feedback_cli::install_panic_hook(&panic_feedback);
-    if let Err(error) = updatable_cli::maybe_apply_staged_update(TOOL_NAME) {
+    if active_updater_config().is_ok()
+        && let Err(error) = updatable_cli::maybe_apply_staged_update(TOOL_NAME)
+    {
         eprintln!("warning: staged-update check failed: {error}");
     }
 
@@ -2188,26 +2191,10 @@ fn run_mcp(command: &McpCommand, config_path: Option<&std::path::Path>) -> Resul
 }
 
 fn run_self_update(json: bool, command: &SelfUpdateCommand) -> Result<(), i32> {
-    let updater = updatable_cli::Updater::new(updater_config());
     match command {
-        SelfUpdateCommand::Status => emit_result(
-            json,
-            updater
-                .current_status()
-                .map_err(updatable_cli::UpdateError::from),
-        ),
-        SelfUpdateCommand::Check => emit_result(
-            json,
-            updater
-                .check_latest()
-                .map_err(updatable_cli::UpdateError::from),
-        ),
-        SelfUpdateCommand::Run => emit_result(
-            json,
-            updater
-                .run_update()
-                .map_err(updatable_cli::UpdateError::from),
-        ),
+        SelfUpdateCommand::Status => emit_result(json, self_update_status()),
+        SelfUpdateCommand::Check => emit_result(json, self_update_check()),
+        SelfUpdateCommand::Run => emit_result(json, self_update_run()),
     }
 }
 

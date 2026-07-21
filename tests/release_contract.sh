@@ -87,12 +87,15 @@ if [ -n "$binary" ]; then
     echo "cara binary is not executable: $binary" >&2
     exit 1
   }
-  mkdir -p "$workspace/home"
-  status_json="$(HOME="$workspace/home" "$binary" --json self-update status)"
+  mkdir -p "$workspace/home/.cargo/bin"
+  cp "$binary" "$workspace/home/.cargo/bin/cara"
+  chmod 0755 "$workspace/home/.cargo/bin/cara"
+  status_json="$(HOME="$workspace/home" PATH="$workspace/home/.cargo/bin" "$workspace/home/.cargo/bin/cara" --json self-update status)"
+  expected_install_dir="$(cd "$workspace/home/.cargo/bin" && pwd -P)"
   [[ "$status_json" == *'"status":"success"'* ]]
   [[ "$status_json" == *'"tool":"cara"'* ]]
   [[ "$status_json" == *"\"current_version\":\"$version\""* ]]
-  [[ "$status_json" == *"\"install_dir\":\"$workspace/home/.local/bin\""* ]]
+  [[ "$status_json" == *"\"install_dir\":\"$expected_install_dir\""* ]]
   [[ "$status_json" == *'"next_staged":false'* ]]
 fi
 

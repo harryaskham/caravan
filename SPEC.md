@@ -238,7 +238,7 @@ Resume is operator/agent initiated only. Before enabling squash auto-merge it re
 - `cara log -f` — foreground existing-tail-then-follow stream; signal-aware and CLI-only.
 - `cara mcp stdio` — expose typed command operations through `mcp-cli`.
 - `cara mcp tools` — print MCP tool metadata.
-- `cara self-update status|check|run` — `updatable-cli` release flow.
+- `cara self-update status|check|run` — `updatable-cli` release flow, bound to the exact running first-PATH-visible stable user binary. `~/.cargo/bin` and `~/.local/bin` update in place; shadowed, development, renamed/test, and package-manager binaries fail closed unless an exact active parent is explicitly selected with `CARA_SELF_UPDATE_INSTALL_DIR`.
 - feedback MCP tools — `feedback-cli` reporting and status.
 - `cara web --repo PATH...` — loopback path-scoped dashboard, typed actions/plans/progress/journal, and optional authenticated GitHub webhook wake receiver.
 

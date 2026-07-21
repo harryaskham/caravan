@@ -279,9 +279,11 @@ RECOVERY, LOCKS, AND OBSERVABILITY
   login, and finally probes other successful `gh` accounts. Selection is cached
   only for the process; Cara never runs `gh auth switch`, stores a preferred
   account in project config, or exposes a token in commands/errors/receipts.
-- `cara self-update status|check|run` is the supported installed-binary update
-  path. A tagged patch release is required before release-only deployments can
-  observe newly landed main-branch behavior.
+- `cara self-update status|check|run` updates only the exact running first-PATH
+  stable user binary (`~/.cargo/bin`, `~/.local/bin`, or an exact explicit
+  `CARA_SELF_UPDATE_INSTALL_DIR`). Shadowed, renamed/test, Cargo target, and
+  package-manager binaries fail closed. A tagged patch release is required
+  before release-only deployments can observe newly landed main behavior.
 
 When in doubt: stop, preserve the structured evidence, make only the suggested
 safe change, and rerun the same Cara command from fresh GitHub facts. This help
@@ -923,30 +925,18 @@ pub fn build_router() -> ToolRouter<AppContext> {
 fn register_self_update_tools(router: &mut ToolRouter<AppContext>) {
     router.add_typed_tool_with_output_schema(
         "self_update_status",
-        "Report installed and staged binary paths without network access. Read-only; repair a reported staged-path problem before running an update.",
-        |_context: &AppContext, _input: updatable_cli::EmptyArgs| {
-            updatable_cli::Updater::new(updater_config())
-                .current_status()
-                .map_err(updatable_cli::UpdateError::from)
-        },
+        "Report the exact active first-PATH stable user binary and adjacent staged path without network access. Shadowed, development, or unmanaged binaries fail closed.",
+        |_context: &AppContext, _input: updatable_cli::EmptyArgs| self_update_status(),
     );
     router.add_typed_tool_with_output_schema(
         "self_update_check",
-        "Check the GitHub releases feed for a newer cara version without installing it. Network failures are typed and safe to retry.",
-        |_context: &AppContext, _input: updatable_cli::EmptyArgs| {
-            updatable_cli::Updater::new(updater_config())
-                .check_latest()
-                .map_err(updatable_cli::UpdateError::from)
-        },
+        "Check the GitHub releases feed for a newer cara version only after validating the exact active first-PATH stable user installation. Network failures are typed and safe to retry.",
+        |_context: &AppContext, _input: updatable_cli::EmptyArgs| self_update_check(),
     );
     router.add_typed_tool_with_output_schema(
         "self_update_run",
-        "Download, verify, stage, and atomically promote the latest cara release. On failure inspect the typed updater error before retrying; never treats a partial stage as success.",
-        |_context: &AppContext, _input: updatable_cli::EmptyArgs| {
-            updatable_cli::Updater::new(updater_config())
-                .run_update()
-                .map_err(updatable_cli::UpdateError::from)
-        },
+        "Download, verify, stage, and atomically promote beside the exact active first-PATH stable user binary. Shadowed/development/unmanaged binaries fail closed and partial stages never count as success.",
+        |_context: &AppContext, _input: updatable_cli::EmptyArgs| self_update_run(),
     );
 }
 
@@ -1085,6 +1075,246 @@ pub fn updater_config() -> updatable_cli::UpdaterConfig {
     }
 }
 
+/// Optional explicit directory for one stable PATH-visible Cara installation.
+pub const SELF_UPDATE_INSTALL_DIR_ENV: &str = "CARA_SELF_UPDATE_INSTALL_DIR";
+
+/// Resolve an updater bound to the exact running, PATH-visible user installation.
+pub fn active_updater_config() -> Result<updatable_cli::UpdaterConfig, AppError> {
+    let current = std::env::current_exe().map_err(|error| {
+        AppError::structured(
+            ErrorCategory::ExecutionFailure,
+            "self_update_current_executable_unavailable",
+            format!("could not resolve the running Cara executable: {error}"),
+            None,
+        )
+    })?;
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let explicit = std::env::var_os(SELF_UPDATE_INSTALL_DIR_ENV).map(PathBuf::from);
+    let install_dir = resolve_self_update_install_dir(
+        &current,
+        std::env::var_os("PATH").as_deref(),
+        home.as_deref(),
+        explicit.as_deref(),
+    )?;
+    let mut config = updater_config();
+    config.install_dir = Some(install_dir);
+    Ok(config)
+}
+
+fn resolve_self_update_install_dir(
+    current: &Path,
+    path: Option<&std::ffi::OsStr>,
+    home: Option<&Path>,
+    explicit: Option<&Path>,
+) -> Result<PathBuf, AppError> {
+    let current = current.canonicalize().map_err(|error| {
+        AppError::structured(
+            ErrorCategory::ExecutionFailure,
+            "self_update_current_executable_unavailable",
+            format!("could not canonicalize the running Cara executable: {error}"),
+            Some(serde_json::json!({"current_executable": current})),
+        )
+    })?;
+    let executable_name = current.file_name().ok_or_else(|| {
+        AppError::validation(
+            "self_update_current_executable_invalid",
+            "the running Cara executable has no file name",
+        )
+    })?;
+    let expected_name = std::ffi::OsStr::new(if cfg!(windows) { "cara.exe" } else { TOOL_NAME });
+    if executable_name != expected_name {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "self_update_development_binary",
+            "self-update is refused from a test or renamed development executable",
+            Some(serde_json::json!({
+                "current_executable": current,
+                "safe_next_action": "run self-update from the installed PATH-visible cara binary"
+            })),
+        ));
+    }
+    let install_dir = current
+        .parent()
+        .expect("executable has parent")
+        .to_path_buf();
+    if is_cargo_development_binary(&current) {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "self_update_development_binary",
+            "self-update will not overwrite a Cargo target/debug or target/release binary",
+            Some(serde_json::json!({
+                "current_executable": current,
+                "safe_next_action": "install a release into ~/.cargo/bin or ~/.local/bin, then rerun it"
+            })),
+        ));
+    }
+    if is_package_manager_binary(&current) {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "self_update_package_managed",
+            "self-update will not overwrite a Nix or Homebrew managed Cara binary",
+            Some(serde_json::json!({
+                "current_executable": current,
+                "safe_next_action": "upgrade Cara through the package manager that owns this binary"
+            })),
+        ));
+    }
+    require_first_path_executable(&current, expected_name, path)?;
+
+    if let Some(explicit) = explicit {
+        if !explicit.is_absolute() || !same_directory(&install_dir, explicit) {
+            return Err(AppError::structured(
+                ErrorCategory::Validation,
+                "self_update_install_dir_mismatch",
+                format!(
+                    "{SELF_UPDATE_INSTALL_DIR_ENV} must be the absolute parent of the running Cara executable"
+                ),
+                Some(serde_json::json!({
+                    "current_executable": current,
+                    "configured_install_dir": explicit,
+                })),
+            ));
+        }
+        return Ok(install_dir);
+    }
+
+    let supported = home.is_some_and(|home| {
+        same_directory(&install_dir, &home.join(".cargo/bin"))
+            || same_directory(&install_dir, &home.join(".local/bin"))
+    });
+    if !supported {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "self_update_install_unmanaged",
+            "the running Cara executable is not in a supported user-managed install directory",
+            Some(serde_json::json!({
+                "current_executable": current,
+                "safe_next_action": format!(
+                    "set {SELF_UPDATE_INSTALL_DIR_ENV} to this absolute directory only if it is intentionally user-managed"
+                )
+            })),
+        ));
+    }
+    Ok(install_dir)
+}
+
+fn require_first_path_executable(
+    current: &Path,
+    expected_name: &std::ffi::OsStr,
+    path: Option<&std::ffi::OsStr>,
+) -> Result<(), AppError> {
+    let visible = path
+        .and_then(|value| {
+            std::env::split_paths(value)
+                .map(|directory| directory.join(expected_name))
+                .find(|candidate| is_executable_file(candidate))
+        })
+        .ok_or_else(|| {
+            AppError::structured(
+                ErrorCategory::Validation,
+                "self_update_binary_not_path_visible",
+                "the running Cara executable is not discoverable on PATH",
+                Some(serde_json::json!({"current_executable": current})),
+            )
+        })?;
+    let visible = visible.canonicalize().map_err(|error| {
+        AppError::structured(
+            ErrorCategory::ExecutionFailure,
+            "self_update_path_executable_unavailable",
+            format!("could not canonicalize the PATH-visible Cara executable: {error}"),
+            Some(serde_json::json!({"path_executable": visible})),
+        )
+    })?;
+    if visible == current {
+        return Ok(());
+    }
+    Err(AppError::structured(
+        ErrorCategory::Validation,
+        "self_update_binary_shadowed",
+        "the running Cara executable is shadowed by a different earlier PATH entry",
+        Some(serde_json::json!({
+            "current_executable": current,
+            "path_executable": visible,
+            "safe_next_action": "fix PATH ordering or run the first PATH-visible cara binary"
+        })),
+    ))
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn same_directory(actual: &Path, expected: &Path) -> bool {
+    expected
+        .canonicalize()
+        .map_or_else(|_| actual == expected, |expected| actual == expected)
+}
+
+fn is_cargo_development_binary(path: &Path) -> bool {
+    path.ancestors().skip(1).any(|profile| {
+        matches!(
+            profile.file_name().and_then(std::ffi::OsStr::to_str),
+            Some("debug" | "release")
+        ) && profile.ancestors().skip(1).any(|ancestor| {
+            ancestor.file_name().and_then(std::ffi::OsStr::to_str) == Some("target")
+        })
+    })
+}
+
+fn is_package_manager_binary(path: &Path) -> bool {
+    path.starts_with("/nix/store")
+        || path.starts_with("/opt/homebrew/Cellar")
+        || path.starts_with("/usr/local/Cellar")
+        || path.starts_with("/home/linuxbrew/.linuxbrew/Cellar")
+}
+
+fn update_error(error: &impl StructuredError) -> AppError {
+    AppError::structured(
+        error.category(),
+        error.code(),
+        error.message(),
+        error.details(),
+    )
+}
+
+/// Return active-install self-update status.
+pub fn self_update_status() -> Result<updatable_cli::UpdateStatus, AppError> {
+    updatable_cli::Updater::new(active_updater_config()?)
+        .current_status()
+        .map_err(updatable_cli::UpdateError::from)
+        .map_err(|error| update_error(&error))
+}
+
+/// Check releases using the active-install contract.
+pub fn self_update_check() -> Result<updatable_cli::LatestReleaseInfo, AppError> {
+    updatable_cli::Updater::new(active_updater_config()?)
+        .check_latest()
+        .map_err(updatable_cli::UpdateError::from)
+        .map_err(|error| update_error(&error))
+}
+
+/// Update the exact active PATH-visible stable user installation.
+pub fn self_update_run() -> Result<updatable_cli::UpdateOutcome, AppError> {
+    updatable_cli::Updater::new(active_updater_config()?)
+        .run_update()
+        .map_err(updatable_cli::UpdateError::from)
+        .map_err(|error| update_error(&error))
+}
+
 /// Feedback configuration using the shared ecosystem environment convention.
 #[must_use]
 pub fn feedback_config() -> FeedbackConfig {
@@ -1105,6 +1335,15 @@ pub fn feedback_destination() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_test_executable(path: &Path) {
+        std::fs::write(path, "installed").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
 
     fn git(directory: &Path, arguments: &[&str]) {
         let status = std::process::Command::new("git")
@@ -1288,6 +1527,90 @@ mod tests {
                 .as_str()
                 .expect("instructions")
                 .contains("Caravan")
+        );
+    }
+
+    #[test]
+    fn self_update_targets_exact_first_path_visible_user_install() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path();
+        let cargo_bin = home.join(".cargo/bin");
+        let local_bin = home.join(".local/bin");
+        std::fs::create_dir_all(&cargo_bin).unwrap();
+        std::fs::create_dir_all(&local_bin).unwrap();
+        let active = cargo_bin.join(if cfg!(windows) { "cara.exe" } else { "cara" });
+        write_test_executable(&active);
+        let path = std::env::join_paths([&cargo_bin, &local_bin]).unwrap();
+        assert_eq!(
+            resolve_self_update_install_dir(&active, Some(&path), Some(home), None).unwrap(),
+            cargo_bin.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn self_update_rejects_shadowed_and_development_binaries() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path();
+        let cargo_bin = home.join(".cargo/bin");
+        let local_bin = home.join(".local/bin");
+        std::fs::create_dir_all(&cargo_bin).unwrap();
+        std::fs::create_dir_all(&local_bin).unwrap();
+        let name = if cfg!(windows) { "cara.exe" } else { "cara" };
+        let first = cargo_bin.join(name);
+        let shadowed = local_bin.join(name);
+        write_test_executable(&first);
+        write_test_executable(&shadowed);
+        let path = std::env::join_paths([&cargo_bin, &local_bin]).unwrap();
+        assert_eq!(
+            resolve_self_update_install_dir(&shadowed, Some(&path), Some(home), None)
+                .unwrap_err()
+                .code(),
+            "self_update_binary_shadowed"
+        );
+
+        let debug = home.join("project/target/aarch64-unknown-linux-gnu/debug");
+        std::fs::create_dir_all(&debug).unwrap();
+        let development = debug.join(name);
+        write_test_executable(&development);
+        let path = std::env::join_paths([&debug]).unwrap();
+        assert_eq!(
+            resolve_self_update_install_dir(&development, Some(&path), Some(home), None)
+                .unwrap_err()
+                .code(),
+            "self_update_development_binary"
+        );
+        assert!(is_package_manager_binary(Path::new(
+            "/nix/store/hash-cara/bin/cara"
+        )));
+        assert!(is_package_manager_binary(Path::new(
+            "/opt/homebrew/Cellar/cara/0.0.5/bin/cara"
+        )));
+    }
+
+    #[test]
+    fn explicit_self_update_dir_must_match_active_path_visible_parent() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path();
+        let managed = home.join("custom/bin");
+        std::fs::create_dir_all(&managed).unwrap();
+        let active = managed.join(if cfg!(windows) { "cara.exe" } else { "cara" });
+        write_test_executable(&active);
+        let path = std::env::join_paths([&managed]).unwrap();
+        assert_eq!(
+            resolve_self_update_install_dir(&active, Some(&path), Some(home), Some(&managed))
+                .unwrap(),
+            managed.canonicalize().unwrap()
+        );
+        assert_eq!(
+            resolve_self_update_install_dir(
+                &active,
+                Some(&path),
+                Some(home),
+                Some(&home.join("other")),
+            )
+            .unwrap_err()
+            .code(),
+            "self_update_install_dir_mismatch"
         );
     }
 

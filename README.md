@@ -333,6 +333,16 @@ Run `./tests/release_contract.sh target/debug/cara` after building to exercise
 the asset/checksum layout and `cara self-update status` with an isolated home;
 it never stages or installs an update over the developer binary.
 
+Self-update is bound to the exact running executable, not a hard-coded default.
+`status`, `check`, and `run` require that executable to be the first executable
+`cara` on `PATH` and place `cara_next` beside it. Existing `~/.cargo/bin/cara`
+and `~/.local/bin/cara` installations migrate automatically by updating in
+place. A shadowed binary, a renamed/test binary, Cargo `target/debug` or
+`target/release` binary, and package-manager location fail closed. For another
+intentional user-managed directory, set `CARA_SELF_UPDATE_INSTALL_DIR` to its
+absolute parent; it must still be the active first `PATH` entry. Startup staged
+promotion is likewise skipped for unmanaged/development binaries.
+
 ## Ecosystem
 
 The binary uses:

@@ -142,3 +142,41 @@ fn json_success_still_exits_zero() {
         serde_json::from_slice(&output.stdout).expect("JSON success envelope");
     assert_eq!(envelope["status"], "success");
 }
+
+#[test]
+fn self_update_status_targets_the_exact_path_visible_cargo_install() {
+    let temporary = tempfile::tempdir().unwrap();
+    let install_dir = temporary.path().join(".cargo/bin");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    let installed = install_dir.join(if cfg!(windows) { "cara.exe" } else { "cara" });
+    std::fs::copy(env!("CARGO_BIN_EXE_cara"), &installed).unwrap();
+    let output = Command::new(&installed)
+        .env("HOME", temporary.path())
+        .env("PATH", &install_dir)
+        .args(["--json", "self-update", "status"])
+        .output()
+        .expect("run copied installed cara");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        envelope["data"]["installed_path"],
+        installed.canonicalize().unwrap().display().to_string()
+    );
+}
+
+#[test]
+fn self_update_refuses_the_cargo_target_development_binary() {
+    let binary = std::path::Path::new(env!("CARGO_BIN_EXE_cara"));
+    let output = cara_command()
+        .env("PATH", binary.parent().unwrap())
+        .args(["--json", "self-update", "status"])
+        .output()
+        .expect("run development cara");
+    assert!(!output.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["error"]["code"], "self_update_development_binary");
+}
