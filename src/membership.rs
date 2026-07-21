@@ -2147,6 +2147,7 @@ mod tests {
             new_base_oid: new_base.oid.clone(),
             new_tree_oid: CommitOid("tree-oid".to_owned()),
             commit_count: 1,
+            merge_topology: None,
             ci_trigger_workflows: vec![".github/workflows/ci.yml".to_owned()],
             lease: format!(
                 "--force-with-lease=refs/heads/{}:{}",
@@ -2340,6 +2341,7 @@ mod tests {
             new_base_oid: crate::model::CommitOid("f".repeat(40)),
             new_tree_oid: crate::model::CommitOid("e".repeat(40)),
             commit_count: 1,
+            merge_topology: None,
             ci_trigger_workflows: vec![".github/workflows/ci.yml".to_owned()],
             lease: format!(
                 "--force-with-lease=refs/heads/{}:{}",
@@ -2402,6 +2404,7 @@ mod tests {
             new_base_oid: head.head.oid.clone(),
             new_tree_oid: crate::model::CommitOid("e".repeat(40)),
             commit_count: 1,
+            merge_topology: None,
             ci_trigger_workflows: vec![".github/workflows/ci.yml".to_owned()],
             lease: format!(
                 "--force-with-lease=refs/heads/{}:{}",

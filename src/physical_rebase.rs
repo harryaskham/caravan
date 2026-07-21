@@ -17,6 +17,8 @@ use crate::AppError;
 use crate::command::{CommandOutput, CommandRunner, CommandSpec, ProcessRunner};
 use crate::model::{BranchSnapshot, CommitOid, PrNumber, PullRequestSnapshot, RepositoryId};
 
+const MAX_MERGE_PRESERVING_COMMITS: usize = 256;
+
 /// Shared child and whole-operation limits for one prepared generation.
 #[derive(Debug, Clone, Copy)]
 pub struct RebaseExecutionBudget {
@@ -109,6 +111,39 @@ pub fn range_base_for_remote_target(
     }
 }
 
+/// One exact commit and parent set in a retained nonlinear candidate range.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RebaseTopologyCommit {
+    pub oid: CommitOid,
+    #[serde(default)]
+    pub parents: Vec<CommitOid>,
+    pub tree_oid: CommitOid,
+}
+
+/// Deterministic old→new topology mapping for one replayed commit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RebaseTopologyMapping {
+    pub old_oid: CommitOid,
+    pub new_oid: CommitOid,
+    #[serde(default)]
+    pub old_parents: Vec<CommitOid>,
+    #[serde(default)]
+    pub new_parents: Vec<CommitOid>,
+}
+
+/// Complete merge-preserving proof retained in plan and apply receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct MergePreservingTopology {
+    pub strategy: String,
+    pub expected_merge_tree_oid: CommitOid,
+    #[serde(default)]
+    pub old_commits: Vec<RebaseTopologyCommit>,
+    #[serde(default)]
+    pub new_commits: Vec<RebaseTopologyCommit>,
+    #[serde(default)]
+    pub mapping: Vec<RebaseTopologyMapping>,
+}
+
 /// Serializable immutable plan produced once and pushed without recomputation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RebasePlan {
@@ -121,6 +156,8 @@ pub struct RebasePlan {
     pub new_head_oid: CommitOid,
     pub new_tree_oid: CommitOid,
     pub commit_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_topology: Option<MergePreservingTopology>,
     pub ci_trigger_workflows: Vec<String>,
     pub lease: String,
     pub already_satisfied: bool,
@@ -144,6 +181,8 @@ pub struct RebaseReceipt {
     pub new_base_oid: CommitOid,
     pub new_tree_oid: CommitOid,
     pub commit_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_topology: Option<MergePreservingTopology>,
     /// Exact-default workflow files proven able to run for this PR base on
     /// both force-push (`synchronize`) and base edit (`edited`).
     pub ci_trigger_workflows: Vec<String>,
@@ -285,45 +324,32 @@ pub fn prepare_candidate(
     }
     let range_base = CommitOid(boundaries[0].to_owned());
     validate_oid(&range_base)?;
-    let merges = run(
+    let old_topology = collect_range_topology(
         &runner,
-        CommandSpec::new("git").args([
-            "rev-list",
-            "--merges",
-            &format!("{}..{}", range_base.0, candidate.head.oid.0),
-        ]),
+        &[&range_base, &target.oid],
+        &candidate.head.oid,
+        "rebase_range_invalid",
     )?;
-    if !merges.is_success() || !merges.stdout.trim().is_empty() {
-        return Err(decision(
-            "rebase_nonlinear_range",
-            "candidate-only history contains a merge commit; no audited merge-preserving rewrite strategy is implemented",
-            json!({"pr": candidate.number, "merge_oids": merges.stdout.lines().collect::<Vec<_>>(), "resumable": true}),
-        ));
-    }
-    let count_output = require_success(
-        &runner,
-        CommandSpec::new("git").args([
-            "rev-list",
-            "--count",
-            &format!("{}..{}", range_base.0, candidate.head.oid.0),
-        ]),
-        "rebase_range_count_failed",
-        "could not count the candidate-only commit range",
-    )?;
-    let commit_count = count_output.stdout.trim().parse::<usize>().map_err(|_| {
-        decision(
-            "rebase_range_count_failed",
-            "Git returned an invalid candidate-only commit count",
-            json!({"output": count_output.stdout}),
-        )
-    })?;
-    if commit_count == 0 {
+    if old_topology.is_empty() {
         return Err(decision(
             "rebase_empty_patch_range",
             "candidate has no commits beyond its exact old base",
             json!({"pr": candidate.number, "resumable": true}),
         ));
     }
+    let commit_count = old_topology.len();
+    let has_merges = old_topology.iter().any(|commit| commit.parents.len() == 2);
+    let expected_merge_tree = if has_merges {
+        validate_merge_preserving_topology(&runner, &old_topology, target, candidate.number)?;
+        Some(expected_merge_tree(
+            &runner,
+            target,
+            &candidate.head.oid,
+            candidate.number,
+        )?)
+    } else {
+        None
+    };
 
     let worktree = TemporaryWorktree::create(
         repository_path,
@@ -336,19 +362,12 @@ pub fn prepare_candidate(
         budget.command_timeout,
         budget.operation_deadline,
     );
-    let rebase = run(
+    let rebase = run_rebase(
         &worktree_runner,
-        CommandSpec::new("git")
-            .args([
-                "-c",
-                "commit.gpgSign=false",
-                "rebase",
-                "--onto",
-                target.oid.0.as_str(),
-                range_base.0.as_str(),
-                candidate.head.oid.0.as_str(),
-            ])
-            .env("GIT_TERMINAL_PROMPT", "0"),
+        &range_base,
+        &target.oid,
+        &candidate.head.oid,
+        has_merges,
     )?;
     if !rebase.is_success() {
         let conflicts = run(
@@ -358,13 +377,46 @@ pub fn prepare_candidate(
         .map(|output| output.stdout.lines().map(str::to_owned).collect::<Vec<_>>())
         .unwrap_or_default();
         return Err(decision(
-            "rebase_conflict",
-            "candidate-only commits do not rebase cleanly; no remote or provider mutation was attempted",
-            json!({"pr": candidate.number, "conflicting_paths": conflicts, "stderr": rebase.stderr, "resumable": true, "next": "repair the branch and rerun the same command"}),
+            if has_merges {
+                "rebase_merge_replay_conflict"
+            } else {
+                "rebase_conflict"
+            },
+            if has_merges {
+                "the independently clean final merge tree cannot be reproduced by the audited merge-preserving sequencer without an intermediate conflict; no remote or provider mutation was attempted"
+            } else {
+                "candidate-only commits do not rebase cleanly; no remote or provider mutation was attempted"
+            },
+            json!({
+                "pr": candidate.number,
+                "conflicting_paths": conflicts,
+                "merge_commits": old_topology.iter().filter(|commit| commit.parents.len() == 2).map(|commit| &commit.oid).collect::<Vec<_>>(),
+                "expected_merge_tree": &expected_merge_tree,
+                "stderr": rebase.stderr,
+                "resumable": true,
+                "next": if has_merges {
+                    "use a reviewed first-party repair/reshape of the reported merge sequence, then rerun the same command"
+                } else {
+                    "repair the branch and rerun the same command"
+                }
+            }),
         ));
     }
     let new_head = rev_parse(&worktree_runner, "HEAD")?;
     let new_tree = rev_parse(&worktree_runner, "HEAD^{tree}")?;
+    let merge_topology = expected_merge_tree
+        .map(|expected| {
+            build_merge_topology_proof(
+                &worktree_runner,
+                &old_topology,
+                &target.oid,
+                &new_head,
+                &new_tree,
+                expected,
+                candidate.number,
+            )
+        })
+        .transpose()?;
     let lease = format!(
         "--force-with-lease=refs/heads/{}:{}",
         candidate.head.name, candidate.head.oid.0
@@ -397,11 +449,285 @@ pub fn prepare_candidate(
         new_head_oid: new_head,
         new_tree_oid: new_tree,
         commit_count,
+        merge_topology,
         ci_trigger_workflows,
         lease,
         already_satisfied,
     };
     Ok(PreparedRebase { plan, worktree })
+}
+
+fn collect_range_topology(
+    runner: &impl CommandRunner,
+    boundaries: &[&CommitOid],
+    head: &CommitOid,
+    code: &'static str,
+) -> Result<Vec<RebaseTopologyCommit>, AppError> {
+    let mut arguments = vec![
+        "rev-list".to_owned(),
+        "--reverse".to_owned(),
+        "--topo-order".to_owned(),
+        "--parents".to_owned(),
+        head.0.clone(),
+    ];
+    arguments.extend(boundaries.iter().map(|base| format!("^{}", base.0)));
+    let output = require_success(
+        runner,
+        CommandSpec::new("git").args(arguments),
+        code,
+        "could not enumerate the exact candidate topology",
+    )?;
+    let lines = output.stdout.lines().collect::<Vec<_>>();
+    if lines.len() > MAX_MERGE_PRESERVING_COMMITS {
+        return Err(decision(
+            "rebase_topology_limit",
+            "candidate topology exceeds the audited merge-preserving bound",
+            json!({"commits": lines.len(), "limit": MAX_MERGE_PRESERVING_COMMITS, "resumable": true}),
+        ));
+    }
+    lines
+        .into_iter()
+        .map(|line| {
+            let mut fields = line.split_whitespace();
+            let oid = CommitOid(fields.next().unwrap_or_default().to_owned());
+            validate_oid(&oid)?;
+            let parents = fields
+                .map(|parent| {
+                    let oid = CommitOid(parent.to_owned());
+                    validate_oid(&oid)?;
+                    Ok(oid)
+                })
+                .collect::<Result<Vec<_>, AppError>>()?;
+            if parents.len() > 2 {
+                return Err(decision(
+                    "rebase_unsupported_octopus",
+                    "merge-preserving rewrite supports only bounded two-parent topology",
+                    json!({"commit": oid, "parents": parents, "resumable": true}),
+                ));
+            }
+            let tree_oid = rev_parse(runner, &format!("{}^{{tree}}", oid.0))?;
+            Ok(RebaseTopologyCommit {
+                oid,
+                parents,
+                tree_oid,
+            })
+        })
+        .collect()
+}
+
+fn is_ancestor(
+    runner: &impl CommandRunner,
+    ancestor: &CommitOid,
+    descendant: &CommitOid,
+) -> Result<bool, AppError> {
+    Ok(run(
+        runner,
+        CommandSpec::new("git").args([
+            "merge-base",
+            "--is-ancestor",
+            ancestor.0.as_str(),
+            descendant.0.as_str(),
+        ]),
+    )?
+    .is_success())
+}
+
+fn validate_merge_preserving_topology(
+    runner: &impl CommandRunner,
+    topology: &[RebaseTopologyCommit],
+    target: &BranchSnapshot,
+    pr: PrNumber,
+) -> Result<(), AppError> {
+    let range = topology
+        .iter()
+        .map(|commit| commit.oid.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    for commit in topology {
+        if commit.parents.is_empty() {
+            return Err(decision(
+                "rebase_cousin_history",
+                "candidate topology contains a root that is not anchored in exact target ancestry",
+                json!({"pr": pr, "commit": commit, "target": target, "resumable": true}),
+            ));
+        }
+        let in_range_parents = commit
+            .parents
+            .iter()
+            .filter(|parent| range.contains(*parent))
+            .count();
+        if commit.parents.len() == 2 && in_range_parents == 0 {
+            return Err(decision(
+                "rebase_external_merge_parents",
+                "merge commit has no parent in the candidate-only range",
+                json!({"pr": pr, "commit": commit, "target": target, "resumable": true}),
+            ));
+        }
+        for parent in commit
+            .parents
+            .iter()
+            .filter(|parent| !range.contains(*parent))
+        {
+            if !is_ancestor(runner, parent, &target.oid)? {
+                return Err(decision(
+                    "rebase_cousin_history",
+                    "candidate merge references history outside both the candidate range and target ancestry",
+                    json!({"pr": pr, "commit": commit, "external_parent": parent, "target": target, "resumable": true}),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn expected_merge_tree(
+    runner: &impl CommandRunner,
+    target: &BranchSnapshot,
+    old_head: &CommitOid,
+    pr: PrNumber,
+) -> Result<CommitOid, AppError> {
+    let output = run(
+        runner,
+        CommandSpec::new("git").args([
+            "merge-tree",
+            "--write-tree",
+            target.oid.0.as_str(),
+            old_head.0.as_str(),
+        ]),
+    )?;
+    if !output.is_success() {
+        return Err(decision(
+            "rebase_merge_tree_conflict",
+            "exact target and nonlinear candidate head do not have one clean merge result tree",
+            json!({"pr": pr, "target": target, "old_head": old_head, "stdout": output.stdout, "stderr": output.stderr, "resumable": true}),
+        ));
+    }
+    let tree = CommitOid(
+        output
+            .stdout
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_owned(),
+    );
+    validate_oid(&tree)?;
+    Ok(tree)
+}
+
+fn run_rebase(
+    runner: &impl CommandRunner,
+    range_base: &CommitOid,
+    target: &CommitOid,
+    old_head: &CommitOid,
+    preserve_merges: bool,
+) -> Result<CommandOutput, AppError> {
+    let mut arguments = vec![
+        "-c".to_owned(),
+        "commit.gpgSign=false".to_owned(),
+        "-c".to_owned(),
+        "user.name=Caravan".to_owned(),
+        "-c".to_owned(),
+        "user.email=caravan@localhost.invalid".to_owned(),
+        "rebase".to_owned(),
+    ];
+    if preserve_merges {
+        arguments.extend([
+            "--rebase-merges=no-rebase-cousins".to_owned(),
+            "--reapply-cherry-picks".to_owned(),
+            "--empty=keep".to_owned(),
+        ]);
+    }
+    let upstream = if preserve_merges { target } else { range_base };
+    arguments.extend([
+        "--committer-date-is-author-date".to_owned(),
+        "--onto".to_owned(),
+        target.0.clone(),
+        upstream.0.clone(),
+        old_head.0.clone(),
+    ]);
+    run(
+        runner,
+        CommandSpec::new("git")
+            .args(arguments)
+            .env("GIT_TERMINAL_PROMPT", "0"),
+    )
+}
+
+fn build_merge_topology_proof(
+    runner: &impl CommandRunner,
+    old_topology: &[RebaseTopologyCommit],
+    target: &CommitOid,
+    new_head: &CommitOid,
+    new_tree: &CommitOid,
+    expected_tree: CommitOid,
+    pr: PrNumber,
+) -> Result<MergePreservingTopology, AppError> {
+    if new_tree != &expected_tree {
+        return Err(decision(
+            "rebase_merge_tree_mismatch",
+            "merge-preserving replay tree differs from the independently computed clean merge tree",
+            json!({"pr": pr, "expected_tree": expected_tree, "actual_tree": new_tree, "resumable": true}),
+        ));
+    }
+    let new_topology =
+        collect_range_topology(runner, &[target], new_head, "rebase_result_invalid")?;
+    if new_topology.len() != old_topology.len() {
+        return Err(decision(
+            "rebase_topology_changed",
+            "merge-preserving replay did not retain one exact result commit per candidate-range commit",
+            json!({"pr": pr, "old_count": old_topology.len(), "new_count": new_topology.len(), "resumable": true}),
+        ));
+    }
+    let oid_mapping = old_topology
+        .iter()
+        .zip(&new_topology)
+        .map(|(old, new)| (old.oid.clone(), new.oid.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut mapping = Vec::with_capacity(old_topology.len());
+    for (old, new) in old_topology.iter().zip(&new_topology) {
+        if old.parents.len() != new.parents.len() {
+            return Err(decision(
+                "rebase_topology_changed",
+                "merge-preserving replay changed a commit's parent cardinality",
+                json!({"pr": pr, "old": old, "new": new, "resumable": true}),
+            ));
+        }
+        for old_parent in &old.parents {
+            if let Some(expected_parent) = oid_mapping.get(old_parent)
+                && !new.parents.contains(expected_parent)
+            {
+                return Err(decision(
+                    "rebase_topology_changed",
+                    "merge-preserving replay changed an internal candidate parent edge",
+                    json!({"pr": pr, "old": old, "new": new, "expected_parent": expected_parent, "resumable": true}),
+                ));
+            }
+        }
+        for new_parent in &new.parents {
+            if !oid_mapping.values().any(|mapped| mapped == new_parent)
+                && !is_ancestor(runner, new_parent, target)?
+            {
+                return Err(decision(
+                    "rebase_topology_changed",
+                    "rebuilt merge contains a parent outside the mapped candidate range and exact target ancestry",
+                    json!({"pr": pr, "new": new, "external_parent": new_parent, "target": target, "resumable": true}),
+                ));
+            }
+        }
+        mapping.push(RebaseTopologyMapping {
+            old_oid: old.oid.clone(),
+            new_oid: new.oid.clone(),
+            old_parents: old.parents.clone(),
+            new_parents: new.parents.clone(),
+        });
+    }
+    Ok(MergePreservingTopology {
+        strategy: "git_rebase_merges_no_rebase_cousins_v1".to_owned(),
+        expected_merge_tree_oid: expected_tree,
+        old_commits: old_topology.to_vec(),
+        new_commits: new_topology,
+        mapping,
+    })
 }
 
 /// Recheck the exact planned object, remote old head, permission, and lease without writing.
@@ -483,6 +809,7 @@ pub fn apply_prepared(prepared: &PreparedRebase) -> Result<RebaseReceipt, AppErr
         new_base_oid: prepared.plan.new_base.branch().oid.clone(),
         new_tree_oid: prepared.plan.new_tree_oid.clone(),
         commit_count: prepared.plan.commit_count,
+        merge_topology: prepared.plan.merge_topology.clone(),
         ci_trigger_workflows: prepared.plan.ci_trigger_workflows.clone(),
         lease: prepared.plan.lease.clone(),
         already_satisfied: prepared.plan.already_satisfied,
@@ -1186,6 +1513,396 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
+    fn preserves_owned_two_parent_candidate_topology_and_tree() {
+        let fixture = fixture();
+        git(&fixture.clone, &["checkout", "-b", "candidate-side"]);
+        std::fs::write(fixture.clone.join("side"), "side\n").unwrap();
+        git(&fixture.clone, &["add", "side"]);
+        git(&fixture.clone, &["commit", "-m", "candidate side"]);
+        git(&fixture.clone, &["checkout", "feature"]);
+        std::fs::write(fixture.clone.join("feature-two"), "feature two\n").unwrap();
+        git(&fixture.clone, &["add", "feature-two"]);
+        git(&fixture.clone, &["commit", "-m", "candidate two"]);
+        git(
+            &fixture.clone,
+            &[
+                "merge",
+                "--no-ff",
+                "candidate-side",
+                "-m",
+                "merge candidate side",
+            ],
+        );
+        git(&fixture.clone, &["checkout", "-b", "candidate-side-two"]);
+        std::fs::write(fixture.clone.join("side-two"), "side two\n").unwrap();
+        git(&fixture.clone, &["add", "side-two"]);
+        git(&fixture.clone, &["commit", "-m", "candidate side two"]);
+        git(&fixture.clone, &["checkout", "feature"]);
+        std::fs::write(fixture.clone.join("feature-three"), "feature three\n").unwrap();
+        git(&fixture.clone, &["add", "feature-three"]);
+        git(&fixture.clone, &["commit", "-m", "candidate three"]);
+        git(
+            &fixture.clone,
+            &[
+                "merge",
+                "--no-ff",
+                "candidate-side-two",
+                "-m",
+                "merge candidate side two",
+            ],
+        );
+        let nonlinear_head = CommitOid(git(&fixture.clone, &["rev-parse", "HEAD"]));
+        git(&fixture.clone, &["push", "origin", "feature"]);
+        let candidate = PullRequestSnapshot {
+            number: PrNumber(7),
+            title: "nonlinear candidate".to_owned(),
+            url: "https://example.invalid/7".to_owned(),
+            state: PullRequestState::Open,
+            draft: false,
+            head: branch(&fixture.repository, "feature", &nonlinear_head),
+            base: branch(&fixture.repository, "main", &fixture.old_main),
+            cross_repository: false,
+            labels: BTreeSet::new(),
+            auto_merge: AutoMergeState::disabled(),
+            checks: Vec::new(),
+            created_at: None,
+            merged_at: None,
+            updated_at: None,
+        };
+        let target = branch(&fixture.repository, "main", &fixture.new_main);
+        let receipt = rewrite_candidate(
+            &fixture.clone,
+            &fixture.repository,
+            &candidate,
+            &target,
+            &target,
+            Duration::from_secs(60),
+        )
+        .expect("owned two-parent topology is preserved");
+        let topology = receipt.merge_topology.as_ref().expect("topology receipt");
+        assert_eq!(topology.strategy, "git_rebase_merges_no_rebase_cousins_v1");
+        assert_eq!(topology.old_commits.len(), topology.new_commits.len());
+        assert_eq!(topology.mapping.len(), topology.old_commits.len());
+        assert_eq!(
+            topology
+                .old_commits
+                .iter()
+                .filter(|commit| commit.parents.len() == 2)
+                .count(),
+            2
+        );
+        assert_eq!(
+            topology
+                .new_commits
+                .iter()
+                .filter(|commit| commit.parents.len() == 2)
+                .count(),
+            2
+        );
+        assert_eq!(receipt.new_tree_oid, topology.expected_merge_tree_oid);
+        assert!(receipt.lease.ends_with(&nonlinear_head.0));
+
+        let mut refreshed = candidate;
+        refreshed.head.oid = receipt.new_head_oid.clone();
+        refreshed.base.oid = fixture.new_main.clone();
+        let second = rewrite_candidate(
+            &fixture.clone,
+            &fixture.repository,
+            &refreshed,
+            &target,
+            &target,
+            Duration::from_secs(60),
+        )
+        .expect("second tick is idempotent");
+        assert!(second.already_satisfied);
+        assert_eq!(second.new_head_oid, receipt.new_head_oid);
+    }
+
+    #[test]
+    fn preserves_default_branch_merge_inside_candidate_history() {
+        let fixture = fixture();
+        git(&fixture.clone, &["checkout", "feature"]);
+        git(
+            &fixture.clone,
+            &["merge", "--no-ff", "main", "-m", "merge main into feature"],
+        );
+        let nonlinear_head = CommitOid(git(&fixture.clone, &["rev-parse", "HEAD"]));
+        git(&fixture.clone, &["push", "origin", "feature"]);
+        git(&fixture.clone, &["checkout", "main"]);
+        std::fs::write(fixture.clone.join("target-two"), "target two\n").unwrap();
+        git(&fixture.clone, &["add", "target-two"]);
+        git(&fixture.clone, &["commit", "-m", "advance target again"]);
+        let target_head = CommitOid(git(&fixture.clone, &["rev-parse", "HEAD"]));
+        git(&fixture.clone, &["push", "origin", "main"]);
+        git(&fixture.clone, &["checkout", "feature"]);
+        let candidate = PullRequestSnapshot {
+            number: PrNumber(7),
+            title: "main-merge candidate".to_owned(),
+            url: "https://example.invalid/7".to_owned(),
+            state: PullRequestState::Open,
+            draft: false,
+            head: branch(&fixture.repository, "feature", &nonlinear_head),
+            base: branch(&fixture.repository, "main", &fixture.old_main),
+            cross_repository: false,
+            labels: BTreeSet::new(),
+            auto_merge: AutoMergeState::disabled(),
+            checks: Vec::new(),
+            created_at: None,
+            merged_at: None,
+            updated_at: None,
+        };
+        let target = branch(&fixture.repository, "main", &target_head);
+        let receipt = rewrite_candidate(
+            &fixture.clone,
+            &fixture.repository,
+            &candidate,
+            &target,
+            &target,
+            Duration::from_secs(60),
+        )
+        .expect("default-branch merge is retained under current target ancestry");
+        let topology = receipt.merge_topology.expect("merge topology");
+        assert!(
+            topology
+                .old_commits
+                .iter()
+                .any(|commit| commit.parents.len() == 2)
+        );
+        assert!(
+            topology
+                .new_commits
+                .iter()
+                .any(|commit| commit.parents.len() == 2)
+        );
+        assert_eq!(receipt.new_tree_oid, topology.expected_merge_tree_oid);
+    }
+
+    #[test]
+    fn nonlinear_parent_generation_feeds_exact_linear_child_plan() {
+        let fixture = fixture();
+        git(&fixture.clone, &["checkout", "-b", "parent-side"]);
+        std::fs::write(fixture.clone.join("parent-side"), "side\n").unwrap();
+        git(&fixture.clone, &["add", "parent-side"]);
+        git(&fixture.clone, &["commit", "-m", "parent side"]);
+        git(&fixture.clone, &["checkout", "feature"]);
+        std::fs::write(fixture.clone.join("parent-two"), "two\n").unwrap();
+        git(&fixture.clone, &["add", "parent-two"]);
+        git(&fixture.clone, &["commit", "-m", "parent two"]);
+        git(
+            &fixture.clone,
+            &["merge", "--no-ff", "parent-side", "-m", "merge parent side"],
+        );
+        let parent_head = CommitOid(git(&fixture.clone, &["rev-parse", "HEAD"]));
+        git(&fixture.clone, &["push", "origin", "feature"]);
+        git(&fixture.clone, &["checkout", "-b", "child"]);
+        std::fs::write(fixture.clone.join("child"), "child\n").unwrap();
+        git(&fixture.clone, &["add", "child"]);
+        git(&fixture.clone, &["commit", "-m", "child"]);
+        let child_head = CommitOid(git(&fixture.clone, &["rev-parse", "HEAD"]));
+        git(&fixture.clone, &["push", "-u", "origin", "child"]);
+        let parent = PullRequestSnapshot {
+            number: PrNumber(7),
+            title: "parent".to_owned(),
+            url: "https://example.invalid/7".to_owned(),
+            state: PullRequestState::Open,
+            draft: false,
+            head: branch(&fixture.repository, "feature", &parent_head),
+            base: branch(&fixture.repository, "main", &fixture.old_main),
+            cross_repository: false,
+            labels: BTreeSet::new(),
+            auto_merge: AutoMergeState::disabled(),
+            checks: Vec::new(),
+            created_at: None,
+            merged_at: None,
+            updated_at: None,
+        };
+        let child = PullRequestSnapshot {
+            number: PrNumber(8),
+            title: "child".to_owned(),
+            url: "https://example.invalid/8".to_owned(),
+            state: PullRequestState::Open,
+            draft: false,
+            head: branch(&fixture.repository, "child", &child_head),
+            base: branch(&fixture.repository, "feature", &parent_head),
+            cross_repository: false,
+            labels: BTreeSet::new(),
+            auto_merge: AutoMergeState::disabled(),
+            checks: Vec::new(),
+            created_at: None,
+            merged_at: None,
+            updated_at: None,
+        };
+        let default = branch(&fixture.repository, "main", &fixture.new_main);
+        let prepared_parent = prepare_candidate(
+            &fixture.clone,
+            &fixture.repository,
+            &parent,
+            range_base_for_remote_target(&parent, &default),
+            PlannedBase::Remote(default.clone()),
+            &default,
+            RebaseExecutionBudget::new(Duration::from_secs(60)),
+        )
+        .expect("nonlinear parent plan");
+        let planned_parent = branch(
+            &fixture.repository,
+            "feature",
+            &prepared_parent.plan.new_head_oid,
+        );
+        let prepared_child = prepare_candidate(
+            &fixture.clone,
+            &fixture.repository,
+            &child,
+            PlannedRangeBase::RemoteBranch {
+                branch: child.base.clone(),
+            },
+            PlannedBase::Simulated(planned_parent),
+            &default,
+            RebaseExecutionBudget::new(Duration::from_secs(60)),
+        )
+        .expect("child consumes retained planned parent");
+        assert!(prepared_parent.plan.merge_topology.is_some());
+        assert!(prepared_child.plan.merge_topology.is_none());
+        let parent_receipt = apply_prepared(&prepared_parent).unwrap();
+        let child_receipt = apply_prepared(&prepared_child).unwrap();
+        let status = std::process::Command::new("git")
+            .current_dir(&fixture.clone)
+            .args([
+                "merge-base",
+                "--is-ancestor",
+                parent_receipt.new_head_oid.0.as_str(),
+                child_receipt.new_head_oid.0.as_str(),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn rejects_octopus_candidate_topology_before_remote_write() {
+        let fixture = fixture();
+        git(&fixture.clone, &["checkout", "-b", "side-one"]);
+        std::fs::write(fixture.clone.join("side-one"), "one\n").unwrap();
+        git(&fixture.clone, &["add", "side-one"]);
+        git(&fixture.clone, &["commit", "-m", "side one"]);
+        git(&fixture.clone, &["checkout", "feature"]);
+        git(&fixture.clone, &["checkout", "-b", "side-two"]);
+        std::fs::write(fixture.clone.join("side-two"), "two\n").unwrap();
+        git(&fixture.clone, &["add", "side-two"]);
+        git(&fixture.clone, &["commit", "-m", "side two"]);
+        git(&fixture.clone, &["checkout", "feature"]);
+        git(
+            &fixture.clone,
+            &["merge", "--no-ff", "side-one", "side-two", "-m", "octopus"],
+        );
+        let head = CommitOid(git(&fixture.clone, &["rev-parse", "HEAD"]));
+        git(&fixture.clone, &["push", "origin", "feature"]);
+        let candidate = PullRequestSnapshot {
+            number: PrNumber(7),
+            title: "octopus".to_owned(),
+            url: "https://example.invalid/7".to_owned(),
+            state: PullRequestState::Open,
+            draft: false,
+            head: branch(&fixture.repository, "feature", &head),
+            base: branch(&fixture.repository, "main", &fixture.old_main),
+            cross_repository: false,
+            labels: BTreeSet::new(),
+            auto_merge: AutoMergeState::disabled(),
+            checks: Vec::new(),
+            created_at: None,
+            merged_at: None,
+            updated_at: None,
+        };
+        let error = rewrite_candidate(
+            &fixture.clone,
+            &fixture.repository,
+            &candidate,
+            &branch(&fixture.repository, "main", &fixture.new_main),
+            &branch(&fixture.repository, "main", &fixture.new_main),
+            Duration::from_secs(60),
+        )
+        .expect_err("octopus topology is unsupported");
+        assert_eq!(
+            mcp_cli::StructuredError::code(&error),
+            "rebase_unsupported_octopus"
+        );
+        assert_eq!(
+            git(
+                &fixture.clone,
+                &["ls-remote", "origin", "refs/heads/feature"]
+            )
+            .split_whitespace()
+            .next(),
+            Some(head.0.as_str())
+        );
+    }
+
+    #[test]
+    fn rejects_merge_parent_outside_candidate_and_target_history() {
+        let fixture = fixture();
+        git(
+            &fixture.clone,
+            &["checkout", "--orphan", "external-history"],
+        );
+        git(&fixture.clone, &["rm", "-rf", "."]);
+        std::fs::write(fixture.clone.join("external"), "external\n").unwrap();
+        git(&fixture.clone, &["add", "external"]);
+        git(&fixture.clone, &["commit", "-m", "external root"]);
+        git(&fixture.clone, &["checkout", "feature"]);
+        git(
+            &fixture.clone,
+            &[
+                "merge",
+                "--allow-unrelated-histories",
+                "--no-ff",
+                "external-history",
+                "-m",
+                "external merge",
+            ],
+        );
+        let head = CommitOid(git(&fixture.clone, &["rev-parse", "HEAD"]));
+        git(&fixture.clone, &["push", "origin", "feature"]);
+        let candidate = PullRequestSnapshot {
+            number: PrNumber(7),
+            title: "external candidate".to_owned(),
+            url: "https://example.invalid/7".to_owned(),
+            state: PullRequestState::Open,
+            draft: false,
+            head: branch(&fixture.repository, "feature", &head),
+            base: branch(&fixture.repository, "main", &fixture.old_main),
+            cross_repository: false,
+            labels: BTreeSet::new(),
+            auto_merge: AutoMergeState::disabled(),
+            checks: Vec::new(),
+            created_at: None,
+            merged_at: None,
+            updated_at: None,
+        };
+        let error = rewrite_candidate(
+            &fixture.clone,
+            &fixture.repository,
+            &candidate,
+            &branch(&fixture.repository, "main", &fixture.new_main),
+            &branch(&fixture.repository, "main", &fixture.new_main),
+            Duration::from_secs(60),
+        )
+        .expect_err("unowned cousin history must fail before push");
+        assert_eq!(
+            mcp_cli::StructuredError::code(&error),
+            "rebase_cousin_history"
+        );
+        assert_eq!(
+            git(
+                &fixture.clone,
+                &["ls-remote", "origin", "refs/heads/feature"]
+            )
+            .split_whitespace()
+            .next(),
+            Some(head.0.as_str())
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
     fn five_member_plan_reuses_exact_simulated_parent_generations() {
         let root = tempfile::tempdir().unwrap();
         let bare = root.path().join("remote.git");
@@ -1426,6 +2143,73 @@ mod tests {
         );
         assert_eq!(
             git(&clone, &["ls-remote", "origin", "refs/heads/feature"]),
+            before
+        );
+    }
+
+    #[test]
+    fn nonlinear_merge_tree_conflict_writes_nothing() {
+        let fixture = fixture();
+        git(&fixture.clone, &["checkout", "main"]);
+        std::fs::write(fixture.clone.join("base"), "target conflict\n").unwrap();
+        git(&fixture.clone, &["commit", "-am", "target conflict"]);
+        let target_head = CommitOid(git(&fixture.clone, &["rev-parse", "HEAD"]));
+        git(&fixture.clone, &["push", "origin", "main"]);
+        git(&fixture.clone, &["checkout", "feature"]);
+        std::fs::write(fixture.clone.join("base"), "candidate conflict\n").unwrap();
+        git(&fixture.clone, &["commit", "-am", "candidate conflict"]);
+        git(&fixture.clone, &["checkout", "-b", "conflict-side"]);
+        std::fs::write(fixture.clone.join("side"), "side\n").unwrap();
+        git(&fixture.clone, &["add", "side"]);
+        git(&fixture.clone, &["commit", "-m", "side"]);
+        git(&fixture.clone, &["checkout", "feature"]);
+        std::fs::write(fixture.clone.join("feature-two"), "two\n").unwrap();
+        git(&fixture.clone, &["add", "feature-two"]);
+        git(&fixture.clone, &["commit", "-m", "feature two"]);
+        git(
+            &fixture.clone,
+            &["merge", "--no-ff", "conflict-side", "-m", "internal merge"],
+        );
+        let head = CommitOid(git(&fixture.clone, &["rev-parse", "HEAD"]));
+        git(&fixture.clone, &["push", "origin", "feature"]);
+        let candidate = PullRequestSnapshot {
+            number: PrNumber(7),
+            title: "conflict".to_owned(),
+            url: "https://example.invalid/7".to_owned(),
+            state: PullRequestState::Open,
+            draft: false,
+            head: branch(&fixture.repository, "feature", &head),
+            base: branch(&fixture.repository, "main", &fixture.old_main),
+            cross_repository: false,
+            labels: BTreeSet::new(),
+            auto_merge: AutoMergeState::disabled(),
+            checks: Vec::new(),
+            created_at: None,
+            merged_at: None,
+            updated_at: None,
+        };
+        let before = git(
+            &fixture.clone,
+            &["ls-remote", "origin", "refs/heads/feature"],
+        );
+        let error = rewrite_candidate(
+            &fixture.clone,
+            &fixture.repository,
+            &candidate,
+            &branch(&fixture.repository, "main", &target_head),
+            &branch(&fixture.repository, "main", &target_head),
+            Duration::from_secs(60),
+        )
+        .expect_err("independent merge-tree conflict fails before push");
+        assert_eq!(
+            mcp_cli::StructuredError::code(&error),
+            "rebase_merge_tree_conflict"
+        );
+        assert_eq!(
+            git(
+                &fixture.clone,
+                &["ls-remote", "origin", "refs/heads/feature"]
+            ),
             before
         );
     }

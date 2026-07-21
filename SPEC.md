@@ -407,7 +407,14 @@ always expose the effective mode and config path; a disabled sync conflict gives
 the exact `rebase_on_join: true` project-config action instead of implying a
 manual hand-rebase.
 
-When enabled, membership rebases one candidate-only linear range. Post-rewrite
+When enabled, membership rebases one bounded candidate-only range. Linear
+ranges use the ordinary sequencer. Owned nonlinear ranges use an explicit
+two-parent merge-preserving strategy: commits reachable only from the candidate
+(after excluding retained old-base and current-target ancestry) are replayed
+with no cousin rebasing, and every old/new parent edge is mapped in the receipt.
+Octopus/root/cousin/external parents are rejected. The rebuilt head tree must
+exactly equal an independently computed clean `merge-tree` for current target +
+old candidate head before any write. Post-rewrite
 provider rediscovery is operation-specific: `join`/`rejoin` require the exact
 live tail named by the rebase receipt; `new`/`renew` require the exact current
 default branch generation and no inferred membership tail. A new caravan has no
@@ -425,8 +432,9 @@ barrier. Independent caravans may apply with bounded parallelism; each chain is
 strictly parent-to-descendant. A mandatory midpoint rediscovery verifies every
 new head and refreshes invalidated CI before ordinary sync policy runs.
 
-A moved branch, merge commit, ambiguous range, conflict, or apply-time lease race
-is a typed resumable decision and is never forced. Global preflight failure has
+A moved branch, unsupported merge topology, ambiguous range, conflict, tree or
+topology mismatch, or apply-time lease race is a typed resumable decision and
+is never forced. Global preflight failure has
 zero writes. Apply-time failure preserves the exact successfully rebuilt prefix
 and skips its descendants; independent in-flight chains may complete. Recovery
 never force-rolls back: rediscover GitHub and rerun the same idempotent sync.

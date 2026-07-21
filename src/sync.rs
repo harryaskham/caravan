@@ -1961,6 +1961,14 @@ fn attach_physical_rebuild(error: AppError, outcome: &PhysicalRebuildOutcome) ->
                 | "rebase_target_history_changed"
                 | "rebase_repository_not_owned"
                 | "rebase_historical_target_mismatch"
+                | "rebase_unsupported_octopus"
+                | "rebase_topology_limit"
+                | "rebase_external_merge_parents"
+                | "rebase_cousin_history"
+                | "rebase_merge_tree_conflict"
+                | "rebase_merge_replay_conflict"
+                | "rebase_merge_tree_mismatch"
+                | "rebase_topology_changed"
         );
         object.insert(
             "next".to_owned(),
@@ -2213,6 +2221,14 @@ fn scheduler_failure_status(error: &AppError) -> SyncFailureSchedulerStatus {
                 | "rebase_target_history_changed"
                 | "rebase_repository_not_owned"
                 | "rebase_historical_target_mismatch"
+                | "rebase_unsupported_octopus"
+                | "rebase_topology_limit"
+                | "rebase_external_merge_parents"
+                | "rebase_cousin_history"
+                | "rebase_merge_tree_conflict"
+                | "rebase_merge_replay_conflict"
+                | "rebase_merge_tree_mismatch"
+                | "rebase_topology_changed"
                 | "rebase_midpoint_head_stale"
                 | "rebase_midpoint_pr_missing"
                 | "rebase_prepared_object_changed"
@@ -6315,6 +6331,14 @@ mod tests {
             "rebase_target_history_changed",
             "rebase_repository_not_owned",
             "rebase_historical_target_mismatch",
+            "rebase_unsupported_octopus",
+            "rebase_topology_limit",
+            "rebase_external_merge_parents",
+            "rebase_cousin_history",
+            "rebase_merge_tree_conflict",
+            "rebase_merge_replay_conflict",
+            "rebase_merge_tree_mismatch",
+            "rebase_topology_changed",
         ] {
             let error = AppError::structured(
                 ErrorCategory::Validation,
@@ -6648,6 +6672,7 @@ mod tests {
             new_head_oid: CommitOid("rewritten0000000000000000000000000000000".to_owned()),
             new_tree_oid: CommitOid("tree000000000000000000000000000000000000".to_owned()),
             commit_count: 1,
+            merge_topology: None,
             ci_trigger_workflows: vec!["CI".to_owned()],
             lease: format!("refs/heads/{}:{}", old_head.name, old_head.oid),
             already_satisfied: false,
@@ -6691,6 +6716,7 @@ mod tests {
             new_head_oid: head.oid.clone(),
             new_tree_oid: CommitOid("tree000000000000000000000000000000000000".to_owned()),
             commit_count: 1,
+            merge_topology: None,
             ci_trigger_workflows: vec!["CI".to_owned()],
             lease: format!("refs/heads/{}:{}", head.name, head.oid),
             already_satisfied: true,
@@ -6730,6 +6756,7 @@ mod tests {
             new_head_oid: rewritten_oid.clone(),
             new_tree_oid: CommitOid("tree000000000000000000000000000000000000".to_owned()),
             commit_count: 1,
+            merge_topology: None,
             ci_trigger_workflows: vec!["CI".to_owned()],
             lease: format!("refs/heads/{}:{}", head.name, head.oid),
             already_satisfied: false,
@@ -6938,6 +6965,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn sync_lock_checkpoint_stays_bounded_for_large_fleet_receipts() {
         let pulls = healthy_chain();
         let status = status(pulls.clone(), Some(PrNumber(1)), &clean);
@@ -6967,6 +6995,7 @@ mod tests {
                     new_head_oid: CommitOid(format!("new-{index}")),
                     new_tree_oid: CommitOid(format!("tree-{index}")),
                     commit_count: 1,
+                    merge_topology: None,
                     ci_trigger_workflows: (0..32)
                         .map(|workflow| format!(".github/workflows/{workflow}.yml"))
                         .collect(),
@@ -6985,6 +7014,7 @@ mod tests {
                     new_base_oid: CommitOid(format!("target-oid-{index}")),
                     new_tree_oid: CommitOid(format!("tree-{index}")),
                     commit_count: 1,
+                    merge_topology: None,
                     ci_trigger_workflows: Vec::new(),
                     lease: format!("--force-with-lease=refs/heads/feature-{index}:old-{index}"),
                     already_satisfied: false,

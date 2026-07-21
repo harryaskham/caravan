@@ -237,6 +237,9 @@ BUILT-IN WEB OPERATIONS
 - Use `--read-only` to disable mutation endpoints. Interactive actions use the
   same typed domain functions, preconditions, operation locks, decisions, and
   receipts as CLI/JSON/MCP; the web server never shells out to human output.
+  Long actions return an action ID immediately, continue under one repository
+  lock across browser disconnects, and expose bounded durable checkpoint phases,
+  terminal receipts, and the newest Cara event/hook journal records.
 - Static HTML, CSS, and JavaScript ship inside `cara`; no CDN or separate web
   deployment is required. Future opt-in repository discovery must remain
   explicit and is not performed by the initial path-scoped release.
@@ -249,10 +252,12 @@ RECOVERY, LOCKS, AND OBSERVABILITY
 - GitHub is the resume cursor. After timeout, interruption, or partial provider
   failure, inspect receipts and rerun the same command. Do not guess whether a
   mutation happened. Only genuine provider-generation races are `retry_tick`.
-  Deterministic unsupported physical histories such as nonlinear, ambiguous, or
-  empty candidate ranges are non-retryable external decisions: use their stable
-  fingerprint and exact repair/reshape/evict/strategy choices rather than
-  repeating the unchanged tick.
+  Deterministic unsupported physical histories such as octopus/cousin/external
+  merge topology, ambiguous, or empty candidate ranges are non-retryable
+  external decisions: use their stable fingerprint and exact
+  repair/reshape/evict/strategy choices rather than repeating the unchanged
+  tick. Bounded owned two-parent topology is preserved only after exact topology
+  mapping and independent clean merge-tree proof.
 - `cara lock status` reports owner token, PID liveness, checkpoint phase, and
   provider indeterminacy. Sync checkpoint evidence is always bounded below the
   owner-file limit: complete counts/hashes plus first/last samples preserve

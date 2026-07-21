@@ -380,8 +380,12 @@ hooks:
     blocking: false
 ```
 
-Cumulative mode rejects fork heads, stale leases, empty/ambiguous ranges, and
-candidate-only merge commits. Membership rewrites one candidate. After the
+Cumulative mode rejects fork heads, stale leases, and empty/ambiguous ranges.
+It preserves bounded owned two-parent candidate topology with
+`rebase-merges=no-rebase-cousins`, independently proves the exact clean
+`merge-tree` result, retains old/new commit-parent mapping in the plan/receipt,
+and rejects octopus roots, cousin/external parents, topology drift, or tree
+mismatch before any write. Membership rewrites one candidate. After the
 mandatory provider rediscovery, `join`/`rejoin` require the exact live tail from
 the rebase receipt, while `new`/`renew` require the exact current default and no
 inferred candidate membership; a new caravan correctly has no join tail.
