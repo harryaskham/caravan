@@ -212,10 +212,13 @@ used by CLI/JSON/MCP, and applies strict CSP/anti-frame/no-store headers. The
 responsive one-page dashboard renders trail-linked caravans, linked GitHub PRs,
 exact generations and check failures. Repositories and attention decisions live
 in independently collapsible left/right sidebars, leaving the center for repo
-metadata, compact active topology, and the **Saloon**. The Saloon
-deterministically groups unenrolled PRs as Ready to Roll, Saddling Up, Other,
-then Bounty List; each group is collapsible, and fresh
-candidate evidence moves a fixed unjoined PR back to Ready to Roll. `Plan sync` runs the same fresh physical/conflict/lease and
+metadata, compact active topology, and the **Saloon**. The Saloon evaluates a
+bounded set of exact current destinations for each admission candidate and
+shows `Ready (main, PR #tail...)`, `Conflicting (main, PR #tail...)`, or
+checking/unknown evidence independently from priority/FIFO position. Mixed PRs
+show both compatible and conflicting targets; stale, truncated, or unevaluated
+targets are never called Ready. Draft/incomplete and skipped/evicted PRs remain
+Saddling Up and Bounty List. `Plan sync` runs the same fresh physical/conflict/lease and
 first auto-admission selection preflight without provider writes, then renders
 ordered exact actions and rediscovery barriers before Apply. Bounded inner lists keep fleet topology and attention queues
 visible without an unbounded page. The Evidence drawer retains the latest typed

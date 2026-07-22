@@ -25,7 +25,8 @@ use sha2::{Digest, Sha256};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 use crate::config::{CaravanConfig, DEFAULT_CONFIG_PATH};
-use crate::model::PullRequestPrecondition;
+use crate::graph::{CompatibilityChecker, GitCompatibilityChecker};
+use crate::model::{BranchSnapshot, CompatibilityOutcome, PrNumber, PullRequestPrecondition};
 use crate::read::StatusOutput;
 use crate::repair::{
     RepairAbortInput, RepairContinueInput, RepairGrantInput, RepairRevokeGrantInput,
@@ -39,7 +40,7 @@ use crate::{
 const INDEX_HTML: &str = include_str!("web_assets/index.html");
 const APP_CSS: &str = include_str!("web_assets/app.css");
 const APP_JS: &str = include_str!("web_assets/app.js");
-const WEB_SCHEMA_VERSION: u32 = 5;
+const WEB_SCHEMA_VERSION: u32 = 6;
 const MIN_POLL_SECONDS: u64 = 2;
 const MAX_POLL_SECONDS: u64 = 3_600;
 const DEFAULT_POLL_SECONDS: u64 = 15;
@@ -52,6 +53,10 @@ const JOURNAL_SNAPSHOT_LIMIT: usize = 50;
 const MAX_WEB_JOURNAL_BYTES: usize = 512 * 1024;
 const MAX_WEBHOOK_DELIVERIES: usize = 1_000;
 const MAX_WEBHOOK_STATE_BYTES: u64 = 256 * 1024;
+const MAX_WEB_COMPATIBILITY_CANDIDATES: usize = 32;
+const MAX_WEB_COMPATIBILITY_TARGETS: usize = 16;
+const MAX_WEB_COMPATIBILITY_PAIRS: usize = 64;
+const MAX_WEB_COMPATIBILITY_SECONDS: u64 = 30;
 type WebhookHmac = Hmac<Sha256>;
 
 /// Start a local dashboard over one or more explicit repository paths.
@@ -111,6 +116,44 @@ impl WebError {
     }
 }
 
+/// Kind of exact destination considered for one unenrolled PR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WebCompatibilityTargetKind {
+    DefaultBranch,
+    CaravanTail,
+}
+
+/// One exact candidate/destination mechanical compatibility result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WebCandidateTargetCompatibility {
+    pub kind: WebCompatibilityTargetKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caravan_id: Option<PrNumber>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tail_pr: Option<PrNumber>,
+    pub target: BranchSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<CompatibilityOutcome>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicting_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<WebError>,
+}
+
+/// Bounded exact target projection for one admission candidate generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WebCandidateCompatibility {
+    pub pr: PrNumber,
+    pub candidate: BranchSnapshot,
+    pub generation_fingerprint: String,
+    pub complete: bool,
+    pub targets_truncated: usize,
+    pub targets: Vec<WebCandidateTargetCompatibility>,
+}
+
 /// One repository's latest periodic typed Cara status.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WebRepositorySnapshot {
@@ -127,6 +170,12 @@ pub struct WebRepositorySnapshot {
     pub status: Option<StatusOutput>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<WebError>,
+    /// Exact default/tail compatibility for bounded unenrolled admission candidates.
+    #[serde(default)]
+    pub candidate_compatibility: Vec<WebCandidateCompatibility>,
+    /// Admission candidates omitted by the bounded web compatibility projection.
+    #[serde(default)]
+    pub candidate_compatibility_truncated: usize,
     /// Most recent bounded typed action result, retained for operational evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_action: Option<WebActionRecord>,
@@ -626,6 +675,8 @@ fn load_repositories(paths: &[PathBuf]) -> Result<Vec<Arc<RepositoryEntry>>, App
                     refreshing: false,
                     status: None,
                     error: None,
+                    candidate_compatibility: Vec::new(),
+                    candidate_compatibility_truncated: 0,
                     last_action: None,
                     journal: None,
                     actions: Vec::new(),
@@ -877,6 +928,8 @@ fn mutation_authority_fingerprint(
         "initialization": status.initialization,
         "pauses": status.pauses,
         "merge_candidates": merge_candidates,
+        "candidate_compatibility": snapshot.candidate_compatibility,
+        "candidate_compatibility_truncated": snapshot.candidate_compatibility_truncated,
     }))
     .ok()?;
     Some(format!("sha256:{:x}", Sha256::digest(material)))
@@ -968,6 +1021,200 @@ fn bound_web_journal(mut output: crate::journal::LogOutput) -> crate::journal::L
     output
 }
 
+#[derive(Debug, Clone)]
+struct WebCompatibilityTargetSpec {
+    kind: WebCompatibilityTargetKind,
+    caravan_id: Option<PrNumber>,
+    tail_pr: Option<PrNumber>,
+    branch: BranchSnapshot,
+}
+
+fn web_candidate_compatibility(
+    context: &AppContext,
+    status: &StatusOutput,
+    previous: &[WebCandidateCompatibility],
+) -> (Vec<WebCandidateCompatibility>, usize) {
+    let timeout = Duration::from_secs(
+        context
+            .config
+            .command_timeout_secs
+            .clamp(1, MAX_WEB_COMPATIBILITY_SECONDS),
+    );
+    let checker = GitCompatibilityChecker::new(&context.repository_path, "origin")
+        .with_timeout(timeout)
+        .with_operation_deadline(std::time::Instant::now() + timeout);
+    project_candidate_compatibility(
+        status,
+        &checker,
+        MAX_WEB_COMPATIBILITY_CANDIDATES,
+        MAX_WEB_COMPATIBILITY_TARGETS,
+        MAX_WEB_COMPATIBILITY_PAIRS,
+        previous,
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn project_candidate_compatibility(
+    status: &StatusOutput,
+    checker: &impl CompatibilityChecker,
+    max_candidates: usize,
+    max_targets: usize,
+    max_pairs: usize,
+    previous: &[WebCandidateCompatibility],
+) -> (Vec<WebCandidateCompatibility>, usize) {
+    let mut target_specs = vec![WebCompatibilityTargetSpec {
+        kind: WebCompatibilityTargetKind::DefaultBranch,
+        caravan_id: None,
+        tail_pr: None,
+        branch: status.analysis.fleet.default_branch.clone(),
+    }];
+    target_specs.extend(status.analysis.fleet.caravans.iter().filter_map(|caravan| {
+        let tail_pr = caravan.tail()?;
+        let tail = status.analysis.pull_requests.get(&tail_pr)?;
+        Some(WebCompatibilityTargetSpec {
+            kind: WebCompatibilityTargetKind::CaravanTail,
+            caravan_id: Some(caravan.id),
+            tail_pr: Some(tail_pr),
+            branch: tail.head.clone(),
+        })
+    }));
+    target_specs.sort_by_key(|target| {
+        (
+            target.kind != WebCompatibilityTargetKind::DefaultBranch,
+            target.tail_pr,
+        )
+    });
+    target_specs.dedup_by(|left, right| {
+        left.kind == right.kind && left.tail_pr == right.tail_pr && left.branch == right.branch
+    });
+    let targets_truncated = target_specs.len().saturating_sub(max_targets);
+    target_specs.truncate(max_targets);
+
+    let total_candidates = status.admission.candidates.len();
+    let selected_candidates = status
+        .admission
+        .candidates
+        .iter()
+        .take(max_candidates)
+        .filter_map(|candidate| {
+            status
+                .analysis
+                .pull_requests
+                .get(&candidate.pr)
+                .map(|pull_request| (candidate.pr, pull_request.head.clone()))
+        })
+        .collect::<Vec<_>>();
+    let candidates_truncated = total_candidates.saturating_sub(selected_candidates.len());
+    let budget_error = || WebError {
+        category: ErrorCategory::Validation,
+        code: "web_compatibility_budget_exhausted".to_owned(),
+        message: "bounded dashboard compatibility pair budget was exhausted".to_owned(),
+        details: Some(json!({
+            "max_candidates": max_candidates,
+            "max_targets": max_targets,
+            "max_pairs": max_pairs,
+            "mutated": false,
+        })),
+    };
+
+    let mut rows = selected_candidates
+        .into_iter()
+        .map(|(pr, candidate)| {
+            let targets = target_specs
+                .iter()
+                .map(|target| WebCandidateTargetCompatibility {
+                    kind: target.kind,
+                    caravan_id: target.caravan_id,
+                    tail_pr: target.tail_pr,
+                    target: target.branch.clone(),
+                    outcome: None,
+                    conflicting_paths: Vec::new(),
+                    diagnostic: None,
+                    error: None,
+                })
+                .collect::<Vec<_>>();
+            let material = serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "pr": pr,
+                "candidate": candidate,
+                "targets": targets.iter().map(|target| json!({
+                    "kind": target.kind,
+                    "caravan_id": target.caravan_id,
+                    "tail_pr": target.tail_pr,
+                    "target": target.target,
+                })).collect::<Vec<_>>(),
+            }))
+            .unwrap_or_default();
+            WebCandidateCompatibility {
+                pr,
+                candidate,
+                generation_fingerprint: format!("sha256:{:x}", Sha256::digest(material)),
+                complete: false,
+                targets_truncated,
+                targets,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    for row in &mut rows {
+        if let Some(previous) = previous.iter().find(|previous| {
+            previous.pr == row.pr
+                && previous.complete
+                && previous.generation_fingerprint == row.generation_fingerprint
+        }) {
+            row.clone_from(previous);
+        }
+    }
+
+    let mut scheduled = Vec::new();
+    let mut branches = Vec::new();
+    for (candidate_index, row) in rows.iter_mut().enumerate() {
+        if row.complete {
+            continue;
+        }
+        for (target_index, target) in row.targets.iter_mut().enumerate() {
+            if scheduled.len() >= max_pairs {
+                target.error = Some(budget_error());
+                continue;
+            }
+            scheduled.push((candidate_index, target_index));
+            branches.push(row.candidate.clone());
+            branches.push(target.target.clone());
+        }
+    }
+    branches.sort_by(|left, right| (&left.name, &left.oid.0).cmp(&(&right.name, &right.oid.0)));
+    branches.dedup();
+
+    match checker.prepare(&branches) {
+        Ok(()) => {
+            for (candidate_index, target_index) in scheduled {
+                let row = &mut rows[candidate_index];
+                let target = &mut row.targets[target_index];
+                match checker.check(&row.candidate, &target.target) {
+                    Ok(report) => {
+                        target.outcome = Some(report.outcome);
+                        target.conflicting_paths = report.conflicting_paths;
+                        target.diagnostic = report.diagnostic;
+                    }
+                    Err(error) => target.error = Some(WebError::from_app(&error)),
+                }
+            }
+        }
+        Err(error) => {
+            let error = WebError::from_app(&error);
+            for (candidate_index, target_index) in scheduled {
+                rows[candidate_index].targets[target_index].error = Some(error.clone());
+            }
+        }
+    }
+    for row in &mut rows {
+        row.complete = row.targets_truncated == 0
+            && !row.targets.is_empty()
+            && row.targets.iter().all(|target| target.outcome.is_some());
+    }
+    (rows, candidates_truncated)
+}
+
 fn has_active_action(repository: &RepositoryEntry) -> bool {
     repository
         .actions
@@ -996,17 +1243,25 @@ fn refresh_repository(repository: &RepositoryEntry) -> bool {
 }
 
 fn refresh_repository_locked(repository: &RepositoryEntry) {
-    {
+    let previous_candidate_compatibility = {
         let mut snapshot = repository
             .snapshot
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         snapshot.refreshing = true;
-    }
+        snapshot.candidate_compatibility.clone()
+    };
     // Coalesce duplicate poll/manual refreshes inside this long-lived process.
     // Mutating action paths invalidate this cache and retain their own exact
     // provider preflight, so cached status is never mutation authority.
     let result = crate::read::status_cached(&repository.context, Duration::from_secs(5));
+    let candidate_compatibility = result.as_ref().ok().map(|status| {
+        web_candidate_compatibility(
+            &repository.context,
+            status,
+            &previous_candidate_compatibility,
+        )
+    });
     let journal = crate::journal::snapshot(
         &repository.context,
         &crate::journal::LogInput {
@@ -1030,11 +1285,17 @@ fn refresh_repository_locked(repository: &RepositoryEntry) {
     }
     match result {
         Ok(status) => {
+            let (candidate_compatibility, truncated) =
+                candidate_compatibility.unwrap_or_else(|| (Vec::new(), 0));
             snapshot.status = Some(status);
             snapshot.error = None;
+            snapshot.candidate_compatibility = candidate_compatibility;
+            snapshot.candidate_compatibility_truncated = truncated;
         }
         Err(error) => {
             snapshot.error = Some(WebError::from_app(&error));
+            snapshot.candidate_compatibility.clear();
+            snapshot.candidate_compatibility_truncated = 0;
         }
     }
 }
@@ -1966,6 +2227,105 @@ mod tests {
         }
     }
 
+    #[test]
+    fn saloon_projection_distinguishes_main_conflict_and_clean_tail() {
+        let mut status = authority_status("candidate-head");
+        let repository = status.repository.clone();
+        let tail = crate::model::PullRequestSnapshot {
+            number: crate::model::PrNumber(2),
+            title: "tail".to_owned(),
+            url: "https://example.invalid/2".to_owned(),
+            state: crate::model::PullRequestState::Open,
+            draft: false,
+            head: crate::model::BranchSnapshot {
+                repository: repository.clone(),
+                name: "tail-2".to_owned(),
+                oid: crate::model::CommitOid("tail-head".to_owned()),
+            },
+            base: status.analysis.fleet.default_branch.clone(),
+            cross_repository: false,
+            labels: BTreeSet::from(["caravan".to_owned()]),
+            auto_merge: crate::model::AutoMergeState::squash(),
+            checks: Vec::new(),
+            created_at: Some("2026-01-01T00:00:02Z".to_owned()),
+            merged_at: None,
+            updated_at: None,
+        };
+        status
+            .analysis
+            .pull_requests
+            .insert(tail.number, tail.clone());
+        status.analysis.fleet.caravans =
+            vec![crate::model::Caravan::new(vec![tail.number]).expect("one-member caravan")];
+        status.admission = crate::read::resolve_admission(&status.analysis, &[]);
+        let checker = |candidate: &BranchSnapshot, target: &BranchSnapshot| {
+            Ok(crate::model::CompatibilityReport {
+                candidate: candidate.clone(),
+                target: target.clone(),
+                outcome: if target.name == "main" {
+                    CompatibilityOutcome::Conflict
+                } else {
+                    CompatibilityOutcome::Clean
+                },
+                conflicting_paths: if target.name == "main" {
+                    vec!["scripts/test-release-helpers.sh".to_owned()]
+                } else {
+                    Vec::new()
+                },
+                diagnostic: Some("fixture".to_owned()),
+            })
+        };
+
+        let (rows, truncated) = project_candidate_compatibility(&status, &checker, 8, 8, 64, &[]);
+        assert_eq!(truncated, 0);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].complete);
+        assert_eq!(rows[0].targets.len(), 2);
+        assert_eq!(
+            rows[0].targets[0].kind,
+            WebCompatibilityTargetKind::DefaultBranch
+        );
+        assert_eq!(
+            rows[0].targets[0].outcome,
+            Some(CompatibilityOutcome::Conflict)
+        );
+        assert_eq!(
+            rows[0].targets[0].conflicting_paths,
+            ["scripts/test-release-helpers.sh"]
+        );
+        assert_eq!(rows[0].targets[1].tail_pr, Some(crate::model::PrNumber(2)));
+        assert_eq!(
+            rows[0].targets[1].outcome,
+            Some(CompatibilityOutcome::Clean)
+        );
+
+        let must_not_recheck = |_candidate: &BranchSnapshot, _target: &BranchSnapshot| {
+            panic!("an unchanged complete generation must reuse exact compatibility evidence")
+        };
+        let (cached, cached_truncated) =
+            project_candidate_compatibility(&status, &must_not_recheck, 8, 8, 64, &rows);
+        assert_eq!(cached_truncated, 0);
+        assert_eq!(cached, rows);
+    }
+
+    #[test]
+    fn saloon_projection_never_marks_unevaluated_pairs_complete() {
+        let status = authority_status("candidate-head");
+        let checker = |_candidate: &BranchSnapshot, _target: &BranchSnapshot| {
+            panic!("zero pair budget must not run compatibility")
+        };
+        let (rows, truncated) = project_candidate_compatibility(&status, &checker, 8, 8, 0, &[]);
+        assert_eq!(truncated, 0);
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].complete);
+        assert_eq!(rows[0].targets.len(), 1);
+        assert!(rows[0].targets[0].outcome.is_none());
+        assert_eq!(
+            rows[0].targets[0].error.as_ref().unwrap().code,
+            "web_compatibility_budget_exhausted"
+        );
+    }
+
     fn set_authority_snapshot(repository: &RepositoryEntry, sequence: u64, status: StatusOutput) {
         let mut snapshot = repository
             .snapshot
@@ -2262,17 +2622,25 @@ mod tests {
         assert!(INDEX_HTML.contains("id=\"repository-sidebar\""));
         assert!(INDEX_HTML.contains("id=\"attention-sidebar\""));
         assert!(INDEX_HTML.contains("id=\"saloon\""));
-        for label in ["Ready to Roll", "Saddling Up", "Other", "Bounty List"] {
+        for label in [
+            "Ready",
+            "Conflicting",
+            "Saddling Up",
+            "Other",
+            "Bounty List",
+        ] {
             assert!(
                 APP_JS.contains(label),
                 "missing Saloon classification {label}"
             );
         }
-        assert!(
-            APP_JS
-                .contains("const SALOON_ORDER = [\"ready\", \"saddling\", \"other\", \"bounty\"]")
-        );
+        assert!(APP_JS.contains(
+            "const SALOON_ORDER = [\"ready\", \"conflicting\", \"saddling\", \"other\", \"bounty\"]"
+        ));
         assert!(APP_JS.contains("admissionFact(status, \"candidates\", pr)"));
+        assert!(APP_JS.contains("Ready (${ready.map(targetLabel).join(\", \")})"));
+        assert!(APP_JS.contains("Conflicting (${conflicting.map(targetLabel).join(\", \")})"));
+        assert!(APP_JS.contains("Exact target compatibility"));
         assert!(APP_CSS.contains(".dashboard.no-caravans .caravan-list .empty-state"));
         assert!(APP_CSS.contains(".repo-rail { grid-column: 1;"));
         assert!(APP_CSS.contains(".content { grid-column: 2;"));

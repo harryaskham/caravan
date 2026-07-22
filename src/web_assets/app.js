@@ -43,11 +43,12 @@
     if (!window.localStorage.getItem("caravan.sidebar.repositories")) sidebarState.repositories = false;
     if (!window.localStorage.getItem("caravan.sidebar.attention")) sidebarState.attention = false;
   }
-  const SALOON_ORDER = ["ready", "saddling", "other", "bounty"];
+  const SALOON_ORDER = ["ready", "conflicting", "saddling", "other", "bounty"];
   const SALOON_META = {
-    ready: ["Ready to Roll", "Eligible for exact tail/new-caravan preflight now"],
+    ready: ["Ready", "Mechanically clean against at least one exact current destination"],
+    conflicting: ["Conflicting", "No exact current destination merges cleanly"],
     saddling: ["Saddling Up", "Known work or provider state is still incomplete"],
-    other: ["Other", "More provider evidence is needed before classification"],
+    other: ["Other", "Exact target compatibility is unknown or still being checked"],
     bounty: ["Bounty List", "Skipped or evicted and not yet fixed"],
   };
 
@@ -241,6 +242,47 @@
     return (status?.admission?.[kind] ?? []).find((item) => item.pr === pr.number) ?? null;
   }
 
+  function compatibilityFact(repo, pr) {
+    return (repo?.candidate_compatibility ?? []).find((item) => item.pr === pr.number) ?? null;
+  }
+
+  function targetLabel(target) {
+    return target.kind === "default_branch" ? "main" : target.tail_pr ? `PR #${target.tail_pr}` : target.target?.name || "tail";
+  }
+
+  function targetSets(repo, pr) {
+    const projection = compatibilityFact(repo, pr);
+    const targets = projection?.targets ?? [];
+    return {
+      projection,
+      ready: targets.filter((target) => normalized(target.outcome) === "clean"),
+      conflicting: targets.filter((target) => normalized(target.outcome) === "conflict"),
+      unknown: targets.filter((target) => !target.outcome),
+    };
+  }
+
+  function compatibilityBadges(repo, pr) {
+    const { projection, ready, conflicting, unknown } = targetSets(repo, pr);
+    if (!projection) return badge("Compatibility unknown", "warn");
+    const rows = [];
+    if (ready.length) rows.push(badge(`Ready (${ready.map(targetLabel).join(", ")})`, "good"));
+    if (conflicting.length) rows.push(badge(`Conflicting (${conflicting.map(targetLabel).join(", ")})`, "bad"));
+    if (unknown.length || !projection.complete || projection.targets_truncated) rows.push(badge("Checking/unknown targets", "warn"));
+    return rows.join("");
+  }
+
+  function compatibilityRows(repo, pr) {
+    const { projection } = targetSets(repo, pr);
+    if (!projection) return "";
+    return `<details class="check-details"><summary>Exact target compatibility</summary><div class="check-list">${projection.targets.map((target) => {
+      const outcome = normalized(target.outcome);
+      const tone = outcome === "clean" ? "good" : outcome === "conflict" ? "bad" : "warn";
+      const paths = target.conflicting_paths?.length ? ` · ${target.conflicting_paths.join(", ")}` : "";
+      const error = target.error ? ` · ${target.error.code}: ${target.error.message}` : "";
+      return `<div class="check-row"><span>${escapeHtml(targetLabel(target))}<small>${escapeHtml(paths + error)}</small></span>${badge(target.outcome || "unknown", tone)}</div>`;
+    }).join("")}</div><p class="reason">generation ${escapeHtml(projection.generation_fingerprint)}${projection.targets_truncated ? ` · ${projection.targets_truncated} targets omitted` : ""}</p></details>`;
+  }
+
   function reasonForPr(status, pr) {
     if (pr.draft) return "Draft pull request";
     if (hasLabel(pr, "caravan-evicted")) return "Explicitly evicted; renew or rejoin after fresh validation";
@@ -254,29 +296,35 @@
     return "Open but outside a valid active caravan; inspect topology problems";
   }
 
-  function saloonClassification(status, pr) {
-    // Fresh candidate evidence wins over stale skip labels: once fixed, an
-    // unenrolled PR returns to Ready to Roll without manual UI bookkeeping.
-    if (admissionFact(status, "candidates", pr) && !pr.draft) return "ready";
+  function saloonClassification(repo, status, pr) {
+    if (admissionFact(status, "candidates", pr) && !pr.draft) {
+      const { projection, ready, conflicting, unknown } = targetSets(repo, pr);
+      if (ready.length) return "ready";
+      if (projection?.complete && conflicting.length && !unknown.length) return "conflicting";
+      return "other";
+    }
     if (hasLabel(pr, "caravan-evicted") || hasLabel(pr, "caravan-join-skipped") || admissionFact(status, "skipped", pr)) return "bounty";
     const checkStates = (pr.checks ?? []).map((check) => normalized(check.state));
     if (pr.draft || admissionFact(status, "rejected", pr) || checkStates.some((value) => value !== "success")) return "saddling";
     return "other";
   }
 
-  function saloonCard(status, pr, group, tail) {
-    const admission = group === "ready"
-      ? tail
-        ? actionButton("Join tail", "join", { pr: pr.number, tail_pr: tail, create_pr: false, reason: "Caravan dashboard canonical admission", priority_label: null }, "primary")
-        : actionButton("New caravan", "new", { pr: pr.number, create_pr: false, reason: "Caravan dashboard canonical admission", priority_label: null }, "primary")
-      : "";
+  function saloonCard(repo, status, pr, group) {
+    const { ready } = targetSets(repo, pr);
+    const admissions = group === "ready" ? ready.map((target) => target.kind === "caravan_tail"
+      ? actionButton(`Join #${target.tail_pr}`, "join", { pr: pr.number, tail_pr: target.tail_pr, create_pr: false, reason: "Caravan dashboard exact compatible admission", priority_label: null }, "primary")
+      : actionButton("New caravan", "new", { pr: pr.number, create_pr: false, reason: "Caravan dashboard exact compatible admission", priority_label: null }, "primary")).join("") : "";
+    const preflightTarget = ready.find((target) => target.tail_pr)?.tail_pr ?? (compatibilityFact(repo, pr)?.targets ?? []).find((target) => target.tail_pr)?.tail_pr;
+    const groupTone = group === "ready" ? "good" : group === "conflicting" || group === "bounty" ? "bad" : "warn";
     return `<article class="queue-card saloon-card">
-      <div class="pr-kicker">${prAnchor(pr, `PR #${pr.number}`, "pr-number")}${pr.draft ? badge("Draft") : badge(SALOON_META[group][0], group === "ready" ? "good" : group === "bounty" ? "bad" : "warn")}</div>
+      <div class="pr-kicker">${prAnchor(pr, `PR #${pr.number}`, "pr-number")}${pr.draft ? badge("Draft") : badge(SALOON_META[group][0], groupTone)}</div>
       <h3>${prAnchor(pr, pr.title || `Pull request #${pr.number}`, "pr-title-link")}</h3>
       <p><span class="mono">${escapeHtml(pr.head?.name)}@${shortOid(pr.head?.oid)}</span> → <span class="mono">${escapeHtml(pr.base?.name)}</span></p>
+      <div class="badges">${compatibilityBadges(repo, pr)}</div>
       <p class="reason">${escapeHtml(reasonForPr(status, pr))}</p>
+      ${compatibilityRows(repo, pr)}
       ${checkRows(pr.checks)}
-      <div class="card-actions">${actionButton("Preflight", "check", { pr: pr.number, ...(tail ? { tail_pr: tail } : {}) }, "", false)}${admission}</div>
+      <div class="card-actions">${actionButton("Preflight", "check", { pr: pr.number, ...(preflightTarget ? { tail_pr: preflightTarget } : {}) }, "", false)}${admissions}</div>
     </article>`;
   }
 
@@ -289,19 +337,17 @@
       ui.saloon.innerHTML = empty("The Saloon is empty");
       return;
     }
-    const firstCaravan = status?.analysis?.fleet?.caravans?.[0];
-    const tail = firstCaravan?.members?.at(-1);
     const candidateOrder = new Map((status?.admission?.candidates ?? []).map((item, index) => [item.pr, index]));
     saloon.sort((left, right) => (candidateOrder.get(left.number) ?? Number.MAX_SAFE_INTEGER) - (candidateOrder.get(right.number) ?? Number.MAX_SAFE_INTEGER) || left.number - right.number);
     const groups = Object.fromEntries(SALOON_ORDER.map((name) => [name, []]));
-    saloon.forEach((pr) => groups[saloonClassification(status, pr)].push(pr));
+    saloon.forEach((pr) => groups[saloonClassification(repo, status, pr)].push(pr));
     ui.saloon.innerHTML = SALOON_ORDER.map((name) => {
       const [title, description] = SALOON_META[name];
       const rows = groups[name];
-      const open = name === "ready" || name === "saddling";
+      const open = name === "ready" || name === "conflicting" || name === "saddling";
       return `<details class="saloon-group" data-saloon-group="${name}" ${open ? "open" : ""}>
-        <summary><span><strong>${title}</strong><small>${description}</small></span>${badge(rows.length, rows.length ? (name === "ready" ? "good" : name === "bounty" ? "bad" : "warn") : "")}</summary>
-        <div class="saloon-cards">${rows.length ? rows.map((pr) => saloonCard(status, pr, name, tail)).join("") : empty(`No PRs in ${title}`)}</div>
+        <summary><span><strong>${title}</strong><small>${description}</small></span>${badge(rows.length, rows.length ? (name === "ready" ? "good" : name === "conflicting" || name === "bounty" ? "bad" : "warn") : "")}</summary>
+        <div class="saloon-cards">${rows.length ? rows.map((pr) => saloonCard(repo, status, pr, name)).join("") : empty(`No PRs in ${title}`)}</div>
       </details>`;
     }).join("");
   }
