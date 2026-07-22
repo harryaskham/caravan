@@ -44,6 +44,9 @@ use plan::{plan_auto_admission_with_checker, plan_caravan_convergence};
 
 const MAX_SYNC_OPERATION_SECS: u64 = 3_600;
 const MAX_PARALLEL_REBASE_CHAINS: usize = 2;
+const PHYSICAL_APPLY_COMMAND_SLOTS_PER_MEMBER: u64 = 3;
+const PHYSICAL_RECONCILIATION_COMMAND_SLOTS_PER_MEMBER: u64 = 2;
+const PHYSICAL_FIXED_POST_WRITE_COMMAND_SLOTS: u64 = 2;
 const AUTO_ADMISSION_SKIP_LABEL: &str = "caravan-join-skipped";
 const AUTO_ADMISSION_SKIP_PREFIX: &str = "<!-- caravan-auto-join-skip-receipt:";
 const MAX_AUTO_ADMISSION_COMMENT_BYTES: usize = 60 * 1024;
@@ -875,6 +878,155 @@ struct PreparedChain {
     members: Vec<crate::physical_rebase::PreparedRebase>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PhysicalCommitBudget {
+    command_slots: u64,
+    required: Duration,
+    mutation_reserve: u32,
+}
+
+fn physical_commit_budget(
+    context: &AppContext,
+    status: &StatusOutput,
+    selected: &[Caravan],
+) -> PhysicalCommitBudget {
+    let member_count = selected
+        .iter()
+        .map(|caravan| u64::try_from(caravan.members.len()).unwrap_or(u64::MAX))
+        .fold(0_u64, u64::saturating_add);
+    let parallel_branch_rounds = selected
+        .chunks(MAX_PARALLEL_REBASE_CHAINS)
+        .map(|batch| {
+            batch
+                .iter()
+                .map(|caravan| u64::try_from(caravan.members.len()).unwrap_or(u64::MAX))
+                .max()
+                .unwrap_or(0)
+        })
+        .fold(0_u64, u64::saturating_add);
+    let (auto_merge_disables, force_heads) = selected
+        .iter()
+        .flat_map(|caravan| caravan.members.iter())
+        .filter_map(|number| status.analysis.pull_requests.get(number))
+        .fold((0_u64, 0_u64), |(auto_merge, force), pull_request| {
+            (
+                auto_merge + u64::from(pull_request.auto_merge.enabled),
+                force + u64::from(pull_request.has_label("caravan-force")),
+            )
+        });
+    // One remove-label mutation plus comment discovery and durable audit write.
+    let force_command_slots = force_heads.saturating_mul(3);
+    let force_mutations = force_heads.saturating_mul(2);
+    let reconciliation =
+        member_count.saturating_mul(PHYSICAL_RECONCILIATION_COMMAND_SLOTS_PER_MEMBER);
+    let command_slots = auto_merge_disables
+        .saturating_add(force_command_slots)
+        .saturating_add(
+            parallel_branch_rounds.saturating_mul(PHYSICAL_APPLY_COMMAND_SLOTS_PER_MEMBER),
+        )
+        .saturating_add(reconciliation)
+        .saturating_add(PHYSICAL_FIXED_POST_WRITE_COMMAND_SLOTS);
+    let required = Duration::from_secs(
+        context
+            .config
+            .command_timeout_secs
+            .saturating_mul(command_slots),
+    );
+    let mutation_reserve = u32::try_from(
+        auto_merge_disables
+            .saturating_add(force_mutations)
+            .saturating_add(member_count)
+            .saturating_add(reconciliation),
+    )
+    .unwrap_or(u32::MAX);
+    PhysicalCommitBudget {
+        command_slots,
+        required,
+        mutation_reserve,
+    }
+}
+
+fn physical_sync_budget_error(
+    context: &AppContext,
+    operation_deadline: Instant,
+    budget: PhysicalCommitBudget,
+    plans: &[crate::physical_rebase::RebasePlan],
+    phase: &'static str,
+) -> AppError {
+    let remaining = operation_deadline.saturating_duration_since(Instant::now());
+    let plan_material = serde_json::to_vec(plans).expect("physical plans serialize");
+    AppError::structured(
+        ErrorCategory::Validation,
+        "physical_sync_budget_insufficient",
+        "physical sync cannot enter its mutation phase without the reserved apply budget",
+        Some(json!({
+            "phase": phase,
+            "required_ms": duration_millis(budget.required),
+            "remaining_ms": duration_millis(remaining),
+            "minimum_additional_ms": duration_millis(budget.required.saturating_sub(remaining)),
+            "command_timeout_ms": context.config.command_timeout_secs.saturating_mul(1_000),
+            "required_command_slots": budget.command_slots,
+            "required_mutation_capacity": budget.mutation_reserve,
+            "prepared_plan_count": plans.len(),
+            "prepared_plan_hash": crate::membership::fnv1a64(&plan_material),
+            "provider_mutations": 0,
+            "branch_mutations": 0,
+            "retryable": false,
+            "config_guidance": "increase sync.max_duration_secs until physical planning completes with required_ms still remaining, or lower command_timeout_secs only when the provider and Git latency bound supports it; the operation deadline is never extended",
+        })),
+    )
+}
+
+fn physical_precommit_deadline(
+    context: &AppContext,
+    operation_deadline: Instant,
+    budget: PhysicalCommitBudget,
+    plans: &[crate::physical_rebase::RebasePlan],
+    phase: &'static str,
+) -> Result<Instant, AppError> {
+    let now = Instant::now();
+    let remaining = operation_deadline.saturating_duration_since(now);
+    let Some(precommit_deadline) = operation_deadline.checked_sub(budget.required) else {
+        return Err(physical_sync_budget_error(
+            context,
+            operation_deadline,
+            budget,
+            plans,
+            phase,
+        ));
+    };
+    if remaining <= budget.required || now >= precommit_deadline {
+        return Err(physical_sync_budget_error(
+            context,
+            operation_deadline,
+            budget,
+            plans,
+            phase,
+        ));
+    }
+    Ok(precommit_deadline)
+}
+
+fn physical_budget_failure(
+    context: &AppContext,
+    status: &StatusOutput,
+    operation_deadline: Instant,
+    budget: PhysicalCommitBudget,
+    plans: Vec<crate::physical_rebase::RebasePlan>,
+    phase: &'static str,
+) -> AppError {
+    let affected_prs = plans.iter().map(|plan| plan.pr).collect();
+    attach_physical_rebuild(
+        physical_sync_budget_error(context, operation_deadline, budget, &plans, phase),
+        &PhysicalRebuildOutcome {
+            repository: Some(status.repository.clone()),
+            affected_prs,
+            plans,
+            ..PhysicalRebuildOutcome::default()
+        },
+    )
+}
+
 #[derive(Default)]
 struct PhysicalRebuildOutcome {
     repository: Option<RepositoryId>,
@@ -915,7 +1067,58 @@ fn prepare_physical_chains(
         selected.iter().map(|caravan| caravan.id).collect(),
         context.config.sync.max_mutations_per_tick,
     );
-    preflight_repository(provider, status, &progress)?;
+    let commit_budget = physical_commit_budget(context, status, &selected);
+    let planning_budget = PhysicalCommitBudget {
+        command_slots: 1,
+        required: Duration::from_secs(context.config.command_timeout_secs),
+        mutation_reserve: commit_budget.mutation_reserve,
+    };
+    let planning_deadline = physical_precommit_deadline(
+        context,
+        operation_deadline,
+        planning_budget,
+        &[],
+        "physical_rebase_planning",
+    )
+    .map_err(|error| {
+        attach_physical_rebuild(
+            error,
+            &PhysicalRebuildOutcome {
+                repository: Some(status.repository.clone()),
+                ..PhysicalRebuildOutcome::default()
+            },
+        )
+    })?;
+    progress.ensure_mutation_capacity(commit_budget.mutation_reserve)?;
+    if let Err(error) = preflight_repository(provider, status, &progress) {
+        if Instant::now() >= planning_deadline {
+            return Err(physical_budget_failure(
+                context,
+                status,
+                operation_deadline,
+                planning_budget,
+                Vec::new(),
+                "physical_rebase_repository_preflight",
+            ));
+        }
+        return Err(error);
+    }
+    let mut precommit_deadline = physical_precommit_deadline(
+        context,
+        operation_deadline,
+        planning_budget,
+        &[],
+        "physical_rebase_repository_preflight",
+    )
+    .map_err(|error| {
+        attach_physical_rebuild(
+            error,
+            &PhysicalRebuildOutcome {
+                repository: Some(status.repository.clone()),
+                ..PhysicalRebuildOutcome::default()
+            },
+        )
+    })?;
     validate_rebase_preflight_graph(status, &selected, &progress, context.config.force_merge)?;
     let timeout = Duration::from_secs(context.config.command_timeout_secs);
     let mut chains = Vec::with_capacity(selected.len());
@@ -945,9 +1148,12 @@ fn prepare_physical_chains(
                     },
                 )
             } else {
-                crate::physical_rebase::PlannedRangeBase::RemoteBranch {
-                    branch: candidate.base.clone(),
-                }
+                let parent = status
+                    .analysis
+                    .pull_requests
+                    .get(&caravan.members[index - 1])
+                    .expect("selected parent has provider facts");
+                crate::physical_rebase::range_base_for_rewritten_parent(candidate, &parent.head)
             };
             let prepared = match crate::physical_rebase::prepare_candidate(
                 &context.repository_path,
@@ -957,7 +1163,7 @@ fn prepare_physical_chains(
                 target,
                 &status.analysis.fleet.default_branch,
                 crate::physical_rebase::RebaseExecutionBudget::new(timeout)
-                    .with_deadline(operation_deadline),
+                    .with_deadline(precommit_deadline),
             ) {
                 Ok(prepared) => prepared,
                 Err(error) => {
@@ -970,7 +1176,17 @@ fn prepare_physical_chains(
                             .chain(members.iter().map(
                                 |item: &crate::physical_rebase::PreparedRebase| item.plan.clone(),
                             ))
-                            .collect();
+                            .collect::<Vec<_>>();
+                    if Instant::now() >= precommit_deadline {
+                        return Err(physical_budget_failure(
+                            context,
+                            status,
+                            operation_deadline,
+                            planning_budget,
+                            plans,
+                            "physical_rebase_planning",
+                        ));
+                    }
                     return Err(attach_physical_rebuild(
                         error,
                         &PhysicalRebuildOutcome {
@@ -992,13 +1208,40 @@ fn prepare_physical_chains(
         }
         chains.push(PreparedChain { caravan, members });
     }
+    let plans = chains
+        .iter()
+        .flat_map(|chain| chain.members.iter().map(|item| item.plan.clone()))
+        .collect::<Vec<_>>();
+    precommit_deadline = physical_precommit_deadline(
+        context,
+        operation_deadline,
+        commit_budget,
+        &plans,
+        "physical_rebase_global_write_barrier",
+    )
+    .map_err(|_| {
+        physical_budget_failure(
+            context,
+            status,
+            operation_deadline,
+            commit_budget,
+            plans.clone(),
+            "physical_rebase_global_write_barrier",
+        )
+    })?;
     if let Err(error) =
-        verify_physical_write_barrier(context, status, provider, &chains, operation_deadline)
+        verify_physical_write_barrier(context, status, provider, &chains, Some(precommit_deadline))
     {
-        let plans: Vec<crate::physical_rebase::RebasePlan> = chains
-            .iter()
-            .flat_map(|chain| chain.members.iter().map(|item| item.plan.clone()))
-            .collect();
+        if Instant::now() >= precommit_deadline {
+            return Err(physical_budget_failure(
+                context,
+                status,
+                operation_deadline,
+                commit_budget,
+                plans,
+                "physical_rebase_global_write_barrier",
+            ));
+        }
         return Err(attach_physical_rebuild(
             error,
             &PhysicalRebuildOutcome {
@@ -1012,6 +1255,23 @@ fn prepare_physical_chains(
             },
         ));
     }
+    physical_precommit_deadline(
+        context,
+        operation_deadline,
+        commit_budget,
+        &plans,
+        "physical_rebase_commit_admission",
+    )
+    .map_err(|_| {
+        physical_budget_failure(
+            context,
+            status,
+            operation_deadline,
+            commit_budget,
+            plans,
+            "physical_rebase_commit_admission",
+        )
+    })?;
     Ok((chains, progress))
 }
 
@@ -1064,13 +1324,14 @@ fn verify_physical_write_barrier(
     status: &StatusOutput,
     provider: &impl SyncProvider,
     chains: &[PreparedChain],
-    _operation_deadline: Instant,
+    phase_deadline: Option<Instant>,
 ) -> Result<(), AppError> {
     let timeout = Duration::from_secs(context.config.command_timeout_secs);
-    crate::physical_rebase::verify_branch_snapshot(
+    crate::physical_rebase::verify_branch_snapshot_before(
         &context.repository_path,
         &status.analysis.fleet.default_branch,
         timeout,
+        phase_deadline,
     )?;
     let mut branches = BTreeSet::new();
     for chain in chains {
@@ -1105,7 +1366,7 @@ fn verify_physical_write_barrier(
                         Some(prepared.plan.pr),
                     )
                 })?;
-            crate::physical_rebase::verify_prepared(prepared)?;
+            crate::physical_rebase::verify_prepared_before(prepared, phase_deadline)?;
         }
     }
     Ok(())
@@ -1177,6 +1438,7 @@ fn apply_physical_chains(
     provider: &impl SyncProvider,
     chains: &[PreparedChain],
     mut progress: SyncProgress,
+    lock: &mut OperationLock,
 ) -> Result<PhysicalRebuildOutcome, AppError> {
     let plans = chains
         .iter()
@@ -1217,6 +1479,31 @@ fn apply_physical_chains(
         .provider_receipts
         .clone_from(&progress.provider_receipts);
     outcome.steps.clone_from(&progress.steps);
+    let control_checkpoint = json!({
+        "rebase_plans": checkpoint_rebase_plans(&outcome.plans),
+        "provider_receipts": checkpoint_provider_receipts(&outcome.provider_receipts),
+        "completed_steps": bounded_checkpoint_sequence(
+            outcome
+                .steps
+                .iter()
+                .map(|step| serde_json::to_value(step).expect("mutation step serializes"))
+                .collect(),
+        ),
+        "branch_writes": 0,
+        "next": "apply retained objects under the exact globally verified leases",
+    });
+    lock.checkpoint(
+        "physical_rebase_control_mutations_complete",
+        control_checkpoint.clone(),
+        false,
+    )
+    .map_err(|error| attach_physical_rebuild(error, &outcome))?;
+    lock.checkpoint(
+        "physical_rebase_branch_apply_in_flight",
+        control_checkpoint,
+        true,
+    )
+    .map_err(|error| attach_physical_rebuild(error, &outcome))?;
     for batch in chains.chunks(MAX_PARALLEL_REBASE_CHAINS) {
         let results = std::thread::scope(|scope| {
             batch
@@ -1296,7 +1583,7 @@ fn apply_prepared_chain(
 ) -> (Vec<crate::physical_rebase::RebaseReceipt>, Option<AppError>) {
     let mut receipts = Vec::with_capacity(chain.members.len());
     for prepared in &chain.members {
-        match crate::physical_rebase::apply_prepared(prepared) {
+        match crate::physical_rebase::apply_prepared_after_write_barrier(prepared) {
             Ok(receipt) => receipts.push(receipt),
             Err(error) => return (receipts, Some(error)),
         }
@@ -1327,6 +1614,8 @@ fn attach_physical_rebuild(error: AppError, outcome: &PhysicalRebuildOutcome) ->
                 | "rebase_target_history_changed"
                 | "rebase_repository_not_owned"
                 | "rebase_historical_target_mismatch"
+                | "rebase_historical_parent_mismatch"
+                | "rebase_historical_source_mismatch"
                 | "rebase_unsupported_octopus"
                 | "rebase_topology_limit"
                 | "rebase_external_merge_parents"
@@ -1336,10 +1625,13 @@ fn attach_physical_rebuild(error: AppError, outcome: &PhysicalRebuildOutcome) ->
                 | "rebase_merge_tree_mismatch"
                 | "rebase_topology_changed"
         );
+        let configuration_decision = error.code() == "physical_sync_budget_insufficient";
         object.insert(
             "next".to_owned(),
             json!(if deterministic_history_decision {
                 "the unchanged exact generation cannot succeed by retry: inspect the reported topology and explicitly repair/reshape/evict, use an audited merge-preserving strategy, or change the candidate head before rerunning"
+            } else if configuration_decision {
+                "increase sync.max_duration_secs enough to retain required_ms after planning (or lower a proven-safe child timeout), then rerun the unchanged command"
             } else {
                 "rediscover provider state and rerun `cara sync --all`"
             }),
@@ -1353,6 +1645,16 @@ fn attach_physical_rebuild(error: AppError, outcome: &PhysicalRebuildOutcome) ->
                     "repair, reshape, or evict the affected PR through a reviewed first-party operation",
                     "use an explicit audited merge-preserving rewrite strategy when available",
                     "rerun only after the candidate head, target generation, config, or supported strategy changes"
+                ]),
+            );
+        } else if configuration_decision {
+            object.insert("retryable".to_owned(), json!(false));
+            object.insert(
+                "suggested_actions".to_owned(),
+                json!([
+                    "increase sync.max_duration_secs above observed planning time plus required_ms",
+                    "lower command_timeout_secs only with a proven provider and Git latency bound",
+                    "rerun plan sync before allowing any mutation"
                 ]),
             );
         }
@@ -1453,7 +1755,37 @@ fn sync_with_lock(
         )?;
         let mut progress = progress;
         invalidate_rewritten_force_intents(&status, &provider, &plans, &mut progress)?;
-        physical_rebuild = apply_physical_chains(&status, &provider, &prepared, progress)?;
+        lock.checkpoint(
+            "physical_rebase_force_intents_invalidated",
+            json!({
+                "rebase_plans": checkpoint_rebase_plans(&plans),
+                "provider_receipts": checkpoint_provider_receipts(&progress.provider_receipts),
+                "completed_steps": bounded_checkpoint_sequence(
+                    progress
+                        .steps
+                        .iter()
+                        .map(|step| serde_json::to_value(step).expect("mutation step serializes"))
+                        .collect(),
+                ),
+                "branch_writes": 0,
+            }),
+            false,
+        )
+        .map_err(|error| {
+            attach_physical_rebuild(
+                error,
+                &PhysicalRebuildOutcome {
+                    repository: Some(status.repository.clone()),
+                    affected_prs: plans.iter().map(|plan| plan.pr).collect(),
+                    plans: plans.clone(),
+                    provider_receipts: progress.provider_receipts.clone(),
+                    steps: progress.steps.clone(),
+                    ..PhysicalRebuildOutcome::default()
+                },
+            )
+        })?;
+        physical_rebuild =
+            apply_physical_chains(&status, &provider, &prepared, progress, &mut lock)?;
         lock.checkpoint(
             "physical_rebase_applied",
             json!({

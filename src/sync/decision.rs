@@ -229,6 +229,8 @@ pub(super) fn scheduler_failure_status(error: &AppError) -> SyncFailureScheduler
                 | "rebase_target_history_changed"
                 | "rebase_repository_not_owned"
                 | "rebase_historical_target_mismatch"
+                | "rebase_historical_parent_mismatch"
+                | "rebase_historical_source_mismatch"
                 | "rebase_unsupported_octopus"
                 | "rebase_topology_limit"
                 | "rebase_external_merge_parents"
@@ -253,6 +255,7 @@ pub(super) fn scheduler_failure_status(error: &AppError) -> SyncFailureScheduler
         None if matches!(
             error_code.as_str(),
             "default_branch_not_protected"
+                | "physical_sync_budget_insufficient"
                 | "rebase_ci_trigger_missing"
                 | "repository_not_initialized"
                 | "unsafe_checkout"

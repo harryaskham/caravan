@@ -72,6 +72,13 @@ pub enum PlannedRangeBase {
         branch: BranchSnapshot,
         current: BranchSnapshot,
     },
+    /// Provider-retained old child base while the named parent branch has
+    /// already advanced and will itself be rewritten to `new_base` in the same
+    /// globally verified physical-sync batch.
+    HistoricalParentBranch {
+        branch: BranchSnapshot,
+        current: BranchSnapshot,
+    },
     /// Retained source boundary from an older configured-default generation.
     /// `current` proves the named default ref advanced while the source-only
     /// patch remains anchored at `branch`.
@@ -90,6 +97,7 @@ impl PlannedRangeBase {
         match self {
             Self::RemoteBranch { branch }
             | Self::HistoricalTargetBranch { branch, .. }
+            | Self::HistoricalParentBranch { branch, .. }
             | Self::HistoricalSourceBranch { branch, .. }
             | Self::PullRequestHead { branch, .. } => branch,
         }
@@ -111,6 +119,25 @@ pub fn range_base_for_remote_target(
         PlannedRangeBase::HistoricalTargetBranch {
             branch: candidate.base.clone(),
             current: target.clone(),
+        }
+    } else {
+        PlannedRangeBase::RemoteBranch {
+            branch: candidate.base.clone(),
+        }
+    }
+}
+
+/// Select a retained child range when GitHub's `BaseRefOid` lags the exact
+/// current parent head which this same physical batch will rewrite.
+#[must_use]
+pub fn range_base_for_rewritten_parent(
+    candidate: &PullRequestSnapshot,
+    current_parent: &BranchSnapshot,
+) -> PlannedRangeBase {
+    if candidate.base.name == current_parent.name && candidate.base.oid != current_parent.oid {
+        PlannedRangeBase::HistoricalParentBranch {
+            branch: candidate.base.clone(),
+            current: current_parent.clone(),
         }
     } else {
         PlannedRangeBase::RemoteBranch {
@@ -261,6 +288,18 @@ pub fn prepare_candidate(
             json!({"pr": candidate.number, "historical_target": current, "target": target, "resumable": true}),
         ));
     }
+    if let PlannedRangeBase::HistoricalParentBranch { branch, current } = &range_source
+        && (branch.name != current.name
+            || current.name != target.name
+            || current.repository != *repository
+            || !matches!(&new_base, PlannedBase::Simulated(_)))
+    {
+        return Err(decision(
+            "rebase_historical_parent_mismatch",
+            "historical child range must bind the exact current parent branch selected for same-batch rewrite",
+            json!({"pr": candidate.number, "historical_parent": current, "target": target, "resumable": true}),
+        ));
+    }
     if let PlannedRangeBase::HistoricalSourceBranch { current, .. } = &range_source
         && (current != workflow_source || current.repository != *repository)
     {
@@ -310,6 +349,10 @@ pub fn prepare_candidate(
         PlannedRangeBase::RemoteBranch { branch } => fetch_exact(&runner, "origin", branch)?,
         PlannedRangeBase::HistoricalTargetBranch { branch, current }
         | PlannedRangeBase::HistoricalSourceBranch { branch, current } => {
+            retain_historical_target_base(&runner, branch, current)?;
+        }
+        PlannedRangeBase::HistoricalParentBranch { branch, current } => {
+            fetch_exact(&runner, "origin", current)?;
             retain_historical_target_base(&runner, branch, current)?;
         }
         PlannedRangeBase::PullRequestHead { pr, branch } => {
@@ -754,10 +797,23 @@ fn build_merge_topology_proof(
 
 /// Recheck the exact planned object, remote old head, permission, and lease without writing.
 pub fn verify_prepared(prepared: &PreparedRebase) -> Result<(), AppError> {
+    verify_prepared_before(prepared, prepared.worktree.operation_deadline)
+}
+
+/// Run final no-write verification under an earlier phase boundary so it
+/// cannot consume wall-clock time reserved for commit/apply.
+pub(crate) fn verify_prepared_before(
+    prepared: &PreparedRebase,
+    phase_deadline: Option<Instant>,
+) -> Result<(), AppError> {
+    let operation_deadline = match (prepared.worktree.operation_deadline, phase_deadline) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (left, right) => left.or(right),
+    };
     let runner = process_runner(
         &prepared.worktree.path,
         prepared.worktree.timeout,
-        prepared.worktree.operation_deadline,
+        operation_deadline,
     );
     let retained_head = rev_parse(&runner, "HEAD")?;
     if retained_head != prepared.plan.new_head_oid {
@@ -782,6 +838,10 @@ pub fn verify_prepared(prepared: &PreparedRebase) -> Result<(), AppError> {
         PlannedRangeBase::RemoteBranch { .. } => {}
         PlannedRangeBase::HistoricalTargetBranch { branch, current }
         | PlannedRangeBase::HistoricalSourceBranch { branch, current } => {
+            retain_historical_target_base(&runner, branch, current)?;
+        }
+        PlannedRangeBase::HistoricalParentBranch { branch, current } => {
+            fetch_exact(&runner, "origin", current)?;
             retain_historical_target_base(&runner, branch, current)?;
         }
         PlannedRangeBase::PullRequestHead { pr, branch } => {
@@ -817,6 +877,45 @@ pub fn apply_prepared(prepared: &PreparedRebase) -> Result<RebaseReceipt, AppErr
             verify_remote_head(&runner, "origin", &target.name, &target.oid)?;
         }
     }
+    push_prepared(prepared)
+}
+
+/// Apply after sync's global write barrier. Revalidate source/range/target
+/// generations, but do not repeat the expensive permission dry-run after
+/// control mutation: the exact force-with-lease push is the writer-race gate.
+pub(crate) fn apply_prepared_after_write_barrier(
+    prepared: &PreparedRebase,
+) -> Result<RebaseReceipt, AppError> {
+    let runner = process_runner(
+        &prepared.worktree.path,
+        prepared.worktree.timeout,
+        prepared.worktree.operation_deadline,
+    );
+    match &prepared.plan.range_source {
+        PlannedRangeBase::RemoteBranch { branch }
+            if matches!(&prepared.plan.new_base, PlannedBase::Remote(_)) =>
+        {
+            verify_remote_head(&runner, "origin", &branch.name, &branch.oid)?;
+        }
+        PlannedRangeBase::RemoteBranch { .. } => {}
+        PlannedRangeBase::HistoricalTargetBranch { branch, current }
+        | PlannedRangeBase::HistoricalParentBranch { branch, current }
+        | PlannedRangeBase::HistoricalSourceBranch { branch, current } => {
+            retain_historical_target_base(&runner, branch, current)?;
+        }
+        PlannedRangeBase::PullRequestHead { pr, branch } => {
+            fetch_exact_pull_request_head(&runner, "origin", *pr, branch)?;
+        }
+    }
+    match &prepared.plan.new_base {
+        PlannedBase::Remote(target) | PlannedBase::Simulated(target) => {
+            verify_remote_head(&runner, "origin", &target.name, &target.oid)?;
+        }
+    }
+    push_prepared(prepared)
+}
+
+fn push_prepared(prepared: &PreparedRebase) -> Result<RebaseReceipt, AppError> {
     if !prepared.plan.already_satisfied {
         let runner = process_runner(
             &prepared.worktree.path,
@@ -951,9 +1050,18 @@ pub fn verify_branch_snapshot(
     snapshot: &BranchSnapshot,
     timeout: Duration,
 ) -> Result<(), AppError> {
+    verify_branch_snapshot_before(repository_path, snapshot, timeout, None)
+}
+
+pub(crate) fn verify_branch_snapshot_before(
+    repository_path: &Path,
+    snapshot: &BranchSnapshot,
+    timeout: Duration,
+    phase_deadline: Option<Instant>,
+) -> Result<(), AppError> {
     validate_branch(&snapshot.name)?;
     validate_oid(&snapshot.oid)?;
-    let runner = ProcessRunner::in_directory(repository_path).with_timeout(timeout);
+    let runner = process_runner(repository_path, timeout, phase_deadline);
     verify_remote_head(&runner, "origin", &snapshot.name, &snapshot.oid)
 }
 
@@ -1815,6 +1923,110 @@ mod tests {
     }
 
     #[test]
+    fn child_provider_base_lag_uses_retained_historical_parent_generation() {
+        let fixture = fixture();
+        git(&fixture.clone, &["checkout", "feature"]);
+        git(&fixture.clone, &["checkout", "-b", "child"]);
+        std::fs::write(fixture.clone.join("child-lag"), "child\n").unwrap();
+        git(&fixture.clone, &["add", "child-lag"]);
+        git(&fixture.clone, &["commit", "-m", "child"]);
+        let child_head = CommitOid(git(&fixture.clone, &["rev-parse", "HEAD"]));
+        git(&fixture.clone, &["push", "-u", "origin", "child"]);
+
+        git(&fixture.clone, &["checkout", "feature"]);
+        std::fs::write(fixture.clone.join("late-parent"), "late parent\n").unwrap();
+        git(&fixture.clone, &["add", "late-parent"]);
+        git(&fixture.clone, &["commit", "-m", "late parent"]);
+        let current_parent = CommitOid(git(&fixture.clone, &["rev-parse", "HEAD"]));
+        git(&fixture.clone, &["push", "origin", "feature"]);
+
+        let parent = PullRequestSnapshot {
+            number: PrNumber(7),
+            title: "parent".to_owned(),
+            url: "https://example.invalid/7".to_owned(),
+            state: PullRequestState::Open,
+            draft: false,
+            head: branch(&fixture.repository, "feature", &current_parent),
+            base: branch(&fixture.repository, "main", &fixture.old_main),
+            cross_repository: false,
+            labels: BTreeSet::new(),
+            auto_merge: AutoMergeState::disabled(),
+            checks: Vec::new(),
+            created_at: None,
+            merged_at: None,
+            updated_at: None,
+        };
+        let child = PullRequestSnapshot {
+            number: PrNumber(8),
+            title: "child".to_owned(),
+            url: "https://example.invalid/8".to_owned(),
+            state: PullRequestState::Open,
+            draft: false,
+            head: branch(&fixture.repository, "child", &child_head),
+            // GitHub can retain the old exact BaseRefOid briefly after the
+            // named parent branch already advertises `current_parent`.
+            base: branch(&fixture.repository, "feature", &fixture.feature),
+            cross_repository: false,
+            labels: BTreeSet::new(),
+            auto_merge: AutoMergeState::disabled(),
+            checks: Vec::new(),
+            created_at: None,
+            merged_at: None,
+            updated_at: None,
+        };
+        let default = branch(&fixture.repository, "main", &fixture.new_main);
+        let prepared_parent = prepare_candidate(
+            &fixture.clone,
+            &fixture.repository,
+            &parent,
+            range_base_for_remote_target(&parent, &default),
+            PlannedBase::Remote(default.clone()),
+            &default,
+            RebaseExecutionBudget::new(Duration::from_secs(60)),
+        )
+        .expect("current parent plan");
+        let planned_parent = branch(
+            &fixture.repository,
+            "feature",
+            &prepared_parent.plan.new_head_oid,
+        );
+        let range_source = range_base_for_rewritten_parent(&child, &parent.head);
+        assert!(matches!(
+            &range_source,
+            PlannedRangeBase::HistoricalParentBranch { branch, current }
+                if branch.oid == fixture.feature && current.oid == current_parent
+        ));
+        let prepared_child = prepare_candidate(
+            &fixture.clone,
+            &fixture.repository,
+            &child,
+            range_source,
+            PlannedBase::Simulated(planned_parent),
+            &default,
+            RebaseExecutionBudget::new(Duration::from_secs(60)),
+        )
+        .expect("old provider BaseRefOid remains an exact historical range boundary");
+
+        verify_prepared(&prepared_parent).expect("parent global preflight");
+        verify_prepared(&prepared_child).expect("child historical-parent preflight");
+        let parent_receipt =
+            apply_prepared_after_write_barrier(&prepared_parent).expect("parent exact lease");
+        let child_receipt =
+            apply_prepared_after_write_barrier(&prepared_child).expect("child exact lease");
+        let status = std::process::Command::new("git")
+            .current_dir(&fixture.clone)
+            .args([
+                "merge-base",
+                "--is-ancestor",
+                parent_receipt.new_head_oid.0.as_str(),
+                child_receipt.new_head_oid.0.as_str(),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
     fn rejects_octopus_candidate_topology_before_remote_write() {
         let fixture = fixture();
         git(&fixture.clone, &["checkout", "-b", "side-one"]);
@@ -2280,13 +2492,15 @@ mod tests {
             RebaseExecutionBudget::new(Duration::from_secs(10)),
         )
         .unwrap();
+        verify_prepared(&prepared).expect("global barrier");
         std::fs::write(fixture.clone.join("external-race"), "race\n").unwrap();
         git(&fixture.clone, &["add", "external-race"]);
         git(&fixture.clone, &["commit", "-m", "external race"]);
         let external = CommitOid(git(&fixture.clone, &["rev-parse", "HEAD"]));
         git(&fixture.clone, &["push", "origin", "feature"]);
 
-        let error = apply_prepared(&prepared).expect_err("lease race must fail");
+        let error = apply_prepared_after_write_barrier(&prepared)
+            .expect_err("exact apply lease must detect the post-barrier writer race");
 
         assert_eq!(mcp_cli::StructuredError::code(&error), "rebase_stale_lease");
         assert!(
@@ -2295,6 +2509,55 @@ mod tests {
                 &["ls-remote", "origin", "refs/heads/feature"]
             )
             .starts_with(&external.0)
+        );
+    }
+
+    #[test]
+    fn barrier_apply_revalidates_moved_default_before_branch_push() {
+        let fixture = fixture();
+        let candidate = PullRequestSnapshot {
+            number: PrNumber(7),
+            title: "candidate".to_owned(),
+            url: "https://example.invalid/7".to_owned(),
+            state: PullRequestState::Open,
+            draft: false,
+            head: branch(&fixture.repository, "feature", &fixture.feature),
+            base: branch(&fixture.repository, "main", &fixture.new_main),
+            cross_repository: false,
+            labels: BTreeSet::new(),
+            auto_merge: AutoMergeState::disabled(),
+            checks: Vec::new(),
+            created_at: None,
+            merged_at: None,
+            updated_at: None,
+        };
+        let prepared = prepare_candidate(
+            &fixture.clone,
+            &fixture.repository,
+            &candidate,
+            remote_range(&candidate),
+            PlannedBase::Remote(branch(&fixture.repository, "main", &fixture.new_main)),
+            &branch(&fixture.repository, "main", &fixture.new_main),
+            RebaseExecutionBudget::new(Duration::from_secs(10)),
+        )
+        .unwrap();
+        verify_prepared(&prepared).expect("global barrier");
+        git(&fixture.clone, &["checkout", "main"]);
+        std::fs::write(fixture.clone.join("late-main"), "late main\n").unwrap();
+        git(&fixture.clone, &["add", "late-main"]);
+        git(&fixture.clone, &["commit", "-m", "late main"]);
+        git(&fixture.clone, &["push", "origin", "main"]);
+
+        let error = apply_prepared_after_write_barrier(&prepared)
+            .expect_err("moved default must stop before candidate push");
+
+        assert_eq!(mcp_cli::StructuredError::code(&error), "rebase_stale_lease");
+        assert!(
+            git(
+                &fixture.clone,
+                &["ls-remote", "origin", "refs/heads/feature"]
+            )
+            .starts_with(&fixture.feature.0)
         );
     }
 

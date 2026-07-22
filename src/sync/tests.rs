@@ -1249,6 +1249,8 @@ fn unsupported_exact_range_shapes_are_never_retry_ticks() {
         "rebase_target_history_changed",
         "rebase_repository_not_owned",
         "rebase_historical_target_mismatch",
+        "rebase_historical_parent_mismatch",
+        "rebase_historical_source_mismatch",
         "rebase_unsupported_octopus",
         "rebase_topology_limit",
         "rebase_external_merge_parents",
@@ -2139,6 +2141,115 @@ fn whole_sync_budget_uses_the_explicit_validated_wall_clock_bound() {
     assert_eq!(sync_operation_budget(&context), Duration::from_secs(10));
     context.config.sync.max_duration_secs = 3_600;
     assert_eq!(sync_operation_budget(&context), Duration::from_secs(3_600));
+}
+
+#[test]
+fn physical_commit_budget_scales_with_chain_and_fails_before_any_write() {
+    let mut pulls = healthy_chain();
+    pulls.truncate(2);
+    let status = status(pulls.clone(), Some(PrNumber(1)), &clean);
+    let provider = FakeProvider::with_pull_requests(pulls);
+    let selected = status.analysis.fleet.caravans.clone();
+    let mut context = AppContext::default();
+    context.config.command_timeout_secs = 10;
+    let budget = physical_commit_budget(&context, &status, &selected);
+    assert_eq!(budget.command_slots, 13);
+    assert_eq!(budget.required, Duration::from_secs(130));
+    assert_eq!(budget.mutation_reserve, 7);
+    let plan = crate::physical_rebase::RebasePlan {
+        pr: PrNumber(1),
+        branch: "one".to_owned(),
+        old_head_oid: branch("one").oid,
+        old_base_oid: branch("main").oid.clone(),
+        range_source: crate::physical_rebase::PlannedRangeBase::RemoteBranch {
+            branch: branch("main"),
+        },
+        new_base: crate::physical_rebase::PlannedBase::Remote(branch("main")),
+        new_head_oid: CommitOid("rewritten0000000000000000000000000000000".to_owned()),
+        new_tree_oid: CommitOid("tree000000000000000000000000000000000000".to_owned()),
+        commit_count: 1,
+        merge_topology: None,
+        ci_trigger_workflows: vec!["CI".to_owned()],
+        lease: "--force-with-lease=refs/heads/one:one".to_owned(),
+        already_satisfied: false,
+    };
+
+    let plans = vec![plan];
+    let operation_deadline = Instant::now() + Duration::from_secs(129);
+    physical_precommit_deadline(
+        &context,
+        operation_deadline,
+        budget,
+        &plans,
+        "physical_rebase_commit_admission",
+    )
+    .expect_err("the complete apply reserve must remain before commitment");
+    let error = physical_budget_failure(
+        &context,
+        &status,
+        operation_deadline,
+        budget,
+        plans,
+        "physical_rebase_commit_admission",
+    );
+
+    assert_eq!(error.code(), "physical_sync_budget_insufficient");
+    let details = error.details().expect("budget evidence");
+    assert_eq!(details["required_ms"], 130_000);
+    assert_eq!(details["prepared_plan_count"], 1);
+    assert!(
+        details["prepared_plan_hash"]
+            .as_str()
+            .unwrap()
+            .starts_with("fnv1a64:")
+    );
+    assert_eq!(details["provider_mutations"], 0);
+    assert_eq!(details["branch_mutations"], 0);
+    assert_eq!(details["rebase_plans"].as_array().unwrap().len(), 1);
+    assert!(
+        details["next"]
+            .as_str()
+            .unwrap()
+            .contains("increase sync.max_duration_secs")
+    );
+    assert_eq!(details["retryable"], false);
+    assert!(provider.calls.borrow().is_empty());
+    let scheduler = scheduler_failure_status(&error);
+    assert_eq!(scheduler.disposition, SchedulerDisposition::OperatorAction);
+    assert_eq!(scheduler.wake_class, SchedulerWakeClass::OperatorAction);
+    assert!(!scheduler.retryable);
+
+    physical_precommit_deadline(
+        &context,
+        Instant::now() + Duration::from_secs(131),
+        budget,
+        &[],
+        "physical_rebase_planning",
+    )
+    .expect("sufficient whole-tick budget retains a planning phase");
+}
+
+#[test]
+fn command_timeout_longer_than_tick_cannot_enter_physical_mutation() {
+    let mut pulls = healthy_chain();
+    pulls.truncate(1);
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+    let mut context = AppContext::default();
+    context.config.command_timeout_secs = 300;
+    context.config.sync.max_duration_secs = 120;
+    let budget = physical_commit_budget(&context, &status, &status.analysis.fleet.caravans);
+
+    let error = physical_precommit_deadline(
+        &context,
+        Instant::now() + sync_operation_budget(&context),
+        budget,
+        &[],
+        "physical_rebase_planning",
+    )
+    .expect_err("a child timeout cannot exceed the mutation-phase reserve");
+
+    assert_eq!(error.code(), "physical_sync_budget_insufficient");
+    assert!(error.details().unwrap()["required_ms"].as_u64().unwrap() > 120_000);
 }
 
 #[test]

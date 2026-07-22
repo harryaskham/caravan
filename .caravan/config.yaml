@@ -8,6 +8,10 @@ agent_priority_labels:
   - caravan-priority:normal
   - caravan-priority:low
 command_timeout_secs: 30
+# Physical-chain planning preserves a conservative N-member apply reserve
+# inside this one absolute deadline before any provider or branch mutation.
+sync:
+  max_duration_secs: 900
 repair:
   materialization_timeout_secs: 180
 loop:

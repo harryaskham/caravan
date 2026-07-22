@@ -405,6 +405,11 @@ hooks:
     blocking: false
 ```
 
+When enabling cumulative mode, set `sync.max_duration_secs` high enough for
+physical planning plus the typed N-member apply reserve; this repository uses
+900 seconds. `cara plan sync --all` reports the exact required/remaining budget
+without mutation when the configured bound is too small.
+
 Cumulative mode rejects fork heads, stale leases, and ambiguous ranges. Before
 `join` creates/updates a PR, rewrites a branch, or changes membership, the
 selected caravan root must target the exact current default generation; a stale
@@ -432,12 +437,20 @@ caravan head-to-tail, feeding each retained planned
 head into its child. It materializes each generation exactly once in a retained
 detached worktree, then verifies every conflict, PR precondition, remote head,
 dry-run permission, and exact lease across the complete plan before the first
-write. Only independent, disjoint caravans apply concurrently (at most two);
-each caravan remains strictly parent-to-descendant. Apply revalidates the
-source/range branch, current default, source head, selected tail, result tree,
-and root provider precondition before any branch push. Successful join receipts
-and durable `join_failed` journal events retain source/target/result evidence
-and every completed provider mutation. Pushes use only
+write. Planning and final no-write verification stop at a precommit deadline
+which preserves an N-member apply reserve inside the one configured operation
+deadline. `physical_sync_budget_insufficient` reports required/remaining time,
+partial-or-complete plan count/hash, zero writes, and configuration guidance.
+Only independent, disjoint caravans apply concurrently (at most two); each
+caravan remains strictly parent-to-descendant. Confirmed control mutations are
+checkpointed before branch apply. Apply revalidates the source/range branch,
+current default, selected tail, result tree, and root provider precondition,
+then lets the exact force-with-lease push detect source-head movement without a
+redundant post-mutation dry-run. A child provider base OID that lags an
+already-advanced parent branch is accepted only as an explicit retained
+ancestor range. Successful join receipts and durable `join_failed` journal
+events retain source/target/result evidence and every completed provider
+mutation. Pushes use only
 `--force-with-lease=refs/heads/<branch>:<old-oid>`. A mandatory midpoint GitHub
 rediscovery verifies every new head and replaces stale CI facts before normal
 sync convergence. Errors preserve exact plan, completed-prefix, provider, and

@@ -456,11 +456,27 @@ retained, simulated new head of its parent. Rebase objects are materialized once
 and retained through apply; they are never recomputed. Every edge conflict,
 workflow trigger, PR precondition, remote old head, branch-set disjointness,
 dry-run permission, and exact lease is verified globally before provider or
-branch writes. Apply revalidates remote source/range/current-default generations,
-source-head lease, selected tail, root provider precondition, and result tree. Auto-merge is disabled for all selected members only after that
-barrier. Independent caravans may apply with bounded parallelism; each chain is
-strictly parent-to-descendant. A mandatory midpoint rediscovery verifies every
-new head and refreshes invalidated CI before ordinary sync policy runs.
+branch writes. Planning and this no-write barrier share a precommit deadline
+which is the one operation deadline minus a conservative apply reserve. The
+reserve scales with selected members, serial control mutations, bounded
+parallel branch-write rounds, midpoint/final discovery, and base/CI
+reconciliation at `command_timeout_secs`. If that reserve cannot remain, both
+`sync` and `plan sync` return `physical_sync_budget_insufficient` with
+required/remaining milliseconds, complete-or-partial plan count/hash, zero
+provider/branch mutations, and configuration guidance; the absolute deadline
+is never extended and unchanged exhaustion is not a retry tick. Auto-merge is
+disabled only after that barrier, and a durable lock checkpoint records the
+confirmed control receipts before any branch write. Apply revalidates remote
+source/range/current-default generations, selected tail, root provider
+precondition, and result tree, but uses the retained object's exact
+force-with-lease as the source-head writer-race gate instead of repeating a slow
+permission dry-run after irreversible control mutation. Independent caravans
+may apply with bounded parallelism; each chain is strictly parent-to-descendant.
+A child provider `BaseRefOid` which still names an ancestor of its
+already-advanced parent branch is retained as an explicit historical range
+boundary; a non-descendant or changed exact head remains a true race. A
+mandatory midpoint rediscovery verifies every new head and refreshes invalidated
+CI before ordinary sync policy runs.
 
 A moved branch, unsupported merge topology, ambiguous range, conflict, tree or
 topology mismatch, or apply-time lease race is a typed resumable decision and
