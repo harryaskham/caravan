@@ -431,10 +431,12 @@ PR creation/update, branch rewrite, or membership mutation, a selected join
 root must target the exact current default OID; otherwise `join_root_stale_default`
 returns zero-write sync guidance. Join source provenance binds repository,
 branch, head, one source/default merge-base parent, source tree, binary-patch
-fingerprint/title, exact selected tail, and independent expected result tree.
+fingerprint/title, stable per-commit patch classification, exact selected tail,
+and independent expected result tree. `git cherry` identity and an effective
+merge-tree/diff against exact current main remove patches already represented
+there under different commit OIDs; mixed ranges replay only unique commits.
 Changes already on current main but absent from an older source parent are
-subtracted from the source-only patch rather than replayed into the child. An
-empty source-only patch is `join_empty_source_noop`, with a complete receipt and
+subtracted rather than replayed into the child. An empty effective patch is `join_empty_source_noop`, with a complete receipt and
 zero provider mutation. Linear ranges use the ordinary sequencer. Owned nonlinear ranges use an explicit
 two-parent merge-preserving strategy: commits reachable only from the candidate
 (after excluding retained old-base and current-target ancestry) are replayed

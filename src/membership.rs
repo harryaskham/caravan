@@ -97,6 +97,11 @@ pub struct JoinSourceReceipt {
     pub parent: crate::model::BranchSnapshot,
     pub tree_oid: crate::model::CommitOid,
     pub patch_fingerprint: String,
+    pub effective_patch_fingerprint: String,
+    #[serde(default)]
+    pub source_commits: Vec<crate::model::CommitOid>,
+    #[serde(default)]
+    pub already_landed_commits: Vec<crate::model::CommitOid>,
     pub source_title: String,
     pub selected_tail: JoinPredecessorReceipt,
     pub expected_result_tree_oid: crate::model::CommitOid,
@@ -684,7 +689,81 @@ fn preflight_join_source(
     .stdout
     .trim()
     .to_owned();
-    let expected_result = if patch.stdout.is_empty() {
+    let cherry = source_command(
+        &runner,
+        CommandSpec::new("git").args([
+            "cherry",
+            default.oid.0.as_str(),
+            source.oid.0.as_str(),
+            parent.oid.0.as_str(),
+        ]),
+        "join_source_patch_identity_failed",
+        "could not compare source patch identities with current default",
+    )?;
+    let mut source_commits = Vec::new();
+    let mut already_landed_commits = Vec::new();
+    for line in cherry.stdout.lines().filter(|line| !line.trim().is_empty()) {
+        let mut fields = line.split_whitespace();
+        let sign = fields.next();
+        let oid = fields.next().unwrap_or_default();
+        if !matches!(sign, Some("+" | "-"))
+            || oid.len() != 40
+            || !oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || fields.next().is_some()
+        {
+            return Err(AppError::structured(
+                ErrorCategory::Validation,
+                "join_source_patch_identity_ambiguous",
+                "Git returned an ambiguous source patch identity",
+                Some(json!({"line": line, "source": source, "default": default, "mutated": false})),
+            ));
+        }
+        let oid = crate::model::CommitOid(oid.to_owned());
+        source_commits.push(oid.clone());
+        if sign == Some("-") {
+            already_landed_commits.push(oid);
+        }
+    }
+    if !patch.stdout.is_empty() && source_commits.is_empty() {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "join_source_patch_identity_ambiguous",
+            "non-empty source content has no bounded stable patch identity",
+            Some(json!({"source": source, "parent": parent, "default": default, "mutated": false})),
+        ));
+    }
+    let effective_default = source_command(
+        &runner,
+        CommandSpec::new("git").args([
+            "merge-tree",
+            "--write-tree",
+            default.oid.0.as_str(),
+            source.oid.0.as_str(),
+        ]),
+        "join_source_effective_patch_conflict",
+        "source patch does not have one clean effective result on current default",
+    )?;
+    let effective_default_tree = crate::model::CommitOid(
+        effective_default
+            .stdout
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_owned(),
+    );
+    let effective_patch = source_command(
+        &runner,
+        CommandSpec::new("git").args([
+            "diff",
+            "--binary",
+            default.oid.0.as_str(),
+            effective_default_tree.0.as_str(),
+        ]),
+        "join_source_effective_patch_failed",
+        "could not derive the source patch not already represented on current default",
+    )?;
+    let expected_result = if effective_patch.stdout.is_empty() {
         source_oid(
             &runner,
             &format!("{}^{{tree}}", tail.oid.0),
@@ -729,11 +808,14 @@ fn preflight_join_source(
         parent,
         tree_oid,
         patch_fingerprint: fnv1a64(patch.stdout.as_bytes()),
+        effective_patch_fingerprint: fnv1a64(effective_patch.stdout.as_bytes()),
+        source_commits,
+        already_landed_commits,
         source_title,
         selected_tail: predecessor.clone(),
         expected_result_tree_oid: expected_result,
     };
-    if patch.stdout.is_empty() {
+    if effective_patch.stdout.is_empty() {
         return Err(AppError::structured(
             ErrorCategory::Validation,
             "join_empty_source_noop",

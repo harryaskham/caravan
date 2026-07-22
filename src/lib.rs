@@ -93,8 +93,9 @@ invocations share root config/state; outside a non-bare worktree writes nothing.
    For checkout-free orchestration, `cara join --pr N --tail-pr T` holds the
    repository operation lock, re-reads the canonical live tail, and first
    requires its root at the exact current default. It receipts source
-   branch/head/parent/tree/patch/title plus tail/result-tree identity; empty
-   source is a durable zero-mutation no-op. It rebases only that source patch
+   branch/head/parent/tree/patch/title plus tail/result-tree identity; stable
+   patch matching removes changes already on current main, and empty effective
+   source is a durable zero-mutation no-op. It rebases only the unique source patch
    onto the tail, re-reads provider facts, refuses admission
    if the tail moved, sets the provider base,
    and returns a versioned exact join receipt. Routine join accepts no force

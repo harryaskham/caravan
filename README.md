@@ -411,9 +411,11 @@ selected caravan root must target the exact current default generation; a stale
 root returns `join_root_stale_default` and requires `sync --all`. The source
 branch is separately bound to exact repository/branch/head, one merge-base
 parent, source tree, binary-patch fingerprint/title provenance, selected tail,
-and independently computed result tree. Main changes already present outside
-the source-only range are therefore never replayed into the child. An empty
-source patch returns `join_empty_source_noop` with the complete receipt and zero
+and independently computed result tree. Stable `git cherry` patch identity plus
+an effective merge-tree/diff against exact current main removes equivalent
+patches already landed under different commit OIDs; mixed ranges replay only
+the genuinely unique commits. Main changes outside the effective source range
+are never replayed into the child. An empty effective source patch returns `join_empty_source_noop` with the complete receipt and zero
 provider/branch mutation.
 
 It preserves bounded owned two-parent candidate topology with

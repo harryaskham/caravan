@@ -505,6 +505,112 @@ fn empty_source_join_is_zero_mutation_with_exact_receipt() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
+fn patch_already_landed_under_distinct_oid_is_zero_mutation_noop() {
+    let temporary = tempfile::tempdir().unwrap();
+    let remote = temporary.path().join("remote.git");
+    let work = temporary.path().join("work");
+    git(
+        temporary.path(),
+        &["init", "--bare", remote.to_str().unwrap()],
+    );
+    git(
+        temporary.path(),
+        &["clone", remote.to_str().unwrap(), work.to_str().unwrap()],
+    );
+    git(&work, &["config", "user.name", "Caravan Test"]);
+    git(&work, &["config", "user.email", "caravan@example.invalid"]);
+    std::fs::write(work.join("base.txt"), "base\n").unwrap();
+    git(&work, &["add", "base.txt"]);
+    git(&work, &["commit", "-m", "base"]);
+    git(&work, &["branch", "-M", "main"]);
+    git(&work, &["push", "-u", "origin", "main"]);
+
+    git(&work, &["checkout", "-b", "source"]);
+    std::fs::write(work.join("release.txt"), "same release patch\n").unwrap();
+    git(&work, &["add", "release.txt"]);
+    git(&work, &["commit", "-m", "source release"]);
+    git(&work, &["push", "-u", "origin", "source"]);
+    let source_oid_value = CommitOid(git(&work, &["rev-parse", "HEAD"]));
+
+    git(&work, &["checkout", "main"]);
+    std::fs::write(work.join("release.txt"), "same release patch\n").unwrap();
+    git(&work, &["add", "release.txt"]);
+    git(&work, &["commit", "-m", "independent main release"]);
+    git(&work, &["push", "origin", "main"]);
+    let main_oid = CommitOid(git(&work, &["rev-parse", "HEAD"]));
+    git(&work, &["checkout", "-b", "tail"]);
+    std::fs::write(work.join("tail.txt"), "tail\n").unwrap();
+    git(&work, &["add", "tail.txt"]);
+    git(&work, &["commit", "-m", "tail"]);
+    git(&work, &["push", "-u", "origin", "tail"]);
+    let tail_oid = CommitOid(git(&work, &["rev-parse", "HEAD"]));
+
+    let mut root = pull_request(1, "tail", "main", &[ACTIVE_LABEL]);
+    root.head.oid.clone_from(&tail_oid);
+    root.base.oid.clone_from(&main_oid);
+    let mut candidate = pull_request(2, "source", "main", &[]);
+    candidate.head.oid.clone_from(&source_oid_value);
+    candidate.base.oid.clone_from(&main_oid);
+    let mut discovered = status(candidate.clone(), vec![root]);
+    discovered
+        .analysis
+        .fleet
+        .default_branch
+        .oid
+        .clone_from(&main_oid);
+    let provider = FakeProvider::with_pull_requests(vec![candidate]);
+    let provider_before = provider.pull_requests.borrow().clone();
+    let context = AppContext {
+        repository_path: work,
+        config: crate::config::CaravanConfig {
+            command_timeout_secs: 30,
+            ..crate::config::CaravanConfig::default()
+        },
+        ..AppContext::default()
+    };
+    let predecessor = JoinPredecessorReceipt {
+        pr: PrNumber(1),
+        branch: "tail".to_owned(),
+        head_oid: tail_oid,
+    };
+    let source = BranchSnapshot {
+        repository: repository(),
+        name: "source".to_owned(),
+        oid: source_oid_value,
+    };
+
+    let error = preflight_join_source(
+        &context,
+        &provider,
+        &discovered,
+        &source,
+        &predecessor,
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+    )
+    .unwrap_err();
+
+    assert_eq!(error.code(), "join_empty_source_noop");
+    let details = error.details().unwrap();
+    assert_eq!(details["mutated"], false);
+    assert_eq!(
+        details["source"]["source_commits"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        details["source"]["already_landed_commits"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(*provider.pull_requests.borrow(), provider_before);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
 fn source_only_plan_excludes_release_already_on_current_main() {
     let temporary = tempfile::tempdir().unwrap();
     let remote = temporary.path().join("remote.git");
@@ -533,6 +639,9 @@ fn source_only_plan_excludes_release_already_on_current_main() {
     let base_oid = CommitOid(git(&work, &["rev-parse", "HEAD"]));
 
     git(&work, &["checkout", "-b", "source"]);
+    std::fs::write(work.join("release.txt"), "already on main\n").unwrap();
+    git(&work, &["add", "release.txt"]);
+    git(&work, &["commit", "-m", "source copy of release"]);
     std::fs::write(work.join("source.txt"), "source-only\n").unwrap();
     git(&work, &["add", "source.txt"]);
     git(&work, &["commit", "-m", "source-only change"]);
@@ -599,6 +708,12 @@ fn source_only_plan_excludes_release_already_on_current_main() {
 
     assert_eq!(receipt.parent.oid, base_oid);
     assert_eq!(receipt.source_title, "source-only change");
+    assert_eq!(receipt.source_commits.len(), 2);
+    assert_eq!(receipt.already_landed_commits.len(), 1);
+    assert_ne!(
+        receipt.patch_fingerprint,
+        receipt.effective_patch_fingerprint
+    );
     let mut planning_candidate = candidate;
     planning_candidate.base.clone_from(&receipt.parent);
     let prepared = crate::physical_rebase::prepare_candidate(
@@ -870,10 +985,13 @@ fn join_receipt_proves_exact_tail_ancestry_and_stale_force_removal() {
             candidate_source_head_oid: Some(candidate.head.oid.clone()),
             source: Some(JoinSourceReceipt {
                 branch: candidate.head.name.clone(),
-                head_oid: candidate.head.oid,
+                head_oid: candidate.head.oid.clone(),
                 parent: before.analysis.fleet.default_branch.clone(),
                 tree_oid: CommitOid("source-tree".to_owned()),
                 patch_fingerprint: "fnv1a64:source".to_owned(),
+                effective_patch_fingerprint: "fnv1a64:effective".to_owned(),
+                source_commits: vec![candidate.head.oid.clone()],
+                already_landed_commits: Vec::new(),
                 source_title: "source title".to_owned(),
                 selected_tail: JoinPredecessorReceipt {
                     pr: head.number,
@@ -969,10 +1087,13 @@ fn root_new_receipt_uses_default_branch_predecessor_bd_d15ba3() {
             candidate_source_head_oid: Some(candidate.head.oid.clone()),
             source: Some(JoinSourceReceipt {
                 branch: candidate.head.name.clone(),
-                head_oid: candidate.head.oid,
+                head_oid: candidate.head.oid.clone(),
                 parent: default.clone(),
                 tree_oid: CommitOid("source-tree".to_owned()),
                 patch_fingerprint: "fnv1a64:source".to_owned(),
+                effective_patch_fingerprint: "fnv1a64:effective".to_owned(),
+                source_commits: vec![candidate.head.oid.clone()],
+                already_landed_commits: Vec::new(),
                 source_title: "source title".to_owned(),
                 selected_tail: JoinPredecessorReceipt {
                     pr: PrNumber(0),

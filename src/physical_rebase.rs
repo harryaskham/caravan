@@ -634,7 +634,7 @@ fn expected_merge_tree(
 
 fn run_rebase(
     runner: &impl CommandRunner,
-    range_base: &CommitOid,
+    _range_base: &CommitOid,
     target: &CommitOid,
     old_head: &CommitOid,
     preserve_merges: bool,
@@ -655,7 +655,11 @@ fn run_rebase(
             "--empty=keep".to_owned(),
         ]);
     }
-    let upstream = if preserve_merges { target } else { range_base };
+    // Use the exact target as the upstream for both sequencers. Git can then
+    // omit patch-equivalent commits already represented on the target while
+    // replaying only genuinely unique source commits. The separately retained
+    // range_base still binds and validates source provenance.
+    let upstream = target;
     arguments.extend([
         "--committer-date-is-author-date".to_owned(),
         "--onto".to_owned(),
