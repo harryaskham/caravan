@@ -813,6 +813,23 @@ mod tests {
     }
 
     impl MembershipProvider for FakeProvider {
+        fn verify_branch_head(
+            &self,
+            _repository: &RepositoryId,
+            _branch: &str,
+            _expected: &CommitOid,
+        ) -> Result<(), MutationError> {
+            Ok(())
+        }
+
+        fn refetch_pull_request(
+            &self,
+            _repository: &RepositoryId,
+            number: PrNumber,
+        ) -> Result<PullRequestSnapshot, MutationError> {
+            Ok(self.pull_requests.borrow()[&number].clone())
+        }
+
         fn branch_is_protected(
             &self,
             _repository: &RepositoryId,

@@ -91,8 +91,11 @@ invocations share root config/state; outside a non-bare worktree writes nothing.
    current default generation and deliberately no join tail. Candidate-head,
    default, tail, or unexpected-membership drift stops before membership writes.
    For checkout-free orchestration, `cara join --pr N --tail-pr T` holds the
-   repository operation lock, re-reads the canonical live tail, rebases the
-   exact candidate onto that tail, re-reads provider facts, refuses admission
+   repository operation lock, re-reads the canonical live tail, and first
+   requires its root at the exact current default. It receipts source
+   branch/head/parent/tree/patch/title plus tail/result-tree identity; empty
+   source is a durable zero-mutation no-op. It rebases only that source patch
+   onto the tail, re-reads provider facts, refuses admission
    if the tail moved, sets the provider base,
    and returns a versioned exact join receipt. Routine join accepts no force
    option and proves any stale-generation `caravan-force` intent was absent or

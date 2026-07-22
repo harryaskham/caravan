@@ -10,7 +10,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::command::CommandRunError;
+use crate::command::{CommandRunError, CommandRunner, CommandSpec, ProcessRunner};
 use crate::github::{
     ControlLabelAudit, CreatePullRequestInput, DiscoveryError, GitHubMutationAdapter,
     GitHubMutationReceipt, MutationError, control_label_marker,
@@ -89,6 +89,19 @@ pub struct JoinPredecessorReceipt {
     pub head_oid: crate::model::CommitOid,
 }
 
+/// Exact source patch and target generation bound before any provider mutation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct JoinSourceReceipt {
+    pub branch: String,
+    pub head_oid: crate::model::CommitOid,
+    pub parent: crate::model::BranchSnapshot,
+    pub tree_oid: crate::model::CommitOid,
+    pub patch_fingerprint: String,
+    pub source_title: String,
+    pub selected_tail: JoinPredecessorReceipt,
+    pub expected_result_tree_oid: crate::model::CommitOid,
+}
+
 /// Final exact candidate state after physical rewrite and provider admission.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct JoinResultReceipt {
@@ -115,6 +128,8 @@ pub struct JoinReceipt {
     pub caravan_id: PrNumber,
     pub candidate_pr: PrNumber,
     pub candidate_source_head_oid: crate::model::CommitOid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<JoinSourceReceipt>,
     pub predecessor: JoinPredecessorReceipt,
     pub default_branch_oid: crate::model::CommitOid,
     pub result: JoinResultReceipt,
@@ -158,6 +173,19 @@ pub struct MembershipOutput {
 
 /// Provider operations required by membership policy.
 pub trait MembershipProvider {
+    fn verify_branch_head(
+        &self,
+        repository: &RepositoryId,
+        branch: &str,
+        expected: &crate::model::CommitOid,
+    ) -> Result<(), MutationError>;
+
+    fn refetch_pull_request(
+        &self,
+        repository: &RepositoryId,
+        number: PrNumber,
+    ) -> Result<PullRequestSnapshot, MutationError>;
+
     fn branch_is_protected(
         &self,
         repository: &RepositoryId,
@@ -222,6 +250,23 @@ pub trait MembershipProvider {
 }
 
 impl<R: crate::command::CommandRunner> MembershipProvider for GitHubMutationAdapter<R> {
+    fn verify_branch_head(
+        &self,
+        repository: &RepositoryId,
+        branch: &str,
+        expected: &crate::model::CommitOid,
+    ) -> Result<(), MutationError> {
+        self.verify_branch_head(repository, branch, expected)
+    }
+
+    fn refetch_pull_request(
+        &self,
+        repository: &RepositoryId,
+        number: PrNumber,
+    ) -> Result<PullRequestSnapshot, MutationError> {
+        self.refetch_pull_request(repository, number)
+    }
+
     fn branch_is_protected(
         &self,
         repository: &RepositoryId,
@@ -419,6 +464,286 @@ pub(crate) fn auto_admit_locked(
     )
 }
 
+fn require_current_join_root(status: &StatusOutput, target: &JoinTarget) -> Result<(), AppError> {
+    let root_number = target.caravan.head().ok_or_else(|| {
+        AppError::validation("join_target_empty", "selected join caravan has no root")
+    })?;
+    let root = status
+        .analysis
+        .pull_requests
+        .get(&root_number)
+        .ok_or_else(|| {
+            AppError::validation(
+                "join_root_missing",
+                "selected join root is absent from discovery",
+            )
+        })?;
+    let current_default = &status.analysis.fleet.default_branch;
+    if root.base.name == current_default.name && root.base.oid == current_default.oid {
+        return Ok(());
+    }
+    Err(AppError::structured(
+        ErrorCategory::Validation,
+        "join_root_stale_default",
+        "selected caravan root is not based on the exact current default generation",
+        Some(json!({
+            "mutated": false,
+            "root_pr": root.number,
+            "root_head": root.head,
+            "observed_root_base": root.base,
+            "required_default": current_default,
+            "selected_tail_pr": target.tail.number,
+            "selected_tail_head": target.tail.head,
+            "safe_next_action": "run `cara sync --all` until the selected root is current, then retry the same join",
+        })),
+    ))
+}
+
+fn revalidate_join_root(
+    status: &StatusOutput,
+    target: &JoinTarget,
+    provider: &impl MembershipProvider,
+) -> Result<(), AppError> {
+    let root_number = target.caravan.head().expect("join caravan is non-empty");
+    let expected = status
+        .analysis
+        .pull_requests
+        .get(&root_number)
+        .expect("join root came from status");
+    let actual = provider
+        .refetch_pull_request(&status.repository, root_number)
+        .map_err(|error| {
+            AppError::structured(
+                ErrorCategory::ExecutionFailure,
+                "join_root_refetch_failed",
+                "could not revalidate selected root before join mutation",
+                Some(json!({"root_pr": root_number, "error": error.to_string(), "mutated": false})),
+            )
+        })?;
+    if PullRequestPrecondition::from(expected) == PullRequestPrecondition::from(&actual)
+        && actual.base == status.analysis.fleet.default_branch
+    {
+        return Ok(());
+    }
+    Err(AppError::structured(
+        ErrorCategory::Validation,
+        "join_root_moved_before_apply",
+        "selected caravan root changed after join preview",
+        Some(json!({
+            "root_pr": root_number,
+            "expected": expected,
+            "actual": actual,
+            "required_default": status.analysis.fleet.default_branch,
+            "mutated": false,
+            "safe_next_action": "rediscover and sync the selected caravan before retrying join",
+        })),
+    ))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn source_command(
+    runner: &impl CommandRunner,
+    command: CommandSpec,
+    code: &str,
+    message: &str,
+) -> Result<crate::command::CommandOutput, AppError> {
+    let output = runner.run(&command).map_err(|error| {
+        AppError::structured(
+            if matches!(error, CommandRunError::Timeout { .. }) {
+                ErrorCategory::Timeout
+            } else {
+                ErrorCategory::ExecutionFailure
+            },
+            code,
+            format!("{message}: {error}"),
+            Some(json!({"command": command.display(), "mutated": false})),
+        )
+    })?;
+    if output.is_success() {
+        Ok(output)
+    } else {
+        Err(AppError::structured(
+            ErrorCategory::Validation,
+            code,
+            message,
+            Some(json!({
+                "command": command.display(),
+                "code": output.code,
+                "stdout": output.stdout,
+                "stderr": output.stderr,
+                "mutated": false,
+            })),
+        ))
+    }
+}
+
+fn source_oid(
+    runner: &impl CommandRunner,
+    revision: &str,
+    code: &str,
+) -> Result<crate::model::CommitOid, AppError> {
+    let output = source_command(
+        runner,
+        CommandSpec::new("git").args(["rev-parse", revision]),
+        code,
+        "could not resolve exact join source identity",
+    )?;
+    let oid = output.stdout.trim();
+    if oid.len() != 40 || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(AppError::validation(
+            code,
+            "join source identity is not one exact Git OID",
+        ));
+    }
+    Ok(crate::model::CommitOid(oid.to_owned()))
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn preflight_join_source(
+    context: &AppContext,
+    provider: &impl MembershipProvider,
+    status: &StatusOutput,
+    source: &crate::model::BranchSnapshot,
+    predecessor: &JoinPredecessorReceipt,
+    operation_deadline: std::time::Instant,
+) -> Result<JoinSourceReceipt, AppError> {
+    let timeout = std::time::Duration::from_secs(context.config.command_timeout_secs);
+    provider
+        .verify_branch_head(&status.repository, &source.name, &source.oid)
+        .map_err(|error| {
+            AppError::structured(
+                ErrorCategory::Validation,
+                "join_source_head_moved",
+                "source branch moved before exact join planning",
+                Some(json!({"source": source, "error": error.to_string(), "mutated": false})),
+            )
+        })?;
+    let runner = ProcessRunner::in_directory(&context.repository_path)
+        .with_timeout(timeout)
+        .with_operation_deadline(operation_deadline);
+    let default = &status.analysis.fleet.default_branch;
+    let tail = crate::model::BranchSnapshot {
+        repository: status.repository.clone(),
+        name: predecessor.branch.clone(),
+        oid: predecessor.head_oid.clone(),
+    };
+    crate::compatibility::prepare_branch_snapshots_with_runner(
+        &runner,
+        "origin",
+        &[default.clone(), tail.clone(), source.clone()],
+    )?;
+    let merge_bases = source_command(
+        &runner,
+        CommandSpec::new("git").args([
+            "merge-base",
+            "--all",
+            default.oid.0.as_str(),
+            source.oid.0.as_str(),
+        ]),
+        "join_source_parent_ambiguous",
+        "could not derive one exact source/default patch boundary",
+    )?;
+    let boundaries = merge_bases.stdout.lines().collect::<Vec<_>>();
+    if boundaries.len() != 1 {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "join_source_parent_ambiguous",
+            "source and current default do not have one exact patch boundary",
+            Some(
+                json!({"source": source, "default": default, "merge_bases": boundaries, "mutated": false}),
+            ),
+        ));
+    }
+    let parent = crate::model::BranchSnapshot {
+        repository: status.repository.clone(),
+        name: default.name.clone(),
+        oid: crate::model::CommitOid(boundaries[0].to_owned()),
+    };
+    let tree_oid = source_oid(
+        &runner,
+        &format!("{}^{{tree}}", source.oid.0),
+        "join_source_tree_invalid",
+    )?;
+    let patch = source_command(
+        &runner,
+        CommandSpec::new("git").args([
+            "diff",
+            "--binary",
+            parent.oid.0.as_str(),
+            source.oid.0.as_str(),
+        ]),
+        "join_source_patch_failed",
+        "could not derive the exact source-only patch",
+    )?;
+    let source_title = source_command(
+        &runner,
+        CommandSpec::new("git").args(["show", "-s", "--format=%s", source.oid.0.as_str()]),
+        "join_source_title_failed",
+        "could not bind source commit title provenance",
+    )?
+    .stdout
+    .trim()
+    .to_owned();
+    let expected_result = if patch.stdout.is_empty() {
+        source_oid(
+            &runner,
+            &format!("{}^{{tree}}", tail.oid.0),
+            "join_target_tree_invalid",
+        )?
+    } else {
+        let merged = source_command(
+            &runner,
+            CommandSpec::new("git").args([
+                "merge-tree",
+                "--write-tree",
+                tail.oid.0.as_str(),
+                source.oid.0.as_str(),
+            ]),
+            "join_source_merge_conflict",
+            "source-only patch does not have one clean result on the selected tail",
+        )?;
+        crate::model::CommitOid(
+            merged
+                .stdout
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_owned(),
+        )
+    };
+    if expected_result.0.len() != 40
+        || !expected_result
+            .0
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(AppError::validation(
+            "join_result_tree_invalid",
+            "join source preflight did not produce one exact result tree",
+        ));
+    }
+    let receipt = JoinSourceReceipt {
+        branch: source.name.clone(),
+        head_oid: source.oid.clone(),
+        parent,
+        tree_oid,
+        patch_fingerprint: fnv1a64(patch.stdout.as_bytes()),
+        source_title,
+        selected_tail: predecessor.clone(),
+        expected_result_tree_oid: expected_result,
+    };
+    if patch.stdout.is_empty() {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "join_empty_source_noop",
+            "source branch has no unique patch beyond current default; join is a zero-mutation no-op",
+            Some(json!({"source": receipt, "mutated": false, "noop": true})),
+        ));
+    }
+    Ok(receipt)
+}
+
 #[allow(clippy::too_many_lines)]
 fn execute_locked(
     context: &AppContext,
@@ -516,6 +841,76 @@ fn execute_locked(
             })
         },
     );
+    let mut join_source_receipt = None;
+    if context.config.rebase_on_join {
+        let target = initial_join_target.as_ref();
+        if let Some(target) = target
+            && let Err(error) = require_current_join_root(&status, target)
+        {
+            return Err(record_join_preflight_failure(
+                context,
+                &status,
+                request,
+                error,
+                dispatch_hooks,
+            ));
+        }
+        let predecessor = selected_predecessor
+            .as_ref()
+            .expect("join predecessor retained");
+        let source = if let Some(number) = status.current_pr {
+            status
+                .analysis
+                .pull_requests
+                .get(&number)
+                .map(|candidate| candidate.head.clone())
+                .ok_or_else(|| {
+                    AppError::validation(
+                        "join_source_missing",
+                        "selected join source PR is absent from discovery",
+                    )
+                })?
+        } else {
+            let branch = status.current_branch.clone().ok_or_else(|| {
+                AppError::validation(
+                    "current_branch_not_found",
+                    "physical membership with --create-pr requires one named source branch",
+                )
+            })?;
+            let runner = ProcessRunner::in_directory(&context.repository_path)
+                .with_timeout(timeout)
+                .with_operation_deadline(operation_deadline);
+            crate::model::BranchSnapshot {
+                repository: status.repository.clone(),
+                name: branch,
+                oid: source_oid(&runner, "HEAD", "join_source_head_invalid")?,
+            }
+        };
+        join_source_receipt = Some(
+            preflight_join_source(
+                context,
+                &provider,
+                &status,
+                &source,
+                predecessor,
+                operation_deadline,
+            )
+            .map_err(|error| {
+                record_join_preflight_failure(context, &status, request, error, dispatch_hooks)
+            })?,
+        );
+        if let Some(target) = target
+            && let Err(error) = revalidate_join_root(&status, target, &provider)
+        {
+            return Err(record_join_preflight_failure(
+                context,
+                &status,
+                request,
+                error,
+                dispatch_hooks,
+            ));
+        }
+    }
     let mut force_invalidation = None;
     let mut creation_state = None;
     let rebase_receipt = if context.config.rebase_on_join {
@@ -647,16 +1042,80 @@ fn execute_locked(
             || status.analysis.fleet.default_branch.clone(),
             |target| target.tail.head,
         );
+        let mut planning_candidate = candidate.clone();
+        if let Some(source) = join_source_receipt.as_ref() {
+            planning_candidate.base.clone_from(&source.parent);
+        }
+        let range_source = join_source_receipt.as_ref().map_or_else(
+            || crate::physical_rebase::range_base_for_remote_target(&planning_candidate, &target),
+            |source| {
+                if source.parent.name == status.analysis.fleet.default_branch.name
+                    && source.parent.oid != status.analysis.fleet.default_branch.oid
+                {
+                    crate::physical_rebase::PlannedRangeBase::HistoricalSourceBranch {
+                        branch: source.parent.clone(),
+                        current: status.analysis.fleet.default_branch.clone(),
+                    }
+                } else {
+                    crate::physical_rebase::range_base_for_remote_target(
+                        &planning_candidate,
+                        &target,
+                    )
+                }
+            },
+        );
         let prepared = crate::physical_rebase::prepare_candidate(
             &context.repository_path,
             &repository,
-            &candidate,
-            crate::physical_rebase::range_base_for_remote_target(&candidate, &target),
+            &planning_candidate,
+            range_source,
             crate::physical_rebase::PlannedBase::Remote(target.clone()),
             &status.analysis.fleet.default_branch,
             crate::physical_rebase::RebaseExecutionBudget::new(timeout)
                 .with_deadline(operation_deadline),
         )?;
+        if let Some(source) = join_source_receipt.as_ref() {
+            let planned_base = match &prepared.plan.new_base {
+                crate::physical_rebase::PlannedBase::Remote(base)
+                | crate::physical_rebase::PlannedBase::Simulated(base) => base,
+            };
+            if prepared.plan.old_head_oid != source.head_oid
+                || prepared.plan.old_base_oid != source.parent.oid
+                || planned_base.name != source.selected_tail.branch
+                || planned_base.oid != source.selected_tail.head_oid
+                || prepared.plan.new_tree_oid != source.expected_result_tree_oid
+            {
+                let error = AppError::structured(
+                    ErrorCategory::Validation,
+                    "join_source_result_mismatch",
+                    "physical join plan does not equal the exact source-only patch receipt",
+                    Some(json!({
+                        "source": source,
+                        "plan": prepared.plan,
+                        "mutated_branch": false,
+                        "safe_next_action": "rediscover source/default/tail facts and retry without provider mutation",
+                    })),
+                );
+                return Err(record_join_preflight_failure(
+                    context,
+                    &status,
+                    request,
+                    error,
+                    dispatch_hooks,
+                ));
+            }
+        }
+        if let Some(target) = initial_join_target.as_ref()
+            && let Err(error) = revalidate_join_root(&status, target, &provider)
+        {
+            return Err(record_join_preflight_failure(
+                context,
+                &status,
+                request,
+                error,
+                dispatch_hooks,
+            ));
+        }
         if candidate.has_label(FORCE_LABEL) && !prepared.plan.already_satisfied {
             let mut invalidation = ExecutionState::new(request.operation);
             invalidation.current = Some(candidate.clone());
@@ -780,6 +1239,7 @@ fn execute_locked(
             JoinReceiptEvidence {
                 predecessor: selected_predecessor,
                 candidate_source_head_oid,
+                source: join_source_receipt,
                 default_branch_oid,
                 rebase_receipt: rebase_receipt.as_ref(),
             },
@@ -821,6 +1281,7 @@ fn execute_locked(
 struct JoinReceiptEvidence<'a> {
     predecessor: Option<JoinPredecessorReceipt>,
     candidate_source_head_oid: Option<crate::model::CommitOid>,
+    source: Option<JoinSourceReceipt>,
     default_branch_oid: crate::model::CommitOid,
     rebase_receipt: Option<&'a crate::physical_rebase::RebaseReceipt>,
 }
@@ -848,6 +1309,15 @@ fn build_join_receipt(
             Some(json!({"candidate_pr": output.pull_request.number})),
         )
     })?;
+    let source = evidence.source;
+    if context.config.rebase_on_join && source.is_none() {
+        return Err(AppError::structured(
+            ErrorCategory::ExecutionFailure,
+            "join_receipt_source_provenance_missing",
+            "physical membership did not retain exact source patch provenance",
+            Some(json!({"candidate_pr": output.pull_request.number})),
+        ));
+    }
     let force_intent = if before
         .analysis
         .pull_requests
@@ -859,10 +1329,15 @@ fn build_join_receipt(
         JoinForceIntent::Absent
     };
     let ancestry_verified = evidence.rebase_receipt.is_some_and(|receipt| {
-        receipt.pr == output.pull_request.number
-            && receipt.new_head_oid == output.pull_request.head.oid
-            && receipt.new_base_branch == predecessor.branch
-            && receipt.new_base_oid == predecessor.head_oid
+        source.as_ref().is_some_and(|source| {
+            receipt.pr == output.pull_request.number
+                && receipt.old_head_oid == source.head_oid
+                && receipt.old_base_oid == source.parent.oid
+                && receipt.new_head_oid == output.pull_request.head.oid
+                && receipt.new_base_branch == predecessor.branch
+                && receipt.new_base_oid == predecessor.head_oid
+                && receipt.new_tree_oid == source.expected_result_tree_oid
+        })
     });
     let membership_durable = output.pull_request.has_label(ACTIVE_LABEL)
         && !output.pull_request.has_label(FORCE_LABEL)
@@ -875,6 +1350,7 @@ fn build_join_receipt(
         caravan_id: output.caravan_id,
         candidate_pr: output.pull_request.number,
         candidate_source_head_oid: source_head,
+        source,
         predecessor,
         default_branch_oid: evidence.default_branch_oid,
         result: JoinResultReceipt {
@@ -999,6 +1475,24 @@ fn attach_rebase_receipt(
     )
 }
 
+fn record_join_preflight_failure(
+    context: &AppContext,
+    status: &StatusOutput,
+    request: &MembershipRequest,
+    error: AppError,
+    dispatch_hooks: bool,
+) -> AppError {
+    let event = join_failed_event(status, request, &error);
+    let error = hooks::attach_events(error, std::slice::from_ref(&event));
+    if !dispatch_hooks {
+        return error;
+    }
+    match hooks::dispatch_events(context, &[event]) {
+        Ok(deliveries) => hooks::attach_deliveries(error, &deliveries),
+        Err(dispatch_error) => dispatch_error,
+    }
+}
+
 fn join_failed_event(
     status: &StatusOutput,
     request: &MembershipRequest,
@@ -1023,7 +1517,13 @@ fn join_failed_event(
         prs.into_iter().collect(),
         Some(status.analysis.fleet.clone()),
         Some(error.to_string()),
-        BTreeMap::from([("error_code".to_owned(), json!(error.code()))]),
+        BTreeMap::from([
+            ("error_code".to_owned(), json!(error.code())),
+            (
+                "error_details".to_owned(),
+                error.details().unwrap_or_default(),
+            ),
+        ]),
     )
 }
 

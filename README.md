@@ -405,7 +405,17 @@ hooks:
     blocking: false
 ```
 
-Cumulative mode rejects fork heads, stale leases, and empty/ambiguous ranges.
+Cumulative mode rejects fork heads, stale leases, and ambiguous ranges. Before
+`join` creates/updates a PR, rewrites a branch, or changes membership, the
+selected caravan root must target the exact current default generation; a stale
+root returns `join_root_stale_default` and requires `sync --all`. The source
+branch is separately bound to exact repository/branch/head, one merge-base
+parent, source tree, binary-patch fingerprint/title provenance, selected tail,
+and independently computed result tree. Main changes already present outside
+the source-only range are therefore never replayed into the child. An empty
+source patch returns `join_empty_source_noop` with the complete receipt and zero
+provider/branch mutation.
+
 It preserves bounded owned two-parent candidate topology with
 `rebase-merges=no-rebase-cousins`, independently proves the exact clean
 `merge-tree` result, retains old/new commit-parent mapping in the plan/receipt,
@@ -421,7 +431,11 @@ head into its child. It materializes each generation exactly once in a retained
 detached worktree, then verifies every conflict, PR precondition, remote head,
 dry-run permission, and exact lease across the complete plan before the first
 write. Only independent, disjoint caravans apply concurrently (at most two);
-each caravan remains strictly parent-to-descendant. Pushes use only
+each caravan remains strictly parent-to-descendant. Apply revalidates the
+source/range branch, current default, source head, selected tail, result tree,
+and root provider precondition before any branch push. Successful join receipts
+and durable `join_failed` journal events retain source/target/result evidence
+and every completed provider mutation. Pushes use only
 `--force-with-lease=refs/heads/<branch>:<old-oid>`. A mandatory midpoint GitHub
 rediscovery verifies every new head and replaces stale CI facts before normal
 sync convergence. Errors preserve exact plan, completed-prefix, provider, and

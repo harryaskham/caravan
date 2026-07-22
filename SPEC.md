@@ -426,8 +426,16 @@ always expose the effective mode and config path; a disabled sync conflict gives
 the exact `rebase_on_join: true` project-config action instead of implying a
 manual hand-rebase.
 
-When enabled, membership rebases one bounded candidate-only range. Linear
-ranges use the ordinary sequencer. Owned nonlinear ranges use an explicit
+When enabled, membership rebases one bounded candidate-only range. Before any
+PR creation/update, branch rewrite, or membership mutation, a selected join
+root must target the exact current default OID; otherwise `join_root_stale_default`
+returns zero-write sync guidance. Join source provenance binds repository,
+branch, head, one source/default merge-base parent, source tree, binary-patch
+fingerprint/title, exact selected tail, and independent expected result tree.
+Changes already on current main but absent from an older source parent are
+subtracted from the source-only patch rather than replayed into the child. An
+empty source-only patch is `join_empty_source_noop`, with a complete receipt and
+zero provider mutation. Linear ranges use the ordinary sequencer. Owned nonlinear ranges use an explicit
 two-parent merge-preserving strategy: commits reachable only from the candidate
 (after excluding retained old-base and current-target ancestry) are replayed
 with no cousin rebasing, and every old/new parent edge is mapped in the receipt.
@@ -446,7 +454,8 @@ retained, simulated new head of its parent. Rebase objects are materialized once
 and retained through apply; they are never recomputed. Every edge conflict,
 workflow trigger, PR precondition, remote old head, branch-set disjointness,
 dry-run permission, and exact lease is verified globally before provider or
-branch writes. Auto-merge is disabled for all selected members only after that
+branch writes. Apply revalidates remote source/range/current-default generations,
+source-head lease, selected tail, root provider precondition, and result tree. Auto-merge is disabled for all selected members only after that
 barrier. Independent caravans may apply with bounded parallelism; each chain is
 strictly parent-to-descendant. A mandatory midpoint rediscovery verifies every
 new head and refreshes invalidated CI before ordinary sync policy runs.
@@ -458,7 +467,9 @@ zero writes. Apply-time failure preserves the exact successfully rebuilt prefix
 and skips its descendants; independent in-flight chains may complete. Recovery
 never force-rolls back: rediscover GitHub and rerun the same idempotent sync.
 Outputs and errors retain old/new head/base/tree, workflow proof, exact lease,
-provider receipts, and completed physical-rebase receipts.
+source patch provenance, provider receipts, and completed physical-rebase
+receipts. Join refusal/no-op paths emit durable journal evidence containing the
+bounded structured details, so zero-write decisions remain auditable.
 
 Provider CI configuration remains a repository precondition. GitHub Actions
 `pull_request.branches` filters apply to the PR base: a workflow restricted to

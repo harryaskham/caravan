@@ -72,6 +72,13 @@ pub enum PlannedRangeBase {
         branch: BranchSnapshot,
         current: BranchSnapshot,
     },
+    /// Retained source boundary from an older configured-default generation.
+    /// `current` proves the named default ref advanced while the source-only
+    /// patch remains anchored at `branch`.
+    HistoricalSourceBranch {
+        branch: BranchSnapshot,
+        current: BranchSnapshot,
+    },
     PullRequestHead {
         pr: PrNumber,
         branch: BranchSnapshot,
@@ -83,6 +90,7 @@ impl PlannedRangeBase {
         match self {
             Self::RemoteBranch { branch }
             | Self::HistoricalTargetBranch { branch, .. }
+            | Self::HistoricalSourceBranch { branch, .. }
             | Self::PullRequestHead { branch, .. } => branch,
         }
     }
@@ -253,6 +261,15 @@ pub fn prepare_candidate(
             json!({"pr": candidate.number, "historical_target": current, "target": target, "resumable": true}),
         ));
     }
+    if let PlannedRangeBase::HistoricalSourceBranch { current, .. } = &range_source
+        && (current != workflow_source || current.repository != *repository)
+    {
+        return Err(decision(
+            "rebase_historical_source_mismatch",
+            "historical source range must bind the exact current configured-default generation",
+            json!({"pr": candidate.number, "historical_source": current, "workflow_source": workflow_source, "resumable": true}),
+        ));
+    }
     validate_branch(&candidate.head.name)?;
     for oid in [
         &candidate.head.oid,
@@ -291,7 +308,8 @@ pub fn prepare_candidate(
     }
     match &range_source {
         PlannedRangeBase::RemoteBranch { branch } => fetch_exact(&runner, "origin", branch)?,
-        PlannedRangeBase::HistoricalTargetBranch { branch, current } => {
+        PlannedRangeBase::HistoricalTargetBranch { branch, current }
+        | PlannedRangeBase::HistoricalSourceBranch { branch, current } => {
             retain_historical_target_base(&runner, branch, current)?;
         }
         PlannedRangeBase::PullRequestHead { pr, branch } => {
@@ -751,6 +769,21 @@ pub fn verify_prepared(prepared: &PreparedRebase) -> Result<(), AppError> {
         &prepared.plan.branch,
         &prepared.plan.old_head_oid,
     )?;
+    match &prepared.plan.range_source {
+        PlannedRangeBase::RemoteBranch { branch }
+            if matches!(&prepared.plan.new_base, PlannedBase::Remote(_)) =>
+        {
+            verify_remote_head(&runner, "origin", &branch.name, &branch.oid)?;
+        }
+        PlannedRangeBase::RemoteBranch { .. } => {}
+        PlannedRangeBase::HistoricalTargetBranch { branch, current }
+        | PlannedRangeBase::HistoricalSourceBranch { branch, current } => {
+            retain_historical_target_base(&runner, branch, current)?;
+        }
+        PlannedRangeBase::PullRequestHead { pr, branch } => {
+            fetch_exact_pull_request_head(&runner, "origin", *pr, branch)?;
+        }
+    }
     let destination = format!("HEAD:refs/heads/{}", prepared.plan.branch);
     require_success(
         &runner,
