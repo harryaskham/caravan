@@ -2641,6 +2641,9 @@ mod tests {
         assert!(APP_JS.contains("Ready (${ready.map(targetLabel).join(\", \")})"));
         assert!(APP_JS.contains("Conflicting (${conflicting.map(targetLabel).join(\", \")})"));
         assert!(APP_JS.contains("Exact target compatibility"));
+        assert!(APP_JS.contains("caravan.saloon.${repositoryId}.${name}"));
+        assert!(APP_JS.contains("ui.saloon.addEventListener(\"toggle\""));
+        assert!(APP_JS.contains("group.open ? \"open\" : \"closed\""));
         assert!(APP_CSS.contains(".dashboard.no-caravans .caravan-list .empty-state"));
         assert!(APP_CSS.contains(".repo-rail { grid-column: 1;"));
         assert!(APP_CSS.contains(".content { grid-column: 2;"));

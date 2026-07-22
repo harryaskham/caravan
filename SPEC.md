@@ -260,7 +260,7 @@ Resume is operator/agent initiated only. Before enabling squash auto-merge it re
 - `cara mcp tools` — print MCP tool metadata.
 - `cara self-update status|check|run` — `updatable-cli` release flow, bound to the exact running first-PATH-visible stable user binary. `~/.cargo/bin` and `~/.local/bin` update in place; shadowed, development, renamed/test, and package-manager binaries fail closed unless an exact active parent is explicitly selected with `CARA_SELF_UPDATE_INSTALL_DIR`.
 - feedback MCP tools — `feedback-cli` reporting and status.
-- `cara web --repo PATH...` — loopback path-scoped dashboard, typed actions/plans/progress/journal, optional authenticated GitHub webhook wake receiver, collapsible repository/attention sidebars, and a center Saloon for unenrolled PRs. Priority/FIFO candidacy never implies mechanical readiness. Under fixed candidate/target/pair and wall-clock bounds, the Saloon checks each projected candidate against the exact current default and every bounded live caravan tail, then shows `Ready (main, PR #tail...)`, `Conflicting (main, PR #tail...)`, or checking/unknown target evidence. Mixed candidates expose both lists and actions select only an exact clean target; stale, failed, truncated, or unevaluated projections are never Ready. Draft/incomplete and skipped/evicted PRs remain separate groups. Accepted actions bind the reviewed compatibility projection as part of the mutation-authority fingerprint alongside exact config/provider/topology facts. Refreshes coalesce behind active jobs; sequence-only drift with an identical fingerprint is harmless, while real drift fails before mutation with expected/actual fingerprints.
+- `cara web --repo PATH...` — loopback path-scoped dashboard, typed actions/plans/progress/journal, optional authenticated GitHub webhook wake receiver, collapsible repository/attention sidebars, and a center Saloon for unenrolled PRs. Saloon groups are ordered Ready to Roll, Saddling Up, Other, Bounty List, with independent per-repository disclosure state retained across polling renders. Priority/FIFO candidacy never implies mechanical readiness: under fixed candidate/target/pair and wall-clock bounds, each candidate is checked against exact current default and every bounded live tail, then shows `Ready (main, PR #tail...)`, `Conflicting (main, PR #tail...)`, or checking/unknown evidence. Mixed candidates expose both lists and actions select only an exact clean target; stale, failed, truncated, or unevaluated projections are never Ready. Fresh candidate evidence returns a fixed unjoined PR to Ready, while draft/incomplete and skipped/evicted PRs remain separate groups. Accepted actions bind the reviewed compatibility projection, refresh sequence, and deterministic mutation-authority fingerprint over exact config/provider/topology facts. Refreshes coalesce behind active jobs; sequence-only drift with an identical fingerprint is harmless, while real drift fails before mutation with expected/actual fingerprints.
 
 The webhook endpoint is disabled unless an operator supplies a secret environment
 variable name and exact GitHub App installation ID. It bounds the body and
@@ -498,7 +498,9 @@ CI before ordinary sync policy runs.
 
 A moved branch, unsupported merge topology, ambiguous range, conflict, tree or
 topology mismatch, or apply-time lease race is a typed resumable decision and
-is never forced. Global preflight failure has
+is never forced. A replay commit-count mismatch reports source/rebuilt/dropped
+counts and exact OIDs, explains duplicate/empty-patch pruning as a likely cause,
+and gives a reviewed source-rebase/repair next action. Global preflight failure has
 zero writes. Apply-time failure preserves the exact successfully rebuilt prefix
 and skips its descendants; independent in-flight chains may complete. Recovery
 never force-rolls back: rediscover GitHub and rerun the same idempotent sync.

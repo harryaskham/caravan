@@ -309,6 +309,17 @@
     return "other";
   }
 
+  function saloonGroupKey(repositoryId, name) {
+    return `caravan.saloon.${repositoryId}.${name}`;
+  }
+
+  function saloonGroupOpen(repositoryId, name) {
+    const retained = window.localStorage.getItem(saloonGroupKey(repositoryId, name));
+    return retained === null
+      ? name === "ready" || name === "conflicting" || name === "saddling"
+      : retained === "open";
+  }
+
   function saloonCard(repo, status, pr, group) {
     const { ready } = targetSets(repo, pr);
     const admissions = group === "ready" ? ready.map((target) => target.kind === "caravan_tail"
@@ -344,7 +355,7 @@
     ui.saloon.innerHTML = SALOON_ORDER.map((name) => {
       const [title, description] = SALOON_META[name];
       const rows = groups[name];
-      const open = name === "ready" || name === "conflicting" || name === "saddling";
+      const open = saloonGroupOpen(repo.id, name);
       return `<details class="saloon-group" data-saloon-group="${name}" ${open ? "open" : ""}>
         <summary><span><strong>${title}</strong><small>${description}</small></span>${badge(rows.length, rows.length ? (name === "ready" ? "good" : name === "conflicting" || name === "bounty" ? "bad" : "warn") : "")}</summary>
         <div class="saloon-cards">${rows.length ? rows.map((pr) => saloonCard(repo, status, pr, name)).join("") : empty(`No PRs in ${title}`)}</div>
@@ -567,6 +578,14 @@
     selectedRepo = button.dataset.repo;
     render();
   });
+  ui.saloon.addEventListener("toggle", (event) => {
+    const group = event.target.closest?.("[data-saloon-group]");
+    if (!group || !selectedRepo) return;
+    window.localStorage.setItem(
+      saloonGroupKey(selectedRepo, group.dataset.saloonGroup),
+      group.open ? "open" : "closed",
+    );
+  }, true);
   ui.dashboard.addEventListener("click", (event) => {
     const button = event.target.closest("[data-web-action]");
     if (!button) return;

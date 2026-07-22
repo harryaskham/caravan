@@ -718,6 +718,36 @@ fn run_rebase(
     )
 }
 
+fn topology_commit_count_changed(
+    pr: PrNumber,
+    old_topology: &[RebaseTopologyCommit],
+    new_topology: &[RebaseTopologyCommit],
+) -> AppError {
+    let dropped = old_topology.len().saturating_sub(new_topology.len());
+    let added = new_topology.len().saturating_sub(old_topology.len());
+    decision(
+        "rebase_topology_changed",
+        "join refused because Git rebuilt a different number of commits than the source range; this usually means source patches already exist on the selected tail/current default or the merge structure changed, so Cara cannot prove a one-to-one safe replay",
+        json!({
+            "pr": pr,
+            "source_commit_count": old_topology.len(),
+            "rebuilt_commit_count": new_topology.len(),
+            "dropped_commit_count": dropped,
+            "added_commit_count": added,
+            "source_commits": old_topology.iter().map(|commit| &commit.oid).collect::<Vec<_>>(),
+            "rebuilt_commits": new_topology.iter().map(|commit| &commit.oid).collect::<Vec<_>>(),
+            "likely_causes": [
+                "one or more source patches are already present on the tail or current default",
+                "Git pruned an empty/duplicate commit",
+                "the merge topology cannot be represented one-for-one after rebase",
+            ],
+            "mutated": false,
+            "resumable": true,
+            "safe_next_action": "inspect source commits against current main/tail; rebase the source to remove already-landed patches, or use reviewed Cara repair for an intentional topology change, then rerun join",
+        }),
+    )
+}
+
 fn build_merge_topology_proof(
     runner: &impl CommandRunner,
     old_topology: &[RebaseTopologyCommit],
@@ -737,10 +767,10 @@ fn build_merge_topology_proof(
     let new_topology =
         collect_range_topology(runner, &[target], new_head, "rebase_result_invalid")?;
     if new_topology.len() != old_topology.len() {
-        return Err(decision(
-            "rebase_topology_changed",
-            "merge-preserving replay did not retain one exact result commit per candidate-range commit",
-            json!({"pr": pr, "old_count": old_topology.len(), "new_count": new_topology.len(), "resumable": true}),
+        return Err(topology_commit_count_changed(
+            pr,
+            old_topology,
+            &new_topology,
         ));
     }
     let oid_mapping = old_topology
@@ -1379,6 +1409,7 @@ mod tests {
 
     use super::*;
     use crate::model::{AutoMergeState, PullRequestState};
+    use mcp_cli::StructuredError;
 
     fn git(directory: &Path, arguments: &[&str]) -> String {
         let output = Command::new("git")
@@ -1396,6 +1427,34 @@ mod tests {
             .expect("UTF-8 git output")
             .trim()
             .to_owned()
+    }
+
+    #[test]
+    fn topology_count_refusal_explains_dropped_commits_and_recovery() {
+        let topology = |oid: char| RebaseTopologyCommit {
+            oid: CommitOid(oid.to_string().repeat(40)),
+            parents: Vec::new(),
+            tree_oid: CommitOid("f".repeat(40)),
+        };
+        let error = topology_commit_count_changed(
+            PrNumber(42),
+            &[topology('a'), topology('b')],
+            &[topology('c')],
+        );
+
+        assert_eq!(error.code(), "rebase_topology_changed");
+        assert!(error.message().contains("different number of commits"));
+        let details = error.details().unwrap();
+        assert_eq!(details["source_commit_count"], 2);
+        assert_eq!(details["rebuilt_commit_count"], 1);
+        assert_eq!(details["dropped_commit_count"], 1);
+        assert_eq!(details["mutated"], false);
+        assert!(
+            details["safe_next_action"]
+                .as_str()
+                .unwrap()
+                .contains("rebase the source")
+        );
     }
 
     struct Fixture {

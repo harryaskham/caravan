@@ -212,13 +212,17 @@ used by CLI/JSON/MCP, and applies strict CSP/anti-frame/no-store headers. The
 responsive one-page dashboard renders trail-linked caravans, linked GitHub PRs,
 exact generations and check failures. Repositories and attention decisions live
 in independently collapsible left/right sidebars, leaving the center for repo
-metadata, compact active topology, and the **Saloon**. The Saloon evaluates a
-bounded set of exact current destinations for each admission candidate and
-shows `Ready (main, PR #tail...)`, `Conflicting (main, PR #tail...)`, or
-checking/unknown evidence independently from priority/FIFO position. Mixed PRs
-show both compatible and conflicting targets; stale, truncated, or unevaluated
-targets are never called Ready. Draft/incomplete and skipped/evicted PRs remain
-Saddling Up and Bounty List. `Plan sync` runs the same fresh physical/conflict/lease and
+metadata, compact active topology, and the **Saloon**. The Saloon
+deterministically groups unenrolled PRs as Ready to Roll, Saddling Up, Other,
+then Bounty List; each group is independently collapsible and its per-repository
+open/closed state survives polling renders. It evaluates a bounded set of exact
+current destinations for each candidate and shows `Ready (main, PR #tail...)`,
+`Conflicting (main, PR #tail...)`, or checking/unknown evidence independently
+from priority/FIFO position. Mixed PRs show both compatible and conflicting
+targets; stale, truncated, or unevaluated targets are never called Ready. Fresh
+candidate evidence moves fixed unjoined PRs back to Ready, while draft/incomplete
+and skipped/evicted PRs remain Saddling Up and Bounty List. `Plan sync` runs the
+same fresh physical/conflict/lease and
 first auto-admission selection preflight without provider writes, then renders
 ordered exact actions and rediscovery barriers before Apply. Bounded inner lists keep fleet topology and attention queues
 visible without an unbounded page. The Evidence drawer retains the latest typed
@@ -448,7 +452,10 @@ It preserves bounded owned two-parent candidate topology with
 `rebase-merges=no-rebase-cousins`, independently proves the exact clean
 `merge-tree` result, retains old/new commit-parent mapping in the plan/receipt,
 and rejects octopus roots, cousin/external parents, topology drift, or tree
-mismatch before any write. Membership rewrites one candidate. After the
+mismatch before any write. When Git changes the replay commit count,
+`rebase_topology_changed` reports source/rebuilt/dropped counts and OIDs, likely
+already-present/empty-patch causes, and a safe source-rebase or reviewed-repair
+next action. Membership rewrites one candidate. After the
 mandatory provider rediscovery, `join`/`rejoin` require the exact live tail from
 the rebase receipt, while `new`/`renew` require the exact current default and no
 inferred candidate membership; a new caravan correctly has no join tail.
