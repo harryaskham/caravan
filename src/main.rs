@@ -53,6 +53,9 @@ enum Command {
     Init,
     /// Discover the current PR, all caravans, invalid fragments, and decisions.
     Status,
+    /// Validate repository policy without repository or provider access.
+    #[command(subcommand)]
+    Config(ConfigCommand),
     /// Serve the embedded multi-repository Caravan operations dashboard.
     Web(caravan::web::WebInput),
     /// Read the bounded repository event journal, optionally following new records.
@@ -119,6 +122,12 @@ struct LogCommand {
     /// Keep streaming new records until interrupted (CLI-only).
     #[arg(short = 'f', long)]
     follow: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    /// Strictly parse config and verify its declared Cara reader floor.
+    Check,
 }
 
 #[derive(Debug, Subcommand)]
@@ -265,6 +274,7 @@ fn run(cli: &Cli) -> Result<(), i32> {
     match &cli.command {
         Command::Init => run_init(cli),
         Command::Status => run_status(cli),
+        Command::Config(command) => run_config(cli, command),
         Command::Web(input) => run_web(cli, input),
         Command::Log(command) => run_log(cli, command),
         Command::NextCandidate => run_next_candidate(cli),
@@ -428,6 +438,45 @@ fn render_journal_record(record: &caravan::journal::JournalRecord) -> String {
 fn run_init(cli: &Cli) -> Result<(), i32> {
     let context = load_context(cli)?;
     emit_result(cli.json, caravan::initialization::init(&context))
+}
+
+fn run_config(cli: &Cli, command: &ConfigCommand) -> Result<(), i32> {
+    match command {
+        ConfigCommand::Check => {
+            let path = cli
+                .config
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(caravan::config::DEFAULT_CONFIG_PATH));
+            let result = caravan::config::CaravanConfig::load(&path).map(|config| {
+                serde_json::json!({
+                    "compatible": true,
+                    "config_version": config.version,
+                    "min_cara_version": config.min_cara_version,
+                    "reader_version": caravan::config::CARA_VERSION,
+                    "path": path,
+                    "provider_mutated": false
+                })
+            });
+            if cli.json {
+                emit_result(true, result)
+            } else {
+                match result {
+                    Ok(receipt) => {
+                        println!(
+                            "config compatible: {} (Cara {}, provider mutation: false)",
+                            receipt["path"].as_str().unwrap_or(".caravan/config.yaml"),
+                            caravan::config::CARA_VERSION
+                        );
+                        Ok(())
+                    }
+                    Err(error) => {
+                        eprintln!("cara: {error}");
+                        Err(2)
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn run_status(cli: &Cli) -> Result<(), i32> {
@@ -2279,6 +2328,19 @@ mod tests {
     #[test]
     fn command_tree_is_internally_consistent() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn config_check_is_an_offline_subcommand() {
+        let cli = Cli::try_parse_from([
+            "cara",
+            "--config",
+            "tests/fixtures/config-v0.0.7.yaml",
+            "config",
+            "check",
+        ])
+        .expect("config check parses");
+        assert!(matches!(cli.command, Command::Config(ConfigCommand::Check)));
     }
 
     #[test]

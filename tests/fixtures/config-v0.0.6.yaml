@@ -1,0 +1,12 @@
+version: 1
+force_merge: false
+rebase_on_join: false
+command_timeout_secs: 30
+repair:
+  materialization_timeout_secs: 180
+loop:
+  interval_secs: 60
+journal:
+  max_bytes: 8388608
+  max_archives: 3
+hooks: {}

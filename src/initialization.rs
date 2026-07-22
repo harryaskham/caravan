@@ -74,7 +74,11 @@ pub fn required_labels(
 const LEGACY_ACTIVE_COLOR: &str = "1D76DB";
 const LEGACY_ACTIVE_DESCRIPTION: &str = "Active member of a Caravan merge chain";
 
-const DEFAULT_CONFIG: &str = "version: 1\nforce_merge: false\nrebase_on_join: false\nagent_priority_labels:\n  - caravan-priority:high\n  - caravan-priority:normal\n  - caravan-priority:low\ncommand_timeout_secs: 30\nrepair:\n  materialization_timeout_secs: 180\nsync:\n  actions:\n    join_unlabelled_prs: false\n  max_candidates_per_tick: 8\n  max_mutations_per_tick: 64\n  max_github_requests_per_tick: 256\n  max_duration_secs: 120\nloop:\n  interval_secs: 60\njournal:\n  max_bytes: 8388608\n  max_archives: 3\nhooks: {}\n";
+const DEFAULT_CONFIG: &str = concat!(
+    "version: 1\nmin_cara_version: \"",
+    env!("CARGO_PKG_VERSION"),
+    "\"\nforce_merge: false\nrebase_on_join: false\nagent_priority_labels:\n  - caravan-priority:high\n  - caravan-priority:normal\n  - caravan-priority:low\ncommand_timeout_secs: 30\nrepair:\n  materialization_timeout_secs: 180\nsync:\n  actions:\n    join_unlabelled_prs: false\n  max_candidates_per_tick: 8\n  max_mutations_per_tick: 64\n  max_github_requests_per_tick: 256\n  max_duration_secs: 120\nloop:\n  interval_secs: 60\njournal:\n  max_bytes: 8388608\n  max_archives: 3\nhooks: {}\n"
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -948,6 +952,7 @@ mod tests {
             generated.agent_priority_labels,
             crate::config::CaravanConfig::default().agent_priority_labels
         );
+        assert_eq!(generated.min_cara_version, crate::config::CARA_VERSION);
 
         let mut replay_context = context(&directory);
         replay_context.config_existed = true;

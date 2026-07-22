@@ -1,0 +1,12 @@
+version: 1
+min_cara_version: "0.0.7"
+force_merge: false
+rebase_on_join: true
+sync:
+  actions:
+    join_unlabelled_prs: false
+  max_candidates_per_tick: 8
+  max_mutations_per_tick: 64
+  max_github_requests_per_tick: 256
+  max_duration_secs: 120
+hooks: {}

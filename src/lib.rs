@@ -71,6 +71,8 @@ CORE MODEL AND INVARIANTS
 FIRST USE AND EVERY SAFE TICK
 Cara resolves one exact Git worktree root before config or mutation, so nested
 invocations share root config/state; outside a non-bare worktree writes nothing.
+Before landing a config/pin change, CI runs `cara config check --config PATH` with
+the exact pinned binary. It performs strict parsing and no repository/provider access.
 1. Run `cara status` (prefer `--json` for automation). It reports initialization,
    effective `rebase_on_join` mode, current/merged branch context, every caravan,
    canonical admission order, pauses, exact base/head/candidate lineage, CI
