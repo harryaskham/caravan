@@ -2274,5 +2274,8 @@ mod tests {
         );
         assert!(APP_JS.contains("admissionFact(status, \"candidates\", pr)"));
         assert!(APP_CSS.contains(".dashboard.no-caravans .caravan-list .empty-state"));
+        assert!(APP_CSS.contains(".repo-rail { grid-column: 1;"));
+        assert!(APP_CSS.contains(".content { grid-column: 2;"));
+        assert!(APP_CSS.contains(".attention-rail { grid-column: 3;"));
     }
 }
