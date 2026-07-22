@@ -87,7 +87,9 @@ the exact pinned binary. It performs strict parsing and no repository/provider a
    remote PR without checkout or mutation. Add `--tail-pr T` (or `--head-pr H`)
    when proposing a join. Follow the typed `new`, `join`, `repair`, `wait`, or
    `reject` action from the returned receipt.
-4. Use `cara new`, `renew`, `join`, or `rejoin` only after that preflight.
+4. Use `cara new --pr N`, `renew --pr N`, `join --pr N`, or `rejoin --pr N`
+   for checkout-free Saloon actions; omit `--pr` only when the checkout resolves
+   one unique open PR. Use membership only after that preflight.
    With `rebase_on_join: true`, post-rewrite rediscovery is operation-specific:
    join/rejoin require the exact live tail, while new/renew require the exact
    current default generation and deliberately no join tail. Candidate-head,
@@ -518,6 +520,11 @@ pub struct CheckInput {
 /// Input for `new` and `renew`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Args)]
 pub struct CreateInput {
+    /// Exact remote candidate PR for checkout-free root admission.
+    #[arg(long, value_name = "PR", conflicts_with = "create_pr")]
+    #[serde(default)]
+    pub pr: Option<u64>,
+
     /// Create the current branch's PR non-interactively with `gh pr create --fill`.
     #[arg(long)]
     #[serde(default)]

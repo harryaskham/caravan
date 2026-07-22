@@ -2196,6 +2196,16 @@ mod tests {
         .unwrap();
         assert_eq!(plan.action.name(), "plan_sync");
         assert!(!plan.action.mutates());
+        let new: WebActionRequest = serde_json::from_value(json!({
+            "expected_refresh_sequence": 9,
+            "action": "new",
+            "input": {"pr": 42, "create_pr": false, "reason": "Saloon admission"}
+        }))
+        .unwrap();
+        let WebAction::New(input) = new.action else {
+            panic!("expected new action");
+        };
+        assert_eq!(input.pr, Some(42));
         assert!(
             serde_json::from_value::<WebActionRequest>(json!({
                 "expected_refresh_sequence": 1,

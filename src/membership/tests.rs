@@ -343,6 +343,32 @@ fn join_failure_event_carries_target_fleet_and_error_code() {
 }
 
 #[test]
+fn root_admission_never_treats_default_branch_as_empty_source() {
+    let candidate = pull_request(2, "two", "main", &[]);
+    let mut discovered = status(candidate, Vec::new());
+    discovered.current_pr = None;
+    discovered.current_branch = Some("main".to_owned());
+    let mut request = MembershipRequest {
+        operation: MembershipOperation::New,
+        create_pr: false,
+        tail_pr: None,
+        head_pr: None,
+        reason: Some("Saloon admission".to_owned()),
+        priority_label: None,
+        agent_priority_labels: Vec::new(),
+    };
+
+    let missing = validate_membership_source_request(&discovered, &request).unwrap_err();
+    assert_eq!(missing.code(), "current_pr_not_found");
+    assert_eq!(missing.details().unwrap()["mutated"], false);
+
+    request.create_pr = true;
+    let default = validate_membership_source_request(&discovered, &request).unwrap_err();
+    assert_eq!(default.code(), "create_pr_on_default_branch");
+    assert_eq!(default.details().unwrap()["mutated"], false);
+}
+
+#[test]
 fn join_refuses_stale_root_before_any_provider_mutation() {
     let mut root = pull_request(1, "one", "main", &[ACTIVE_LABEL]);
     root.base.oid = CommitOid("stale-main".to_owned());

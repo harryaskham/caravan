@@ -2344,6 +2344,18 @@ mod tests {
     }
 
     #[test]
+    fn new_accepts_remote_candidate_without_using_server_checkout_branch() {
+        let cli = Cli::try_parse_from(["cara", "new", "--pr", "43"])
+            .expect("remote root admission parses");
+        let Command::New(input) = cli.command else {
+            panic!("expected new");
+        };
+        assert_eq!(input.pr, Some(43));
+        assert!(!input.create_pr);
+        assert!(Cli::try_parse_from(["cara", "new", "--pr", "43", "--create-pr"]).is_err());
+    }
+
+    #[test]
     fn join_accepts_remote_candidate_and_explicit_tail() {
         let cli = Cli::try_parse_from(["cara", "join", "--pr", "43", "--tail-pr", "42"])
             .expect("remote atomic join parses");

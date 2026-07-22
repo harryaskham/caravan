@@ -177,12 +177,12 @@ Remote `--pr` preflight must select the canonical first priority/FIFO attempt. A
 
 ### Creation and membership
 
-- `cara new [--create-pr]` — create a one-PR caravan from the current branch's open PR.
-- `cara join [--tail-pr N | --head-pr N] [--create-pr]` — append the current PR to a valid tail.
-- `cara renew [--create-pr]` — reevaluate an evicted current PR as a new caravan.
-- `cara rejoin [--tail-pr N | --head-pr N] [--create-pr]` — reevaluate an evicted current PR and append it.
+- `cara new [--pr N | --create-pr]` — create a one-PR caravan from one exact remote Saloon PR, the current branch's unique open PR, or an explicitly created topic-branch PR.
+- `cara join [--pr N] [--tail-pr N | --head-pr N] [--create-pr]` — append an exact remote/current PR to a valid tail.
+- `cara renew [--pr N | --create-pr]` — reevaluate an exact evicted PR as a new caravan.
+- `cara rejoin [--pr N] [--tail-pr N | --head-pr N] [--create-pr]` — reevaluate an exact evicted PR and append it.
 
-Without a current PR, automation fails unless `--create-pr` is set. Creation uses the non-interactive equivalent of `gh pr create --fill` and then continues. In a human TTY, `new` and local `join` offer that continuation automatically. They publish an unpublished topic branch only after confirmation. When invoked from the default branch, the assistant displays the complete short status and may, after confirmation, create a topic branch, stage all displayed changes, commit with an editable default message, push, create the PR, and resume. A clean default branch can only become a new topic branch; Cara explains that a real commit is required and never fabricates an empty change. `NO_COLOR` suppresses ANSI styling; terminal OSC-8 PR links and titles are presentation-only and never enter JSON/MCP.
+Without a current PR, automation fails unless exact `--pr N` or explicit `--create-pr` is set. Default-branch `HEAD` is never treated as an empty membership source. Creation uses the non-interactive equivalent of `gh pr create --fill` and then continues. In a human TTY, `new` and local `join` offer that continuation automatically. They publish an unpublished topic branch only after confirmation. When invoked from the default branch, the assistant displays the complete short status and may, after confirmation, create a topic branch, stage all displayed changes, commit with an editable default message, push, create the PR, and resume. A clean default branch can only become a new topic branch; Cara explains that a real commit is required and never fabricates an empty change. `NO_COLOR` suppresses ANSI styling; terminal OSC-8 PR links and titles are presentation-only and never enter JSON/MCP.
 
 `join`/`rejoin` without a target succeed only when exactly one valid caravan tail exists; otherwise they return candidate tails and require an explicit target.
 

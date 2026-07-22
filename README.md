@@ -93,9 +93,9 @@ cara config check [--config PATH]  # strict, read-only pin/config compatibility
 cara status
 cara web --repo PATH [--repo PATH ...] [--read-only]
 cara check [--pr N] [--tail-pr N | --head-pr N]
-cara new [--create-pr]
-cara join [--tail-pr N | --head-pr N] [--create-pr]
-cara renew | cara rejoin
+cara new [--pr N | --create-pr]
+cara join [--pr N] [--tail-pr N | --head-pr N] [--create-pr]
+cara renew [--pr N | --create-pr] | cara rejoin [--pr N]
 cara show | cara next | cara prev
 cara plan sync [--all] [--rerun-failed]
 cara sync [--all] [--rerun-failed] | cara loop [--once] [--manual --shell COMMAND]

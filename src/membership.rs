@@ -368,7 +368,7 @@ pub fn new(context: &AppContext, input: &CreateInput) -> Result<MembershipOutput
             priority_label: input.priority_label.clone(),
             agent_priority_labels: context.config.agent_priority_labels.clone(),
         },
-        None,
+        input.pr,
     )
 }
 
@@ -385,7 +385,7 @@ pub fn renew(context: &AppContext, input: &CreateInput) -> Result<MembershipOutp
             priority_label: input.priority_label.clone(),
             agent_priority_labels: context.config.agent_priority_labels.clone(),
         },
-        None,
+        input.pr,
     )
 }
 
@@ -543,6 +543,41 @@ fn revalidate_join_root(
             "safe_next_action": "rediscover and sync the selected caravan before retrying join",
         })),
     ))
+}
+
+fn validate_membership_source_request(
+    status: &StatusOutput,
+    request: &MembershipRequest,
+) -> Result<(), AppError> {
+    if status.current_pr.is_none() && !request.create_pr {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "current_pr_not_found",
+            "root admission requires an explicit --pr or a checkout with one unique open PR",
+            Some(json!({
+                "current_branch": status.current_branch,
+                "mutated": false,
+                "safe_next_action": "rerun with `new --pr <PR>` (or `renew --pr <PR>`) for a Saloon candidate",
+            })),
+        ));
+    }
+    if status.current_pr.is_none()
+        && request.create_pr
+        && status.current_branch.as_deref() == Some(status.default_branch.as_str())
+    {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "create_pr_on_default_branch",
+            "cannot create a pull request directly from the default branch",
+            Some(json!({
+                "branch": status.current_branch,
+                "default_branch": status.default_branch,
+                "mutated": false,
+                "safe_next_action": "check out a topic branch with a unique patch, then rerun --create-pr",
+            })),
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -925,6 +960,7 @@ fn execute_locked(
     );
     let mut join_source_receipt = None;
     if context.config.rebase_on_join {
+        validate_membership_source_request(&status, request)?;
         let target = initial_join_target.as_ref();
         if let Some(target) = target
             && let Err(error) = require_current_join_root(&status, target)
