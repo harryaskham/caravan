@@ -1,5 +1,7 @@
 version: 1
-force_merge: false
+# This repository dogfoods every mutating Cara policy. Force remains one-shot,
+# exact-generation operator intent and never bypasses textual conflicts.
+force_merge: true
 # Explicit opt-in: rewrites owned PR branches under exact force-with-lease.
 rebase_on_join: true
 # Highest to lowest; ties and unlabelled attempts use immutable PR createdAt FIFO.
@@ -8,9 +10,17 @@ agent_priority_labels:
   - caravan-priority:normal
   - caravan-priority:low
 command_timeout_secs: 30
-# Physical-chain planning preserves a conservative N-member apply reserve
-# inside this one absolute deadline before any provider or branch mutation.
+# Automatic growth is sync-all-only and starts only after the existing fleet
+# converges. Every candidate, provider call, mutation, and wall-clock phase is
+# bounded; incompatible generations receive exact advisory skip receipts.
 sync:
+  actions:
+    join_unlabelled_prs: true
+  max_candidates_per_tick: 8
+  max_mutations_per_tick: 64
+  max_github_requests_per_tick: 256
+  # Physical-chain planning preserves a conservative N-member apply reserve
+  # inside this one absolute deadline before any provider or branch mutation.
   max_duration_secs: 900
 repair:
   materialization_timeout_secs: 180

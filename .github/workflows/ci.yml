@@ -3,7 +3,10 @@ name: CI
 on:
   push:
     branches: [main]
+  # Physical Caravan children target predecessor branches, so this trigger must
+  # remain unfiltered and include every event that can refresh stacked CI.
   pull_request:
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
   workflow_dispatch:
 
 concurrency:

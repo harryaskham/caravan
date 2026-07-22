@@ -59,6 +59,14 @@ after the same check passes.
   evidence receipt; unchanged generations are not retried, while candidate,
   default, tail, config, or heuristic changes invalidate the skip automatically.
 
+## Dogfooding
+
+Caravan develops Caravan through its own checked-in physical-chain, automatic
+admission, force, CI, and repair policies. Cacophony worker reintegration is
+being moved to the transactional `pr_cara_join` handoff so every feature lands
+through the same path operators use. See [`docs/dogfood.md`](docs/dogfood.md)
+for rollout gates, daily operation, evidence capture, and rollback.
+
 ## V1 command surface
 
 Every bounded queue operation is implemented by one shared typed library path
