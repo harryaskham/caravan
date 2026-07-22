@@ -284,7 +284,11 @@ RECOVERY, LOCKS, AND OBSERVABILITY
   and must deduplicate retries. Hook failure cannot roll back completed GitHub
   work; blocking hooks return typed partial receipts.
 - `cara show`, `next`, `prev`, and `van list|next|prev` are navigation surfaces;
-  they never authorize skipping admission or mutation preflight.
+  they never authorize skipping admission or mutation preflight. If a clean,
+  non-current destination lags a Cara physical rewrite, navigation reverifies
+  the provider OID, atomically preserves the old local OID under
+  `refs/cara-backup/navigation/*`, reports that receipt, and then checks out the
+  exact branch. Current/other-worktree branches and dirty state fail closed.
 - `--json` and MCP return the same typed envelopes and schemas. Unknown provider
   values are preserved rather than guessed into success. A subprocess exceeding
   its independent stdout/stderr capture bound returns `command_output_limit`
@@ -788,7 +792,7 @@ pub fn build_router() -> ToolRouter<AppContext> {
     );
     router.add_typed_tool_with_output_schema(
         "next",
-        "Check out the next PR toward the current caravan tail. Local worktrees must be clean and unambiguous; clean or finish Git state before retrying an unsafe_checkout error.",
+        "Check out the next PR toward the current caravan tail. A stale clean non-current destination is retained under an exact internal backup ref before following a reverified Cara-rewritten provider head; current/other-worktree branches and dirty state fail closed.",
         |context: &AppContext, _input: EmptyInput| {
             navigation::navigate(
                 context,
@@ -799,7 +803,7 @@ pub fn build_router() -> ToolRouter<AppContext> {
     );
     router.add_typed_tool_with_output_schema(
         "prev",
-        "Check out the previous PR toward the current caravan head. Local worktrees must be clean and unambiguous; clean or finish Git state before retrying an unsafe_checkout error.",
+        "Check out the previous PR toward the current caravan head. A stale clean non-current destination is retained under an exact internal backup ref before following a reverified Cara-rewritten provider head; current/other-worktree branches and dirty state fail closed.",
         |context: &AppContext, _input: EmptyInput| {
             navigation::navigate(
                 context,

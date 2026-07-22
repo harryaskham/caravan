@@ -157,7 +157,12 @@ compatible and preserved. See [`docs/first-use.md`](docs/first-use.md).
 
 `cara van next` on the default branch enters the first caravan head; ordinary
 `cara next` remains chain-local and requires the current branch to map to an
-open caravan PR.
+open caravan PR. Navigation follows the exact provider generation after a Cara
+physical rewrite. If a clean, non-current destination branch is stale locally,
+Cara atomically retains its old OID under `refs/cara-backup/navigation/*`,
+advances the named branch to the reverified provider OID, and reports the backup
+ref before checkout. It never resets the current branch or a branch checked out
+in another worktree, and never discards a local generation.
 
 For human flow testing, `cara loop --manual [--shell 'zsh -i']` runs normal
 sync-all ticks and opens a real inherited-TTY shell only at an

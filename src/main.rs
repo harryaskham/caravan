@@ -2121,6 +2121,15 @@ fn run_navigation(
                 "checked out PR #{} on `{}` ({})",
                 output.to_pr, output.branch, output.oid
             );
+            if let Some(reconciliation) = output.local_branch_reconciliation {
+                println!(
+                    "preserved stale local {} at `{}`; advanced {} -> {}",
+                    reconciliation.previous_oid,
+                    reconciliation.backup_ref,
+                    reconciliation.previous_oid,
+                    reconciliation.provider_oid,
+                );
+            }
             Ok(())
         }
         Err(error) => emit_human_error(error),
