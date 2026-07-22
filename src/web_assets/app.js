@@ -6,8 +6,15 @@
     dashboard: document.querySelector("#dashboard"),
     overview: document.querySelector("#repo-overview"),
     caravans: document.querySelector("#caravans"),
-    waiting: document.querySelector("#waiting-prs"),
+    saloon: document.querySelector("#saloon"),
+    saloonCount: document.querySelector("#saloon-count"),
     decisions: document.querySelector("#decisions"),
+    attentionCount: document.querySelector("#attention-count"),
+    workspace: document.querySelector("#workspace"),
+    repositorySidebar: document.querySelector("#repository-sidebar"),
+    attentionSidebar: document.querySelector("#attention-sidebar"),
+    toggleRepositories: document.querySelector("#toggle-repositories"),
+    toggleAttention: document.querySelector("#toggle-attention"),
     connection: document.querySelector("#connection"),
     activity: document.querySelector("#activity"),
     refresh: document.querySelector("#refresh-all"),
@@ -28,6 +35,21 @@
   let selectedRepo = null;
   let requestInFlight = false;
   let inspectorMode = null;
+  const sidebarState = {
+    repositories: window.localStorage.getItem("caravan.sidebar.repositories") !== "collapsed",
+    attention: window.localStorage.getItem("caravan.sidebar.attention") !== "collapsed",
+  };
+  if (window.matchMedia("(max-width: 900px)").matches) {
+    if (!window.localStorage.getItem("caravan.sidebar.repositories")) sidebarState.repositories = false;
+    if (!window.localStorage.getItem("caravan.sidebar.attention")) sidebarState.attention = false;
+  }
+  const SALOON_ORDER = ["ready", "saddling", "other", "bounty"];
+  const SALOON_META = {
+    ready: ["Ready to Roll", "Eligible for exact tail/new-caravan preflight now"],
+    saddling: ["Saddling Up", "Known work or provider state is still incomplete"],
+    other: ["Other", "More provider evidence is needed before classification"],
+    bounty: ["Bounty List", "Skipped or evicted and not yet fixed"],
+  };
 
   const escapeHtml = (value) => String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -43,6 +65,26 @@
   const openPr = (pr) => String(pr?.state ?? "").toLowerCase() === "open";
   const normalized = (value) => String(value ?? "unknown").toLowerCase();
   const selected = () => state?.repositories?.find((item) => item.id === selectedRepo) ?? null;
+
+  function applySidebarState() {
+    ui.workspace.classList.toggle("repositories-collapsed", !sidebarState.repositories);
+    ui.workspace.classList.toggle("attention-collapsed", !sidebarState.attention);
+    ui.repositorySidebar.hidden = !sidebarState.repositories;
+    ui.attentionSidebar.hidden = !sidebarState.attention;
+    ui.toggleRepositories.setAttribute("aria-expanded", String(sidebarState.repositories));
+    ui.toggleAttention.setAttribute("aria-expanded", String(sidebarState.attention));
+  }
+
+  function toggleSidebar(name, force) {
+    sidebarState[name] = force ?? !sidebarState[name];
+    if (sidebarState[name] && window.matchMedia("(max-width: 900px)").matches) {
+      const other = name === "repositories" ? "attention" : "repositories";
+      sidebarState[other] = false;
+      window.localStorage.setItem(`caravan.sidebar.${other}`, "collapsed");
+    }
+    window.localStorage.setItem(`caravan.sidebar.${name}`, sidebarState[name] ? "expanded" : "collapsed");
+    applySidebarState();
+  }
 
   function empty(message) {
     const node = ui.empty.content.firstElementChild.cloneNode(true);
@@ -119,7 +161,7 @@
     const caravans = status?.analysis?.fleet?.caravans ?? [];
     const problems = status?.analysis?.fleet?.problems ?? [];
     const activeMembers = new Set(caravans.flatMap((caravan) => caravan.members));
-    const waiting = prValues(status).filter((pr) => openPr(pr) && !activeMembers.has(pr.number));
+    const saloon = prValues(status).filter((pr) => openPr(pr) && !activeMembers.has(pr.number));
     const updated = repo.refreshed_unix_ms ? new Date(repo.refreshed_unix_ms).toLocaleTimeString() : "Never";
     const mode = status?.rebase_on_join?.state ?? "unknown";
     const webhook = state?.webhook;
@@ -132,7 +174,7 @@
         <p>Updated ${escapeHtml(updated)} · physical chains ${escapeHtml(mode)} · ${escapeHtml(webhookText)}</p>
       </article>
       <article class="overview-card"><span class="metric-label">Caravans</span><strong class="metric">${caravans.length}</strong><p>${activeMembers.size} PRs</p></article>
-      <article class="overview-card"><span class="metric-label">Waiting</span><strong class="metric">${waiting.length}</strong><p>not enrolled</p></article>
+      <article class="overview-card"><span class="metric-label">Saloon</span><strong class="metric">${saloon.length}</strong><p>not yet joined</p></article>
       <article class="overview-card"><span class="metric-label">Attention</span><strong class="metric">${problems.length + (repo.error ? 1 : 0)}</strong><p>${state.read_only ? "read only" : "mutable"}</p></article>`;
   }
 
@@ -195,41 +237,72 @@
     }).join("");
   }
 
+  function admissionFact(status, kind, pr) {
+    return (status?.admission?.[kind] ?? []).find((item) => item.pr === pr.number) ?? null;
+  }
+
   function reasonForPr(status, pr) {
     if (pr.draft) return "Draft pull request";
     if (hasLabel(pr, "caravan-evicted")) return "Explicitly evicted; renew or rejoin after fresh validation";
-    const rejection = status?.admission?.rejected?.find((item) => item.pr === pr.number);
+    const rejection = admissionFact(status, "rejected", pr);
     if (rejection) return rejection.reason;
-    const skipped = status?.admission?.skipped?.find((item) => item.pr === pr.number);
+    const skipped = admissionFact(status, "skipped", pr);
     if (skipped) return skipped.reason;
-    const candidate = status?.admission?.candidates?.find((item) => item.pr === pr.number);
+    const candidate = admissionFact(status, "candidates", pr);
     if (candidate) return candidate.reason;
     if (!hasLabel(pr, "caravan")) return "Not enrolled; exact candidate and compatibility preflight required";
     return "Open but outside a valid active caravan; inspect topology problems";
   }
 
-  function renderWaiting(repo) {
+  function saloonClassification(status, pr) {
+    // Fresh candidate evidence wins over stale skip labels: once fixed, an
+    // unenrolled PR returns to Ready to Roll without manual UI bookkeeping.
+    if (admissionFact(status, "candidates", pr) && !pr.draft) return "ready";
+    if (hasLabel(pr, "caravan-evicted") || hasLabel(pr, "caravan-join-skipped") || admissionFact(status, "skipped", pr)) return "bounty";
+    const checkStates = (pr.checks ?? []).map((check) => normalized(check.state));
+    if (pr.draft || admissionFact(status, "rejected", pr) || checkStates.some((value) => value !== "success")) return "saddling";
+    return "other";
+  }
+
+  function saloonCard(status, pr, group, tail) {
+    const admission = group === "ready"
+      ? tail
+        ? actionButton("Join tail", "join", { pr: pr.number, tail_pr: tail, create_pr: false, reason: "Caravan dashboard canonical admission", priority_label: null }, "primary")
+        : actionButton("New caravan", "new", { pr: pr.number, create_pr: false, reason: "Caravan dashboard canonical admission", priority_label: null }, "primary")
+      : "";
+    return `<article class="queue-card saloon-card">
+      <div class="pr-kicker">${prAnchor(pr, `PR #${pr.number}`, "pr-number")}${pr.draft ? badge("Draft") : badge(SALOON_META[group][0], group === "ready" ? "good" : group === "bounty" ? "bad" : "warn")}</div>
+      <h3>${prAnchor(pr, pr.title || `Pull request #${pr.number}`, "pr-title-link")}</h3>
+      <p><span class="mono">${escapeHtml(pr.head?.name)}@${shortOid(pr.head?.oid)}</span> → <span class="mono">${escapeHtml(pr.base?.name)}</span></p>
+      <p class="reason">${escapeHtml(reasonForPr(status, pr))}</p>
+      ${checkRows(pr.checks)}
+      <div class="card-actions">${actionButton("Preflight", "check", { pr: pr.number, ...(tail ? { tail_pr: tail } : {}) }, "", false)}${admission}</div>
+    </article>`;
+  }
+
+  function renderSaloon(repo) {
     const status = repo.status;
     const active = new Set((status?.analysis?.fleet?.caravans ?? []).flatMap((item) => item.members));
-    const waiting = prValues(status).filter((pr) => openPr(pr) && !active.has(pr.number));
-    if (!waiting.length) {
-      ui.waiting.innerHTML = empty("No waiting pull requests");
+    const saloon = prValues(status).filter((pr) => openPr(pr) && !active.has(pr.number));
+    ui.saloonCount.textContent = `${saloon.length} ${saloon.length === 1 ? "PR" : "PRs"}`;
+    if (!saloon.length) {
+      ui.saloon.innerHTML = empty("The Saloon is empty");
       return;
     }
     const firstCaravan = status?.analysis?.fleet?.caravans?.[0];
     const tail = firstCaravan?.members?.at(-1);
-    ui.waiting.innerHTML = waiting.map((pr) => {
-      const admission = hasLabel(pr, "caravan-evicted")
-        ? tail ? actionButton("Rejoin", "rejoin", { pr: pr.number, tail_pr: tail, create_pr: false, reason: "Cara web operator rejoin", priority_label: null }, "primary") : actionButton("Renew", "renew", { pr: pr.number, create_pr: false, reason: "Cara web operator renew", priority_label: null }, "primary")
-        : tail ? actionButton("Join tail", "join", { pr: pr.number, tail_pr: tail, create_pr: false, reason: "Cara web canonical admission", priority_label: null }, "primary") : actionButton("New caravan", "new", { pr: pr.number, create_pr: false, reason: "Cara web canonical admission", priority_label: null }, "primary");
-      return `<article class="queue-card">
-        <div class="pr-kicker">${prAnchor(pr, `PR #${pr.number}`, "pr-number")}${pr.draft ? badge("Draft") : badge("Open", "info")}</div>
-        <h3>${prAnchor(pr, pr.title || `Pull request #${pr.number}`, "pr-title-link")}</h3>
-        <p><span class="mono">${escapeHtml(pr.head?.name)}@${shortOid(pr.head?.oid)}</span> → <span class="mono">${escapeHtml(pr.base?.name)}</span></p>
-        <p class="reason">${escapeHtml(reasonForPr(status, pr))}</p>
-        ${checkRows(pr.checks)}
-        <div class="card-actions">${actionButton("Preflight", "check", { pr: pr.number, ...(tail ? { tail_pr: tail } : {}) }, "", false)}${admission}</div>
-      </article>`;
+    const candidateOrder = new Map((status?.admission?.candidates ?? []).map((item, index) => [item.pr, index]));
+    saloon.sort((left, right) => (candidateOrder.get(left.number) ?? Number.MAX_SAFE_INTEGER) - (candidateOrder.get(right.number) ?? Number.MAX_SAFE_INTEGER) || left.number - right.number);
+    const groups = Object.fromEntries(SALOON_ORDER.map((name) => [name, []]));
+    saloon.forEach((pr) => groups[saloonClassification(status, pr)].push(pr));
+    ui.saloon.innerHTML = SALOON_ORDER.map((name) => {
+      const [title, description] = SALOON_META[name];
+      const rows = groups[name];
+      const open = name === "ready" || name === "saddling";
+      return `<details class="saloon-group" data-saloon-group="${name}" ${open ? "open" : ""}>
+        <summary><span><strong>${title}</strong><small>${description}</small></span>${badge(rows.length, rows.length ? (name === "ready" ? "good" : name === "bounty" ? "bad" : "warn") : "")}</summary>
+        <div class="saloon-cards">${rows.length ? rows.map((pr) => saloonCard(status, pr, name, tail)).join("") : empty(`No PRs in ${title}`)}</div>
+      </details>`;
     }).join("");
   }
 
@@ -243,6 +316,7 @@
       details: problem,
       tone: problem.kind === "unknown" ? "warn" : "bad",
     }));
+    ui.attentionCount.textContent = String(items.length);
     if (!items.length) {
       ui.decisions.innerHTML = empty("No unresolved decisions");
       return;
@@ -331,8 +405,9 @@
     renderTabs();
     renderOverview(repo);
     renderCaravans(repo);
-    renderWaiting(repo);
+    renderSaloon(repo);
     renderDecisions(repo);
+    applySidebarState();
     if (inspectorMode) openInspector(inspectorMode);
   }
 
@@ -434,6 +509,12 @@
   ui.evidence.addEventListener("click", () => openInspector("evidence"));
   ui.config.addEventListener("click", () => openInspector("config"));
   ui.closeInspector.addEventListener("click", () => { inspectorMode = null; ui.inspector.hidden = true; });
+  ui.toggleRepositories.addEventListener("click", () => toggleSidebar("repositories"));
+  ui.toggleAttention.addEventListener("click", () => toggleSidebar("attention"));
+  ui.workspace.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-close-sidebar]");
+    if (button) toggleSidebar(button.dataset.closeSidebar, false);
+  });
   ui.tabs.addEventListener("click", (event) => {
     const button = event.target.closest("[data-repo]");
     if (!button) return;
@@ -447,6 +528,7 @@
     try { input = JSON.parse(button.dataset.webInput || "{}"); } catch { toast("Invalid embedded action payload"); return; }
     performAction(button.dataset.webAction, input, button);
   });
+  applySidebarState();
   fetchState();
   setInterval(() => fetchState({ quiet: true }), 5000);
 })();

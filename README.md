@@ -202,8 +202,12 @@ and provider identity. The initial server refuses non-loopback listeners,
 canonicalizes and deduplicates paths, periodically returns the same typed status
 used by CLI/JSON/MCP, and applies strict CSP/anti-frame/no-store headers. The
 responsive one-page dashboard renders trail-linked caravans, linked GitHub PRs,
-exact generations and check failures, unenrolled PR reasons, and current
-problems/decisions. `Plan sync` runs the same fresh physical/conflict/lease and
+exact generations and check failures. Repositories and attention decisions live
+in independently collapsible left/right sidebars, leaving the center for repo
+metadata, compact active topology, and the **Saloon**. The Saloon
+deterministically groups unenrolled PRs as Ready to Roll, Saddling Up, Other,
+then Bounty List; each group is collapsible, and fresh
+candidate evidence moves a fixed unjoined PR back to Ready to Roll. `Plan sync` runs the same fresh physical/conflict/lease and
 first auto-admission selection preflight without provider writes, then renders
 ordered exact actions and rediscovery barriers before Apply. Bounded inner lists keep fleet topology and attention queues
 visible without an unbounded page. The Evidence drawer retains the latest typed

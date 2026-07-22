@@ -2246,5 +2246,23 @@ mod tests {
         assert!(APP_JS.contains("plan_sync"));
         assert!(APP_JS.contains("Action progress"));
         assert!(APP_JS.contains("Journal receipt"));
+        assert!(INDEX_HTML.contains("<h1>Caravan</h1>"));
+        assert!(!INDEX_HTML.contains("Caravan Control"));
+        assert!(!INDEX_HTML.contains("Waiting at the rail"));
+        assert!(INDEX_HTML.contains("id=\"repository-sidebar\""));
+        assert!(INDEX_HTML.contains("id=\"attention-sidebar\""));
+        assert!(INDEX_HTML.contains("id=\"saloon\""));
+        for label in ["Ready to Roll", "Saddling Up", "Other", "Bounty List"] {
+            assert!(
+                APP_JS.contains(label),
+                "missing Saloon classification {label}"
+            );
+        }
+        assert!(
+            APP_JS
+                .contains("const SALOON_ORDER = [\"ready\", \"saddling\", \"other\", \"bounty\"]")
+        );
+        assert!(APP_JS.contains("admissionFact(status, \"candidates\", pr)"));
+        assert!(APP_CSS.contains(".dashboard.no-caravans .caravan-list .empty-state"));
     }
 }

@@ -4,15 +4,16 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
-  <title>Cara · Caravan operations</title>
+  <title>Caravan · Repository operations</title>
   <link rel="stylesheet" href="/assets/app.css">
   <script defer src="/assets/app.js"></script>
 </head>
 <body>
   <a class="skip-link" href="#workspace">Skip to caravan workspace</a>
   <header class="masthead">
+    <button id="toggle-repositories" class="sidebar-toggle" type="button" aria-controls="repository-sidebar" aria-expanded="true" title="Toggle repositories">☰ <span>Repositories</span></button>
     <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
-    <div class="brand-copy"><h1>Cara <span>Caravan Control</span></h1></div>
+    <div class="brand-copy"><h1>Caravan</h1></div>
     <div class="masthead-actions">
       <span id="activity" class="activity" hidden aria-label="Refreshing"></span>
       <span id="connection" class="connection" role="status">Connecting</span>
@@ -21,12 +22,13 @@
       <button id="show-evidence" class="button" type="button" hidden>Evidence</button>
       <button id="show-config" class="button" type="button" hidden>Config</button>
       <button id="refresh-all" class="button" type="button">Refresh</button>
+      <button id="toggle-attention" class="sidebar-toggle" type="button" aria-controls="attention-sidebar" aria-expanded="true" title="Toggle attention">Attention <span id="attention-count" class="sidebar-count">0</span></button>
     </div>
   </header>
 
   <main id="workspace" class="workspace" tabindex="-1">
-    <nav class="repo-rail" aria-label="Repositories">
-      <div class="rail-heading"><h2>Repositories</h2></div>
+    <nav id="repository-sidebar" class="repo-rail side-panel" aria-label="Repositories">
+      <div class="rail-heading"><h2>Repositories</h2><button class="panel-close" type="button" data-close-sidebar="repositories" aria-label="Collapse repositories">‹</button></div>
       <div id="repo-tabs" class="repo-tabs" role="tablist" aria-label="Repository views"></div>
     </nav>
 
@@ -36,23 +38,22 @@
 
         <section class="section-block caravan-section" aria-labelledby="caravans-title">
           <div class="section-heading">
-            <div><p class="eyebrow">Active topology</p><h2 id="caravans-title">Caravans</h2></div>
+            <div><p class="eyebrow">Active topology</p><h2 id="caravans-title">Active caravans</h2></div>
           </div>
           <div id="caravans" class="caravan-list"></div>
         </section>
 
-        <section class="split-grid">
-          <div class="section-block compact" aria-labelledby="waiting-title">
-            <div class="section-heading"><div><p class="eyebrow">Not enrolled</p><h2 id="waiting-title">Waiting at the rail</h2></div></div>
-            <div id="waiting-prs" class="card-stack"></div>
-          </div>
-          <div class="section-block compact" aria-labelledby="decisions-title">
-            <div class="section-heading"><div><p class="eyebrow">Attention</p><h2 id="decisions-title">Decisions &amp; blockers</h2></div></div>
-            <div id="decisions" class="card-stack"></div>
-          </div>
+        <section class="section-block compact saloon-section" aria-labelledby="saloon-title">
+          <div class="section-heading"><div><p class="eyebrow">Not yet joined</p><h2 id="saloon-title">Saloon</h2></div><span id="saloon-count" class="section-count">0 PRs</span></div>
+          <div id="saloon" class="saloon-groups"></div>
         </section>
       </div>
     </section>
+
+    <aside id="attention-sidebar" class="attention-rail side-panel" aria-labelledby="decisions-title">
+      <div class="rail-heading"><div><p class="eyebrow">Attention</p><h2 id="decisions-title">Decisions &amp; blockers</h2></div><button class="panel-close" type="button" data-close-sidebar="attention" aria-label="Collapse decisions and blockers">›</button></div>
+      <div id="decisions" class="card-stack"></div>
+    </aside>
   </main>
 
   <aside id="inspector" class="inspector" hidden aria-labelledby="inspector-title">
