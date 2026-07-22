@@ -4,7 +4,8 @@
    and required labels are ready.
 2. If not ready, run `cara init` (or MCP tool `init`). This explicit operation:
    - atomically creates an absent `.caravan/config.yaml` with safe version-1
-     defaults, using create-new semantics;
+     defaults and the running release as `min_cara_version`, using create-new
+     semantics;
    - preserves every existing config byte and rejects invalid existing config;
    - verifies repository `WRITE` (or stronger) permission, squash auto-merge,
      and protected default-branch check/review policy;
@@ -17,6 +18,13 @@
    operator-owned label. Rerun `cara init`; retries and concurrent creation are
    safe and converge by exact re-read.
 5. Run `cara status` again, then use `new`, `join`, or `sync`.
+
+Before merging any config/pin update, run the exact pinned binary as
+`cara --config .caravan/config.yaml config check`. This command only reads and
+strictly parses the config; its receipt records `provider_mutated: false`. A
+policy section introduced by a newer release must raise `min_cara_version` in
+the same change that advances the pin. Existing configs without the gate remain
+legacy-compatible, while unknown or misspelled policy keys are still rejected.
 
 Canonical labels:
 

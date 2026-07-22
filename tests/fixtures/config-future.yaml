@@ -1,0 +1,4 @@
+version: 1
+min_cara_version: "9.0.0"
+future_security_policy:
+  require_attestation: true

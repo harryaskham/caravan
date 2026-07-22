@@ -97,6 +97,18 @@ if [ -n "$binary" ]; then
   [[ "$status_json" == *"\"current_version\":\"$version\""* ]]
   [[ "$status_json" == *"\"install_dir\":\"$expected_install_dir\""* ]]
   [[ "$status_json" == *'"next_staged":false'* ]]
+
+  # Reader/config compatibility is an offline release gate. This fixture is the
+  # sync policy that broke Cara 0.0.6; no GitHub/provider command is involved.
+  config_json="$(
+    HOME="$workspace/home" PATH="$workspace/home/.cargo/bin" \
+      "$workspace/home/.cargo/bin/cara" --json \
+      --config tests/fixtures/config-v0.0.7.yaml config check
+  )"
+  [[ "$config_json" == *'"status":"success"'* ]]
+  [[ "$config_json" == *'"compatible":true'* ]]
+  [[ "$config_json" == *'"min_cara_version":"0.0.7"'* ]]
+  [[ "$config_json" == *'"provider_mutated":false'* ]]
 fi
 
 echo "release contract ok: cara $version"

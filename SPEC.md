@@ -88,6 +88,24 @@ provider mutation authority.
 
 Before config discovery or any mutation, `cara` resolves the exact non-bare Git worktree root with a bounded noninteractive Git query. Root and nested invocations share that repository identity, default `.caravan/config.yaml`, locks, journal, repair state, status cache, and domain behavior. Linked worktrees retain their own worktree root while common-Git state uses Git's common directory. A relative explicit `--config` remains relative to the invocation directory and is converted to an absolute identity; outside Git and bare repositories return `repository_not_found` and write nothing.
 
+### Rolling config compatibility
+
+Repository policy remains strict: unknown top-level and nested keys are rejected,
+so misspellings and unaudited security policy never silently degrade. Every newly
+generated config declares `min_cara_version`. Before strict schema parsing, Cara
+reads only that audited gate; a reader below the floor returns the typed,
+non-mutating `cara_upgrade_required` error with running/required versions and an
+upgrade action. This ordering also gives a stable upgrade diagnostic when the
+new policy contains sections unknown to the older reader contract.
+
+Adding a policy section requires advancing `min_cara_version` to its first Cara
+release. A consuming repository must update its pinned Cara runtime and config in
+the same change, and CI must run `CaravanConfig::check_reader_compatibility` (or
+parse the repository config with that exact pinned binary) before merge. Lowering
+the gate or adding a section without advancing it is not a supported rollout.
+Old configs without the gate remain readable with safe defaults; arbitrary
+unknown fields never become an extension mechanism.
+
 `cara` discovers the base repository, default branch, current local branch, PRs, labels, bases, head revisions, auto-merge state, and checks through `git` and authenticated `gh`/GitHub APIs.
 
 Graph identity is derived each run. No UUID is persisted. A hook receives the complete relevant graph snapshot so a changing head/ID is explicit.
@@ -106,7 +124,7 @@ preconditions.
 
 - `cara init` is the only automatic first-use mutation surface.
 - When `.caravan/config.yaml` is absent it is created atomically with version-1
-  defaults. An existing valid file is preserved byte-for-byte; incompatible or
+  defaults and the running release in `min_cara_version`. An existing valid file is preserved byte-for-byte; incompatible or
   unreadable files are bounded errors and are never merged or overwritten.
   The checkout guard permits only this exact, validated regular file when it is
   untracked; tracked modifications, symlinks/path escapes, and every other

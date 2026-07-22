@@ -13,6 +13,8 @@ use crate::model::EventKind;
 
 /// Supported config schema version.
 pub const CONFIG_VERSION: u32 = 1;
+/// Version of this Cara reader.
+pub const CARA_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Default repository-relative config path.
 pub const DEFAULT_CONFIG_PATH: &str = ".caravan/config.yaml";
 const MAX_INTERVAL_SECS: u64 = 86_400;
@@ -25,6 +27,10 @@ const MAX_SYNC_DURATION_SECS: u64 = 3_600;
 
 fn config_version() -> u32 {
     CONFIG_VERSION
+}
+
+fn legacy_min_cara_version() -> String {
+    "0.0.0".to_owned()
 }
 
 fn default_loop_interval_secs() -> u64 {
@@ -73,6 +79,28 @@ fn default_agent_priority_labels() -> Vec<String> {
         "caravan-priority:normal".to_owned(),
         "caravan-priority:low".to_owned(),
     ]
+}
+
+fn compare_release_versions(left: &str, right: &str) -> Result<std::cmp::Ordering, ConfigError> {
+    fn parse(value: &str) -> Result<[u64; 3], ConfigError> {
+        let components = value
+            .split('.')
+            .map(str::parse::<u64>)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| {
+                ConfigError::Validation(format!(
+                    "Cara version `{value}` must be an X.Y.Z release version"
+                ))
+            })?;
+        let [major, minor, patch] = components.as_slice() else {
+            return Err(ConfigError::Validation(format!(
+                "Cara version `{value}` must be an X.Y.Z release version"
+            )));
+        };
+        Ok([*major, *minor, *patch])
+    }
+
+    Ok(parse(left)?.cmp(&parse(right)?))
 }
 
 /// Bounded repository event-journal retention policy.
@@ -187,6 +215,10 @@ impl Default for HookConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct CaravanConfig {
     pub version: u32,
+    /// Oldest Cara release authorized to read this policy. Repositories must
+    /// advance their pinned reader before or atomically with this declaration.
+    #[serde(default = "legacy_min_cara_version")]
+    pub min_cara_version: String,
     pub force_merge: bool,
     /// Explicitly authorize lease-protected history rewriting so PR ancestry
     /// physically follows the Caravan chain. Safe default is disabled.
@@ -210,6 +242,7 @@ impl Default for CaravanConfig {
     fn default() -> Self {
         Self {
             version: config_version(),
+            min_cara_version: CARA_VERSION.to_owned(),
             force_merge: false,
             rebase_on_join: false,
             agent_priority_labels: default_agent_priority_labels(),
@@ -226,12 +259,45 @@ impl Default for CaravanConfig {
 impl CaravanConfig {
     /// Parse YAML and validate the complete policy.
     pub fn parse(yaml: &str) -> Result<Self, ConfigError> {
+        Self::check_reader_compatibility(yaml, CARA_VERSION)?;
         let config: Self = serde_yaml::from_str(yaml).map_err(|error| ConfigError::Parse {
             path: None,
             message: error.to_string(),
         })?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// Check a repository's declared reader floor before strict schema parsing.
+    ///
+    /// Pin-validation CI can call this with the pinned Cara version. Performing
+    /// this preflight first ensures a future additive section produces a typed
+    /// upgrade error rather than an unrelated unknown-field diagnostic.
+    pub fn check_reader_compatibility(yaml: &str, reader_version: &str) -> Result<(), ConfigError> {
+        let document: serde_yaml::Value =
+            serde_yaml::from_str(yaml).map_err(|error| ConfigError::Parse {
+                path: None,
+                message: error.to_string(),
+            })?;
+        let Some(mapping) = document.as_mapping() else {
+            return Ok(());
+        };
+        let key = serde_yaml::Value::String("min_cara_version".to_owned());
+        let Some(required) = mapping.get(&key) else {
+            return Ok(());
+        };
+        let Some(required) = required.as_str() else {
+            return Err(ConfigError::Validation(
+                "min_cara_version must be a quoted X.Y.Z release version".to_owned(),
+            ));
+        };
+        if compare_release_versions(reader_version, required)? == std::cmp::Ordering::Less {
+            return Err(ConfigError::UpgradeRequired {
+                required: required.to_owned(),
+                running: reader_version.to_owned(),
+            });
+        }
+        Ok(())
     }
 
     /// Read an explicit config file. Missing files are errors.
@@ -285,6 +351,14 @@ impl CaravanConfig {
             return Err(ConfigError::UnsupportedVersion {
                 found: self.version,
                 supported: CONFIG_VERSION,
+            });
+        }
+        if compare_release_versions(CARA_VERSION, &self.min_cara_version)?
+            == std::cmp::Ordering::Less
+        {
+            return Err(ConfigError::UpgradeRequired {
+                required: self.min_cara_version.clone(),
+                running: CARA_VERSION.to_owned(),
             });
         }
         let mut priority_labels = std::collections::BTreeSet::new();
@@ -403,6 +477,10 @@ pub enum ConfigError {
         found: u32,
         supported: u32,
     },
+    UpgradeRequired {
+        required: String,
+        running: String,
+    },
     Validation(String),
 }
 
@@ -435,6 +513,10 @@ impl std::fmt::Display for ConfigError {
                 formatter,
                 "unsupported caravan config version {found}; supported version is {supported}"
             ),
+            Self::UpgradeRequired { required, running } => write!(
+                formatter,
+                "Cara {running} cannot read this repository policy; upgrade the pinned Cara runtime to {required} or newer before using this config"
+            ),
             Self::Validation(message) => formatter.write_str(message),
         }
     }
@@ -453,6 +535,7 @@ impl StructuredError for ConfigError {
             Self::Read { .. } => "config_read_failed",
             Self::Parse { .. } => "config_parse_failed",
             Self::UnsupportedVersion { .. } => "unsupported_config_version",
+            Self::UpgradeRequired { .. } => "cara_upgrade_required",
             Self::Validation(_) => "invalid_config",
         }
         .to_owned()
@@ -474,6 +557,12 @@ impl StructuredError for ConfigError {
             Self::UnsupportedVersion { found, supported } => {
                 Some(json!({ "found": found, "supported": supported }))
             }
+            Self::UpgradeRequired { required, running } => Some(json!({
+                "required": required,
+                "running": running,
+                "mutated": false,
+                "safe_next_action": format!("upgrade the pinned Cara runtime to {required} or newer")
+            })),
             Self::Validation(_) => None,
         }
     }
@@ -573,6 +662,53 @@ hooks:
         )
         .unwrap_err();
         assert_eq!(hook.code(), "config_parse_failed");
+    }
+
+    #[test]
+    fn rolling_config_fixtures_gate_old_readers_and_accept_old_configs() {
+        let old_config = include_str!("../tests/fixtures/config-v0.0.6.yaml");
+        let current_config = include_str!("../tests/fixtures/config-v0.0.7.yaml");
+        let future_config = include_str!("../tests/fixtures/config-future.yaml");
+
+        let parsed_old = CaravanConfig::parse(old_config).expect("new reader accepts old config");
+        assert_eq!(parsed_old.min_cara_version, "0.0.0");
+        assert!(!parsed_old.sync.actions.join_unlabelled_prs);
+        assert_eq!(
+            CaravanConfig::check_reader_compatibility(current_config, "0.0.6")
+                .unwrap_err()
+                .code(),
+            "cara_upgrade_required"
+        );
+        CaravanConfig::parse(current_config).expect("released reader accepts sync policy");
+
+        // Compatibility is checked before strict parsing. A pinned old reader
+        // receives the upgrade gate even when a newer schema has unknown keys.
+        assert_eq!(
+            CaravanConfig::check_reader_compatibility(future_config, "0.0.7")
+                .unwrap_err()
+                .code(),
+            "cara_upgrade_required"
+        );
+        assert_eq!(
+            CaravanConfig::parse("version: 1\nmin_cara_version: \"0.0.7\"\nmisspelled_sync: {}\n")
+                .unwrap_err()
+                .code(),
+            "config_parse_failed"
+        );
+    }
+
+    #[test]
+    fn upgrade_error_is_typed_and_non_mutating() {
+        let error = CaravanConfig::check_reader_compatibility(
+            "version: 1\nmin_cara_version: \"1.2.3\"\nunknown_future_policy: {}\n",
+            "1.2.2",
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "cara_upgrade_required");
+        let details = error.details().expect("typed details");
+        assert_eq!(details["required"], "1.2.3");
+        assert_eq!(details["running"], "1.2.2");
+        assert_eq!(details["mutated"], false);
     }
 
     #[test]

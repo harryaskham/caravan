@@ -89,6 +89,7 @@ Domain surface:
 
 ```text
 cara init
+cara config check [--config PATH]  # strict, read-only pin/config compatibility
 cara status
 cara web --repo PATH [--repo PATH ...] [--read-only]
 cara check [--pr N] [--tail-pr N | --head-pr N]
