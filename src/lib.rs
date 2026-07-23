@@ -21,6 +21,7 @@ pub mod navigation;
 pub mod operation_lock;
 pub mod pause;
 pub mod physical_rebase;
+pub mod priority;
 pub mod read;
 pub mod repair;
 pub mod reshape;
@@ -239,6 +240,11 @@ RESHAPING AND EXPLICIT INTENT
   revoke` removes only current-generation intent and is audited/idempotent.
   Sync alone consumes armed intent for a one-shot squash. Force never bypasses
   textual conflicts, stale facts, ownership, holds, permissions, or leases.
+- Use audited `cara priority set|clear` to change one exact unenrolled PR's
+  configured automatic-admission rank or restore FIFO. Priority is scheduling
+  metadata only: it never authorizes membership, changes topology, or bypasses
+  compatibility. Unknown/conflicting metadata and stale PR/config facts fail
+  closed before overwrite.
 - Use `cara pause` with actor and reason for incidents or maintenance. Pause
   disables only the exact head auto-merge and preserves topology. Expiry is a
   warning, never implicit resume. Only `cara resume` may revalidate exact facts,
@@ -796,6 +802,20 @@ pub fn build_router() -> ToolRouter<AppContext> {
         "rejoin",
         "After complete compatibility preflight, append an evicted PR after a valid tail and remove eviction/force labels. Typed partial receipts are resumable by rediscovery and the same rejoin call.",
         |context: &AppContext, input: JoinInput| membership::rejoin(context, &input),
+    );
+    router.add_typed_tool_with_output_schema(
+        "priority_set",
+        "Set one exact configured automatic-admission priority on an unenrolled PR under fresh provider/config preconditions and post a durable audit. This changes ordering only, never compatibility or membership authority.",
+        |context: &AppContext, input: priority::PrioritySetInput| {
+            priority::set(context, &input)
+        },
+    );
+    router.add_typed_tool_with_output_schema(
+        "priority_clear",
+        "Clear configured automatic-admission priority from an unenrolled PR under fresh provider/config preconditions, restoring FIFO with a durable audit.",
+        |context: &AppContext, input: priority::PriorityClearInput| {
+            priority::clear(context, &input)
+        },
     );
     router.add_typed_tool_with_output_schema(
         "show",

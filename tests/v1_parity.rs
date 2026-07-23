@@ -23,6 +23,34 @@ fn every_bounded_v1_domain_command_has_a_real_json_operation() {
         ("renew", &["renew"]),
         ("join", &["join", "--tail-pr", "1"]),
         ("rejoin", &["rejoin", "--head-pr", "1"]),
+        (
+            "priority_set",
+            &[
+                "priority",
+                "set",
+                "--pr",
+                "1",
+                "--label",
+                "caravan-priority:high",
+                "--actor",
+                "parity",
+                "--reason",
+                "parity priority",
+            ],
+        ),
+        (
+            "priority_clear",
+            &[
+                "priority",
+                "clear",
+                "--pr",
+                "1",
+                "--actor",
+                "parity",
+                "--reason",
+                "parity FIFO",
+            ],
+        ),
         ("show", &["show"]),
         (
             "force_arm",
@@ -175,6 +203,23 @@ fn every_bounded_mcp_domain_tool_routes_to_the_real_operation() {
         ("renew", serde_json::json!({})),
         ("join", serde_json::json!({ "tail_pr": 1 })),
         ("rejoin", serde_json::json!({ "head_pr": 1 })),
+        (
+            "priority_set",
+            serde_json::json!({
+                "pr": 1,
+                "label": "caravan-priority:high",
+                "actor": "parity",
+                "reason": "parity priority"
+            }),
+        ),
+        (
+            "priority_clear",
+            serde_json::json!({
+                "pr": 1,
+                "actor": "parity",
+                "reason": "parity FIFO"
+            }),
+        ),
         ("show", serde_json::json!({})),
         (
             "force_arm",
@@ -293,6 +338,8 @@ fn mcp_registry_covers_all_bounded_v1_operations_with_schemas() {
         "renew",
         "join",
         "rejoin",
+        "priority_set",
+        "priority_clear",
         "show",
         "force_arm",
         "force_revoke",

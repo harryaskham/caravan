@@ -106,6 +106,8 @@ cara check [--pr N] [--tail-pr N | --head-pr N]
 cara new [--pr N | --create-pr]
 cara join [--pr N] [--tail-pr N | --head-pr N] [--create-pr]
 cara renew [--pr N | --create-pr] | cara rejoin [--pr N]
+cara priority set --pr N --label caravan-priority:high --actor A --reason R
+cara priority clear --pr N --actor A --reason R
 cara show | cara next | cara prev
 cara force --pr N --actor A --reason R
 cara force revoke --pr N --actor A --reason R
@@ -126,7 +128,7 @@ cara self-update status | check | run
 cara feedback status | report
 ```
 
-`cara next-candidate` selects the canonical priority/FIFO attempt. Preflight that exact provider candidate with `cara check --pr N` (and optionally `--tail-pr T` or `--head-pr H`) without checking out or mutating a branch, base, label, or auto-merge state. The receipt includes the canonical provider candidate identity/freshness evidence, exact head/base repository and OIDs, draft/labels/auto-merge facts, enrollment and canonical-order state, pairwise conflict paths, and a mechanical `new`, `join`, `repair`, `wait`, or `reject` continuation. Provider/ref races fail closed, and a rejected first attempt is never silently leapfrogged.
+`cara next-candidate` selects the canonical priority/FIFO attempt. Preflight that exact provider candidate with `cara check --pr N` (and optionally `--tail-pr T` or `--head-pr H`) without checking out or mutating a branch, base, label, or auto-merge state. The receipt includes the canonical provider candidate identity/freshness evidence, exact head/base repository and OIDs, draft/labels/auto-merge facts, enrollment and canonical-order state, pairwise conflict paths, and a mechanical `new`, `join`, `repair`, `wait`, or `reject` continuation. Provider/ref races fail closed, and a rejected first attempt is never silently leapfrogged. Use audited `cara priority set|clear` to change one unenrolled PR's persistent automatic-order metadata; priority never authorizes membership or bypasses compatibility.
 
 Human CLI output is terminal-aware: concise sectioned layouts use color when
 stdout is a TTY, honor `NO_COLOR`, and render PR numbers/titles as OSC-8 GitHub

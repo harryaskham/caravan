@@ -16,6 +16,7 @@ is required or used.
 | renew evicted | `cara renew [--create-pr]` | envelope | `renew` | evicted/force labels removed only after preflight |
 | join tail | `cara join [...]` | envelope | `join` | explicit/dynamic tail, resumable exact receipts |
 | rejoin evicted | `cara rejoin [...]` | envelope | `rejoin` | same target contract plus eviction cleanup |
+| admission priority | `cara priority set/clear --pr N --actor A --reason R` | envelope | `priority_set`, `priority_clear` | exact configured label/FIFO transition, unenrolled eligibility, fresh PR/config preconditions, write permission, durable audit, idempotent partial receipts |
 | current caravan | `cara show` | envelope | `show` | whole chain and highlighted position |
 | chain navigation | `cara next`, `cara prev` | envelope | `next`, `prev` | clean-worktree/exact-head guarded checkout |
 | fleet list/navigation | `cara van list/next/prev` | envelope | `van_list/next/prev` | deterministic PR-number head order |

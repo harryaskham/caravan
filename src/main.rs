@@ -72,6 +72,9 @@ enum Command {
     Join(JoinInput),
     /// Reevaluate and append an evicted PR after a caravan tail.
     Rejoin(JoinInput),
+    /// Set or clear audited automatic-admission priority metadata.
+    #[command(subcommand)]
+    Priority(PriorityCommand),
     /// Show the current branch's whole caravan and position.
     Show,
     /// Check out the next PR toward the current caravan tail.
@@ -130,6 +133,14 @@ struct LogCommand {
 enum ConfigCommand {
     /// Strictly parse config and verify its declared Cara reader floor.
     Check,
+}
+
+#[derive(Debug, Subcommand)]
+enum PriorityCommand {
+    /// Set one exact configured priority label on an unenrolled PR.
+    Set(caravan::priority::PrioritySetInput),
+    /// Clear configured priority labels and restore FIFO ordering.
+    Clear(caravan::priority::PriorityClearInput),
 }
 
 #[derive(Debug, Subcommand)]
@@ -336,6 +347,7 @@ fn run(cli: &Cli) -> Result<(), i32> {
         Command::Rejoin(input) => {
             run_membership(cli, |context| caravan::membership::rejoin(context, input))
         }
+        Command::Priority(command) => run_priority(cli, command),
         Command::Show => run_show(cli),
         Command::Next => run_navigation(
             cli,
@@ -892,6 +904,38 @@ fn run_force(cli: &Cli, command: &ForceCommand) -> Result<(), i32> {
                 output.default_branch.oid,
                 output.mutated,
                 output.next
+            );
+            Ok(())
+        }
+        Err(error) => emit_human_error(error),
+    }
+}
+
+fn run_priority(cli: &Cli, command: &PriorityCommand) -> Result<(), i32> {
+    let context = load_context(cli)?;
+    let result = match command {
+        PriorityCommand::Set(input) => caravan::priority::set(&context, input),
+        PriorityCommand::Clear(input) => caravan::priority::clear(&context, input),
+    };
+    if cli.json {
+        return emit_result(true, result);
+    }
+    match result {
+        Ok(output) => {
+            let basis = output.selected_label.as_deref().map_or_else(
+                || "FIFO".to_owned(),
+                |label| {
+                    format!(
+                        "{label} (rank {})",
+                        output.selected_rank.unwrap_or_default()
+                    )
+                },
+            );
+            println!(
+                "priority PR #{}: {} — {} provider receipts; audit durable",
+                output.pr,
+                basis,
+                output.provider_receipts.len()
             );
             Ok(())
         }
@@ -2673,6 +2717,39 @@ mod tests {
         let (input, revoke) = command.operation().unwrap();
         assert_eq!(input.pr, 42);
         assert!(revoke);
+    }
+
+    #[test]
+    fn priority_set_and_clear_require_exact_audit_inputs() {
+        let set = Cli::try_parse_from([
+            "cara",
+            "priority",
+            "set",
+            "--pr",
+            "43",
+            "--label",
+            "caravan-priority:high",
+            "--actor",
+            "operator",
+            "--reason",
+            "urgent",
+        ])
+        .expect("priority set parses");
+        let Command::Priority(PriorityCommand::Set(input)) = set.command else {
+            panic!("expected priority set");
+        };
+        assert_eq!(input.pr, 43);
+        assert_eq!(input.label, "caravan-priority:high");
+
+        let clear = Cli::try_parse_from([
+            "cara", "priority", "clear", "--pr", "43", "--actor", "operator", "--reason", "FIFO",
+        ])
+        .expect("priority clear parses");
+        assert!(matches!(
+            clear.command,
+            Command::Priority(PriorityCommand::Clear(_))
+        ));
+        assert!(Cli::try_parse_from(["cara", "priority", "clear", "--pr", "43"]).is_err());
     }
 
     #[test]
