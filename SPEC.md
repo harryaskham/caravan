@@ -328,14 +328,17 @@ source/test failure, cancelled, or unknown. Only current-generation
 infrastructure failures are rerunnable; stale or unproved lineage requires a
 fresh exact-candidate trigger.
 
-A user/agent may use the managed repair workspace, rerun failed checks, evict/split, or mark a known acceptable failure with `caravan-force`. Raw nested worktrees, manual `update-ref`, and force publication are not valid Cara decision continuations.
+A user/agent may use the managed repair workspace, rerun failed checks,
+evict/split, or arm a known acceptable failure with audited `cara force --pr N
+--actor A --reason R`. Raw label edits, nested worktrees, manual `update-ref`, and
+force publication are not valid Cara decision continuations.
 
 `caravan-force` is explicit operator intent to bypass any CI state that is not fully successful, including expected, queued, running, failed, unknown, mixed, or empty checks. When it becomes head, `cara sync` may force-squash it only when:
 
 1. `.caravan/config.yaml` sets `force_merge: true`;
 2. the open head has `caravan-force`;
 3. it remains mechanically conflict-free with the default branch;
-4. the authenticated actor has repository permission.
+4. the authenticated actor has repository ADMIN permission.
 
 An exact force-labelled head may keep provider-native auto-merge disabled while
 Cara validates this policy. Cara posts the generation-bound audit and invokes
@@ -347,9 +350,24 @@ force-labelled head when `force_merge: true`; structural graph errors,
 non-squash or externally enabled auto-merge, ordinary unlabelled head gaps, and
 selected-head drift remain blocking through final rediscovery.
 
-Force intent is bound to the exact labelled head generation. Before any Cara-owned physical rewrite, sync/join removes `caravan-force` from the old head and posts a durable old→planned-generation invalidation audit; a force merge of the rewritten generation requires a fresh external operator label. An already-satisfied plan does not consume intent because its head OID did not change. Routine membership never adds or carries force intent.
+Force intent is bound to the exact labelled head generation. `cara force` and
+`cara force revoke` rediscover exact PR/default facts, require the current active
+head, clean compatibility, no hold/graph problem, and ADMIN permission, then
+change only `caravan-force` under exact preconditions and post a deterministic
+actor/reason/check audit. Both operations are idempotent; revoke never touches
+unrelated labels. Before any Cara-owned physical rewrite, sync/join removes
+`caravan-force` from the old head and posts a durable old→planned-generation
+invalidation audit; a force merge of the rewritten generation requires a fresh
+`cara force` operation. An already-satisfied plan does not consume intent
+because its head OID did not change. Routine membership never adds or carries
+force intent.
 
-No approval hook or interactive reason is required. Before accepting the externally applied `caravan-force` label, sync/loop posts a durable generated-reason comment containing the exact observed checks (including pending, running, failed, mixed, or empty observations), enabled force policy, authenticated ADMIN permission, exact clean compatibility proof, and squash action. Comment failure is resumable and prevents the force merge. The attempt and result are emitted as audit events. Force never bypasses textual conflicts.
+Before consuming armed `caravan-force`, sync/loop posts its separate durable
+acceptance audit containing the exact observed checks (including pending,
+running, failed, mixed, or empty observations), enabled force policy,
+authenticated ADMIN permission, exact clean compatibility proof, and squash
+action. Comment failure is resumable and prevents the force merge. The attempt
+and result are emitted as audit events. Force never bypasses textual conflicts.
 
 ## 8. Decision points and errors
 

@@ -78,6 +78,8 @@ enum Command {
     Next,
     /// Check out the previous PR toward the current caravan head.
     Prev,
+    /// Arm or revoke audited exact-generation one-shot force intent.
+    Force(ForceCommand),
     /// Explicitly freeze one caravan and disable only its head auto-merge.
     Pause(PauseInput),
     /// Explicitly revalidate and resume one paused caravan.
@@ -146,6 +148,53 @@ enum LockCommand {
     Status(LockStatusInput),
     /// Remove only a verified-stale lock after explicit confirmation.
     Recover(LockRecoverInput),
+}
+
+#[derive(Debug, Args)]
+struct ForceCommand {
+    /// Exact active Caravan head PR to arm (omit only with `revoke`).
+    #[arg(long, value_name = "PR")]
+    pr: Option<u64>,
+    /// Audited operator identity (omit only with `revoke`).
+    #[arg(long, value_name = "ACTOR")]
+    actor: Option<String>,
+    /// Bounded operator rationale (omit only with `revoke`).
+    #[arg(long, value_name = "TEXT")]
+    reason: Option<String>,
+    #[command(subcommand)]
+    command: Option<ForceSubcommand>,
+}
+
+#[derive(Debug, Subcommand)]
+enum ForceSubcommand {
+    /// Revoke current exact-generation force intent.
+    Revoke(caravan::force::ForceIntentInput),
+}
+
+impl ForceCommand {
+    fn operation(&self) -> Result<(caravan::force::ForceIntentInput, bool), AppError> {
+        if let Some(ForceSubcommand::Revoke(input)) = &self.command {
+            if self.pr.is_some() || self.actor.is_some() || self.reason.is_some() {
+                return Err(AppError::validation(
+                    "force_arguments_ambiguous",
+                    "put --pr/--actor/--reason after `force revoke`, not before it",
+                ));
+            }
+            return Ok((input.clone(), true));
+        }
+        let input = caravan::force::ForceIntentInput {
+            pr: self.pr.ok_or_else(|| {
+                AppError::validation("force_pr_required", "cara force requires --pr")
+            })?,
+            actor: self.actor.clone().ok_or_else(|| {
+                AppError::validation("force_actor_required", "cara force requires --actor")
+            })?,
+            reason: self.reason.clone().ok_or_else(|| {
+                AppError::validation("force_reason_required", "cara force requires --reason")
+            })?,
+        };
+        Ok((input, false))
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -298,6 +347,7 @@ fn run(cli: &Cli) -> Result<(), i32> {
             caravan::navigation::Scope::Caravan,
             caravan::navigation::Direction::Previous,
         ),
+        Command::Force(command) => run_force(cli, command),
         Command::Pause(input) => run_pause(cli, input),
         Command::Resume(input) => run_resume(cli, input),
         Command::Sync(input) => run_sync(cli, input),
@@ -807,6 +857,42 @@ fn run_membership(
     match result {
         Ok(output) => {
             print!("{}", render_membership(&output));
+            Ok(())
+        }
+        Err(error) => emit_human_error(error),
+    }
+}
+
+fn run_force(cli: &Cli, command: &ForceCommand) -> Result<(), i32> {
+    let (input, revoke) = match command.operation() {
+        Ok(operation) => operation,
+        Err(error) => return emit_result::<serde_json::Value, _>(cli.json, Err(error)),
+    };
+    let context = load_context(cli)?;
+    let result = if revoke {
+        caravan::force::revoke(&context, &input)
+    } else {
+        caravan::force::arm(&context, &input)
+    };
+    if cli.json {
+        return emit_result(true, result);
+    }
+    match result {
+        Ok(output) => {
+            println!(
+                "force {:?} PR #{}: {} head={} default={} changed={}\n  {}",
+                output.operation,
+                output.pr,
+                if output.intent_present {
+                    "armed"
+                } else {
+                    "absent"
+                },
+                output.head.oid,
+                output.default_branch.oid,
+                output.mutated,
+                output.next
+            );
             Ok(())
         }
         Err(error) => emit_human_error(error),
@@ -2547,6 +2633,46 @@ mod tests {
         assert_eq!(input.head_pr, None);
         assert!(!input.create_pr);
         assert!(Cli::try_parse_from(["cara", "join", "--pr", "43", "--create-pr"]).is_err());
+    }
+
+    #[test]
+    fn force_arm_and_revoke_parse_with_explicit_identity() {
+        let arm = Cli::try_parse_from([
+            "cara",
+            "force",
+            "--pr",
+            "42",
+            "--actor",
+            "operator",
+            "--reason",
+            "accept known failure",
+        ])
+        .expect("force arm parses");
+        let Command::Force(command) = arm.command else {
+            panic!("expected force");
+        };
+        let (input, revoke) = command.operation().unwrap();
+        assert_eq!(input.pr, 42);
+        assert!(!revoke);
+
+        let revoke = Cli::try_parse_from([
+            "cara",
+            "force",
+            "revoke",
+            "--pr",
+            "42",
+            "--actor",
+            "operator",
+            "--reason",
+            "intent no longer applies",
+        ])
+        .expect("force revoke parses");
+        let Command::Force(command) = revoke.command else {
+            panic!("expected force revoke");
+        };
+        let (input, revoke) = command.operation().unwrap();
+        assert_eq!(input.pr, 42);
+        assert!(revoke);
     }
 
     #[test]

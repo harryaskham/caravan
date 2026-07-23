@@ -9,6 +9,7 @@ use std::time::Duration;
 pub mod ci;
 pub mod command;
 pub mod compatibility;
+pub mod force;
 pub mod github;
 pub mod graph;
 pub mod hooks;
@@ -230,12 +231,14 @@ RESHAPING AND EXPLICIT INTENT
 - `cara evict --pr N --reason ...` removes a member and reconnects its child only
   after exact compatibility proof. `split` makes the selected PR a new head.
   `renew` and `rejoin` re-evaluate an evicted PR from fresh facts.
-- `caravan-force` is explicit intent to accept non-successful CI, not a general
-  safety bypass. It requires `force_merge: true`, an open non-draft labelled
-  head, exact current default/head compatibility, ADMIN permission, a durable
-  audit comment, and a one-shot squash. It never bypasses textual conflicts,
-  stale facts, ownership, holds, permissions, or lease checks. If CI is already
-  fully successful, normal auto-merge policy applies instead.
+- `cara force --pr N --actor A --reason R` is the only supported way to arm
+  exact-generation `caravan-force` intent for non-successful CI; raw label edits
+  are not an operator contract. It requires `force_merge: true`, an open
+  non-draft active head, clean exact default/head compatibility, no hold/graph
+  issue, ADMIN permission, and a durable actor/reason/check audit. `cara force
+  revoke` removes only current-generation intent and is audited/idempotent.
+  Sync alone consumes armed intent for a one-shot squash. Force never bypasses
+  textual conflicts, stale facts, ownership, holds, permissions, or leases.
 - Use `cara pause` with actor and reason for incidents or maintenance. Pause
   disables only the exact head auto-merge and preserves topology. Expiry is a
   warning, never implicit resume. Only `cara resume` may revalidate exact facts,
@@ -820,6 +823,16 @@ pub fn build_router() -> ToolRouter<AppContext> {
                 navigation::Direction::Previous,
             )
         }
+    );
+    router.add_typed_tool_with_output_schema(
+        "force_arm",
+        "Arm exact-generation one-shot caravan-force intent on an eligible active head after clean compatibility, policy, hold, permission, branch and PR preflight. Posts a durable audited comment; sync remains the sole final merge owner.",
+        |context: &AppContext, input: force::ForceIntentInput| force::arm(context, &input),
+    );
+    router.add_typed_tool_with_output_schema(
+        "force_revoke",
+        "Idempotently revoke exact-generation caravan-force intent from an eligible active head under exact preconditions and post a durable audit without touching unrelated labels.",
+        |context: &AppContext, input: force::ForceIntentInput| force::revoke(context, &input),
     );
     router.add_typed_tool_with_output_schema(
         "pause",
@@ -1489,6 +1502,8 @@ mod tests {
             "join",
             "rejoin",
             "show",
+            "force_arm",
+            "force_revoke",
             "next",
             "prev",
             "plan_sync",

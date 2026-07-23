@@ -51,7 +51,9 @@ after the same check passes.
   it, the exact head/default compatibility proof is still current, and GitHub
   reports admin permission. Cara-owned physical rewrites consume and audit any
   force label bound to the old head; the new generation requires a fresh
-  operator label, while routine membership never carries force intent.
+  audited `cara force --pr N --actor A --reason R` operation, while routine
+  membership never carries force intent. `cara force revoke` removes only the
+  exact current-generation intent and posts the matching durable audit.
 - Optional sync-owned auto-admission is strictly opt-in. After the existing
   fleet converges, `sync --all` considers unlabelled PRs in configured-priority
   then immutable-FIFO order and greedily joins the first compatible live tail.
@@ -105,6 +107,8 @@ cara new [--pr N | --create-pr]
 cara join [--pr N] [--tail-pr N | --head-pr N] [--create-pr]
 cara renew [--pr N | --create-pr] | cara rejoin [--pr N]
 cara show | cara next | cara prev
+cara force --pr N --actor A --reason R
+cara force revoke --pr N --actor A --reason R
 cara plan sync [--all] [--rerun-failed]
 cara sync [--all] [--rerun-failed] | cara loop [--once] [--manual --shell COMMAND]
 cara repair start --pr N [--target-pr T]
