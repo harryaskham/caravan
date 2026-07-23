@@ -2291,6 +2291,105 @@ fn run_feedback(json: bool, command: &FeedbackCommand) -> Result<(), i32> {
     }
 }
 
+fn short_oid(value: &str) -> &str {
+    value.get(..value.len().min(9)).unwrap_or(value)
+}
+
+fn human_error_evidence(error: &impl StructuredError) -> Option<String> {
+    let details = error.details()?;
+    let compact = match error.code().as_str() {
+        "join_root_moved_before_apply" => Some(format!(
+            "{} #{} changed: {}\n  expected head/base: {} / {}\n  actual head/base:   {} / {}\n  {}",
+            warning("Retryable root drift"),
+            details["root_pr"],
+            details["changed_fields"].as_array().map_or_else(
+                || "unknown fields".to_owned(),
+                |items| items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            details["expected"]["head"]["oid"]
+                .as_str()
+                .map_or("unknown", short_oid),
+            details["expected"]["base"]["oid"]
+                .as_str()
+                .map_or("unknown", short_oid),
+            details["actual"]["head"]["oid"]
+                .as_str()
+                .map_or("unknown", short_oid),
+            details["actual"]["base"]["oid"]
+                .as_str()
+                .map_or("unknown", short_oid),
+            details["safe_next_action"]
+                .as_str()
+                .unwrap_or("rediscover and retry the same join"),
+        )),
+        "rebase_topology_changed" if details.get("source_commit_count").is_some() => Some(format!(
+            "{}: source {} → rebuilt {} (dropped {}, added {})\n  source commits: {}\n  rebuilt commits: {}\n  {}",
+            warning("Topology replay changed commit count"),
+            details["source_commit_count"],
+            details["rebuilt_commit_count"],
+            details["dropped_commit_count"],
+            details["added_commit_count"],
+            details["source_commits"].as_array().map_or_else(
+                || "unknown".to_owned(),
+                |items| items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(short_oid)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            details["rebuilt_commits"].as_array().map_or_else(
+                || "none".to_owned(),
+                |items| items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(short_oid)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            details["safe_next_action"]
+                .as_str()
+                .unwrap_or("inspect and rebase the source, then retry"),
+        )),
+        "physical_sync_budget_insufficient" => Some(format!(
+            "{}: {}ms required, {}ms remaining ({} command slots)\n  {}",
+            warning("Physical sync stopped before mutation"),
+            details["required_ms"],
+            details["remaining_ms"],
+            details["required_command_slots"],
+            details["config_guidance"]
+                .as_str()
+                .unwrap_or("increase the bounded sync duration and retry"),
+        )),
+        "join_empty_source_noop" => Some(format!(
+            "{}: {}@{} has no effective patch beyond current main\n  No provider or branch mutation was attempted.",
+            success("No-op"),
+            details["source"]["branch"].as_str().unwrap_or("source"),
+            details["source"]["head_oid"]
+                .as_str()
+                .map_or("unknown", short_oid),
+        )),
+        _ => None,
+    };
+    if compact.is_some() {
+        return compact;
+    }
+    let encoded = serde_json::to_string_pretty(&details).unwrap_or_else(|_| details.to_string());
+    if encoded.len() <= 4_096 {
+        Some(encoded)
+    } else {
+        Some(format!(
+            "{}\n  Re-run with --json for the complete structured evidence ({} bytes).",
+            dim("Structured evidence is too large for the human terminal view."),
+            encoded.len()
+        ))
+    }
+}
+
 fn emit_result<T, E>(json: bool, result: Result<T, E>) -> Result<(), i32>
 where
     T: Serialize,
@@ -2308,12 +2407,14 @@ where
             Ok(())
         }
         Err(error) => {
-            eprintln!("cara: {error}");
-            if let Some(details) = error.details() {
-                eprintln!(
-                    "{}",
-                    serde_json::to_string_pretty(&details).unwrap_or_else(|_| details.to_string())
-                );
+            eprintln!(
+                "{} {}: {}",
+                failure("cara"),
+                heading(error.code()),
+                error.message()
+            );
+            if let Some(evidence) = human_error_evidence(&error) {
+                eprintln!("{evidence}");
             }
             Err(1)
         }
@@ -2324,6 +2425,85 @@ where
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[derive(Debug)]
+    struct HumanTestError {
+        code: &'static str,
+        details: serde_json::Value,
+    }
+
+    impl std::fmt::Display for HumanTestError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(self.code)
+        }
+    }
+
+    impl mcp_cli::StructuredError for HumanTestError {
+        fn category(&self) -> mcp_cli::ErrorCategory {
+            mcp_cli::ErrorCategory::Validation
+        }
+        fn code(&self) -> String {
+            self.code.to_owned()
+        }
+        fn message(&self) -> String {
+            self.code.to_owned()
+        }
+        fn details(&self) -> Option<serde_json::Value> {
+            Some(self.details.clone())
+        }
+    }
+
+    #[test]
+    fn human_root_drift_evidence_is_compact_and_actionable() {
+        let evidence = human_error_evidence(&HumanTestError {
+            code: "join_root_moved_before_apply",
+            details: serde_json::json!({
+                "root_pr": 2086,
+                "changed_fields": ["head"],
+                "expected": {"head":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"base":{"oid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"checks":[{"huge":"ignored"}]},
+                "actual": {"head":{"oid":"cccccccccccccccccccccccccccccccccccccccc"},"base":{"oid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"checks":[{"huge":"ignored"}]},
+                "safe_next_action": "rediscover and retry the same join"
+            }),
+        })
+        .unwrap();
+        assert!(evidence.contains("Retryable root drift"));
+        assert!(evidence.contains("head"));
+        assert!(evidence.contains("rediscover and retry"));
+        assert!(!evidence.contains("huge"));
+    }
+
+    #[test]
+    fn human_topology_evidence_explains_commit_pruning() {
+        let evidence = human_error_evidence(&HumanTestError {
+            code: "rebase_topology_changed",
+            details: serde_json::json!({
+                "source_commit_count": 2,
+                "rebuilt_commit_count": 1,
+                "dropped_commit_count": 1,
+                "added_commit_count": 0,
+                "source_commits": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+                "rebuilt_commits": ["cccccccccccccccccccccccccccccccccccccccc"],
+                "safe_next_action": "rebase the source and retry"
+            }),
+        })
+        .unwrap();
+        assert!(evidence.contains("source 2 → rebuilt 1"));
+        assert!(evidence.contains("dropped 1"));
+        assert!(evidence.contains("rebase the source"));
+        assert!(!evidence.contains("aaaaaaaaaaaaaaaaaaaaaaaa"));
+    }
+
+    #[test]
+    fn oversized_generic_human_evidence_is_not_dumped() {
+        let evidence = human_error_evidence(&HumanTestError {
+            code: "large_fixture",
+            details: serde_json::json!({"payload": "x".repeat(10_000)}),
+        })
+        .unwrap();
+        assert!(evidence.contains("too large"));
+        assert!(evidence.contains("--json"));
+        assert!(evidence.len() < 300);
+    }
 
     #[test]
     fn command_tree_is_internally_consistent() {

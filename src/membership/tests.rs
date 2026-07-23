@@ -397,6 +397,35 @@ fn join_refuses_stale_root_before_any_provider_mutation() {
 }
 
 #[test]
+fn join_root_check_progress_does_not_stale_mutation_identity() {
+    let mut root = pull_request(1, "one", "main", &[ACTIVE_LABEL]);
+    root.checks = vec![crate::model::CheckSnapshot {
+        name: "Changed surface admission".to_owned(),
+        state: crate::model::CheckState::Queued,
+        provider_state: Some("QUEUED".to_owned()),
+        details_url: None,
+    }];
+    let candidate = pull_request(2, "two", "main", &[]);
+    let status = status(candidate.clone(), vec![root.clone()]);
+    let request = MembershipRequest {
+        operation: MembershipOperation::Join,
+        create_pr: false,
+        tail_pr: Some(1),
+        head_pr: None,
+        reason: Some("check progress fixture".to_owned()),
+        priority_label: None,
+        agent_priority_labels: Vec::new(),
+    };
+    let target = resolve_join_target(&status, &request).unwrap();
+    root.checks[0].state = crate::model::CheckState::InProgress;
+    root.checks[0].provider_state = Some("IN_PROGRESS".to_owned());
+    let provider = FakeProvider::with_pull_requests(vec![root, candidate]);
+
+    revalidate_join_root(&status, &target, &provider)
+        .expect("check-only churn is not mutation-authority drift");
+}
+
+#[test]
 fn join_root_drift_after_preview_fails_before_provider_mutation() {
     let root = pull_request(1, "one", "main", &[ACTIVE_LABEL]);
     let candidate = pull_request(2, "two", "main", &[]);
@@ -419,7 +448,12 @@ fn join_root_drift_after_preview_fails_before_provider_mutation() {
     let error = revalidate_join_root(&status, &target, &provider).unwrap_err();
 
     assert_eq!(error.code(), "join_root_moved_before_apply");
-    assert_eq!(error.details().unwrap()["mutated"], false);
+    let details = error.details().unwrap();
+    assert_eq!(details["mutated"], false);
+    assert_eq!(details["retryable"], true);
+    assert_eq!(details["changed_fields"], json!(["head"]));
+    assert!(details["expected"].get("checks").is_none());
+    assert!(details["actual"].get("checks").is_none());
     assert_eq!(*provider.pull_requests.borrow(), provider_before);
 }
 

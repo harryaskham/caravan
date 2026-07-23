@@ -542,6 +542,15 @@ repair status reports its exact phase, budget, process group, partial path, last
 error, and resume/abort path. Exact retries reuse verified partial objects after
 a sideband disconnect; changed repository/head/target/provider/config facts
 still refuse rather than trusting the cache.
+Human CLI errors render concise colored operational evidence rather than dumping
+unbounded provider snapshots. Root-join drift lists only changed mutation facts
+(head/base/labels/state/auto-merge), topology refusals show compact commit counts
+and OIDs, and physical-budget decisions show required/remaining time. Evidence
+over 4 KiB is summarized with a `--json` hint; JSON/MCP always retain the full
+structured continuation. CI/check state transitions are deliberately excluded
+from membership mutation identity, so queued→running check progress does not
+invalidate an otherwise exact retry.
+
 Status propagates one absolute deadline through discovery,
 compatibility, and label inventory; every child receives only the remaining
 budget. Timeouts terminate and reap the child process group and return stable

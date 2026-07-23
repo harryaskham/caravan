@@ -504,6 +504,62 @@ fn require_current_join_root(status: &StatusOutput, target: &JoinTarget) -> Resu
     ))
 }
 
+fn membership_identity_matches(
+    expected: &PullRequestSnapshot,
+    actual: &PullRequestSnapshot,
+) -> bool {
+    expected.number == actual.number
+        && expected.state == actual.state
+        && expected.draft == actual.draft
+        && expected.head == actual.head
+        && expected.base == actual.base
+        && expected.cross_repository == actual.cross_repository
+        && expected.labels == actual.labels
+        && expected.auto_merge == actual.auto_merge
+}
+
+fn membership_identity(pull: &PullRequestSnapshot) -> serde_json::Value {
+    json!({
+        "number": pull.number,
+        "state": pull.state,
+        "draft": pull.draft,
+        "head": pull.head,
+        "base": pull.base,
+        "cross_repository": pull.cross_repository,
+        "labels": pull.labels,
+        "auto_merge": pull.auto_merge,
+    })
+}
+
+fn membership_identity_changes(
+    expected: &PullRequestSnapshot,
+    actual: &PullRequestSnapshot,
+) -> Vec<&'static str> {
+    let mut changed = Vec::new();
+    if expected.state != actual.state {
+        changed.push("state");
+    }
+    if expected.draft != actual.draft {
+        changed.push("draft");
+    }
+    if expected.head != actual.head {
+        changed.push("head");
+    }
+    if expected.base != actual.base {
+        changed.push("base");
+    }
+    if expected.cross_repository != actual.cross_repository {
+        changed.push("head_repository");
+    }
+    if expected.labels != actual.labels {
+        changed.push("labels");
+    }
+    if expected.auto_merge != actual.auto_merge {
+        changed.push("auto_merge");
+    }
+    changed
+}
+
 fn revalidate_join_root(
     status: &StatusOutput,
     target: &JoinTarget,
@@ -525,22 +581,27 @@ fn revalidate_join_root(
                 Some(json!({"root_pr": root_number, "error": error.to_string(), "mutated": false})),
             )
         })?;
-    if PullRequestPrecondition::from(expected) == PullRequestPrecondition::from(&actual)
+    if membership_identity_matches(expected, &actual)
         && actual.base == status.analysis.fleet.default_branch
     {
         return Ok(());
     }
+    let changed_fields = membership_identity_changes(expected, &actual);
     Err(AppError::structured(
         ErrorCategory::Validation,
         "join_root_moved_before_apply",
         "selected caravan root changed after join preview",
         Some(json!({
             "root_pr": root_number,
-            "expected": expected,
-            "actual": actual,
+            "changed_fields": changed_fields,
+            "expected": membership_identity(expected),
+            "actual": membership_identity(&actual),
             "required_default": status.analysis.fleet.default_branch,
+            "ignored_check_churn": true,
             "mutated": false,
-            "safe_next_action": "rediscover and sync the selected caravan before retrying join",
+            "retryable": true,
+            "retry_command": "rerun the same `cara join` command",
+            "safe_next_action": "rediscover and retry the same join; run `cara sync --all` first only when root head/base/labels/auto-merge actually changed",
         })),
     ))
 }
