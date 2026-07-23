@@ -1174,7 +1174,14 @@ pub fn check_analysis(
 
     let mut problems = status.analysis.fleet.problems.clone();
     validate_candidate(pull_request, &mut problems);
-    if candidate_stale {
+    // In physical membership mode the provider's synthetic merge ref is
+    // advisory only: prepare/apply independently fetch and verify the exact PR
+    // head plus current default/tail, prove merge-tree compatibility and range
+    // topology, and push under force-with-lease. Requiring a fresh synthetic
+    // parent here can deadlock the rewrite which would refresh that ref. Virtual
+    // mode retains strict provider-candidate freshness.
+    let candidate_stale_blocks_admission = candidate_stale && !status.rebase_on_join.enabled;
+    if candidate_stale_blocks_admission {
         problems.push(GraphProblem {
             kind: GraphProblemKind::Unknown,
             prs: vec![current_pr],
@@ -1226,7 +1233,7 @@ pub fn check_analysis(
                 } else {
                     AdmissionDecision::Accepted
                 },
-                freshness: if candidate_stale {
+                freshness: if candidate_stale_blocks_admission {
                     CandidateFreshness::Stale
                 } else {
                     CandidateFreshness::Fresh
@@ -1312,7 +1319,7 @@ pub fn check_analysis(
             } else {
                 AdmissionDecision::Accepted
             },
-            freshness: if candidate_stale {
+            freshness: if candidate_stale_blocks_admission {
                 CandidateFreshness::Stale
             } else {
                 CandidateFreshness::Fresh
@@ -2295,6 +2302,59 @@ mod tests {
                 .as_ref()
                 .map(|identity| identity.freshness),
             Some(crate::model::MergeCandidateFreshness::StaleHead)
+        );
+    }
+
+    #[test]
+    fn physical_admission_uses_exact_git_proof_when_synthetic_base_is_stale() {
+        let candidate = pr(9, "nine", "main", false);
+        let mut status = status(candidate.clone(), Vec::new());
+        status.rebase_on_join = RebaseOnJoinStatus {
+            enabled: true,
+            state: "enabled".to_owned(),
+            config_path: ".caravan/config.yaml".to_owned(),
+            required_action: None,
+        };
+        status
+            .merge_candidates
+            .push(crate::model::MergeCandidateIdentity {
+                pr: candidate.number,
+                provider_updated_at: "2026-01-01T00:00:00Z".to_owned(),
+                observed_at: "2026-01-01T00:00:01Z".to_owned(),
+                base: candidate.base.clone(),
+                head: candidate.head.clone(),
+                synthetic: None,
+                auto_merge: crate::model::NativeAutoMergeState {
+                    enabled: false,
+                    merge_method: None,
+                    actor: None,
+                },
+                freshness: crate::model::MergeCandidateFreshness::StaleBase,
+                stale_base: true,
+                stale_head: false,
+                stale_reasons: vec!["synthetic base parent is stale".to_owned()],
+            });
+
+        let output = check_analysis(
+            &status,
+            &CheckInput {
+                pr: Some(9),
+                tail_pr: None,
+                head_pr: None,
+            },
+            &clean_checker,
+        )
+        .expect("physical mode owns a fresh exact Git/lease preflight");
+
+        assert!(output.eligible);
+        assert_eq!(output.next_action, CandidateNextAction::New);
+        assert!(output.problems.is_empty());
+        assert_eq!(
+            output
+                .merge_candidate
+                .as_ref()
+                .map(|identity| identity.freshness),
+            Some(crate::model::MergeCandidateFreshness::StaleBase)
         );
     }
 
