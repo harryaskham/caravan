@@ -12,4 +12,4 @@ run-web-dev *repos:
   for repo in {{repos}}; do
     flags+=("--repo" "$repo")
   done
-  bash -c "~/.cargo/bin/cara web ${flags[@]}"
+  ~/.cargo/bin/cara web ${flags[@]}
