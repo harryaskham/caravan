@@ -914,9 +914,10 @@ fn physical_commit_budget(
                 force + u64::from(pull_request.has_label("caravan-force")),
             )
         });
-    // One remove-label mutation plus comment discovery and durable audit write.
-    let force_command_slots = force_heads.saturating_mul(3);
-    let force_mutations = force_heads.saturating_mul(2);
+    // Invalidation reserves remove+audit and the complete compensating
+    // add+audit path when branch non-publication is later proven.
+    let force_command_slots = force_heads.saturating_mul(6);
+    let force_mutations = force_heads.saturating_mul(4);
     let reconciliation =
         member_count.saturating_mul(PHYSICAL_RECONCILIATION_COMMAND_SLOTS_PER_MEMBER);
     let command_slots = auto_merge_disables
@@ -1036,6 +1037,7 @@ struct PhysicalRebuildOutcome {
     receipts: Vec<crate::physical_rebase::RebaseReceipt>,
     provider_receipts: Vec<GitHubMutationReceipt>,
     steps: Vec<MutationStep>,
+    force_intent_restorations: Vec<Value>,
 }
 
 fn selected_unpaused_caravans(status: &StatusOutput, all: bool) -> Result<Vec<Caravan>, AppError> {
@@ -1433,6 +1435,157 @@ fn invalidate_rewritten_force_intents(
 }
 
 #[allow(clippy::too_many_lines)]
+fn restore_force_intent_after_nonpublication(
+    status: &StatusOutput,
+    provider: &impl SyncProvider,
+    plan: &crate::physical_rebase::RebasePlan,
+    progress: &mut SyncProgress,
+    outcome: &mut PhysicalRebuildOutcome,
+    original_error: AppError,
+) -> AppError {
+    let Some(original) = status.analysis.pull_requests.get(&plan.pr) else {
+        return original_error;
+    };
+    if plan.already_satisfied || !original.has_label("caravan-force") {
+        return original_error;
+    }
+    let observed = match provider.refetch_pull_request(&status.repository, plan.pr) {
+        Ok(observed) => observed,
+        Err(error) => {
+            outcome.force_intent_restorations.push(json!({
+                "pr": plan.pr,
+                "state": "indeterminate",
+                "old_head_oid": plan.old_head_oid,
+                "planned_head_oid": plan.new_head_oid,
+                "provider_error": error.to_string(),
+                "restored": false,
+            }));
+            return original_error;
+        }
+    };
+    if observed.head.oid == plan.new_head_oid {
+        outcome.force_intent_restorations.push(json!({
+            "pr": plan.pr,
+            "state": "published",
+            "observed_head_oid": observed.head.oid,
+            "restored": false,
+            "reason": "planned generation is provider-visible; old-generation intent stays invalidated",
+        }));
+        return original_error;
+    }
+    if observed.head.oid != plan.old_head_oid {
+        outcome.force_intent_restorations.push(json!({
+            "pr": plan.pr,
+            "state": "indeterminate",
+            "old_head_oid": plan.old_head_oid,
+            "planned_head_oid": plan.new_head_oid,
+            "observed_head_oid": observed.head.oid,
+            "restored": false,
+        }));
+        return original_error;
+    }
+
+    progress.current.insert(plan.pr, observed.clone());
+    let mut audit_before_labels = observed.labels.clone();
+    audit_before_labels.remove("caravan-force");
+    let mut after_labels = audit_before_labels.clone();
+    after_labels.insert("caravan-force".to_owned());
+    let audit = ControlLabelAudit {
+        operation: "force_restore_nonpublication".to_owned(),
+        marker: control_label_marker(
+            "force_restore_nonpublication",
+            plan.pr,
+            &plan.old_head_oid,
+            &audit_before_labels,
+            &after_labels,
+        ),
+        before_labels: audit_before_labels,
+        after_labels,
+        actor: "cara physical-rebase recovery policy".to_owned(),
+        reason: format!(
+            "restored caravan-force intent on unchanged old head {} after planned generation {} was proven not published ({})",
+            plan.old_head_oid,
+            plan.new_head_oid,
+            original_error.code(),
+        ),
+        reason_source: "exact provider non-publication proof after failed branch apply".to_owned(),
+        compatibility_evidence: format!(
+            "retained physical plan for PR #{} failed before provider exposed the planned head",
+            plan.pr
+        ),
+        clean_squash_evidence:
+            "old-generation intent only; any later successful rewrite invalidates it again"
+                .to_owned(),
+        admission_priority_basis: "not applicable: restoration does not change caravan order"
+            .to_owned(),
+    };
+
+    let restore = (|| -> Result<(), AppError> {
+        if observed.has_label("caravan-force") {
+            progress.already(
+                MutationKind::AddLabel,
+                plan.pr,
+                "old-generation force intent already restored",
+            );
+        } else {
+            progress.ensure_mutation_capacity(1)?;
+            let receipt = provider
+                .add_label(
+                    &status.repository,
+                    &progress.precondition(plan.pr),
+                    "caravan-force",
+                )
+                .map_err(|error| mutation_error(&error, progress, Some(plan.pr)))?;
+            progress.record(
+                receipt,
+                "restored caravan-force after proven rewrite non-publication",
+            );
+        }
+        progress.ensure_control_label_comment(provider, &status.repository, plan.pr, &audit)
+    })();
+    match restore {
+        Ok(()) => {
+            outcome.force_intent_restorations.push(json!({
+                "pr": plan.pr,
+                "state": "restored",
+                "old_head_oid": plan.old_head_oid,
+                "planned_head_oid": plan.new_head_oid,
+                "observed_head_oid": progress.current.get(&plan.pr).map(|pr| &pr.head.oid),
+                "restored": true,
+                "audit_marker": audit.marker,
+            }));
+            original_error
+        }
+        Err(restore_error) => AppError::structured(
+            ErrorCategory::ExecutionFailure,
+            "force_intent_restore_failed",
+            "rewrite non-publication was proven but old-generation force intent restoration did not complete",
+            Some(json!({
+                "pr": plan.pr,
+                "old_head_oid": plan.old_head_oid,
+                "planned_head_oid": plan.new_head_oid,
+                "original_error": {
+                    "category": original_error.category(),
+                    "code": original_error.code(),
+                    "message": original_error.message(),
+                    "details": original_error.details(),
+                },
+                "restore_error": {
+                    "category": restore_error.category(),
+                    "code": restore_error.code(),
+                    "message": restore_error.message(),
+                    "details": restore_error.details(),
+                },
+                "completed_steps": progress.steps,
+                "provider_receipts": progress.provider_receipts,
+                "resumable": true,
+                "next": "rediscover the exact old head and rerun sync; restoration audits deduplicate by exact transition",
+            })),
+        ),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 fn apply_physical_chains(
     status: &StatusOutput,
     provider: &impl SyncProvider,
@@ -1515,12 +1668,13 @@ fn apply_physical_chains(
                 .collect::<Vec<_>>()
         });
         let mut first_error = None;
+        let mut failed_plans = Vec::new();
         for (chain, result) in batch.iter().zip(results) {
             match result {
                 Ok((receipts, error)) => {
                     outcome.receipts.extend(receipts);
-                    if first_error.is_none() {
-                        first_error = error;
+                    if let Some(error) = error {
+                        failed_plans.push(error);
                     }
                 }
                 Err(_) if first_error.is_none() => {
@@ -1534,7 +1688,24 @@ fn apply_physical_chains(
                 Err(_) => {}
             }
         }
+        for (plan, error) in failed_plans {
+            let error = restore_force_intent_after_nonpublication(
+                status,
+                provider,
+                &plan,
+                &mut progress,
+                &mut outcome,
+                error,
+            );
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
         if let Some(error) = first_error {
+            outcome
+                .provider_receipts
+                .clone_from(&progress.provider_receipts);
+            outcome.steps.clone_from(&progress.steps);
             return Err(attach_physical_rebuild(error, &outcome));
         }
     }
@@ -1580,12 +1751,15 @@ fn apply_physical_chains(
 
 fn apply_prepared_chain(
     chain: &PreparedChain,
-) -> (Vec<crate::physical_rebase::RebaseReceipt>, Option<AppError>) {
+) -> (
+    Vec<crate::physical_rebase::RebaseReceipt>,
+    Option<(crate::physical_rebase::RebasePlan, AppError)>,
+) {
     let mut receipts = Vec::with_capacity(chain.members.len());
     for prepared in &chain.members {
         match crate::physical_rebase::apply_prepared_after_write_barrier(prepared) {
             Ok(receipt) => receipts.push(receipt),
-            Err(error) => return (receipts, Some(error)),
+            Err(error) => return (receipts, Some((prepared.plan.clone(), error))),
         }
     }
     (receipts, None)
@@ -1605,6 +1779,10 @@ fn attach_physical_rebuild(error: AppError, outcome: &PhysicalRebuildOutcome) ->
             json!(outcome.provider_receipts),
         );
         object.insert("completed_steps".to_owned(), json!(outcome.steps));
+        object.insert(
+            "force_intent_restorations".to_owned(),
+            json!(outcome.force_intent_restorations),
+        );
         object.insert("resumable".to_owned(), json!(true));
         let deterministic_history_decision = matches!(
             error.code().as_str(),

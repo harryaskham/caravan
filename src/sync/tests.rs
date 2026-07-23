@@ -416,7 +416,23 @@ impl SyncProvider for FakeProvider {
         audit: &ControlLabelAudit,
     ) -> Result<GitHubMutationReceipt, MutationError> {
         self.audits.borrow_mut().push(audit.clone());
-        self.mutate(expected, MutationKind::Comment, |_| {})
+        let already = self
+            .comments
+            .borrow()
+            .get(&expected.number)
+            .is_some_and(|comments| comments.iter().any(|body| body == &audit.marker));
+        if !already {
+            self.comments
+                .borrow_mut()
+                .entry(expected.number)
+                .or_default()
+                .push(audit.marker.clone());
+        }
+        let mut receipt = self.mutate(expected, MutationKind::Comment, |_| {})?;
+        if already {
+            receipt.provider_output = Some(format!("existing GitHub comment {}", audit.marker));
+        }
+        Ok(receipt)
     }
 
     fn admin_squash_merge(
@@ -1709,6 +1725,181 @@ fn force_merge_permission_denial_preserves_attempt_event() {
         "force_merge_attempted"
     );
     assert!(provider.calls.borrow().is_empty());
+}
+
+fn force_rewrite_plan(status: &StatusOutput) -> crate::physical_rebase::RebasePlan {
+    let old_head = status.analysis.pull_requests[&PrNumber(1)].head.clone();
+    crate::physical_rebase::RebasePlan {
+        pr: PrNumber(1),
+        branch: old_head.name.clone(),
+        old_head_oid: old_head.oid.clone(),
+        old_base_oid: status.analysis.fleet.default_branch.oid.clone(),
+        range_source: crate::physical_rebase::PlannedRangeBase::RemoteBranch {
+            branch: status.analysis.fleet.default_branch.clone(),
+        },
+        new_base: crate::physical_rebase::PlannedBase::Remote(
+            status.analysis.fleet.default_branch.clone(),
+        ),
+        new_head_oid: CommitOid("rewritten0000000000000000000000000000000".to_owned()),
+        new_tree_oid: CommitOid("tree000000000000000000000000000000000000".to_owned()),
+        commit_count: 1,
+        merge_topology: None,
+        ci_trigger_workflows: vec!["CI".to_owned()],
+        lease: format!("refs/heads/{}:{}", old_head.name, old_head.oid),
+        already_satisfied: false,
+    }
+}
+
+#[test]
+fn failed_rewrite_restores_force_only_after_proven_nonpublication() {
+    let mut pulls = healthy_chain();
+    pulls.truncate(1);
+    pulls[0].labels.insert("caravan-force".to_owned());
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+    let plan = force_rewrite_plan(&status);
+    let mut progress = SyncProgress::new(&status, vec![PrNumber(1)], u32::MAX);
+    invalidate_rewritten_force_intents(
+        &status,
+        &provider,
+        std::slice::from_ref(&plan),
+        &mut progress,
+    )
+    .unwrap();
+    assert!(!provider.pulls.borrow()[&PrNumber(1)].has_label("caravan-force"));
+    let mut outcome = PhysicalRebuildOutcome::default();
+    let error = restore_force_intent_after_nonpublication(
+        &status,
+        &provider,
+        &plan,
+        &mut progress,
+        &mut outcome,
+        AppError::validation("rebase_stale_lease", "push refused"),
+    );
+
+    assert_eq!(error.code(), "rebase_stale_lease");
+    assert!(provider.pulls.borrow()[&PrNumber(1)].has_label("caravan-force"));
+    assert_eq!(outcome.force_intent_restorations[0]["state"], "restored");
+    assert_eq!(outcome.force_intent_restorations[0]["restored"], true);
+    assert_eq!(
+        provider.calls.borrow().as_slice(),
+        [
+            MutationKind::RemoveLabel,
+            MutationKind::Comment,
+            MutationKind::AddLabel,
+            MutationKind::Comment,
+        ]
+    );
+    assert_eq!(
+        provider.audits.borrow()[1].operation,
+        "force_restore_nonpublication"
+    );
+
+    let mut repeated_outcome = PhysicalRebuildOutcome::default();
+    let repeated = restore_force_intent_after_nonpublication(
+        &status,
+        &provider,
+        &plan,
+        &mut progress,
+        &mut repeated_outcome,
+        AppError::validation("rebase_stale_lease", "push refused"),
+    );
+    assert_eq!(repeated.code(), "rebase_stale_lease");
+    assert_eq!(
+        repeated_outcome.force_intent_restorations[0]["state"],
+        "restored"
+    );
+    assert_eq!(provider.comments.borrow()[&PrNumber(1)].len(), 2);
+    assert_eq!(
+        provider.comments.borrow()[&PrNumber(1)]
+            .iter()
+            .filter(|body| body.contains("force_restore_nonpublication"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn published_or_indeterminate_rewrite_never_restores_old_force_intent() {
+    for observed_oid in [
+        CommitOid("rewritten0000000000000000000000000000000".to_owned()),
+        CommitOid("thirdparty000000000000000000000000000000".to_owned()),
+    ] {
+        let mut pulls = healthy_chain();
+        pulls.truncate(1);
+        pulls[0].labels.insert("caravan-force".to_owned());
+        let provider = FakeProvider::with_pull_requests(pulls.clone());
+        let status = status(pulls, Some(PrNumber(1)), &clean);
+        let plan = force_rewrite_plan(&status);
+        let mut progress = SyncProgress::new(&status, vec![PrNumber(1)], u32::MAX);
+        invalidate_rewritten_force_intents(
+            &status,
+            &provider,
+            std::slice::from_ref(&plan),
+            &mut progress,
+        )
+        .unwrap();
+        provider
+            .pulls
+            .borrow_mut()
+            .get_mut(&PrNumber(1))
+            .unwrap()
+            .head
+            .oid = observed_oid.clone();
+        let mut outcome = PhysicalRebuildOutcome::default();
+        let error = restore_force_intent_after_nonpublication(
+            &status,
+            &provider,
+            &plan,
+            &mut progress,
+            &mut outcome,
+            AppError::validation("rebase_stale_lease", "push outcome"),
+        );
+        assert_eq!(error.code(), "rebase_stale_lease");
+        assert!(!provider.pulls.borrow()[&PrNumber(1)].has_label("caravan-force"));
+        assert_eq!(
+            outcome.force_intent_restorations[0]["state"],
+            if observed_oid == plan.new_head_oid {
+                "published"
+            } else {
+                "indeterminate"
+            }
+        );
+        assert_eq!(provider.calls.borrow().len(), 2);
+    }
+}
+
+#[test]
+fn force_restore_comment_failure_retains_partial_label_receipt() {
+    let mut pulls = healthy_chain();
+    pulls.truncate(1);
+    pulls[0].labels.insert("caravan-force".to_owned());
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+    let plan = force_rewrite_plan(&status);
+    let mut progress = SyncProgress::new(&status, vec![PrNumber(1)], u32::MAX);
+    invalidate_rewritten_force_intents(
+        &status,
+        &provider,
+        std::slice::from_ref(&plan),
+        &mut progress,
+    )
+    .unwrap();
+    provider.fail_once(MutationKind::Comment);
+    let mut outcome = PhysicalRebuildOutcome::default();
+    let error = restore_force_intent_after_nonpublication(
+        &status,
+        &provider,
+        &plan,
+        &mut progress,
+        &mut outcome,
+        AppError::validation("rebase_stale_lease", "push refused"),
+    );
+    assert_eq!(error.code(), "force_intent_restore_failed");
+    assert!(provider.pulls.borrow()[&PrNumber(1)].has_label("caravan-force"));
+    let details = error.details().unwrap();
+    assert_eq!(details["original_error"]["code"], "rebase_stale_lease");
+    assert!(details["provider_receipts"].as_array().unwrap().len() >= 3);
 }
 
 #[test]

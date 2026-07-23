@@ -238,8 +238,11 @@ RESHAPING AND EXPLICIT INTENT
   non-draft active head, clean exact default/head compatibility, no hold/graph
   issue, ADMIN permission, and a durable actor/reason/check audit. `cara force
   revoke` removes only current-generation intent and is audited/idempotent.
-  Sync alone consumes armed intent for a one-shot squash. Force never bypasses
-  textual conflicts, stale facts, ownership, holds, permissions, or leases.
+  Sync alone consumes armed intent for a one-shot squash. If a rewrite fails,
+  old-generation intent is restored only after a fresh provider read proves the
+  old head remained unpublished; planned or indeterminate generations never
+  receive restored intent. Force never bypasses textual conflicts, stale facts,
+  ownership, holds, permissions, or leases.
 - Use audited `cara priority set|clear` to change one exact unenrolled PR's
   configured automatic-admission rank or restore FIFO. Priority is scheduling
   metadata only: it never authorizes membership, changes topology, or bypasses

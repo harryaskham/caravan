@@ -53,7 +53,11 @@ after the same check passes.
   force label bound to the old head; the new generation requires a fresh
   audited `cara force --pr N --actor A --reason R` operation, while routine
   membership never carries force intent. `cara force revoke` removes only the
-  exact current-generation intent and posts the matching durable audit.
+  exact current-generation intent and posts the matching durable audit. If Cara
+  invalidates old-generation intent before a physical rewrite and then proves
+  that generation was not published, it restores the old label under a fresh
+  precondition plus deterministic recovery audit; published or indeterminate
+  outcomes never restore it.
 - Optional sync-owned auto-admission is strictly opt-in. After the existing
   fleet converges, `sync --all` considers unlabelled PRs in configured-priority
   then immutable-FIFO order and greedily joins the first compatible live tail.

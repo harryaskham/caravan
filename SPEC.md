@@ -364,7 +364,12 @@ unrelated labels. Before any Cara-owned physical rewrite, sync/join removes
 invalidation audit; a force merge of the rewritten generation requires a fresh
 `cara force` operation. An already-satisfied plan does not consume intent
 because its head OID did not change. Routine membership never adds or carries
-force intent.
+force intent. If invalidation completes but branch publication fails, Cara
+refetches the provider head: only an exact old-head observation proves
+non-publication and permits restoring `caravan-force` under a fresh PR
+precondition plus deterministic recovery audit. An observed planned head keeps
+intent invalidated; any other head or failed refetch is indeterminate and never
+restores intent. Partial restoration receipts remain explicit and resumable.
 
 Before consuming armed `caravan-force`, sync/loop posts its separate durable
 acceptance audit containing the exact observed checks (including pending,

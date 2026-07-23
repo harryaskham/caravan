@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use mcp_cli::{ErrorCategory, StructuredError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::command::{CommandRunError, CommandRunner, CommandSpec, ProcessRunner};
 use crate::github::{
@@ -1307,8 +1307,19 @@ fn execute_locked(
             invalidation.ensure_control_label_comment(&provider, &repository, &audit)?;
             force_invalidation = Some(invalidation);
         }
-        let receipt = crate::physical_rebase::apply_prepared(&prepared)
-            .map_err(|error| attach_force_invalidation(error, force_invalidation.as_ref()))?;
+        let receipt = match crate::physical_rebase::apply_prepared(&prepared) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                return Err(restore_membership_force_after_nonpublication(
+                    &provider,
+                    &repository,
+                    &candidate,
+                    &prepared.plan,
+                    force_invalidation.as_mut(),
+                    error,
+                ));
+            }
+        };
         // GitHub is authoritative after a push. Never apply base/label changes
         // against the stale pre-rewrite PR snapshot.
         if let Some(candidate) = candidate_pr {
@@ -1604,6 +1615,146 @@ fn force_rewrite_invalidation_audit(
             "not applicable: force intent is removed before branch history changes".to_owned(),
         admission_priority_basis: "unchanged from the membership request".to_owned(),
     }
+}
+
+#[allow(clippy::too_many_lines)]
+fn restore_membership_force_after_nonpublication(
+    provider: &impl MembershipProvider,
+    repository: &RepositoryId,
+    candidate: &PullRequestSnapshot,
+    plan: &crate::physical_rebase::RebasePlan,
+    invalidation: Option<&mut ExecutionState>,
+    original_error: AppError,
+) -> AppError {
+    let Some(invalidation) = invalidation else {
+        return original_error;
+    };
+    let observed = match provider.refetch_pull_request(repository, candidate.number) {
+        Ok(observed) => observed,
+        Err(error) => {
+            return attach_force_restoration_evidence(
+                attach_force_invalidation(original_error, Some(invalidation)),
+                json!({
+                    "state": "indeterminate",
+                    "provider_error": error.to_string(),
+                    "restored": false,
+                }),
+            );
+        }
+    };
+    if observed.head.oid == plan.new_head_oid {
+        return attach_force_restoration_evidence(
+            attach_force_invalidation(original_error, Some(invalidation)),
+            json!({
+                "state": "published",
+                "observed_head_oid": observed.head.oid,
+                "restored": false,
+            }),
+        );
+    }
+    if observed.head.oid != plan.old_head_oid {
+        return attach_force_restoration_evidence(
+            attach_force_invalidation(original_error, Some(invalidation)),
+            json!({
+                "state": "indeterminate",
+                "old_head_oid": plan.old_head_oid,
+                "planned_head_oid": plan.new_head_oid,
+                "observed_head_oid": observed.head.oid,
+                "restored": false,
+            }),
+        );
+    }
+
+    invalidation.current = Some(observed.clone());
+    let mut audit_before_labels = observed.labels.clone();
+    audit_before_labels.remove(FORCE_LABEL);
+    let mut restored_labels = audit_before_labels.clone();
+    restored_labels.insert(FORCE_LABEL.to_owned());
+    let audit = ControlLabelAudit {
+        operation: "force_restore_nonpublication".to_owned(),
+        marker: control_label_marker(
+            "force_restore_nonpublication",
+            candidate.number,
+            &plan.old_head_oid,
+            &audit_before_labels,
+            &restored_labels,
+        ),
+        before_labels: audit_before_labels,
+        after_labels: restored_labels,
+        actor: "cara membership physical-rebase recovery policy".to_owned(),
+        reason: format!(
+            "restored caravan-force intent on unchanged old head {} after planned generation {} was proven not published ({})",
+            plan.old_head_oid,
+            plan.new_head_oid,
+            original_error.code(),
+        ),
+        reason_source: "exact provider non-publication proof after failed branch apply".to_owned(),
+        compatibility_evidence:
+            "membership physical plan failed before provider exposed its planned head".to_owned(),
+        clean_squash_evidence:
+            "old-generation intent only; any later successful rewrite invalidates it again"
+                .to_owned(),
+        admission_priority_basis: "unchanged from the membership request".to_owned(),
+    };
+    let restore = (|| -> Result<(), AppError> {
+        invalidation.ensure_label_present(provider, repository, FORCE_LABEL)?;
+        invalidation.ensure_control_label_comment(provider, repository, &audit)
+    })();
+    match restore {
+        Ok(()) => attach_force_restoration_evidence(
+            original_error,
+            json!({
+                "state": "restored",
+                "old_head_oid": plan.old_head_oid,
+                "planned_head_oid": plan.new_head_oid,
+                "observed_head_oid": invalidation.current.as_ref().map(|pr| &pr.head.oid),
+                "restored": true,
+                "audit_marker": audit.marker,
+                "completed_steps": invalidation.steps,
+                "provider_receipts": invalidation.provider_receipts,
+            }),
+        ),
+        Err(restore_error) => AppError::structured(
+            ErrorCategory::ExecutionFailure,
+            "force_intent_restore_failed",
+            "rewrite non-publication was proven but old-generation force intent restoration did not complete",
+            Some(json!({
+                "pr": candidate.number,
+                "old_head_oid": plan.old_head_oid,
+                "planned_head_oid": plan.new_head_oid,
+                "original_error": {
+                    "category": original_error.category(),
+                    "code": original_error.code(),
+                    "message": original_error.message(),
+                    "details": original_error.details(),
+                },
+                "restore_error": {
+                    "category": restore_error.category(),
+                    "code": restore_error.code(),
+                    "message": restore_error.message(),
+                    "details": restore_error.details(),
+                },
+                "completed_steps": invalidation.steps,
+                "provider_receipts": invalidation.provider_receipts,
+                "resumable": true,
+                "next": "rediscover the exact old head and rerun the same membership command; restoration audit markers deduplicate",
+            })),
+        ),
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn attach_force_restoration_evidence(error: AppError, restoration: Value) -> AppError {
+    let mut details = error.details().unwrap_or_else(|| json!({}));
+    if let Some(object) = details.as_object_mut() {
+        object.insert("force_intent_restoration".to_owned(), restoration);
+    }
+    AppError::structured(
+        error.category(),
+        error.code(),
+        error.message(),
+        Some(details),
+    )
 }
 
 fn attach_force_invalidation(error: AppError, state: Option<&ExecutionState>) -> AppError {

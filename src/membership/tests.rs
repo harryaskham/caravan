@@ -991,6 +991,99 @@ fn atomic_join_rejects_live_tail_drift_after_physical_rebase() {
     assert_eq!(error.details().unwrap()["mutated_membership"], false);
 }
 
+fn force_rewrite_plan(candidate: &PullRequestSnapshot) -> crate::physical_rebase::RebasePlan {
+    crate::physical_rebase::RebasePlan {
+        pr: candidate.number,
+        branch: candidate.head.name.clone(),
+        old_head_oid: candidate.head.oid.clone(),
+        old_base_oid: candidate.base.oid.clone(),
+        range_source: crate::physical_rebase::PlannedRangeBase::RemoteBranch {
+            branch: candidate.base.clone(),
+        },
+        new_base: crate::physical_rebase::PlannedBase::Remote(candidate.base.clone()),
+        new_head_oid: CommitOid("rewritten0000000000000000000000000000000".to_owned()),
+        new_tree_oid: CommitOid("tree000000000000000000000000000000000000".to_owned()),
+        commit_count: 1,
+        merge_topology: None,
+        ci_trigger_workflows: vec![".github/workflows/ci.yml".to_owned()],
+        lease: format!(
+            "--force-with-lease=refs/heads/{}:{}",
+            candidate.head.name, candidate.head.oid
+        ),
+        already_satisfied: false,
+    }
+}
+
+#[test]
+fn membership_rewrite_failure_restores_force_after_exact_nonpublication() {
+    let mut candidate = pull_request(2, "two", "main", &[FORCE_LABEL]);
+    candidate.labels.insert(ACTIVE_LABEL.to_owned());
+    let provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
+    let plan = force_rewrite_plan(&candidate);
+    let mut invalidation = ExecutionState::new(MembershipOperation::New);
+    invalidation.current = Some(candidate.clone());
+    invalidation
+        .ensure_label_absent(&provider, &repository(), FORCE_LABEL)
+        .unwrap();
+    let error = restore_membership_force_after_nonpublication(
+        &provider,
+        &repository(),
+        &candidate,
+        &plan,
+        Some(&mut invalidation),
+        AppError::validation("rebase_stale_lease", "push refused"),
+    );
+    assert_eq!(error.code(), "rebase_stale_lease");
+    assert!(provider.pull_requests.borrow()[&candidate.number].has_label(FORCE_LABEL));
+    let details = error.details().unwrap();
+    assert_eq!(details["force_intent_restoration"]["state"], "restored");
+    assert_eq!(details["force_intent_restoration"]["restored"], true);
+}
+
+#[test]
+fn membership_rewrite_published_or_indeterminate_never_restores_force() {
+    for observed in [
+        CommitOid("rewritten0000000000000000000000000000000".to_owned()),
+        CommitOid("thirdparty000000000000000000000000000000".to_owned()),
+    ] {
+        let mut candidate = pull_request(2, "two", "main", &[FORCE_LABEL]);
+        candidate.labels.insert(ACTIVE_LABEL.to_owned());
+        let provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
+        let plan = force_rewrite_plan(&candidate);
+        let mut invalidation = ExecutionState::new(MembershipOperation::New);
+        invalidation.current = Some(candidate.clone());
+        invalidation
+            .ensure_label_absent(&provider, &repository(), FORCE_LABEL)
+            .unwrap();
+        provider
+            .pull_requests
+            .borrow_mut()
+            .get_mut(&candidate.number)
+            .unwrap()
+            .head
+            .oid = observed.clone();
+        let error = restore_membership_force_after_nonpublication(
+            &provider,
+            &repository(),
+            &candidate,
+            &plan,
+            Some(&mut invalidation),
+            AppError::validation("rebase_stale_lease", "push outcome"),
+        );
+        assert_eq!(error.code(), "rebase_stale_lease");
+        assert!(!provider.pull_requests.borrow()[&candidate.number].has_label(FORCE_LABEL));
+        let details = error.details().unwrap();
+        assert_eq!(
+            details["force_intent_restoration"]["state"],
+            if observed == plan.new_head_oid {
+                "published"
+            } else {
+                "indeterminate"
+            }
+        );
+    }
+}
+
 #[test]
 fn join_receipt_proves_exact_tail_ancestry_and_stale_force_removal() {
     let head = pull_request(1, "one", "main", &[ACTIVE_LABEL]);
