@@ -234,7 +234,10 @@ ordered exact actions and rediscovery barriers before Apply. Bounded inner lists
 visible without an unbounded page. The Evidence drawer retains the latest typed
 action receipt, CI lineage diagnostics, canonical events, and hook delivery
 outcomes; the Config drawer shows the effective parsed policy with hook commands
-redacted. Mutating requests are accepted as bounded per-repository action jobs. Acceptance
+redacted. Eligible active heads expose audited Force/Unforce controls, while
+unenrolled Saloon PRs expose configured priority/FIFO controls; both require an
+actor and reason and call the same typed force/priority APIs as CLI/MCP rather
+than editing labels directly. Mutating requests are accepted as bounded per-repository action jobs. Acceptance
 binds both the displayed refresh sequence and a deterministic mutation-authority
 fingerprint over exact config/default/PR/check/topology/pause facts. Poll or
 webhook refreshes coalesce behind queued/running actions; harmless sequence drift

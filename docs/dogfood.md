@@ -121,12 +121,28 @@ cara repair continue --session SESSION --actor "$USER"
 
 `force_merge: true` permits a one-shot admin squash only after exact
 head/default compatibility, permission, policy, and audit checks. Force intent
-is bound to one head generation and is invalidated by a Cara-owned rewrite. The
-current released interface observes the exact `caravan-force` label; until the
-first-party `cara force` command lands, adding that label is an explicit
-operator action and must be followed immediately by fresh `cara sync --all`
-evidence. `caravan-forced` is not a recognized label. Force never bypasses a
-textual conflict, stale provider fact, hold, ownership check, or permission.
+is bound to one head generation and is invalidated by a Cara-owned rewrite. Arm
+or revoke it only through the audited typed interface, then let sync consume it:
+
+```sh
+cara force --pr 120 --actor "$USER" --reason 'known acceptable CI failure'
+cara force revoke --pr 120 --actor "$USER" --reason 'intent withdrawn'
+cara sync --all
+```
+
+`caravan-forced` is not a recognized label. Force never bypasses a textual
+conflict, stale provider fact, hold, ownership check, or permission. Likewise,
+change automatic order through `cara priority set|clear`, not raw labels:
+
+```sh
+cara priority set --pr 123 --label caravan-priority:high \
+  --actor "$USER" --reason 'operator scheduling decision'
+cara priority clear --pr 123 --actor "$USER" --reason 'return to FIFO'
+```
+
+Priority changes scheduling only and never authorizes membership or bypasses
+compatibility. The dashboard exposes these same typed operations with mandatory
+actor/reason confirmation.
 
 ## Every gap becomes work
 

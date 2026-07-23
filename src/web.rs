@@ -40,7 +40,7 @@ use crate::{
 const INDEX_HTML: &str = include_str!("web_assets/index.html");
 const APP_CSS: &str = include_str!("web_assets/app.css");
 const APP_JS: &str = include_str!("web_assets/app.js");
-const WEB_SCHEMA_VERSION: u32 = 6;
+const WEB_SCHEMA_VERSION: u32 = 7;
 const MIN_POLL_SECONDS: u64 = 2;
 const MAX_POLL_SECONDS: u64 = 3_600;
 const DEFAULT_POLL_SECONDS: u64 = 15;
@@ -288,6 +288,10 @@ pub enum WebAction {
     Rejoin(JoinInput),
     New(CreateInput),
     Renew(CreateInput),
+    ForceArm(crate::force::ForceIntentInput),
+    ForceRevoke(crate::force::ForceIntentInput),
+    PrioritySet(crate::priority::PrioritySetInput),
+    PriorityClear(crate::priority::PriorityClearInput),
     Split(SplitInput),
     Evict(EvictInput),
     Pause(PauseInput),
@@ -310,6 +314,10 @@ impl WebAction {
             Self::Rejoin(_) => "rejoin",
             Self::New(_) => "new",
             Self::Renew(_) => "renew",
+            Self::ForceArm(_) => "force_arm",
+            Self::ForceRevoke(_) => "force_revoke",
+            Self::PrioritySet(_) => "priority_set",
+            Self::PriorityClear(_) => "priority_clear",
             Self::Split(_) => "split",
             Self::Evict(_) => "evict",
             Self::Pause(_) => "pause",
@@ -1901,6 +1909,12 @@ fn run_action(context: &AppContext, action: WebAction) -> Result<serde_json::Val
         WebAction::Rejoin(input) => serialize_action(crate::membership::rejoin(context, &input)),
         WebAction::New(input) => serialize_action(crate::membership::new(context, &input)),
         WebAction::Renew(input) => serialize_action(crate::membership::renew(context, &input)),
+        WebAction::ForceArm(input) => serialize_action(crate::force::arm(context, &input)),
+        WebAction::ForceRevoke(input) => serialize_action(crate::force::revoke(context, &input)),
+        WebAction::PrioritySet(input) => serialize_action(crate::priority::set(context, &input)),
+        WebAction::PriorityClear(input) => {
+            serialize_action(crate::priority::clear(context, &input))
+        }
         WebAction::Split(input) => serialize_action(crate::reshape::split(context, &input)),
         WebAction::Evict(input) => serialize_action(crate::reshape::evict(context, &input)),
         WebAction::Pause(input) => serialize_action(crate::pause::pause(context, &input)),
@@ -2566,6 +2580,34 @@ mod tests {
             panic!("expected new action");
         };
         assert_eq!(input.pr, Some(42));
+
+        for (action, input) in [
+            (
+                "force_arm",
+                json!({"pr": 42, "actor": "cara-web", "reason": "known failure"}),
+            ),
+            (
+                "force_revoke",
+                json!({"pr": 42, "actor": "cara-web", "reason": "withdraw intent"}),
+            ),
+            (
+                "priority_set",
+                json!({"pr": 42, "label": "caravan-priority:high", "actor": "cara-web", "reason": "urgent"}),
+            ),
+            (
+                "priority_clear",
+                json!({"pr": 42, "actor": "cara-web", "reason": "FIFO"}),
+            ),
+        ] {
+            let request: WebActionRequest = serde_json::from_value(json!({
+                "expected_refresh_sequence": 10,
+                "action": action,
+                "input": input,
+            }))
+            .unwrap();
+            assert_eq!(request.action.name(), action);
+            assert!(request.action.mutates());
+        }
         assert!(
             serde_json::from_value::<WebActionRequest>(json!({
                 "expected_refresh_sequence": 1,
@@ -2641,6 +2683,12 @@ mod tests {
         assert!(APP_JS.contains("Ready (${ready.map(targetLabel).join(\", \")})"));
         assert!(APP_JS.contains("Conflicting (${conflicting.map(targetLabel).join(\", \")})"));
         assert!(APP_JS.contains("Exact target compatibility"));
+        assert!(APP_JS.contains("force_arm"));
+        assert!(APP_JS.contains("force_revoke"));
+        assert!(APP_JS.contains("priority_set"));
+        assert!(APP_JS.contains("priority_clear"));
+        assert!(APP_JS.contains("data-audit-required"));
+        assert!(APP_JS.contains("Actor and reason are required"));
         assert!(APP_JS.contains("caravan.saloon.${repositoryId}.${name}"));
         assert!(APP_JS.contains("ui.saloon.addEventListener(\"toggle\""));
         assert!(APP_JS.contains("group.open ? \"open\" : \"closed\""));

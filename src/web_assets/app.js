@@ -179,19 +179,27 @@
       <article class="overview-card"><span class="metric-label">Attention</span><strong class="metric">${problems.length + (repo.error ? 1 : 0)}</strong><p>${state.read_only ? "read only" : "mutable"}</p></article>`;
   }
 
-  function actionButton(label, action, input, tone = "", mutates = true) {
+  function actionButton(label, action, input, tone = "", mutates = true, auditRequired = false) {
     const actionBusy = selected()?.actions?.some((job) => ["queued", "running"].includes(job.state)) ?? false;
     const disabled = actionBusy || (state?.read_only && mutates);
     const title = actionBusy ? "Another repository action is in progress" : disabled ? "Disabled by --read-only" : `Run typed ${action.replaceAll("_", " ")} action`;
-    return `<button type="button" class="mini-action ${tone}" data-web-action="${escapeHtml(action)}" data-web-input="${escapeHtml(JSON.stringify(input))}" data-mutates="${mutates}" title="${escapeHtml(title)}" ${disabled ? "disabled" : ""}>${escapeHtml(label)}</button>`;
+    return `<button type="button" class="mini-action ${tone}" data-web-action="${escapeHtml(action)}" data-web-input="${escapeHtml(JSON.stringify(input))}" data-mutates="${mutates}" ${auditRequired ? 'data-audit-required="true"' : ""} title="${escapeHtml(title)}" ${disabled ? "disabled" : ""}>${escapeHtml(label)}</button>`;
   }
 
-  function renderPrCard(pr, index) {
+  function renderPrCard(pr, index, status, pause) {
     if (!pr) return `<article class="pr-card"><p>Provider snapshot unavailable</p></article>`;
     const [ciText, ciTone] = checkTone(pr.checks);
     const auto = pr.auto_merge?.enabled ? badge("Auto merge", "info") : badge("Auto merge off");
-    const force = hasLabel(pr, "caravan-force") ? badge("Force intent", "bad") : "";
+    const forcePresent = hasLabel(pr, "caravan-force");
+    const force = forcePresent ? badge("Force intent", "bad") : "";
     const failures = checkRows(pr.checks);
+    const forceProblem = (status?.analysis?.fleet?.problems ?? []).some((problem) => (problem.prs ?? []).includes(pr.number));
+    const forceEligible = index === 0 && openPr(pr) && !pause && !forceProblem && selected()?.effective_config?.force_merge === true && ciText !== "CI green";
+    const forceControl = index === 0 && forcePresent
+      ? actionButton("Unforce", "force_revoke", { pr: pr.number }, "", true, true)
+      : forceEligible
+        ? actionButton("Force", "force_arm", { pr: pr.number }, "danger", true, true)
+        : "";
     return `<article class="pr-card ${index === 0 ? "head" : ""}">
       <div class="pr-kicker">${prAnchor(pr, `PR #${pr.number}`, "pr-number")}${index === 0 ? badge("Head", "info") : badge(`Position ${index + 1}`)}</div>
       <h3 class="pr-title">${prAnchor(pr, pr.title || `Pull request #${pr.number}`, "pr-title-link")}</h3>
@@ -201,6 +209,7 @@
       ${failures ? `<details class="check-details"><summary>Why CI is blocked</summary>${failures}</details>` : ""}
       <div class="card-actions">
         ${actionButton("Check", "check", { pr: pr.number }, "", false)}
+        ${forceControl}
         ${index > 0 ? actionButton("Split", "split", { pr: pr.number }) : ""}
         ${actionButton("Evict", "evict", { pr: pr.number, reason: "Cara web operator eviction" }, "danger")}
       </div>
@@ -233,7 +242,7 @@
             <div class="inline-actions">${actionButton("Plan", "plan_sync", { all: true, rerun_failed: false }, "", false)}${actionButton("Sync", "sync", { all: true, rerun_failed: false }, "primary")}${holdAction}</div>
           </div>
         </header>
-        <div class="trail">${members.map(renderPrCard).join("")}</div>
+        <div class="trail">${members.map((pr, index) => renderPrCard(pr, index, status, pause)).join("")}</div>
       </article>`;
     }).join("");
   }
@@ -327,15 +336,21 @@
       : actionButton("New caravan", "new", { pr: pr.number, create_pr: false, reason: "Caravan dashboard exact compatible admission", priority_label: null }, "primary")).join("") : "";
     const preflightTarget = ready.find((target) => target.tail_pr)?.tail_pr ?? (compatibilityFact(repo, pr)?.targets ?? []).find((target) => target.tail_pr)?.tail_pr;
     const groupTone = group === "ready" ? "good" : group === "conflicting" || group === "bounty" ? "bad" : "warn";
+    const priorities = repo.effective_config?.agent_priority_labels ?? [];
+    const selectedPriorities = priorities.filter((label) => hasLabel(pr, label));
+    const unknownPriorities = labelNames(pr).filter((label) => label.startsWith("caravan-priority:") && !priorities.includes(label));
+    const priorityEligible = openPr(pr) && !pr.draft && !pr.cross_repository && !hasLabel(pr, "caravan") && !hasLabel(pr, "caravan-evicted") && selectedPriorities.length <= 1 && !unknownPriorities.length;
+    const priorityControls = priorityEligible ? priorities.map((label) => hasLabel(pr, label) ? "" : actionButton(label.replace("caravan-priority:", "Priority "), "priority_set", { pr: pr.number, label }, "", true, true)).join("") + (selectedPriorities.length ? actionButton("Priority FIFO", "priority_clear", { pr: pr.number }, "", true, true) : "") : "";
+    const priorityBadge = selectedPriorities.length ? badge(selectedPriorities[0].replace("caravan-priority:", "Priority "), "info") : priorityEligible ? badge("Priority FIFO") : "";
     return `<article class="queue-card saloon-card">
       <div class="pr-kicker">${prAnchor(pr, `PR #${pr.number}`, "pr-number")}${pr.draft ? badge("Draft") : badge(SALOON_META[group][0], groupTone)}</div>
       <h3>${prAnchor(pr, pr.title || `Pull request #${pr.number}`, "pr-title-link")}</h3>
       <p><span class="mono">${escapeHtml(pr.head?.name)}@${shortOid(pr.head?.oid)}</span> → <span class="mono">${escapeHtml(pr.base?.name)}</span></p>
-      <div class="badges">${compatibilityBadges(repo, pr)}</div>
+      <div class="badges">${compatibilityBadges(repo, pr)}${priorityBadge}</div>
       <p class="reason">${escapeHtml(reasonForPr(status, pr))}</p>
       ${compatibilityRows(repo, pr)}
       ${checkRows(pr.checks)}
-      <div class="card-actions">${actionButton("Preflight", "check", { pr: pr.number, ...(preflightTarget ? { tail_pr: preflightTarget } : {}) }, "", false)}${admissions}</div>
+      <div class="card-actions">${actionButton("Preflight", "check", { pr: pr.number, ...(preflightTarget ? { tail_pr: preflightTarget } : {}) }, "", false)}${admissions}${priorityControls}</div>
     </article>`;
   }
 
@@ -500,7 +515,7 @@
   async function performAction(action, input, button) {
     const repo = selected();
     if (!repo || (state.read_only && button?.dataset.mutates !== "false")) return;
-    const destructive = ["evict", "split", "pause", "repair_abort"].includes(action);
+    const destructive = ["evict", "split", "pause", "repair_abort", "force_arm", "force_revoke", "priority_set", "priority_clear"].includes(action);
     if (destructive && !window.confirm(`Run ${action.replaceAll("_", " ")} against ${repoName(repo)} using the current exact snapshot?`)) return;
     if (button) button.disabled = true;
     setBusy(true);
@@ -591,6 +606,16 @@
     if (!button) return;
     let input = {};
     try { input = JSON.parse(button.dataset.webInput || "{}"); } catch { toast("Invalid embedded action payload"); return; }
+    if (button.dataset.auditRequired === "true") {
+      const defaultActor = window.localStorage.getItem("caravan.audit.actor") || "cara-web";
+      const actor = window.prompt("Audited actor", defaultActor);
+      if (actor === null) return;
+      const reason = window.prompt(`Reason for ${button.dataset.webAction.replaceAll("_", " ")}`, "");
+      if (reason === null) return;
+      if (!actor.trim() || !reason.trim()) { toast("Actor and reason are required"); return; }
+      window.localStorage.setItem("caravan.audit.actor", actor.trim());
+      input = { ...input, actor: actor.trim(), reason: reason.trim() };
+    }
     performAction(button.dataset.webAction, input, button);
   });
   applySidebarState();
