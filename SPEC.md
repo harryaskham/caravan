@@ -344,11 +344,14 @@ force publication are not valid Cara decision continuations.
 3. it remains mechanically conflict-free with the default branch;
 4. the authenticated actor has repository ADMIN permission.
 
-An exact force-labelled head may keep provider-native auto-merge disabled while
-Cara validates this policy. Cara posts the generation-bound audit and invokes
-the administrator squash primitive directly; it never arms native auto-merge as
-a force prerequisite, because repositories without a holding requirement could
-otherwise merge before Cara records its authorization. A targeted sync may
+An exact force-labelled head armed through the ordinary `cara force` surface may
+keep provider-native auto-merge disabled while Cara validates this policy. Sync
+posts the generation-bound audit and invokes the administrator squash primitive
+directly; that ordinary surface never arms native auto-merge as a force
+prerequisite, because repositories without a holding requirement could otherwise
+merge before Cara records its authorization. The separately reviewed
+`force-intent apply` transaction below is explicitly authorized to repair the
+missing squash auto-merge postcondition before it arms its exact label field. A targeted sync may
 defer this one repairable disabled-auto-merge invariant on an unrelated
 force-labelled head when `force_merge: true`; structural graph errors,
 non-squash or externally enabled auto-merge, ordinary unlabelled head gaps, and
@@ -370,6 +373,32 @@ non-publication and permits restoring `caravan-force` under a fresh PR
 precondition plus deterministic recovery audit. An observed planned head keeps
 intent invalidated; any other head or failed refetch is indeterminate and never
 restores intent. Partial restoration receipts remain explicit and resumable.
+
+The controller-reviewed exception contract is a separate exact machine surface:
+`cara --json force-intent preview|apply|revoke --pr N --head OID
+--membership-generation G --failure-fingerprint F --reason R
+--expires-at-ms T --auto-merge squash`, with matching MCP tools
+`force_intent_preview`, `force_intent_apply`, and `force_intent_revoke`. Every
+invocation performs fresh provider discovery. Membership generation hashes the
+ordered Caravan membership, exact member head/base facts, and current default
+branch. CI failures expose the same deterministic `fnv1a64` fingerprint in the
+sync decision, exact check evidence, and current decision evidence.
+
+Preview is always zero-write and returns the current provider head, membership,
+checks, decision, fingerprint, and expiry. Apply requires unexpired authority,
+`force_merge: true`, exact supplied head/generation/fingerprint, a current CI
+failure, active owned head membership, clean compatibility, no hold or unrelated
+graph problem, fresh default/head/check preconditions, and ADMIN permission. It
+converges `caravan-force` plus missing squash auto-merge fields in one GraphQL
+provider mutation and independently refetches the complete postcondition; a
+partially applied aliased response is a typed resumable error with before/after
+evidence. The selected head's disabled-auto-merge invariant is the one repairable
+graph gap; all unrelated graph failures remain blocking. Revoke accepts expired
+authority, removes only exact-generation force intent, preserves queue-owned
+squash auto-merge, and is idempotent. Apply and revoke post a deterministic
+GitHub-visible audit bound to the complete reviewed authority; audit failure
+retains provider receipts for exact retry. This reviewed surface does not consume
+intent or merge: normal sync remains the sole queue actor.
 
 Before consuming armed `caravan-force`, sync/loop posts its separate durable
 acceptance audit containing the exact observed checks (including pending,

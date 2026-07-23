@@ -3514,6 +3514,10 @@ fn ci_decision_error(
         json!(progress.current.get(&observation.pr)),
     );
     evidence.insert("event".to_owned(), json!(event));
+    if let Some(force_intent) = crate::force_intent::sync_decision_evidence(status, observation.pr)
+    {
+        evidence.insert("force_intent".to_owned(), force_intent);
+    }
     let mut suggested_actions = vec![
         "repair and push the affected PR, then rerun `cara sync`".to_owned(),
         format!(

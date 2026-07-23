@@ -284,6 +284,14 @@ pub(super) fn scheduler_failure_status(error: &AppError) -> SyncFailureScheduler
 
 fn scheduler_decision_fingerprint(error: &AppError) -> String {
     let details = error.details().unwrap_or_else(|| json!({}));
+    if error.code() == "ci_failure"
+        && let Some(fingerprint) = details
+            .pointer("/decision/evidence/force_intent/failure_fingerprint")
+            .and_then(serde_json::Value::as_str)
+        && fingerprint.starts_with("fnv1a64:")
+    {
+        return fingerprint.to_owned();
+    }
     let material = serde_json::to_vec(&json!({
         "error_code": error.code(),
         "repository": details.get("repository"),

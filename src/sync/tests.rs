@@ -1161,6 +1161,32 @@ fn unforced_failure_returns_exact_ci_decision_and_canonical_event() {
         details["decision"]["evidence"]["event"]["operation_id"],
         details["decision"]["operation_id"]
     );
+    let force_fingerprint = details["decision"]["evidence"]["force_intent"]["failure_fingerprint"]
+        .as_str()
+        .expect("CI decision exposes reviewed force fingerprint");
+    assert!(force_fingerprint.starts_with("fnv1a64:"));
+    assert_eq!(
+        details["decision"]["evidence"]["force_intent"]["required_checks"]["failure_fingerprint"],
+        force_fingerprint
+    );
+    assert_eq!(
+        details["decision"]["evidence"]["force_intent"]["current_decision"]["failure_fingerprint"],
+        force_fingerprint
+    );
+    let attached = attach_scheduler_failure(
+        &error,
+        &SyncFailureSchedulerStatus {
+            schema_version: 1,
+            disposition: SchedulerDisposition::ExternalDecision,
+            wake_class: SchedulerWakeClass::ExternalDecision,
+            retryable: false,
+            error_code: "ci_failure".to_owned(),
+        },
+    );
+    assert_eq!(
+        mcp_cli::StructuredError::details(&attached).unwrap()["decision_fingerprint"],
+        force_fingerprint
+    );
     assert!(provider.calls.borrow().is_empty());
     let scheduler = scheduler_failure_status(&error);
     assert_eq!(

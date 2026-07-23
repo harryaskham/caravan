@@ -83,6 +83,9 @@ enum Command {
     Prev,
     /// Arm or revoke audited exact-generation one-shot force intent.
     Force(ForceCommand),
+    /// Reviewed exact-head force authority consumed by Cacophony controllers.
+    #[command(subcommand)]
+    ForceIntent(ReviewedForceIntentCommand),
     /// Explicitly freeze one caravan and disable only its head auto-merge.
     Pause(PauseInput),
     /// Explicitly revalidate and resume one paused caravan.
@@ -180,6 +183,16 @@ struct ForceCommand {
 enum ForceSubcommand {
     /// Revoke current exact-generation force intent.
     Revoke(caravan::force::ForceIntentInput),
+}
+
+#[derive(Debug, Subcommand)]
+enum ReviewedForceIntentCommand {
+    /// Re-read exact provider/membership/check/decision evidence without mutation.
+    Preview(caravan::force_intent::ReviewedForceIntentInput),
+    /// Atomically converge exact-head force intent plus squash auto-merge.
+    Apply(caravan::force_intent::ReviewedForceIntentInput),
+    /// Idempotently revoke exact-generation force intent, including after expiry.
+    Revoke(caravan::force_intent::ReviewedForceIntentInput),
 }
 
 impl ForceCommand {
@@ -360,6 +373,7 @@ fn run(cli: &Cli) -> Result<(), i32> {
             caravan::navigation::Direction::Previous,
         ),
         Command::Force(command) => run_force(cli, command),
+        Command::ForceIntent(command) => run_reviewed_force_intent(cli, command),
         Command::Pause(input) => run_pause(cli, input),
         Command::Resume(input) => run_resume(cli, input),
         Command::Sync(input) => run_sync(cli, input),
@@ -904,6 +918,37 @@ fn run_force(cli: &Cli, command: &ForceCommand) -> Result<(), i32> {
                 output.default_branch.oid,
                 output.mutated,
                 output.next
+            );
+            Ok(())
+        }
+        Err(error) => emit_human_error(error),
+    }
+}
+
+fn run_reviewed_force_intent(cli: &Cli, command: &ReviewedForceIntentCommand) -> Result<(), i32> {
+    let context = load_context(cli)?;
+    let result = match command {
+        ReviewedForceIntentCommand::Preview(input) => {
+            caravan::force_intent::preview(&context, input)
+        }
+        ReviewedForceIntentCommand::Apply(input) => caravan::force_intent::apply(&context, input),
+        ReviewedForceIntentCommand::Revoke(input) => caravan::force_intent::revoke(&context, input),
+    };
+    if cli.json {
+        return emit_result(true, result);
+    }
+    match result {
+        Ok(output) => {
+            println!(
+                "force-intent {} PR #{} head={} membership={} decision={} changed={} atomic={}\n  {}",
+                output.action,
+                output.pr,
+                output.provider_head,
+                output.membership_generation,
+                output.failure_fingerprint,
+                output.mutated,
+                output.atomic_provider_transaction,
+                output.next,
             );
             Ok(())
         }
@@ -2717,6 +2762,47 @@ mod tests {
         let (input, revoke) = command.operation().unwrap();
         assert_eq!(input.pr, 42);
         assert!(revoke);
+    }
+
+    #[test]
+    fn reviewed_force_intent_contract_parses_exact_caco_arguments() {
+        for action in ["preview", "apply", "revoke"] {
+            let cli = Cli::try_parse_from([
+                "cara",
+                "--json",
+                "force-intent",
+                action,
+                "--pr",
+                "2120",
+                "--head",
+                "4b5ddd6a9f1d61599d68ccd05e5c831dba1fc239",
+                "--membership-generation",
+                "fnv1a64:1111111111111111",
+                "--failure-fingerprint",
+                "fnv1a64:2222222222222222",
+                "--reason",
+                "known provider control-plane failure",
+                "--expires-at-ms",
+                "9999999999999",
+                "--auto-merge",
+                "squash",
+            ])
+            .unwrap_or_else(|error| panic!("{action} must parse: {error}"));
+            let Command::ForceIntent(command) = cli.command else {
+                panic!("expected reviewed force-intent {action}");
+            };
+            let input = match command {
+                ReviewedForceIntentCommand::Preview(input)
+                | ReviewedForceIntentCommand::Apply(input)
+                | ReviewedForceIntentCommand::Revoke(input) => input,
+            };
+            assert_eq!(input.pr, 2120);
+            assert_eq!(input.head, "4b5ddd6a9f1d61599d68ccd05e5c831dba1fc239");
+            assert_eq!(
+                input.auto_merge,
+                caravan::force_intent::ReviewedAutoMerge::Squash
+            );
+        }
     }
 
     #[test]

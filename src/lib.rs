@@ -10,6 +10,7 @@ pub mod ci;
 pub mod command;
 pub mod compatibility;
 pub mod force;
+pub mod force_intent;
 pub mod github;
 pub mod graph;
 pub mod hooks;
@@ -243,6 +244,16 @@ RESHAPING AND EXPLICIT INTENT
   old head remained unpublished; planned or indeterminate generations never
   receive restored intent. Force never bypasses textual conflicts, stale facts,
   ownership, holds, permissions, or leases.
+- Controller-reviewed exact exceptions use `cara --json force-intent
+  preview|apply|revoke --pr N --head OID --membership-generation G
+  --failure-fingerprint F --reason R --expires-at-ms T --auto-merge squash`
+  and matching MCP tools. CI decisions expose the same deterministic fingerprint.
+  Preview performs no writes. Apply independently re-reads exact head,
+  membership, checks, decision, default branch, compatibility, holds, graph,
+  and permission, then converges force intent plus missing squash auto-merge in
+  one provider mutation and refetches the complete postcondition. Revoke accepts
+  expired authority, removes only force intent, preserves queue-owned auto-merge,
+  and is idempotent. Partial provider/audit results retain exact retry receipts.
 - Use audited `cara priority set|clear` to change one exact unenrolled PR's
   configured automatic-admission rank or restore FIFO. Priority is scheduling
   metadata only: it never authorizes membership, changes topology, or bypasses
@@ -856,6 +867,27 @@ pub fn build_router() -> ToolRouter<AppContext> {
         "force_revoke",
         "Idempotently revoke exact-generation caravan-force intent from an eligible active head under exact preconditions and post a durable audit without touching unrelated labels.",
         |context: &AppContext, input: force::ForceIntentInput| force::revoke(context, &input),
+    );
+    router.add_typed_tool_with_output_schema(
+        "force_intent_preview",
+        "Re-read one exact provider head, Caravan membership generation, current check rollup, and CI-decision fingerprint for reviewed bounded force authority. Never mutates.",
+        |context: &AppContext, input: force_intent::ReviewedForceIntentInput| {
+            force_intent::preview(context, &input)
+        },
+    );
+    router.add_typed_tool_with_output_schema(
+        "force_intent_apply",
+        "Validate exact reviewed force evidence and converge caravan-force plus squash auto-merge through one provider transaction under fresh head/check preconditions and durable audit.",
+        |context: &AppContext, input: force_intent::ReviewedForceIntentInput| {
+            force_intent::apply(context, &input)
+        },
+    );
+    router.add_typed_tool_with_output_schema(
+        "force_intent_revoke",
+        "Idempotently revoke one exact-generation reviewed force intent, including after expiry, while preserving normal queue ownership of squash auto-merge.",
+        |context: &AppContext, input: force_intent::ReviewedForceIntentInput| {
+            force_intent::revoke(context, &input)
+        },
     );
     router.add_typed_tool_with_output_schema(
         "pause",
@@ -1486,6 +1518,8 @@ mod tests {
         assert!(output.instructions.contains("cara join --pr N --tail-pr T"));
         assert!(output.instructions.contains("cara repair start"));
         assert!(output.instructions.contains("caravan-force"));
+        assert!(output.instructions.contains("force-intent"));
+        assert!(output.instructions.contains("--membership-generation"));
         assert!(
             output
                 .instructions
@@ -1527,6 +1561,9 @@ mod tests {
             "show",
             "force_arm",
             "force_revoke",
+            "force_intent_preview",
+            "force_intent_apply",
+            "force_intent_revoke",
             "next",
             "prev",
             "plan_sync",
@@ -1566,6 +1603,40 @@ mod tests {
         assert!(encoded.contains("provider_writes"));
         assert!(encoded.contains("auto_admission"));
         assert!(encoded.contains("plan_hash"));
+    }
+
+    #[test]
+    fn reviewed_force_tool_schemas_match_caco_evidence_contract() {
+        let tools =
+            serde_json::to_value(build_router().tool_metadata()).expect("tool metadata serializes");
+        for name in [
+            "force_intent_preview",
+            "force_intent_apply",
+            "force_intent_revoke",
+        ] {
+            let tool = tools
+                .as_array()
+                .expect("metadata array")
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            let encoded = serde_json::to_string(tool).expect("force metadata serializes");
+            for field in [
+                "head",
+                "provider_head",
+                "membership_generation",
+                "membership",
+                "failure_fingerprint",
+                "required_checks",
+                "current_decision",
+                "expires_at_ms",
+                "force_intent_applied",
+                "squash_auto_merge_enabled",
+                "atomic_provider_transaction",
+            ] {
+                assert!(encoded.contains(field), "{name} schema omitted {field}");
+            }
+        }
     }
 
     #[test]

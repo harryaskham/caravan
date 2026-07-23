@@ -373,6 +373,20 @@ pub enum MutationError {
         /// Provider conclusion.
         conclusion: String,
     },
+    /// A reviewed single-request provider transition returned without the
+    /// complete requested postcondition. Before/after facts make a partial
+    /// GraphQL response explicit and resumable rather than guessed.
+    AtomicTransactionIncomplete {
+        operation: String,
+        before: Box<model::PullRequestSnapshot>,
+        after: Box<model::PullRequestSnapshot>,
+        desired_label_present: bool,
+        desired_squash_auto_merge: bool,
+        provider_error: Option<String>,
+    },
+    /// One provider node required to construct an exact GraphQL mutation was
+    /// absent from the fresh repository lookup.
+    MissingProviderResource { resource: String },
 }
 
 impl std::fmt::Display for MutationError {
@@ -420,6 +434,22 @@ impl std::fmt::Display for MutationError {
                 formatter,
                 "workflow run {run_id} is not failed (conclusion: {conclusion})"
             ),
+            Self::AtomicTransactionIncomplete {
+                operation,
+                desired_label_present,
+                desired_squash_auto_merge,
+                provider_error,
+                ..
+            } => write!(
+                formatter,
+                "atomic provider transaction `{operation}` did not converge (label_present={desired_label_present}, squash_auto_merge={desired_squash_auto_merge}): {}",
+                provider_error
+                    .as_deref()
+                    .unwrap_or("provider returned an incomplete postcondition")
+            ),
+            Self::MissingProviderResource { resource } => {
+                write!(formatter, "provider resource `{resource}` is unavailable")
+            }
         }
     }
 }
@@ -841,6 +871,115 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
             MutationKind::DisableAutoMerge,
             auto_merge_command(repository, expected.number, true),
         )
+    }
+
+    /// Converge one exact label state and, when requested, squash auto-merge in
+    /// one GraphQL mutation request after a check-sensitive PR precondition.
+    ///
+    /// The provider may report GraphQL errors after applying an earlier aliased
+    /// field, so this primitive always refetches and either proves the complete
+    /// postcondition or returns explicit before/after partial-state evidence.
+    pub fn atomic_label_and_squash_auto_merge(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+        label: &str,
+        desired_label_present: bool,
+        ensure_squash_auto_merge: bool,
+    ) -> Result<(GitHubMutationReceipt, bool), MutationError> {
+        let before = self.verify_precondition_with_checks(repository, expected)?;
+        let label_change = before.has_label(label) != desired_label_present;
+        let squash_ready = before.auto_merge.enabled
+            && before.auto_merge.merge_method == Some(MergeMethod::Squash);
+        let auto_merge_change = ensure_squash_auto_merge && !squash_ready;
+        if !label_change && !auto_merge_change {
+            return Ok((
+                GitHubMutationReceipt {
+                    kind: MutationKind::ForceIntentTransaction,
+                    before: Some(before.clone()),
+                    after: before,
+                    provider_output: Some(
+                        "atomic provider force postcondition already satisfied".to_owned(),
+                    ),
+                },
+                false,
+            ));
+        }
+
+        let ids: ForceTransactionIdsResponse = self.json(force_transaction_ids_command(
+            repository,
+            expected.number,
+            label,
+        ))?;
+        let pull_request_id = ids
+            .data
+            .repository
+            .pull_request
+            .map(|pull| pull.id)
+            .ok_or_else(|| MutationError::MissingProviderResource {
+                resource: format!("pull_request:{}", expected.number),
+            })?;
+        let label_id = if label_change {
+            Some(
+                ids.data
+                    .repository
+                    .label
+                    .map(|label| label.id)
+                    .ok_or_else(|| MutationError::MissingProviderResource {
+                        resource: format!("label:{label}"),
+                    })?,
+            )
+        } else {
+            None
+        };
+        let command = force_transaction_command(
+            &pull_request_id,
+            label_id.as_deref(),
+            desired_label_present,
+            auto_merge_change,
+        );
+        let output = self.runner.run(&command).map_err(DiscoveryError::from)?;
+        let after = self.refetch_pull_request(repository, expected.number)?;
+        let label_converged = after.has_label(label) == desired_label_present;
+        let auto_merge_converged = !ensure_squash_auto_merge
+            || (after.auto_merge.enabled
+                && after.auto_merge.merge_method == Some(MergeMethod::Squash));
+        let provider_error = (!output.is_success()).then(|| {
+            format!(
+                "status {}: {}",
+                output
+                    .code
+                    .map_or_else(|| "signal".to_owned(), |code| code.to_string()),
+                diagnostic_excerpt(&output.stderr)
+            )
+        });
+        if !label_converged || !auto_merge_converged {
+            return Err(MutationError::AtomicTransactionIncomplete {
+                operation: "label_and_squash_auto_merge".to_owned(),
+                before: Box::new(before),
+                after: Box::new(after),
+                desired_label_present,
+                desired_squash_auto_merge: ensure_squash_auto_merge,
+                provider_error,
+            });
+        }
+        let provider_output = if let Some(error) = provider_error {
+            Some(format!(
+                "provider reported `{error}`, but exact refetch proved the complete postcondition"
+            ))
+        } else {
+            let value = output.stdout.trim();
+            (!value.is_empty()).then(|| diagnostic_excerpt(value))
+        };
+        Ok((
+            GitHubMutationReceipt {
+                kind: MutationKind::ForceIntentTransaction,
+                before: Some(before),
+                after,
+                provider_output,
+            },
+            true,
+        ))
     }
 
     /// List failed Actions runs for the exact PR head after verification.
@@ -1907,6 +2046,72 @@ fn auto_merge_command(repository: &RepositoryId, number: PrNumber, disable: bool
     }
 }
 
+fn force_transaction_ids_command(
+    repository: &RepositoryId,
+    number: PrNumber,
+    label: &str,
+) -> CommandSpec {
+    let query = "query($owner:String!,$name:String!,$number:Int!,$label:String!){repository(owner:$owner,name:$name){pullRequest(number:$number){id} label(name:$label){id}}}";
+    CommandSpec::new("gh").args([
+        "api".to_owned(),
+        "graphql".to_owned(),
+        "-f".to_owned(),
+        format!("query={query}"),
+        "-F".to_owned(),
+        format!("owner={}", repository.owner),
+        "-F".to_owned(),
+        format!("name={}", repository.name),
+        "-F".to_owned(),
+        format!("number={number}"),
+        "-F".to_owned(),
+        format!("label={label}"),
+    ])
+}
+
+fn force_transaction_command(
+    pull_request_id: &str,
+    label_id: Option<&str>,
+    desired_label_present: bool,
+    enable_squash_auto_merge: bool,
+) -> CommandSpec {
+    let mut fields = Vec::new();
+    // GraphQL guarantees top-level mutation fields execute serially, but not
+    // rollback across aliases. Enable queue-safe auto-merge first so any prefix
+    // failure can never leave force intent armed without its reviewed holding
+    // postcondition.
+    if enable_squash_auto_merge {
+        fields.push("forceAutoMerge:enablePullRequestAutoMerge(input:{pullRequestId:$pullRequestId,mergeMethod:SQUASH}){clientMutationId}".to_owned());
+    }
+    if label_id.is_some() {
+        let mutation = if desired_label_present {
+            "addLabelsToLabelable"
+        } else {
+            "removeLabelsFromLabelable"
+        };
+        fields.push(format!(
+            "forceLabel:{mutation}(input:{{labelableId:$pullRequestId,labelIds:[$labelId]}}){{clientMutationId}}"
+        ));
+    }
+    let variables = if label_id.is_some() {
+        "$pullRequestId:ID!,$labelId:ID!"
+    } else {
+        "$pullRequestId:ID!"
+    };
+    let query = format!("mutation({variables}){{{}}}", fields.join(" "));
+    let mut command = CommandSpec::new("gh").args([
+        "api".to_owned(),
+        "graphql".to_owned(),
+        "-f".to_owned(),
+        format!("query={query}"),
+        "-f".to_owned(),
+        format!("pullRequestId={pull_request_id}"),
+    ]);
+    if let Some(label_id) = label_id {
+        command = command.args(["-f".to_owned(), format!("labelId={label_id}")]);
+    }
+    command
+}
+
 fn failed_runs_command(repository: &RepositoryId, head_oid: &str) -> CommandSpec {
     CommandSpec::new("gh").args([
         "run".to_owned(),
@@ -2232,6 +2437,28 @@ struct MergeCandidatesRepository {
     default_branch_ref: Option<GraphDefaultBranchRefJson>,
     #[serde(flatten)]
     candidates: BTreeMap<String, Option<GraphCommitJson>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ForceTransactionIdsResponse {
+    data: ForceTransactionIdsData,
+}
+
+#[derive(Debug, Deserialize)]
+struct ForceTransactionIdsData {
+    repository: ForceTransactionIdsRepository,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ForceTransactionIdsRepository {
+    pull_request: Option<GraphNodeId>,
+    label: Option<GraphNodeId>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphNodeId {
+    id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3776,6 +4003,118 @@ mod tests {
                 .unwrap()
                 .starts_with("existing GitHub comment")
         );
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn reviewed_force_state_uses_one_graphql_mutation_and_refetches_complete_postcondition() {
+        let repository = repository();
+        let mutation = force_transaction_command("PR_node", Some("LABEL_node"), true, true);
+        let rendered = mutation.display();
+        assert!(
+            rendered.find("forceAutoMerge").unwrap() < rendered.find("forceLabel").unwrap(),
+            "safe serial prefix enables holding auto-merge before arming force intent"
+        );
+        let mut expected = precondition(12);
+        expected.auto_merge = AutoMergeState::disabled();
+        let mut before: serde_json::Value =
+            serde_json::from_str(&pr_object_json(12, "feature/widget", "acme/widgets")).unwrap();
+        before["autoMergeRequest"] = serde_json::Value::Null;
+        let mut after = before.clone();
+        after["labels"] = serde_json::json!([{"name": "caravan"}, {"name": "caravan-force"}]);
+        after["autoMergeRequest"] = serde_json::json!({
+            "mergeMethod": "SQUASH",
+            "enabledAt": "2026-07-17T10:00:00Z",
+            "enabledBy": {"login": "octocat"}
+        });
+        let ids = serde_json::json!({"data": {"repository": {
+            "pullRequest": {"id": "PR_node"},
+            "label": {"id": "LABEL_node"}
+        }}})
+        .to_string();
+        let runner = FakeRunner::new(vec![
+            (
+                pull_request_command(&repository, "12"),
+                CommandOutput::success(before.to_string()),
+            ),
+            (
+                force_transaction_ids_command(&repository, PrNumber(12), "caravan-force"),
+                CommandOutput::success(ids),
+            ),
+            (
+                force_transaction_command("PR_node", Some("LABEL_node"), true, true),
+                CommandOutput::success(r#"{"data":{"forceLabel":{},"forceAutoMerge":{}}}"#),
+            ),
+            (
+                pull_request_command(&repository, "12"),
+                CommandOutput::success(after.to_string()),
+            ),
+        ]);
+        let adapter = GitHubMutationAdapter::new(runner);
+
+        let (receipt, performed) = adapter
+            .atomic_label_and_squash_auto_merge(&repository, &expected, "caravan-force", true, true)
+            .unwrap();
+
+        assert!(performed);
+        assert_eq!(receipt.kind, MutationKind::ForceIntentTransaction);
+        assert!(receipt.after.has_label("caravan-force"));
+        assert_eq!(receipt.after.auto_merge, AutoMergeState::squash());
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn reviewed_force_partial_graphql_result_is_explicit_and_resumable() {
+        let repository = repository();
+        let mut expected = precondition(12);
+        expected.auto_merge = AutoMergeState::disabled();
+        let mut before: serde_json::Value =
+            serde_json::from_str(&pr_object_json(12, "feature/widget", "acme/widgets")).unwrap();
+        before["autoMergeRequest"] = serde_json::Value::Null;
+        let mut partial = before.clone();
+        partial["autoMergeRequest"] = serde_json::json!({
+            "mergeMethod": "SQUASH",
+            "enabledAt": "2026-07-17T10:00:00Z",
+            "enabledBy": {"login": "octocat"}
+        });
+        let ids = serde_json::json!({"data": {"repository": {
+            "pullRequest": {"id": "PR_node"},
+            "label": {"id": "LABEL_node"}
+        }}})
+        .to_string();
+        let runner = FakeRunner::new(vec![
+            (
+                pull_request_command(&repository, "12"),
+                CommandOutput::success(before.to_string()),
+            ),
+            (
+                force_transaction_ids_command(&repository, PrNumber(12), "caravan-force"),
+                CommandOutput::success(ids),
+            ),
+            (
+                force_transaction_command("PR_node", Some("LABEL_node"), true, true),
+                CommandOutput::failure(1, "second mutation field failed"),
+            ),
+            (
+                pull_request_command(&repository, "12"),
+                CommandOutput::success(partial.to_string()),
+            ),
+        ]);
+        let adapter = GitHubMutationAdapter::new(runner);
+
+        let error = adapter
+            .atomic_label_and_squash_auto_merge(&repository, &expected, "caravan-force", true, true)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            MutationError::AtomicTransactionIncomplete {
+                desired_label_present: true,
+                desired_squash_auto_merge: true,
+                ref after,
+                ..
+            } if !after.has_label("caravan-force") && after.auto_merge.enabled
+        ));
         adapter.runner.assert_exhausted();
     }
 

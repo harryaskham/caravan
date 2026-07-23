@@ -573,6 +573,9 @@ pub enum MutationKind {
     SetBase,
     AddLabel,
     RemoveLabel,
+    /// One reviewed provider transaction coupling exact-head force intent with
+    /// the requested queue-owned squash auto-merge postcondition.
+    ForceIntentTransaction,
     /// Durable GitHub-visible explanation of a control-label transition.
     Comment,
     EnableAutoMerge,
