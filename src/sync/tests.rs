@@ -1,6 +1,7 @@
 //! Hermetic sync policy, decision, force, CI, and receipt fixtures.
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::process::Command;
 
 use super::*;
 use crate::graph;
@@ -791,6 +792,31 @@ fn plan_hash_binds_exact_actions_not_telemetry() {
     let mut changed = base;
     changed.actions[0].reason = "different exact action".to_owned();
     assert_ne!(first.plan_hash, changed.finalize_hash().plan_hash);
+}
+
+#[test]
+fn empty_physical_apply_is_valid_before_root_auto_admission() {
+    let status = status(Vec::new(), None, &clean);
+    let provider = FakeProvider::with_pull_requests(Vec::new());
+    let progress = SyncProgress::new(&status, Vec::new(), 64);
+    let temporary = tempfile::tempdir().unwrap();
+    let initialized = Command::new("git")
+        .current_dir(temporary.path())
+        .args(["init", "--quiet"])
+        .status()
+        .unwrap();
+    assert!(initialized.success());
+    let mut lock = OperationLock::acquire(temporary.path(), "empty_physical_apply").unwrap();
+
+    let outcome = apply_physical_chains(&status, &provider, &[], progress, &mut lock)
+        .expect("empty selected caravan set must not panic or mutate");
+
+    assert_eq!(outcome.caravan_id, None);
+    assert!(outcome.plans.is_empty());
+    assert!(outcome.receipts.is_empty());
+    assert!(outcome.provider_receipts.is_empty());
+    assert!(provider.calls.borrow().is_empty());
+    lock.release().unwrap();
 }
 
 #[test]

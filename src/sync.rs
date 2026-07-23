@@ -1599,7 +1599,11 @@ fn apply_physical_chains(
         .collect::<Vec<_>>();
     let mut outcome = PhysicalRebuildOutcome {
         repository: Some(status.repository.clone()),
-        caravan_id: (chains.len() == 1).then_some(chains[0].caravan.id),
+        caravan_id: if chains.len() == 1 {
+            chains.first().map(|chain| chain.caravan.id)
+        } else {
+            None
+        },
         affected_prs: plans.iter().map(|plan| plan.pr).collect(),
         plans,
         ..PhysicalRebuildOutcome::default()
