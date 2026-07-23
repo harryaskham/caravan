@@ -1279,6 +1279,7 @@ mod tests {
             current_branch: Some(pull.head.name.clone()),
             current_pr: Some(pull.number),
             pull_requests: vec![pull],
+            generation_facts: Vec::new(),
             observed_at: None,
         };
         let checker = |_candidate: &BranchSnapshot, target: &BranchSnapshot| {

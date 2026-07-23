@@ -566,6 +566,7 @@ fn status(
         current_branch: current.map(|number| format!("pr-{number}")),
         current_pr: current,
         pull_requests: pulls,
+        generation_facts: Vec::new(),
         observed_at: None,
     };
     let analysis = graph::analyze(&snapshot, checker).expect("analysis");

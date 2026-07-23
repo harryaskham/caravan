@@ -11,6 +11,7 @@ pub mod command;
 pub mod compatibility;
 pub mod force;
 pub mod force_intent;
+pub mod generation;
 pub mod github;
 pub mod graph;
 pub mod hooks;
@@ -70,6 +71,14 @@ CORE MODEL AND INVARIANTS
   from highest to lowest, then immutable GitHub `createdAt`, then PR number.
   Never re-sort, skip, or leapfrog the first canonical attempt because it failed,
   except under the explicit sync-owned generation-bound greedy policy below.
+- Cacophony-shaped PRs bind generation, agent, source head, stack slot, and bead
+  metadata. Within the same agent/bead/slot, only a unique exact contained
+  successor or current reviewed canonical-link receipt is admissible. Proven
+  older PRs are `superseded_generation` and excluded without blocking the
+  canonical successor; divergent, invalid, or unproved siblings fail closed.
+  Different agents and declared stack parent/child slots are independent. Every
+  membership path re-lists exact generation facts immediately before mutation;
+  Cara reports safe owner close/reflect actions but never auto-closes a PR.
 
 FIRST USE AND EVERY SAFE TICK
 Cara resolves one exact Git worktree root before config or mutation, so nested

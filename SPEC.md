@@ -23,6 +23,27 @@ A PR with `caravan-evicted` is excluded and cannot use `new` or `join`. It must 
 
 GitHub is authoritative for automatic admission. `.caravan/config.yaml` lists `agent_priority_labels` from highest to lowest priority. Unqueued, non-draft admission attempts with an explicit configured label precede lower-priority and unlabelled attempts. Ties, including all candidates without an explicit priority, are FIFO by immutable GitHub `createdAt` ascending. PR number ascending is only the deterministic equal-time tie-break (and legacy missing-time fallback after timestamped peers). Head commit/author timestamps and PR updated time never affect position: pushes and rebases cannot reset queue age. Automatic admission is never LIFO.
 
+Cacophony-shaped PRs additionally carry bounded `Cacophony-Generation`,
+`Cacophony-Agent`, `Cacophony-Head`, `Cacophony-Stack-Base`,
+`Cacophony-Stack-State`, and `Beads` metadata. Ordinary PRs without those markers
+remain unaffected; an immutable `-pr-g<oid>` branch with missing/partial metadata
+fails closed. Within one exact agent, overlapping bead stream, and stack slot,
+Cara accepts a unique provider-proved contained successor or the newest exact
+source when identities are equal. A current reviewed
+`caravan-dogfood-controller` priority audit may explicitly link one canonical PR
+to named superseded PRs when source objects are no longer provider-addressable;
+a later priority-clear audit revokes that link. Different agents and declared
+stack parent/child slots are never conflated. Older proven generations are
+reported as `superseded_generation`, excluded from priority/FIFO and Saloon
+Ready without blocking their canonical successor, and are never auto-closed.
+Divergent, unproved, conflicting-link, or invalid siblings are
+`ambiguous_generation`/`invalid_generation_metadata` and block for owner choice.
+Active noncanonical generations become graph problems. Every existing-PR
+membership path re-lists generation metadata, current reviewed links, and exact
+source relationships immediately before branch/label/base/auto-merge mutation;
+a newer generation, disappeared candidate, metadata drift, or uncertain compare
+stops with zero writes and a safe close/reflect continuation.
+
 `status`, JSON, MCP, and `next-candidate` expose the same complete ordered attempt list, the resolved label/rank, and a reason for every candidate. This is a selection contract, not a claim that candidate/default and cross-caravan compatibility preflight has passed. Automation must select the canonical first attempt, run `cara check` and the corresponding `new`/`join` preflight, and must not re-sort or leapfrog it if preflight rejects it. The oldest selected eligible PR becomes a new head targeting the default branch; each later selected eligible PR appends at the tail. Rejection fails closed: repair or explicitly change the PR's GitHub state/labels, then rediscover the canonical list. More than one configured priority label on a PR, or any unknown `caravan-priority:*` label, also fails closed and excludes that PR with an explicit rejection reason.
 
 An operator may override this automatic order for an explicit canary selection only by supplying a non-empty reason and recording that reason as a comment on the selected PR. A canary override does not alter the automatic policy or the canonical order subsequently reported by Caravan.

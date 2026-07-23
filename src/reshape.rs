@@ -444,10 +444,15 @@ fn virtual_status(
         current_branch: status.current_branch.clone(),
         current_pr: status.current_pr,
         pull_requests: pull_requests.into_values().collect(),
+        generation_facts: Vec::new(),
         observed_at: None,
     };
     let analysis = crate::graph::derive(&snapshot);
-    let admission = crate::read::resolve_admission(&analysis, &status.admission.priority_labels);
+    let admission = crate::read::resolve_admission_with_generation(
+        &analysis,
+        &status.admission.priority_labels,
+        status.admission.generation_integrity.clone(),
+    );
     StatusOutput {
         provider_api: status.provider_api.clone(),
         merge_candidates: Vec::new(),
@@ -483,6 +488,7 @@ fn preflight_result(
         current_branch: status.current_branch.clone(),
         current_pr: status.current_pr,
         pull_requests: status.analysis.pull_requests.values().cloned().collect(),
+        generation_facts: Vec::new(),
         observed_at: None,
     };
     let analysis = analyze(&snapshot, checker)?;
@@ -975,6 +981,7 @@ mod tests {
             current_branch: Some("fixture".to_owned()),
             current_pr: pulls.first().map(|pull_request| pull_request.number),
             pull_requests: pulls,
+            generation_facts: Vec::new(),
             observed_at: None,
         };
         let analysis = crate::graph::analyze(&snapshot, &Clean).unwrap();

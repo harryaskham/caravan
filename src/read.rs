@@ -171,7 +171,15 @@ pub struct RejectedAdmissionCandidate {
     pub priority_rank: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
+    /// Superseded generations are excluded rather than allowed to block their
+    /// proven canonical successor. Ambiguous/invalid candidates still block.
+    #[serde(default = "default_true")]
+    pub blocks_order: bool,
     pub reason: String,
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 /// Resolved GitHub-visible automatic-admission policy and result.
@@ -179,6 +187,10 @@ pub struct RejectedAdmissionCandidate {
 pub struct AdmissionStatus {
     pub policy: String,
     pub priority_labels: Vec<String>,
+    /// Cacophony generation classification is provider-derived and remains
+    /// visible even when a superseded PR is excluded from FIFO selection.
+    #[serde(default)]
+    pub generation_integrity: crate::generation::GenerationIntegrityStatus,
     /// Ordered highest priority first, then immutable provider creation time.
     pub candidates: Vec<AdmissionCandidate>,
     /// Exact generations carrying the sync-owned best-effort skip label.
@@ -491,7 +503,7 @@ fn status_with_discovery_options(
     let checker = GitCompatibilityChecker::new(&context.repository_path, "origin")
         .with_timeout(child_timeout)
         .with_operation_deadline(operation_deadline);
-    let analysis = analyze(&snapshot, &checker).map_err(|error| {
+    let mut analysis = analyze(&snapshot, &checker).map_err(|error| {
         if mcp_cli::StructuredError::category(&error) == ErrorCategory::Timeout {
             AppError::structured(
                 ErrorCategory::Timeout,
@@ -545,7 +557,32 @@ fn status_with_discovery_options(
         initialization.ready = false;
         initialization.next = Some("run `cara init` to atomically create .caravan/config.yaml and verify repository readiness".to_owned());
     }
-    let admission = resolve_admission(&analysis, &context.config.agent_priority_labels);
+    let mut generation_facts = snapshot.generation_facts.clone();
+    for pr in crate::generation::duplicate_stream_prs(&generation_facts)
+        .into_iter()
+        .take(32)
+    {
+        if let Ok(comments) = label_provider.pull_request_comment_bodies(&snapshot.repository, pr) {
+            crate::generation::attach_reviewed_supersession_links(
+                &mut generation_facts,
+                pr,
+                &comments,
+            );
+        }
+    }
+    let generation_integrity = crate::generation::analyze(&generation_facts, |base, head| {
+        label_provider
+            .compare_commits(&snapshot.repository, base, head)
+            .unwrap_or_else(|error| crate::generation::CommitRelation::Unknown {
+                reason: error.to_string(),
+            })
+    });
+    apply_generation_graph_problems(&mut analysis, &generation_integrity);
+    let admission = resolve_admission_with_generation(
+        &analysis,
+        &context.config.agent_priority_labels,
+        generation_integrity,
+    );
     let labels_elapsed = started.elapsed();
     let mut provider_api = provider_runner.github_api_telemetry();
     if label_cache_hit {
@@ -641,10 +678,57 @@ pub fn next_candidate(context: &AppContext) -> Result<NextCandidateOutput, AppEr
     })
 }
 
+fn apply_generation_graph_problems(
+    analysis: &mut GraphAnalysis,
+    integrity: &crate::generation::GenerationIntegrityStatus,
+) {
+    for finding in &integrity.findings {
+        if finding.disposition == crate::generation::GenerationDisposition::CurrentGeneration
+            || !analysis
+                .pull_requests
+                .get(&finding.pr)
+                .is_some_and(PullRequestSnapshot::is_active_caravan_member)
+        {
+            continue;
+        }
+        let kind = match finding.disposition {
+            crate::generation::GenerationDisposition::CurrentGeneration => continue,
+            crate::generation::GenerationDisposition::SupersededGeneration => {
+                GraphProblemKind::SupersededGeneration
+            }
+            crate::generation::GenerationDisposition::AmbiguousGeneration => {
+                GraphProblemKind::AmbiguousGeneration
+            }
+            crate::generation::GenerationDisposition::InvalidGenerationMetadata => {
+                GraphProblemKind::InvalidGenerationMetadata
+            }
+        };
+        analysis.fleet.problems.push(GraphProblem {
+            kind,
+            prs: finding.related_prs.clone(),
+            message: finding.reason.clone(),
+        });
+    }
+}
+
 /// Resolve configured explicit priority and FIFO from one GitHub snapshot.
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn resolve_admission(analysis: &GraphAnalysis, priority_labels: &[String]) -> AdmissionStatus {
+    resolve_admission_with_generation(
+        analysis,
+        priority_labels,
+        crate::generation::GenerationIntegrityStatus::default(),
+    )
+}
+
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn resolve_admission_with_generation(
+    analysis: &GraphAnalysis,
+    priority_labels: &[String],
+    generation_integrity: crate::generation::GenerationIntegrityStatus,
+) -> AdmissionStatus {
     let ranks: std::collections::BTreeMap<&str, usize> = priority_labels
         .iter()
         .enumerate()
@@ -673,34 +757,62 @@ pub fn resolve_admission(analysis: &GraphAnalysis, priority_labels: &[String]) -
             .filter(|label| !ranks.contains_key(label.as_str()))
             .collect();
 
-        let rejection = if !invalid.is_empty() {
-            Some(format!(
-                "fail closed: unknown priority label(s): {}",
-                invalid
-                    .iter()
-                    .map(|label| label.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+        let generation_finding = generation_integrity.finding(*number);
+        let generation_rejection = generation_finding.and_then(|finding| {
+            (finding.disposition != crate::generation::GenerationDisposition::CurrentGeneration)
+                .then(|| {
+                    (
+                        finding.reason.clone(),
+                        finding.disposition
+                            != crate::generation::GenerationDisposition::SupersededGeneration,
+                    )
+                })
+        });
+        let rejection = if let Some((reason, blocks_order)) = generation_rejection {
+            Some((format!("fail closed: {reason}"), blocks_order))
+        } else if !invalid.is_empty() {
+            Some((
+                format!(
+                    "fail closed: unknown priority label(s): {}",
+                    invalid
+                        .iter()
+                        .map(|label| label.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                true,
             ))
         } else if configured.len() > 1 {
-            Some(format!(
-                "fail closed: conflicting priority labels: {}",
-                configured
-                    .iter()
-                    .map(|(label, _)| label.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+            Some((
+                format!(
+                    "fail closed: conflicting priority labels: {}",
+                    configured
+                        .iter()
+                        .map(|(label, _)| label.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                true,
             ))
         } else if pull_request.draft {
-            Some("fail closed: draft PR must wait until marked ready".to_owned())
+            Some((
+                "fail closed: draft PR must wait until marked ready".to_owned(),
+                true,
+            ))
         } else if pull_request.cross_repository {
-            Some("fail closed: fork-only PR cannot be admitted to a caravan".to_owned())
+            Some((
+                "fail closed: fork-only PR cannot be admitted to a caravan".to_owned(),
+                true,
+            ))
         } else if pull_request.auto_merge.enabled {
-            Some("fail closed: candidate already has auto-merge enabled".to_owned())
+            Some((
+                "fail closed: candidate already has auto-merge enabled".to_owned(),
+                true,
+            ))
         } else {
             None
         };
-        if let Some(reason) = rejection {
+        if let Some((reason, blocks_order)) = rejection {
             rejected.push(RejectedAdmissionCandidate {
                 pr: *number,
                 // Unknown priority metadata blocks before known attempts: its
@@ -708,6 +820,7 @@ pub fn resolve_admission(analysis: &GraphAnalysis, priority_labels: &[String]) -
                 // configured rank/FIFO key as selectable candidates.
                 priority_rank: (configured.len() == 1).then(|| configured[0].1 + 1),
                 created_at: pull_request.created_at.clone(),
+                blocks_order,
                 reason,
             });
             continue;
@@ -800,19 +913,25 @@ pub fn resolve_admission(analysis: &GraphAnalysis, priority_labels: &[String]) -
                 candidate.pr,
             )
         })
-        .chain(rejected.iter().map(|candidate| {
-            (
-                candidate.priority_rank.unwrap_or(priority_labels.len() + 1),
-                candidate.created_at.is_none(),
-                candidate.created_at.clone().unwrap_or_default(),
-                candidate.pr,
-            )
-        }))
+        .chain(
+            rejected
+                .iter()
+                .filter(|candidate| candidate.blocks_order)
+                .map(|candidate| {
+                    (
+                        candidate.priority_rank.unwrap_or(priority_labels.len() + 1),
+                        candidate.created_at.is_none(),
+                        candidate.created_at.clone().unwrap_or_default(),
+                        candidate.pr,
+                    )
+                }),
+        )
         .min()
         .map(|(_, _, _, pr)| pr);
     AdmissionStatus {
-        policy: "ordered admission attempts: explicit agent priority label (configured high to low), then FIFO by immutable provider created_at ascending with PR number ascending as equal-time tie-break; missing created_at falls back deterministically to PR number after timestamped peers; never LIFO; check/new preflight required and rejection never causes automatic leapfrogging".to_owned(),
+        policy: "Cacophony-shaped PRs first require unique current generation integrity; proven superseded generations are excluded without blocking their canonical successor, while ambiguous/invalid generations block. Remaining attempts use explicit agent priority label (configured high to low), then FIFO by immutable provider created_at ascending with PR number ascending as equal-time tie-break; missing created_at falls back deterministically to PR number after timestamped peers; never LIFO; check/new preflight required and rejection never causes automatic leapfrogging".to_owned(),
         priority_labels: priority_labels.to_vec(),
+        generation_integrity,
         candidates,
         skipped,
         rejected,
@@ -1835,6 +1954,7 @@ mod tests {
             current_branch: Some("current".to_owned()),
             current_pr: Some(current_number),
             pull_requests,
+            generation_facts: Vec::new(),
             observed_at: None,
         };
         let checker = clean_checker;
@@ -2110,6 +2230,100 @@ mod tests {
                 .policy
                 .contains("never causes automatic leapfrogging")
         );
+    }
+
+    #[test]
+    fn superseded_generation_is_excluded_without_blocking_canonical_successor() {
+        let labels = vec!["caravan-priority:high".to_owned()];
+        let mut older = pr(2107, "old", "main", false);
+        older.labels.insert(labels[0].clone());
+        older.created_at = Some("2026-07-23T01:50:32Z".to_owned());
+        let mut newer = pr(2123, "new", "main", false);
+        newer.labels.insert(labels[0].clone());
+        newer.created_at = Some("2026-07-23T18:34:41Z".to_owned());
+        let status = status(older.clone(), vec![newer.clone()]);
+        let generation = crate::generation::analyze(
+            &[
+                crate::model::PullRequestGenerationFact {
+                    pr: older.number,
+                    provider_head: older.head.oid.clone(),
+                    created_at: older.created_at.clone(),
+                    provenance: Some(crate::model::CacophonyGenerationProvenance {
+                        generation: format!("old-pr-g{}", "a".repeat(40)),
+                        agent: "android-agent".to_owned(),
+                        source_head: crate::model::CommitOid("a".repeat(40)),
+                        bead_ids: BTreeSet::from(["bd-c7440c".to_owned()]),
+                        stack_base: "main".to_owned(),
+                        stack_state: "root".to_owned(),
+                    }),
+                    metadata_error: None,
+                    supersedes: BTreeSet::new(),
+                },
+                crate::model::PullRequestGenerationFact {
+                    pr: newer.number,
+                    provider_head: newer.head.oid.clone(),
+                    created_at: newer.created_at.clone(),
+                    provenance: Some(crate::model::CacophonyGenerationProvenance {
+                        generation: format!("new-pr-g{}", "b".repeat(40)),
+                        agent: "android-agent".to_owned(),
+                        source_head: crate::model::CommitOid("b".repeat(40)),
+                        bead_ids: BTreeSet::from(["bd-c7440c".to_owned(), "bd-4734d1".to_owned()]),
+                        stack_base: "main".to_owned(),
+                        stack_state: "root".to_owned(),
+                    }),
+                    metadata_error: None,
+                    supersedes: BTreeSet::new(),
+                },
+            ],
+            |_base, _head| crate::generation::CommitRelation::Ahead,
+        );
+        let admission = resolve_admission_with_generation(&status.analysis, &labels, generation);
+        assert_eq!(admission.next_candidate, Some(newer.number));
+        assert_eq!(admission.candidates[0].pr, newer.number);
+        let excluded = admission
+            .rejected
+            .iter()
+            .find(|candidate| candidate.pr == older.number)
+            .unwrap();
+        assert!(!excluded.blocks_order);
+        assert!(excluded.reason.contains("superseded"));
+    }
+
+    #[test]
+    fn active_superseded_generation_becomes_a_graph_stop() {
+        let older = pr(2107, "old", "main", true);
+        let newer = pr(2123, "new", "main", false);
+        let mut status = status(older.clone(), vec![newer.clone()]);
+        let old_fact = crate::model::PullRequestGenerationFact {
+            pr: older.number,
+            provider_head: older.head.oid.clone(),
+            created_at: older.created_at.clone(),
+            provenance: Some(crate::model::CacophonyGenerationProvenance {
+                generation: format!("old-pr-g{}", "a".repeat(40)),
+                agent: "android-agent".to_owned(),
+                source_head: crate::model::CommitOid("a".repeat(40)),
+                bead_ids: BTreeSet::from(["bd-c7440c".to_owned()]),
+                stack_base: "main".to_owned(),
+                stack_state: "root".to_owned(),
+            }),
+            metadata_error: None,
+            supersedes: BTreeSet::new(),
+        };
+        let mut new_fact = old_fact.clone();
+        new_fact.pr = newer.number;
+        new_fact.provider_head = newer.head.oid.clone();
+        new_fact.created_at = newer.created_at.clone();
+        new_fact.provenance.as_mut().unwrap().generation = format!("new-pr-g{}", "b".repeat(40));
+        new_fact.provenance.as_mut().unwrap().source_head = crate::model::CommitOid("b".repeat(40));
+        new_fact.supersedes.insert(older.number);
+        let generation = crate::generation::analyze(&[old_fact, new_fact], |_base, _head| {
+            unreachable!("reviewed link is complete")
+        });
+        apply_generation_graph_problems(&mut status.analysis, &generation);
+        assert!(status.analysis.fleet.problems.iter().any(|problem| {
+            problem.kind == GraphProblemKind::SupersededGeneration
+                && problem.prs.contains(&older.number)
+        }));
     }
 
     #[test]

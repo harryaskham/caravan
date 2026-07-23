@@ -14,10 +14,11 @@ use crate::model::{
     PrNumber, PullRequestPrecondition, RepositoryId,
 };
 
-const PR_JSON_FIELDS: &str = "number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository,baseRefName,baseRefOid,labels,autoMergeRequest,statusCheckRollup,createdAt,mergedAt,url,updatedAt";
+const PR_JSON_FIELDS: &str = "number,title,body,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository,baseRefName,baseRefOid,labels,autoMergeRequest,statusCheckRollup,createdAt,mergedAt,url,updatedAt";
 // Merged predecessors are graph history, never CI candidates. Omitting the
 // rollup prevents old check suites from dominating provider response size.
 const PR_HISTORY_JSON_FIELDS: &str = "number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository,baseRefName,baseRefOid,labels,autoMergeRequest,createdAt,mergedAt,url,updatedAt";
+const GENERATION_PR_JSON_FIELDS: &str = "number,body,headRefName,headRefOid,createdAt";
 const WORKFLOW_RUN_JSON_FIELDS: &str =
     "databaseId,headSha,status,conclusion,event,name,workflowName,url";
 /// Keeps JSON/MCP output and GraphQL cost bounded on pathological repositories.
@@ -623,6 +624,41 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
             description,
         ))?;
         Ok(())
+    }
+
+    /// Return bounded structured generation metadata for every open provider PR.
+    /// Parsing is faithful; same-stream/supersession policy lives in the
+    /// generation domain module.
+    pub fn open_generation_facts(
+        &self,
+        repository: &RepositoryId,
+    ) -> Result<Vec<model::PullRequestGenerationFact>, MutationError> {
+        let pulls: Vec<GenerationPullRequestJson> =
+            self.json(open_generation_pr_command(&repository.slug(), 1_000))?;
+        Ok(pulls
+            .iter()
+            .map(GenerationPullRequestJson::generation_fact)
+            .collect())
+    }
+
+    /// Compare two exact commit OIDs without changing refs or local worktrees.
+    pub fn compare_commits(
+        &self,
+        repository: &RepositoryId,
+        base: &CommitOid,
+        head: &CommitOid,
+    ) -> Result<crate::generation::CommitRelation, MutationError> {
+        let comparison: CommitComparisonJson =
+            self.json(compare_commits_command(repository, base, head))?;
+        Ok(match comparison.status.as_str() {
+            "ahead" => crate::generation::CommitRelation::Ahead,
+            "behind" => crate::generation::CommitRelation::Behind,
+            "identical" => crate::generation::CommitRelation::Identical,
+            "diverged" => crate::generation::CommitRelation::Diverged,
+            other => crate::generation::CommitRelation::Unknown {
+                reason: format!("provider returned unknown compare status `{other}`"),
+            },
+        })
     }
 
     /// Refetch one PR by number without applying policy.
@@ -1288,7 +1324,7 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
         // One bounded snapshot supplies current-branch lookup, active members,
         // admission candidates, and all live check rollups. Do not re-fetch the
         // same expensive rollups through current/labelled provider queries.
-        let all_open_prs = self.pull_requests(
+        let (all_open_prs, generation_facts) = self.pull_requests_with_generation(
             open_pr_command(&repository.slug(), self.options.open_limit),
             &repository,
         )?;
@@ -1369,6 +1405,7 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
             current_branch,
             current_pr: current_pr_number,
             pull_requests: pull_requests.into_values().collect(),
+            generation_facts,
             observed_at: None,
         })
     }
@@ -1799,10 +1836,27 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
         command: CommandSpec,
         repository: &RepositoryId,
     ) -> Result<Vec<model::PullRequestSnapshot>, DiscoveryError> {
-        self.json::<Vec<PullRequestJson>>(command)?
+        Ok(self.pull_requests_with_generation(command, repository)?.0)
+    }
+
+    fn pull_requests_with_generation(
+        &self,
+        command: CommandSpec,
+        repository: &RepositoryId,
+    ) -> Result<
+        (
+            Vec<model::PullRequestSnapshot>,
+            Vec<model::PullRequestGenerationFact>,
+        ),
+        DiscoveryError,
+    > {
+        let pulls = self.json::<Vec<PullRequestJson>>(command)?;
+        let generation_facts = pulls.iter().map(PullRequestJson::generation_fact).collect();
+        let snapshots = pulls
             .into_iter()
             .map(|pull_request| pull_request.into_snapshot(repository))
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((snapshots, generation_facts))
     }
 
     fn json<T: DeserializeOwned>(&self, command: CommandSpec) -> Result<T, DiscoveryError> {
@@ -2110,6 +2164,37 @@ fn force_transaction_command(
         command = command.args(["-f".to_owned(), format!("labelId={label_id}")]);
     }
     command
+}
+
+fn open_generation_pr_command(repository: &str, limit: usize) -> CommandSpec {
+    CommandSpec::new("gh").args([
+        "pr".to_owned(),
+        "list".to_owned(),
+        "--repo".to_owned(),
+        repository.to_owned(),
+        "--state".to_owned(),
+        "open".to_owned(),
+        "--limit".to_owned(),
+        limit.to_string(),
+        "--json".to_owned(),
+        GENERATION_PR_JSON_FIELDS.to_owned(),
+    ])
+}
+
+fn compare_commits_command(
+    repository: &RepositoryId,
+    base: &CommitOid,
+    head: &CommitOid,
+) -> CommandSpec {
+    CommandSpec::new("gh").args([
+        "api".to_owned(),
+        format!(
+            "repos/{}/compare/{}...{}",
+            repository.slug(),
+            base.0,
+            head.0
+        ),
+    ])
 }
 
 fn failed_runs_command(repository: &RepositoryId, head_oid: &str) -> CommandSpec {
@@ -2647,6 +2732,11 @@ impl From<WorkflowRunJson> for WorkflowRunSnapshot {
 }
 
 #[derive(Debug, Deserialize)]
+struct CommitComparisonJson {
+    status: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct WorkflowRunDetailsJson {
     id: u64,
     head_sha: String,
@@ -2686,9 +2776,34 @@ impl From<WorkflowRunDetailsJson> for WorkflowRunSnapshot {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct GenerationPullRequestJson {
+    number: u64,
+    #[serde(default)]
+    body: String,
+    head_ref_name: String,
+    head_ref_oid: String,
+    created_at: String,
+}
+
+impl GenerationPullRequestJson {
+    fn generation_fact(&self) -> model::PullRequestGenerationFact {
+        crate::generation::parse_generation_fact(
+            PrNumber(self.number),
+            CommitOid(self.head_ref_oid.clone()),
+            &self.head_ref_name,
+            Some(self.created_at.clone()),
+            &self.body,
+        )
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PullRequestJson {
     number: u64,
     title: String,
+    #[serde(default)]
+    body: String,
     state: ProviderPullRequestState,
     is_draft: bool,
     head_ref_name: String,
@@ -2710,6 +2825,16 @@ struct PullRequestJson {
 }
 
 impl PullRequestJson {
+    fn generation_fact(&self) -> model::PullRequestGenerationFact {
+        crate::generation::parse_generation_fact(
+            PrNumber(self.number),
+            CommitOid(self.head_ref_oid.clone()),
+            &self.head_ref_name,
+            Some(self.created_at.clone()),
+            &self.body,
+        )
+    }
+
     fn into_snapshot(
         self,
         base_repository: &RepositoryId,
@@ -4115,6 +4240,46 @@ mod tests {
                 ..
             } if !after.has_label("caravan-force") && after.auto_merge.enabled
         ));
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn generation_facts_parse_provider_body_and_compare_exact_source_commits() {
+        let repository = repository();
+        let source = "a".repeat(40);
+        let generation = format!("agent/example-pr-g{source}");
+        let mut pull: serde_json::Value =
+            serde_json::from_str(&pr_object_json(12, &generation, "acme/widgets")).unwrap();
+        pull["headRefOid"] = serde_json::json!("b".repeat(40));
+        pull["body"] = serde_json::json!(format!(
+            "Beads: bd-c7440c\n\nCacophony-Generation: `{generation}`\nCacophony-Agent: `agent-a`\nCacophony-Head: `{source}`\nCacophony-Stack-Base: `main`\nCacophony-Stack-State: `root`"
+        ));
+        let head = CommitOid("c".repeat(40));
+        let runner = FakeRunner::new(vec![
+            (
+                open_generation_pr_command(&repository.slug(), 1_000),
+                CommandOutput::success(serde_json::json!([pull]).to_string()),
+            ),
+            (
+                compare_commits_command(&repository, &CommitOid(source.clone()), &head),
+                CommandOutput::success(r#"{"status":"ahead"}"#),
+            ),
+        ]);
+        let adapter = GitHubMutationAdapter::new(runner);
+
+        let facts = adapter.open_generation_facts(&repository).unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].provider_head, CommitOid("b".repeat(40)));
+        assert_eq!(
+            facts[0].provenance.as_ref().unwrap().source_head,
+            CommitOid(source.clone())
+        );
+        assert_eq!(
+            adapter
+                .compare_commits(&repository, &CommitOid(source), &head)
+                .unwrap(),
+            crate::generation::CommitRelation::Ahead
+        );
         adapter.runner.assert_exhausted();
     }
 

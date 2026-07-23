@@ -266,6 +266,8 @@ mod tests {
                     admission: crate::read::AdmissionStatus {
                         policy: "priority then FIFO".to_owned(),
                         priority_labels: Vec::new(),
+                        generation_integrity: crate::generation::GenerationIntegrityStatus::default(
+                        ),
                         candidates: Vec::new(),
                         skipped: Vec::new(),
                         rejected: Vec::new(),

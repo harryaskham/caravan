@@ -189,6 +189,10 @@ pub(super) fn preflight_eligibility(
     target: Option<&JoinTarget>,
     checker: &impl CompatibilityChecker,
 ) -> Result<CheckOutput, AppError> {
+    crate::generation::require_admissible(
+        &status.admission.generation_integrity,
+        candidate.number,
+    )?;
     if candidate.has_label(ACTIVE_LABEL) {
         let unrelated = status.analysis.fleet.problems.iter().filter(|problem| {
             !(problem.kind == crate::model::GraphProblemKind::AutoMergeInvariant

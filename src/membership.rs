@@ -178,6 +178,34 @@ pub struct MembershipOutput {
 
 /// Provider operations required by membership policy.
 pub trait MembershipProvider {
+    /// Fresh open generation facts used only by the membership domain's
+    /// immediate pre-mutation generation guard.
+    fn open_generation_facts(
+        &self,
+        _repository: &RepositoryId,
+    ) -> Result<Vec<crate::model::PullRequestGenerationFact>, MutationError> {
+        Ok(Vec::new())
+    }
+
+    fn compare_generation_commits(
+        &self,
+        _repository: &RepositoryId,
+        _base: &crate::model::CommitOid,
+        _head: &crate::model::CommitOid,
+    ) -> Result<crate::generation::CommitRelation, MutationError> {
+        Ok(crate::generation::CommitRelation::Unknown {
+            reason: "generation comparison is unavailable in this provider".to_owned(),
+        })
+    }
+
+    fn generation_comment_bodies(
+        &self,
+        _repository: &RepositoryId,
+        _pr: PrNumber,
+    ) -> Result<Vec<String>, MutationError> {
+        Ok(Vec::new())
+    }
+
     fn verify_branch_head(
         &self,
         repository: &RepositoryId,
@@ -255,6 +283,30 @@ pub trait MembershipProvider {
 }
 
 impl<R: crate::command::CommandRunner> MembershipProvider for GitHubMutationAdapter<R> {
+    fn open_generation_facts(
+        &self,
+        repository: &RepositoryId,
+    ) -> Result<Vec<crate::model::PullRequestGenerationFact>, MutationError> {
+        self.open_generation_facts(repository)
+    }
+
+    fn compare_generation_commits(
+        &self,
+        repository: &RepositoryId,
+        base: &crate::model::CommitOid,
+        head: &crate::model::CommitOid,
+    ) -> Result<crate::generation::CommitRelation, MutationError> {
+        self.compare_commits(repository, base, head)
+    }
+
+    fn generation_comment_bodies(
+        &self,
+        repository: &RepositoryId,
+        pr: PrNumber,
+    ) -> Result<Vec<String>, MutationError> {
+        self.pull_request_comment_bodies(repository, pr)
+    }
+
     fn verify_branch_head(
         &self,
         repository: &RepositoryId,
@@ -502,6 +554,85 @@ fn require_current_join_root(status: &StatusOutput, target: &JoinTarget) -> Resu
             "safe_next_action": "run `cara sync --all` until the selected root is current, then retry the same join",
         })),
     ))
+}
+
+fn revalidate_generation_before_membership(
+    status: &StatusOutput,
+    candidate: PrNumber,
+    provider: &impl MembershipProvider,
+) -> Result<(), AppError> {
+    if status
+        .admission
+        .generation_integrity
+        .finding(candidate)
+        .is_none()
+    {
+        // Ordinary repositories and legacy non-Cacophony PRs retain existing
+        // behavior. A Cacophony-shaped PR with missing metadata has an explicit
+        // invalid finding and therefore never takes this branch.
+        return Ok(());
+    }
+    let mut facts = provider
+        .open_generation_facts(&status.repository)
+        .map_err(|error| {
+            AppError::structured(
+                ErrorCategory::ExecutionFailure,
+                "generation_revalidation_failed",
+                "could not re-read open Cacophony generations immediately before membership mutation",
+                Some(json!({
+                    "pr": candidate,
+                    "error": error.to_string(),
+                    "mutated": false,
+                    "safe_next_action": "restore provider reads and rerun the same membership command",
+                })),
+            )
+        })?;
+    if !facts.iter().any(|fact| fact.pr == candidate) {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "generation_candidate_missing",
+            "selected generation disappeared before membership mutation",
+            Some(json!({
+                "pr": candidate,
+                "expected_generation_integrity": status.admission.generation_integrity,
+                "mutated": false,
+                "safe_next_action": "rediscover open PR generations; never mutate or close the missing candidate by assumption",
+            })),
+        ));
+    }
+    for pr in crate::generation::duplicate_stream_prs(&facts)
+        .into_iter()
+        .take(32)
+    {
+        if let Ok(comments) = provider.generation_comment_bodies(&status.repository, pr) {
+            crate::generation::attach_reviewed_supersession_links(&mut facts, pr, &comments);
+        }
+    }
+    let fresh = crate::generation::analyze(&facts, |base, head| {
+        provider
+            .compare_generation_commits(&status.repository, base, head)
+            .unwrap_or_else(|error| crate::generation::CommitRelation::Unknown {
+                reason: error.to_string(),
+            })
+    });
+    let finding = fresh.finding(candidate).ok_or_else(|| {
+        AppError::structured(
+            ErrorCategory::Validation,
+            "generation_metadata_disappeared",
+            "selected PR no longer carries exact Cacophony generation metadata",
+            Some(json!({
+                "pr": candidate,
+                "expected_generation_integrity": status.admission.generation_integrity,
+                "actual_generation_integrity": fresh,
+                "mutated": false,
+                "safe_next_action": "repair or review provider metadata; do not admit the candidate",
+            })),
+        )
+    })?;
+    if finding.disposition != crate::generation::GenerationDisposition::CurrentGeneration {
+        return crate::generation::require_admissible(&fresh, candidate);
+    }
+    Ok(())
 }
 
 fn membership_identity_matches(
@@ -1295,6 +1426,7 @@ fn execute_locked(
                 dispatch_hooks,
             ));
         }
+        revalidate_generation_before_membership(&status, candidate.number, &provider)?;
         if candidate.has_label(FORCE_LABEL) && !prepared.plan.already_satisfied {
             let mut invalidation = ExecutionState::new(request.operation);
             invalidation.current = Some(candidate.clone());
@@ -1982,6 +2114,7 @@ fn execute_with_rebase_guard(
     validate_operation_shape(&candidate, &request, &desired_base)?;
     let eligibility =
         preflight_eligibility(&status, &candidate, &request, target.as_ref(), checker)?;
+    revalidate_generation_before_membership(&status, candidate.number, provider)?;
     let before_labels = candidate.labels.clone();
     let admission_priority_basis = desired_priority_label.map_or_else(
         || {

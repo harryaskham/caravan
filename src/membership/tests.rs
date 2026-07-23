@@ -14,6 +14,9 @@ struct FakeProvider {
     allows_auto_merge: bool,
     branch_protected: bool,
     pull_requests: RefCell<BTreeMap<PrNumber, PullRequestSnapshot>>,
+    generation_facts: RefCell<Vec<crate::model::PullRequestGenerationFact>>,
+    generation_relations:
+        RefCell<BTreeMap<(CommitOid, CommitOid), crate::generation::CommitRelation>>,
     fail_kind: RefCell<Option<MutationKind>>,
 }
 
@@ -29,6 +32,8 @@ impl FakeProvider {
                     .map(|pull_request| (pull_request.number, pull_request))
                     .collect(),
             ),
+            generation_facts: RefCell::new(Vec::new()),
+            generation_relations: RefCell::new(BTreeMap::new()),
             fail_kind: RefCell::new(None),
         }
     }
@@ -70,6 +75,29 @@ impl FakeProvider {
 }
 
 impl MembershipProvider for FakeProvider {
+    fn open_generation_facts(
+        &self,
+        _repository: &RepositoryId,
+    ) -> Result<Vec<crate::model::PullRequestGenerationFact>, MutationError> {
+        Ok(self.generation_facts.borrow().clone())
+    }
+
+    fn compare_generation_commits(
+        &self,
+        _repository: &RepositoryId,
+        base: &CommitOid,
+        head: &CommitOid,
+    ) -> Result<crate::generation::CommitRelation, MutationError> {
+        Ok(self
+            .generation_relations
+            .borrow()
+            .get(&(base.clone(), head.clone()))
+            .cloned()
+            .unwrap_or_else(|| crate::generation::CommitRelation::Unknown {
+                reason: "unconfigured fixture relation".to_owned(),
+            }))
+    }
+
     fn verify_branch_head(
         &self,
         _repository: &RepositoryId,
@@ -233,6 +261,31 @@ fn pull_request(number: u64, head: &str, base: &str, labels: &[&str]) -> PullReq
     }
 }
 
+fn generation_fact(
+    pr: u64,
+    agent: &str,
+    bead: &str,
+    source: char,
+    created_at: &str,
+) -> crate::model::PullRequestGenerationFact {
+    let source_head = CommitOid(source.to_string().repeat(40));
+    crate::model::PullRequestGenerationFact {
+        pr: PrNumber(pr),
+        provider_head: CommitOid(format!("provider-{pr}")),
+        created_at: Some(created_at.to_owned()),
+        provenance: Some(crate::model::CacophonyGenerationProvenance {
+            generation: format!("agent/{agent}-pr-g{}", source_head.0),
+            agent: agent.to_owned(),
+            source_head,
+            bead_ids: BTreeSet::from([bead.to_owned()]),
+            stack_base: "main".to_owned(),
+            stack_state: "root".to_owned(),
+        }),
+        metadata_error: None,
+        supersedes: BTreeSet::new(),
+    }
+}
+
 fn status(current: PullRequestSnapshot, others: Vec<PullRequestSnapshot>) -> StatusOutput {
     let current_number = current.number;
     let mut pull_requests = others;
@@ -252,6 +305,7 @@ fn status(current: PullRequestSnapshot, others: Vec<PullRequestSnapshot>) -> Sta
         current_branch: Some("current".to_owned()),
         current_pr: Some(current_number),
         pull_requests,
+        generation_facts: Vec::new(),
         observed_at: None,
     };
     let analysis = analyze(&snapshot, &clean).unwrap();
@@ -1680,4 +1734,148 @@ fn rejoin_removes_evicted_and_force_after_full_preflight() {
     assert!(!output.pull_request.has_label(EVICTED_LABEL));
     assert!(!output.pull_request.has_label(FORCE_LABEL));
     assert_eq!(output.pull_request.base.name, "one");
+}
+
+#[test]
+fn newer_same_stream_generation_appearing_after_discovery_stops_before_membership_write() {
+    let candidate = pull_request(2107, "old", "main", &[]);
+    let old_fact = generation_fact(
+        2107,
+        "android-agent",
+        "bd-c7440c",
+        'a',
+        "2026-07-23T01:50:32Z",
+    );
+    let newer_fact = generation_fact(
+        2123,
+        "android-agent",
+        "bd-c7440c",
+        'b',
+        "2026-07-23T18:34:41Z",
+    );
+    let initial_integrity = crate::generation::analyze(
+        std::slice::from_ref(&old_fact),
+        |_base, _head| unreachable!(),
+    );
+    let mut initial_status = status(candidate.clone(), Vec::new());
+    initial_status.admission = crate::read::resolve_admission_with_generation(
+        &initial_status.analysis,
+        &[],
+        initial_integrity,
+    );
+    let provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
+    *provider.generation_facts.borrow_mut() = vec![old_fact.clone(), newer_fact.clone()];
+    provider.generation_relations.borrow_mut().insert(
+        (
+            old_fact.provenance.as_ref().unwrap().source_head.clone(),
+            newer_fact.provenance.as_ref().unwrap().source_head.clone(),
+        ),
+        crate::generation::CommitRelation::Ahead,
+    );
+
+    let error = execute(
+        initial_status,
+        &clean,
+        &provider,
+        MembershipRequest {
+            operation: MembershipOperation::New,
+            create_pr: false,
+            tail_pr: None,
+            head_pr: None,
+            reason: Some("automatic admission".to_owned()),
+            priority_label: None,
+            agent_priority_labels: Vec::new(),
+        },
+    )
+    .expect_err("newer same-stream generation must stop the stale candidate");
+
+    assert_eq!(
+        mcp_cli::StructuredError::code(&error),
+        "superseded_generation"
+    );
+    let unchanged = &provider.pull_requests.borrow()[&PrNumber(2107)];
+    assert!(!unchanged.has_label(ACTIVE_LABEL));
+    assert!(!unchanged.auto_merge.enabled);
+    assert_eq!(unchanged.base.name, "main");
+}
+
+#[test]
+fn generation_candidate_close_race_fails_before_any_membership_mutation() {
+    let candidate = pull_request(2107, "old", "main", &[]);
+    let candidate_fact = generation_fact(2107, "agent-a", "bd-c7440c", 'a', "2026-07-23T01:50:32Z");
+    let initial_integrity = crate::generation::analyze(
+        std::slice::from_ref(&candidate_fact),
+        |_base, _head| unreachable!(),
+    );
+    let mut initial_status = status(candidate.clone(), Vec::new());
+    initial_status.admission = crate::read::resolve_admission_with_generation(
+        &initial_status.analysis,
+        &[],
+        initial_integrity,
+    );
+    let provider = FakeProvider::with_pull_requests(vec![candidate]);
+    // The fresh open-generation read observes the candidate closed/absent.
+    provider.generation_facts.borrow_mut().clear();
+
+    let error = execute(
+        initial_status,
+        &clean,
+        &provider,
+        MembershipRequest {
+            operation: MembershipOperation::New,
+            create_pr: false,
+            tail_pr: None,
+            head_pr: None,
+            reason: Some("manual admission".to_owned()),
+            priority_label: None,
+            agent_priority_labels: Vec::new(),
+        },
+    )
+    .expect_err("closed generation must never be admitted from stale discovery");
+
+    assert_eq!(
+        mcp_cli::StructuredError::code(&error),
+        "generation_candidate_missing"
+    );
+    let unchanged = &provider.pull_requests.borrow()[&PrNumber(2107)];
+    assert!(!unchanged.has_label(ACTIVE_LABEL));
+    assert!(!unchanged.auto_merge.enabled);
+}
+
+#[test]
+fn same_bead_generation_from_unrelated_agent_does_not_block_membership() {
+    let candidate = pull_request(2107, "old", "main", &[]);
+    let candidate_fact = generation_fact(2107, "agent-a", "bd-c7440c", 'a', "2026-07-23T01:50:32Z");
+    let unrelated = generation_fact(2123, "agent-b", "bd-c7440c", 'b', "2026-07-23T18:34:41Z");
+    let initial_integrity = crate::generation::analyze(
+        std::slice::from_ref(&candidate_fact),
+        |_base, _head| unreachable!(),
+    );
+    let mut initial_status = status(candidate.clone(), Vec::new());
+    initial_status.admission = crate::read::resolve_admission_with_generation(
+        &initial_status.analysis,
+        &[],
+        initial_integrity,
+    );
+    let provider = FakeProvider::with_pull_requests(vec![candidate]);
+    *provider.generation_facts.borrow_mut() = vec![candidate_fact, unrelated];
+
+    let output = execute(
+        initial_status,
+        &clean,
+        &provider,
+        MembershipRequest {
+            operation: MembershipOperation::New,
+            create_pr: false,
+            tail_pr: None,
+            head_pr: None,
+            reason: Some("manual admission".to_owned()),
+            priority_label: None,
+            agent_priority_labels: Vec::new(),
+        },
+    )
+    .expect("unrelated owner stream remains independently admissible");
+
+    assert!(output.pull_request.has_label(ACTIVE_LABEL));
+    assert!(output.pull_request.auto_merge.enabled);
 }

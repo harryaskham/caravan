@@ -257,6 +257,39 @@ impl GitHubApiTelemetry {
     }
 }
 
+/// Exact Cacophony-owned PR generation metadata parsed from bounded provider
+/// body fields. The source head is the immutable agent generation before any
+/// Cara-owned physical rewrite of the provider PR branch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CacophonyGenerationProvenance {
+    pub generation: String,
+    pub agent: String,
+    pub source_head: CommitOid,
+    #[serde(default)]
+    pub bead_ids: BTreeSet<String>,
+    pub stack_base: String,
+    pub stack_state: String,
+}
+
+/// One open PR's bounded generation facts. Missing metadata on ordinary PRs is
+/// not an error; a Cacophony-shaped or partially marked PR records an explicit
+/// validation error and is never admitted automatically.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PullRequestGenerationFact {
+    pub pr: PrNumber,
+    pub provider_head: CommitOid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<CacophonyGenerationProvenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_error: Option<String>,
+    /// Exact PRs named by a reviewed provider-visible canonical-generation
+    /// link record on this PR. Empty means no such authority was observed.
+    #[serde(default)]
+    pub supersedes: BTreeSet<PrNumber>,
+}
+
 /// Complete discovery result before graph policy is applied.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RepositorySnapshot {
@@ -282,6 +315,9 @@ pub struct RepositorySnapshot {
     /// to recognize rolling head advancement.
     #[serde(default)]
     pub pull_requests: Vec<PullRequestSnapshot>,
+    /// Open provider PR generation facts used by admission integrity policy.
+    #[serde(default)]
+    pub generation_facts: Vec<PullRequestGenerationFact>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_at: Option<String>,
 }
@@ -407,6 +443,9 @@ pub enum GraphProblemKind {
     ForkOnlyPredecessor,
     AutoMergeInvariant,
     Incompatible,
+    SupersededGeneration,
+    AmbiguousGeneration,
+    InvalidGenerationMetadata,
     Unknown,
 }
 

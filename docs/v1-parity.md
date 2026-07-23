@@ -8,7 +8,7 @@ is required or used.
 
 | SPEC operation | Human CLI | `--json` | MCP tool | Checked behavior |
 |---|---|---|---|---|
-| repository inspection | `cara status` | envelope | `status` | live discovery, graph, PR/check facts, initialization, canonical priority-then-FIFO attempts, authenticated GitHub call/rate-budget telemetry |
+| repository inspection | `cara status` | envelope | `status` | live discovery, graph, PR/check facts, initialization, Cacophony generation-integrity classification, canonical priority-then-FIFO attempts, authenticated GitHub call/rate-budget telemetry |
 | event journal | `cara log` / `cara log -f` | bounded envelope / NDJSON follow | bounded `log` only | common-Git storage, filters, exact IDs, hook receipts, locking, rotation, torn-tail recovery |
 | next admission | `cara next-candidate` | envelope | `next_candidate` | nonmutating canonical first attempt; membership preflight remains required and rejection cannot leapfrog; invalid labels fail closed |
 | eligibility / remote preflight | `cara check [--pr N] [--tail-pr N\|--head-pr N]` | envelope | `check` | exact provider candidate receipt, active/new/join modes, canonical fail-closed selection, stale-head rejection, next action, provider-call/rate telemetry; target forms exclusive |

@@ -612,6 +612,7 @@ mod tests {
             current_branch: None,
             current_pr: None,
             pull_requests,
+            generation_facts: Vec::new(),
             observed_at: None,
         }
     }
