@@ -77,7 +77,7 @@ impl FakeProvider {
             .cloned()
             .expect("fake PR");
         let actual = PullRequestPrecondition::from(&before);
-        if &actual != expected {
+        if !actual.mutation_identity_eq(expected) {
             return Err(MutationError::StalePrecondition {
                 expected: Box::new(expected.clone()),
                 actual: Box::new(actual),
@@ -109,7 +109,7 @@ impl SyncProvider for FakeProvider {
             .cloned()
             .expect("fake PR");
         let actual_precondition = PullRequestPrecondition::from(&actual);
-        if actual_precondition != *expected {
+        if !actual_precondition.mutation_identity_eq(expected) {
             return Err(MutationError::StalePrecondition {
                 expected: Box::new(expected.clone()),
                 actual: Box::new(actual_precondition),
@@ -2542,6 +2542,51 @@ fn mutation_timeout_preserves_category_and_completed_steps() {
         details["operation_receipt"]["completed_steps"][0]["summary"],
         "base advanced"
     );
+}
+
+#[test]
+fn check_progress_does_not_stale_sync_auto_merge_mutation() {
+    let mut pulls = healthy_chain();
+    pulls.truncate(1);
+    pulls[0].auto_merge = AutoMergeState::disabled();
+    pulls[0].checks = vec![check(
+        "Changed surface admission",
+        CheckState::Queued,
+        Some(99),
+    )];
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+    let current = provider.pulls.borrow()[&PrNumber(1)].clone();
+    provider
+        .pulls
+        .borrow_mut()
+        .get_mut(&PrNumber(1))
+        .unwrap()
+        .checks[0]
+        .state = CheckState::InProgress;
+    provider
+        .pulls
+        .borrow_mut()
+        .get_mut(&PrNumber(1))
+        .unwrap()
+        .checks[0]
+        .provider_state = Some("IN_PROGRESS".to_owned());
+
+    let progress = execute(&status, &provider, false, false, false)
+        .expect("check-only churn must not stale auto-merge repair");
+
+    assert!(progress.operation_receipt().changed);
+    assert!(
+        provider
+            .calls
+            .borrow()
+            .contains(&MutationKind::EnableAutoMerge)
+    );
+    let after = provider.pulls.borrow()[&PrNumber(1)].clone();
+    assert_eq!(after.head, current.head);
+    assert_eq!(after.base, current.base);
+    assert_eq!(after.labels, current.labels);
+    assert_eq!(after.auto_merge, AutoMergeState::squash());
 }
 
 #[test]

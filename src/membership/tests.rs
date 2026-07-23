@@ -42,7 +42,7 @@ impl FakeProvider {
         let mut pull_requests = self.pull_requests.borrow_mut();
         let current = pull_requests.get_mut(&expected.number).expect("fake PR");
         let actual = PullRequestPrecondition::from(&*current);
-        if actual != *expected {
+        if !actual.mutation_identity_eq(expected) {
             return Err(MutationError::StalePrecondition {
                 expected: Box::new(expected.clone()),
                 actual: Box::new(actual),

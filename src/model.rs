@@ -482,6 +482,22 @@ pub struct PullRequestPrecondition {
     pub auto_merge: AutoMergeState,
 }
 
+impl PullRequestPrecondition {
+    /// Compare only facts that authorize topology/label/base/auto-merge writes.
+    /// Check progress remains observation state and is guarded separately by
+    /// CI-specific commands.
+    #[must_use]
+    pub fn mutation_identity_eq(&self, other: &Self) -> bool {
+        self.number == other.number
+            && self.state == other.state
+            && self.head_oid == other.head_oid
+            && self.base_ref == other.base_ref
+            && self.base_oid == other.base_oid
+            && self.labels == other.labels
+            && self.auto_merge == other.auto_merge
+    }
+}
+
 impl From<&PullRequestSnapshot> for PullRequestPrecondition {
     fn from(snapshot: &PullRequestSnapshot) -> Self {
         Self {

@@ -263,6 +263,12 @@ pub fn resume(context: &AppContext, input: &ResumeInput) -> Result<PauseOutput, 
             "squash auto-merge already restored by a prior resume attempt",
         ));
     } else {
+        provider
+            .verify_precondition_with_checks(
+                &status.repository,
+                &PullRequestPrecondition::from(current),
+            )
+            .map_err(|error| mutation_error("resume", &error))?;
         let receipt = provider
             .enable_squash_auto_merge(&status.repository, &PullRequestPrecondition::from(current))
             .map_err(|error| mutation_error("resume", &error))?;

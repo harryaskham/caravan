@@ -604,7 +604,9 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
         self.refetch_selector(repository, &number.to_string())
     }
 
-    /// Refetch and compare every mutation-sensitive fact.
+    /// Refetch and compare mutation-authority facts. Check/CI progress is
+    /// intentionally excluded so queued→running churn cannot stale unrelated
+    /// base/label/auto-merge operations.
     pub fn verify_precondition(
         &self,
         repository: &RepositoryId,
@@ -613,6 +615,27 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
         let actual_snapshot = self.refetch_pull_request(repository, expected.number)?;
         let actual = PullRequestPrecondition::from(&actual_snapshot);
         let changed_fields = changed_precondition_fields(expected, &actual);
+        if changed_fields.is_empty() {
+            Ok(actual_snapshot)
+        } else {
+            Err(MutationError::StalePrecondition {
+                expected: Box::new(expected.clone()),
+                actual: Box::new(actual),
+                changed_fields,
+            })
+        }
+    }
+
+    /// Refetch and compare mutation authority plus exact observed checks for
+    /// CI-specific operations such as diagnostics and rerun.
+    pub fn verify_precondition_with_checks(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+    ) -> Result<model::PullRequestSnapshot, MutationError> {
+        let actual_snapshot = self.refetch_pull_request(repository, expected.number)?;
+        let actual = PullRequestPrecondition::from(&actual_snapshot);
+        let changed_fields = changed_precondition_fields_with_checks(expected, &actual);
         if changed_fields.is_empty() {
             Ok(actual_snapshot)
         } else {
@@ -826,7 +849,7 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
         repository: &RepositoryId,
         expected: &PullRequestPrecondition,
     ) -> Result<Vec<WorkflowRunSnapshot>, MutationError> {
-        let before = self.verify_precondition(repository, expected)?;
+        let before = self.verify_precondition_with_checks(repository, expected)?;
         let runs: Vec<WorkflowRunJson> =
             self.json(failed_runs_command(repository, before.head.oid.0.as_str()))?;
         Ok(runs
@@ -843,7 +866,7 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
         expected: &PullRequestPrecondition,
         run_ids: &[u64],
     ) -> Result<crate::ci::WorkflowFailureDiagnostics, MutationError> {
-        self.verify_precondition(repository, expected)?;
+        self.verify_precondition_with_checks(repository, expected)?;
         crate::ci::diagnose_failed_runs(&self.runner, repository, expected, run_ids)
             .map_err(Into::into)
     }
@@ -858,7 +881,7 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
         let run: WorkflowRunSnapshot = self
             .json::<WorkflowRunDetailsJson>(workflow_run_command(repository, run_id))?
             .into();
-        let before = self.verify_precondition(repository, expected)?;
+        let before = self.verify_precondition_with_checks(repository, expected)?;
         if !run.pull_requests.contains(&expected.number) {
             return Err(MutationError::RunPullRequestMismatch {
                 run_id,
@@ -997,11 +1020,19 @@ fn changed_precondition_fields(
     if expected.labels != actual.labels {
         changed.push("labels".to_owned());
     }
-    if expected.checks != actual.checks {
-        changed.push("checks".to_owned());
-    }
     if expected.auto_merge != actual.auto_merge {
         changed.push("auto_merge".to_owned());
+    }
+    changed
+}
+
+fn changed_precondition_fields_with_checks(
+    expected: &PullRequestPrecondition,
+    actual: &PullRequestPrecondition,
+) -> Vec<String> {
+    let mut changed = changed_precondition_fields(expected, actual);
+    if expected.checks != actual.checks {
+        changed.push("checks".to_owned());
     }
     changed
 }
@@ -3413,6 +3444,70 @@ mod tests {
             error,
             MutationError::StalePrecondition { changed_fields, .. }
                 if changed_fields == ["head_oid"]
+        ));
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn check_only_churn_does_not_stale_unrelated_provider_mutation() {
+        let repository = repository();
+        let expected = precondition(12);
+        let before = pr_object_json(12, "feature/widget", "acme/widgets").replace(
+            r#""status":"COMPLETED","conclusion":"SUCCESS""#,
+            r#""status":"IN_PROGRESS","conclusion":null"#,
+        );
+        let after = before
+            .replace(r#""baseRefName":"main""#, r#""baseRefName":"develop""#)
+            .replace(r#""baseRefOid":"base-12""#, r#""baseRefOid":"develop-oid""#);
+        let runner = FakeRunner::new(vec![
+            (
+                pull_request_command(&repository, "12"),
+                CommandOutput::success(before.clone()),
+            ),
+            (
+                edit_pull_request_command(&repository, PrNumber(12), "--base", "develop"),
+                CommandOutput::success("https://example.test/pr/12\n"),
+            ),
+            (
+                pull_request_command(&repository, "12"),
+                CommandOutput::success(after),
+            ),
+        ]);
+        let adapter = GitHubMutationAdapter::new(runner);
+
+        let receipt = adapter.set_base(&repository, &expected, "develop").unwrap();
+
+        assert_eq!(receipt.kind, MutationKind::SetBase);
+        assert_eq!(
+            receipt.before.unwrap().checks[0].state,
+            CheckState::InProgress
+        );
+        assert_eq!(receipt.after.base.name, "develop");
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn ci_specific_precondition_still_rejects_check_churn() {
+        let repository = repository();
+        let expected = precondition(12);
+        let before = pr_object_json(12, "feature/widget", "acme/widgets").replace(
+            r#""status":"COMPLETED","conclusion":"SUCCESS""#,
+            r#""status":"IN_PROGRESS","conclusion":null"#,
+        );
+        let runner = FakeRunner::new(vec![(
+            pull_request_command(&repository, "12"),
+            CommandOutput::success(before),
+        )]);
+        let adapter = GitHubMutationAdapter::new(runner);
+
+        let error = adapter
+            .verify_precondition_with_checks(&repository, &expected)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            MutationError::StalePrecondition { changed_fields, .. }
+                if changed_fields == ["checks"]
         ));
         adapter.runner.assert_exhausted();
     }

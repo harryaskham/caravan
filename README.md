@@ -553,9 +553,10 @@ unbounded provider snapshots. Root-join drift lists only changed mutation facts
 (head/base/labels/state/auto-merge), topology refusals show compact commit counts
 and OIDs, and physical-budget decisions show required/remaining time. Evidence
 over 4 KiB is summarized with a `--json` hint; JSON/MCP always retain the full
-structured continuation. CI/check state transitions are deliberately excluded
-from membership mutation identity, so queued→running check progress does not
-invalidate an otherwise exact retry.
+structured continuation. CI/check state transitions are deliberately excluded from topology, base,
+label, comment, and auto-merge mutation identity, so queued→running progress
+does not invalidate an otherwise exact sync/join retry. CI diagnostics and
+rerun operations retain strict check/run/head identity.
 
 Status propagates one absolute deadline through discovery,
 compatibility, and label inventory; every child receives only the remaining
