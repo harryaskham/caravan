@@ -1411,6 +1411,12 @@ mod tests {
     use crate::model::{AutoMergeState, PullRequestState};
     use mcp_cli::StructuredError;
 
+    // Physical-rebase fixtures intentionally exercise several real local Git
+    // fetch/rebase/merge subprocesses. Keep their non-timeout assertions
+    // resilient when the Nix build runs the suite under CPU/I/O contention;
+    // timeout policy has separate focused coverage.
+    const TEST_REBASE_BUDGET: Duration = Duration::from_secs(60);
+
     fn git(directory: &Path, arguments: &[&str]) -> String {
         let output = Command::new("git")
             .current_dir(directory)
@@ -2302,7 +2308,7 @@ mod tests {
                 remote_range(candidate),
                 target,
                 &default,
-                RebaseExecutionBudget::new(Duration::from_secs(10)),
+                RebaseExecutionBudget::new(TEST_REBASE_BUDGET),
             )
             .unwrap();
             target = PlannedBase::Simulated(branch(
@@ -2372,7 +2378,7 @@ mod tests {
             },
             PlannedBase::Remote(branch(&repository, "main", &receipts[0].new_head_oid)),
             &branch(&repository, "main", &receipts[0].new_head_oid),
-            RebaseExecutionBudget::new(Duration::from_secs(10)),
+            RebaseExecutionBudget::new(TEST_REBASE_BUDGET),
         )
         .expect("merged predecessor PR ref retains exact range");
         assert_eq!(promoted_plan.plan.pr, PrNumber(1962));
@@ -2440,7 +2446,7 @@ mod tests {
             remote_range(&candidate),
             PlannedBase::Remote(branch(&repository, "main", &main)),
             &branch(&repository, "main", &main),
-            RebaseExecutionBudget::new(Duration::from_secs(10)),
+            RebaseExecutionBudget::new(TEST_REBASE_BUDGET),
         )
         .err()
         .expect("conflict must fail planning");
@@ -2548,7 +2554,7 @@ mod tests {
             remote_range(&candidate),
             PlannedBase::Remote(branch(&fixture.repository, "main", &fixture.new_main)),
             &branch(&fixture.repository, "main", &fixture.new_main),
-            RebaseExecutionBudget::new(Duration::from_secs(10)),
+            RebaseExecutionBudget::new(TEST_REBASE_BUDGET),
         )
         .unwrap();
         verify_prepared(&prepared).expect("global barrier");
@@ -2597,7 +2603,7 @@ mod tests {
             remote_range(&candidate),
             PlannedBase::Remote(branch(&fixture.repository, "main", &fixture.new_main)),
             &branch(&fixture.repository, "main", &fixture.new_main),
-            RebaseExecutionBudget::new(Duration::from_secs(10)),
+            RebaseExecutionBudget::new(TEST_REBASE_BUDGET),
         )
         .unwrap();
         verify_prepared(&prepared).expect("global barrier");
@@ -2645,7 +2651,7 @@ mod tests {
             &candidate,
             &branch(&fixture.repository, "main", &fixture.new_main),
             &branch(&fixture.repository, "main", &fixture.new_main),
-            Duration::from_secs(10),
+            TEST_REBASE_BUDGET,
         )
         .unwrap_err();
         assert_eq!(mcp_cli::StructuredError::code(&error), "rebase_stale_lease");
