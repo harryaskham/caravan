@@ -1250,30 +1250,44 @@ mod tests {
     #[test]
     fn one_absolute_deadline_bounds_multiple_phases_and_reaps_the_hung_phase() {
         let operation_started = Instant::now();
-        // The assertion is about sharing one absolute budget, not requiring a
-        // loaded host to schedule the first shell within one second. Keep the
-        // child timeout larger so the operation deadline remains authoritative.
-        let operation_budget = Duration::from_secs(3);
+        // The assertion is about sharing one absolute budget and keeping it
+        // authoritative over the per-child timeout. Keep the operation budget
+        // large enough that ordinary process scheduling under a fully parallel
+        // Nix build cannot masquerade as a deadline violation.
+        let operation_budget = Duration::from_secs(10);
+        let child_timeout = Duration::from_secs(120);
         let runner = ProcessRunner::new()
-            .with_timeout(Duration::from_secs(5))
+            .with_timeout(child_timeout)
             .with_operation_deadline(operation_started + operation_budget);
         runner
-            .run(&CommandSpec::new("sh").args(["-c", "sleep 0.05"]))
+            .run(&CommandSpec::new("sh").args(["-c", "exit 0"]))
             .expect("first phase fits the budget");
+        let first_phase_elapsed = operation_started.elapsed();
         let error = runner
-            .run(&CommandSpec::new("sh").args(["-c", "printf phase-two; sleep 30"]))
+            .run(&CommandSpec::new("sh").args(["-c", "printf phase-two; sleep 300"]))
             .expect_err("hung second phase must consume only the remaining budget");
 
-        assert!(operation_started.elapsed() < Duration::from_secs(4));
+        assert!(operation_started.elapsed() < operation_budget + Duration::from_secs(15));
         let CommandRunError::Timeout {
             timeout_ms, stdout, ..
         } = error
         else {
             panic!("expected deadline timeout");
         };
+        // The hung phase inherits only what the shared operation deadline has
+        // left, never the much larger per-child timeout.
         assert!(
-            timeout_ms <= duration_millis(operation_budget).saturating_sub(50),
+            timeout_ms <= duration_millis(operation_budget),
             "remaining budget was {timeout_ms}ms"
+        );
+        assert!(
+            timeout_ms < duration_millis(child_timeout),
+            "operation deadline must stay authoritative, got {timeout_ms}ms"
+        );
+        assert!(
+            timeout_ms
+                <= duration_millis(operation_budget.saturating_sub(first_phase_elapsed)) + 50,
+            "second phase must not regain the first phase's spent budget: {timeout_ms}ms"
         );
         assert!(stdout.is_empty() || stdout == "phase-two");
     }
@@ -1309,8 +1323,8 @@ mod tests {
                     for iteration in 0..ITERATIONS {
                         if iteration % 8 == 0 {
                             let error = ProcessRunner::new()
-                                .with_timeout(Duration::from_millis(20))
-                                .run(&CommandSpec::new("sh").args(["-c", "sleep 30"]))
+                                .with_timeout(Duration::from_millis(200))
+                                .run(&CommandSpec::new("sh").args(["-c", "sleep 300"]))
                                 .expect_err("the hanging sibling must time out");
                             assert!(
                                 matches!(error, CommandRunError::Timeout { .. }),
@@ -1348,16 +1362,16 @@ mod tests {
         // the full Nix suite is running in parallel. The assertion below is
         // about preserving bytes emitted before termination, not about proving
         // that a fresh shell can always start within 100 ms on a loaded host.
-        let timeout = Duration::from_secs(1);
+        let timeout = Duration::from_secs(5);
         let error = ProcessRunner::new()
             .with_timeout(timeout)
             .run(
                 &CommandSpec::new("sh")
-                    .args(["-c", "printf started; printf diagnostic >&2; sleep 30"]),
+                    .args(["-c", "printf started; printf diagnostic >&2; sleep 300"]),
             )
             .expect_err("hanging child must time out");
 
-        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(started.elapsed() < Duration::from_secs(30));
         let CommandRunError::Timeout {
             command,
             process_group_id,
