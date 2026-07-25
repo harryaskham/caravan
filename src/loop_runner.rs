@@ -1,8 +1,10 @@
 //! Foreground `cara loop` driver over canonical `sync --all` ticks.
 //!
 //! The loop owns no queue cursor: each iteration rediscovers GitHub through the
-//! regular sync implementation. Any sync decision/error stops the foreground
-//! loop after configured hooks consume its canonical event.
+//! regular sync implementation. A failed tick is bounded evidence, not a stop
+//! condition: configured hooks consume its canonical event and the driver keeps
+//! ticking so provider races, moved default branches, and external decisions
+//! converge without operator restarts. Only an explicit signal ends the loop.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -31,23 +33,53 @@ pub struct LoopTickOutput {
     pub hook_deliveries: Vec<HookDelivery>,
 }
 
+/// Bounded evidence for one failed foreground tick.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct LoopTickFailure {
+    pub tick: u64,
+    pub code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_class: Option<String>,
+    pub retryable: bool,
+    #[serde(default)]
+    pub hook_deliveries: Vec<HookDelivery>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_error: Option<String>,
+    pub next: String,
+}
+
 /// Bounded summary returned when `--once` completes or a signal stops the loop.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct LoopOutput {
     pub ticks: u64,
+    #[serde(default)]
+    pub failed_ticks: u64,
+    #[serde(default)]
+    pub consecutive_failures: u64,
     pub stopped_by_signal: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_tick: Option<LoopTickOutput>,
+    /// Most recent bounded failures, oldest first.
+    #[serde(default)]
+    pub recent_failures: Vec<LoopTickFailure>,
 }
+
+const MAX_RETAINED_FAILURES: usize = 20;
 
 /// Run one tick or a signal-aware foreground loop.
 ///
-/// `observe` is invoked after each successful tick so the CLI can stream human
-/// progress without making the unbounded process an MCP tool.
+/// `observe` is invoked after each successful tick and `observe_failure` after
+/// each failed tick so the CLI can stream human progress without making the
+/// unbounded process an MCP tool. The unbounded loop never exits on a domain
+/// failure; it records bounded evidence, dispatches hooks, and ticks again.
 pub fn run(
     context: &AppContext,
     input: &LoopInput,
     mut observe: impl FnMut(&LoopTickOutput),
+    mut observe_failure: impl FnMut(&AppError, &LoopTickFailure),
 ) -> Result<LoopOutput, AppError> {
     let interval_secs = input
         .interval_secs
@@ -64,8 +96,11 @@ pub fn run(
         observe(&output);
         return Ok(LoopOutput {
             ticks: 1,
+            failed_ticks: 0,
+            consecutive_failures: 0,
             stopped_by_signal: false,
             last_tick: Some(output),
+            recent_failures: Vec::new(),
         });
     }
 
@@ -84,7 +119,21 @@ pub fn run(
         Duration::from_secs(interval_secs),
         || tick(context),
         |output| observe(output),
+        |error, failure| observe_failure(error, failure),
+        |error| dispatch_failure_hooks(context, error),
     )
+}
+
+/// Deliver canonical events attached to a failed tick without stopping the loop.
+fn dispatch_failure_hooks(
+    context: &AppContext,
+    error: &AppError,
+) -> Result<Vec<HookDelivery>, AppError> {
+    let events = hooks::events_from_error(error);
+    if events.is_empty() {
+        return Ok(Vec::new());
+    }
+    hooks::dispatch_events(context, &events)
 }
 
 /// Run one canonical sync-all tick including ordinary hook delivery.
@@ -112,20 +161,49 @@ pub fn tick(context: &AppContext) -> Result<LoopTickOutput, AppError> {
     }
 }
 
+/// Drive bounded ticks until an explicit stop signal.
+///
+/// The signature keeps `Result` so future fatal driver conditions stay typed,
+/// while ordinary domain failures are recorded and retried rather than
+/// returned.
+#[allow(clippy::unnecessary_wraps)]
 fn drive(
     stop: &AtomicBool,
     interval: Duration,
     mut tick: impl FnMut() -> Result<LoopTickOutput, AppError>,
     mut observe: impl FnMut(&LoopTickOutput),
+    mut observe_failure: impl FnMut(&AppError, &LoopTickFailure),
+    mut deliver_failure_hooks: impl FnMut(&AppError) -> Result<Vec<HookDelivery>, AppError>,
 ) -> Result<LoopOutput, AppError> {
     let mut ticks = 0_u64;
+    let mut failed_ticks = 0_u64;
+    let mut consecutive_failures = 0_u64;
     let mut last_tick = None;
+    let mut recent_failures: Vec<LoopTickFailure> = Vec::new();
     while !stop.load(Ordering::SeqCst) {
         let started = Instant::now();
-        let output = tick()?;
-        observe(&output);
         ticks += 1;
-        last_tick = Some(output);
+        match tick() {
+            Ok(output) => {
+                consecutive_failures = 0;
+                observe(&output);
+                last_tick = Some(output);
+            }
+            Err(error) => {
+                failed_ticks += 1;
+                consecutive_failures += 1;
+                let (hook_deliveries, hook_error) = match deliver_failure_hooks(&error) {
+                    Ok(deliveries) => (deliveries, None),
+                    Err(hook_error) => (Vec::new(), Some(hook_error.to_string())),
+                };
+                let failure = tick_failure(ticks, &error, hook_deliveries, hook_error);
+                observe_failure(&error, &failure);
+                if recent_failures.len() == MAX_RETAINED_FAILURES {
+                    recent_failures.remove(0);
+                }
+                recent_failures.push(failure);
+            }
+        }
         let deadline = started + interval;
         while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -134,9 +212,53 @@ fn drive(
     }
     Ok(LoopOutput {
         ticks,
+        failed_ticks,
+        consecutive_failures,
         stopped_by_signal: true,
         last_tick,
+        recent_failures,
     })
+}
+
+fn tick_failure(
+    tick: u64,
+    error: &AppError,
+    hook_deliveries: Vec<HookDelivery>,
+    hook_error: Option<String>,
+) -> LoopTickFailure {
+    use mcp_cli::StructuredError as _;
+    let scheduler = error
+        .details()
+        .and_then(|details| details.get("scheduler_status").cloned());
+    let field = |name: &str| {
+        scheduler
+            .as_ref()
+            .and_then(|status| status.get(name))
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+    };
+    let retryable = scheduler
+        .as_ref()
+        .and_then(|status| status.get("retryable"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let next = if retryable {
+        "provider generation race; the next tick rediscovers exact facts and retries".to_owned()
+    } else {
+        "external decision or operator action is required; the loop keeps ticking and converges once it is resolved"
+            .to_owned()
+    };
+    LoopTickFailure {
+        tick,
+        code: error.code(),
+        message: error.message(),
+        disposition: field("disposition"),
+        wake_class: field("wake_class"),
+        retryable,
+        hook_deliveries,
+        hook_error,
+        next,
+    }
 }
 
 fn ready_unqueued_events(output: &SyncOutput) -> Vec<CaravanEvent> {
@@ -201,8 +323,6 @@ fn ready_unqueued_events(output: &SyncOutput) -> Vec<CaravanEvent> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-
-    use mcp_cli::StructuredError;
 
     use super::*;
     use crate::model::{CaravanFleet, CommitOid, OperationId, OperationReceipt, RepositoryId};
@@ -312,29 +432,108 @@ mod tests {
                 Ok(tick_output())
             },
             |_| {},
+            |_, _| {},
+            |_| Ok(Vec::new()),
         )
         .unwrap();
 
         assert_eq!(output.ticks, 2);
+        assert_eq!(output.failed_ticks, 0);
         assert!(output.stopped_by_signal);
     }
 
     #[test]
-    fn decision_error_stops_without_another_tick() {
+    fn retryable_and_decision_failures_keep_ticking_with_bounded_evidence() {
         let stop = AtomicBool::new(false);
         let mut calls = 0_u8;
-        let error = drive(
+        let mut hook_calls = 0_u8;
+        let mut observed = Vec::new();
+        let output = drive(
             &stop,
             Duration::from_millis(1),
             || {
                 calls += 1;
-                Err::<LoopTickOutput, _>(AppError::validation("decision", "stop"))
+                match calls {
+                    1 => Err(AppError::structured(
+                        ErrorCategory::Validation,
+                        "rebase_stale_lease",
+                        "remote branch moved since discovery",
+                        Some(serde_json::json!({
+                            "scheduler_status": {
+                                "disposition": "retry_tick",
+                                "wake_class": "retry_tick",
+                                "retryable": true,
+                            }
+                        })),
+                    )),
+                    2 => Err(AppError::structured(
+                        ErrorCategory::Validation,
+                        "ci_failure",
+                        "PR #7 has unresolved CI failure",
+                        Some(serde_json::json!({
+                            "scheduler_status": {
+                                "disposition": "external_decision",
+                                "wake_class": "external_decision",
+                                "retryable": false,
+                            }
+                        })),
+                    )),
+                    _ => {
+                        stop.store(true, Ordering::SeqCst);
+                        Ok(tick_output())
+                    }
+                }
             },
             |_| {},
+            |_, failure| observed.push(failure.clone()),
+            |_| {
+                hook_calls += 1;
+                Ok(Vec::new())
+            },
         )
-        .unwrap_err();
+        .expect("domain failures never end the foreground loop");
 
-        assert_eq!(error.code(), "decision");
-        assert_eq!(calls, 1);
+        assert_eq!(output.ticks, 3);
+        assert_eq!(output.failed_ticks, 2);
+        assert_eq!(output.consecutive_failures, 0);
+        assert_eq!(hook_calls, 2);
+        assert_eq!(observed.len(), 2);
+        assert_eq!(observed[0].code, "rebase_stale_lease");
+        assert!(observed[0].retryable);
+        assert_eq!(observed[0].wake_class.as_deref(), Some("retry_tick"));
+        assert_eq!(observed[1].code, "ci_failure");
+        assert!(!observed[1].retryable);
+        assert!(output.last_tick.is_some());
+        assert_eq!(output.recent_failures.len(), 2);
+    }
+
+    #[test]
+    fn retained_failure_evidence_stays_bounded() {
+        let stop = AtomicBool::new(false);
+        let mut calls = 0_u32;
+        let output = drive(
+            &stop,
+            Duration::from_millis(1),
+            || {
+                calls += 1;
+                if calls > 40 {
+                    stop.store(true, Ordering::SeqCst);
+                }
+                Err::<LoopTickOutput, _>(AppError::validation("stale_precondition", "race"))
+            },
+            |_| {},
+            |_, _| {},
+            |_| Ok(Vec::new()),
+        )
+        .unwrap();
+
+        assert_eq!(output.recent_failures.len(), MAX_RETAINED_FAILURES);
+        assert_eq!(output.consecutive_failures, output.failed_ticks);
+        assert!(output.last_tick.is_none());
+        assert_eq!(
+            output.recent_failures.last().unwrap().tick,
+            output.ticks,
+            "retained evidence keeps the newest failing tick"
+        );
     }
 }

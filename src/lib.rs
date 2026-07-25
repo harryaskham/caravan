@@ -136,7 +136,11 @@ the exact pinned binary. It performs strict parsing and no repository/provider a
    before considering a later candidate. Manual membership consumes that label.
    The same path powers `loop` and `loop --once`; every tick reports exact
    candidate/mutation/GitHub/wall bounds, joins, skips, remaining work, and
-   continuation. Fleet scanning never starts a candidate below its reserved
+   continuation. The unbounded `loop` never exits on a domain failure: it
+   dispatches the canonical event to configured hooks, prints bounded failure
+   evidence, and ticks again, so stale leases, moved default branches, and
+   pending decisions converge without a restart. `loop --once` still returns one
+   typed error for schedulers. Fleet scanning never starts a candidate below its reserved
    exact-Git budget; selected remote PRs reuse fresh fleet facts and receive a
    new bounded deadline for refetch, compatibility, physical Git, and mutation.
 7. Preserve the complete structured error. Its category, code, exact OIDs,

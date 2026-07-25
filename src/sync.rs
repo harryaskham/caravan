@@ -1586,6 +1586,31 @@ fn restore_force_intent_after_nonpublication(
 }
 
 #[allow(clippy::too_many_lines)]
+/// Bounded provider-consistency retries after an exact force-with-lease push.
+///
+/// GitHub occasionally serves a PR head that lags a completed push by seconds.
+/// Retrying the exact expected OID is not a policy weakening: the lease already
+/// proved the write, and any other observed generation still fails closed.
+pub(crate) const PROVIDER_HEAD_CONVERGENCE_ATTEMPTS: u32 = 6;
+const PROVIDER_HEAD_CONVERGENCE_DELAY: Duration = Duration::from_millis(1_500);
+
+fn refetch_until_exact_head(
+    provider: &impl SyncProvider,
+    repository: &RepositoryId,
+    pr: PrNumber,
+    expected: &crate::model::CommitOid,
+) -> Result<PullRequestSnapshot, MutationError> {
+    let mut observed = provider.refetch_pull_request(repository, pr)?;
+    let mut attempt = 1;
+    while &observed.head.oid != expected && attempt < PROVIDER_HEAD_CONVERGENCE_ATTEMPTS {
+        std::thread::sleep(PROVIDER_HEAD_CONVERGENCE_DELAY);
+        observed = provider.refetch_pull_request(repository, pr)?;
+        attempt += 1;
+    }
+    Ok(observed)
+}
+
+#[allow(clippy::too_many_lines)]
 fn apply_physical_chains(
     status: &StatusOutput,
     provider: &impl SyncProvider,
@@ -1714,23 +1739,33 @@ fn apply_physical_chains(
         }
     }
     for receipt in &outcome.receipts {
-        let observed = provider
-            .refetch_pull_request(&status.repository, receipt.pr)
-            .map_err(|error| {
-                attach_physical_rebuild(
-                    mutation_error(&error, &progress, Some(receipt.pr)),
-                    &outcome,
-                )
-            })?;
+        let observed = refetch_until_exact_head(
+            provider,
+            &status.repository,
+            receipt.pr,
+            &receipt.new_head_oid,
+        )
+        .map_err(|error| {
+            attach_physical_rebuild(
+                mutation_error(&error, &progress, Some(receipt.pr)),
+                &outcome,
+            )
+        })?;
         if observed.head.oid != receipt.new_head_oid {
             return Err(attach_physical_rebuild(
                 AppError::structured(
                     ErrorCategory::Validation,
                     "rebase_midpoint_head_stale",
                     "provider did not expose the exact applied branch generation",
-                    Some(
-                        json!({"receipt": receipt, "observed_head": observed.head.oid, "resumable": true}),
-                    ),
+                    Some(json!({
+                        "receipt": receipt,
+                        "observed_head": observed.head.oid,
+                        "expected_head": receipt.new_head_oid,
+                        "attempts": PROVIDER_HEAD_CONVERGENCE_ATTEMPTS,
+                        "resumable": true,
+                        "auto_merge_state": "head auto-merge stays intentionally disabled until a tick revalidates the rewritten generation's fresh CI",
+                        "safe_next_action": "rerun the same idempotent sync; the exact pushed generation converges without another rewrite",
+                    })),
                 ),
                 &outcome,
             ));
@@ -1977,12 +2012,29 @@ fn sync_with_lock(
             }),
             false,
         )?;
-        let midpoint = read::status_with_deadline_and_budget(
+        let mut midpoint = read::status_with_deadline_and_budget(
             context,
             operation_deadline,
             Some(&github_budget),
         )
         .map_err(|error| attach_physical_rebuild(error, &physical_rebuild))?;
+        // One bounded re-read absorbs provider list-view lag behind an exact
+        // proven push; a persistent mismatch still fails closed below.
+        if physical_rebuild.receipts.iter().any(|receipt| {
+            midpoint
+                .analysis
+                .pull_requests
+                .get(&receipt.pr)
+                .is_none_or(|observed| observed.head.oid != receipt.new_head_oid)
+        }) {
+            std::thread::sleep(PROVIDER_HEAD_CONVERGENCE_DELAY);
+            midpoint = read::status_with_deadline_and_budget(
+                context,
+                operation_deadline,
+                Some(&github_budget),
+            )
+            .map_err(|error| attach_physical_rebuild(error, &physical_rebuild))?;
+        }
         for receipt in &physical_rebuild.receipts {
             let observed = midpoint
                 .analysis
@@ -2005,9 +2057,14 @@ fn sync_with_lock(
                         ErrorCategory::Validation,
                         "rebase_midpoint_head_stale",
                         "midpoint discovery did not contain the exact planned head",
-                        Some(
-                            json!({"receipt": receipt, "observed_head": observed.head.oid, "resumable": true}),
-                        ),
+                        Some(json!({
+                            "receipt": receipt,
+                            "observed_head": observed.head.oid,
+                            "expected_head": receipt.new_head_oid,
+                            "resumable": true,
+                            "auto_merge_state": "head auto-merge stays intentionally disabled until a tick revalidates the rewritten generation's fresh CI",
+                            "safe_next_action": "rerun the same idempotent sync; the exact pushed generation converges without another rewrite",
+                        })),
                     ),
                     &physical_rebuild,
                 ));

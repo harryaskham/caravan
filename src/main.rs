@@ -1340,19 +1340,62 @@ fn run_loop(cli: &Cli, input: &LoopInput) -> Result<(), i32> {
     }
     let context = load_context(cli)?;
     if cli.json {
-        return emit_result(true, caravan::loop_runner::run(&context, input, |_| {}));
+        return emit_result(
+            true,
+            caravan::loop_runner::run(&context, input, |_| {}, |_, _| {}),
+        );
     }
-    match caravan::loop_runner::run(&context, input, |tick| {
-        print!("{}", render_loop_tick(tick));
-    }) {
+    match caravan::loop_runner::run(
+        &context,
+        input,
+        |tick| {
+            print!("{}", render_loop_tick(tick));
+        },
+        |error, failure| {
+            eprintln!("{}", render_loop_failure(error, failure));
+        },
+    ) {
         Ok(output) => {
             if output.stopped_by_signal {
-                println!("loop stopped after {} tick(s)", output.ticks);
+                println!(
+                    "loop stopped after {} tick(s) ({} failed)",
+                    output.ticks, output.failed_ticks
+                );
             }
             Ok(())
         }
         Err(error) => emit_human_error(error),
     }
+}
+
+fn render_loop_failure(
+    error: &AppError,
+    failure: &caravan::loop_runner::LoopTickFailure,
+) -> String {
+    let mut rendered = format!(
+        "tick {} failed: {} — {}\n  disposition={} wake={} retryable={}\n  next: {}",
+        failure.tick,
+        failure.code,
+        failure.message,
+        failure.disposition.as_deref().unwrap_or("unknown"),
+        failure.wake_class.as_deref().unwrap_or("unknown"),
+        failure.retryable,
+        failure.next,
+    );
+    if !failure.hook_deliveries.is_empty() {
+        let _ = write!(
+            rendered,
+            "\n  hook deliveries: {}",
+            failure.hook_deliveries.len()
+        );
+    }
+    if let Some(hook_error) = &failure.hook_error {
+        let _ = write!(rendered, "\n  hook delivery failed: {hook_error}");
+    }
+    if let Some(evidence) = human_error_evidence(error) {
+        let _ = write!(rendered, "\n{evidence}");
+    }
+    rendered
 }
 
 fn run_manual_loop(context: &AppContext, input: &LoopInput) -> Result<(), i32> {
@@ -1383,7 +1426,22 @@ fn run_manual_loop(context: &AppContext, input: &LoopInput) -> Result<(), i32> {
                 // Shell success is not resolution authority. Rediscover and
                 // rerun the exact tick immediately.
             }
-            Err(error) => return emit_human_error(error),
+            Err(error) if input.once => return emit_human_error(error),
+            Err(error) => {
+                // A failed tick is evidence, not a stop condition: rediscover
+                // and retry so provider races and moved default branches
+                // converge without restarting the foreground loop.
+                eprintln!(
+                    "{} {}: {}",
+                    failure("cara"),
+                    heading(mcp_cli::StructuredError::code(&error)),
+                    mcp_cli::StructuredError::message(&error)
+                );
+                if let Some(evidence) = human_error_evidence(&error) {
+                    eprintln!("{evidence}");
+                }
+                std::thread::sleep(interval);
+            }
         }
     }
 }
@@ -2470,6 +2528,7 @@ fn short_oid(value: &str) -> &str {
     value.get(..value.len().min(9)).unwrap_or(value)
 }
 
+#[allow(clippy::too_many_lines)]
 fn human_error_evidence(error: &impl StructuredError) -> Option<String> {
     let details = error.details()?;
     let compact = match error.code().as_str() {
@@ -2539,6 +2598,36 @@ fn human_error_evidence(error: &impl StructuredError) -> Option<String> {
             details["config_guidance"]
                 .as_str()
                 .unwrap_or("increase the bounded sync duration and retry"),
+        )),
+        "rebase_midpoint_head_stale" | "rebase_midpoint_pr_missing" => Some(format!(
+            "{}: PR #{} branch {}\n  expected head: {}\n  observed head: {}\n  {}\n  {}",
+            warning("Provider has not exposed the exact pushed generation yet"),
+            details["receipt"]["pr"],
+            details["receipt"]["branch"].as_str().unwrap_or("unknown"),
+            details["receipt"]["new_head_oid"]
+                .as_str()
+                .map_or("unknown", short_oid),
+            details["observed_head"]
+                .as_str()
+                .map_or("absent from discovery", short_oid),
+            details["auto_merge_state"].as_str().unwrap_or(
+                "head auto-merge stays intentionally disabled until fresh CI is revalidated"
+            ),
+            details["safe_next_action"]
+                .as_str()
+                .unwrap_or("rerun the same idempotent sync"),
+        )),
+        "rebase_stale_lease" => Some(format!(
+            "{}: branch {}\n  expected: {}\n  actual:   {}\n  {}",
+            warning("Remote generation moved during this tick"),
+            details["branch"].as_str().unwrap_or("unknown"),
+            details["expected_oid"]
+                .as_str()
+                .map_or("unknown", short_oid),
+            details["actual_oid"].as_str().map_or("unknown", short_oid),
+            details["next"]
+                .as_str()
+                .unwrap_or("rediscover provider state and rerun `cara sync --all`"),
         )),
         "join_empty_source_noop" => Some(format!(
             "{}: {}@{} has no effective patch beyond current main\n  No provider or branch mutation was attempted.",

@@ -262,7 +262,7 @@ Splitting retargets the selected non-head to the default branch, making it a new
 - `cara repair abort --session ID --confirm` — after explicit review, remove only the local persisted workspace/session; provider state is never changed.
 - `cara pause --head-pr N --actor A --reason R` — place an explicit incident or maintenance hold on one exact caravan and disable only its head auto-merge.
 - `cara resume --head-pr N --actor A` — explicitly revalidate and release that hold.
-- `cara loop` — repeatedly run `sync --all` at the configured interval.
+- `cara loop` — repeatedly run `sync --all` at the configured interval. A failed tick is bounded evidence, not a stop condition: canonical events are dispatched to configured hooks and the loop keeps ticking so retryable provider races, moved default branches, and unresolved external decisions converge without an operator restart. Only an explicit stop signal ends it, and the summary reports total, failed, and consecutive-failure counts plus bounded recent-failure receipts. `loop --once` remains a single bounded tick and still returns its typed error.
 - `cara loop --manual [--shell COMMAND]` — CLI-only human controller. At an exact `external_decision`, persist private bounded decision JSON, release the operation lock, inherit the controlling TTY in a safe affected/repair workspace, and run `$SHELL -i` or the explicit command. Zero exit triggers fresh rediscovery and another exact tick; nonzero stops with evidence. Refuse JSON/MCP/non-TTY use.
 
 `loop` is a lightweight foreground daemon. It keeps no authority beyond GitHub and performs the same idempotent ticks as direct `sync --all` calls.
