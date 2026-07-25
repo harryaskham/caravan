@@ -758,15 +758,15 @@ pub fn resolve_admission_with_generation(
             .collect();
 
         let generation_finding = generation_integrity.finding(*number);
+        // A structurally ineligible PR is not an admission attempt at all, so it
+        // is reported with exact evidence but never becomes the canonical head
+        // of the queue. Only rank-indeterminate priority metadata blocks order,
+        // because canonical position genuinely cannot be computed. Eligible
+        // candidates whose exact mechanical attempt fails still cannot be
+        // leapfrogged: sync owns that generation-bound skip receipt.
         let generation_rejection = generation_finding.and_then(|finding| {
             (finding.disposition != crate::generation::GenerationDisposition::CurrentGeneration)
-                .then(|| {
-                    (
-                        finding.reason.clone(),
-                        finding.disposition
-                            != crate::generation::GenerationDisposition::SupersededGeneration,
-                    )
-                })
+                .then(|| (finding.reason.clone(), false))
         });
         let rejection = if let Some((reason, blocks_order)) = generation_rejection {
             Some((format!("fail closed: {reason}"), blocks_order))
@@ -796,18 +796,19 @@ pub fn resolve_admission_with_generation(
             ))
         } else if pull_request.draft {
             Some((
-                "fail closed: draft PR must wait until marked ready".to_owned(),
-                true,
+                "not an admission attempt: draft PR must be marked ready first".to_owned(),
+                false,
             ))
         } else if pull_request.cross_repository {
             Some((
-                "fail closed: fork-only PR cannot be admitted to a caravan".to_owned(),
-                true,
+                "not an admission attempt: fork-only PR cannot be admitted to a caravan".to_owned(),
+                false,
             ))
         } else if pull_request.auto_merge.enabled {
             Some((
-                "fail closed: candidate already has auto-merge enabled".to_owned(),
-                true,
+                "not an admission attempt: candidate already has externally enabled auto-merge"
+                    .to_owned(),
+                false,
             ))
         } else {
             None
@@ -929,7 +930,7 @@ pub fn resolve_admission_with_generation(
         .min()
         .map(|(_, _, _, pr)| pr);
     AdmissionStatus {
-        policy: "Cacophony-shaped PRs first require unique current generation integrity; proven superseded generations are excluded without blocking their canonical successor, while ambiguous/invalid generations block. Remaining attempts use explicit agent priority label (configured high to low), then FIFO by immutable provider created_at ascending with PR number ascending as equal-time tie-break; missing created_at falls back deterministically to PR number after timestamped peers; never LIFO; check/new preflight required and rejection never causes automatic leapfrogging".to_owned(),
+        policy: "Cacophony-shaped PRs first require unique current generation integrity. Structurally ineligible PRs (draft, fork-only, externally enabled auto-merge, superseded/ambiguous/invalid generation) are reported with exact reasons and excluded from ordering rather than wedging the queue, while unknown or conflicting configured priority labels block because canonical rank cannot be computed. Remaining attempts use explicit agent priority label (configured high to low), then FIFO by immutable provider created_at ascending with PR number ascending as equal-time tie-break; missing created_at falls back deterministically to PR number after timestamped peers; never LIFO; check/new preflight required and an eligible candidate whose exact mechanical attempt fails never causes automatic leapfrogging".to_owned(),
         priority_labels: priority_labels.to_vec(),
         generation_integrity,
         candidates,
@@ -2381,6 +2382,89 @@ mod tests {
                 .map(|candidate| candidate.pr)
                 .collect::<Vec<_>>(),
             [PrNumber(20)]
+        );
+    }
+
+    #[test]
+    fn ineligible_candidates_are_reported_without_wedging_eligible_admission() {
+        let mut draft = pr(10, "draft", "main", false);
+        draft.draft = true;
+        let mut fork = pr(20, "fork", "main", false);
+        fork.cross_repository = true;
+        let mut external = pr(30, "external", "main", false);
+        external.auto_merge = AutoMergeState::squash();
+        let eligible = pr(40, "eligible", "main", false);
+        let status = status(draft, vec![fork, external, eligible]);
+        let labels = crate::config::CaravanConfig::default().agent_priority_labels;
+
+        let admission = resolve_admission(&status.analysis, &labels);
+
+        assert_eq!(
+            admission.next_candidate,
+            Some(PrNumber(40)),
+            "structurally ineligible PRs must not starve an eligible candidate"
+        );
+        assert_eq!(admission.candidates.len(), 1);
+        assert!(
+            admission
+                .rejected
+                .iter()
+                .all(|candidate| !candidate.blocks_order
+                    && candidate.reason.contains("not an admission attempt"))
+        );
+        assert_eq!(
+            admission
+                .rejected
+                .iter()
+                .map(|candidate| candidate.pr)
+                .collect::<Vec<_>>(),
+            vec![PrNumber(20), PrNumber(30)],
+            "drafts are excluded before admission ordering; fork/auto-merge PRs are reported"
+        );
+    }
+
+    #[test]
+    fn ambiguous_generation_reports_exactly_without_blocking_other_owners() {
+        let ambiguous_first = pr(2107, "old", "main", false);
+        let ambiguous_second = pr(2109, "newer", "main", false);
+        let unrelated = pr(2115, "unrelated", "main", false);
+        let status = status(
+            ambiguous_first.clone(),
+            vec![ambiguous_second.clone(), unrelated.clone()],
+        );
+        let fact = |pr: &crate::model::PullRequestSnapshot, source: char| {
+            crate::model::PullRequestGenerationFact {
+                pr: pr.number,
+                provider_head: pr.head.oid.clone(),
+                created_at: pr.created_at.clone(),
+                provenance: Some(crate::model::CacophonyGenerationProvenance {
+                    generation: format!("agent/x-pr-g{}", source.to_string().repeat(40)),
+                    agent: "android-agent".to_owned(),
+                    source_head: crate::model::CommitOid(source.to_string().repeat(40)),
+                    bead_ids: BTreeSet::from(["bd-c7440c".to_owned()]),
+                    stack_base: "main".to_owned(),
+                    stack_state: "root".to_owned(),
+                }),
+                metadata_error: None,
+                supersedes: BTreeSet::new(),
+            }
+        };
+        let generation = crate::generation::analyze(
+            &[fact(&ambiguous_first, 'a'), fact(&ambiguous_second, 'b')],
+            |_base, _head| crate::generation::CommitRelation::Diverged,
+        );
+        let labels = crate::config::CaravanConfig::default().agent_priority_labels;
+
+        let admission = resolve_admission_with_generation(&status.analysis, &labels, generation);
+
+        assert_eq!(admission.next_candidate, Some(unrelated.number));
+        assert_eq!(admission.rejected.len(), 2);
+        assert!(
+            admission
+                .rejected
+                .iter()
+                .all(|candidate| !candidate.blocks_order
+                    && candidate.reason.contains("divergent or unproved"))
         );
     }
 

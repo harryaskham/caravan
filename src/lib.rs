@@ -69,8 +69,14 @@ CORE MODEL AND INVARIANTS
   admission bound are checked before automatic changes.
 - Automatic admission is deterministic: configured `caravan-priority:*` labels
   from highest to lowest, then immutable GitHub `createdAt`, then PR number.
-  Never re-sort, skip, or leapfrog the first canonical attempt because it failed,
-  except under the explicit sync-owned generation-bound greedy policy below.
+  Never re-sort, skip, or leapfrog the first canonical *eligible* attempt because
+  it failed, except under the explicit sync-owned generation-bound greedy policy
+  below. Structurally ineligible PRs are not attempts at all: drafts, fork-only
+  heads, externally enabled auto-merge, and superseded/ambiguous/invalid
+  generations are reported with exact reasons and excluded from ordering, so one
+  wedged PR never starves the fleet. Unknown or conflicting configured priority
+  labels still block because canonical rank cannot be computed. With zero
+  caravans, the first eligible candidate forms a new root caravan.
 - Cacophony-shaped PRs bind generation, agent, source head, stack slot, and bead
   metadata. Within the same agent/bead/slot, only a unique exact contained
   successor or current reviewed canonical-link receipt is admissible. Proven

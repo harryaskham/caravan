@@ -192,7 +192,7 @@ preconditions.
 - `cara check [--pr N] --tail-pr T` — check whether the selected remote/current PR can join after exact tail `T`.
 - `cara check [--pr N] --head-pr H` — resolve caravan `H`, then check against its current tail.
 
-Remote `--pr` preflight must select the canonical first priority/FIFO attempt. A rejected first attempt remains canonical and blocks later candidates; requesting a later PR returns a rejection receipt rather than silently leapfrogging. Already enrolled candidates are reported without mutation.
+Remote `--pr` preflight must select the canonical first priority/FIFO attempt. Structurally ineligible PRs never enter that ordered attempt list: drafts, fork-only heads, externally enabled auto-merge, and superseded/ambiguous/invalid Cacophony generations are reported with exact reasons and excluded, so one wedged PR cannot starve every other owner. Unknown or conflicting configured priority labels still block, because canonical rank cannot be computed. An eligible candidate whose exact mechanical attempt fails remains canonical and blocks later candidates; requesting a later PR returns a rejection receipt rather than silently leapfrogging. Already enrolled candidates are reported without mutation.
 
 `--tail-pr` names the intended merge target. `--head-pr` names a caravan whose tail is resolved at execution time. They are mutually exclusive.
 
