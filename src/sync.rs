@@ -1043,10 +1043,10 @@ struct PhysicalRebuildOutcome {
 fn selected_unpaused_caravans(status: &StatusOutput, all: bool) -> Result<Vec<Caravan>, AppError> {
     let mut selected = select_caravans(status, all)?;
     selected.retain(|caravan| {
-        !status.pauses.iter().any(|pause| {
-            pause.state != crate::pause::PauseState::Stale
-                && pause.record.caravan_head == caravan.id
-        })
+        !status
+            .pauses
+            .iter()
+            .any(|pause| pause.state.is_effective() && pause.record.caravan_head == caravan.id)
     });
     Ok(selected)
 }
@@ -2836,8 +2836,7 @@ fn current_tail_generations(status: &StatusOutput) -> Vec<AutoAdmissionTailGener
                 branch: tail.head.name.clone(),
                 head_oid: tail.head.oid.clone(),
                 held: status.pauses.iter().any(|pause| {
-                    pause.state != crate::pause::PauseState::Stale
-                        && pause.record.caravan_head == caravan.id
+                    pause.state.is_effective() && pause.record.caravan_head == caravan.id
                 }),
             })
         })
@@ -3002,7 +3001,7 @@ fn execute_bounded(
         .pauses
         .iter()
         .filter(|pause| {
-            pause.state != crate::pause::PauseState::Stale
+            pause.state.is_effective()
                 && caravans
                     .iter()
                     .any(|caravan| caravan.id == pause.record.caravan_head)

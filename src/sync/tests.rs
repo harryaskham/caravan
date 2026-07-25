@@ -2247,6 +2247,7 @@ fn dead_owner_recovery_is_preserved_on_later_sync_error() {
                 phase: "decision_checkout_in_flight".to_owned(),
                 updated_unix_ms: 2,
                 evidence: json!({ "pr": 2008 }),
+                evidence_compaction: None,
                 provider_state_indeterminate: false,
             }),
         },
@@ -2968,6 +2969,7 @@ fn sync_all_skips_paused_caravan_and_progresses_independent_caravan() {
         record,
         state: crate::pause::PauseState::Active,
         auto_merge_suspended: true,
+        retired_state: None,
         safe_next_action: "explicit resume".to_owned(),
     });
     status.analysis.fleet.problems.retain(|problem| {

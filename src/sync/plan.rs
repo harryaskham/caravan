@@ -59,7 +59,7 @@ pub fn plan_sync(context: &AppContext, input: &SyncInput) -> Result<SyncPlanOutp
             .pauses
             .iter()
             .filter(|pause| {
-                pause.state != crate::pause::PauseState::Stale
+                pause.state.is_effective()
                     && status
                         .analysis
                         .fleet
@@ -120,7 +120,7 @@ pub fn plan_sync(context: &AppContext, input: &SyncInput) -> Result<SyncPlanOutp
         .iter()
         .any(|plan| !plan.already_satisfied);
     for pause in &status.pauses {
-        if pause.state != crate::pause::PauseState::Stale {
+        if pause.state.is_effective() {
             push_plan_action(
                 &mut actions,
                 SyncPlanAction {

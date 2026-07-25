@@ -635,7 +635,7 @@ Freeze one caravan without invalidating or blocking independent caravans:
 
 ```sh
 cara pause --head-pr 42 --actor oncall --reason "incident INC-123"
-cara status                    # reports active, expired, or stale hold evidence
+cara status                    # active, expired, stale, or retired hold evidence
 cara sync --all                # skips #42 without mutation; continues the fleet
 # After CI/operator recovery:
 cara resume --head-pr 42 --actor oncall
@@ -647,7 +647,9 @@ branches, bases, children, and all PR heads. Optional `--expires-unix-secs` and
 `--external-reference` metadata are bounded and non-secret. Expiry only changes
 the status warning: no background loop can resume a hold. Resume is an explicit
 audited action and fails closed if the head, base, labels, topology, compatibility,
-or safe terminal check state no longer matches. See `SPEC.md` for recovery and
+or safe terminal check state no longer matches. When provider truth shows the exact
+recorded head merged or closed, the hold is retired: it stays as history, never as an
+active card, and never as an auto-merge repair request. See `SPEC.md` for recovery and
 retry semantics.
 
 ```sh

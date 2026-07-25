@@ -751,6 +751,38 @@ mod tests {
     }
 
     #[test]
+    fn merged_force_head_leaves_no_active_caravan_or_auto_merge_problem() {
+        // Post-merge recovery case: the provider already merged a force-labelled
+        // head that carried a long check history. Even if durable checkpoint
+        // publication failed, fresh discovery must retire it from active
+        // topology and never demand auto-merge repair on a merged PR.
+        let mut merged = pull_request(2101, "tui-remote-pane", "main");
+        merged.state = PullRequestState::Merged;
+        merged.auto_merge = AutoMergeState::disabled();
+        merged.merged_at = Some("2026-07-25T01:07:18Z".to_owned());
+        merged.labels = BTreeSet::from(["caravan".to_owned(), "caravan-force".to_owned()]);
+        merged.checks = (0..500)
+            .map(|index| CheckSnapshot {
+                name: format!("check-{index}"),
+                state: crate::model::CheckState::Success,
+                provider_state: Some("SUCCESS".to_owned()),
+                details_url: Some(format!("https://example.invalid/runs/{index}")),
+            })
+            .collect();
+
+        let analysis = derive(&snapshot(vec![merged.clone()]));
+
+        assert!(analysis.fleet.caravans.is_empty());
+        assert!(analysis.fleet.unqueued.is_empty());
+        assert!(analysis.fleet.problems.is_empty());
+        assert!(analysis.healthy());
+        // The merge receipt stays observable for evidence and dashboards.
+        let observed = &analysis.pull_requests[&PrNumber(2101)];
+        assert_eq!(observed.state, PullRequestState::Merged);
+        assert_eq!(observed.merged_at.as_deref(), Some("2026-07-25T01:07:18Z"));
+    }
+
+    #[test]
     fn enforces_auto_merge_only_on_the_head() {
         let mut non_head = pull_request(2, "two", "one");
         non_head.auto_merge = AutoMergeState::squash();

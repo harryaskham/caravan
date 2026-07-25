@@ -798,9 +798,11 @@ fn validate_apply_policy(
         .fleet
         .containing(pr)
         .expect("current evidence proved membership");
-    if status.pauses.iter().any(|pause| {
-        pause.record.caravan_head == caravan.id && pause.state != crate::pause::PauseState::Stale
-    }) {
+    if status
+        .pauses
+        .iter()
+        .any(|pause| pause.record.caravan_head == caravan.id && pause.state.is_effective())
+    {
         return Err(force_validation(
             "force_intent_caravan_held",
             "reviewed force intent cannot bypass an active or expired explicit hold",

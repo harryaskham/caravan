@@ -57,6 +57,19 @@ pub enum PauseState {
     Active,
     Expired,
     Stale,
+    /// Provider truth shows the recorded head merged (or closed). The hold is
+    /// historical evidence only: it can never be resumed, never implies an
+    /// auto-merge repair, and never represents an active caravan.
+    Retired,
+}
+
+impl PauseState {
+    /// Whether this hold still constrains live operations. Stale and retired
+    /// records are diagnostics, never authority.
+    #[must_use]
+    pub fn is_effective(self) -> bool {
+        matches!(self, Self::Active | Self::Expired)
+    }
 }
 
 /// Status-facing hold report. Stale holds never suppress graph errors.
@@ -65,6 +78,10 @@ pub struct PauseStatus {
     pub record: PauseRecord,
     pub state: PauseState,
     pub auto_merge_suspended: bool,
+    /// Exact provider-truth terminal state for the recorded head, when the
+    /// head is no longer open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired_state: Option<PullRequestState>,
     pub safe_next_action: String,
 }
 
@@ -119,7 +136,7 @@ pub fn pause(context: &AppContext, input: &PauseInput) -> Result<PauseOutput, Ap
     let head = PrNumber(input.head_pr);
     if let Some(existing) = load_one(&context.repository_path, head)? {
         let report = classify(&status, existing.clone());
-        if report.state != PauseState::Stale {
+        if report.state.is_effective() {
             return Ok(noop(
                 "pause",
                 existing,
@@ -209,7 +226,7 @@ pub fn resume(context: &AppContext, input: &ResumeInput) -> Result<PauseOutput, 
     let status = read::status(context)?;
     crate::initialization::require_ready(&status.initialization)?;
     let report = classify(&status, record.clone());
-    if report.state == PauseState::Stale {
+    if !report.state.is_effective() {
         return Err(stale_error("resume", &report));
     }
     reject_other_graph_problems(&status, &record.members, true)?;
@@ -299,7 +316,7 @@ pub fn apply_to_status(repository_path: &Path, status: &mut StatusOutput) -> Res
         .map(|record| classify(status, record))
         .collect::<Vec<_>>();
     for report in &reports {
-        if report.state != PauseState::Stale && report.auto_merge_suspended {
+        if report.state.is_effective() && report.auto_merge_suspended {
             let head = report.record.caravan_head;
             status.analysis.fleet.problems.retain(|problem| {
                 !(problem.kind == crate::model::GraphProblemKind::AutoMergeInvariant
@@ -315,6 +332,12 @@ pub fn apply_to_status(repository_path: &Path, status: &mut StatusOutput) -> Res
 fn classify(status: &StatusOutput, record: PauseRecord) -> PauseStatus {
     let current = status.analysis.pull_requests.get(&record.caravan_head);
     let caravan = status.analysis.fleet.caravan(record.caravan_head);
+    // Provider truth dominates every durable local record. A merged or closed
+    // head is history, so it must never be resumable, never suspend an
+    // invariant, and never request an auto-merge repair on an unmergeable PR.
+    let retired_state = current
+        .map(|pr| pr.state)
+        .filter(|state| *state != PullRequestState::Open);
     let facts_match = current.is_some_and(|pr| {
         let actual = PullRequestPrecondition::from(pr);
         actual.number == record.expected_head.number
@@ -332,15 +355,36 @@ fn classify(status: &StatusOutput, record: PauseRecord) -> PauseStatus {
     let expired = record
         .expires_unix_secs
         .is_some_and(|expiry| now() >= expiry);
-    let state = if stale {
+    let state = if retired_state.is_some() {
+        PauseState::Retired
+    } else if stale {
         PauseState::Stale
     } else if expired {
         PauseState::Expired
     } else {
         PauseState::Active
     };
-    let suspended = current.is_some_and(|pr| !pr.auto_merge.enabled);
-    PauseStatus { record, state, auto_merge_suspended: suspended, safe_next_action: if stale { "facts changed: inspect and repair without resuming; stale holds fail closed" } else if expired { "expiry never resumes automatically; explicitly resume after revalidation or replace the hold" } else { "after recovery, explicitly run `cara resume` as an audited action" }.to_owned() }
+    let suspended = retired_state.is_none() && current.is_some_and(|pr| !pr.auto_merge.enabled);
+    let safe_next_action = match state {
+        PauseState::Retired => {
+            "provider truth retired this head; keep the record as history and never resume or repair auto-merge on it"
+        }
+        PauseState::Stale => {
+            "facts changed: inspect and repair without resuming; stale holds fail closed"
+        }
+        PauseState::Expired => {
+            "expiry never resumes automatically; explicitly resume after revalidation or replace the hold"
+        }
+        PauseState::Active => "after recovery, explicitly run `cara resume` as an audited action",
+    }
+    .to_owned();
+    PauseStatus {
+        record,
+        state,
+        auto_merge_suspended: suspended,
+        retired_state,
+        safe_next_action,
+    }
 }
 
 fn reject_other_graph_problems(
@@ -838,6 +882,31 @@ mod tests {
             output.analysis.fleet.problems[0].kind,
             crate::model::GraphProblemKind::Branching
         );
+    }
+
+    #[test]
+    fn merged_head_retires_the_hold_and_never_requests_auto_merge_repair() {
+        let mut merged = head(AutoMergeState::disabled(), "sha", CheckState::Success);
+        let record = record(&merged);
+        merged.state = PullRequestState::Merged;
+        merged.merged_at = Some("2026-07-25T01:07:18Z".to_owned());
+        let mut output = status(merged);
+        // A merged head cannot be an active caravan member, so provider truth
+        // leaves the fleet empty even while the durable hold survives.
+        output.analysis.fleet.caravans.clear();
+        output.analysis.fleet.problems = vec![crate::model::GraphProblem {
+            kind: crate::model::GraphProblemKind::AutoMergeInvariant,
+            prs: vec![PrNumber(1)],
+            message: "head auto-merge".to_owned(),
+        }];
+
+        let report = classify(&output, record);
+
+        assert_eq!(report.state, PauseState::Retired);
+        assert_eq!(report.retired_state, Some(PullRequestState::Merged));
+        assert!(!report.auto_merge_suspended);
+        assert!(!report.state.is_effective());
+        assert!(report.safe_next_action.contains("never resume"));
     }
 
     #[test]

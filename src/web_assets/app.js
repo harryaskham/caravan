@@ -217,7 +217,9 @@
   }
 
   function pauseFor(status, caravan) {
-    return (status?.pauses ?? []).find((pause) => pause?.record?.caravan_head === caravan.id && normalized(pause.state) !== "stale");
+    // Stale and provider-retired holds are historical diagnostics only; they
+    // never present as an active hold or imply auto-merge repair.
+    return (status?.pauses ?? []).find((pause) => pause?.record?.caravan_head === caravan.id && !["stale", "retired"].includes(normalized(pause.state)));
   }
 
   function renderCaravans(repo) {

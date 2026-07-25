@@ -335,9 +335,11 @@ fn execute(
             input,
         ));
     }
-    if status.pauses.iter().any(|pause| {
-        pause.record.caravan_head == caravan.id && pause.state != crate::pause::PauseState::Stale
-    }) {
+    if status
+        .pauses
+        .iter()
+        .any(|pause| pause.record.caravan_head == caravan.id && pause.state.is_effective())
+    {
         return Err(force_validation(
             "force_caravan_held",
             "force intent cannot bypass an active or expired explicit Caravan hold",
@@ -1048,6 +1050,7 @@ mod tests {
             },
             state: crate::pause::PauseState::Active,
             auto_merge_suspended: true,
+            retired_state: None,
             safe_next_action: "resume".to_owned(),
         });
         let provider = FakeProvider::new(pull.clone());

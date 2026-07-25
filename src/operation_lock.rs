@@ -15,6 +15,7 @@ use mcp_cli::ErrorCategory;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::AppError;
 use crate::command::{CommandRunError, CommandRunner, CommandSpec, ProcessRunner};
@@ -51,8 +52,28 @@ pub struct OperationLockCheckpoint {
     pub updated_unix_ms: u64,
     /// Operation-specific compact receipt and exact provider precondition facts.
     pub evidence: Value,
+    /// Present when oversized evidence was replaced by a bounded digest so the
+    /// checkpoint itself can never fail an operation whose provider mutation
+    /// already completed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_compaction: Option<CheckpointCompaction>,
     /// True while a provider write may have completed without an after receipt.
     pub provider_state_indeterminate: bool,
+}
+
+/// Bounded description of evidence that was too large to persist verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CheckpointCompaction {
+    /// Serialized byte length of the original evidence.
+    pub original_bytes: u64,
+    /// Stable digest of the exact original evidence bytes.
+    pub original_digest: String,
+    /// Top-level evidence keys preserved as a navigation hint.
+    #[serde(default)]
+    pub keys: Vec<String>,
+    /// Element counts for bounded arrays such as check or receipt histories.
+    #[serde(default)]
+    pub counts: std::collections::BTreeMap<String, u64>,
 }
 
 /// Read-only lock inspection returned by CLI and MCP.
@@ -164,7 +185,7 @@ impl OperationLock {
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                     match recover_dead_owner_for_acquire(&path)? {
                         DeadOwnerProbe::Recovered(receipt) => {
-                            recovered_dead_owner.get_or_insert(receipt);
+                            recovered_dead_owner.get_or_insert(*receipt);
                         }
                         DeadOwnerProbe::Gone if attempt < 2 => {}
                         DeadOwnerProbe::Gone => {
@@ -266,16 +287,22 @@ impl OperationLock {
             phase: phase.into(),
             updated_unix_ms,
             evidence,
+            evidence_compaction: None,
             provider_state_indeterminate,
         });
-        let encoded = serde_json::to_vec(&self.owner).map_err(|error| {
-            AppError::structured(
-                ErrorCategory::SerializationError,
-                "operation_lock_checkpoint_encode_failed",
-                format!("could not encode operation lock checkpoint: {error}"),
-                None,
-            )
-        })?;
+        let mut encoded = self.encoded_owner()?;
+        if u64::try_from(encoded.len()).unwrap_or(u64::MAX) > MAX_OWNER_BYTES {
+            // A checkpoint is recovery evidence, not mutation authority.
+            // Oversized evidence (for example a very long check history after a
+            // successful provider merge) is replaced by a bounded digest rather
+            // than failing an operation whose remote effect already happened.
+            self.compact_checkpoint_evidence();
+            encoded = self.encoded_owner()?;
+        }
+        if u64::try_from(encoded.len()).unwrap_or(u64::MAX) > MAX_OWNER_BYTES {
+            self.minimize_checkpoint_evidence();
+            encoded = self.encoded_owner()?;
+        }
         if u64::try_from(encoded.len()).unwrap_or(u64::MAX) > MAX_OWNER_BYTES {
             return Err(AppError::structured(
                 ErrorCategory::Validation,
@@ -297,6 +324,57 @@ impl OperationLock {
             ));
         }
         self.persist_checkpoint_bytes(&encoded)
+    }
+
+    fn encoded_owner(&self) -> Result<Vec<u8>, AppError> {
+        serde_json::to_vec(&self.owner).map_err(|error| {
+            AppError::structured(
+                ErrorCategory::SerializationError,
+                "operation_lock_checkpoint_encode_failed",
+                format!("could not encode operation lock checkpoint: {error}"),
+                None,
+            )
+        })
+    }
+
+    /// Replace oversized evidence with counts, keys, and an exact digest.
+    fn compact_checkpoint_evidence(&mut self) {
+        let Some(checkpoint) = self.owner.checkpoint.as_mut() else {
+            return;
+        };
+        let serialized = serde_json::to_vec(&checkpoint.evidence).unwrap_or_default();
+        let mut keys = Vec::new();
+        let mut counts = std::collections::BTreeMap::new();
+        if let Value::Object(map) = &checkpoint.evidence {
+            for (key, value) in map {
+                keys.push(key.clone());
+                if let Value::Array(items) = value {
+                    counts.insert(key.clone(), u64::try_from(items.len()).unwrap_or(u64::MAX));
+                }
+            }
+        }
+        checkpoint.evidence_compaction = Some(CheckpointCompaction {
+            original_bytes: u64::try_from(serialized.len()).unwrap_or(u64::MAX),
+            original_digest: digest_hex(&serialized),
+            keys,
+            counts,
+        });
+        checkpoint.evidence = json!({
+            "compacted": true,
+            "reason": "evidence exceeded the bounded operation-lock owner file",
+        });
+    }
+
+    /// Last-resort phase-only checkpoint. Recovery keeps the phase and the
+    /// indeterminate-provider flag even when nothing else fits.
+    fn minimize_checkpoint_evidence(&mut self) {
+        if let Some(checkpoint) = self.owner.checkpoint.as_mut() {
+            checkpoint.evidence = json!({ "compacted": true });
+            if let Some(compaction) = checkpoint.evidence_compaction.as_mut() {
+                compaction.keys.clear();
+                compaction.counts.clear();
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -742,7 +820,7 @@ fn process_is_alive(pid: u32) -> Result<bool, AppError> {
 enum DeadOwnerProbe {
     Gone,
     Live,
-    Recovered(OperationLockRecovery),
+    Recovered(Box<OperationLockRecovery>),
 }
 
 fn recover_dead_owner_for_acquire(path: &Path) -> Result<DeadOwnerProbe, AppError> {
@@ -809,13 +887,13 @@ fn recover_dead_owner_for_acquire(path: &Path) -> Result<DeadOwnerProbe, AppErro
         )
     })?;
     let age_secs = lock_age_secs(&metadata, &latest);
-    Ok(DeadOwnerProbe::Recovered(OperationLockRecovery {
+    Ok(DeadOwnerProbe::Recovered(Box::new(OperationLockRecovery {
         path: path.display().to_string(),
         removed_owner: latest,
         age_secs,
         owner_alive: false,
         token_verified: true,
-    }))
+    })))
 }
 
 fn existing_lock_error(path: &Path, stale_after: Duration) -> Result<AppError, io::Error> {
@@ -866,6 +944,10 @@ fn read_owner(path: &Path) -> Result<OperationLockOwner, io::Error> {
     file.take(MAX_OWNER_BYTES).read_to_end(&mut bytes)?;
     serde_json::from_slice(&bytes)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn digest_hex(material: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(material))
 }
 
 fn lock_io_error(code: &str, message: &str, path: &Path, error: &io::Error) -> AppError {
@@ -1013,6 +1095,54 @@ mod tests {
         assert_eq!(checkpoint.phase, "provider_write_in_flight");
         assert_eq!(checkpoint.evidence["pr"], 2008);
         assert!(checkpoint.provider_state_indeterminate);
+        assert!(checkpoint.evidence_compaction.is_none());
+        lock.release().unwrap();
+    }
+
+    #[test]
+    fn oversized_post_merge_checkpoint_compacts_instead_of_failing_the_operation() {
+        let repository = test_repository();
+        let mut lock = OperationLock::acquire(repository.path(), "sync").unwrap();
+        // A force-labelled head can carry a very long check history. The
+        // provider merge already succeeded, so the checkpoint must degrade to
+        // bounded evidence rather than fail after the remote effect.
+        let checks = (0..4_000)
+            .map(|index| {
+                json!({
+                    "name": format!("check-{index}-with-a-long-descriptive-workflow-name"),
+                    "state": "success",
+                    "details_url": format!("https://example.invalid/runs/{index}/jobs/{index}"),
+                })
+            })
+            .collect::<Vec<_>>();
+        let evidence = json!({
+            "merged_pr": 2101,
+            "merge_commit": "3ad8d2843fe2f05e4617081d14837482f51b448c",
+            "checks": checks,
+        });
+        let original_bytes = serde_json::to_vec(&evidence).unwrap().len();
+        assert!(u64::try_from(original_bytes).unwrap() > MAX_OWNER_BYTES);
+
+        lock.checkpoint("provider_merge_completed", evidence, true)
+            .expect("a completed provider merge must still checkpoint");
+
+        let persisted = read_owner(lock.path()).unwrap();
+        let encoded = serde_json::to_vec(&persisted).unwrap();
+        assert!(u64::try_from(encoded.len()).unwrap() <= MAX_OWNER_BYTES);
+        let checkpoint = persisted.checkpoint.expect("durable checkpoint");
+        assert_eq!(checkpoint.phase, "provider_merge_completed");
+        assert!(checkpoint.provider_state_indeterminate);
+        assert_eq!(checkpoint.evidence["compacted"], true);
+        let compaction = checkpoint
+            .evidence_compaction
+            .expect("bounded compaction receipt");
+        assert_eq!(
+            compaction.original_bytes,
+            u64::try_from(original_bytes).unwrap()
+        );
+        assert!(compaction.original_digest.starts_with("sha256:"));
+        assert_eq!(compaction.counts["checks"], 4_000);
+        assert!(compaction.keys.contains(&"merge_commit".to_owned()));
         lock.release().unwrap();
     }
 
@@ -1034,6 +1164,7 @@ mod tests {
                 phase: "provider_write_in_flight".to_owned(),
                 updated_unix_ms: 1,
                 evidence: json!({ "pr": 2008 }),
+                evidence_compaction: None,
                 provider_state_indeterminate: true,
             }),
         };
