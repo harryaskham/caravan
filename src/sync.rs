@@ -23,11 +23,16 @@ use crate::hooks::{self, HookDelivery};
 use crate::model::{
     Caravan, CaravanEvent, CheckSnapshot, CheckState, CompatibilityOutcome, DecisionKind,
     DecisionPoint, EventId, EventKind, GraphProblem, GraphProblemKind, MergeCandidateIdentity,
-    MergeMethod, MutationKind, MutationStep, MutationStepState, OperationId, OperationReceipt,
-    PrNumber, PullRequestPrecondition, PullRequestSnapshot, PullRequestState, RepositoryId,
+    MutationKind, MutationStep, MutationStepState, OperationId, OperationReceipt, PrNumber,
+    PullRequestPrecondition, PullRequestSnapshot, PullRequestState, RepositoryId,
 };
 use crate::operation_lock::{OperationLock, OperationLockRecovery};
 use crate::read::{self, StatusOutput};
+use crate::root_auto_merge::{
+    self, ROOT_AUTO_MERGE_ARMING_ATTEMPTS, ROOT_AUTO_MERGE_CONFIRMATION_DELAY,
+    ROOT_AUTO_MERGE_CONFIRMATION_READS, RootAutoMergeFailureCause, RootAutoMergeReceipt,
+    RootAutoMergeTrigger,
+};
 use crate::{AppContext, AppError, CheckInput, SyncInput};
 
 mod decision;
@@ -48,6 +53,9 @@ const PHYSICAL_APPLY_COMMAND_SLOTS_PER_MEMBER: u64 = 3;
 const PHYSICAL_RECONCILIATION_COMMAND_SLOTS_PER_MEMBER: u64 = 2;
 const PHYSICAL_FIXED_POST_WRITE_COMMAND_SLOTS: u64 = 2;
 const AUTO_ADMISSION_SKIP_LABEL: &str = "caravan-join-skipped";
+/// Labels whose transition changes whether a PR may be an admitted caravan root
+/// at all. Only these gate convergent root arming; other label churn does not.
+const CARAVAN_CONTROL_LABELS: [&str; 2] = ["caravan", "caravan-evicted"];
 const AUTO_ADMISSION_SKIP_PREFIX: &str = "<!-- caravan-auto-join-skip-receipt:";
 const MAX_AUTO_ADMISSION_COMMENT_BYTES: usize = 60 * 1024;
 const MAX_RESERVED_CANDIDATE_BUDGET_SECS: u64 = 30;
@@ -536,6 +544,10 @@ pub struct SyncOutput {
     /// Exact provider before/after facts for completed remote mutations.
     #[serde(default)]
     pub provider_receipts: Vec<GitHubMutationReceipt>,
+    /// Durable proof that every converged caravan root carries required native
+    /// SQUASH auto-merge on its exact current head, with engine provenance.
+    #[serde(default)]
+    pub root_auto_merge: Vec<RootAutoMergeReceipt>,
     /// Complete immutable physical-rebase plans approved before the write barrier.
     #[serde(default)]
     pub rebase_plans: Vec<crate::physical_rebase::RebasePlan>,
@@ -1635,6 +1647,19 @@ fn apply_physical_chains(
     };
     for chain in chains {
         for prepared in &chain.members {
+            // Only a member whose exact branch generation is actually rewritten
+            // needs its native auto-merge dropped first. Disarming an untouched
+            // caravan root every tick creates a durability window in which any
+            // later failure (CI stop, budget, provider error) leaves required
+            // root arming off until an operator notices.
+            if prepared.plan.already_satisfied {
+                progress.already(
+                    MutationKind::DisableAutoMerge,
+                    prepared.plan.pr,
+                    "exact cumulative ancestry already satisfied; no branch rewrite, so native auto-merge is retained",
+                );
+                continue;
+            }
             if let Err(error) =
                 progress.ensure_auto_merge_disabled(provider, &status.repository, prepared.plan.pr)
             {
@@ -2096,6 +2121,15 @@ fn sync_with_lock(
             .count(),
     )
     .unwrap_or(u32::MAX);
+    // Exact generations this tick's own scheduler rebase published. Root arming
+    // provenance must attribute a provider-side auto-merge drop to the engine's
+    // own rewrite rather than to an external actor.
+    let rewritten_heads = physical_rebuild
+        .receipts
+        .iter()
+        .filter(|receipt| !receipt.already_satisfied)
+        .map(|receipt| (receipt.pr, receipt.new_head_oid.clone()))
+        .collect::<BTreeMap<_, _>>();
     let mut progress = execute_bounded(
         &status,
         &provider,
@@ -2107,6 +2141,7 @@ fn sync_with_lock(
             .sync
             .max_mutations_per_tick
             .saturating_sub(physical_mutations),
+        &rewritten_heads,
     )?;
     if context.config.rebase_on_join {
         physical_rebuild.steps.append(&mut progress.steps);
@@ -2212,6 +2247,7 @@ fn sync_with_lock(
                     .sync
                     .max_mutations_per_tick
                     .saturating_sub(completed_mutation_count(&progress)),
+                &rewritten_heads,
             )
             .map_err(|error| {
                 attach_auto_admission_progress(&error, context, &progress, &github_budget)
@@ -2269,6 +2305,7 @@ fn sync_with_lock(
         }),
         lock_recovery,
         provider_receipts: progress.provider_receipts,
+        root_auto_merge: progress.root_auto_merge,
         rebase_plans: progress.rebase_plans,
         rebase_receipts: progress.rebase_receipts,
         historical_predecessor: read::historical_predecessor(&status),
@@ -2331,6 +2368,10 @@ fn merge_sync_progress(target: &mut SyncProgress, mut source: SyncProgress) {
     target
         .provider_receipts
         .append(&mut source.provider_receipts);
+    for receipt in std::mem::take(&mut source.root_auto_merge) {
+        target.root_auto_merge.retain(|item| item.pr != receipt.pr);
+        target.root_auto_merge.push(receipt);
+    }
     target.rebase_plans.append(&mut source.rebase_plans);
     target.rebase_receipts.append(&mut source.rebase_receipts);
     target.paused_caravans.append(&mut source.paused_caravans);
@@ -2985,9 +3026,18 @@ fn execute(
     rerun_failed: bool,
     force_merge: bool,
 ) -> Result<SyncProgress, AppError> {
-    execute_bounded(status, provider, all, rerun_failed, force_merge, u32::MAX)
+    execute_bounded(
+        status,
+        provider,
+        all,
+        rerun_failed,
+        force_merge,
+        u32::MAX,
+        &BTreeMap::new(),
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_bounded(
     status: &StatusOutput,
     provider: &impl SyncProvider,
@@ -2995,6 +3045,7 @@ fn execute_bounded(
     rerun_failed: bool,
     force_merge: bool,
     mutation_limit: u32,
+    rewritten_heads: &BTreeMap<PrNumber, crate::model::CommitOid>,
 ) -> Result<SyncProgress, AppError> {
     let mut caravans = select_caravans(status, all)?;
     let paused_caravans = status
@@ -3038,6 +3089,7 @@ fn execute_bounded(
             caravan,
             rerun_failed,
             force_merge,
+            rewritten_heads,
             &mut progress,
         )?;
     }
@@ -3045,12 +3097,14 @@ fn execute_bounded(
     Ok(progress)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn reconcile_caravan(
     status: &StatusOutput,
     provider: &impl SyncProvider,
     caravan: &Caravan,
     rerun_failed: bool,
     force_merge: bool,
+    rewritten_heads: &BTreeMap<PrNumber, crate::model::CommitOid>,
     progress: &mut SyncProgress,
 ) -> Result<(), AppError> {
     let head = caravan.head().expect("caravans are non-empty");
@@ -3062,6 +3116,7 @@ fn reconcile_caravan(
     }
 
     let mut forced_head = false;
+    let mut ci_failure = None;
     for number in caravan.members.iter().copied() {
         let observation = progress.observe_ci(provider, &status.repository, number)?;
         let disposition = observation.disposition;
@@ -3075,13 +3130,21 @@ fn reconcile_caravan(
                     &observation.rerunnable_run_ids,
                 )?;
             }
-            return Err(ci_decision_error(status, caravan, &observation, progress));
+            ci_failure = Some(observation);
+            break;
         }
         forced_head |= number == head && disposition == CiDisposition::Forced;
     }
 
     if forced_head {
-        return force_merge_head(status, provider, caravan, force_merge, progress);
+        return force_merge_head(
+            status,
+            provider,
+            caravan,
+            force_merge,
+            rewritten_heads,
+            progress,
+        );
     }
 
     // Repair externally enabled non-heads before enabling the head so sync
@@ -3089,7 +3152,22 @@ fn reconcile_caravan(
     for number in caravan.members.iter().skip(1).copied() {
         progress.ensure_auto_merge_disabled(provider, &status.repository, number)?;
     }
-    progress.ensure_squash_auto_merge(provider, &status.repository, head)
+    // Required root arming is scheduler-owned convergent state, so it converges
+    // before any CI stop. Native auto-merge only merges a passing head, and a
+    // tick that stopped at a failing generation must never leave the admitted
+    // root disarmed waiting for an operator to re-arm it.
+    progress.ensure_root_squash_auto_merge(
+        provider,
+        &status.repository,
+        caravan.id,
+        head,
+        status.analysis.pull_requests.get(&head),
+        rewritten_heads.get(&head),
+    )?;
+    if let Some(observation) = ci_failure {
+        return Err(ci_decision_error(status, caravan, &observation, progress));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3098,6 +3176,7 @@ fn force_merge_head(
     provider: &impl SyncProvider,
     caravan: &Caravan,
     force_merge: bool,
+    rewritten_heads: &BTreeMap<PrNumber, crate::model::CommitOid>,
     progress: &mut SyncProgress,
 ) -> Result<(), AppError> {
     let head = caravan.head().expect("caravan head");
@@ -3258,7 +3337,14 @@ fn force_merge_head(
         for number in caravan.members.iter().skip(2).copied() {
             progress.ensure_auto_merge_disabled(provider, &status.repository, number)?;
         }
-        progress.ensure_squash_auto_merge(provider, &status.repository, new_head)?;
+        progress.ensure_root_squash_auto_merge(
+            provider,
+            &status.repository,
+            new_head,
+            new_head,
+            status.analysis.pull_requests.get(&new_head),
+            rewritten_heads.get(&new_head),
+        )?;
     }
     Ok(())
 }
@@ -4265,6 +4351,7 @@ fn decision_error(decision: &DecisionPoint, progress: &SyncProgress) -> AppError
         Some(json!({
             "decision": decision,
             "provider_receipts": progress.provider_receipts,
+            "root_auto_merge": progress.root_auto_merge,
         })),
     )
 }
@@ -4275,6 +4362,7 @@ struct SyncProgress {
     repository: RepositoryId,
     steps: Vec<MutationStep>,
     provider_receipts: Vec<GitHubMutationReceipt>,
+    root_auto_merge: Vec<RootAutoMergeReceipt>,
     rebase_plans: Vec<crate::physical_rebase::RebasePlan>,
     rebase_receipts: Vec<crate::physical_rebase::RebaseReceipt>,
     synchronized_caravans: Vec<PrNumber>,
@@ -4298,6 +4386,7 @@ impl SyncProgress {
             repository: status.repository.clone(),
             steps: Vec::new(),
             provider_receipts: Vec::new(),
+            root_auto_merge: Vec::new(),
             rebase_plans: Vec::new(),
             rebase_receipts: Vec::new(),
             synchronized_caravans,
@@ -4587,34 +4676,323 @@ impl SyncProgress {
         Ok(())
     }
 
-    fn ensure_squash_auto_merge(
+    /// Converge scheduler-owned required squash auto-merge on the exact current
+    /// caravan root head.
+    ///
+    /// Native auto-merge is dropped by the provider whenever the root's head or
+    /// base generation is rewritten, and the provider's list projection can
+    /// still expose the pre-rewrite `autoMergeRequest`. Deciding this required
+    /// invariant from discovery facts therefore silently degrades a caravan
+    /// until somebody re-arms it by hand. This convergence instead:
+    ///
+    /// 1. re-reads the exact current root generation from a fresh single-PR
+    ///    provider read;
+    /// 2. refuses to prove anything against a generation other than the one this
+    ///    tick already verified;
+    /// 3. arms and then re-reads until squash auto-merge is proven on the
+    ///    resulting head, never on the pre-rebase generation;
+    /// 4. persists a sealed receipt carrying auditable engine provenance;
+    /// 5. reports a typed cause and defers retry to the next bounded tick when
+    ///    arming cannot be proven.
+    fn ensure_root_squash_auto_merge(
+        &mut self,
+        provider: &impl SyncProvider,
+        repository: &RepositoryId,
+        caravan_id: PrNumber,
+        number: PrNumber,
+        discovery: Option<&PullRequestSnapshot>,
+        rewritten_head: Option<&crate::model::CommitOid>,
+    ) -> Result<(), AppError> {
+        let previous = self.current.get(&number).cloned();
+        let (mut observed, mut reads) = self.read_exact_root_generation(
+            provider,
+            repository,
+            caravan_id,
+            number,
+            previous.as_ref(),
+        )?;
+        let proven = self
+            .root_auto_merge
+            .iter()
+            .rev()
+            .find(|receipt| receipt.pr == number)
+            .map(|receipt| receipt.head.oid.clone());
+        let observed_before = observed.auto_merge.clone();
+        let trigger = root_auto_merge::classify_trigger(
+            discovery,
+            &observed,
+            rewritten_head,
+            proven.as_ref(),
+        );
+
+        if !trigger.requires_write() {
+            self.already(
+                MutationKind::EnableAutoMerge,
+                number,
+                "exact current caravan root head already carries required squash auto-merge",
+            );
+            self.push_root_auto_merge(
+                caravan_id,
+                &observed,
+                trigger,
+                &observed_before,
+                false,
+                reads,
+                0,
+            );
+            return Ok(());
+        }
+
+        let mut attempts = 0_u32;
+        while attempts < ROOT_AUTO_MERGE_ARMING_ATTEMPTS {
+            attempts += 1;
+            let target_head = observed.head.oid.clone();
+            let (armed, arming_reads) =
+                self.arm_root_once(provider, repository, number, &observed, &target_head)?;
+            observed = armed;
+            reads = reads.saturating_add(arming_reads);
+            if observed.head.oid != target_head {
+                return Err(self.root_auto_merge_failure(
+                    caravan_id,
+                    number,
+                    RootAutoMergeFailureCause::RootHeadMovedDuringArming,
+                    trigger,
+                    &observed,
+                    Some(&target_head),
+                    attempts,
+                    reads,
+                ));
+            }
+            if root_auto_merge::squash_armed(&observed) {
+                self.push_root_auto_merge(
+                    caravan_id,
+                    &observed,
+                    trigger,
+                    &observed_before,
+                    true,
+                    reads,
+                    attempts,
+                );
+                return Ok(());
+            }
+        }
+        Err(self.root_auto_merge_failure(
+            caravan_id,
+            number,
+            RootAutoMergeFailureCause::ProviderDidNotPersistArming,
+            trigger,
+            &observed,
+            None,
+            attempts,
+            reads,
+        ))
+    }
+
+    /// Perform one bounded arming attempt and re-read the exact resulting head
+    /// until squash auto-merge is proven or the bounded reads are exhausted.
+    fn arm_root_once(
         &mut self,
         provider: &impl SyncProvider,
         repository: &RepositoryId,
         number: PrNumber,
-    ) -> Result<(), AppError> {
-        let auto_merge = &self.current.get(&number).expect("sync member").auto_merge;
-        if auto_merge.enabled && auto_merge.merge_method == Some(MergeMethod::Squash) {
-            self.already(
-                MutationKind::EnableAutoMerge,
-                number,
-                "head squash auto-merge already enabled",
-            );
-            return Ok(());
-        }
-        if auto_merge.enabled {
+        observed: &PullRequestSnapshot,
+        target_head: &crate::model::CommitOid,
+    ) -> Result<(PullRequestSnapshot, u32), AppError> {
+        if observed.auto_merge.enabled {
             self.ensure_mutation_capacity(1)?;
             let receipt = provider
                 .disable_auto_merge(repository, &self.precondition(number))
                 .map_err(|error| mutation_error(&error, self, Some(number)))?;
-            self.record(receipt, "disabled non-squash auto-merge on head");
+            self.record(
+                receipt,
+                "disabled non-squash auto-merge on the exact caravan root head",
+            );
         }
         self.ensure_mutation_capacity(1)?;
         let receipt = provider
             .enable_squash_auto_merge(repository, &self.precondition(number))
             .map_err(|error| mutation_error(&error, self, Some(number)))?;
-        self.record(receipt, "enabled squash auto-merge on head PR");
-        Ok(())
+        let mut observed = receipt.after.clone();
+        self.record(
+            receipt,
+            "armed scheduler-owned squash auto-merge on the exact caravan root head",
+        );
+        let mut reads = 1_u32;
+
+        // Bounded confirmation re-reads absorb provider read lag behind an
+        // accepted mutation. They never accept a different generation.
+        while reads < ROOT_AUTO_MERGE_CONFIRMATION_READS
+            && !(&observed.head.oid == target_head && root_auto_merge::squash_armed(&observed))
+        {
+            std::thread::sleep(ROOT_AUTO_MERGE_CONFIRMATION_DELAY);
+            observed = provider
+                .refetch_pull_request(repository, number)
+                .map_err(|error| mutation_error(&error, self, Some(number)))?;
+            self.current.insert(number, observed.clone());
+            reads = reads.saturating_add(1);
+        }
+        Ok((observed, reads))
+    }
+
+    /// Read the exact current root generation.
+    ///
+    /// Bounded re-reads absorb provider read lag behind a generation this tick
+    /// already verified. Any other structural divergence from the tick's own
+    /// facts stays an ordinary resumable stale-precondition decision instead of
+    /// being converged blind.
+    fn read_exact_root_generation(
+        &mut self,
+        provider: &impl SyncProvider,
+        repository: &RepositoryId,
+        caravan_id: PrNumber,
+        number: PrNumber,
+        previous: Option<&PullRequestSnapshot>,
+    ) -> Result<(PullRequestSnapshot, u32), AppError> {
+        let expected_head = previous.map(|snapshot| snapshot.head.oid.clone());
+        let mut observed = provider
+            .refetch_pull_request(repository, number)
+            .map_err(|error| mutation_error(&error, self, Some(number)))?;
+        let mut reads = 1_u32;
+        while reads < ROOT_AUTO_MERGE_CONFIRMATION_READS
+            && expected_head
+                .as_ref()
+                .is_some_and(|oid| &observed.head.oid != oid)
+        {
+            std::thread::sleep(ROOT_AUTO_MERGE_CONFIRMATION_DELAY);
+            observed = provider
+                .refetch_pull_request(repository, number)
+                .map_err(|error| mutation_error(&error, self, Some(number)))?;
+            reads = reads.saturating_add(1);
+        }
+        if let Some(expected) = expected_head.as_ref()
+            && &observed.head.oid != expected
+        {
+            return Err(self.root_auto_merge_failure(
+                caravan_id,
+                number,
+                RootAutoMergeFailureCause::StaleProviderView,
+                RootAutoMergeTrigger::RootHeadRewritten,
+                &observed,
+                Some(expected),
+                0,
+                reads,
+            ));
+        }
+        // Auto-merge and head facts are convergent scheduler-owned state, but a
+        // raced membership/state/base transition still belongs to the ordinary
+        // optimistic contract and must stop with a resumable decision. Unrelated
+        // label churn (priority, force, review metadata) is deliberately not a
+        // stop: it cannot make required root arming wrong, and treating it as a
+        // decision would turn routine fleet activity into operator babysitting.
+        if let Some(previous) = previous {
+            let expected = PullRequestPrecondition::from(previous);
+            let actual = PullRequestPrecondition::from(&observed);
+            let mut changed_fields = crate::github::changed_precondition_fields(&expected, &actual)
+                .into_iter()
+                .filter(|field| field != "auto_merge" && field != "labels")
+                .collect::<Vec<_>>();
+            for label in CARAVAN_CONTROL_LABELS {
+                if previous.has_label(label) != observed.has_label(label) {
+                    changed_fields.push(format!("labels.{label}"));
+                }
+            }
+            if !changed_fields.is_empty() {
+                let error = MutationError::StalePrecondition {
+                    expected: Box::new(expected),
+                    actual: Box::new(actual),
+                    changed_fields,
+                };
+                return Err(mutation_error(&error, self, Some(number)));
+            }
+        }
+        self.current.insert(number, observed.clone());
+        Ok((observed, reads))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_root_auto_merge(
+        &mut self,
+        caravan_id: PrNumber,
+        observed: &PullRequestSnapshot,
+        trigger: RootAutoMergeTrigger,
+        observed_before: &crate::model::AutoMergeState,
+        engine_armed: bool,
+        confirmation_reads: u32,
+        arming_attempts: u32,
+    ) {
+        let receipt = root_auto_merge::receipt(
+            &self.repository,
+            caravan_id,
+            observed,
+            root_auto_merge::provenance(&self.operation_id, trigger, observed_before, engine_armed),
+            confirmation_reads,
+            arming_attempts,
+        );
+        if engine_armed {
+            self.events.push(self.event(
+                EventKind::RootAutoMergeArmed,
+                Some(caravan_id),
+                vec![observed.number],
+                Some(trigger.reason().to_owned()),
+                BTreeMap::from([
+                    ("root_auto_merge_receipt".to_owned(), json!(receipt.clone())),
+                    ("trigger".to_owned(), json!(trigger)),
+                ]),
+            ));
+        }
+        self.root_auto_merge
+            .retain(|existing| existing.pr != receipt.pr);
+        self.root_auto_merge.push(receipt);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn root_auto_merge_failure(
+        &self,
+        caravan_id: PrNumber,
+        number: PrNumber,
+        cause: RootAutoMergeFailureCause,
+        trigger: RootAutoMergeTrigger,
+        observed: &PullRequestSnapshot,
+        expected_head: Option<&crate::model::CommitOid>,
+        arming_attempts: u32,
+        confirmation_reads: u32,
+    ) -> AppError {
+        AppError::structured(
+            ErrorCategory::ExecutionFailure,
+            "root_auto_merge_not_durable",
+            format!(
+                "caravan root #{number} could not be proven to carry required squash auto-merge on its exact current head ({})",
+                cause.code()
+            ),
+            Some(json!({
+                "cause": cause,
+                "cause_code": cause.code(),
+                "trigger": trigger,
+                "trigger_reason": trigger.reason(),
+                "provenance": root_auto_merge::provenance(
+                    &self.operation_id,
+                    trigger,
+                    &observed.auto_merge,
+                    false,
+                ),
+                "caravan_id": caravan_id,
+                "affected_pr": number,
+                "observed_head": observed.head.oid,
+                "expected_head": expected_head,
+                "observed_auto_merge": observed.auto_merge,
+                "arming_attempts": arming_attempts,
+                "arming_attempt_limit": ROOT_AUTO_MERGE_ARMING_ATTEMPTS,
+                "confirmation_reads": confirmation_reads,
+                "confirmation_read_limit": ROOT_AUTO_MERGE_CONFIRMATION_READS,
+                "operation_receipt": self.operation_receipt(),
+                "provider_receipts": self.provider_receipts,
+                "root_auto_merge": self.root_auto_merge,
+                "events": self.events,
+                "operator_action_required": false,
+                "resumable": true,
+                "next": cause.next(),
+            })),
+        )
     }
 }
 

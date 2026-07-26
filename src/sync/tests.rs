@@ -14,6 +14,11 @@ struct FakeProvider {
     allows_auto_merge: bool,
     branch_protected: bool,
     pulls: RefCell<BTreeMap<PrNumber, PullRequestSnapshot>>,
+    /// Scripted stale provider list/read responses served before live facts.
+    refetch_overrides: RefCell<BTreeMap<PrNumber, VecDeque<PullRequestSnapshot>>>,
+    /// Arming requests the provider accepts but silently never persists.
+    unpersisted_armings: RefCell<BTreeMap<PrNumber, u32>>,
+    refetches: RefCell<Vec<PrNumber>>,
     failures: RefCell<VecDeque<MutationKind>>,
     calls: RefCell<Vec<MutationKind>>,
     failed_runs: RefCell<BTreeMap<PrNumber, Vec<WorkflowRunSnapshot>>>,
@@ -38,6 +43,9 @@ impl FakeProvider {
                     .collect(),
             ),
             failures: RefCell::new(VecDeque::new()),
+            refetch_overrides: RefCell::new(BTreeMap::new()),
+            unpersisted_armings: RefCell::new(BTreeMap::new()),
+            refetches: RefCell::new(Vec::new()),
             calls: RefCell::new(Vec::new()),
             failed_runs: RefCell::new(BTreeMap::new()),
             diagnostic_heads: RefCell::new(BTreeMap::new()),
@@ -52,6 +60,20 @@ impl FakeProvider {
 
     fn fail_once(&self, kind: MutationKind) {
         self.failures.borrow_mut().push_back(kind);
+    }
+
+    /// Serve one stale provider generation before live facts are exposed.
+    fn serve_stale_read(&self, number: PrNumber, stale: PullRequestSnapshot) {
+        self.refetch_overrides
+            .borrow_mut()
+            .entry(number)
+            .or_default()
+            .push_back(stale);
+    }
+
+    /// Accept `count` arming requests without ever persisting auto-merge.
+    fn never_persist_arming(&self, number: PrNumber, count: u32) {
+        self.unpersisted_armings.borrow_mut().insert(number, count);
     }
 
     fn mutate(
@@ -125,6 +147,15 @@ impl SyncProvider for FakeProvider {
         _repository: &RepositoryId,
         number: PrNumber,
     ) -> Result<PullRequestSnapshot, MutationError> {
+        self.refetches.borrow_mut().push(number);
+        if let Some(stale) = self
+            .refetch_overrides
+            .borrow_mut()
+            .get_mut(&number)
+            .and_then(VecDeque::pop_front)
+        {
+            return Ok(stale);
+        }
         Ok(self.pulls.borrow()[&number].clone())
     }
 
@@ -176,6 +207,20 @@ impl SyncProvider for FakeProvider {
         _repository: &RepositoryId,
         expected: &PullRequestPrecondition,
     ) -> Result<GitHubMutationReceipt, MutationError> {
+        let unpersisted = self
+            .unpersisted_armings
+            .borrow()
+            .get(&expected.number)
+            .copied()
+            .unwrap_or(0);
+        if unpersisted > 0 {
+            self.unpersisted_armings
+                .borrow_mut()
+                .insert(expected.number, unpersisted - 1);
+            // The provider accepts the request and then exposes no
+            // `autoMergeRequest`, exactly as observed on live caravan roots.
+            return self.mutate(expected, MutationKind::EnableAutoMerge, |_| {});
+        }
         self.mutate(expected, MutationKind::EnableAutoMerge, |pull_request| {
             pull_request.auto_merge = AutoMergeState::squash();
         })
@@ -2171,7 +2216,14 @@ fn passing_checks_with_stale_force_label_use_normal_auto_merge() {
         *provider.calls.borrow(),
         vec![MutationKind::EnableAutoMerge]
     );
-    assert!(progress.events.is_empty());
+    assert_eq!(
+        progress
+            .events
+            .iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>(),
+        vec![EventKind::RootAutoMergeArmed]
+    );
     assert!(provider.audits.borrow().is_empty());
 }
 
@@ -2225,6 +2277,7 @@ fn successful_force_merge_is_one_shot_and_advances_child() {
             EventKind::ForceMergeAttempted,
             EventKind::ForceMergeCompleted,
             EventKind::HeadAdvanced,
+            EventKind::RootAutoMergeArmed,
         ]
     );
     assert_eq!(
@@ -2847,7 +2900,7 @@ fn stale_provider_facts_stop_with_a_resumable_decision() {
         .get_mut(&PrNumber(1))
         .unwrap()
         .labels
-        .insert("external-change".to_owned());
+        .insert("caravan-evicted".to_owned());
 
     let error = execute(&status, &provider, false, false, false).expect_err("race stops");
 
@@ -2855,9 +2908,44 @@ fn stale_provider_facts_stop_with_a_resumable_decision() {
     let details = mcp_cli::StructuredError::details(&error).expect("details");
     assert_eq!(details["decision"]["kind"], "stale_precondition");
     assert_eq!(details["decision"]["resumable"], true);
+    // Root convergence reads the exact provider generation itself, so the raced
+    // control-label transition is named exactly rather than reported as an
+    // opaque provider-side precondition rejection.
     assert_eq!(
         details["decision"]["evidence"]["changed_fields"],
-        json!(["fake_race"])
+        json!(["labels.caravan-evicted"])
+    );
+    assert!(
+        !provider
+            .calls
+            .borrow()
+            .contains(&MutationKind::EnableAutoMerge),
+        "a raced membership transition must not be converged blind"
+    );
+}
+
+#[test]
+fn unrelated_label_churn_never_blocks_required_root_convergence() {
+    let mut pulls = healthy_chain();
+    pulls.truncate(1);
+    pulls[0].auto_merge = AutoMergeState::disabled();
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+    provider
+        .pulls
+        .borrow_mut()
+        .get_mut(&PrNumber(1))
+        .unwrap()
+        .labels
+        .insert("caravan-priority:high".to_owned());
+
+    let progress =
+        execute(&status, &provider, false, false, false).expect("routine label churn converges");
+
+    assert!(root_receipt(&progress, 1).provenance.engine_armed);
+    assert_eq!(
+        provider.pulls.borrow()[&PrNumber(1)].auto_merge,
+        AutoMergeState::squash()
     );
 }
 
@@ -3009,5 +3097,512 @@ fn externally_enabled_non_head_is_disabled_before_head_repair() {
             MutationKind::DisableAutoMerge,
             MutationKind::EnableAutoMerge
         ]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Scheduler-owned root squash auto-merge durability (bd-2015d2).
+//
+// Live caravan2208 repeatedly lost required root arming across scheduler
+// rebase and head transitions and stayed degraded until somebody re-armed it by
+// hand. These fixtures pin arming as convergent scheduler-owned state proven on
+// the exact resulting head with auditable engine provenance.
+// ---------------------------------------------------------------------------
+
+fn root_receipt(progress: &SyncProgress, pr: u64) -> &crate::root_auto_merge::RootAutoMergeReceipt {
+    progress
+        .root_auto_merge
+        .iter()
+        .find(|receipt| receipt.pr == PrNumber(pr))
+        .expect("converged root carries a durable auto-merge receipt")
+}
+
+#[test]
+fn created_caravan_root_is_armed_with_sealed_engine_provenance() {
+    let mut pulls = healthy_chain();
+    pulls.truncate(1);
+    pulls[0].auto_merge = AutoMergeState::disabled();
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+
+    let progress = execute(&status, &provider, false, false, false).expect("root converges");
+
+    let receipt = root_receipt(&progress, 1);
+    assert!(receipt.hash_is_valid());
+    assert_eq!(receipt.merge_method, crate::model::MergeMethod::Squash);
+    assert_eq!(receipt.head, provider.pulls.borrow()[&PrNumber(1)].head);
+    assert!(receipt.observed_after.enabled);
+    assert!(receipt.provenance.engine_armed);
+    assert_eq!(
+        receipt.provenance.owner,
+        crate::root_auto_merge::ROOT_AUTO_MERGE_OWNER
+    );
+    assert_eq!(
+        receipt.provenance.trigger,
+        crate::root_auto_merge::RootAutoMergeTrigger::RootAdmitted
+    );
+    assert_eq!(receipt.provenance.operation_id, progress.operation_id);
+    assert!(
+        progress
+            .events
+            .iter()
+            .any(|event| event.kind == EventKind::RootAutoMergeArmed)
+    );
+}
+
+#[test]
+fn rewritten_root_head_is_rearmed_on_the_resulting_generation() {
+    let mut pulls = healthy_chain();
+    pulls.truncate(1);
+    // Post-rebase discovery: the provider dropped auto-merge when the scheduler
+    // rewrote the root branch.
+    pulls[0].auto_merge = AutoMergeState::disabled();
+    pulls[0].head.oid = CommitOid("79abc31d4efc07a579145cf904c83c1420f8b4ac".to_owned());
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+    let rewritten = BTreeMap::from([(
+        PrNumber(1),
+        CommitOid("79abc31d4efc07a579145cf904c83c1420f8b4ac".to_owned()),
+    )]);
+
+    let progress = execute_bounded(
+        &status,
+        &provider,
+        false,
+        false,
+        false,
+        u32::MAX,
+        &rewritten,
+    )
+    .expect("rewritten root converges");
+
+    let receipt = root_receipt(&progress, 1);
+    assert_eq!(
+        receipt.provenance.trigger,
+        crate::root_auto_merge::RootAutoMergeTrigger::RootHeadRewritten
+    );
+    // The proof belongs to the resulting head, never the pre-rebase generation.
+    assert_eq!(
+        receipt.head.oid,
+        CommitOid("79abc31d4efc07a579145cf904c83c1420f8b4ac".to_owned())
+    );
+    assert_eq!(
+        provider.pulls.borrow()[&PrNumber(1)].auto_merge,
+        AutoMergeState::squash()
+    );
+}
+
+#[test]
+fn root_arming_converges_before_a_failing_ci_generation_stops_the_tick() {
+    let mut pulls = healthy_chain();
+    pulls[0].auto_merge = AutoMergeState::disabled();
+    pulls[0].checks = vec![check("build-test", CheckState::Success, Some(70))];
+    pulls[1].checks = vec![check("build-test", CheckState::Failure, Some(71))];
+    let failing = failed_run(71, &pulls[1]);
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    provider
+        .failed_runs
+        .borrow_mut()
+        .insert(PrNumber(2), vec![failing]);
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+
+    let error =
+        execute(&status, &provider, false, false, false).expect_err("failing CI stops the tick");
+
+    assert_eq!(mcp_cli::StructuredError::code(&error), "ci_failure");
+    // The required root invariant is convergent state, so a CI stop must never
+    // leave the admitted root disarmed for an operator to repair.
+    assert_eq!(
+        provider.pulls.borrow()[&PrNumber(1)].auto_merge,
+        AutoMergeState::squash()
+    );
+    let details = mcp_cli::StructuredError::details(&error).expect("details");
+    assert_eq!(details["root_auto_merge"][0]["pr"], 1);
+    assert_eq!(
+        details["root_auto_merge"][0]["provenance"]["owner"],
+        crate::root_auto_merge::ROOT_AUTO_MERGE_OWNER
+    );
+}
+
+#[test]
+fn externally_disarmed_root_is_rearmed_with_external_provenance() {
+    let mut pulls = healthy_chain();
+    pulls.truncate(1);
+    // Discovery saw the armed generation; the provider now exposes it disarmed
+    // on the exact same head and base.
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+    provider
+        .pulls
+        .borrow_mut()
+        .get_mut(&PrNumber(1))
+        .expect("fake root")
+        .auto_merge = AutoMergeState::disabled();
+
+    let progress = execute(&status, &provider, false, false, false).expect("root reconverges");
+
+    let receipt = root_receipt(&progress, 1);
+    assert_eq!(
+        receipt.provenance.trigger,
+        crate::root_auto_merge::RootAutoMergeTrigger::ExternallyDisarmed
+    );
+    assert!(receipt.provenance.engine_armed);
+    assert_eq!(
+        provider.pulls.borrow()[&PrNumber(1)].auto_merge,
+        AutoMergeState::squash()
+    );
+}
+
+#[test]
+fn idempotent_replay_proves_arming_without_a_provider_write() {
+    let mut pulls = healthy_chain();
+    pulls.truncate(1);
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+
+    let first = execute(&status, &provider, false, false, false).expect("already armed");
+    let second = execute(&status, &provider, false, false, false).expect("replay is a no-op");
+
+    assert!(provider.calls.borrow().is_empty());
+    for progress in [&first, &second] {
+        let receipt = root_receipt(progress, 1);
+        assert!(receipt.hash_is_valid());
+        assert!(!receipt.provenance.engine_armed);
+        assert_eq!(receipt.arming_attempts, 0);
+        assert_eq!(
+            receipt.provenance.trigger,
+            crate::root_auto_merge::RootAutoMergeTrigger::IdempotentReplay
+        );
+        assert!(
+            progress
+                .events
+                .iter()
+                .all(|event| event.kind != EventKind::RootAutoMergeArmed),
+            "an unchanged root emits no arming event"
+        );
+    }
+}
+
+#[test]
+fn a_stale_armed_list_view_never_satisfies_the_root_invariant() {
+    let mut pulls = healthy_chain();
+    pulls.truncate(1);
+    // Discovery still projects the pre-rewrite `autoMergeRequest`.
+    let status = status(pulls.clone(), Some(PrNumber(1)), &clean);
+    pulls[0].auto_merge = AutoMergeState::disabled();
+    let provider = FakeProvider::with_pull_requests(pulls);
+
+    let progress = execute(&status, &provider, false, false, false).expect("fresh read converges");
+
+    assert!(
+        provider
+            .calls
+            .borrow()
+            .contains(&MutationKind::EnableAutoMerge),
+        "a stale armed projection must not short-circuit required arming"
+    );
+    assert!(root_receipt(&progress, 1).provenance.engine_armed);
+    assert_eq!(
+        provider.pulls.borrow()[&PrNumber(1)].auto_merge,
+        AutoMergeState::squash()
+    );
+}
+
+#[test]
+fn a_stale_head_read_converges_within_bounded_rereads() {
+    let mut pulls = healthy_chain();
+    pulls.truncate(1);
+    pulls[0].auto_merge = AutoMergeState::disabled();
+    let mut superseded = pulls[0].clone();
+    superseded.head.oid = CommitOid("pre-rebase".to_owned());
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    provider.serve_stale_read(PrNumber(1), superseded);
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+
+    let progress =
+        execute(&status, &provider, false, false, false).expect("bounded re-reads converge");
+
+    let receipt = root_receipt(&progress, 1);
+    assert!(receipt.confirmation_reads >= 2);
+    assert_eq!(
+        receipt.head.oid,
+        CommitOid("one0000000000000000000000000000000000000".to_owned())
+    );
+}
+
+#[test]
+fn a_persistently_stale_head_read_stops_with_a_typed_bounded_cause() {
+    let mut pulls = healthy_chain();
+    pulls.truncate(1);
+    pulls[0].auto_merge = AutoMergeState::disabled();
+    let mut superseded = pulls[0].clone();
+    superseded.head.oid = CommitOid("pre-rebase".to_owned());
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    for _ in 0..crate::root_auto_merge::ROOT_AUTO_MERGE_CONFIRMATION_READS {
+        provider.serve_stale_read(PrNumber(1), superseded.clone());
+    }
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+
+    let error = execute(&status, &provider, false, false, false)
+        .expect_err("a superseded generation is never armed");
+
+    assert_eq!(
+        mcp_cli::StructuredError::code(&error),
+        "root_auto_merge_not_durable"
+    );
+    let details = mcp_cli::StructuredError::details(&error).expect("details");
+    assert_eq!(details["cause"], "stale_provider_view");
+    assert_eq!(details["resumable"], true);
+    assert_eq!(details["operator_action_required"], false);
+    assert_eq!(details["provenance"]["owner"], "caravan-scheduler");
+    assert!(
+        !provider
+            .calls
+            .borrow()
+            .contains(&MutationKind::EnableAutoMerge)
+    );
+    assert!(
+        scheduler_failure_status(&error).retryable,
+        "bounded sync policy owns the retry, never an operator"
+    );
+}
+
+#[test]
+fn an_unpersisted_arming_stops_with_a_typed_bounded_cause() {
+    let mut pulls = healthy_chain();
+    pulls.truncate(1);
+    pulls[0].auto_merge = AutoMergeState::disabled();
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    provider.never_persist_arming(
+        PrNumber(1),
+        crate::root_auto_merge::ROOT_AUTO_MERGE_ARMING_ATTEMPTS,
+    );
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+
+    let error = execute(&status, &provider, false, false, false)
+        .expect_err("unproven arming is never reported as converged");
+
+    assert_eq!(
+        mcp_cli::StructuredError::code(&error),
+        "root_auto_merge_not_durable"
+    );
+    let details = mcp_cli::StructuredError::details(&error).expect("details");
+    assert_eq!(details["cause"], "provider_did_not_persist_arming");
+    assert_eq!(
+        details["arming_attempts"],
+        crate::root_auto_merge::ROOT_AUTO_MERGE_ARMING_ATTEMPTS
+    );
+    assert_eq!(details["operator_action_required"], false);
+    assert!(
+        details["next"]
+            .as_str()
+            .expect("next")
+            .starts_with("rerun the same idempotent bounded sync tick")
+    );
+    assert!(scheduler_failure_status(&error).retryable);
+}
+
+#[test]
+fn root_convergence_never_mutates_compliant_child_members() {
+    let mut pulls = healthy_chain();
+    pulls[0].auto_merge = AutoMergeState::disabled();
+    let before = pulls.clone();
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+
+    let progress = execute(&status, &provider, false, false, false).expect("root converges");
+
+    assert_eq!(
+        *provider.calls.borrow(),
+        vec![MutationKind::EnableAutoMerge],
+        "only the admitted root is mutated"
+    );
+    for child in before.iter().skip(1) {
+        assert_eq!(&provider.pulls.borrow()[&child.number], child);
+    }
+    assert_eq!(progress.root_auto_merge.len(), 1);
+    assert_eq!(progress.root_auto_merge[0].pr, PrNumber(1));
+}
+
+#[test]
+fn required_root_arming_and_candidate_ineligibility_stay_distinct() {
+    let mut pulls = healthy_chain();
+    pulls.truncate(1);
+    pulls[0].auto_merge = AutoMergeState::disabled();
+    // An unadmitted candidate with native auto-merge is structurally
+    // ineligible; the admitted root instead *requires* squash auto-merge.
+    let mut candidate = pull_request(
+        7,
+        "seven",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::squash(),
+    );
+    candidate.labels.remove("caravan");
+    pulls.push(candidate);
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+
+    assert!(
+        status
+            .admission
+            .rejected
+            .iter()
+            .any(|rejected| rejected.pr == PrNumber(7)
+                && rejected.reason.contains("externally enabled auto-merge")),
+        "native auto-merge keeps an unadmitted candidate structurally ineligible"
+    );
+
+    let progress = execute(&status, &provider, false, false, false).expect("root converges");
+
+    assert!(root_receipt(&progress, 1).observed_after.enabled);
+    assert_eq!(
+        provider.pulls.borrow()[&PrNumber(7)].auto_merge,
+        AutoMergeState::squash(),
+        "an unadmitted candidate is never mutated by root convergence"
+    );
+}
+
+/// Exact live caravan2208 generation observed on 2026-07-26 while this defect
+/// was reproduced read-only: members `[2208, 2210, 2213, 2215]`, root head
+/// `79abc31d…` on `main@b464e1ae…`, `autoMergeRequest` null, caravan label and
+/// membership intact. The root had already been re-armed by hand more than once
+/// and needed yet another external re-arm at 23:06:11Z, which is precisely the
+/// operator-babysitting loop required root convergence must remove.
+fn caravan2208_generation() -> Vec<PullRequestSnapshot> {
+    let mut root = pull_request(
+        2208,
+        "root",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    root.head.oid = CommitOid("79abc31d4efc07a579145cf904c83c1420f8b4ac".to_owned());
+    root.base.oid = CommitOid("b464e1ae5cb8033a0789997652d97d6b3efd5c7e".to_owned());
+    let mut members = vec![root];
+    for (number, head, base, head_oid) in [
+        (
+            2210,
+            "member-2210",
+            "root",
+            "2e02a53116fc3a4afc14542104b026b1bbf750fe",
+        ),
+        (
+            2213,
+            "member-2213",
+            "member-2210",
+            "c9fe0b2baf3a4fcbf779cf5ac20efb1851ed6416",
+        ),
+        (
+            2215,
+            "member-2215",
+            "member-2213",
+            "90ce3e98bef2df4c93dd3be0966f159867bc62ad",
+        ),
+    ] {
+        let mut member = pull_request(
+            number,
+            head,
+            base,
+            PullRequestState::Open,
+            AutoMergeState::disabled(),
+        );
+        member.head.oid = CommitOid(head_oid.to_owned());
+        members.push(member);
+    }
+    members
+}
+
+#[test]
+fn live_caravan2208_root_converges_without_touching_its_children() {
+    let pulls = caravan2208_generation();
+    let children = pulls[1..].to_vec();
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    let status = status(pulls, Some(PrNumber(2208)), &clean);
+    let rewritten = BTreeMap::from([(
+        PrNumber(2208),
+        CommitOid("79abc31d4efc07a579145cf904c83c1420f8b4ac".to_owned()),
+    )]);
+
+    assert_eq!(
+        status.analysis.fleet.caravans[0].members,
+        vec![
+            PrNumber(2208),
+            PrNumber(2210),
+            PrNumber(2213),
+            PrNumber(2215)
+        ]
+    );
+    assert!(
+        status.analysis.fleet.problems.iter().any(|problem| {
+            problem.kind == GraphProblemKind::AutoMergeInvariant
+                && problem.message.contains("caravan head #2208")
+        }),
+        "the live generation reproduces the reported auto_merge_invariant"
+    );
+
+    let progress = execute_bounded(&status, &provider, true, false, true, u32::MAX, &rewritten)
+        .expect("scheduler converges required root arming");
+
+    let receipt = root_receipt(&progress, 2208);
+    assert!(receipt.hash_is_valid());
+    assert_eq!(
+        receipt.head.oid,
+        CommitOid("79abc31d4efc07a579145cf904c83c1420f8b4ac".to_owned())
+    );
+    assert_eq!(
+        receipt.base.oid,
+        CommitOid("b464e1ae5cb8033a0789997652d97d6b3efd5c7e".to_owned())
+    );
+    assert_eq!(
+        receipt.provenance.trigger,
+        crate::root_auto_merge::RootAutoMergeTrigger::RootHeadRewritten
+    );
+    assert!(receipt.provenance.engine_armed);
+    assert_eq!(
+        provider.pulls.borrow()[&PrNumber(2208)].auto_merge,
+        AutoMergeState::squash()
+    );
+    assert_eq!(
+        *provider.calls.borrow(),
+        vec![MutationKind::EnableAutoMerge],
+        "convergence mutates only the admitted root"
+    );
+    for child in &children {
+        assert_eq!(&provider.pulls.borrow()[&child.number], child);
+    }
+}
+
+#[test]
+fn live_caravan2208_replay_is_a_proven_no_op() {
+    let pulls = caravan2208_generation();
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    let status = status(pulls, Some(PrNumber(2208)), &clean);
+    let rewritten = BTreeMap::from([(
+        PrNumber(2208),
+        CommitOid("79abc31d4efc07a579145cf904c83c1420f8b4ac".to_owned()),
+    )]);
+
+    execute_bounded(&status, &provider, true, false, true, u32::MAX, &rewritten)
+        .expect("first tick arms the root");
+    let armed_pulls = provider
+        .pulls
+        .borrow()
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    let armed = self::status(armed_pulls, Some(PrNumber(2208)), &clean);
+    provider.calls.borrow_mut().clear();
+
+    let progress = execute_bounded(&armed, &provider, true, false, true, u32::MAX, &rewritten)
+        .expect("replay converges without another write");
+
+    assert!(provider.calls.borrow().is_empty());
+    assert!(armed.analysis.fleet.problems.is_empty());
+    let receipt = root_receipt(&progress, 2208);
+    assert!(!receipt.provenance.engine_armed);
+    assert_eq!(
+        receipt.provenance.trigger,
+        crate::root_auto_merge::RootAutoMergeTrigger::IdempotentReplay
     );
 }

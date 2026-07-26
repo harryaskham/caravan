@@ -1172,7 +1172,7 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
     }
 }
 
-fn changed_precondition_fields(
+pub(crate) fn changed_precondition_fields(
     expected: &PullRequestPrecondition,
     actual: &PullRequestPrecondition,
 ) -> Vec<String> {

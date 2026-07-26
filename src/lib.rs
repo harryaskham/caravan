@@ -28,6 +28,7 @@ pub mod priority;
 pub mod read;
 pub mod repair;
 pub mod reshape;
+pub mod root_auto_merge;
 pub mod sync;
 pub mod web;
 
@@ -66,6 +67,18 @@ CORE MODEL AND INVARIANTS
 - The head targets the default branch. Each child targets its predecessor's
   branch. Only the head may have squash auto-merge enabled; non-head auto-merge
   is disabled even if someone enabled it externally.
+- Required root squash auto-merge is scheduler-owned convergent state. Every
+  sync that creates, rebases, renews, or advances a caravan root re-reads the
+  exact current root from a fresh single-PR provider read and idempotently
+  proves SQUASH auto-merge on the resulting head, never on a pre-rebase
+  generation or a stale list projection. It converges before a failing-CI stop.
+  Each converged root carries a sealed `root_auto_merge` receipt with the proven
+  head/base, bounded read/attempt counts, and auditable engine provenance so a
+  controller can tell engine convergence from human repair; engine arming emits
+  `root_auto_merge_armed`. Unproven arming is the typed retryable
+  `root_auto_merge_not_durable` with cause `provider_did_not_persist_arming`,
+  `root_head_moved_during_arming`, or `stale_provider_view`; bounded sync policy
+  owns the retry and periodic operator re-arming is never the mechanism.
 - Multiple caravans may exist. Cross-caravan compatibility and the configured
   admission bound are checked before automatic changes.
 - Automatic admission is deterministic: configured `caravan-priority:*` labels
@@ -189,7 +202,9 @@ For membership, Cara prepares one candidate. For `sync --all`, Cara:
 4. verifies every conflict, workflow trigger, PR precondition, default/workflow
    OID, old branch head, branch-set disjointness, push permission, and exact
    force-with-lease before the first write;
-5. disables auto-merge on all selected members only after that global barrier;
+5. disables auto-merge only on selected members whose branch generation is
+   actually rewritten, after that global barrier. An already-satisfied ancestry
+   plan retains native arming rather than opening a durability window;
 6. applies parent before descendant. A chain is always serial. Only independent,
    disjoint caravans may apply concurrently, with a bounded worker count;
 7. performs mandatory midpoint GitHub rediscovery, verifies every pushed head,

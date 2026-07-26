@@ -1902,6 +1902,22 @@ fn render_sync(output: &caravan::sync::SyncOutput) -> String {
             receipt.lease
         );
     }
+    for receipt in &output.root_auto_merge {
+        let _ = writeln!(
+            text,
+            "  root auto-merge #{} {}@{}: {} by {} ({})",
+            receipt.pr,
+            receipt.head.name,
+            receipt.head.oid,
+            if receipt.provenance.engine_armed {
+                "armed"
+            } else {
+                "already armed"
+            },
+            receipt.provenance.owner,
+            receipt.provenance.reason
+        );
+    }
     for observation in &output.ci {
         let _ = writeln!(
             text,

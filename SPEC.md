@@ -380,6 +380,42 @@ Normal behavior:
 - Pending CI: sync reports waiting and makes no speculative repair.
 - Failed CI without `caravan-force`: decision point.
 
+Required root squash auto-merge is scheduler-owned convergent state, not an
+operator chore. The provider drops `autoMergeRequest` whenever the root's head
+or base generation is rewritten, and its list projection can still expose the
+pre-rewrite request, so every sync that creates, rebases, renews, or advances a
+caravan root re-reads the exact current root from a fresh single-PR provider
+read and idempotently proves SQUASH auto-merge on the *resulting* head. A member
+is only disarmed before a rewrite that actually happens: an already-satisfied
+ancestry plan retains native arming rather than opening a durability window.
+Root convergence runs before a failing-CI stop, because native auto-merge merges
+only a passing head and a stopped tick must never leave the admitted root
+disarmed.
+
+Every converged root carries a sealed `root_auto_merge` receipt with the exact
+proven head/base, observed auto-merge facts, bounded read/attempt counts, and
+auditable engine provenance (`owner`, `component`, operation ID, derived
+trigger, observed-before state and provider actor, and whether this tick
+performed the write). Triggers are derived, never guessed:
+`idempotent_replay`, `root_admitted`, `root_head_rewritten`,
+`root_base_advanced`, `externally_disarmed`, `non_squash_method`. Engine arming
+emits `root_auto_merge_armed`; an unchanged root emits nothing.
+
+When arming cannot be proven the tick fails with `root_auto_merge_not_durable`
+carrying a typed cause — `provider_did_not_persist_arming`,
+`root_head_moved_during_arming`, or `stale_provider_view` — plus
+`operator_action_required=false`. Retry belongs to bounded sync policy: the
+failure is retryable, and periodic operator re-arming is never the convergence
+mechanism. Native auto-merge on an *unadmitted* candidate keeps that candidate
+structurally ineligible; only the admitted root requires it.
+
+A raced state, draft, base, `caravan`, or `caravan-evicted` transition observed
+by that fresh read is still an ordinary resumable `stale_precondition` decision
+naming the exact changed field. Unrelated label churn — priority, force, or
+review metadata — never blocks required root convergence, because it cannot make
+arming wrong and treating it as a decision would reintroduce operator
+babysitting.
+
 A failed-CI decision contains bounded structured run, job, and failed-step
 facts. For an allowlisted lineage-verification step, Cara requests only the
 first 60 KiB of the job log and retains only a strict
@@ -494,7 +530,8 @@ Core decision kinds include:
 - `stale_precondition`;
 - `unsafe_checkout`;
 - `hook_failure`;
-- `force_merge_denied`.
+- `force_merge_denied`;
+- `root_auto_merge_not_durable`.
 
 Human output is concise; `--json` uses stable `mcp-cli` envelopes. Exit status is non-zero for every unresolved decision point.
 
@@ -515,7 +552,8 @@ Hook events include:
 - `split`;
 - `ci_failed`;
 - `force_merge_attempted`;
-- `force_merge_completed`.
+- `force_merge_completed`;
+- `root_auto_merge_armed`.
 
 A hook is a configured shell command. It receives one versioned metadata JSON object on stdin and non-secret context such as `CARA_EVENT`, repository, and PR numbers in environment variables. Hook metadata contains operation/event IDs suitable for external deduplication.
 Before hook delivery, every canonical secret-free event is durably appended with

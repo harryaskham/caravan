@@ -360,6 +360,7 @@ mod tests {
                 timing: None,
                 lock_recovery: None,
                 provider_receipts: Vec::new(),
+                root_auto_merge: Vec::new(),
                 rebase_plans: Vec::new(),
                 rebase_receipts: Vec::new(),
                 historical_predecessor: None,

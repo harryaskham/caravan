@@ -453,7 +453,7 @@ pub(super) fn plan_caravan_convergence(
         SyncPlanAction {
             order: 0,
             phase: SyncPlanPhase::ProviderConvergence,
-            state: if head_snapshot.auto_merge.enabled {
+            state: if crate::root_auto_merge::squash_armed(head_snapshot) {
                 SyncPlanActionState::AlreadySatisfied
             } else if deferred {
                 SyncPlanActionState::DeferredUntilRediscovery
@@ -465,7 +465,8 @@ pub(super) fn plan_caravan_convergence(
             caravan_id: Some(caravan.id),
             expected: Some(PullRequestPrecondition::from(head_snapshot)),
             target: Some(json!({"enabled": true, "merge_method": "squash"})),
-            reason: "healthy caravan head is the sole auto-merge candidate".to_owned(),
+            reason: "required root squash auto-merge is scheduler-owned convergent state; apply re-reads the exact current root generation and proves the postcondition on the resulting head"
+                .to_owned(),
         },
     )?;
     Ok(())

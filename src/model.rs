@@ -710,6 +710,9 @@ pub enum EventKind {
     CiFailed,
     ForceMergeAttempted,
     ForceMergeCompleted,
+    /// Scheduler-owned convergence proved required native SQUASH auto-merge on
+    /// the exact current caravan root head.
+    RootAutoMergeArmed,
 }
 
 impl std::fmt::Display for EventKind {
