@@ -224,6 +224,7 @@ pub(super) fn preflight_eligibility(
                 .cloned(),
             enrolled: true,
             canonical_candidate: status.admission.next_candidate == Some(candidate.number),
+            admission_note: None,
             next_action: if request.operation.is_join() {
                 read::CandidateNextAction::Join
             } else {

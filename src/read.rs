@@ -278,7 +278,13 @@ pub struct CheckOutput {
     /// Whether the candidate was already in the discovered active fleet.
     pub enrolled: bool,
     /// Whether this is the canonical first priority/FIFO admission attempt.
+    /// Automatic selection follows this order; an explicit `--pr` selection is
+    /// deliberate intent and is not blocked by it.
     pub canonical_candidate: bool,
+    /// Non-blocking evidence when explicit intent differs from the automatic
+    /// priority/FIFO order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_note: Option<String>,
     pub next_action: CandidateNextAction,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caravan_id: Option<PrNumber>,
@@ -930,7 +936,7 @@ pub fn resolve_admission_with_generation(
         .min()
         .map(|(_, _, _, pr)| pr);
     AdmissionStatus {
-        policy: "Cacophony-shaped PRs first require unique current generation integrity. Structurally ineligible PRs (draft, fork-only, externally enabled auto-merge, superseded/ambiguous/invalid generation) are reported with exact reasons and excluded from ordering rather than wedging the queue, while unknown or conflicting configured priority labels block because canonical rank cannot be computed. Remaining attempts use explicit agent priority label (configured high to low), then FIFO by immutable provider created_at ascending with PR number ascending as equal-time tie-break; missing created_at falls back deterministically to PR number after timestamped peers; never LIFO; check/new preflight required and an eligible candidate whose exact mechanical attempt fails never causes automatic leapfrogging".to_owned(),
+        policy: "Cacophony-shaped PRs first require unique current generation integrity. Structurally ineligible PRs (draft, fork-only, externally enabled auto-merge, superseded/ambiguous/invalid generation) are reported with exact reasons and excluded from ordering rather than wedging the queue, while unknown or conflicting configured priority labels block because canonical rank cannot be computed. Remaining attempts use explicit agent priority label (configured high to low), then FIFO by immutable provider created_at ascending with PR number ascending as equal-time tie-break; missing created_at falls back deterministically to PR number after timestamped peers; never LIFO; check/new preflight required and an eligible candidate whose exact mechanical attempt fails never causes automatic leapfrogging. This ordering binds automatic selection only: an explicit `--pr` admission intent proceeds on its own exact eligibility".to_owned(),
         priority_labels: priority_labels.to_vec(),
         generation_integrity,
         candidates,
@@ -1275,6 +1281,7 @@ pub fn check_analysis(
             merge_candidate,
             enrolled: true,
             canonical_candidate,
+            admission_note: None,
             next_action: if input.tail_pr.is_some() || input.head_pr.is_some() {
                 CandidateNextAction::Reject
             } else if candidate_stale || eligible {
@@ -1293,6 +1300,7 @@ pub fn check_analysis(
     }
 
     let mut problems = status.analysis.fleet.problems.clone();
+    let mut ordering_note: Option<String> = None;
     validate_candidate(pull_request, &mut problems);
     // In physical membership mode the provider's synthetic merge ref is
     // advisory only: prepare/apply independently fetch and verify the exact PR
@@ -1316,13 +1324,14 @@ pub fn check_analysis(
         });
     }
     if remote && !canonical_candidate {
-        problems.push(GraphProblem {
-            kind: GraphProblemKind::Unknown,
-            prs: vec![current_pr],
-            message: status.admission.next_candidate.map_or_else(
-                || "candidate is not selectable because no canonical admission attempt exists".to_owned(),
-                |first| format!("candidate is not canonical first admission attempt; fail closed on PR #{first}"),
-            ),
+        // Priority/FIFO ordering governs automatic selection. An explicit
+        // `--pr` selection is deliberate admission intent, so canonical
+        // position is reported as evidence and never blocks an otherwise
+        // fully eligible candidate.
+        ordering_note = status.admission.next_candidate.map(|first| {
+            format!(
+                "explicit admission intent for PR #{current_pr}; automatic priority/FIFO order would have selected PR #{first} first"
+            )
         });
     }
     let mut reports = Vec::new();
@@ -1343,11 +1352,6 @@ pub fn check_analysis(
                     ActionEligibility::Ineligible
                 },
                 target: ActionTarget::New,
-                order: if canonical_candidate || !remote {
-                    ActionOrder::Canonical
-                } else {
-                    ActionOrder::NonCanonical
-                },
                 admission: if admission_rejection.is_some() {
                     AdmissionDecision::Rejected
                 } else {
@@ -1371,6 +1375,7 @@ pub fn check_analysis(
                 merge_candidate,
                 enrolled: false,
                 canonical_candidate,
+                admission_note: ordering_note.clone(),
                 next_action,
                 caravan_id: Some(current_pr),
                 target_pr: None,
@@ -1429,11 +1434,6 @@ pub fn check_analysis(
                 ActionEligibility::Ineligible
             },
             target: ActionTarget::Join,
-            order: if canonical_candidate || !remote {
-                ActionOrder::Canonical
-            } else {
-                ActionOrder::NonCanonical
-            },
             admission: if admission_rejection.is_some() {
                 AdmissionDecision::Rejected
             } else {
@@ -1457,6 +1457,7 @@ pub fn check_analysis(
             merge_candidate,
             enrolled: false,
             canonical_candidate,
+            admission_note: ordering_note.clone(),
             next_action,
             caravan_id: Some(target_caravan.id),
             target_pr: Some(tail_number),
@@ -1616,12 +1617,6 @@ enum ActionTarget {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ActionOrder {
-    Canonical,
-    NonCanonical,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdmissionDecision {
     Accepted,
     Rejected,
@@ -1636,7 +1631,6 @@ enum CandidateFreshness {
 struct CandidateActionContext {
     eligibility: ActionEligibility,
     target: ActionTarget,
-    order: ActionOrder,
     admission: AdmissionDecision,
     freshness: CandidateFreshness,
 }
@@ -1646,9 +1640,6 @@ fn candidate_action(
     reports: &[CompatibilityReport],
     context: &CandidateActionContext,
 ) -> CandidateNextAction {
-    if context.order == ActionOrder::NonCanonical {
-        return CandidateNextAction::Reject;
-    }
     if candidate.draft || context.freshness == CandidateFreshness::Stale {
         return CandidateNextAction::Wait;
     }
@@ -2530,7 +2521,10 @@ mod tests {
     }
 
     #[test]
-    fn remote_candidate_receipt_rejects_a_noncanonical_pr_without_leapfrogging() {
+    fn explicit_remote_intent_admits_a_noncanonical_pr_with_ordering_evidence() {
+        // Priority/FIFO governs automatic selection. An explicit `--pr` request
+        // is deliberate admission intent, so a fully eligible later PR is not
+        // wedged behind an unadmitted earlier candidate.
         let first = pr(10, "first", "main", false);
         let second = pr(20, "second", "main", false);
         let status = status(first, vec![second]);
@@ -2543,20 +2537,44 @@ mod tests {
             },
             &clean_checker,
         )
-        .expect("remote rejection is an inspectable receipt");
-        assert!(!output.eligible);
+        .expect("explicit remote intent is admissible");
+        assert!(output.eligible);
         assert!(!output.canonical_candidate);
-        assert_eq!(output.next_action, CandidateNextAction::Reject);
+        assert_eq!(output.next_action, CandidateNextAction::New);
         assert!(
             output
                 .problems
                 .iter()
-                .any(|problem| problem.message.contains("fail closed on PR #10"))
+                .all(|problem| !problem.message.contains("canonical"))
         );
+        let note = output.admission_note.clone().expect("ordering evidence");
+        assert!(note.contains("PR #20"));
+        assert!(note.contains("PR #10"));
         let json = serde_json::to_value(&output).expect("remote receipt serializes");
-        assert_eq!(json["next_action"], "reject");
+        assert_eq!(json["next_action"], "new");
         assert_eq!(json["candidate"]["number"], 20);
+        assert_eq!(json["canonical_candidate"], false);
         assert!(json.get("merge_candidate").is_none());
+    }
+
+    #[test]
+    fn ineligible_noncanonical_pr_still_fails_closed() {
+        let first = pr(10, "first", "main", false);
+        let mut draft = pr(20, "second", "main", false);
+        draft.draft = true;
+        let status = status(first, vec![draft]);
+        let output = check_analysis(
+            &status,
+            &CheckInput {
+                pr: Some(20),
+                tail_pr: None,
+                head_pr: None,
+            },
+            &clean_checker,
+        )
+        .expect("rejection remains an inspectable receipt");
+        assert!(!output.eligible);
+        assert_ne!(output.next_action, CandidateNextAction::New);
     }
 
     #[test]
