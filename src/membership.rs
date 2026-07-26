@@ -168,6 +168,10 @@ pub struct MembershipOutput {
     pub join_receipt: Option<JoinReceipt>,
     pub pull_request: PullRequestSnapshot,
     pub caravan_id: PrNumber,
+    /// Typed intent-aware admission-order decision bound to this operation,
+    /// including exact provider-mutation and idempotency evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_intent: Option<crate::admission::AdmissionIntentDecision>,
     /// Canonical events emitted after the complete membership operation.
     #[serde(default)]
     pub events: Vec<CaravanEvent>,
@@ -2138,6 +2142,19 @@ fn execute_with_rebase_guard(
             format!("explicit configured agent priority label `{label}` (rank {rank}, 1 highest)")
         },
     );
+    // Durable audit records why intent-aware order permitted this operation,
+    // including any FIFO row bypassed only because it is still unjoined.
+    let admission_priority_basis = eligibility.admission_intent.as_ref().map_or_else(
+        || admission_priority_basis.clone(),
+        |decision| {
+            format!(
+                "{admission_priority_basis}; intent={} order={:?} {}",
+                decision.intent.name(),
+                decision.outcome,
+                decision.reason
+            )
+        },
+    );
     state.current = Some(candidate);
 
     state.ensure_base(provider, &status.repository, &desired_base)?;
@@ -2178,6 +2195,10 @@ fn execute_with_rebase_guard(
     let caravan_id = target
         .as_ref()
         .map_or(pull_request.number, |target| target.caravan.id);
+    let mut admission_intent = eligibility.admission_intent;
+    if let Some(decision) = admission_intent.as_mut() {
+        decision.record_execution(receipt.changed);
+    }
     Ok(MembershipOutput {
         receipt,
         rebase_receipt: None,
@@ -2185,6 +2206,7 @@ fn execute_with_rebase_guard(
         join_receipt: None,
         pull_request,
         caravan_id,
+        admission_intent,
         events: Vec::new(),
         hook_deliveries: Vec::new(),
     })

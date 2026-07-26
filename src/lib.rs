@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+pub mod admission;
 pub mod ci;
 pub mod command;
 pub mod compatibility;
@@ -77,6 +78,16 @@ CORE MODEL AND INVARIANTS
   wedged PR never starves the fleet. Unknown or conflicting configured priority
   labels still block because canonical rank cannot be computed. With zero
   caravans, the first eligible candidate forms a new root caravan.
+- That order is the *first-admission* contract. Intent is resolved before FIFO
+  rejection: an explicit `join` to a valid resolved caravan target may attach
+  ahead of earlier rows while every bypassed row is an unrelated *unjoined*
+  first-admission attempt, and those rows keep their canonical order. New /
+  first-admission intent and automatic sync admission remain strictly FIFO. A
+  joined row, a base-chain dependency, a rank-indeterminate row, a candidate
+  that is not itself an ordered attempt, or an ambiguous/missing target all fail
+  closed. Every check/membership receipt carries the typed `admission_intent`
+  decision: intent, target, rows bypassed only because they are unjoined,
+  compatibility, provider mutation, and idempotency.
 - Cacophony-shaped PRs bind generation, agent, source head, stack slot, and bead
   metadata. Within the same agent/bead/slot, only a unique exact contained
   successor or current reviewed canonical-link receipt is admissible. Proven
@@ -813,7 +824,7 @@ pub fn build_router() -> ToolRouter<AppContext> {
     );
     router.add_typed_tool_with_output_schema(
         "check",
-        "Preflight an exact remote candidate with --pr, or the current PR when omitted, without checkout or provider mutation. Optionally test joining --tail-pr or the resolved tail of --head-pr; returns exact facts and a mechanical next action.",
+        "Preflight an exact remote candidate with --pr, or the current PR when omitted, without checkout or provider mutation. Optionally test joining --tail-pr or the resolved tail of --head-pr; returns exact facts, a typed admission-intent decision, and a mechanical next action. Explicit join intent is resolved before FIFO rejection and may attach ahead of unrelated unjoined rows; new-caravan intent stays strictly FIFO.",
         |context: &AppContext, input: CheckInput| read::check(context, &input),
     );
     router.add_typed_tool_with_output_schema(

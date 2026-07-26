@@ -182,6 +182,22 @@ pub(super) fn validate_operation_shape(
     Ok(())
 }
 
+/// Typed admission-intent provenance for an already active resumed candidate.
+fn resume_admission_intent(
+    status: &StatusOutput,
+    candidate: &PullRequestSnapshot,
+    target: Option<&JoinTarget>,
+) -> crate::admission::AdmissionIntentDecision {
+    let mut decision = crate::admission::evaluate(
+        &status.admission,
+        &status.analysis,
+        candidate,
+        target.map(|target| &target.caravan),
+    );
+    decision.record_preflight(true, true);
+    decision
+}
+
 pub(super) fn preflight_eligibility(
     status: &StatusOutput,
     candidate: &PullRequestSnapshot,
@@ -225,6 +241,7 @@ pub(super) fn preflight_eligibility(
             enrolled: true,
             canonical_candidate: status.admission.next_candidate == Some(candidate.number),
             admission_note: None,
+            admission_intent: Some(resume_admission_intent(status, candidate, target)),
             next_action: if request.operation.is_join() {
                 read::CandidateNextAction::Join
             } else {

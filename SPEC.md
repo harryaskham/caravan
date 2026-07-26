@@ -44,7 +44,7 @@ source relationships immediately before branch/label/base/auto-merge mutation;
 a newer generation, disappeared candidate, metadata drift, or uncertain compare
 stops with zero writes and a safe close/reflect continuation.
 
-`status`, JSON, MCP, and `next-candidate` expose the same complete ordered attempt list, the resolved label/rank, and a reason for every candidate. This is a selection contract, not a claim that candidate/default and cross-caravan compatibility preflight has passed. Automation must select the canonical first attempt, run `cara check` and the corresponding `new`/`join` preflight, and must not re-sort or leapfrog it if preflight rejects it. This binds automatic selection; an explicit `--pr` request remains deliberate admission intent. The oldest selected eligible PR becomes a new head targeting the default branch; each later selected eligible PR appends at the tail. Rejection fails closed: repair or explicitly change the PR's GitHub state/labels, then rediscover the canonical list. More than one configured priority label on a PR, or any unknown `caravan-priority:*` label, also fails closed and excludes that PR with an explicit rejection reason.
+`status`, JSON, MCP, and `next-candidate` expose the same complete ordered attempt list, the resolved label/rank, and a reason for every candidate. This is a selection contract, not a claim that candidate/default and cross-caravan compatibility preflight has passed. Automation must select the canonical first attempt for first-admission intent, run `cara check` and the corresponding `new`/`join` preflight, and must not re-sort or leapfrog it if preflight rejects it. Explicit join intent to a valid resolved caravan target is evaluated separately and may attach ahead of unrelated unjoined rows without changing their order (see *Explicit join intent versus first-admission order*). The oldest selected eligible PR becomes a new head targeting the default branch; each later selected eligible PR appends at the tail. Rejection fails closed: repair or explicitly change the PR's GitHub state/labels, then rediscover the canonical list. More than one configured priority label on a PR, or any unknown `caravan-priority:*` label, also fails closed and excludes that PR with an explicit rejection reason.
 
 An operator may override this automatic order for an explicit canary selection only by supplying a non-empty reason and recording that reason as a comment on the selected PR. A canary override does not alter the automatic policy or the canonical order subsequently reported by Caravan.
 
@@ -192,7 +192,45 @@ preconditions.
 - `cara check [--pr N] --tail-pr T` — check whether the selected remote/current PR can join after exact tail `T`.
 - `cara check [--pr N] --head-pr H` — resolve caravan `H`, then check against its current tail.
 
-Remote `--pr` preflight must select the canonical first priority/FIFO attempt. Structurally ineligible PRs never enter that ordered attempt list: drafts, fork-only heads, externally enabled auto-merge, and superseded/ambiguous/invalid Cacophony generations are reported with exact reasons and excluded, so one wedged PR cannot starve every other owner. Unknown or conflicting configured priority labels still block, because canonical rank cannot be computed. An eligible candidate whose exact mechanical attempt fails remains canonical for automatic selection, which never silently leapfrogs it. Remote `--pr` preflight is explicit operator/agent admission intent: it is admitted on that candidate's own exact eligibility, compatibility, freshness, and generation integrity, and reports non-blocking `canonical_candidate` plus `admission_note` ordering evidence instead of failing for queue position, so an unadmitted earlier PR cannot wedge every other owner. Already enrolled candidates are reported without mutation.
+Remote `--pr` preflight must select the canonical first priority/FIFO attempt for first-admission (`new`) intent. Structurally ineligible PRs never enter that ordered attempt list: drafts, fork-only heads, externally enabled auto-merge, and superseded/ambiguous/invalid Cacophony generations are reported with exact reasons and excluded, so one wedged PR cannot starve every other owner. Unknown or conflicting configured priority labels still block, because canonical rank cannot be computed. An eligible candidate whose exact mechanical attempt fails remains canonical and blocks later candidates; requesting a later PR for new-caravan intent returns a rejection receipt rather than silently leapfrogging. Already enrolled candidates are reported without mutation.
+
+#### Explicit join intent versus first-admission order
+
+Priority-then-FIFO is the contract for *first admission*: which unjoined PR
+becomes the next root or the next automatically grown member. It was never a
+claim that attaching a specific PR behind a specific live tail must first wait
+for every unrelated unjoined PR ahead of it. Cara therefore resolves intent
+*before* FIFO canonical-candidate rejection. Explicit `join` intent (`--tail-pr`
+or `--head-pr`, and every `join`/`rejoin` membership operation) that resolves to
+a valid target caravan may attach ahead of earlier ordered rows only while every
+bypassed row is an unrelated, unjoined first-admission attempt. First admission
+and new-caravan intent remain governed by FIFO with no exception, and automatic
+sync admission still selects only the canonical candidate.
+
+The relaxation is exact and fails closed. A row is never bypassed when it is an
+active caravan member, when it is on the candidate's exact base chain, or when
+its canonical rank cannot be computed (unknown/conflicting priority metadata).
+A candidate that is not itself a current ordered admission attempt — rejected,
+stale-pinned, or carrying a generation-bound skip — gains nothing from declaring
+intent. An unresolved, missing, or ambiguous join target is an error before
+ordering is considered, never a guess. Ordering never substitutes for
+compatibility, dependency, policy, provider-candidate freshness, generation
+integrity, or provider/auth success: those still reject the attach.
+
+Reviewed operator resolution `choice-019f9d34` narrows the earlier blanket
+explicit-`--pr` relaxation: canonical position is still reported as non-blocking
+`canonical_candidate` plus `admission_note` evidence on every remote receipt, but
+only explicit join intent is admitted ahead of order. A remote `--pr` request
+without a resolved join target is first-admission intent and still fails closed
+on the canonical row.
+
+Every check receipt and every membership receipt carries a typed
+`admission_intent` decision recording intent, resolved target caravan and tail,
+the canonical candidate at decision time, each ordered row ahead with its exact
+disposition (`bypassed_unjoined`, `blocked_joined`, `blocked_dependency`,
+`blocked_rank_indeterminate`, `blocked_new_intent`), compatibility and preflight
+cleanliness, provider mutation, and idempotency. The durable control-label audit
+comment records the same intent, order outcome, and reason.
 
 `--tail-pr` names the intended merge target. `--head-pr` names a caravan whose tail is resolved at execution time. They are mutually exclusive.
 

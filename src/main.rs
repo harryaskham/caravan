@@ -2247,6 +2247,33 @@ fn render_show(output: &caravan::read::ShowOutput) -> String {
     text
 }
 
+/// Render the typed intent-aware admission decision bound to a check receipt.
+fn render_admission_intent(intent: &caravan::admission::AdmissionIntentDecision) -> String {
+    let prs = |numbers: &[caravan::model::PrNumber]| {
+        numbers
+            .iter()
+            .map(|pr| format!("#{pr}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let mut text = String::new();
+    let _ = writeln!(
+        text,
+        "  admission intent={} order={:?} target_caravan={} bypassed_unjoined=[{}] blocked_by=[{}] provider_mutated={} idempotent={}",
+        intent.intent.name(),
+        intent.outcome,
+        intent
+            .target_caravan
+            .map_or_else(|| "none".to_owned(), |id| format!("#{id}")),
+        prs(&intent.bypassed_unjoined_prs),
+        prs(&intent.blocking_prs),
+        intent.provider_mutated,
+        intent.idempotent,
+    );
+    let _ = writeln!(text, "    {}", intent.reason);
+    text
+}
+
 fn render_check(output: &caravan::read::CheckOutput) -> String {
     let eligibility = if output.eligible {
         success("eligible")
@@ -2306,6 +2333,9 @@ fn render_check(output: &caravan::read::CheckOutput) -> String {
             identity.stale_base,
             identity.stale_head,
         );
+    }
+    if let Some(intent) = &output.admission_intent {
+        text.push_str(&render_admission_intent(intent));
     }
     for report in &output.compatibility {
         let _ = writeln!(

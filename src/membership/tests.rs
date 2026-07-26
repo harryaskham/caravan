@@ -1405,6 +1405,177 @@ fn join_infers_unique_tail_and_preserves_non_head_auto_merge_off() {
     assert_eq!(output.caravan_id, PrNumber(1));
 }
 
+/// Explicit join intent attaches ahead of an older unjoined FIFO row and its
+/// receipt carries exact intent, target, bypass, mutation, and idempotency.
+#[test]
+fn explicit_join_admits_ahead_of_older_unjoined_row_with_bound_provenance() {
+    let head = pull_request(1, "one", "main", &[ACTIVE_LABEL]);
+    let older = pull_request(2, "two", "main", &[]);
+    let candidate = pull_request(3, "three", "main", &[]);
+    let provider =
+        FakeProvider::with_pull_requests(vec![head.clone(), older.clone(), candidate.clone()]);
+    let discovered = status(candidate, vec![head, older]);
+    assert_eq!(discovered.admission.next_candidate, Some(PrNumber(2)));
+
+    let output = execute(
+        discovered,
+        &clean,
+        &provider,
+        MembershipRequest {
+            operation: MembershipOperation::Join,
+            create_pr: false,
+            tail_pr: Some(1),
+            head_pr: None,
+            reason: None,
+            priority_label: None,
+            agent_priority_labels: Vec::new(),
+        },
+    )
+    .expect("explicit join intent is not blocked by an unrelated unjoined row");
+
+    assert_eq!(output.pull_request.base.name, "one");
+    assert_eq!(output.caravan_id, PrNumber(1));
+    let intent = output
+        .admission_intent
+        .expect("membership binds the typed admission decision");
+    assert_eq!(intent.intent, crate::admission::AdmissionIntent::Join);
+    assert_eq!(
+        intent.outcome,
+        crate::admission::AdmissionOrderOutcome::JoinAheadOfUnjoined
+    );
+    assert_eq!(intent.candidate_pr, PrNumber(3));
+    assert_eq!(intent.target_caravan, Some(PrNumber(1)));
+    assert_eq!(intent.target_tail, Some(PrNumber(1)));
+    assert_eq!(intent.bypassed_unjoined_prs, vec![PrNumber(2)]);
+    assert!(intent.blocking_prs.is_empty());
+    assert!(intent.compatibility_clean && intent.preflight_clean);
+    assert!(intent.provider_mutated);
+    assert!(!intent.idempotent);
+}
+
+/// An exact duplicate retry resumes the same attach without a second durable
+/// membership and keeps identical typed intent provenance.
+#[test]
+fn duplicate_explicit_join_retry_resumes_the_same_attach() {
+    let head = pull_request(1, "one", "main", &[ACTIVE_LABEL]);
+    let older = pull_request(2, "two", "main", &[]);
+    let candidate = pull_request(3, "three", "main", &[]);
+    let provider =
+        FakeProvider::with_pull_requests(vec![head.clone(), older.clone(), candidate.clone()]);
+    *provider.fail_kind.borrow_mut() = Some(MutationKind::AddLabel);
+    let request = MembershipRequest {
+        operation: MembershipOperation::Join,
+        create_pr: false,
+        tail_pr: Some(1),
+        head_pr: None,
+        reason: None,
+        priority_label: None,
+        agent_priority_labels: Vec::new(),
+    };
+    let error = execute(
+        status(candidate, vec![head.clone(), older.clone()]),
+        &clean,
+        &provider,
+        request.clone(),
+    )
+    .expect_err("injected provider failure stops the first attempt");
+    assert_eq!(error.code(), "github_mutation_failed");
+
+    *provider.fail_kind.borrow_mut() = None;
+    let partial = provider.pull_requests.borrow()[&PrNumber(3)].clone();
+    assert_eq!(partial.base.name, "one");
+    assert!(!partial.has_label(ACTIVE_LABEL));
+
+    let output = execute(
+        status(partial, vec![head, older]),
+        &clean,
+        &provider,
+        request,
+    )
+    .expect("the exact retry resumes rather than restarting");
+
+    assert_eq!(output.pull_request.base.name, "one");
+    assert!(output.pull_request.has_label(ACTIVE_LABEL));
+    assert!(output.receipt.completed_steps.iter().any(|step| {
+        step.kind == MutationKind::SetBase && step.state == MutationStepState::AlreadySatisfied
+    }));
+    let intent = output
+        .admission_intent
+        .expect("retry still emits typed provenance");
+    assert_eq!(
+        intent.outcome,
+        crate::admission::AdmissionOrderOutcome::JoinAheadOfUnjoined
+    );
+    assert_eq!(intent.target_caravan, Some(PrNumber(1)));
+    assert_eq!(intent.bypassed_unjoined_prs, vec![PrNumber(2)]);
+    assert_eq!(
+        intent.dependency_prs,
+        vec![PrNumber(1)],
+        "the resumed candidate now depends on its joined target root"
+    );
+    assert!(intent.provider_mutated);
+}
+
+/// An ambiguous join target fails closed and never reaches ordering.
+#[test]
+fn ambiguous_join_target_fails_closed_before_any_bypass() {
+    let first_root = pull_request(1, "one", "main", &[ACTIVE_LABEL]);
+    let second_root = pull_request(2, "two", "main", &[ACTIVE_LABEL]);
+    let candidate = pull_request(3, "three", "main", &[]);
+    let provider = FakeProvider::with_pull_requests(vec![
+        first_root.clone(),
+        second_root.clone(),
+        candidate.clone(),
+    ]);
+
+    let error = execute(
+        status(candidate, vec![first_root, second_root]),
+        &clean,
+        &provider,
+        MembershipRequest {
+            operation: MembershipOperation::Join,
+            create_pr: false,
+            tail_pr: None,
+            head_pr: None,
+            reason: None,
+            priority_label: None,
+            agent_priority_labels: Vec::new(),
+        },
+    )
+    .expect_err("an ambiguous target is never guessed");
+
+    assert_eq!(error.code(), "ambiguous_caravan_tail");
+}
+
+/// A provider failure during an intent-permitted join is never a silent bypass.
+#[test]
+fn provider_failure_during_permitted_join_reports_partial_evidence() {
+    let head = pull_request(1, "one", "main", &[ACTIVE_LABEL]);
+    let older = pull_request(2, "two", "main", &[]);
+    let candidate = pull_request(3, "three", "main", &[]);
+    let provider =
+        FakeProvider::with_pull_requests(vec![head.clone(), older.clone(), candidate.clone()]);
+    *provider.fail_kind.borrow_mut() = Some(MutationKind::AddLabel);
+
+    let error = execute(
+        status(candidate, vec![head, older]),
+        &clean,
+        &provider,
+        MembershipRequest {
+            operation: MembershipOperation::Join,
+            create_pr: false,
+            tail_pr: Some(1),
+            head_pr: None,
+            reason: None,
+            priority_label: None,
+            agent_priority_labels: Vec::new(),
+        },
+    )
+    .expect_err("provider failure fails the operation");
+
+    assert_eq!(error.code(), "github_mutation_failed");
+}
+
 #[test]
 fn routine_join_consumes_stale_force_label_instead_of_carrying_bypass_intent() {
     let head = pull_request(1, "one", "main", &[ACTIVE_LABEL]);

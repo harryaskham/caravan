@@ -285,6 +285,10 @@ pub struct CheckOutput {
     /// priority/FIFO order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admission_note: Option<String>,
+    /// Typed intent-aware admission-order decision and provenance. Explicit
+    /// join intent is resolved here before FIFO canonical-candidate rejection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_intent: Option<crate::admission::AdmissionIntentDecision>,
     pub next_action: CandidateNextAction,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caravan_id: Option<PrNumber>,
@@ -936,7 +940,7 @@ pub fn resolve_admission_with_generation(
         .min()
         .map(|(_, _, _, pr)| pr);
     AdmissionStatus {
-        policy: "Cacophony-shaped PRs first require unique current generation integrity. Structurally ineligible PRs (draft, fork-only, externally enabled auto-merge, superseded/ambiguous/invalid generation) are reported with exact reasons and excluded from ordering rather than wedging the queue, while unknown or conflicting configured priority labels block because canonical rank cannot be computed. Remaining attempts use explicit agent priority label (configured high to low), then FIFO by immutable provider created_at ascending with PR number ascending as equal-time tie-break; missing created_at falls back deterministically to PR number after timestamped peers; never LIFO; check/new preflight required and an eligible candidate whose exact mechanical attempt fails never causes automatic leapfrogging. This ordering binds automatic selection only: an explicit `--pr` admission intent proceeds on its own exact eligibility".to_owned(),
+        policy: "Cacophony-shaped PRs first require unique current generation integrity. Structurally ineligible PRs (draft, fork-only, externally enabled auto-merge, superseded/ambiguous/invalid generation) are reported with exact reasons and excluded from ordering rather than wedging the queue, while unknown or conflicting configured priority labels block because canonical rank cannot be computed. Remaining attempts use explicit agent priority label (configured high to low), then FIFO by immutable provider created_at ascending with PR number ascending as equal-time tie-break; missing created_at falls back deterministically to PR number after timestamped peers; never LIFO; check/new preflight required and an eligible candidate whose exact mechanical attempt fails never causes automatic leapfrogging. This ordering binds automatic selection and every first-admission/new-caravan intent; explicit join intent to a valid resolved caravan target is evaluated separately and may attach ahead of unrelated unjoined rows without changing their canonical order".to_owned(),
         priority_labels: priority_labels.to_vec(),
         generation_integrity,
         candidates,
@@ -1271,6 +1275,9 @@ pub fn check_analysis(
             });
         }
         let eligible = status.healthy && active_problems.is_empty();
+        let mut enrolled_intent =
+            crate::admission::evaluate(&status.admission, &status.analysis, pull_request, None);
+        enrolled_intent.record_preflight(true, eligible);
         let output = CheckOutput {
             provider_api: status.provider_api.clone(),
             rebase_on_join: status.rebase_on_join.clone(),
@@ -1282,6 +1289,7 @@ pub fn check_analysis(
             enrolled: true,
             canonical_candidate,
             admission_note: None,
+            admission_intent: Some(enrolled_intent),
             next_action: if input.tail_pr.is_some() || input.head_pr.is_some() {
                 CandidateNextAction::Reject
             } else if candidate_stale || eligible {
@@ -1323,25 +1331,55 @@ pub fn check_analysis(
             message: rejected.reason.clone(),
         });
     }
+    // Intent is resolved before FIFO canonical-candidate rejection. An
+    // unresolved, missing, or ambiguous join target fails closed here and never
+    // reaches the ordering relaxation below.
+    let explicit_join = input.tail_pr.is_some() || input.head_pr.is_some();
+    let target_caravan = explicit_join
+        .then(|| resolve_target_caravan(status, input))
+        .transpose()?;
+    let mut admission_intent = crate::admission::evaluate(
+        &status.admission,
+        &status.analysis,
+        pull_request,
+        target_caravan,
+    );
     if remote && !canonical_candidate {
-        // Priority/FIFO ordering governs automatic selection. An explicit
-        // `--pr` selection is deliberate admission intent, so canonical
-        // position is reported as evidence and never blocks an otherwise
-        // fully eligible candidate.
+        // Canonical position is always reported as non-blocking evidence.
         ordering_note = status.admission.next_candidate.map(|first| {
             format!(
-                "explicit admission intent for PR #{current_pr}; automatic priority/FIFO order would have selected PR #{first} first"
+                "explicit {} admission intent for PR #{current_pr}; automatic priority/FIFO order would have selected PR #{first} first",
+                admission_intent.intent.name()
             )
         });
+        // Explicit join intent to a resolved target may pass earlier rows only
+        // while every bypassed row is an unrelated unjoined first-admission
+        // attempt. First admission / new-caravan intent stays FIFO-governed.
+        if !admission_intent.bypasses_fifo() {
+            problems.push(GraphProblem {
+                kind: GraphProblemKind::Unknown,
+                prs: vec![current_pr],
+                message: status.admission.next_candidate.map_or_else(
+                    || "candidate is not selectable because no canonical admission attempt exists".to_owned(),
+                    |first| format!("candidate is not canonical first admission attempt; fail closed on PR #{first}"),
+                ),
+            });
+        }
     }
+    let order_admits = canonical_candidate || !remote || admission_intent.bypasses_fifo();
     let mut reports = Vec::new();
 
-    let explicit_join = input.tail_pr.is_some() || input.head_pr.is_some();
     if !explicit_join {
         if !pull_request.cross_repository {
             check_new(status, pull_request, checker, &mut reports, &mut problems)?;
         }
         let eligible = problems.is_empty();
+        admission_intent.record_preflight(
+            reports
+                .iter()
+                .all(|report| report.outcome == CompatibilityOutcome::Clean),
+            eligible,
+        );
         let next_action = candidate_action(
             pull_request,
             &reports,
@@ -1352,6 +1390,11 @@ pub fn check_analysis(
                     ActionEligibility::Ineligible
                 },
                 target: ActionTarget::New,
+                order: if order_admits {
+                    ActionOrder::Canonical
+                } else {
+                    ActionOrder::NonCanonical
+                },
                 admission: if admission_rejection.is_some() {
                     AdmissionDecision::Rejected
                 } else {
@@ -1376,6 +1419,7 @@ pub fn check_analysis(
                 enrolled: false,
                 canonical_candidate,
                 admission_note: ordering_note.clone(),
+                admission_intent: Some(admission_intent),
                 next_action,
                 caravan_id: Some(current_pr),
                 target_pr: None,
@@ -1388,7 +1432,7 @@ pub fn check_analysis(
         );
     }
 
-    let target_caravan = resolve_target_caravan(status, input)?;
+    let target_caravan = target_caravan.expect("explicit join resolved its target");
     let tail_number = target_caravan.tail().expect("caravans are non-empty");
     let tail = status
         .analysis
@@ -1424,6 +1468,12 @@ pub fn check_analysis(
     }
 
     let eligible = problems.is_empty();
+    admission_intent.record_preflight(
+        reports
+            .iter()
+            .all(|report| report.outcome == CompatibilityOutcome::Clean),
+        eligible,
+    );
     let next_action = candidate_action(
         pull_request,
         &reports,
@@ -1434,6 +1484,11 @@ pub fn check_analysis(
                 ActionEligibility::Ineligible
             },
             target: ActionTarget::Join,
+            order: if order_admits {
+                ActionOrder::Canonical
+            } else {
+                ActionOrder::NonCanonical
+            },
             admission: if admission_rejection.is_some() {
                 AdmissionDecision::Rejected
             } else {
@@ -1458,6 +1513,7 @@ pub fn check_analysis(
             enrolled: false,
             canonical_candidate,
             admission_note: ordering_note.clone(),
+            admission_intent: Some(admission_intent),
             next_action,
             caravan_id: Some(target_caravan.id),
             target_pr: Some(tail_number),
@@ -1622,6 +1678,13 @@ enum AdmissionDecision {
     Rejected,
 }
 
+/// Whether intent-aware admission ordering permits this candidate now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActionOrder {
+    Canonical,
+    NonCanonical,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CandidateFreshness {
     Fresh,
@@ -1631,6 +1694,7 @@ enum CandidateFreshness {
 struct CandidateActionContext {
     eligibility: ActionEligibility,
     target: ActionTarget,
+    order: ActionOrder,
     admission: AdmissionDecision,
     freshness: CandidateFreshness,
 }
@@ -1640,6 +1704,9 @@ fn candidate_action(
     reports: &[CompatibilityReport],
     context: &CandidateActionContext,
 ) -> CandidateNextAction {
+    if context.order == ActionOrder::NonCanonical {
+        return CandidateNextAction::Reject;
+    }
     if candidate.draft || context.freshness == CandidateFreshness::Stale {
         return CandidateNextAction::Wait;
     }
@@ -2520,11 +2587,13 @@ mod tests {
         assert_eq!(details["mutated"], false);
     }
 
+    /// Reviewed operator resolution choice-019f9d34 (bd-afa02d) narrows the
+    /// earlier blanket explicit-`--pr` relaxation (bd-c1799b): FIFO still
+    /// governs first admission, and only explicit *join* intent to a valid
+    /// resolved target attaches ahead of unrelated unjoined rows. Canonical
+    /// position is still reported as non-blocking `admission_note` evidence.
     #[test]
-    fn explicit_remote_intent_admits_a_noncanonical_pr_with_ordering_evidence() {
-        // Priority/FIFO governs automatic selection. An explicit `--pr` request
-        // is deliberate admission intent, so a fully eligible later PR is not
-        // wedged behind an unadmitted earlier candidate.
+    fn explicit_remote_new_intent_reports_ordering_evidence_and_stays_fifo() {
         let first = pr(10, "first", "main", false);
         let second = pr(20, "second", "main", false);
         let status = status(first, vec![second]);
@@ -2537,24 +2606,71 @@ mod tests {
             },
             &clean_checker,
         )
-        .expect("explicit remote intent is admissible");
-        assert!(output.eligible);
+        .expect("remote rejection is an inspectable receipt");
+        assert!(!output.eligible);
         assert!(!output.canonical_candidate);
-        assert_eq!(output.next_action, CandidateNextAction::New);
+        assert_eq!(output.next_action, CandidateNextAction::Reject);
         assert!(
             output
                 .problems
                 .iter()
-                .all(|problem| !problem.message.contains("canonical"))
+                .any(|problem| problem.message.contains("fail closed on PR #10"))
         );
         let note = output.admission_note.clone().expect("ordering evidence");
         assert!(note.contains("PR #20"));
         assert!(note.contains("PR #10"));
+        let intent = output
+            .admission_intent
+            .clone()
+            .expect("typed decision is emitted");
+        assert_eq!(intent.intent, crate::admission::AdmissionIntent::New);
+        assert_eq!(
+            intent.outcome,
+            crate::admission::AdmissionOrderOutcome::BlockedByOrder
+        );
         let json = serde_json::to_value(&output).expect("remote receipt serializes");
-        assert_eq!(json["next_action"], "new");
+        assert_eq!(json["next_action"], "reject");
         assert_eq!(json["candidate"]["number"], 20);
         assert_eq!(json["canonical_candidate"], false);
         assert!(json.get("merge_candidate").is_none());
+    }
+
+    /// The same non-canonical PR is admissible the moment it declares explicit
+    /// join intent to a valid live target, while the bypassed row stays ordered.
+    #[test]
+    fn explicit_remote_join_intent_admits_the_same_noncanonical_pr() {
+        let root = pr(1, "root", "main", true);
+        let first = pr(10, "first", "main", false);
+        let second = pr(20, "second", "main", false);
+        let status = status(second, vec![root, first]);
+        assert_eq!(status.admission.next_candidate, Some(PrNumber(10)));
+
+        let output = check_analysis(
+            &status,
+            &CheckInput {
+                pr: Some(20),
+                tail_pr: Some(1),
+                head_pr: None,
+            },
+            &clean_checker,
+        )
+        .expect("explicit join intent is admissible");
+
+        assert!(output.eligible, "problems: {:?}", output.problems);
+        assert_eq!(output.next_action, CandidateNextAction::Join);
+        assert!(!output.canonical_candidate);
+        assert!(output.admission_note.is_some());
+        let intent = output.admission_intent.expect("typed decision is emitted");
+        assert_eq!(
+            intent.outcome,
+            crate::admission::AdmissionOrderOutcome::JoinAheadOfUnjoined
+        );
+        assert_eq!(intent.bypassed_unjoined_prs, vec![PrNumber(10)]);
+        assert_eq!(
+            status.admission.next_candidate,
+            Some(PrNumber(10)),
+            "the bypassed row keeps its canonical first-admission position"
+        );
     }
 
     #[test]
@@ -2672,6 +2788,244 @@ mod tests {
                 .map(|identity| identity.freshness),
             Some(crate::model::MergeCandidateFreshness::StaleBase)
         );
+    }
+
+    /// Explicit join intent attaches ahead of an older unrelated unjoined row
+    /// while that row keeps its canonical first-admission position.
+    #[test]
+    fn explicit_join_is_admitted_ahead_of_older_unjoined_fifo_rows() {
+        let candidate = pr(2179, "green", "main", false);
+        let status = status(
+            candidate,
+            vec![
+                pr(1, "root", "main", true),
+                pr(2113, "old-unjoined", "main", false),
+            ],
+        );
+        assert_eq!(status.admission.next_candidate, Some(PrNumber(2113)));
+
+        let output = check_analysis(
+            &status,
+            &CheckInput {
+                pr: Some(2179),
+                tail_pr: Some(1),
+                head_pr: None,
+            },
+            &clean_checker,
+        )
+        .expect("explicit join intent is evaluated before FIFO rejection");
+
+        assert!(output.eligible, "problems: {:?}", output.problems);
+        assert_eq!(output.next_action, CandidateNextAction::Join);
+        assert_eq!(output.mode, CheckMode::JoinTail);
+        assert!(!output.canonical_candidate);
+        let intent = output.admission_intent.expect("typed decision is emitted");
+        assert_eq!(intent.intent, crate::admission::AdmissionIntent::Join);
+        assert_eq!(
+            intent.outcome,
+            crate::admission::AdmissionOrderOutcome::JoinAheadOfUnjoined
+        );
+        assert_eq!(intent.target_caravan, Some(PrNumber(1)));
+        assert_eq!(intent.bypassed_unjoined_prs, vec![PrNumber(2113)]);
+        assert!(intent.blocking_prs.is_empty());
+        assert!(intent.compatibility_clean && intent.preflight_clean);
+        assert!(!intent.provider_mutated && !intent.idempotent);
+        assert_eq!(
+            status.admission.next_candidate,
+            Some(PrNumber(2113)),
+            "bypassed FIFO rows keep their canonical order"
+        );
+    }
+
+    /// FIFO still governs first admission: the same PR without join intent is
+    /// still rejected behind the older unjoined row.
+    #[test]
+    fn new_intent_still_fails_closed_behind_the_canonical_row() {
+        let candidate = pr(2179, "green", "main", false);
+        let status = status(candidate, vec![pr(2113, "old-unjoined", "main", false)]);
+
+        let output = check_analysis(
+            &status,
+            &CheckInput {
+                pr: Some(2179),
+                tail_pr: None,
+                head_pr: None,
+            },
+            &clean_checker,
+        )
+        .expect("non-canonical new intent is an inspectable receipt");
+
+        assert!(!output.eligible);
+        assert_eq!(output.next_action, CandidateNextAction::Reject);
+        assert!(output.problems.iter().any(|problem| {
+            problem
+                .message
+                .contains("not canonical first admission attempt")
+        }));
+        let intent = output.admission_intent.expect("typed decision is emitted");
+        assert_eq!(intent.intent, crate::admission::AdmissionIntent::New);
+        assert_eq!(
+            intent.outcome,
+            crate::admission::AdmissionOrderOutcome::BlockedByOrder
+        );
+        assert_eq!(intent.blocking_prs, vec![PrNumber(2113)]);
+    }
+
+    /// A conflicting explicit join is rejected even though ordering allowed it.
+    #[test]
+    fn conflicting_explicit_join_is_rejected_with_bound_evidence() {
+        let candidate = pr(2179, "green", "main", false);
+        let status = status(
+            candidate,
+            vec![
+                pr(1, "root", "main", true),
+                pr(2113, "old-unjoined", "main", false),
+            ],
+        );
+        let conflict = |candidate: &crate::model::BranchSnapshot,
+                        target: &crate::model::BranchSnapshot| {
+            Ok(CompatibilityReport {
+                candidate: candidate.clone(),
+                target: target.clone(),
+                outcome: CompatibilityOutcome::Conflict,
+                conflicting_paths: vec!["src/lib.rs".to_owned()],
+                diagnostic: None,
+            })
+        };
+
+        let output = check_analysis(
+            &status,
+            &CheckInput {
+                pr: Some(2179),
+                tail_pr: Some(1),
+                head_pr: None,
+            },
+            &conflict,
+        )
+        .expect("remote rejection is an inspectable receipt");
+
+        assert!(!output.eligible);
+        assert_eq!(output.next_action, CandidateNextAction::Repair);
+        let intent = output.admission_intent.expect("typed decision is emitted");
+        assert_eq!(
+            intent.outcome,
+            crate::admission::AdmissionOrderOutcome::BlockedByPreflight
+        );
+        assert!(!intent.compatibility_clean);
+        assert!(intent.reason.contains("exact preflight rejected"));
+    }
+
+    /// An unresolved or ambiguous join target fails closed before ordering.
+    #[test]
+    fn ambiguous_or_missing_join_target_never_relaxes_order() {
+        let candidate = pr(2179, "green", "main", false);
+        let status = status(
+            candidate,
+            vec![
+                pr(1, "root", "main", true),
+                pr(3, "other-root", "main", true),
+                pr(2113, "old-unjoined", "main", false),
+            ],
+        );
+
+        let error = check_analysis(
+            &status,
+            &CheckInput {
+                pr: Some(2179),
+                tail_pr: Some(2113),
+                head_pr: None,
+            },
+            &clean_checker,
+        )
+        .expect_err("an unjoined PR is not a caravan tail");
+
+        assert_eq!(error.code(), "caravan_tail_not_found");
+    }
+
+    /// A stale pinned provider candidate still blocks explicit join intent.
+    #[test]
+    fn stale_candidate_still_blocks_explicit_join_intent() {
+        let candidate = pr(2179, "green", "main", false);
+        let mut status = status(
+            candidate.clone(),
+            vec![
+                pr(1, "root", "main", true),
+                pr(2113, "old-unjoined", "main", false),
+            ],
+        );
+        status
+            .merge_candidates
+            .push(crate::model::MergeCandidateIdentity {
+                pr: candidate.number,
+                provider_updated_at: "2026-01-01T00:00:00Z".to_owned(),
+                observed_at: "2026-01-01T00:00:01Z".to_owned(),
+                base: candidate.base.clone(),
+                head: candidate.head.clone(),
+                synthetic: None,
+                auto_merge: crate::model::NativeAutoMergeState {
+                    enabled: false,
+                    merge_method: None,
+                    actor: None,
+                },
+                freshness: crate::model::MergeCandidateFreshness::StaleHead,
+                stale_base: false,
+                stale_head: true,
+                stale_reasons: vec!["synthetic head parent is stale".to_owned()],
+            });
+
+        let output = check_analysis(
+            &status,
+            &CheckInput {
+                pr: Some(2179),
+                tail_pr: Some(1),
+                head_pr: None,
+            },
+            &clean_checker,
+        )
+        .expect("stale rejection is an inspectable receipt");
+
+        assert!(!output.eligible);
+        assert_eq!(output.next_action, CandidateNextAction::Wait);
+        let intent = output.admission_intent.expect("typed decision is emitted");
+        assert_eq!(
+            intent.outcome,
+            crate::admission::AdmissionOrderOutcome::BlockedByPreflight
+        );
+    }
+
+    /// A provider/compatibility failure propagates instead of being bypassed.
+    #[test]
+    fn provider_failure_during_join_preflight_propagates() {
+        let candidate = pr(2179, "green", "main", false);
+        let status = status(
+            candidate,
+            vec![
+                pr(1, "root", "main", true),
+                pr(2113, "old-unjoined", "main", false),
+            ],
+        );
+        let failing = |_candidate: &crate::model::BranchSnapshot,
+                       _target: &crate::model::BranchSnapshot| {
+            Err(AppError::structured(
+                ErrorCategory::ExecutionFailure,
+                "compatibility_provider_failed",
+                "injected provider failure",
+                None,
+            ))
+        };
+
+        let error = check_analysis(
+            &status,
+            &CheckInput {
+                pr: Some(2179),
+                tail_pr: Some(1),
+                head_pr: None,
+            },
+            &failing,
+        )
+        .expect_err("provider failure is never an admission bypass");
+
+        assert_eq!(error.code(), "compatibility_provider_failed");
     }
 
     #[test]
