@@ -1,0 +1,22 @@
+# Rolling-runtime shape used by canonical downstream deployments.
+#
+# Cacophony deliberately pins no Cara version: `min_cara_version` is the neutral
+# `0.0.0` sentinel, and its `cara-runtime-version-guard.sh` fails if that value
+# ever changes or a second minimum-version field appears. Every released Cara
+# must therefore accept this config offline, with no provider interaction. A
+# regression here fails closed on every canonical queue tick.
+version: 1
+min_cara_version: "0.0.0"
+force_merge: true
+rebase_on_join: true
+command_timeout_secs: 120
+loop:
+  interval_secs: 60
+sync:
+  actions:
+    join_unlabelled_prs: true
+  max_candidates_per_tick: 8
+  max_mutations_per_tick: 64
+  max_github_requests_per_tick: 256
+  max_duration_secs: 3600
+hooks: {}

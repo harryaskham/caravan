@@ -106,13 +106,52 @@ release-backfill-target tag target:
       "smoke/$root/cara" --version
     fi
 
-    # Upload without clobbering an already-published identical asset set.
+    # A published asset is immutable input to downstream digest pins, so never
+    # silently swap one. Re-uploading the identical bytes is a no-op; different
+    # bytes under the same name fail closed for a human to resolve.
+    published="$(mktemp -d "${TMPDIR:-/tmp}/cara-release-published.XXXXXX")"
+    if gh release download "$TAG" --repo "$REPO" --dir "$published" \
+         --pattern "$root.sha256" >/dev/null 2>&1; then
+      remote_digest="$(awk '{print $1; exit}' "$published/$root.sha256")"
+      local_digest="$(awk '{print $1; exit}' "dist/$root.sha256")"
+      if [[ "$remote_digest" == "$local_digest" ]]; then
+        echo "already published with identical digest $local_digest; nothing to do"
+        rm -rf "$published"
+        exit 0
+      fi
+      echo "error: $TAG already publishes $root.tar.gz with a different digest" >&2
+      echo "  published: $remote_digest" >&2
+      echo "  local:     $local_digest" >&2
+      echo "  refusing to replace an asset that downstream pins may already reference" >&2
+      rm -rf "$published"
+      exit 1
+    fi
+    rm -rf "$published"
+
     for asset in "$root.tar.gz" "$root.sha256"; do
       echo "uploading $asset to $REPO release $TAG"
-      gh release upload "$TAG" "dist/$asset" --repo "$REPO" --clobber
+      gh release upload "$TAG" "dist/$asset" --repo "$REPO"
     done
 
     echo "done: $root assets published to $REPO release $TAG"
+
+# Emit exact downstream Cara runtime pin rows for a published release.
+#
+# Downstream consumers (Cacophony's `.cacophony/cara-runtime-pins.tsv`) record a
+# reviewed digest per released platform. This verifies each published checksum
+# against the archive it downloaded and fails closed when a platform is missing,
+# so a partially published release can never be pinned as if it were complete.
+#   just release-pin-rows v0.0.9
+#   just release-pin-rows v0.0.9 "bd-e741b9 reviewed release binary"
+release-pin-rows tag context="reviewed release binary":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    TAG="{{ tag }}"
+    [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+      echo "error: tag must be vX.Y.Z (got: $TAG)" >&2
+      exit 2
+    }
+    ./scripts/release-pin-rows.sh "${TAG#v}" --context "{{ context }}"
 
 # Build and upload every target reachable from this host. Remote targets are
 # skipped with an explicit message rather than silently omitted.

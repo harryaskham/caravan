@@ -82,6 +82,58 @@ done
 grep -q 'softprops/action-gh-release@v2' .github/workflows/release.yml
 grep -q 'scripts/package-release.sh' .github/workflows/release.yml
 
+# Downstream pin rows are derived from published assets, never hand-typed. This
+# fixture is fully offline: it packages throwaway per-target binaries and checks
+# the exact TSV contract downstream consumers read.
+pins_dist="$workspace/pins-dist"
+mkdir -p "$pins_dist"
+for target in x86_64-linux aarch64-linux aarch64-darwin; do
+  printf '#!/usr/bin/env sh\nprintf "cara %s\\n"\n' "$target" > "$workspace/bin/cara-$target"
+  chmod 0755 "$workspace/bin/cara-$target"
+  ./scripts/package-release.sh "$version" "$target" "$workspace/bin/cara-$target" "$pins_dist" >/dev/null
+done
+
+pin_rows="$(./scripts/release-pin-rows.sh "$version" --dist "$pins_dist" --context 'contract fixture')"
+[ "$(grep -c "^cara $version\b" <<<"$pin_rows")" = 3 ]
+grep -q "^# v$version assets: https://github.com/" <<<"$pin_rows"
+grep -q '^# archive sha256: aarch64-darwin=.* aarch64-linux=.* x86_64-linux=' <<<"$pin_rows"
+for target in x86_64-linux aarch64-linux aarch64-darwin; do
+  pin_row="$(grep -F "	$target	" <<<"$pin_rows")"
+  [ "$(awk -F '\t' '{print NF}' <<<"$pin_row")" = 5 ]
+  [ "$(awk -F '\t' '{print $5}' <<<"$pin_row")" = 'contract fixture' ]
+  pinned_archive="$(awk -F '\t' '{print $4}' <<<"$pin_row")"
+  [ "$pinned_archive" = "$(awk '{print $1; exit}' "$pins_dist/cara-$version-$target.sha256")" ]
+  mkdir -p "$workspace/pins-extract-$target"
+  tar -xzf "$pins_dist/cara-$version-$target.tar.gz" -C "$workspace/pins-extract-$target"
+  if command -v shasum >/dev/null 2>&1; then
+    pinned_expected="$(shasum -a 256 "$workspace/pins-extract-$target/cara-$version-$target/cara" | awk '{print $1}')"
+  else
+    pinned_expected="$(sha256sum "$workspace/pins-extract-$target/cara-$version-$target/cara" | awk '{print $1}')"
+  fi
+  [ "$(awk -F '\t' '{print $2}' <<<"$pin_row")" = "$pinned_expected" ]
+done
+
+# A partially published release must never look pinnable.
+rm -f "$pins_dist/cara-$version-aarch64-darwin.tar.gz" "$pins_dist/cara-$version-aarch64-darwin.sha256"
+if ./scripts/release-pin-rows.sh "$version" --dist "$pins_dist" >/dev/null 2>&1; then
+  echo "release-pin-rows.sh accepted a partially published release" >&2
+  exit 1
+fi
+partial_rows="$(./scripts/release-pin-rows.sh "$version" --dist "$pins_dist" --allow-partial 2>/dev/null)"
+grep -q "^# missing aarch64-darwin: " <<<"$partial_rows"
+[ "$(grep -c "^cara $version\b" <<<"$partial_rows")" = 2 ]
+
+# A tampered published checksum is a hard failure, never a pinned row.
+bad_dist="$workspace/pins-tampered"
+mkdir -p "$bad_dist"
+cp "$pins_dist/cara-$version-x86_64-linux.tar.gz" "$bad_dist/"
+printf '%s  cara-%s-x86_64-linux.tar.gz\n' "$(printf '0%.0s' $(seq 64))" "$version" \
+  > "$bad_dist/cara-$version-x86_64-linux.sha256"
+if ./scripts/release-pin-rows.sh "$version" --dist "$bad_dist" --allow-partial >/dev/null 2>&1; then
+  echo "release-pin-rows.sh accepted a tampered published checksum" >&2
+  exit 1
+fi
+
 if [ -n "$binary" ]; then
   [ -x "$binary" ] || {
     echo "cara binary is not executable: $binary" >&2
@@ -109,6 +161,20 @@ if [ -n "$binary" ]; then
   [[ "$config_json" == *'"compatible":true'* ]]
   [[ "$config_json" == *'"min_cara_version":"0.0.7"'* ]]
   [[ "$config_json" == *'"provider_mutated":false'* ]]
+
+  # Canonical downstream deployments pin no Cara version and rely on the neutral
+  # sentinel. Rejecting it would fail closed on every queue tick, so it is a
+  # release gate, not an incidental case.
+  sentinel_json="$(
+    HOME="$workspace/home" PATH="$workspace/home/.cargo/bin" \
+      "$workspace/home/.cargo/bin/cara" --json \
+      --config tests/fixtures/config-rolling-sentinel.yaml config check
+  )"
+  [[ "$sentinel_json" == *'"status":"success"'* ]]
+  [[ "$sentinel_json" == *'"compatible":true'* ]]
+  [[ "$sentinel_json" == *'"min_cara_version":"0.0.0"'* ]]
+  [[ "$sentinel_json" == *'"provider_mutated":false'* ]]
+  [[ "$sentinel_json" == *"\"reader_version\":\"$version\""* ]]
 fi
 
 echo "release contract ok: cara $version"

@@ -407,6 +407,18 @@ Run `./tests/release_contract.sh target/debug/cara` after building to exercise
 the asset/checksum layout and `cara self-update status` with an isolated home;
 it never stages or installs an update over the developer binary.
 
+When a runner for one platform is down or exhausted, `just release-backfill-all
+<tag>` (or `just release-backfill-target <tag> <target>`) builds the exact
+tagged source in a detached worktree and uploads the same assets to the existing
+tag. It never creates, moves, or force-pushes a tag.
+
+Downstream consumers that record a reviewed digest per released platform derive
+those rows with `just release-pin-rows <tag>`. It re-verifies every published
+`.sha256` against the archive it downloaded and fails closed when a platform is
+unpublished, so a partially published release can never be pinned as if it were
+complete. [`docs/release/v0.0.9-rollout.md`](docs/release/v0.0.9-rollout.md) is
+the worked example, including the read-only rollout proof and rollback pin.
+
 Self-update is bound to the exact running executable, not a hard-coded default.
 `status`, `check`, and `run` require that executable to be the first executable
 `cara` on `PATH` and place `cara_next` beside it. Existing `~/.cargo/bin/cara`
