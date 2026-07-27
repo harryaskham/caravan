@@ -835,6 +835,48 @@ fn source_oid(
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+/// Refuse to create a pull request for a branch with no unique patch.
+///
+/// bd-032049: the empty-source refusal already existed, but it ran only after
+/// `--create-pr` had already created the pull request, so a no-op candidate
+/// still produced a real PR and its inferred "work" was an already-landed
+/// default-branch advance. Proving the branch first keeps the whole operation
+/// zero-mutation.
+fn require_nonempty_source_branch(
+    context: &AppContext,
+    status: &StatusOutput,
+    branch: &str,
+    operation_deadline: std::time::Instant,
+) -> Result<(), AppError> {
+    let timeout = std::time::Duration::from_secs(context.config.command_timeout_secs);
+    let runner = ProcessRunner::in_directory(&context.repository_path)
+        .with_timeout(timeout)
+        .with_operation_deadline(operation_deadline);
+    let default = &status.analysis.fleet.default_branch;
+    let patch = source_command(
+        &runner,
+        CommandSpec::new("git").args(["diff", "--binary", &format!("{}...HEAD", default.oid.0)]),
+        "join_source_patch_unavailable",
+        "could not compute the exact source patch against the current default branch",
+    )?;
+    if patch.stdout.is_empty() {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "join_empty_source_noop",
+            "source branch has no unique patch beyond current default; refusing to create a pull request for a zero-mutation no-op",
+            Some(json!({
+                "branch": branch,
+                "default_branch": default,
+                "mutated": false,
+                "noop": true,
+                "safe_next_action": "commit the intended change on this branch, or rerun without --create-pr against an existing pull request",
+            })),
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
 fn preflight_join_source(
     context: &AppContext,
     provider: &impl MembershipProvider,
@@ -1281,6 +1323,11 @@ fn execute_locked(
                 context.config.sync.actions.join_unlabelled_prs,
                 &state,
             )?;
+            // bd-032049: prove the branch carries unique work BEFORE creating a
+            // pull request. Creating first let an empty candidate become a real
+            // PR whose "work" was an already-landed default-branch advance,
+            // which was then replayed onto the caravan tail.
+            require_nonempty_source_branch(context, &status, &current_branch, operation_deadline)?;
             let receipt = provider
                 .create_pull_request(
                     &status.repository,
