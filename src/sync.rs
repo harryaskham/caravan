@@ -1487,7 +1487,16 @@ fn prepare_physical_chains(
                 target,
                 &status.analysis.fleet.default_branch,
                 crate::physical_rebase::RebaseExecutionBudget::new(timeout)
-                    .with_deadline(precommit_deadline),
+                    .with_deadline(precommit_deadline)
+                    // bd-85b71d: only the root is squash-merged by Cara, and
+                    // only then is its history discarded at landing. A child's
+                    // ancestry must still physically follow the chain, so it is
+                    // never flattened.
+                    .flattening_squashed_root(
+                        index == 0
+                            && context.config.sync.resolved_head_merge_actor()
+                                == crate::model::HeadMergeActor::Caravan,
+                    ),
             ) {
                 Ok(prepared) => prepared,
                 Err(error) => {

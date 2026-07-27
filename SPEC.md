@@ -518,6 +518,14 @@ Promotion failure is the typed `root_promotion_incomplete` with cause
 the typed `root_merge_refused` with cause `base_not_default_branch`,
 `root_head_moved_before_merge`, `foreign_auto_merge_actor`,
 `provider_did_not_persist_merge`, `merged_into_unexpected_base`, or
+A merge-preserving root that Cara will squash-merge is flattened rather than
+replayed (bd-85b71d): its history is discarded at landing, so the tick commits
+the already-proven merge tree directly onto the exact target instead of
+re-resolving conflicts its author resolved by hand. Children are never
+flattened, because their ancestry must physically follow the chain, and an
+unauthorized merge-preserving replay still fails closed with
+`rebase_merge_replay_conflict`.
+
 `merge_not_reachable_from_default`. Ordinary bounded waits — pending checks,
 unsatisfied required contexts, an unproven or changed cumulative tree, an
 already-merged root, or the spent per-tick merge allowance — are visible

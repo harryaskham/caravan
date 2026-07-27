@@ -31,6 +31,17 @@ pub struct RebaseExecutionBudget {
     /// conflict until a reviewed operation opts in, so no live provider branch
     /// is ever rewritten by mere detection.
     pub reconcile_squash_equivalent: bool,
+    /// Explicitly authorize flattening a merge-preserving root that is about to
+    /// be squash-merged.
+    ///
+    /// bd-85b71d: when Cara owns the merge, the root lands as one squash commit
+    /// and its history is discarded. Replaying that history commit-by-commit can
+    /// only fail — a root that merged the default branch into itself re-hits
+    /// conflicts its author already resolved by hand, with no stored rerere
+    /// resolution — while proving nothing about what actually lands. Disabled by
+    /// default so a child, whose ancestry must physically follow the chain, is
+    /// never flattened.
+    pub flatten_squashed_root: bool,
 }
 
 impl RebaseExecutionBudget {
@@ -40,7 +51,15 @@ impl RebaseExecutionBudget {
             command_timeout,
             operation_deadline: None,
             reconcile_squash_equivalent: false,
+            flatten_squashed_root: false,
         }
+    }
+
+    /// Authorize flattening a squash-merged root (bd-85b71d).
+    #[must_use]
+    pub const fn flattening_squashed_root(mut self, flatten: bool) -> Self {
+        self.flatten_squashed_root = flatten;
+        self
     }
 
     #[must_use]
@@ -456,16 +475,36 @@ pub fn prepare_candidate(
     } else {
         None
     };
-    let rebase = run_rebase(
-        &worktree_runner,
-        &range_base,
-        &target.oid,
-        &candidate.head.oid,
-        has_merges,
-        reconciliation
-            .as_ref()
-            .and_then(SquashEquivalenceReport::authorized_range_base),
-    )?;
+    // bd-85b71d: a merge-preserving root that Cara will squash-merge does not
+    // need its history replayed. `expected_merge_tree` has already proven the
+    // exact content that will land, so build that commit directly instead of
+    // re-resolving conflicts the author already resolved by hand.
+    let flattened = if has_merges && budget.flatten_squashed_root {
+        Some(flatten_to_target(
+            &worktree_runner,
+            candidate,
+            target,
+            expected_merge_tree
+                .as_ref()
+                .expect("a merge-preserving range always proves its merge tree"),
+        )?)
+    } else {
+        None
+    };
+    let rebase = if flattened.is_some() {
+        CommandOutput::success(String::new())
+    } else {
+        run_rebase(
+            &worktree_runner,
+            &range_base,
+            &target.oid,
+            &candidate.head.oid,
+            has_merges,
+            reconciliation
+                .as_ref()
+                .and_then(SquashEquivalenceReport::authorized_range_base),
+        )?
+    };
     if !rebase.is_success() {
         let conflicts = run(
             &worktree_runner,
@@ -512,6 +551,7 @@ pub fn prepare_candidate(
         )?;
     }
     let merge_topology = expected_merge_tree
+        .filter(|_| flattened.is_none())
         .map(|expected| {
             build_merge_topology_proof(
                 &worktree_runner,
@@ -685,6 +725,46 @@ fn validate_merge_preserving_topology(
         }
     }
     Ok(())
+}
+
+/// Build one commit carrying the proven merge tree directly on the target.
+///
+/// bd-85b71d: used only for a root Cara is about to squash-merge, where history
+/// is discarded at landing. The resulting head has the exact tree that
+/// `expected_merge_tree` already proved clean against the target, so the content
+/// that lands is unchanged while nothing has to be replayed.
+fn flatten_to_target(
+    runner: &impl CommandRunner,
+    candidate: &PullRequestSnapshot,
+    target: &BranchSnapshot,
+    expected_tree: &CommitOid,
+) -> Result<CommitOid, AppError> {
+    let message = format!(
+        "{}\n\nFlattened by Caravan for squash landing (PR #{}).",
+        candidate.title, candidate.number
+    );
+    let commit = require_success(
+        runner,
+        CommandSpec::new("git").args([
+            "commit-tree",
+            expected_tree.0.as_str(),
+            "-p",
+            target.oid.0.as_str(),
+            "-m",
+            message.as_str(),
+        ]),
+        "rebase_flatten_failed",
+        "the proven merge tree could not be committed onto the exact target",
+    )?;
+    let head = CommitOid(commit.stdout.trim().to_owned());
+    validate_oid(&head)?;
+    require_success(
+        runner,
+        CommandSpec::new("git").args(["reset", "--hard", head.0.as_str()]),
+        "rebase_flatten_failed",
+        "the flattened commit could not be checked out for verification",
+    )?;
+    Ok(head)
 }
 
 fn expected_merge_tree(
@@ -2853,6 +2933,171 @@ mod tests {
         assert_eq!(
             git(&clone, &["ls-remote", "origin", "refs/heads/feature"]),
             before
+        );
+    }
+
+    /// bd-85b71d live shape (Cacophony PR2215): the root merged the default
+    /// branch into itself, resolving conflicts by hand. Replaying that history
+    /// re-hits those conflicts and fails, even though the final merge tree is
+    /// independently clean. When Cara owns the squash merge the history is
+    /// discarded at landing, so the root is flattened onto the proven tree
+    /// instead of replayed.
+    #[test]
+    fn a_squashed_root_is_flattened_instead_of_replaying_its_merges() {
+        let fixture = fixture();
+
+        // The fixture already advanced remote main with a `parent` file. The
+        // candidate edits that same path, so replaying the in-branch merge of
+        // main must conflict while the final tree stays clean.
+        let target_head = fixture.new_main.clone();
+        git(&fixture.clone, &["checkout", "feature"]);
+        std::fs::write(fixture.clone.join("parent"), "candidate side\n").unwrap();
+        git(&fixture.clone, &["add", "parent"]);
+        git(&fixture.clone, &["commit", "-m", "candidate edits parent"]);
+        // Resolve the conflict by hand inside the branch, exactly as PR2215 did.
+        let merge = std::process::Command::new("git")
+            .current_dir(&fixture.clone)
+            .args([
+                "merge",
+                "--no-ff",
+                "-m",
+                "merge main into candidate",
+                "main",
+            ])
+            .output()
+            .expect("run merge");
+        if !merge.status.success() {
+            std::fs::write(fixture.clone.join("parent"), "resolved by hand\n").unwrap();
+            git(&fixture.clone, &["add", "parent"]);
+            git(&fixture.clone, &["commit", "--no-edit"]);
+        }
+        let head = CommitOid(git(&fixture.clone, &["rev-parse", "HEAD"]));
+        git(&fixture.clone, &["push", "origin", "feature"]);
+
+        let candidate = PullRequestSnapshot {
+            number: PrNumber(2215),
+            title: "cumulative root".to_owned(),
+            url: "https://example.invalid/2215".to_owned(),
+            state: PullRequestState::Open,
+            draft: false,
+            head: branch(&fixture.repository, "feature", &head),
+            base: branch(&fixture.repository, "main", &target_head),
+            cross_repository: false,
+            labels: BTreeSet::new(),
+            auto_merge: AutoMergeState::disabled(),
+            checks: Vec::new(),
+            created_at: None,
+            merged_at: None,
+            updated_at: None,
+        };
+        let target = branch(&fixture.repository, "main", &target_head);
+
+        let prepared = prepare_candidate(
+            &fixture.clone,
+            &fixture.repository,
+            &candidate,
+            remote_range(&candidate),
+            PlannedBase::Remote(target.clone()),
+            &target,
+            RebaseExecutionBudget::new(TEST_REBASE_BUDGET).flattening_squashed_root(true),
+        )
+        .expect("a squashed root is flattened rather than replayed");
+
+        // One commit, parented directly on the exact target, carrying the tree
+        // the merge-tree proof already validated.
+        assert_eq!(
+            git(
+                &fixture.clone,
+                &[
+                    "rev-list",
+                    "--count",
+                    &format!("{}..{}", target_head.0, prepared.plan.new_head_oid.0)
+                ]
+            ),
+            "1"
+        );
+        assert_eq!(
+            git(
+                &fixture.clone,
+                &["rev-parse", &format!("{}^", prepared.plan.new_head_oid.0)]
+            ),
+            target_head.0
+        );
+        assert_eq!(
+            git(
+                &fixture.clone,
+                &[
+                    "rev-parse",
+                    &format!("{}^{{tree}}", prepared.plan.new_head_oid.0)
+                ]
+            ),
+            prepared.plan.new_tree_oid.0
+        );
+    }
+
+    /// Without the explicit authorization the same shape still fails closed, so
+    /// a child is never silently flattened.
+    #[test]
+    fn a_merge_preserving_child_is_never_flattened() {
+        let fixture = fixture();
+        let target_head = fixture.new_main.clone();
+        git(&fixture.clone, &["checkout", "feature"]);
+        std::fs::write(fixture.clone.join("parent"), "candidate side\n").unwrap();
+        git(&fixture.clone, &["add", "parent"]);
+        git(&fixture.clone, &["commit", "-m", "candidate edits parent"]);
+        let merge = std::process::Command::new("git")
+            .current_dir(&fixture.clone)
+            .args([
+                "merge",
+                "--no-ff",
+                "-m",
+                "merge main into candidate",
+                "main",
+            ])
+            .output()
+            .expect("run merge");
+        if !merge.status.success() {
+            std::fs::write(fixture.clone.join("parent"), "resolved by hand\n").unwrap();
+            git(&fixture.clone, &["add", "parent"]);
+            git(&fixture.clone, &["commit", "--no-edit"]);
+        }
+        let head = CommitOid(git(&fixture.clone, &["rev-parse", "HEAD"]));
+        git(&fixture.clone, &["push", "origin", "feature"]);
+
+        let candidate = PullRequestSnapshot {
+            number: PrNumber(2216),
+            title: "child".to_owned(),
+            url: "https://example.invalid/2216".to_owned(),
+            state: PullRequestState::Open,
+            draft: false,
+            head: branch(&fixture.repository, "feature", &head),
+            base: branch(&fixture.repository, "main", &target_head),
+            cross_repository: false,
+            labels: BTreeSet::new(),
+            auto_merge: AutoMergeState::disabled(),
+            checks: Vec::new(),
+            created_at: None,
+            merged_at: None,
+            updated_at: None,
+        };
+        let target = branch(&fixture.repository, "main", &target_head);
+
+        let error = prepare_candidate(
+            &fixture.clone,
+            &fixture.repository,
+            &candidate,
+            remote_range(&candidate),
+            PlannedBase::Remote(target.clone()),
+            &target,
+            RebaseExecutionBudget::new(TEST_REBASE_BUDGET),
+        );
+        let Err(error) = error else {
+            panic!("an unauthorized merge-preserving replay must fail closed");
+        };
+
+        assert_eq!(
+            mcp_cli::StructuredError::code(&error),
+            "rebase_merge_replay_conflict"
         );
     }
 
