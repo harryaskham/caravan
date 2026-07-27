@@ -249,8 +249,13 @@ fn pull_request(number: u64, head: &str, base: &str, labels: &[&str]) -> PullReq
         base: branch(base),
         cross_repository: false,
         labels: labels.iter().map(|label| (*label).to_owned()).collect(),
-        // Cara is the merge actor by default: no member is armed.
-        auto_merge: AutoMergeState::disabled(),
+        // Absent configuration keeps the historical provider-native actor, so
+        // a root in this fixture is armed exactly as an existing fleet is.
+        auto_merge: if labels.contains(&ACTIVE_LABEL) && base == "main" {
+            AutoMergeState::squash()
+        } else {
+            AutoMergeState::disabled()
+        },
         checks: Vec::new(),
         created_at: Some(format!("2026-01-01T00:00:{number:02}Z")),
         merged_at: None,
@@ -899,7 +904,7 @@ fn atomic_new_and_renew_accept_exact_default_without_a_join_tail() {
 
         assert!(output.pull_request.has_label(ACTIVE_LABEL));
         assert!(!output.pull_request.has_label(EVICTED_LABEL));
-        assert_eq!(output.pull_request.auto_merge, AutoMergeState::disabled());
+        assert_eq!(output.pull_request.auto_merge, AutoMergeState::squash());
         assert_eq!(output.pull_request.base, status_default(&rebase));
     }
 }
@@ -1326,7 +1331,7 @@ fn root_new_receipt_uses_default_branch_predecessor_bd_d15ba3() {
 }
 
 #[test]
-fn new_applies_active_label_and_leaves_merging_to_cara() {
+fn new_applies_active_label_and_squash_auto_merge() {
     let candidate = pull_request(1, "one", "main", &[]);
     let provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
     let output = execute(
@@ -1346,9 +1351,8 @@ fn new_applies_active_label_and_leaves_merging_to_cara() {
     .unwrap();
 
     assert!(output.pull_request.has_label(ACTIVE_LABEL));
-    // Cara is the single merge actor: a fresh root is never armed with a
-    // provider auto-merge request that could land it before promotion.
-    assert_eq!(output.pull_request.auto_merge, AutoMergeState::disabled());
+    // Absent configuration keeps the historical provider-native actor.
+    assert_eq!(output.pull_request.auto_merge, AutoMergeState::squash());
     assert_eq!(output.caravan_id, PrNumber(1));
     assert!(output.receipt.changed);
 }
@@ -1766,7 +1770,7 @@ fn missing_labels_fail_before_provider_mutation() {
 fn partial_failure_reports_receipts_and_rerun_resumes() {
     let candidate = pull_request(1, "one", "main", &[]);
     let provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
-    *provider.fail_kind.borrow_mut() = Some(MutationKind::Comment);
+    *provider.fail_kind.borrow_mut() = Some(MutationKind::EnableAutoMerge);
     let request = MembershipRequest {
         operation: MembershipOperation::New,
         create_pr: false,
@@ -1802,8 +1806,7 @@ fn partial_failure_reports_receipts_and_rerun_resumes() {
         .unwrap()
         .clone();
     let output = execute(status(partial, Vec::new()), &clean, &provider, request).unwrap();
-    assert_eq!(output.pull_request.auto_merge, AutoMergeState::disabled());
-    assert!(output.pull_request.has_label(ACTIVE_LABEL));
+    assert_eq!(output.pull_request.auto_merge, AutoMergeState::squash());
 }
 
 #[test]
@@ -2097,5 +2100,5 @@ fn same_bead_generation_from_unrelated_agent_does_not_block_membership() {
     .expect("unrelated owner stream remains independently admissible");
 
     assert!(output.pull_request.has_label(ACTIVE_LABEL));
-    assert!(!output.pull_request.auto_merge.enabled);
+    assert!(output.pull_request.auto_merge.enabled);
 }

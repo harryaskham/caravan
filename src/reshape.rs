@@ -976,8 +976,12 @@ mod tests {
             base: branch(base, 99),
             cross_repository: false,
             labels: BTreeSet::from([ACTIVE_LABEL.to_owned()]),
-            // Cara is the merge actor by default: no member is armed.
-            auto_merge: AutoMergeState::disabled(),
+            // Absent configuration keeps the historical provider-native actor.
+            auto_merge: if base == "main" {
+                AutoMergeState::squash()
+            } else {
+                AutoMergeState::disabled()
+            },
             checks: Vec::new(),
             created_at: Some(format!("2026-01-01T00:00:{number:02}Z")),
             merged_at: None,
@@ -1087,7 +1091,7 @@ mod tests {
     }
 
     #[test]
-    fn evict_head_promotes_child_to_the_default_branch_without_arming() {
+    fn evict_head_promotes_child_with_squash_auto_merge() {
         let pulls = vec![pull_request(1, "main"), pull_request(2, "pr-1")];
         let provider = FakeProvider::new(&pulls);
         execute(
@@ -1101,8 +1105,7 @@ mod tests {
         .unwrap();
         let state = provider.pull_requests.borrow();
         assert_eq!(state[&PrNumber(2)].base.name, "main");
-        // Cara merges promoted roots itself; the promoted child is never armed.
-        assert_eq!(state[&PrNumber(2)].auto_merge, AutoMergeState::disabled());
+        assert_eq!(state[&PrNumber(2)].auto_merge, AutoMergeState::squash());
     }
 
     #[test]
@@ -1156,7 +1159,7 @@ mod tests {
         .unwrap();
         let state = provider.pull_requests.borrow();
         assert_eq!(state[&PrNumber(2)].base.name, "main");
-        assert_eq!(state[&PrNumber(2)].auto_merge, AutoMergeState::disabled());
+        assert_eq!(state[&PrNumber(2)].auto_merge, AutoMergeState::squash());
         assert_eq!(output.resulting_fleet.caravans.len(), 2);
     }
 

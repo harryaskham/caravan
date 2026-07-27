@@ -67,13 +67,15 @@ CORE MODEL AND INVARIANTS
 - Every active member has the `caravan` label and is open, non-draft, and owned
   by the base repository. Fork-only heads are rejected.
 - The root targets the default branch. Each child targets its predecessor's
-  branch. `sync.head_merge_actor` names the single merge actor: `caravan`
-  (default) or the historical `github`. Under `caravan` no member may carry a
-  provider `autoMergeRequest`; under `github` exactly the root must. The
-  auto-merge invariant is gated on that same fact, so a repository that disabled
-  native auto-merge never reports an unsatisfiable problem. The field is
-  optional and the historical `sync.auto_merge_head` boolean is still accepted,
-  because older Cara builds reject unknown configuration keys.
+  branch. `sync.head_merge_actor` names the single merge actor: `caravan` or
+  `github`. Under `caravan` no member may carry a provider `autoMergeRequest`;
+  under `github` exactly the root must. The auto-merge invariant is gated on
+  that same fact, so a repository that disabled native auto-merge never reports
+  an unsatisfiable problem. Caravan-owned merging is opt-in: an absent field
+  resolves to `github`, because a runtime upgrade must never silently change who
+  merges a repository's pull requests. Older Cara builds also reject unknown
+  configuration keys, so the field is optional in both directions, and the
+  historical `sync.auto_merge_head` boolean is still accepted.
 - Under `caravan`, a sync tick is the merge actor and treats each root as one
   ordered fenced transaction: re-read the exact generation; retarget to the
   exact default branch when its base is anything else, including an

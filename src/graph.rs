@@ -673,8 +673,12 @@ mod tests {
             base: branch(base),
             cross_repository: false,
             labels: BTreeSet::from(["caravan".to_owned()]),
-            // Cara is the merge actor by default, so no member is armed.
-            auto_merge: AutoMergeState::disabled(),
+            // Absent configuration keeps the historical provider-native actor.
+            auto_merge: if base == "main" {
+                AutoMergeState::squash()
+            } else {
+                AutoMergeState::disabled()
+            },
             checks: Vec::<CheckSnapshot>::new(),
             created_at: Some(format!("2026-01-01T00:00:{number:02}Z")),
             merged_at: None,
@@ -875,15 +879,17 @@ mod tests {
 
     #[test]
     fn the_auto_merge_invariant_is_gated_on_the_configured_merge_actor() {
+        // Absent configuration keeps the historical actor, so `derive` itself
+        // still requires the root to be armed.
+        assert_eq!(HeadMergeActor::default(), HeadMergeActor::Github);
         // A repository that deliberately disabled provider-native auto-merge so
         // cara can own the merge must not report a permanently unsatisfiable
         // "head must have squash auto-merge enabled" problem. Under the default
         // caravan-owned actor the invariant inverts instead: an armed root is a
         // second merge actor and is the problem.
-        let disarmed = snapshot(vec![
-            pull_request(1, "one", "main"),
-            pull_request(2, "two", "one"),
-        ]);
+        let mut disarmed_root = pull_request(1, "one", "main");
+        disarmed_root.auto_merge = AutoMergeState::disabled();
+        let disarmed = snapshot(vec![disarmed_root, pull_request(2, "two", "one")]);
         assert!(
             derive_for_actor(&disarmed, HeadMergeActor::Caravan)
                 .fleet
@@ -903,9 +909,10 @@ mod tests {
             "native delegation still requires the root to be armed"
         );
 
-        let mut armed_root = pull_request(1, "one", "main");
-        armed_root.auto_merge = AutoMergeState::squash();
-        let armed = snapshot(vec![armed_root, pull_request(2, "two", "one")]);
+        let armed = snapshot(vec![
+            pull_request(1, "one", "main"),
+            pull_request(2, "two", "one"),
+        ]);
         assert!(
             derive_for_actor(&armed, HeadMergeActor::Github)
                 .fleet

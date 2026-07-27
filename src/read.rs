@@ -2211,8 +2211,12 @@ mod tests {
             } else {
                 BTreeSet::new()
             },
-            // Cara is the merge actor by default: no member is armed.
-            auto_merge: AutoMergeState::disabled(),
+            // Absent configuration keeps the historical provider-native actor.
+            auto_merge: if active && base == "main" {
+                AutoMergeState::squash()
+            } else {
+                AutoMergeState::disabled()
+            },
             checks: Vec::new(),
             created_at: Some(format!("2026-01-01T00:00:{number:02}Z")),
             merged_at: None,

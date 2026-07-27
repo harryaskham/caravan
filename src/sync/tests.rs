@@ -5589,7 +5589,13 @@ fn caravan_status(
     identical_trees: bool,
 ) -> StatusOutput {
     let mut status = status(pulls, current, &clean);
-    status.head_merge = crate::read::HeadMergeStatus::default();
+    // Caravan-owned merging is opt-in: these fixtures set it explicitly, just
+    // as a repository does once every consumer of its config understands the
+    // key.
+    status.head_merge = crate::read::HeadMergeStatus {
+        actor: crate::model::HeadMergeActor::Caravan,
+        ..crate::read::HeadMergeStatus::default()
+    };
     let snapshot = RepositorySnapshot {
         merge_candidates: Vec::new(),
         merge_candidates_truncated: 0,
@@ -6111,4 +6117,39 @@ fn a_default_branch_that_moved_since_discovery_defers_the_landing_to_a_fresh_pro
         step.summary
             .contains(crate::root_merge::RootMergeBlock::CumulativeTreeUnproven.reason())
     }));
+}
+
+#[test]
+fn an_existing_config_on_a_new_runtime_keeps_the_native_merge_actor() {
+    // bd-f8cf99 / backcompat-default-github. A runtime upgrade alone must never
+    // change who merges a repository's pull requests. A fleet whose config
+    // predates `head_merge_actor` therefore keeps arming the root exactly as
+    // before, and cara performs no squash merge of its own.
+    let status = crate::read::HeadMergeStatus::from_config(&crate::config::SyncConfig::default());
+    assert_eq!(status.actor, crate::model::HeadMergeActor::Github);
+
+    let mut pulls = healthy_chain();
+    pulls.truncate(1);
+    pulls[0].auto_merge = AutoMergeState::disabled();
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    // `status()` is the historical fixture: exactly what an existing repository
+    // looks like when the new binary is deployed with no config change.
+    let fleet = self::status(pulls, Some(PrNumber(1)), &clean);
+    assert_eq!(fleet.head_merge.actor, crate::model::HeadMergeActor::Github);
+
+    let progress = execute(&fleet, &provider, false, false, false).expect("native actor converges");
+
+    assert!(
+        provider
+            .calls
+            .borrow()
+            .contains(&MutationKind::EnableAutoMerge),
+        "the historical actor still arms the root"
+    );
+    assert!(
+        !provider.calls.borrow().contains(&MutationKind::SquashMerge),
+        "cara does not take over merging without an explicit opt-in"
+    );
+    assert!(!progress.root_auto_merge.is_empty());
+    assert!(progress.root_merge.is_empty());
 }
