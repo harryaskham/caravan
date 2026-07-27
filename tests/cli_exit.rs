@@ -143,19 +143,68 @@ fn json_success_still_exits_zero() {
     assert_eq!(envelope["status"], "success");
 }
 
+/// Copy a binary and make sure every writable handle is flushed and closed.
+///
+/// Linux refuses to exec a file that is still open for writing (`ETXTBSY`), and
+/// a plain `fs::copy` can leave that window open just long enough for the
+/// following exec to fail. Writing explicitly, syncing, and dropping the handle
+/// closes it deterministically.
+fn copy_executable(source: &std::path::Path, destination: &std::path::Path) {
+    use std::io::Write;
+    let bytes = std::fs::read(source).expect("read built cara binary");
+    {
+        let mut file = std::fs::File::create(destination).expect("create installed cara");
+        file.write_all(&bytes).expect("write installed cara");
+        file.sync_all().expect("flush installed cara");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(destination, std::fs::Permissions::from_mode(0o755))
+            .expect("mark installed cara executable");
+    }
+}
+
+/// Exec the copied binary, tolerating a brief `ETXTBSY` window.
+///
+/// Under a loaded Nix build the kernel can still consider the freshly written
+/// file busy for a moment. That is an environment race, not a Cara defect, so
+/// the fixture retries briefly rather than failing the whole release gate.
+fn run_installed(
+    installed: &std::path::Path,
+    home: &std::path::Path,
+    path: &std::path::Path,
+) -> std::process::Output {
+    let mut last = None;
+    for attempt in 0..50 {
+        match Command::new(installed)
+            .env("HOME", home)
+            .env("PATH", path)
+            .args(["--json", "self-update", "status"])
+            .output()
+        {
+            Ok(output) => return output,
+            Err(error) if error.raw_os_error() == Some(26) => {
+                std::thread::sleep(std::time::Duration::from_millis(20 * (attempt + 1)));
+                last = Some(error);
+            }
+            Err(error) => panic!("run copied installed cara: {error:?}"),
+        }
+    }
+    panic!(
+        "copied cara stayed busy: {:?}",
+        last.expect("at least one busy error")
+    );
+}
+
 #[test]
 fn self_update_status_targets_the_exact_path_visible_cargo_install() {
     let temporary = tempfile::tempdir().unwrap();
     let install_dir = temporary.path().join(".cargo/bin");
     std::fs::create_dir_all(&install_dir).unwrap();
     let installed = install_dir.join(if cfg!(windows) { "cara.exe" } else { "cara" });
-    std::fs::copy(env!("CARGO_BIN_EXE_cara"), &installed).unwrap();
-    let output = Command::new(&installed)
-        .env("HOME", temporary.path())
-        .env("PATH", &install_dir)
-        .args(["--json", "self-update", "status"])
-        .output()
-        .expect("run copied installed cara");
+    copy_executable(std::path::Path::new(env!("CARGO_BIN_EXE_cara")), &installed);
+    let output = run_installed(&installed, temporary.path(), &install_dir);
     assert!(
         output.status.success(),
         "{}",
