@@ -361,6 +361,34 @@ pub fn derive_for_actor(snapshot: &RepositorySnapshot, actor: HeadMergeActor) ->
         match heads_by_branch.get(&pull_request.base.name) {
             Some(parents) if parents.len() == 1 => {
                 let parent = parents[0];
+                // bd-1cf2e1: a branch name is not identity. If a merged caravan
+                // member used this same branch name, an unrelated new PR that
+                // reused it would silently become this child's parent, because
+                // active heads take precedence over merged ones. Bind the exact
+                // recorded base OID to the resolved parent head and fail closed
+                // when they disagree.
+                let reused = merged_by_head.get(&pull_request.base.name).copied();
+                let parent_head = active.get(&parent).map(|parent| parent.head.oid.clone());
+                let provenance_matches = parent_head
+                    .as_ref()
+                    .is_none_or(|head| *head == pull_request.base.oid);
+                if reused.is_some() && !provenance_matches {
+                    roots.insert(pull_request.number);
+                    problems.push(GraphProblem {
+                        kind: GraphProblemKind::ReusedBranchProvenance,
+                        prs: std::iter::once(pull_request.number)
+                            .chain(std::iter::once(parent))
+                            .chain(reused)
+                            .collect(),
+                        message: format!(
+                            "PR #{} records base `{}` at {} but active PR #{parent} now holds that branch; a merged caravan member also used it, so the predecessor is ambiguous",
+                            pull_request.number,
+                            pull_request.base.name,
+                            pull_request.base.oid.0,
+                        ),
+                    });
+                    continue;
+                }
                 parent_of.insert(pull_request.number, parent);
                 children
                     .entry(parent)
@@ -1029,6 +1057,32 @@ mod tests {
         let observed = &analysis.pull_requests[&PrNumber(2101)];
         assert_eq!(observed.state, PullRequestState::Merged);
         assert_eq!(observed.merged_at.as_deref(), Some("2026-07-25T01:07:18Z"));
+    }
+
+    /// bd-1cf2e1: a merged member's branch name reused by an unrelated active
+    /// PR must not silently become the child's parent.
+    #[test]
+    fn reused_branch_name_fails_closed_instead_of_reparenting() {
+        let mut merged_parent = pull_request(1, "shared", "main");
+        merged_parent.state = PullRequestState::Merged;
+        // The child still records the merged parent's exact head OID.
+        let child = pull_request(2, "child", "shared");
+        // An unrelated active PR has since taken the same branch name, with a
+        // different head OID.
+        let mut reuser = pull_request(3, "shared", "main");
+        reuser.head.oid = CommitOid("reused-head".to_owned());
+
+        let analysis = derive(&snapshot(vec![merged_parent, child, reuser]));
+
+        assert!(
+            analysis.fleet.problems.iter().any(|problem| {
+                problem.kind == GraphProblemKind::ReusedBranchProvenance
+                    && problem.prs.contains(&PrNumber(2))
+            }),
+            "expected a reused-branch provenance problem: {:?}",
+            analysis.fleet.problems
+        );
+        assert!(!analysis.healthy());
     }
 
     #[test]

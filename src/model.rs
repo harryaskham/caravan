@@ -504,6 +504,9 @@ pub enum GraphProblemKind {
     ForkOnlyPredecessor,
     AutoMergeInvariant,
     Incompatible,
+    /// A child's base branch name resolves to an active head while a merged
+    /// caravan member used the same branch name, so provenance is ambiguous.
+    ReusedBranchProvenance,
     SupersededGeneration,
     AmbiguousGeneration,
     InvalidGenerationMetadata,
