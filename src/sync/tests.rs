@@ -6301,3 +6301,80 @@ fn an_operator_reverted_ancestor_is_refused_never_silently_reintroduced() {
         "successors are left untouched for rescoping"
     );
 }
+
+#[test]
+fn a_conflicting_caravan_wakes_a_repair_actor_but_a_race_only_reruns_the_tick() {
+    // Scheduler posture: no Actions runtime, a Caco-managed cron tick, and
+    // hooks dispatching repair agents. The cron cannot read prose, so the
+    // caravan-owned merge actor must classify its own refusals: one error code
+    // covers both bounded races and states no rerun can resolve.
+    let pulls = vec![
+        caravan_member(2223, "pr2223", "main"),
+        caravan_member(2225, "pr2225", "pr2223"),
+    ];
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    let status = caravan_status_with_containment(pulls, Some(PrNumber(2223)), true, false);
+
+    let error = execute(&status, &provider, false, false, false).expect_err("refused");
+    let scheduler = super::decision::scheduler_failure_status(&error);
+    assert_eq!(scheduler.wake_class, SchedulerWakeClass::ExternalDecision);
+    assert!(!scheduler.retryable);
+    assert_eq!(scheduler.error_code, "root_merge_refused");
+
+    // The repair-wake event carries the exact caravan and PRs, so a dispatched
+    // agent starts from provider facts rather than from log scraping.
+    let error = super::decision::attach_scheduler_failure(&error, &scheduler);
+    let event = super::decision::sync_failed_event(&error).expect("a conflicting caravan wakes");
+    assert_eq!(event.kind, EventKind::SyncFailed);
+    assert_eq!(event.caravan_id, Some(PrNumber(2223)));
+    assert_eq!(event.prs, vec![PrNumber(2223)]);
+    assert_eq!(event.metadata["error_code"], "root_merge_refused");
+    assert_eq!(
+        event.metadata["scheduler_status"]["wake_class"],
+        "external_decision"
+    );
+    assert!(
+        event.metadata["decision_fingerprint"]
+            .as_str()
+            .is_some_and(|fingerprint| fingerprint.starts_with("fnv1a64:")),
+        "external deduplication needs a stable fingerprint"
+    );
+
+    // A bounded provider race under the same error code is the opposite: rerun
+    // the same idempotent tick and never wake a repair agent.
+    let pulls = vec![caravan_member(1, "one", "main")];
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    provider.never_persist_merge(
+        PrNumber(1),
+        crate::root_merge::ROOT_MERGE_CONFIRMATION_READS,
+    );
+    let status = caravan_status(pulls, Some(PrNumber(1)), true);
+
+    let error = execute(&status, &provider, false, false, false).expect_err("unproven merge");
+    let scheduler = super::decision::scheduler_failure_status(&error);
+    assert_eq!(scheduler.error_code, "root_merge_refused");
+    assert_eq!(scheduler.wake_class, SchedulerWakeClass::RetryTick);
+    assert!(scheduler.retryable);
+    let error = super::decision::attach_scheduler_failure(&error, &scheduler);
+    assert!(
+        super::decision::sync_failed_event(&error).is_none(),
+        "a bounded race never dispatches a repair agent"
+    );
+}
+
+#[test]
+fn a_repository_without_squash_merging_is_operator_action_not_a_retry() {
+    let pulls = vec![caravan_member(1, "one", "main")];
+    let mut provider = FakeProvider::with_pull_requests(pulls.clone());
+    provider.allows_squash_merge = false;
+    let status = caravan_status(pulls, Some(PrNumber(1)), true);
+
+    let error = execute(&status, &provider, false, false, false).expect_err("cannot squash");
+    let scheduler = super::decision::scheduler_failure_status(&error);
+    assert_eq!(scheduler.error_code, "squash_merge_not_enabled");
+    assert_eq!(scheduler.wake_class, SchedulerWakeClass::OperatorAction);
+    assert!(
+        !scheduler.retryable,
+        "repository settings are not fixed by rerunning the tick"
+    );
+}

@@ -627,6 +627,19 @@ carried, the remaining members, and the successor's base before and after
 promotion. It emits `root_merged`. Together they prove already-merged
 predecessor content is not duplicated and child content is not lost.
 
+Cara is scheduler-neutral: `sync` and `loop --once` are bounded ticks with no
+dependence on any hosted runner or service runtime, so a Caco-managed cron, a
+hosted workflow, or a manual invocation are the same call. Because such a
+scheduler dispatches repair actors from hooks rather than reading prose, the
+caravan-owned merge actor classifies its own refusals by typed cause rather than
+by error code: one code covers both bounded provider races and states no rerun
+can resolve. A resumable cause is `wake_class=retry_tick` and emits no repair
+wake; a non-resumable one is `wake_class=external_decision` and emits exactly
+one canonical `sync_failed` carrying the exact repository, caravan, affected
+PRs, typed cause, and a stable decision fingerprint for external deduplication.
+A repository that cannot squash merge at all is `operator_action`, because no
+rerun changes repository settings.
+
 Promotion failure is the typed `root_promotion_incomplete` with cause
 `base_retarget_not_observed`, `root_head_moved_during_promotion`, or
 `stale_provider_view`, always before any merge is attempted. Merge refusal is
