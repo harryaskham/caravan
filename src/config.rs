@@ -209,16 +209,19 @@ pub struct SyncConfig {
     pub reserve_secs_per_command: u64,
     /// Which actor merges the caravan root into the default branch.
     ///
-    /// `caravan` (default) means Cara promotes the root to the exact default
-    /// branch and performs the squash merges itself, so no caravan member ever
-    /// carries a provider `autoMergeRequest`. `github` keeps the historical
+    /// `caravan` means Cara promotes the root to the exact default branch and
+    /// performs the squash merges itself, so no caravan member ever carries a
+    /// provider `autoMergeRequest`. `github` (the default) keeps the historical
     /// delegation where the scheduler arms native squash auto-merge on the root.
     /// The name is deliberately self-describing: `github` never means "do not
     /// merge the head".
     ///
-    /// Optional for rollout safety: Cara 0.0.7-0.0.10 reject unknown config
-    /// keys, so a repository must only add this field once every consumer of
-    /// its `.caravan/config.yaml` has upgraded. Absent means the default.
+    /// Optional and backward compatible in both directions. Cara 0.0.7-0.0.10
+    /// reject unknown config keys, so a repository must only add this field once
+    /// every consumer of its `.caravan/config.yaml` has upgraded; and an absent
+    /// field keeps the historical merge actor, so deploying a newer runtime
+    /// against an existing config never silently changes who merges. Adopting
+    /// caravan-owned merging is an explicit, ordered operator decision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_merge_actor: Option<HeadMergeActor>,
     /// Historical boolean spelling of [`Self::head_merge_actor`]. `true` selects
@@ -241,8 +244,10 @@ impl SyncConfig {
     /// Resolve the configured merge actor from either spelling.
     ///
     /// An explicit `head_merge_actor` always wins; the historical
-    /// `auto_merge_head` boolean is honoured for mixed-version rollouts; absent
-    /// configuration keeps the caravan-owned default.
+    /// `auto_merge_head` boolean is honoured for mixed-version rollouts
+    /// (`true` = provider, `false` = caravan); absent configuration preserves
+    /// the historical provider-native actor so an upgrade alone never changes
+    /// who merges.
     #[must_use]
     pub fn resolved_head_merge_actor(&self) -> HeadMergeActor {
         self.head_merge_actor.unwrap_or_else(|| {
@@ -663,37 +668,57 @@ mod tests {
 
     #[test]
     fn the_merge_actor_is_optional_backward_compatible_and_self_describing() {
-        // Rollout hazard: Cara 0.0.7-0.0.10 reject unknown config keys, so a
-        // repository can only add the field once every consumer upgraded. An
-        // old document must therefore keep parsing and keep the safe default.
+        // Two independent compatibility directions must hold.
+        //
+        // Forward: Cara 0.0.7-0.0.10 reject unknown config keys, so a
+        // repository can only add the field once every consumer upgraded.
+        //
+        // Backward (bd-f8cf99, backcompat-default-github): deploying a newer
+        // runtime against an *existing* config must never silently change who
+        // merges that repository's pull requests. An absent field therefore
+        // resolves to the historical provider-native actor, and caravan-owned
+        // merging is an explicit, ordered operator decision.
         let legacy = CaravanConfig::parse("version: 1\n").expect("old documents still parse");
         assert_eq!(legacy.sync.head_merge_actor, None);
         assert_eq!(legacy.sync.auto_merge_head, None);
         assert_eq!(
             legacy.sync.resolved_head_merge_actor(),
-            HeadMergeActor::Caravan,
-            "cara owns the merge unless a repository explicitly delegates it"
+            HeadMergeActor::Github,
+            "an old config on a new runtime keeps the native merge actor"
         );
+        assert_eq!(
+            CaravanConfig::default().sync.resolved_head_merge_actor(),
+            HeadMergeActor::Github
+        );
+        assert_eq!(HeadMergeActor::default(), HeadMergeActor::Github);
         assert_eq!(
             legacy.sync.external_auto_merge_policy,
             ExternalAutoMergePolicy::Disable
         );
 
-        let explicit = CaravanConfig::parse(
-            "version: 1\nsync:\n  head_merge_actor: github\n  external_auto_merge_policy: refuse\n",
+        // Caravan-owned merging is opted into explicitly.
+        let opted_in = CaravanConfig::parse(
+            "version: 1\nsync:\n  head_merge_actor: caravan\n  external_auto_merge_policy: refuse\n",
         )
         .expect("the typed field parses");
         assert_eq!(
-            explicit.sync.resolved_head_merge_actor(),
-            HeadMergeActor::Github
+            opted_in.sync.resolved_head_merge_actor(),
+            HeadMergeActor::Caravan
         );
         assert_eq!(
-            explicit.sync.external_auto_merge_policy,
+            opted_in.sync.external_auto_merge_policy,
             ExternalAutoMergePolicy::Refuse
+        );
+        let explicit_native =
+            CaravanConfig::parse("version: 1\nsync:\n  head_merge_actor: github\n")
+                .expect("the typed field parses");
+        assert_eq!(
+            explicit_native.sync.resolved_head_merge_actor(),
+            HeadMergeActor::Github
         );
 
         // The historical boolean spelling stays accepted for mixed-version
-        // rollouts; `true` means the provider is the merge actor.
+        // rollouts: `true` means the provider is the merge actor.
         let boolean = CaravanConfig::parse("version: 1\nsync:\n  auto_merge_head: true\n")
             .expect("alias parses");
         assert_eq!(

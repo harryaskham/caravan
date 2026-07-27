@@ -431,9 +431,16 @@ impl Caravan {
 ///
 /// Provider-native auto-merge cannot be ordered against caravan-owned topology:
 /// a root armed while its base was still a merged predecessor branch merges
-/// instantly into that predecessor instead of the default branch. The caravan
-/// therefore owns the merge by default and native delegation is a compatibility
-/// policy, not the contract.
+/// instantly into that predecessor instead of the default branch. Caravan-owned
+/// merging is therefore the intended end state.
+///
+/// It is nonetheless **not** the default. A runtime upgrade must never silently
+/// change who merges a repository's pull requests: a fleet running an existing
+/// config would flip merge actors the moment the new binary is deployed, before
+/// its operators know the option exists. Absent configuration therefore
+/// preserves exactly the historical behaviour, and `caravan` is opted into
+/// explicitly once every consumer of that repository's config understands the
+/// key.
 ///
 /// The name is deliberately self-describing: `github` never means "do not merge
 /// the head", it means "the provider's `autoMergeRequest` is the merge actor".
@@ -444,10 +451,11 @@ impl Caravan {
 pub enum HeadMergeActor {
     /// Cara promotes the root to the default branch and performs the exact
     /// squash merges itself. No caravan member may carry native auto-merge.
-    #[default]
     Caravan,
-    /// Historical: the provider merges the root through native squash
-    /// auto-merge armed by the scheduler on the exact root head.
+    /// The provider merges the root through native squash auto-merge armed by
+    /// the scheduler on the exact root head. This is the backward-compatible
+    /// default so an upgrade alone never changes the merge actor.
+    #[default]
     Github,
 }
 

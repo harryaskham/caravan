@@ -784,7 +784,7 @@ mod tests {
             base: branch("main"),
             cross_repository: false,
             labels: BTreeSet::from(["caravan".to_owned()]),
-            auto_merge: AutoMergeState::disabled(),
+            auto_merge: AutoMergeState::squash(),
             checks: vec![CheckSnapshot {
                 name: "CI".to_owned(),
                 state: CheckState::Failure,

@@ -400,13 +400,20 @@ Normal behavior:
 - Pending CI: sync reports waiting and makes no speculative repair.
 - Failed CI without `caravan-force`: decision point.
 
-`sync.head_merge_actor` names the single merge actor: `caravan` (default) or
-`github`. It is deliberately self-describing — `github` never means "do not
-merge the root", it means the provider's `autoMergeRequest` performs the merge.
-The field is optional and a historical `sync.auto_merge_head` boolean is still
-accepted, because older Cara builds reject unknown configuration keys and a
-repository can only adopt the field once every consumer has upgraded. The
-auto-merge invariant is gated on the same fact, so a repository that
+`sync.head_merge_actor` names the single merge actor: `caravan` or `github`. It
+is deliberately self-describing — `github` never means "do not merge the root",
+it means the provider's `autoMergeRequest` performs the merge. Caravan-owned
+merging is the intended end state but it is **opt-in**, and an absent field
+resolves to `github`. Both compatibility directions matter: older Cara builds
+reject unknown configuration keys, so a repository can only adopt the field once
+every consumer has upgraded; and deploying a newer runtime against an existing
+config must never silently change who merges that repository's pull requests.
+The historical `sync.auto_merge_head` boolean is still accepted (`true` =
+provider, `false` = caravan). The rollout is therefore ordered: deploy the
+schema-capable runtime with the key absent, set `head_merge_actor: caravan`
+once every consumer understands it, then disable provider-native auto-merge.
+
+The auto-merge invariant is gated on the same fact, so a repository that
 deliberately disabled provider-native auto-merge never reports a permanently
 unsatisfiable problem: under `caravan` *no* member may carry native auto-merge,
 under `github` exactly the root must.
