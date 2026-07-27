@@ -14,6 +14,7 @@ use crate::model::{
     CumulativeTreeProof, GraphProblem, GraphProblemKind, HeadMergeActor, MergeMethod, PrNumber,
     PullRequestSnapshot, PullRequestState, RepositorySnapshot,
 };
+use crate::squash_equivalence::SquashEquivalenceReport;
 
 /// Full read-only analysis shared by status, show, check, CLI JSON, and MCP.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -29,6 +30,15 @@ pub struct GraphAnalysis {
     /// only lands when its squash produces the already-validated head tree.
     #[serde(default)]
     pub cumulative_trees: Vec<CumulativeTreeProof>,
+    /// Exact squash-equivalence evidence for every attachment that is *not*
+    /// mechanically clean. A stacked candidate whose earliest commits were
+    /// already squash-landed on the target conflicts against content identical
+    /// to what it carries; this evidence states, with exact per-path blob
+    /// proof, whether that is the case here and whether reconciling it would
+    /// leave a clean replay. It is evidence only: it never authorizes a
+    /// rewrite on its own.
+    #[serde(default)]
+    pub squash_reconciliations: Vec<SquashEquivalenceReport>,
 }
 
 impl GraphAnalysis {
@@ -62,6 +72,18 @@ pub trait CompatibilityChecker {
         _candidate: &BranchSnapshot,
         _target: &BranchSnapshot,
     ) -> Result<Option<CumulativeTreeProof>, AppError> {
+        Ok(None)
+    }
+
+    /// Exact squash-equivalence evidence for a non-clean attachment.
+    ///
+    /// Fakes keep the default "no evidence", so graph policy tests never claim
+    /// a conflict is reconcilable without a real Git proof.
+    fn squash_equivalence(
+        &self,
+        _candidate: &BranchSnapshot,
+        _target: &BranchSnapshot,
+    ) -> Result<Option<SquashEquivalenceReport>, AppError> {
         Ok(None)
     }
 }
@@ -200,6 +222,34 @@ impl CompatibilityChecker for GitCompatibilityChecker {
                     .unwrap_or_else(|| std::time::Instant::now() + self.timeout),
             );
         compatibility::cumulative_tree_proof_with_runner(
+            &runner,
+            candidate,
+            target,
+            candidate_oid,
+            target_oid,
+        )
+        .map(Some)
+    }
+
+    fn squash_equivalence(
+        &self,
+        candidate: &BranchSnapshot,
+        target: &BranchSnapshot,
+    ) -> Result<Option<SquashEquivalenceReport>, AppError> {
+        let key = |branch: &BranchSnapshot| (branch.name.clone(), branch.oid.0.clone());
+        let cache = self.prepared.borrow();
+        let (Some(candidate_oid), Some(target_oid)) =
+            (cache.get(&key(candidate)), cache.get(&key(target)))
+        else {
+            return Ok(None);
+        };
+        let runner = crate::command::ProcessRunner::in_directory(&self.repository)
+            .with_timeout(self.timeout)
+            .with_operation_deadline(
+                self.operation_deadline
+                    .unwrap_or_else(|| std::time::Instant::now() + self.timeout),
+            );
+        crate::squash_equivalence::analyze_with_runner(
             &runner,
             candidate,
             target,
@@ -457,6 +507,7 @@ pub fn derive_for_actor(snapshot: &RepositorySnapshot, actor: HeadMergeActor) ->
         pull_requests,
         compatibility: Vec::new(),
         cumulative_trees: Vec::new(),
+        squash_reconciliations: Vec::new(),
     }
 }
 
@@ -503,10 +554,11 @@ pub fn analyze_for_actor(
         let report = checker.check(&head_branch, &snapshot.default_branch)?;
         record_compatibility(
             &mut analysis,
+            checker,
             report,
             vec![head_number],
             "caravan head does not merge cleanly into the current default branch",
-        );
+        )?;
         // The caravan-owned merge lands the root's *already-validated* tree or
         // nothing at all, so the proof is collected with the same exact
         // revisions the compatibility report used.
@@ -529,10 +581,11 @@ pub fn analyze_for_actor(
             let report = checker.check(&child_branch, &parent_branch)?;
             record_compatibility(
                 &mut analysis,
+                checker,
                 report,
                 vec![pair[0], pair[1]],
                 "adjacent caravan PRs are not mechanically compatible",
-            );
+            )?;
         }
     }
 
@@ -559,30 +612,44 @@ pub fn analyze_for_actor(
             let report = checker.check(&head_branch, &tail_branch)?;
             record_compatibility(
                 &mut analysis,
+                checker,
                 report,
                 vec![head_number, tail_number],
                 "one caravan head cannot be attached after another caravan tail",
-            );
+            )?;
         }
     }
 
     Ok(analysis)
 }
 
+/// Record one compatibility report plus, for a non-clean attachment, the exact
+/// squash-equivalence evidence for the same revisions.
+///
+/// The extra evidence is collected only on conflict, so healthy fleets never
+/// pay for it, and it never changes the compatibility outcome: a conflict stays
+/// a conflict until a reviewed operation acts on the proof.
 fn record_compatibility(
     analysis: &mut GraphAnalysis,
+    checker: &impl CompatibilityChecker,
     report: CompatibilityReport,
     prs: Vec<PrNumber>,
     message: &str,
-) {
+) -> Result<(), AppError> {
     if report.outcome != CompatibilityOutcome::Clean {
         analysis.fleet.problems.push(GraphProblem {
             kind: GraphProblemKind::Incompatible,
             prs,
             message: message.to_owned(),
         });
+        if let Some(reconciliation) =
+            checker.squash_equivalence(&report.candidate, &report.target)?
+        {
+            analysis.squash_reconciliations.push(reconciliation);
+        }
     }
     analysis.compatibility.push(report);
+    Ok(())
 }
 
 fn walk_linear(
@@ -781,6 +848,103 @@ mod tests {
         );
         // Head/default (2), adjacent (1), and both ordered cross-caravan pairs.
         assert_eq!(analysis.compatibility.len(), 5);
+    }
+
+    #[test]
+    fn conflicting_attachment_records_squash_equivalence_evidence_only_on_conflict() {
+        struct ConflictingChecker {
+            queried: std::cell::RefCell<Vec<(String, String)>>,
+        }
+        impl CompatibilityChecker for ConflictingChecker {
+            fn check(
+                &self,
+                candidate: &BranchSnapshot,
+                target: &BranchSnapshot,
+            ) -> Result<CompatibilityReport, AppError> {
+                if candidate.name == "two" && target.name == "one" {
+                    return Ok(CompatibilityReport {
+                        candidate: candidate.clone(),
+                        target: target.clone(),
+                        outcome: CompatibilityOutcome::Conflict,
+                        conflicting_paths: vec!["app.rs".to_owned()],
+                        diagnostic: None,
+                    });
+                }
+                clean(candidate, target)
+            }
+
+            fn squash_equivalence(
+                &self,
+                candidate: &BranchSnapshot,
+                target: &BranchSnapshot,
+            ) -> Result<Option<SquashEquivalenceReport>, AppError> {
+                self.queried
+                    .borrow_mut()
+                    .push((candidate.name.clone(), target.name.clone()));
+                Ok(Some(SquashEquivalenceReport {
+                    schema_version: 1,
+                    candidate: candidate.clone(),
+                    target: target.clone(),
+                    candidate_oid: candidate.oid.clone(),
+                    target_oid: target.oid.clone(),
+                    merge_base: None,
+                    outcome: crate::squash_equivalence::SquashEquivalenceOutcome::NoEquivalence,
+                    before: None,
+                    after: None,
+                    proven_boundary: None,
+                    boundary_tree: None,
+                    target_tree: None,
+                    commits: Vec::new(),
+                    represented_paths: Vec::new(),
+                    represented_paths_truncated: false,
+                    candidate_commit_count: 0,
+                    analyzed_prefix_complete: true,
+                    evaluated_boundaries: 0,
+                    evaluation_bounded: false,
+                    reason: "fixture".to_owned(),
+                    policy: crate::squash_equivalence::SQUASH_EQUIVALENCE_POLICY.to_owned(),
+                }))
+            }
+        }
+
+        let checker = ConflictingChecker {
+            queried: std::cell::RefCell::new(Vec::new()),
+        };
+        let analysis = analyze(
+            &snapshot(vec![
+                pull_request(1, "one", "main"),
+                pull_request(2, "two", "one"),
+            ]),
+            &checker,
+        )
+        .unwrap();
+
+        assert!(!analysis.healthy());
+        assert_eq!(
+            checker.queried.borrow().as_slice(),
+            [("two".to_owned(), "one".to_owned())],
+            "evidence is collected exactly once, only for the conflicting pair"
+        );
+        assert_eq!(analysis.squash_reconciliations.len(), 1);
+        let evidence = &analysis.squash_reconciliations[0];
+        assert_eq!(evidence.candidate.name, "two");
+        assert_eq!(evidence.target.name, "one");
+        assert!(evidence.authorized_range_base().is_none());
+    }
+
+    #[test]
+    fn healthy_fleet_collects_no_squash_equivalence_evidence() {
+        let analysis = analyze(
+            &snapshot(vec![
+                pull_request(1, "one", "main"),
+                pull_request(2, "two", "one"),
+            ]),
+            &clean,
+        )
+        .unwrap();
+
+        assert!(analysis.healthy());
+        assert!(analysis.squash_reconciliations.is_empty());
     }
 
     #[test]

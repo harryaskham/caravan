@@ -18,6 +18,7 @@ use crate::model::{
     Caravan, CompatibilityOutcome, CompatibilityReport, GraphProblem, GraphProblemKind, PrNumber,
     PullRequestSnapshot, PullRequestState, RepositoryId,
 };
+use crate::squash_equivalence::SquashEquivalenceReport;
 use crate::{AppContext, AppError, CheckInput};
 
 /// Exact configured merge-actor policy shared by every merge-aware surface.
@@ -359,6 +360,14 @@ pub struct CheckOutput {
     pub eligible: bool,
     #[serde(default)]
     pub compatibility: Vec<CompatibilityReport>,
+    /// Exact squash-equivalence evidence for every non-clean pair above.
+    ///
+    /// A stacked candidate whose earliest commits already landed as a squash
+    /// conflicts against content identical to what it carries; this states,
+    /// with exact per-path blob proof, whether that is the case and whether
+    /// reconciling it would leave a clean replay. It is evidence only.
+    #[serde(default)]
+    pub squash_reconciliations: Vec<SquashEquivalenceReport>,
     #[serde(default)]
     pub problems: Vec<GraphProblem>,
     pub initialization: crate::initialization::InitializationStatus,
@@ -1522,6 +1531,7 @@ pub fn check_analysis(
             target_pr: None,
             eligible,
             compatibility: status.analysis.compatibility.clone(),
+            squash_reconciliations: status.analysis.squash_reconciliations.clone(),
             problems: active_problems,
             initialization: status.initialization.clone(),
         };
@@ -1598,10 +1608,18 @@ pub fn check_analysis(
     }
     let order_admits = canonical_candidate || admission_intent.order_permits_admission();
     let mut reports = Vec::new();
+    let mut reconciliations = Vec::new();
 
     if !explicit_join {
         if !pull_request.cross_repository {
-            check_new(status, pull_request, checker, &mut reports, &mut problems)?;
+            check_new(
+                status,
+                pull_request,
+                checker,
+                &mut reports,
+                &mut problems,
+                &mut reconciliations,
+            )?;
         }
         let eligible = problems.is_empty();
         admission_intent.record_preflight(
@@ -1655,6 +1673,7 @@ pub fn check_analysis(
                 target_pr: None,
                 eligible,
                 compatibility: reports,
+                squash_reconciliations: reconciliations,
                 problems,
                 initialization: status.initialization.clone(),
             },
@@ -1671,12 +1690,14 @@ pub fn check_analysis(
         .expect("derived tail has a snapshot");
     if !pull_request.cross_repository {
         record_report(
+            checker,
             checker.check(&pull_request.head, &tail.head)?,
             vec![tail_number, current_pr],
             "candidate does not merge cleanly after the selected tail",
             &mut reports,
             &mut problems,
-        );
+            &mut reconciliations,
+        )?;
         for caravan in &status.analysis.fleet.caravans {
             if caravan.id == target_caravan.id {
                 continue;
@@ -1688,12 +1709,14 @@ pub fn check_analysis(
                 .get(&head_number)
                 .expect("derived head has a snapshot");
             record_report(
+                checker,
                 checker.check(&head.head, &pull_request.head)?,
                 vec![head_number, current_pr],
                 "another caravan head cannot attach after the proposed new tail",
                 &mut reports,
                 &mut problems,
-            );
+                &mut reconciliations,
+            )?;
         }
     }
 
@@ -1749,6 +1772,7 @@ pub fn check_analysis(
             target_pr: Some(tail_number),
             eligible,
             compatibility: reports,
+            squash_reconciliations: reconciliations,
             problems,
             initialization: status.initialization.clone(),
         },
@@ -1762,14 +1786,17 @@ fn check_new(
     checker: &impl CompatibilityChecker,
     reports: &mut Vec<CompatibilityReport>,
     problems: &mut Vec<GraphProblem>,
+    reconciliations: &mut Vec<SquashEquivalenceReport>,
 ) -> Result<(), AppError> {
     record_report(
+        checker,
         checker.check(&pull_request.head, &status.analysis.fleet.default_branch)?,
         vec![pull_request.number],
         "candidate new head does not merge cleanly into the default branch",
         reports,
         problems,
-    );
+        reconciliations,
+    )?;
     for caravan in &status.analysis.fleet.caravans {
         let head_number = caravan.head().expect("caravans are non-empty");
         let tail_number = caravan.tail().expect("caravans are non-empty");
@@ -1784,19 +1811,23 @@ fn check_new(
             .get(&tail_number)
             .expect("derived tail has a snapshot");
         record_report(
+            checker,
             checker.check(&pull_request.head, &tail.head)?,
             vec![pull_request.number, tail_number],
             "candidate head cannot attach after an existing caravan tail",
             reports,
             problems,
-        );
+            reconciliations,
+        )?;
         record_report(
+            checker,
             checker.check(&head.head, &pull_request.head)?,
             vec![head_number, pull_request.number],
             "existing caravan head cannot attach after the candidate tail",
             reports,
             problems,
-        );
+            reconciliations,
+        )?;
     }
     Ok(())
 }
@@ -1873,21 +1904,35 @@ fn validate_candidate(pull_request: &PullRequestSnapshot, problems: &mut Vec<Gra
     }
 }
 
+/// Record one pairwise report plus, for a non-clean pair, the exact
+/// squash-equivalence evidence for the same revisions.
+///
+/// Collecting it only on conflict keeps healthy preflights free of extra Git
+/// work, and it never changes the outcome: a conflict stays a conflict until a
+/// separately reviewed operation acts on the proof.
 fn record_report(
+    checker: &impl CompatibilityChecker,
     report: CompatibilityReport,
     prs: Vec<PrNumber>,
     message: &str,
     reports: &mut Vec<CompatibilityReport>,
     problems: &mut Vec<GraphProblem>,
-) {
+    reconciliations: &mut Vec<SquashEquivalenceReport>,
+) -> Result<(), AppError> {
     if report.outcome != CompatibilityOutcome::Clean {
         problems.push(GraphProblem {
             kind: GraphProblemKind::Incompatible,
             prs,
             message: message.to_owned(),
         });
+        if let Some(reconciliation) =
+            checker.squash_equivalence(&report.candidate, &report.target)?
+        {
+            reconciliations.push(reconciliation);
+        }
     }
     reports.push(report);
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3404,6 +3449,94 @@ mod tests {
         );
         assert!(!intent.compatibility_clean);
         assert!(intent.reason.contains("exact preflight rejected"));
+    }
+
+    /// A conflicting attachment preflight carries the exact squash-equivalence
+    /// evidence for the same revisions, and a clean one carries none.
+    #[test]
+    fn conflicting_check_carries_squash_equivalence_evidence() {
+        struct ReconcilableChecker;
+        impl CompatibilityChecker for ReconcilableChecker {
+            fn check(
+                &self,
+                candidate: &crate::model::BranchSnapshot,
+                target: &crate::model::BranchSnapshot,
+            ) -> Result<CompatibilityReport, AppError> {
+                Ok(CompatibilityReport {
+                    candidate: candidate.clone(),
+                    target: target.clone(),
+                    outcome: CompatibilityOutcome::Conflict,
+                    conflicting_paths: vec!["src/lib.rs".to_owned()],
+                    diagnostic: None,
+                })
+            }
+
+            fn squash_equivalence(
+                &self,
+                candidate: &crate::model::BranchSnapshot,
+                target: &crate::model::BranchSnapshot,
+            ) -> Result<Option<SquashEquivalenceReport>, AppError> {
+                Ok(Some(SquashEquivalenceReport {
+                    schema_version: 1,
+                    candidate: candidate.clone(),
+                    target: target.clone(),
+                    candidate_oid: candidate.oid.clone(),
+                    target_oid: target.oid.clone(),
+                    merge_base: None,
+                    outcome: crate::squash_equivalence::SquashEquivalenceOutcome::NoEquivalence,
+                    before: None,
+                    after: None,
+                    proven_boundary: None,
+                    boundary_tree: None,
+                    target_tree: None,
+                    commits: Vec::new(),
+                    represented_paths: Vec::new(),
+                    represented_paths_truncated: false,
+                    candidate_commit_count: 2,
+                    analyzed_prefix_complete: true,
+                    evaluated_boundaries: 0,
+                    evaluation_bounded: false,
+                    reason: "ordinary three-way divergence".to_owned(),
+                    policy: crate::squash_equivalence::SQUASH_EQUIVALENCE_POLICY.to_owned(),
+                }))
+            }
+        }
+
+        let candidate = pr(2227, "tail", "main", false);
+        let status = status(candidate, vec![pr(1, "root", "main", true)]);
+
+        let conflicting = check_analysis(
+            &status,
+            &CheckInput {
+                pr: Some(2227),
+                tail_pr: Some(1),
+                head_pr: None,
+            },
+            &ReconcilableChecker,
+        )
+        .expect("rejection is an inspectable receipt");
+
+        assert!(!conflicting.eligible);
+        assert!(!conflicting.squash_reconciliations.is_empty());
+        assert!(
+            conflicting
+                .squash_reconciliations
+                .iter()
+                .all(|report| report.authorized_range_base().is_none()),
+            "unproven evidence never authorizes a boundary"
+        );
+
+        let clean = check_analysis(
+            &status,
+            &CheckInput {
+                pr: Some(2227),
+                tail_pr: Some(1),
+                head_pr: None,
+            },
+            &clean_checker,
+        )
+        .expect("clean receipt");
+        assert!(clean.squash_reconciliations.is_empty());
     }
 
     /// An unresolved or ambiguous join target fails closed before ordering.

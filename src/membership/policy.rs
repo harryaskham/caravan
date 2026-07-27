@@ -258,6 +258,7 @@ pub(super) fn preflight_eligibility(
             target_pr: target.and_then(|target| target.caravan.tail()),
             eligible: true,
             compatibility: status.analysis.compatibility.clone(),
+            squash_reconciliations: status.analysis.squash_reconciliations.clone(),
             problems: Vec::new(),
             initialization: status.initialization.clone(),
         });

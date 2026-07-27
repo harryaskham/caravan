@@ -16,6 +16,7 @@ use serde_json::json;
 use crate::AppError;
 use crate::command::{CommandOutput, CommandRunner, CommandSpec, ProcessRunner};
 use crate::model::{BranchSnapshot, CommitOid, PrNumber, PullRequestSnapshot, RepositoryId};
+use crate::squash_equivalence::{self, SquashEquivalenceReport};
 
 const MAX_MERGE_PRESERVING_COMMITS: usize = 256;
 
@@ -24,6 +25,12 @@ const MAX_MERGE_PRESERVING_COMMITS: usize = 256;
 pub struct RebaseExecutionBudget {
     pub command_timeout: Duration,
     pub operation_deadline: Option<Instant>,
+    /// Explicitly authorize reconciling squash-equivalent stacked history.
+    ///
+    /// Disabled by default: replaying already-landed history stays a typed
+    /// conflict until a reviewed operation opts in, so no live provider branch
+    /// is ever rewritten by mere detection.
+    pub reconcile_squash_equivalent: bool,
 }
 
 impl RebaseExecutionBudget {
@@ -32,12 +39,20 @@ impl RebaseExecutionBudget {
         Self {
             command_timeout,
             operation_deadline: None,
+            reconcile_squash_equivalent: false,
         }
     }
 
     #[must_use]
     pub fn with_deadline(mut self, deadline: Instant) -> Self {
         self.operation_deadline = Some(deadline);
+        self
+    }
+
+    /// Authorize dropping stacked commits the target already holds byte-for-byte.
+    #[must_use]
+    pub const fn with_squash_reconciliation(mut self, authorized: bool) -> Self {
+        self.reconcile_squash_equivalent = authorized;
         self
     }
 }
@@ -190,9 +205,16 @@ pub struct RebasePlan {
     pub new_base: PlannedBase,
     pub new_head_oid: CommitOid,
     pub new_tree_oid: CommitOid,
+    /// Commits in the exact source range, including any this plan reconciled
+    /// away because the target already holds them; `squash_reconciliation`
+    /// lists exactly which commits were dropped and which were replayed.
     pub commit_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_topology: Option<MergePreservingTopology>,
+    /// Exact proof for any stacked history this plan reconciled away because
+    /// the target already holds its cumulative content byte-for-byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub squash_reconciliation: Option<SquashEquivalenceReport>,
     pub ci_trigger_workflows: Vec<String>,
     pub lease: String,
     pub already_satisfied: bool,
@@ -218,6 +240,9 @@ pub struct RebaseReceipt {
     pub commit_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_topology: Option<MergePreservingTopology>,
+    /// Exact proof for any stacked history this rewrite reconciled away.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub squash_reconciliation: Option<SquashEquivalenceReport>,
     /// Exact-default workflow files proven able to run for this PR base on
     /// both force-push (`synchronize`) and base edit (`edited`).
     pub ci_trigger_workflows: Vec<String>,
@@ -423,12 +448,23 @@ pub fn prepare_candidate(
         budget.command_timeout,
         budget.operation_deadline,
     );
+    // Reconciliation is opt-in and additionally requires exact proof, so a
+    // routine rewrite never silently drops history. A merge-preserving range
+    // is excluded: only an ancestor-closed linear range can be proven here.
+    let reconciliation = if budget.reconcile_squash_equivalent && !has_merges {
+        authorized_reconciliation(&runner, candidate, target, &range_base)?
+    } else {
+        None
+    };
     let rebase = run_rebase(
         &worktree_runner,
         &range_base,
         &target.oid,
         &candidate.head.oid,
         has_merges,
+        reconciliation
+            .as_ref()
+            .and_then(SquashEquivalenceReport::authorized_range_base),
     )?;
     if !rebase.is_success() {
         let conflicts = run(
@@ -465,6 +501,16 @@ pub fn prepare_candidate(
     }
     let new_head = rev_parse(&worktree_runner, "HEAD")?;
     let new_tree = rev_parse(&worktree_runner, "HEAD^{tree}")?;
+    if let Some(report) = &reconciliation {
+        verify_reconciled_replay(
+            &worktree_runner,
+            report,
+            &target.oid,
+            &new_head,
+            &new_tree,
+            candidate.number,
+        )?;
+    }
     let merge_topology = expected_merge_tree
         .map(|expected| {
             build_merge_topology_proof(
@@ -511,6 +557,7 @@ pub fn prepare_candidate(
         new_tree_oid: new_tree,
         commit_count,
         merge_topology,
+        squash_reconciliation: reconciliation,
         ci_trigger_workflows,
         lease,
         already_satisfied,
@@ -681,6 +728,7 @@ fn run_rebase(
     target: &CommitOid,
     old_head: &CommitOid,
     preserve_merges: bool,
+    reconciled_upstream: Option<&CommitOid>,
 ) -> Result<CommandOutput, AppError> {
     let mut arguments = vec![
         "-c".to_owned(),
@@ -702,7 +750,12 @@ fn run_rebase(
     // omit patch-equivalent commits already represented on the target while
     // replaying only genuinely unique source commits. The separately retained
     // range_base still binds and validates source provenance.
-    let upstream = target;
+    //
+    // A reconciled upstream replaces it only when squash-equivalence analysis
+    // proved, path by path, that the target already holds that boundary's
+    // cumulative content; the replay then starts from proven-landed history
+    // instead of re-applying it against itself.
+    let upstream = reconciled_upstream.unwrap_or(target);
     arguments.extend([
         "--committer-date-is-author-date".to_owned(),
         "--onto".to_owned(),
@@ -716,6 +769,102 @@ fn run_rebase(
             .args(arguments)
             .env("GIT_TERMINAL_PROMPT", "0"),
     )
+}
+
+/// Prove whether an opt-in reconciliation may drop stacked history here.
+///
+/// Returns a report only when squash-equivalence analysis authorized a
+/// boundary *and* that boundary is a genuine interior commit of this exact
+/// replay range. Anything else fails closed to the ordinary replay, which
+/// still reports a typed conflict instead of dropping unproven history.
+fn authorized_reconciliation(
+    runner: &impl CommandRunner,
+    candidate: &PullRequestSnapshot,
+    target: &BranchSnapshot,
+    range_base: &CommitOid,
+) -> Result<Option<SquashEquivalenceReport>, AppError> {
+    let report = squash_equivalence::analyze_with_runner(
+        runner,
+        &candidate.head,
+        target,
+        &candidate.head.oid,
+        &target.oid,
+    )?;
+    let Some(boundary) = report.authorized_range_base() else {
+        return Ok(None);
+    };
+    // The proven boundary must sit strictly inside this replay range: after the
+    // retained source boundary, before the candidate head, and not already an
+    // ancestor-equal of either endpoint.
+    if boundary == &candidate.head.oid
+        || boundary == range_base
+        || !is_ancestor(runner, range_base, boundary)?
+        || !is_ancestor(runner, boundary, &candidate.head.oid)?
+    {
+        return Ok(None);
+    }
+    Ok(Some(report))
+}
+
+/// Independently verify one reconciled replay against its own proof.
+///
+/// The rebase is not trusted to have produced the proven result: the rebuilt
+/// tree must equal the cumulative tree the reconciliation computed, and the
+/// rebuilt commit count must equal exactly the retained commits. Any deviation
+/// fails closed before the push preflight, so nothing is pushed.
+fn verify_reconciled_replay(
+    runner: &impl CommandRunner,
+    report: &SquashEquivalenceReport,
+    target: &CommitOid,
+    new_head: &CommitOid,
+    new_tree: &CommitOid,
+    pr: PrNumber,
+) -> Result<(), AppError> {
+    let expected_tree = report
+        .after
+        .as_ref()
+        .map(|evidence| evidence.result_tree.clone())
+        .ok_or_else(|| {
+            decision(
+                "rebase_reconciled_proof_missing",
+                "reconciled replay lost its cumulative tree proof",
+                json!({"pr": pr, "resumable": true}),
+            )
+        })?;
+    if new_tree != &expected_tree {
+        return Err(decision(
+            "rebase_reconciled_tree_mismatch",
+            "reconciled replay produced a different cumulative tree than the independently proven reconciliation; nothing was pushed",
+            json!({
+                "pr": pr,
+                "expected_tree": expected_tree,
+                "actual_tree": new_tree,
+                "reconciliation": report.details(),
+                "mutated": false,
+                "resumable": true,
+                "next": "rediscover exact revisions and rerun without squash-equivalence reconciliation",
+            }),
+        ));
+    }
+    let rebuilt = collect_range_topology(runner, &[target], new_head, "rebase_result_invalid")?;
+    let retained = report.retained_commits().len();
+    if rebuilt.len() != retained {
+        return Err(decision(
+            "rebase_reconciled_topology_mismatch",
+            "reconciled replay rebuilt a different number of commits than the proven retained set; nothing was pushed",
+            json!({
+                "pr": pr,
+                "retained_commit_count": retained,
+                "rebuilt_commit_count": rebuilt.len(),
+                "dropped_commits": report.dropped_commits(),
+                "rebuilt_commits": rebuilt.iter().map(|commit| &commit.oid).collect::<Vec<_>>(),
+                "mutated": false,
+                "resumable": true,
+                "next": "rediscover exact revisions and rerun without squash-equivalence reconciliation",
+            }),
+        ));
+    }
+    Ok(())
 }
 
 fn topology_commit_count_changed(
@@ -976,6 +1125,7 @@ fn push_prepared(prepared: &PreparedRebase) -> Result<RebaseReceipt, AppError> {
         new_tree_oid: prepared.plan.new_tree_oid.clone(),
         commit_count: prepared.plan.commit_count,
         merge_topology: prepared.plan.merge_topology.clone(),
+        squash_reconciliation: prepared.plan.squash_reconciliation.clone(),
         ci_trigger_workflows: prepared.plan.ci_trigger_workflows.clone(),
         lease: prepared.plan.lease.clone(),
         already_satisfied: prepared.plan.already_satisfied,
@@ -1530,6 +1680,251 @@ mod tests {
             name: name.to_owned(),
             oid: oid.clone(),
         }
+    }
+
+    /// A stacked candidate whose first member landed as **one** squash commit
+    /// combining several pre-squash commits.
+    ///
+    /// This is the shape Git's own patch-equivalence detection cannot resolve:
+    /// no individual pre-squash commit has the squash's patch id, so the
+    /// sequencer replays them against content identical to what they produce.
+    ///
+    /// `divergent` reproduces the shape that must never be reconciled: the
+    /// target moved past the equality point, so merge base, target tip, and
+    /// candidate head are three distinct blobs for the same file.
+    struct StackedFixture {
+        _root: tempfile::TempDir,
+        clone: PathBuf,
+        repository: RepositoryId,
+        old_main: CommitOid,
+        new_main: CommitOid,
+        landed_first: CommitOid,
+        landed_head: CommitOid,
+        feature: CommitOid,
+    }
+
+    fn stacked_squash_fixture(divergent: bool) -> StackedFixture {
+        let root = tempfile::tempdir().unwrap();
+        let bare = root.path().join("remote.git");
+        git(root.path(), &["init", "--bare", bare.to_str().unwrap()]);
+        let clone = root.path().join("clone");
+        git(
+            root.path(),
+            &["clone", bare.to_str().unwrap(), clone.to_str().unwrap()],
+        );
+        git(&clone, &["config", "user.name", "Caravan Test"]);
+        git(&clone, &["config", "user.email", "caravan@example.invalid"]);
+        git(&clone, &["checkout", "-b", "main"]);
+        std::fs::create_dir_all(clone.join(".github/workflows")).unwrap();
+        std::fs::write(
+            clone.join(".github/workflows/stack.yml"),
+            "on:\n  pull_request:\n    types: [opened, synchronize, reopened, edited, labeled, unlabeled]\njobs: {}\n",
+        )
+        .unwrap();
+        std::fs::write(clone.join("app.rs"), "alpha\n").unwrap();
+        git(&clone, &["add", "app.rs", ".github/workflows/stack.yml"]);
+        git(&clone, &["commit", "-m", "base"]);
+        let old_main = CommitOid(git(&clone, &["rev-parse", "HEAD"]));
+        git(&clone, &["push", "-u", "origin", "main"]);
+
+        // The stacked member whose two commits later land as one squash.
+        git(&clone, &["checkout", "-b", "feature"]);
+        std::fs::write(clone.join("app.rs"), "beta\n").unwrap();
+        git(&clone, &["add", "app.rs"]);
+        git(&clone, &["commit", "-m", "member one part a"]);
+        let landed_first = CommitOid(git(&clone, &["rev-parse", "HEAD"]));
+        std::fs::write(clone.join("app.rs"), "gamma\n").unwrap();
+        git(&clone, &["add", "app.rs"]);
+        git(&clone, &["commit", "-m", "member one part b"]);
+        let landed_head = CommitOid(git(&clone, &["rev-parse", "HEAD"]));
+        std::fs::write(clone.join("app.rs"), "delta\n").unwrap();
+        std::fs::write(clone.join("child.rs"), "child\n").unwrap();
+        git(&clone, &["add", "app.rs", "child.rs"]);
+        git(&clone, &["commit", "-m", "member two content"]);
+        let feature = CommitOid(git(&clone, &["rev-parse", "HEAD"]));
+        git(&clone, &["push", "-u", "origin", "feature"]);
+
+        git(&clone, &["checkout", "main"]);
+        std::fs::write(clone.join("app.rs"), "gamma\n").unwrap();
+        git(&clone, &["add", "app.rs"]);
+        git(&clone, &["commit", "-m", "squash of member one"]);
+        if divergent {
+            std::fs::write(clone.join("app.rs"), "epsilon\n").unwrap();
+            git(&clone, &["add", "app.rs"]);
+            git(&clone, &["commit", "-m", "later independent landing"]);
+        }
+        let new_main = CommitOid(git(&clone, &["rev-parse", "HEAD"]));
+        git(&clone, &["push", "origin", "main"]);
+        git(&clone, &["checkout", "feature"]);
+
+        StackedFixture {
+            _root: root,
+            clone,
+            repository: RepositoryId {
+                owner: "owner".to_owned(),
+                name: "repo".to_owned(),
+            },
+            old_main,
+            new_main,
+            landed_first,
+            landed_head,
+            feature,
+        }
+    }
+
+    fn stacked_candidate(fixture: &StackedFixture) -> PullRequestSnapshot {
+        PullRequestSnapshot {
+            number: crate::model::PrNumber(2227),
+            title: "stacked tail".to_owned(),
+            url: "https://example.invalid/2227".to_owned(),
+            state: PullRequestState::Open,
+            draft: false,
+            head: branch(&fixture.repository, "feature", &fixture.feature),
+            base: branch(&fixture.repository, "main", &fixture.old_main),
+            cross_repository: false,
+            labels: BTreeSet::new(),
+            auto_merge: AutoMergeState::disabled(),
+            checks: Vec::new(),
+            created_at: None,
+            merged_at: None,
+            updated_at: None,
+        }
+    }
+
+    fn prepare_stacked(
+        fixture: &StackedFixture,
+        reconcile: bool,
+    ) -> Result<PreparedRebase, AppError> {
+        let candidate = stacked_candidate(fixture);
+        let target = branch(&fixture.repository, "main", &fixture.new_main);
+        prepare_candidate(
+            &fixture.clone,
+            &fixture.repository,
+            &candidate,
+            range_base_for_remote_target(&candidate, &target),
+            PlannedBase::Remote(target.clone()),
+            &target,
+            RebaseExecutionBudget::new(TEST_REBASE_BUDGET).with_squash_reconciliation(reconcile),
+        )
+    }
+
+    #[test]
+    fn replaying_squash_landed_history_conflicts_without_explicit_reconciliation() {
+        let fixture = stacked_squash_fixture(false);
+
+        let error = prepare_stacked(&fixture, false)
+            .err()
+            .expect("replaying already-landed stacked history conflicts");
+
+        assert_eq!(error.code(), "rebase_conflict");
+        let details = error.details().unwrap();
+        assert_eq!(details["conflicting_paths"][0], "app.rs");
+        // Detection alone never rewrites: the branch is untouched.
+        assert_eq!(
+            git(
+                &fixture.clone,
+                &["ls-remote", "origin", "refs/heads/feature"]
+            )
+            .split_whitespace()
+            .next(),
+            Some(fixture.feature.0.as_str())
+        );
+    }
+
+    #[test]
+    fn opt_in_reconciliation_drops_only_proven_squash_landed_history() {
+        let fixture = stacked_squash_fixture(false);
+
+        let prepared = prepare_stacked(&fixture, true).expect("proven reconciliation replays");
+
+        let reconciliation = prepared
+            .plan
+            .squash_reconciliation
+            .as_ref()
+            .expect("reconciliation receipt");
+        assert_eq!(
+            reconciliation.outcome,
+            crate::squash_equivalence::SquashEquivalenceOutcome::Reconcilable
+        );
+        assert_eq!(
+            reconciliation.dropped_commits(),
+            [fixture.landed_first.clone(), fixture.landed_head.clone()]
+        );
+        assert_eq!(
+            reconciliation.retained_commits(),
+            std::slice::from_ref(&fixture.feature)
+        );
+        assert_eq!(reconciliation.affected_paths(), ["app.rs"]);
+        assert_eq!(
+            reconciliation.authorized_range_base(),
+            Some(&fixture.landed_head)
+        );
+        // The replay is exactly the retained commit on top of the exact target,
+        // and its tree is the independently proven cumulative tree.
+        let replayed = git(
+            &fixture.clone,
+            &[
+                "rev-list",
+                "--count",
+                &format!("{}..{}", fixture.new_main.0, prepared.plan.new_head_oid.0),
+            ],
+        );
+        assert_eq!(replayed, "1");
+        assert_eq!(
+            prepared.plan.new_tree_oid,
+            reconciliation
+                .after
+                .as_ref()
+                .expect("reconciled merge evidence")
+                .result_tree
+        );
+        assert_eq!(
+            git(
+                &fixture.clone,
+                &["show", &format!("{}:app.rs", prepared.plan.new_head_oid.0)]
+            ),
+            "delta"
+        );
+        assert_eq!(
+            git(
+                &fixture.clone,
+                &[
+                    "show",
+                    &format!("{}:child.rs", prepared.plan.new_head_oid.0)
+                ]
+            ),
+            "child"
+        );
+        // Nothing was pushed while only preparing.
+        assert_eq!(
+            git(
+                &fixture.clone,
+                &["ls-remote", "origin", "refs/heads/feature"]
+            )
+            .split_whitespace()
+            .next(),
+            Some(fixture.feature.0.as_str())
+        );
+    }
+
+    #[test]
+    fn opt_in_reconciliation_still_fails_closed_on_divergence_after_equality() {
+        let fixture = stacked_squash_fixture(true);
+
+        let error = prepare_stacked(&fixture, true)
+            .err()
+            .expect("genuine divergence is never reconciled");
+
+        assert_eq!(error.code(), "rebase_conflict");
+        assert_eq!(
+            git(
+                &fixture.clone,
+                &["ls-remote", "origin", "refs/heads/feature"]
+            )
+            .split_whitespace()
+            .next(),
+            Some(fixture.feature.0.as_str())
+        );
     }
 
     fn remote_range(candidate: &PullRequestSnapshot) -> PlannedRangeBase {

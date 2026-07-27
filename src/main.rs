@@ -2454,6 +2454,25 @@ fn render_check(output: &caravan::read::CheckOutput) -> String {
             report.conflicting_paths.join(","),
         );
     }
+    for reconciliation in &output.squash_reconciliations {
+        let _ = writeln!(
+            text,
+            "  squash-equivalence {}: {}@{} -> {}@{} dropped=[{}] paths=[{}]",
+            reconciliation.outcome.name(),
+            reconciliation.candidate.name,
+            reconciliation.candidate_oid,
+            reconciliation.target.name,
+            reconciliation.target_oid,
+            reconciliation
+                .dropped_commits()
+                .iter()
+                .map(|oid| oid.0.clone())
+                .collect::<Vec<_>>()
+                .join(","),
+            reconciliation.affected_paths().join(","),
+        );
+        let _ = writeln!(text, "    {}", reconciliation.reason);
+    }
     for problem in &output.problems {
         let _ = writeln!(text, "! {}", render_fleet_problem(problem));
     }
@@ -3287,6 +3306,7 @@ mod tests {
                 pull_requests: std::collections::BTreeMap::new(),
                 compatibility: Vec::new(),
                 cumulative_trees: Vec::new(),
+                squash_reconciliations: Vec::new(),
             },
             pauses: Vec::new(),
             sync_budget: caravan::sync::SyncBudgetStatus::default(),

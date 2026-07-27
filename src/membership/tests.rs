@@ -353,6 +353,7 @@ fn rebase_receipt(
         new_tree_oid: CommitOid("tree-oid".to_owned()),
         commit_count: 1,
         merge_topology: None,
+        squash_reconciliation: None,
         ci_trigger_workflows: vec![".github/workflows/ci.yml".to_owned()],
         lease: format!(
             "--force-with-lease=refs/heads/{}:{}",
@@ -1019,6 +1020,7 @@ fn atomic_join_rejects_live_tail_drift_after_physical_rebase() {
         new_tree_oid: crate::model::CommitOid("e".repeat(40)),
         commit_count: 1,
         merge_topology: None,
+        squash_reconciliation: None,
         ci_trigger_workflows: vec![".github/workflows/ci.yml".to_owned()],
         lease: format!(
             "--force-with-lease=refs/heads/{}:{}",
@@ -1064,6 +1066,7 @@ fn force_rewrite_plan(candidate: &PullRequestSnapshot) -> crate::physical_rebase
         new_tree_oid: CommitOid("tree000000000000000000000000000000000000".to_owned()),
         commit_count: 1,
         merge_topology: None,
+        squash_reconciliation: None,
         ci_trigger_workflows: vec![".github/workflows/ci.yml".to_owned()],
         lease: format!(
             "--force-with-lease=refs/heads/{}:{}",
@@ -1175,6 +1178,7 @@ fn join_receipt_proves_exact_tail_ancestry_and_stale_force_removal() {
         new_tree_oid: crate::model::CommitOid("e".repeat(40)),
         commit_count: 1,
         merge_topology: None,
+        squash_reconciliation: None,
         ci_trigger_workflows: vec![".github/workflows/ci.yml".to_owned()],
         lease: format!(
             "--force-with-lease=refs/heads/{}:{}",
@@ -1277,6 +1281,7 @@ fn root_new_receipt_uses_default_branch_predecessor_bd_d15ba3() {
         new_tree_oid: crate::model::CommitOid("e".repeat(40)),
         commit_count: 1,
         merge_topology: None,
+        squash_reconciliation: None,
         ci_trigger_workflows: vec![".github/workflows/ci.yml".to_owned()],
         lease: format!(
             "--force-with-lease=refs/heads/{}:{}",

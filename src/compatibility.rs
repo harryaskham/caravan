@@ -143,7 +143,7 @@ pub(crate) fn cumulative_tree_proof_with_runner(
 }
 
 /// Exact tree object of one already-fetched commit.
-fn commit_tree_with_runner(
+pub(crate) fn commit_tree_with_runner(
     runner: &impl CommandRunner,
     commit: &CommitOid,
 ) -> Result<CommitOid, AppError> {
@@ -168,23 +168,38 @@ fn commit_tree_with_runner(
 }
 
 /// One `git merge-tree` construction shared by compatibility and tree proofs.
-fn merge_tree_with_runner(
+pub(crate) fn merge_tree_with_runner(
     runner: &impl CommandRunner,
     candidate_oid: &CommitOid,
     target_oid: &CommitOid,
 ) -> Result<(CompatibilityOutcome, String, Vec<String>), AppError> {
-    let output = git_output(
-        runner,
-        [
-            "merge-tree",
-            "--write-tree",
-            "--name-only",
-            "--no-messages",
-            "-z",
-            target_oid.0.as_str(),
-            candidate_oid.0.as_str(),
-        ],
-    )?;
+    merge_tree_with_base_with_runner(runner, candidate_oid, target_oid, None)
+}
+
+/// One `git merge-tree` construction with an optional explicit merge base.
+///
+/// An explicit base is how squash-equivalence reconciliation proves what the
+/// retained commits alone would produce: history already represented on the
+/// target is excluded from the three-way merge instead of being replayed.
+pub(crate) fn merge_tree_with_base_with_runner(
+    runner: &impl CommandRunner,
+    candidate_oid: &CommitOid,
+    target_oid: &CommitOid,
+    merge_base: Option<&CommitOid>,
+) -> Result<(CompatibilityOutcome, String, Vec<String>), AppError> {
+    let mut arguments = vec![
+        "merge-tree".to_owned(),
+        "--write-tree".to_owned(),
+        "--name-only".to_owned(),
+        "--no-messages".to_owned(),
+        "-z".to_owned(),
+    ];
+    if let Some(base) = merge_base {
+        arguments.push(format!("--merge-base={}", base.0));
+    }
+    arguments.push(target_oid.0.clone());
+    arguments.push(candidate_oid.0.clone());
+    let output = git_output(runner, arguments)?;
     let outcome = match output.code {
         Some(0) => CompatibilityOutcome::Clean,
         Some(1) => CompatibilityOutcome::Conflict,
@@ -562,7 +577,10 @@ fn resolve_local_commit(
     Ok(CommitOid(oid))
 }
 
-fn git_output<I, S>(runner: &impl CommandRunner, arguments: I) -> Result<CommandOutput, AppError>
+pub(crate) fn git_output<I, S>(
+    runner: &impl CommandRunner,
+    arguments: I,
+) -> Result<CommandOutput, AppError>
 where
     I: IntoIterator<Item = S>,
     S: Into<String>,
@@ -572,7 +590,7 @@ where
         .map_err(|error| command_run_error(&error))
 }
 
-fn command_run_error(error: &CommandRunError) -> AppError {
+pub(crate) fn command_run_error(error: &CommandRunError) -> AppError {
     if let CommandRunError::OutputLimit {
         command,
         code,
@@ -642,7 +660,7 @@ fn parse_single_oid(command: &str, output: &CommandOutput) -> Result<String, App
     }
 }
 
-fn valid_full_oid(value: &str) -> bool {
+pub(crate) fn valid_full_oid(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
@@ -650,7 +668,7 @@ fn contains_line_break(value: &str) -> bool {
     value.contains(['\n', '\r'])
 }
 
-fn git_failure(
+pub(crate) fn git_failure(
     code: &str,
     message: impl Into<String>,
     exit_code: Option<i32>,
@@ -668,7 +686,7 @@ fn git_failure(
     )
 }
 
-fn malformed_git_output(
+pub(crate) fn malformed_git_output(
     code: &str,
     message: impl Into<String>,
     output: &CommandOutput,
@@ -696,7 +714,7 @@ fn bounded_text(text: &str) -> String {
     format!("{}…[truncated]", &text[..end])
 }
 
-fn bytes_to_text(bytes: &[u8]) -> String {
+pub(crate) fn bytes_to_text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 

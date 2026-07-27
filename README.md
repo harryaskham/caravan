@@ -74,6 +74,27 @@ after the same check passes.
   Incompatible generations receive `caravan-join-skipped` plus a durable exact
   evidence receipt; unchanged generations are not retried, while candidate,
   default, tail, config, or heuristic changes invalidate the skip automatically.
+- Every non-clean attachment check also returns exact squash-equivalence
+  evidence. A landed member reaches the default branch as one squash commit
+  whose content matches that member's cumulative content but whose commit
+  identity is unrelated to the pre-squash commits later members still carry, so
+  replaying that stacked history can conflict against content identical to what
+  it introduces. Cara reports whether an ancestor-closed linear prefix of the
+  candidate-only range is already held by the target byte for byte — identical
+  blob objects *and* file modes on every path that prefix's cumulative diff
+  changes — and whether replaying only the retained commits from that proven
+  boundary is independently clean. Commit messages, subjects, and patch text are
+  never proof, an identical patch with a different resulting blob is not
+  equivalence, and an untouched file that happens to match proves nothing. A
+  represented prefix whose retained commits still diverge reports
+  `residual_conflict`; ordinary three-way divergence after the equality point
+  reports `no_equivalence`. Neither drops a commit, and nothing is ever resolved
+  by taking either side. Detection is evidence, not authority: reconciliation
+  applies only under an explicitly authorized rewrite, which reverifies the
+  replayed head tree against the proven cumulative tree and the rebuilt commit
+  count against the proven retained set before any push. Receipts list dropped
+  and retained commits, the proven boundary and its tree, the represented paths
+  with blobs and modes, and the cumulative tree before and after reconciliation.
 
 ## Dogfooding
 

@@ -713,6 +713,7 @@ mod tests {
             pull_requests: BTreeMap::from([(candidate.number, candidate.clone())]),
             compatibility: Vec::new(),
             cumulative_trees: Vec::new(),
+            squash_reconciliations: Vec::new(),
         };
         let status = StatusOutput {
             head_merge: crate::read::HeadMergeStatus::default(),

@@ -88,6 +88,51 @@ Mechanical compatibility does not prove semantic correctness. CI, the user, or a
 
 The default branch may move independently. A caravan head that no longer merges cleanly into it is a decision point. A valid repair may change the PR, reshape the caravan, or land an outside-caravan fix on the default branch that restores compatibility without rerunning caravan PR CI.
 
+### Squash-equivalent stacked history
+
+A landed member arrives on the default branch as **one** squash commit. Its
+content is identical to that member's cumulative content, but its commit
+identity is unrelated to the pre-squash commits every surviving later member
+still carries. Replaying that stacked history against the target therefore
+re-applies changes the target already holds, and Git's own patch-identity
+pruning cannot help once one squash combined several source commits.
+
+Every non-clean attachment check — head to default, adjacent child to parent,
+and one caravan head after another caravan tail — therefore also produces exact
+squash-equivalence evidence for the same revisions. The evidence answers one
+question: is there an ancestor-closed linear prefix of the candidate-only range
+whose cumulative content the target already holds byte for byte, and does
+replaying only the retained commits from that proven boundary merge cleanly?
+
+The proof is exact and narrow:
+
+1. Every path the prefix's cumulative diff changes — additions, modifications,
+   deletions, and file modes — must be identical on the exact target tip. A
+   path the prefix never touched is not evidence, so a vacuous match on an
+   unrelated identical file proves nothing.
+2. Commit messages, subjects, authorship, dates, and patch text are never
+   proof. An identical patch that yields a different resulting blob is not
+   equivalence.
+3. Replaying the retained commits with the proven boundary as merge base must
+   be independently clean.
+
+Outcomes are `reconcilable`, `no_equivalence`, `residual_conflict` (the prefix
+is represented but the retained commits still diverge), and `indeterminate`
+(absent or ambiguous merge base, non-linear candidate range, or a path Git
+cannot represent exactly). Only `reconcilable` authorizes a boundary, and
+ordinary three-way divergence after the equality point — merge base, target
+tip, and candidate head all distinct for the same file — is never reconciled.
+Nothing is ever resolved by taking either side.
+
+Detection is not authority. Evidence alone never rewrites a live provider
+branch: reconciliation is applied only by an explicitly authorized rewrite,
+which additionally reverifies that the replayed head tree equals the proven
+cumulative tree and that the rebuilt commit count equals the proven retained
+set, failing closed before any push. The receipt records the dropped and
+retained commits, the proven boundary and its tree, the exact represented paths
+with their blobs and modes, and the cumulative tree before and after
+reconciliation.
+
 ## 4. Discovery and identity
 
 Provider access is authenticated. Cara accepts an explicit ambient
