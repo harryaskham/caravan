@@ -1745,6 +1745,27 @@ fn dim(value: impl AsRef<str>) -> String {
     styled("2", value)
 }
 
+/// Render one fleet problem row.
+///
+/// A fleet problem is repository-wide: the same row is emitted for every
+/// candidate a `cara check`/`sync` run inspects, regardless of which PR
+/// actually carries the defect. Naming the exact PRs keeps a single foreign
+/// candidate's problem from reading as a defect in the candidate the operator
+/// asked about (Cacophony bd-e4dbcb).
+fn render_fleet_problem(problem: &caravan::model::GraphProblem) -> String {
+    let prs = problem
+        .prs
+        .iter()
+        .map(|pr| format!("#{pr}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    if prs.is_empty() {
+        format!("{:?}: {}", problem.kind, problem.message)
+    } else {
+        format!("{:?} [{prs}]: {}", problem.kind, problem.message)
+    }
+}
+
 fn pr_link(number: caravan::model::PrNumber, title: &str, url: &str) -> String {
     let label = format!("#{number} {title}");
     if terminal_output() && !url.is_empty() {
@@ -2251,13 +2272,7 @@ fn render_status(output: &caravan::read::StatusOutput) -> String {
         );
     }
     for problem in &output.analysis.fleet.problems {
-        let _ = writeln!(
-            text,
-            "{} {:?}: {}",
-            failure("!"),
-            problem.kind,
-            problem.message
-        );
+        let _ = writeln!(text, "{} {}", failure("!"), render_fleet_problem(problem));
     }
     text
 }
@@ -2328,7 +2343,7 @@ fn render_show(output: &caravan::read::ShowOutput) -> String {
         );
     }
     for problem in &output.problems {
-        let _ = writeln!(text, "! {:?}: {}", problem.kind, problem.message);
+        let _ = writeln!(text, "! {}", render_fleet_problem(problem));
     }
     text
 }
@@ -2440,7 +2455,7 @@ fn render_check(output: &caravan::read::CheckOutput) -> String {
         );
     }
     for problem in &output.problems {
-        let _ = writeln!(text, "! {:?}: {}", problem.kind, problem.message);
+        let _ = writeln!(text, "! {}", render_fleet_problem(problem));
     }
     text
 }
@@ -2809,6 +2824,32 @@ where
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    /// A repository-wide problem row names the exact PRs that carry it, so a
+    /// single foreign candidate's defect is not read as a defect in every
+    /// candidate a run happens to inspect (Cacophony bd-e4dbcb).
+    #[test]
+    fn fleet_problem_rows_name_their_exact_prs() {
+        let row = render_fleet_problem(&caravan::model::GraphProblem {
+            kind: caravan::model::GraphProblemKind::InvalidGenerationMetadata,
+            prs: vec![caravan::model::PrNumber(2215)],
+            message: "missing exact generation metadata: Beads".to_owned(),
+        });
+        assert_eq!(
+            row,
+            "InvalidGenerationMetadata [#2215]: missing exact generation metadata: Beads"
+        );
+
+        let unattributed = render_fleet_problem(&caravan::model::GraphProblem {
+            kind: caravan::model::GraphProblemKind::InvalidGenerationMetadata,
+            prs: Vec::new(),
+            message: "missing exact generation metadata: Beads".to_owned(),
+        });
+        assert_eq!(
+            unattributed,
+            "InvalidGenerationMetadata: missing exact generation metadata: Beads"
+        );
+    }
 
     #[derive(Debug)]
     struct HumanTestError {

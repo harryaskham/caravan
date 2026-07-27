@@ -254,6 +254,13 @@ fn parse_beads(body: &str) -> BTreeSet<String> {
     };
     value
         .split(|character: char| character == ',' || character.is_ascii_whitespace())
+        // Cacophony bodies quote generation values inconsistently: every
+        // `Cacophony-*` trailer is backtick-quoted and `metadata_value` already
+        // unquotes it, while `Beads:` is conventionally plain. A hand-authored
+        // recovery body that quotes the bead list to match its surrounding
+        // prose declares exactly the same beads, so accept both spellings
+        // instead of invalidating an otherwise exact generation over quoting.
+        .map(|value| value.trim_matches('`'))
         .filter(|value| {
             value.strip_prefix("bd-").is_some_and(|suffix| {
                 suffix.len() == 6 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -761,6 +768,57 @@ mod tests {
         );
         assert!(partial.provenance.is_none());
         assert!(partial.metadata_error.unwrap().contains("missing"));
+    }
+
+    /// A backtick-quoted `Beads:` declaration names exactly the same beads as
+    /// the plain spelling. Cacophony PR #2215 quoted its bead list to match the
+    /// surrounding hand-authored recovery prose, which invalidated the whole
+    /// generation and published one fleet-wide problem row that every unrelated
+    /// candidate's `cara check` then displayed.
+    #[test]
+    fn quoted_and_plain_beads_declarations_are_equivalent() {
+        let head = "f".repeat(40);
+        let generation = format!("agent/ms-dev-6/cacophony/d23tqrb17ss3e6xo-pr-g{head}");
+        let trailers = format!(
+            "Cacophony-Generation: `{generation}`\nCacophony-Agent: `d23tqrb17ss3e6xo`\nCacophony-Head: `{head}`\nCacophony-Stack-Base: `main`\nCacophony-Stack-State: `root`"
+        );
+        let expected = BTreeSet::from(["bd-74b155".to_owned(), "bd-282638".to_owned()]);
+        for declaration in [
+            "Beads: bd-74b155, bd-282638",
+            "Beads: `bd-74b155`, `bd-282638`",
+            "Beads: `bd-74b155, bd-282638`",
+        ] {
+            let parsed = parse_generation_fact(
+                PrNumber(2215),
+                oid('c'),
+                &generation,
+                None,
+                &format!("## Original generation metadata\n\n{declaration}\n\n{trailers}"),
+            );
+            assert_eq!(
+                parsed.metadata_error, None,
+                "declaration should be exact: {declaration}"
+            );
+            assert_eq!(
+                parsed.provenance.expect("exact generation").bead_ids,
+                expected,
+                "declaration should name the same beads: {declaration}"
+            );
+        }
+
+        // A declaration that names no well-formed bead is still incomplete.
+        let empty = parse_generation_fact(
+            PrNumber(2216),
+            oid('c'),
+            &generation,
+            None,
+            &format!("Beads: `not-a-bead`\n\n{trailers}"),
+        );
+        assert!(
+            empty
+                .metadata_error
+                .is_some_and(|error| error.contains("Beads"))
+        );
     }
 
     #[test]
