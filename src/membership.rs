@@ -2167,7 +2167,8 @@ fn execute_with_rebase_guard(
         || admission_priority_basis.clone(),
         |decision| {
             format!(
-                "{admission_priority_basis}; intent={} order={:?} {}",
+                "{admission_priority_basis}; selection={} intent={} order={:?} {}",
+                decision.selection.name(),
                 decision.intent.name(),
                 decision.outcome,
                 decision.reason

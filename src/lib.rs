@@ -104,16 +104,22 @@ CORE MODEL AND INVARIANTS
   wedged PR never starves the fleet. Unknown or conflicting configured priority
   labels still block because canonical rank cannot be computed. With zero
   caravans, the first eligible candidate forms a new root caravan.
-- That order is the *first-admission* contract. Intent is resolved before FIFO
-  rejection: an explicit `join` to a valid resolved caravan target may attach
-  ahead of earlier rows while every bypassed row is an unrelated *unjoined*
-  first-admission attempt, and those rows keep their canonical order. New /
-  first-admission intent and automatic sync admission remain strictly FIFO. A
-  joined row, a base-chain dependency, a rank-indeterminate row, a candidate
-  that is not itself an ordered attempt, or an ambiguous/missing target all fail
-  closed. Every check/membership receipt carries the typed `admission_intent`
-  decision: intent, target, rows bypassed only because they are unjoined,
-  compatibility, provider mutation, and idempotency.
+- That order is the *automatic selection* contract. Selection and intent are
+  separate axes, and conflating them is what regressed this behaviour in 0.0.10.
+  Automatic priority/FIFO selection is bound by order for `new` and `join`
+  alike. Explicit owner intent — naming one exact remote PR with `cara check
+  --pr N`, with or without `--tail-pr`/`--head-pr` — is resolved *before* FIFO
+  rejection for `new` and `join` alike: it may attach ahead of earlier rows
+  while every bypassed row is an unrelated *unjoined* first-admission attempt,
+  and those rows keep their canonical order. A joined row, a base-chain
+  dependency, a rank-indeterminate row, a candidate that is not itself an
+  ordered attempt, or an ambiguous/missing target all fail closed. An owner
+  operating on their own checked-out PR (local `check`, membership,
+  renew/rejoin) reports canonical position as evidence only. Every
+  check/membership receipt carries the typed `admission_intent` decision:
+  selection, intent, target, rows bypassed only because they are unjoined,
+  compatibility, provider mutation, and idempotency; the human note is derived
+  from that same decision, so note, decision, and mutation cannot disagree.
 - Cacophony-shaped PRs bind generation, agent, source head, stack slot, and bead
   metadata. Within the same agent/bead/slot, only a unique exact contained
   successor or current reviewed canonical-link receipt is admissible. Proven

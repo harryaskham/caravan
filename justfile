@@ -171,3 +171,74 @@ release-backfill-all tag:
         echo "warning: $target backfill failed on this host; run it on a host advertising that platform" >&2
       }
     done
+
+# Cut an annotated release tag at an already-landed main commit.
+#
+# `scripts/release.sh` is the one-shot path: bump, commit, tag, push. Caravan's
+# reviewed flow instead lands the `release: vX.Y.Z` version bump through the
+# ordinary agent/reintegration lifecycle, so by the time the tag is cut the bump
+# already exists on main and `release.sh` refuses ("already current"). This
+# recipe closes that exact gap and nothing else.
+#
+# It is fail-closed: the commit must be on origin/main, its tree's Cargo.toml
+# version must equal the tag, the tag must not already exist locally or on
+# origin, and the working tree must be clean. It never moves or force-pushes a
+# tag and never edits a file.
+#   just release-tag v0.0.11                # tag exact origin/main
+#   just release-tag v0.0.11 <commit-sha>   # tag one exact landed commit
+release-tag tag commit="origin/main":
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    TAG="{{ tag }}"
+    REF="{{ commit }}"
+
+    [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+      echo "error: tag must be vX.Y.Z (got: $TAG)" >&2
+      exit 2
+    }
+    [ -z "$(git status --porcelain)" ] || {
+      echo "error: working tree is dirty; clean it before tagging" >&2
+      exit 1
+    }
+
+    git fetch origin main --tags --quiet
+    COMMIT="$(git rev-parse --verify "$REF^{commit}")"
+
+    git merge-base --is-ancestor "$COMMIT" origin/main || {
+      echo "error: $COMMIT is not contained in origin/main; tags are cut from landed main only" >&2
+      exit 1
+    }
+
+    VERSION="${TAG#v}"
+    CARGO_VERSION="$(git show "$COMMIT:Cargo.toml" | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)"
+    LOCK_VERSION="$(git show "$COMMIT:Cargo.lock" | awk '/^name = "caravan"$/ { getline; sub(/^version = "/, ""); sub(/"$/, ""); print; exit }')"
+    FLAKE_VERSION="$(git show "$COMMIT:flake.nix" | sed -n 's/^ *version = "\(.*\)";$/\1/p' | head -1)"
+    for pair in "Cargo.toml:$CARGO_VERSION" "Cargo.lock:$LOCK_VERSION" "flake.nix:$FLAKE_VERSION"; do
+      file="${pair%%:*}"
+      found="${pair#*:}"
+      [ "$found" = "$VERSION" ] || {
+        echo "error: $file at $COMMIT declares version '$found', not '$VERSION'" >&2
+        exit 1
+      }
+    done
+
+    if git rev-parse --quiet --verify "refs/tags/$TAG" >/dev/null; then
+      echo "error: tag already exists locally: $TAG" >&2
+      exit 1
+    fi
+    set +e
+    git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1
+    remote_tag_status=$?
+    set -e
+    case "$remote_tag_status" in
+      0) echo "error: tag already exists on origin: $TAG" >&2; exit 1 ;;
+      2) ;;
+      *) echo "error: could not verify whether $TAG exists on origin" >&2; exit 1 ;;
+    esac
+
+    echo "==> tagging $TAG at $COMMIT (version $VERSION verified in Cargo.toml, Cargo.lock, flake.nix)"
+    git tag -a "$TAG" -m "$TAG" "$COMMIT"
+    git push origin "refs/tags/$TAG"
+    echo "==> pushed $TAG; release.yml will publish cara assets for that tag"
+    echo "    next: just release-pin-rows $TAG \"reviewed release binary\""

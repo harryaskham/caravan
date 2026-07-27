@@ -1,14 +1,27 @@
-//! Explicit join intent versus first-admission FIFO order.
+//! Explicit owner intent versus automatic first-admission FIFO order.
 //!
-//! Priority-then-FIFO order is the contract for *first admission*: which
-//! unjoined PR becomes the next caravan root or the next automatically grown
-//! member. It was never a claim that an operator or agent asking to attach a
-//! specific PR behind a specific live tail must first wait for every unrelated
-//! unjoined PR ahead of it. This module makes that distinction typed and
-//! deterministic: an explicit `join` may pass earlier rows *only* when every
-//! bypassed row is an unrelated, unjoined first-admission attempt, and it never
+//! Priority-then-FIFO order is the contract for *automatic* selection: which
+//! unjoined PR sync picks next as the new caravan root or the next
+//! automatically grown member. It was never a claim that an operator or agent
+//! naming one exact PR must first wait for every unrelated unjoined PR ahead of
+//! it.
+//!
+//! Two axes are therefore modelled separately, because conflating them is
+//! exactly how this behaviour regressed once already:
+//!
+//! * [`AdmissionSelection`] — *who chose this candidate*: automatic priority/
+//!   FIFO order, an explicit owner request naming a remote PR, or the owner's
+//!   own checked-out PR.
+//! * [`AdmissionIntent`] — *what the candidate asked for*: form a new caravan
+//!   (`new`) or attach to a resolved live target (`join`).
+//!
+//! Automatic selection is bound by FIFO for both intents, without exception.
+//! Explicit owner selection is resolved *before* FIFO canonical-candidate
+//! rejection for both intents, and may pass earlier rows *only* when every
+//! bypassed row is an unrelated, unjoined first-admission attempt. It never
 //! passes a joined row, a base-chain dependency, or a row whose canonical rank
-//! cannot even be computed.
+//! cannot even be computed, and it never substitutes for compatibility,
+//! freshness, generation, policy, or provider preflight.
 
 use std::collections::BTreeSet;
 
@@ -20,7 +33,7 @@ use crate::model::{Caravan, PrNumber, PullRequestSnapshot, PullRequestState};
 use crate::read::AdmissionStatus;
 
 /// Deterministic contract text bound into every emitted decision.
-pub const ADMISSION_INTENT_POLICY: &str = "Explicit join intent is resolved before FIFO canonical-candidate rejection. FIFO governs first admission and new-caravan intent unchanged. An explicit join to a valid resolved target may attach ahead of earlier rows only while every bypassed row is an unrelated unjoined first-admission attempt; a joined row, a base-chain dependency of the candidate, a rank-indeterminate row, or an unresolved/ambiguous target fails closed on canonical order. Ordering never substitutes for compatibility, dependency, policy, freshness, or provider preflight.";
+pub const ADMISSION_INTENT_POLICY: &str = "Priority/FIFO order binds automatic admission selection for both `new` and `join` intent, without exception. Explicit owner intent — an operator or agent naming one exact remote candidate with `cara check --pr N`, optionally `--tail-pr`/`--head-pr` — is resolved before FIFO canonical-candidate rejection for both `new` and `join`, and may attach ahead of earlier rows only while every bypassed row is an unrelated unjoined first-admission attempt; a joined row, a base-chain dependency of the candidate, a rank-indeterminate row, a candidate that is not itself a current ordered admission attempt, or an unresolved/ambiguous join target fails closed on canonical order. An owner operating on their own checked-out PR (local check, membership, renew/rejoin) reports canonical position as evidence only, exactly as before. Ordering never substitutes for compatibility, dependency, policy, freshness, generation integrity, or provider preflight.";
 
 /// Maximum base-chain hops walked while deriving candidate dependencies.
 const MAX_DEPENDENCY_DEPTH: usize = 64;
@@ -31,7 +44,7 @@ const MAX_DEPENDENCY_DEPTH: usize = 64;
 pub enum AdmissionIntent {
     /// First admission: form a new caravan from an unjoined PR.
     New,
-    /// Explicit attach to a named, already resolved live caravan target.
+    /// Attach to a named, already resolved live caravan target.
     Join,
 }
 
@@ -42,6 +55,48 @@ impl AdmissionIntent {
             Self::New => "new",
             Self::Join => "join",
         }
+    }
+}
+
+/// Who selected this candidate. Orthogonal to [`AdmissionIntent`]: `new` is not
+/// a synonym for automatic selection, and `join` is not a synonym for explicit
+/// selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmissionSelection {
+    /// Sync/`next-candidate` automatic order. FIFO binds it without exception.
+    Automatic,
+    /// An owner named this exact remote candidate (`cara check --pr N`, with or
+    /// without `--tail-pr`/`--head-pr`). Deliberate admission intent.
+    Explicit,
+    /// The owner is operating on their own checked-out PR (local `check`, and
+    /// every local membership operation including renew/rejoin). Canonical
+    /// position is reported as evidence and never gates the receipt.
+    CheckedOut,
+}
+
+impl AdmissionSelection {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Automatic => "automatic",
+            Self::Explicit => "explicit",
+            Self::CheckedOut => "checked_out",
+        }
+    }
+
+    /// Whether canonical order may be relaxed for an unrelated unjoined row.
+    /// Automatic selection never relaxes it; both owner-driven selections do.
+    #[must_use]
+    pub const fn relaxes_order(self) -> bool {
+        matches!(self, Self::Explicit | Self::CheckedOut)
+    }
+
+    /// Whether the owner is operating on their own checked-out PR, where
+    /// canonical position has always been evidence rather than a gate.
+    #[must_use]
+    pub const fn is_checked_out(self) -> bool {
+        matches!(self, Self::CheckedOut)
     }
 }
 
@@ -57,8 +112,9 @@ pub enum OrderedRowDisposition {
     BlockedDependency,
     /// Row's canonical rank cannot be computed, so nothing may pass it.
     BlockedRankIndeterminate,
-    /// FIFO governs first-admission/new-caravan intent without exception.
-    BlockedNewIntent,
+    /// Automatic selection never passes an earlier ordered row, for either
+    /// intent.
+    BlockedAutomaticOrder,
 }
 
 impl OrderedRowDisposition {
@@ -85,20 +141,23 @@ pub struct OrderedRow {
 pub enum AdmissionOrderOutcome {
     /// Candidate is the canonical first ordered admission attempt.
     Canonical,
-    /// Explicit join attaches ahead of unrelated unjoined FIFO rows.
-    JoinAheadOfUnjoined,
+    /// Explicit owner intent attaches ahead of unrelated unjoined FIFO rows.
+    ExplicitAheadOfUnjoined,
     /// Fail closed behind the canonical row.
     BlockedByOrder,
     /// Ordering permitted the attach; exact preflight rejected it anyway.
     BlockedByPreflight,
     /// Candidate is already an active caravan member; ordering does not apply.
     AlreadyEnrolled,
+    /// The owner is operating on their own checked-out PR; canonical position
+    /// is evidence only and never gates this receipt.
+    OwnerSelected,
 }
 
 impl AdmissionOrderOutcome {
     #[must_use]
     pub const fn admits_ahead_of_fifo(self) -> bool {
-        matches!(self, Self::JoinAheadOfUnjoined)
+        matches!(self, Self::ExplicitAheadOfUnjoined)
     }
 }
 
@@ -108,6 +167,9 @@ impl AdmissionOrderOutcome {
 pub struct AdmissionIntentDecision {
     pub schema_version: u32,
     pub intent: AdmissionIntent,
+    /// Who chose this candidate. Automatic selection is FIFO-bound for both
+    /// intents; explicit owner selection is not.
+    pub selection: AdmissionSelection,
     pub outcome: AdmissionOrderOutcome,
     pub candidate_pr: PrNumber,
     /// Canonical first ordered attempt at decision time, when one exists.
@@ -153,8 +215,9 @@ impl AdmissionIntentDecision {
         matches!(
             self.outcome,
             AdmissionOrderOutcome::Canonical
-                | AdmissionOrderOutcome::JoinAheadOfUnjoined
+                | AdmissionOrderOutcome::ExplicitAheadOfUnjoined
                 | AdmissionOrderOutcome::AlreadyEnrolled
+                | AdmissionOrderOutcome::OwnerSelected
         )
     }
 
@@ -171,7 +234,8 @@ impl AdmissionIntentDecision {
         if !preflight_clean && self.outcome.admits_ahead_of_fifo() {
             self.outcome = AdmissionOrderOutcome::BlockedByPreflight;
             self.reason = format!(
-                "explicit join intent cleared canonical order, but exact preflight rejected the attach; {}",
+                "explicit {} intent cleared canonical order, but exact preflight rejected the attach; {}",
+                self.intent.name(),
                 self.reason
             );
         }
@@ -227,7 +291,11 @@ pub fn dependency_prs(analysis: &GraphAnalysis, candidate: &PullRequestSnapshot)
 ///
 /// `target` is the already resolved join target: an unresolved or ambiguous
 /// target never reaches this function, so ordering can never be relaxed by a
-/// guess about which caravan an operator meant.
+/// guess about which caravan an operator meant. `selection` records who chose
+/// the candidate: [`AdmissionSelection::Automatic`] is FIFO-bound for either
+/// intent, [`AdmissionSelection::Explicit`] may pass earlier unrelated unjoined
+/// rows for either intent, and [`AdmissionSelection::CheckedOut`] reports
+/// canonical position as evidence without ever gating on it.
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn evaluate(
@@ -235,6 +303,7 @@ pub fn evaluate(
     analysis: &GraphAnalysis,
     candidate: &PullRequestSnapshot,
     target: Option<&Caravan>,
+    selection: AdmissionSelection,
 ) -> AdmissionIntentDecision {
     let intent = target.map_or(AdmissionIntent::New, |_| AdmissionIntent::Join);
     let unranked = admission.priority_labels.len() + 1;
@@ -248,6 +317,7 @@ pub fn evaluate(
     let mut decision = AdmissionIntentDecision {
         schema_version: 1,
         intent,
+        selection,
         outcome: AdmissionOrderOutcome::BlockedByOrder,
         candidate_pr: candidate.number,
         canonical_candidate_pr: admission.next_candidate,
@@ -282,6 +352,12 @@ pub fn evaluate(
     }
 
     let Some(candidate_row) = candidate_row else {
+        if selection == AdmissionSelection::CheckedOut {
+            decision.outcome = AdmissionOrderOutcome::OwnerSelected;
+            "owner is operating on this exact checked-out PR; canonical order is evidence only"
+                .clone_into(&mut decision.reason);
+            return decision;
+        }
         decision.reason = admission
             .rejected
             .iter()
@@ -320,10 +396,10 @@ pub fn evaluate(
             OrderedRowDisposition::BlockedJoined
         } else if dependency_set.contains(&row.pr) {
             OrderedRowDisposition::BlockedDependency
-        } else if intent == AdmissionIntent::New {
-            OrderedRowDisposition::BlockedNewIntent
-        } else {
+        } else if selection.relaxes_order() {
             OrderedRowDisposition::BypassedUnjoined
+        } else {
+            OrderedRowDisposition::BlockedAutomaticOrder
         };
         rows.push(OrderedRow {
             pr: row.pr,
@@ -367,36 +443,37 @@ pub fn evaluate(
         .collect();
     decision.ordered_rows_ahead = rows;
 
-    if intent == AdmissionIntent::New {
+    if !selection.relaxes_order() {
         decision.reason = admission.next_candidate.map_or_else(
             || {
-                "new-caravan intent is not selectable because no canonical admission attempt exists"
+                "automatic admission is not selectable because no canonical attempt exists"
                     .to_owned()
             },
             |canonical| {
                 format!(
-                    "FIFO governs first admission; new-caravan intent fails closed on canonical PR #{canonical}"
+                    "priority/FIFO binds automatic selection for {} intent; fail closed on canonical PR #{canonical}",
+                    intent.name()
                 )
             },
         );
         return decision;
     }
 
+    let target_text = decision.target_caravan.map_or_else(
+        || "forming a new caravan".to_owned(),
+        |id| format!("to caravan #{id}"),
+    );
     if decision.blocking_prs.is_empty() {
-        decision.outcome = AdmissionOrderOutcome::JoinAheadOfUnjoined;
+        decision.outcome = AdmissionOrderOutcome::ExplicitAheadOfUnjoined;
         decision.reason = if decision.bypassed_unjoined_prs.is_empty() {
             format!(
-                "explicit join intent to caravan #{}; no earlier ordered row exists",
-                decision
-                    .target_caravan
-                    .map_or_else(|| "?".to_owned(), |id| id.to_string())
+                "explicit {} intent {target_text}; no earlier ordered row exists",
+                intent.name()
             )
         } else {
             format!(
-                "explicit join intent to caravan #{}; earlier row(s) {} bypassed only because they are unrelated unjoined first-admission attempts",
-                decision
-                    .target_caravan
-                    .map_or_else(|| "?".to_owned(), |id| id.to_string()),
+                "explicit {} intent {target_text}; earlier row(s) {} bypassed only because they are unrelated unjoined first-admission attempts and keep their canonical order",
+                intent.name(),
                 decision
                     .bypassed_unjoined_prs
                     .iter()
@@ -408,15 +485,29 @@ pub fn evaluate(
         return decision;
     }
 
+    let blocking = decision
+        .ordered_rows_ahead
+        .iter()
+        .filter(|row| !row.disposition.bypassed())
+        .map(|row| format!("#{} ({:?})", row.pr, row.disposition))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if selection.is_checked_out() {
+        // The owner is already on this exact PR; local `check` and every local
+        // membership operation have never been gated by canonical order. The
+        // rows are still reported so the receipt states exactly what a remote
+        // explicit request would have failed closed on.
+        decision.outcome = AdmissionOrderOutcome::OwnerSelected;
+        decision.reason = format!(
+            "owner is operating on this exact checked-out PR; canonical order is evidence only; a remote explicit {} request would fail closed on earlier row(s) {blocking}",
+            intent.name()
+        );
+        return decision;
+    }
+
     decision.reason = format!(
-        "explicit join intent fails closed: earlier row(s) {} are not unrelated unjoined attempts",
-        decision
-            .ordered_rows_ahead
-            .iter()
-            .filter(|row| !row.disposition.bypassed())
-            .map(|row| format!("#{} ({:?})", row.pr, row.disposition))
-            .collect::<Vec<_>>()
-            .join(", ")
+        "explicit {} intent {target_text} fails closed: earlier row(s) {blocking} are not unrelated unjoined attempts",
+        intent.name()
     );
     decision
 }

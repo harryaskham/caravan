@@ -91,7 +91,8 @@ fn admission(analysis: &GraphAnalysis) -> AdmissionStatus {
     )
 }
 
-/// Older unjoined FIFO row plus a valid newer explicit join.
+/// Explicit owner `join` passes an older unrelated unjoined FIFO row while that
+/// row keeps its canonical first-admission position.
 #[test]
 fn explicit_join_passes_only_unrelated_unjoined_fifo_rows() {
     let analysis = analysis(vec![
@@ -109,10 +110,20 @@ fn explicit_join_passes_only_unrelated_unjoined_fifo_rows() {
         "FIFO still names the oldest unjoined row"
     );
 
-    let decision = evaluate(&admission, &analysis, &candidate, Some(&target));
+    let decision = evaluate(
+        &admission,
+        &analysis,
+        &candidate,
+        Some(&target),
+        AdmissionSelection::Explicit,
+    );
 
     assert_eq!(decision.intent, AdmissionIntent::Join);
-    assert_eq!(decision.outcome, AdmissionOrderOutcome::JoinAheadOfUnjoined);
+    assert_eq!(decision.selection, AdmissionSelection::Explicit);
+    assert_eq!(
+        decision.outcome,
+        AdmissionOrderOutcome::ExplicitAheadOfUnjoined
+    );
     assert!(decision.bypasses_fifo());
     assert_eq!(decision.target_caravan, Some(PrNumber(1)));
     assert_eq!(decision.target_tail, Some(PrNumber(1)));
@@ -136,31 +147,86 @@ fn explicit_join_passes_only_unrelated_unjoined_fifo_rows() {
     assert_eq!(decision.policy, ADMISSION_INTENT_POLICY);
 }
 
-/// FIFO still governs first admission and new-caravan intent.
+/// Restored reviewed semantics (bd-7099e8): explicit owner `new` intent is the
+/// same deliberate admission intent as explicit `join`. Cara 0.0.10 recognized
+/// the intent but applied FIFO anyway; the two must agree.
 #[test]
-fn new_intent_never_bypasses_an_older_fifo_row() {
+fn explicit_new_intent_also_passes_unrelated_unjoined_fifo_rows() {
     let analysis = analysis(vec![
+        pr(2113, "old-unjoined", "main", false),
+        pr(2213, "generation4", "main", false),
+    ]);
+    let admission = admission(&analysis);
+    let candidate = analysis.pull_requests[&PrNumber(2213)].clone();
+
+    let decision = evaluate(
+        &admission,
+        &analysis,
+        &candidate,
+        None,
+        AdmissionSelection::Explicit,
+    );
+
+    assert_eq!(decision.intent, AdmissionIntent::New);
+    assert_eq!(decision.selection, AdmissionSelection::Explicit);
+    assert_eq!(
+        decision.outcome,
+        AdmissionOrderOutcome::ExplicitAheadOfUnjoined
+    );
+    assert!(decision.bypasses_fifo());
+    assert!(decision.target_caravan.is_none());
+    assert_eq!(decision.bypassed_unjoined_prs, vec![PrNumber(2113)]);
+    assert!(decision.blocking_prs.is_empty());
+    assert_eq!(
+        decision.ordered_rows_ahead[0].disposition,
+        OrderedRowDisposition::BypassedUnjoined
+    );
+    assert!(decision.reason.contains("forming a new caravan"));
+    assert_eq!(
+        admission.next_candidate,
+        Some(PrNumber(2113)),
+        "the bypassed row keeps its canonical first-admission position"
+    );
+}
+
+/// Automatic priority/FIFO selection is a separate axis and is bound by order
+/// for `new` and `join` intent alike.
+#[test]
+fn automatic_selection_never_bypasses_an_earlier_row_for_either_intent() {
+    let analysis = analysis(vec![
+        pr(1, "root", "main", true),
         pr(2113, "old-unjoined", "main", false),
         pr(2179, "green", "main", false),
     ]);
     let admission = admission(&analysis);
     let candidate = analysis.pull_requests[&PrNumber(2179)].clone();
+    let target = analysis.fleet.caravans[0].clone();
 
-    let decision = evaluate(&admission, &analysis, &candidate, None);
+    for intent_target in [None, Some(&target)] {
+        let decision = evaluate(
+            &admission,
+            &analysis,
+            &candidate,
+            intent_target,
+            AdmissionSelection::Automatic,
+        );
 
-    assert_eq!(decision.intent, AdmissionIntent::New);
-    assert_eq!(decision.outcome, AdmissionOrderOutcome::BlockedByOrder);
-    assert!(!decision.bypasses_fifo());
-    assert!(decision.bypassed_unjoined_prs.is_empty());
-    assert_eq!(decision.blocking_prs, vec![PrNumber(2113)]);
-    assert_eq!(
-        decision.ordered_rows_ahead[0].disposition,
-        OrderedRowDisposition::BlockedNewIntent
-    );
-    assert!(decision.reason.contains("FIFO governs first admission"));
+        assert_eq!(decision.selection, AdmissionSelection::Automatic);
+        assert_eq!(decision.outcome, AdmissionOrderOutcome::BlockedByOrder);
+        assert!(!decision.bypasses_fifo());
+        assert!(!decision.order_permits_admission());
+        assert!(decision.bypassed_unjoined_prs.is_empty());
+        assert_eq!(decision.blocking_prs, vec![PrNumber(2113)]);
+        assert_eq!(
+            decision.ordered_rows_ahead[0].disposition,
+            OrderedRowDisposition::BlockedAutomaticOrder
+        );
+        assert!(decision.reason.contains("binds automatic selection"));
+    }
 }
 
-/// The canonical row itself is canonical for either intent.
+/// The canonical row itself is canonical for either intent and either
+/// selection.
 #[test]
 fn canonical_candidate_is_reported_without_bypass() {
     let analysis = analysis(vec![
@@ -171,14 +237,21 @@ fn canonical_candidate_is_reported_without_bypass() {
     let candidate = analysis.pull_requests[&PrNumber(2113)].clone();
     let target = analysis.fleet.caravans[0].clone();
 
-    let decision = evaluate(&admission, &analysis, &candidate, Some(&target));
+    for selection in [
+        AdmissionSelection::Automatic,
+        AdmissionSelection::Explicit,
+        AdmissionSelection::CheckedOut,
+    ] {
+        let decision = evaluate(&admission, &analysis, &candidate, Some(&target), selection);
 
-    assert_eq!(decision.outcome, AdmissionOrderOutcome::Canonical);
-    assert!(!decision.bypasses_fifo());
-    assert!(decision.ordered_rows_ahead.is_empty());
+        assert_eq!(decision.outcome, AdmissionOrderOutcome::Canonical);
+        assert!(!decision.bypasses_fifo());
+        assert!(decision.order_permits_admission());
+        assert!(decision.ordered_rows_ahead.is_empty());
+    }
 }
 
-/// A joined ancestor/dependency is never skipped.
+/// A joined ancestor/dependency is never skipped, for `new` or `join` intent.
 #[test]
 fn joined_and_dependency_rows_are_never_bypassed() {
     // #2100 is the candidate's exact base-chain parent and still unjoined;
@@ -193,27 +266,35 @@ fn joined_and_dependency_rows_are_never_bypassed() {
     let candidate = analysis.pull_requests[&PrNumber(2179)].clone();
     let target = analysis.fleet.caravans[0].clone();
 
-    let decision = evaluate(&admission, &analysis, &candidate, Some(&target));
+    for intent_target in [None, Some(&target)] {
+        let decision = evaluate(
+            &admission,
+            &analysis,
+            &candidate,
+            intent_target,
+            AdmissionSelection::Explicit,
+        );
 
-    assert_eq!(decision.dependency_prs, vec![PrNumber(2100)]);
-    assert_eq!(decision.outcome, AdmissionOrderOutcome::BlockedByOrder);
-    assert!(!decision.bypasses_fifo());
-    assert_eq!(decision.blocking_prs, vec![PrNumber(2100)]);
-    assert_eq!(decision.bypassed_unjoined_prs, vec![PrNumber(2050)]);
-    assert_eq!(
-        decision
-            .ordered_rows_ahead
-            .iter()
-            .find(|row| row.pr == PrNumber(2100))
-            .expect("dependency row is reported")
-            .disposition,
-        OrderedRowDisposition::BlockedDependency
-    );
+        assert_eq!(decision.dependency_prs, vec![PrNumber(2100)]);
+        assert_eq!(decision.outcome, AdmissionOrderOutcome::BlockedByOrder);
+        assert!(!decision.bypasses_fifo());
+        assert_eq!(decision.blocking_prs, vec![PrNumber(2100)]);
+        assert_eq!(decision.bypassed_unjoined_prs, vec![PrNumber(2050)]);
+        assert_eq!(
+            decision
+                .ordered_rows_ahead
+                .iter()
+                .find(|row| row.pr == PrNumber(2100))
+                .expect("dependency row is reported")
+                .disposition,
+            OrderedRowDisposition::BlockedDependency
+        );
+    }
 }
 
-/// A rank-indeterminate row blocks every later attempt, including explicit join.
+/// A rank-indeterminate row blocks every later attempt, for either intent.
 #[test]
-fn rank_indeterminate_rows_block_explicit_join() {
+fn rank_indeterminate_rows_block_explicit_intent() {
     let mut blocked = pr(2113, "old-unjoined", "main", false);
     blocked.labels.insert("caravan-priority:unknown".to_owned());
     let analysis = analysis(vec![
@@ -225,19 +306,28 @@ fn rank_indeterminate_rows_block_explicit_join() {
     let candidate = analysis.pull_requests[&PrNumber(2179)].clone();
     let target = analysis.fleet.caravans[0].clone();
 
-    let decision = evaluate(&admission, &analysis, &candidate, Some(&target));
+    for intent_target in [None, Some(&target)] {
+        let decision = evaluate(
+            &admission,
+            &analysis,
+            &candidate,
+            intent_target,
+            AdmissionSelection::Explicit,
+        );
 
-    assert_eq!(decision.outcome, AdmissionOrderOutcome::BlockedByOrder);
-    assert_eq!(decision.blocking_prs, vec![PrNumber(2113)]);
-    assert_eq!(
-        decision.ordered_rows_ahead[0].disposition,
-        OrderedRowDisposition::BlockedRankIndeterminate
-    );
+        assert_eq!(decision.outcome, AdmissionOrderOutcome::BlockedByOrder);
+        assert_eq!(decision.blocking_prs, vec![PrNumber(2113)]);
+        assert_eq!(
+            decision.ordered_rows_ahead[0].disposition,
+            OrderedRowDisposition::BlockedRankIndeterminate
+        );
+    }
 }
 
-/// A candidate that is not an ordered admission attempt gains nothing from intent.
+/// A candidate that is not an ordered admission attempt gains nothing from
+/// declaring intent, for `new` or `join`.
 #[test]
-fn stale_pinned_or_rejected_candidate_cannot_use_join_intent() {
+fn stale_pinned_or_rejected_candidate_cannot_use_explicit_intent() {
     let mut skipped = pr(2179, "green", "main", false);
     skipped.labels.insert("caravan-join-skipped".to_owned());
     let analysis = analysis(vec![
@@ -249,15 +339,79 @@ fn stale_pinned_or_rejected_candidate_cannot_use_join_intent() {
     let candidate = analysis.pull_requests[&PrNumber(2179)].clone();
     let target = analysis.fleet.caravans[0].clone();
 
-    let decision = evaluate(&admission, &analysis, &candidate, Some(&target));
+    for intent_target in [None, Some(&target)] {
+        let decision = evaluate(
+            &admission,
+            &analysis,
+            &candidate,
+            intent_target,
+            AdmissionSelection::Explicit,
+        );
 
-    assert_eq!(decision.outcome, AdmissionOrderOutcome::BlockedByOrder);
-    assert!(!decision.bypasses_fifo());
-    assert!(
-        decision
-            .reason
-            .contains("not a current ordered admission attempt")
+        assert_eq!(decision.outcome, AdmissionOrderOutcome::BlockedByOrder);
+        assert!(!decision.bypasses_fifo());
+        assert!(
+            decision
+                .reason
+                .contains("not a current ordered admission attempt")
+        );
+    }
+}
+
+/// The owner's own checked-out PR reports canonical position as evidence only:
+/// local `check`, renew, and rejoin were never gated by admission order.
+#[test]
+fn checked_out_owner_selection_reports_order_as_evidence_only() {
+    let stacked = analysis(vec![
+        pr(2050, "unrelated", "main", false),
+        pr(2100, "parent", "main", false),
+        pr(2179, "child", "parent", false),
+    ]);
+    let stacked_admission = admission(&stacked);
+    let candidate = stacked.pull_requests[&PrNumber(2179)].clone();
+
+    let decision = evaluate(
+        &stacked_admission,
+        &stacked,
+        &candidate,
+        None,
+        AdmissionSelection::CheckedOut,
     );
+
+    assert_eq!(decision.selection, AdmissionSelection::CheckedOut);
+    assert_eq!(decision.outcome, AdmissionOrderOutcome::OwnerSelected);
+    assert!(decision.order_permits_admission());
+    assert!(!decision.bypasses_fifo());
+    assert!(decision.reason.contains("evidence only"));
+    assert_eq!(
+        decision
+            .ordered_rows_ahead
+            .iter()
+            .map(|row| row.pr)
+            .collect::<Vec<_>>(),
+        vec![PrNumber(2050), PrNumber(2100)],
+        "provenance still names every ordered row ahead"
+    );
+
+    // A candidate that is not an ordered attempt at all (evicted, skipped) is
+    // still an owner-selected checked-out operation, so renew/rejoin work.
+    let mut evicted_pr = pr(2179, "green", "main", false);
+    evicted_pr.labels.insert("caravan-evicted".to_owned());
+    let evicted = analysis(vec![evicted_pr, pr(2113, "old-unjoined", "main", false)]);
+    let evicted_admission = admission(&evicted);
+    let evicted_candidate = evicted.pull_requests[&PrNumber(2179)].clone();
+    let evicted_decision = evaluate(
+        &evicted_admission,
+        &evicted,
+        &evicted_candidate,
+        None,
+        AdmissionSelection::CheckedOut,
+    );
+    assert_eq!(
+        evicted_decision.outcome,
+        AdmissionOrderOutcome::OwnerSelected
+    );
+    assert!(evicted_decision.order_permits_admission());
 }
 
 /// Failed preflight downgrades an otherwise permitted ordering decision.
@@ -272,7 +426,13 @@ fn failed_preflight_downgrades_a_permitted_join() {
     let candidate = analysis.pull_requests[&PrNumber(2179)].clone();
     let target = analysis.fleet.caravans[0].clone();
 
-    let mut decision = evaluate(&admission, &analysis, &candidate, Some(&target));
+    let mut decision = evaluate(
+        &admission,
+        &analysis,
+        &candidate,
+        Some(&target),
+        AdmissionSelection::Explicit,
+    );
     assert!(decision.bypasses_fifo());
     decision.record_preflight(false, false);
 
@@ -281,6 +441,31 @@ fn failed_preflight_downgrades_a_permitted_join() {
     assert!(!decision.preflight_clean);
     assert!(!decision.order_permits_admission());
     assert!(decision.reason.contains("exact preflight rejected"));
+}
+
+/// The same downgrade applies to a permitted explicit `new`.
+#[test]
+fn failed_preflight_downgrades_a_permitted_new() {
+    let analysis = analysis(vec![
+        pr(2113, "old-unjoined", "main", false),
+        pr(2179, "green", "main", false),
+    ]);
+    let admission = admission(&analysis);
+    let candidate = analysis.pull_requests[&PrNumber(2179)].clone();
+
+    let mut decision = evaluate(
+        &admission,
+        &analysis,
+        &candidate,
+        None,
+        AdmissionSelection::Explicit,
+    );
+    assert!(decision.bypasses_fifo());
+    decision.record_preflight(false, false);
+
+    assert_eq!(decision.outcome, AdmissionOrderOutcome::BlockedByPreflight);
+    assert!(!decision.order_permits_admission());
+    assert!(decision.reason.contains("explicit new intent"));
 }
 
 /// Provider mutation and idempotency are exact, not inferred.
@@ -294,10 +479,22 @@ fn execution_evidence_records_mutation_and_idempotent_replay() {
     let candidate = analysis.pull_requests[&PrNumber(2179)].clone();
     let target = analysis.fleet.caravans[0].clone();
 
-    let mut mutated = evaluate(&admission, &analysis, &candidate, Some(&target));
+    let mut mutated = evaluate(
+        &admission,
+        &analysis,
+        &candidate,
+        Some(&target),
+        AdmissionSelection::Explicit,
+    );
     mutated.record_preflight(true, true);
     mutated.record_execution(true);
-    let mut replayed = evaluate(&admission, &analysis, &candidate, Some(&target));
+    let mut replayed = evaluate(
+        &admission,
+        &analysis,
+        &candidate,
+        Some(&target),
+        AdmissionSelection::Explicit,
+    );
     replayed.record_preflight(true, true);
     replayed.record_execution(false);
 
@@ -316,7 +513,13 @@ fn enrolled_candidate_reports_already_enrolled() {
     let admission = admission(&analysis);
     let candidate = analysis.pull_requests[&PrNumber(2)].clone();
 
-    let decision = evaluate(&admission, &analysis, &candidate, None);
+    let decision = evaluate(
+        &admission,
+        &analysis,
+        &candidate,
+        None,
+        AdmissionSelection::Explicit,
+    );
 
     assert_eq!(decision.outcome, AdmissionOrderOutcome::AlreadyEnrolled);
     assert!(decision.order_permits_admission());
@@ -336,5 +539,51 @@ fn dependency_walk_is_bounded_and_deterministic() {
     assert_eq!(
         dependency_prs(&analysis, &candidate),
         vec![PrNumber(11), PrNumber(12)]
+    );
+}
+
+/// The typed decision serializes with both axes so Cacophony can A/B explicit
+/// owner intent against automatic FIFO selection from JSON alone.
+#[test]
+fn decision_json_names_selection_intent_and_dispositions() {
+    let analysis = analysis(vec![
+        pr(2113, "old-unjoined", "main", false),
+        pr(2213, "generation4", "main", false),
+    ]);
+    let admission = admission(&analysis);
+    let candidate = analysis.pull_requests[&PrNumber(2213)].clone();
+
+    let explicit = serde_json::to_value(evaluate(
+        &admission,
+        &analysis,
+        &candidate,
+        None,
+        AdmissionSelection::Explicit,
+    ))
+    .expect("decision serializes");
+    let automatic = serde_json::to_value(evaluate(
+        &admission,
+        &analysis,
+        &candidate,
+        None,
+        AdmissionSelection::Automatic,
+    ))
+    .expect("decision serializes");
+
+    assert_eq!(explicit["selection"], "explicit");
+    assert_eq!(explicit["intent"], "new");
+    assert_eq!(explicit["outcome"], "explicit_ahead_of_unjoined");
+    assert_eq!(explicit["ordered_rows_ahead"][0]["pr"], 2113);
+    assert_eq!(
+        explicit["ordered_rows_ahead"][0]["disposition"],
+        "bypassed_unjoined"
+    );
+
+    assert_eq!(automatic["selection"], "automatic");
+    assert_eq!(automatic["intent"], "new");
+    assert_eq!(automatic["outcome"], "blocked_by_order");
+    assert_eq!(
+        automatic["ordered_rows_ahead"][0]["disposition"],
+        "blocked_automatic_order"
     );
 }

@@ -183,6 +183,10 @@ pub(super) fn validate_operation_shape(
 }
 
 /// Typed admission-intent provenance for an already active resumed candidate.
+///
+/// Membership always operates on the owner's own current PR, so this is
+/// checked-out owner selection: canonical position is evidence, never a gate.
+/// Automatic priority/FIFO selection stays owned by sync.
 fn resume_admission_intent(
     status: &StatusOutput,
     candidate: &PullRequestSnapshot,
@@ -193,6 +197,7 @@ fn resume_admission_intent(
         &status.analysis,
         candidate,
         target.map(|target| &target.caravan),
+        crate::admission::AdmissionSelection::CheckedOut,
     );
     decision.record_preflight(true, true);
     decision

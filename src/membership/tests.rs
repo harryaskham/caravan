@@ -1442,7 +1442,7 @@ fn explicit_join_admits_ahead_of_older_unjoined_row_with_bound_provenance() {
     assert_eq!(intent.intent, crate::admission::AdmissionIntent::Join);
     assert_eq!(
         intent.outcome,
-        crate::admission::AdmissionOrderOutcome::JoinAheadOfUnjoined
+        crate::admission::AdmissionOrderOutcome::ExplicitAheadOfUnjoined
     );
     assert_eq!(intent.candidate_pr, PrNumber(3));
     assert_eq!(intent.target_caravan, Some(PrNumber(1)));
@@ -1505,7 +1505,7 @@ fn duplicate_explicit_join_retry_resumes_the_same_attach() {
         .expect("retry still emits typed provenance");
     assert_eq!(
         intent.outcome,
-        crate::admission::AdmissionOrderOutcome::JoinAheadOfUnjoined
+        crate::admission::AdmissionOrderOutcome::ExplicitAheadOfUnjoined
     );
     assert_eq!(intent.target_caravan, Some(PrNumber(1)));
     assert_eq!(intent.bypassed_unjoined_prs, vec![PrNumber(2)]);
@@ -1515,6 +1515,52 @@ fn duplicate_explicit_join_retry_resumes_the_same_attach() {
         "the resumed candidate now depends on its joined target root"
     );
     assert!(intent.provider_mutated);
+}
+
+/// bd-7099e8: explicit owner `new` membership is the same deliberate intent as
+/// explicit `join`. The typed decision and the durable audit must both name the
+/// bypassed unrelated unjoined row, exactly as `cara check` reported, and the
+/// mutation must actually happen.
+#[test]
+fn explicit_new_membership_admits_ahead_of_an_older_unjoined_row() {
+    let older = pull_request(2, "two", "main", &[]);
+    let candidate = pull_request(3, "three", "main", &[]);
+    let provider = FakeProvider::with_pull_requests(vec![older.clone(), candidate.clone()]);
+    let discovered = status(candidate, vec![older]);
+    assert_eq!(discovered.admission.next_candidate, Some(PrNumber(2)));
+
+    let output = execute(
+        discovered,
+        &clean,
+        &provider,
+        MembershipRequest {
+            operation: MembershipOperation::New,
+            create_pr: false,
+            tail_pr: None,
+            head_pr: None,
+            reason: None,
+            priority_label: None,
+            agent_priority_labels: Vec::new(),
+        },
+    )
+    .expect("explicit new intent is not blocked by an unrelated unjoined row");
+
+    assert_eq!(output.pull_request.base.name, "main");
+    assert!(output.pull_request.has_label(ACTIVE_LABEL));
+    assert_eq!(output.caravan_id, PrNumber(3));
+    let intent = output
+        .admission_intent
+        .expect("membership binds the typed admission decision");
+    assert_eq!(intent.intent, crate::admission::AdmissionIntent::New);
+    assert_eq!(
+        intent.outcome,
+        crate::admission::AdmissionOrderOutcome::ExplicitAheadOfUnjoined
+    );
+    assert!(intent.target_caravan.is_none());
+    assert_eq!(intent.bypassed_unjoined_prs, vec![PrNumber(2)]);
+    assert!(intent.blocking_prs.is_empty());
+    assert!(intent.provider_mutated);
+    assert!(!intent.idempotent);
 }
 
 /// An ambiguous join target fails closed and never reaches ordering.

@@ -596,6 +596,14 @@ fn run_next_candidate(cli: &Cli) -> Result<(), i32> {
                     .unwrap_or("fail closed: provider attempt metadata unavailable");
                 println!("next admission attempt: #{number} — {reason}");
                 println!("  {}", output.attempt_contract);
+                if let Some(decision) = &output.automatic_selection {
+                    println!(
+                        "  automatic selection={} order={:?}: {}",
+                        decision.selection.name(),
+                        decision.outcome,
+                        decision.reason,
+                    );
+                }
             } else {
                 println!("no automatic-admission attempt");
             }
@@ -2324,7 +2332,8 @@ fn render_admission_intent(intent: &caravan::admission::AdmissionIntentDecision)
     let mut text = String::new();
     let _ = writeln!(
         text,
-        "  admission intent={} order={:?} target_caravan={} bypassed_unjoined=[{}] blocked_by=[{}] provider_mutated={} idempotent={}",
+        "  admission selection={} intent={} order={:?} target_caravan={} bypassed_unjoined=[{}] blocked_by=[{}] provider_mutated={} idempotent={}",
+        intent.selection.name(),
         intent.intent.name(),
         intent.outcome,
         intent
@@ -2401,6 +2410,9 @@ fn render_check(output: &caravan::read::CheckOutput) -> String {
     }
     if let Some(intent) = &output.admission_intent {
         text.push_str(&render_admission_intent(intent));
+    }
+    if let Some(note) = &output.admission_note {
+        let _ = writeln!(text, "  note: {note}");
     }
     for report in &output.compatibility {
         let _ = writeln!(
