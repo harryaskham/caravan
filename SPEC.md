@@ -345,6 +345,15 @@ Fleet navigation is browsing, not queue priority. V1 browses heads by PR number.
 - `cara evict [--pr N] --reason TEXT` — remove a member (current PR by default).
 - `cara split [--pr N]` — make a non-head member the head of a new caravan.
 
+`cara evict --cascade` also releases every member after the selected PR, and
+`cara evict --all` dissolves the whole caravan (bd-e9187e). Both release members
+**tail-first**, so no surviving edge is ever re-linked across a removed member
+and each step is an ordinary audited eviction with its own receipts. A refusal
+stops the sequence and returns `eviction_cascade_interrupted`, naming the
+members already released and the one that failed, so an interrupted cascade is
+resumable rather than a silently half-dissolved chain. `--cascade` and `--all`
+are mutually exclusive.
+
 Eviction adds `caravan-evicted`, removes `caravan` and `caravan-force`, and disables auto-merge. If the evicted PR has a child, that child is retargeted to the evicted PR's predecessor (or the default branch when evicting the head), but only if the new edge and fleet are compatible. The command fails before mutation if it cannot safely close the gap. Evicting a tail needs no rejoin.
 
 Splitting retargets the selected non-head to the default branch, making it a new head. Both resulting caravans must satisfy all graph and fleet compatibility invariants.

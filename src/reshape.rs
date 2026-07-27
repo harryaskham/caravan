@@ -74,11 +74,114 @@ pub fn evict(context: &AppContext, input: &EvictInput) -> Result<ReshapeOutput, 
             "--reason must contain a non-empty eviction rationale",
         ));
     }
-    execute_live(
-        context,
-        ReshapeOperation::Evict,
-        input.pr.map(PrNumber),
-        Some(input.reason.clone()),
+    if input.cascade && input.all {
+        return Err(AppError::validation(
+            "eviction_scope_ambiguous",
+            "--cascade and --all are mutually exclusive: choose the tail suffix or the whole caravan",
+        ));
+    }
+    if !input.cascade && !input.all {
+        return execute_live(
+            context,
+            ReshapeOperation::Evict,
+            input.pr.map(PrNumber),
+            Some(input.reason.clone()),
+        );
+    }
+    evict_many(context, input)
+}
+
+/// Release several members tail-first (bd-e9187e).
+///
+/// A single eviction has to close the gap it opens by re-linking the evicted
+/// member's child onto its predecessor, and that new edge can be incompatible.
+/// Removing the current tail never re-links anything, so an ordered sequence of
+/// tail removals dissolves a chain that no single eviction could touch. Each
+/// step is an ordinary audited eviction with its own receipts, and the sequence
+/// stops at the first refusal rather than leaving a half-dissolved chain
+/// unreported.
+fn evict_many(context: &AppContext, input: &EvictInput) -> Result<ReshapeOutput, AppError> {
+    let status = read::status(context)?;
+    let selected = input
+        .pr
+        .map(PrNumber)
+        .or(status.current_pr)
+        .ok_or_else(|| {
+            AppError::validation(
+                "eviction_pr_required",
+                "no PR was selected and the current branch has no unique open pull request",
+            )
+        })?;
+    let caravan = status
+        .analysis
+        .fleet
+        .containing(selected)
+        .ok_or_else(|| {
+            AppError::validation(
+                "eviction_pr_not_active",
+                format!("PR #{selected} is not an active caravan member"),
+            )
+        })?
+        .clone();
+    let index = caravan
+        .members
+        .iter()
+        .position(|member| *member == selected)
+        .expect("containing caravan holds the selected member");
+    let ordered = if input.all {
+        caravan.members.clone()
+    } else {
+        caravan.members[index..].to_vec()
+    };
+
+    let mut released = Vec::new();
+    let mut last = None;
+    // Tail-first: the last member always has no child, so no gap is opened.
+    for member in ordered.iter().rev().copied() {
+        match execute_live(
+            context,
+            ReshapeOperation::Evict,
+            Some(member),
+            Some(input.reason.clone()),
+        ) {
+            Ok(output) => {
+                released.push(member);
+                last = Some(output);
+            }
+            Err(error) => {
+                return Err(partial_cascade_error(&error, &ordered, &released, member));
+            }
+        }
+    }
+    let mut output = last.ok_or_else(|| {
+        AppError::validation(
+            "eviction_empty_scope",
+            "the selected scope contained no caravan members",
+        )
+    })?;
+    output.affected_prs = released;
+    Ok(output)
+}
+
+/// Report an interrupted cascade honestly, naming what was already released.
+fn partial_cascade_error(
+    error: &AppError,
+    ordered: &[PrNumber],
+    released: &[PrNumber],
+    failed: PrNumber,
+) -> AppError {
+    AppError::structured(
+        error.category(),
+        "eviction_cascade_interrupted",
+        format!("cascading eviction stopped at PR #{failed}: {error}"),
+        Some(json!({
+            "requested_members": ordered,
+            "released_members": released,
+            "failed_member": failed,
+            "source": error.details(),
+            "resumable": true,
+            "safe_next_action": "the released members are already evicted; inspect the reported failure and rerun the same command to continue from the remaining tail",
+        })),
     )
 }
 

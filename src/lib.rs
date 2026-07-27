@@ -775,6 +775,20 @@ pub struct EvictInput {
     /// Human/agent rationale included in the eviction event and hook metadata.
     #[arg(long, value_name = "TEXT")]
     pub reason: String,
+
+    /// Also evict every member after the selected PR (bd-e9187e).
+    ///
+    /// Members are released tail-first, so no surviving edge is ever re-linked
+    /// across a removed member and each individual removal is trivially
+    /// compatible.
+    #[arg(long)]
+    #[serde(default)]
+    pub cascade: bool,
+
+    /// Evict every member of the selected caravan, dissolving it entirely.
+    #[arg(long)]
+    #[serde(default)]
+    pub all: bool,
 }
 
 /// Input for `cara split`.
