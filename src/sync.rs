@@ -28,6 +28,10 @@ use crate::model::{
 };
 use crate::operation_lock::{OperationLock, OperationLockRecovery};
 use crate::read::{self, StatusOutput};
+use crate::required_runs::{
+    self, HeadRunLineage, MissingRequiredRunsProblem, RequiredContextsRead, RequiredRunsClock,
+    RequiredRunsInput, RequiredRunsReceipt, RequiredRunsRecovery, RequiredRunsRetrigger,
+};
 use crate::root_auto_merge::{
     self, ROOT_AUTO_MERGE_ARMING_ATTEMPTS, ROOT_AUTO_MERGE_CONFIRMATION_DELAY,
     ROOT_AUTO_MERGE_CONFIRMATION_READS, RootAutoMergeFailureCause, RootAutoMergeReceipt,
@@ -79,6 +83,10 @@ const CARAVAN_CONTROL_LABELS: [&str; 2] = ["caravan", "caravan-evicted"];
 const AUTO_ADMISSION_SKIP_PREFIX: &str = "<!-- caravan-auto-join-skip-receipt:";
 const MAX_AUTO_ADMISSION_COMMENT_BYTES: usize = 60 * 1024;
 const MAX_RESERVED_CANDIDATE_BUDGET_SECS: u64 = 30;
+/// Default bounded wait before an unreported required context is a stall.
+const DEFAULT_MISSING_REQUIRED_RUNS_GRACE_SECS: u64 = 300;
+/// Stable provenance reason retained on every required-run receipt.
+const REQUIRED_RUNS_CONVERGENCE_REASON: &str = "bounded scheduler verification that every required context has reporting run lineage on the exact current head";
 /// Evolvable deterministic best-effort queue heuristic exposed in receipts.
 pub const AUTO_ADMISSION_HEURISTIC_VERSION: &str = "priority_fifo_greedy_v1";
 
@@ -228,6 +236,11 @@ pub struct SyncSchedulerStatus {
     pub waiting_prs: Vec<PrNumber>,
     #[serde(default)]
     pub held_caravans: Vec<PrNumber>,
+    /// Members whose required contexts have no reporting run lineage on their
+    /// exact current head. A non-empty list always degrades the disposition;
+    /// the scheduler is never healthy while a caravan cannot start CI at all.
+    #[serde(default)]
+    pub missing_required_runs: Vec<MissingRequiredRunsProblem>,
     pub reason: String,
 }
 
@@ -614,6 +627,10 @@ pub struct SyncOutput {
     /// SQUASH auto-merge on its exact current head, with engine provenance.
     #[serde(default)]
     pub root_auto_merge: Vec<RootAutoMergeReceipt>,
+    /// Durable per-member proof that every required context has reporting run
+    /// lineage on the exact current head, or the typed reason it does not.
+    #[serde(default)]
+    pub required_runs: Vec<RequiredRunsReceipt>,
     /// Complete immutable physical-rebase plans approved before the write barrier.
     #[serde(default)]
     pub rebase_plans: Vec<crate::physical_rebase::RebasePlan>,
@@ -729,6 +746,28 @@ pub trait SyncProvider {
         repository: &RepositoryId,
         expected: &PullRequestPrecondition,
     ) -> Result<Vec<WorkflowRunSnapshot>, MutationError>;
+
+    /// Exact protection-declared required contexts for one base branch.
+    fn branch_required_contexts(
+        &self,
+        repository: &RepositoryId,
+        branch: &str,
+    ) -> Result<RequiredContextsRead, MutationError>;
+
+    /// Check-suite and workflow-run lineage on the exact verified head.
+    fn head_run_lineage(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+    ) -> Result<HeadRunLineage, MutationError>;
+
+    /// Request exactly one existing check suite again on the unchanged head.
+    fn rerequest_check_suite(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+        check_suite_id: u64,
+    ) -> Result<GitHubMutationReceipt, MutationError>;
 
     fn failed_run_diagnostics(
         &self,
@@ -868,6 +907,31 @@ impl<R: crate::command::CommandRunner> SyncProvider for GitHubMutationAdapter<R>
         expected: &PullRequestPrecondition,
     ) -> Result<Vec<WorkflowRunSnapshot>, MutationError> {
         self.failed_runs_for_pull_request(repository, expected)
+    }
+
+    fn branch_required_contexts(
+        &self,
+        repository: &RepositoryId,
+        branch: &str,
+    ) -> Result<RequiredContextsRead, MutationError> {
+        self.branch_required_contexts(repository, branch)
+    }
+
+    fn head_run_lineage(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+    ) -> Result<HeadRunLineage, MutationError> {
+        self.head_run_lineage(repository, expected)
+    }
+
+    fn rerequest_check_suite(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+        check_suite_id: u64,
+    ) -> Result<GitHubMutationReceipt, MutationError> {
+        self.rerequest_check_suite(repository, expected, check_suite_id)
     }
 
     fn failed_run_diagnostics(
@@ -2161,6 +2225,8 @@ fn bounded_prefix_output(
             &progress.ci,
             &progress.paused_caravans,
             context.config.rebase_on_join,
+            &progress.required_runs,
+            &progress.missing_required_runs,
         )
     };
     Ok(SyncOutput {
@@ -2186,6 +2252,7 @@ fn bounded_prefix_output(
         lock_recovery,
         provider_receipts: progress.provider_receipts,
         root_auto_merge: Vec::new(),
+        required_runs: progress.required_runs,
         rebase_plans: progress.rebase_plans,
         rebase_receipts: progress.rebase_receipts,
         historical_predecessor: read::historical_predecessor(&status),
@@ -2464,6 +2531,7 @@ fn sync_with_lock(
             .max_mutations_per_tick
             .saturating_sub(physical_mutations),
         &rewritten_heads,
+        RequiredRunsPolicy::from_config(&context.config.sync),
     )?;
     if context.config.rebase_on_join {
         physical_rebuild.steps.append(&mut progress.steps);
@@ -2570,6 +2638,7 @@ fn sync_with_lock(
                     .max_mutations_per_tick
                     .saturating_sub(completed_mutation_count(&progress)),
                 &rewritten_heads,
+                RequiredRunsPolicy::from_config(&context.config.sync),
             )
             .map_err(|error| {
                 attach_auto_admission_progress(&error, context, &progress, &github_budget)
@@ -2613,6 +2682,8 @@ fn sync_with_lock(
         &progress.ci,
         &progress.paused_caravans,
         context.config.rebase_on_join,
+        &progress.required_runs,
+        &progress.missing_required_runs,
     );
     Ok(SyncOutput {
         receipt: progress.operation_receipt(),
@@ -2628,6 +2699,7 @@ fn sync_with_lock(
         lock_recovery,
         provider_receipts: progress.provider_receipts,
         root_auto_merge: progress.root_auto_merge,
+        required_runs: progress.required_runs,
         rebase_plans: progress.rebase_plans,
         rebase_receipts: progress.rebase_receipts,
         historical_predecessor: read::historical_predecessor(&status),
@@ -2685,6 +2757,21 @@ fn completed_mutation_count(progress: &SyncProgress) -> u32 {
     .unwrap_or(u32::MAX)
 }
 
+/// Keep one hook notification per distinct required-run problem fingerprint.
+fn dedupe_required_runs_events(events: &mut Vec<CaravanEvent>) {
+    let mut seen = BTreeSet::new();
+    events.retain(|event| {
+        if event.kind != EventKind::RequiredRunsMissing {
+            return true;
+        }
+        event
+            .metadata
+            .get("fingerprint")
+            .and_then(Value::as_str)
+            .is_none_or(|fingerprint| seen.insert(fingerprint.to_owned()))
+    });
+}
+
 fn merge_sync_progress(target: &mut SyncProgress, mut source: SyncProgress) {
     target.steps.append(&mut source.steps);
     target
@@ -2694,6 +2781,16 @@ fn merge_sync_progress(target: &mut SyncProgress, mut source: SyncProgress) {
         target.root_auto_merge.retain(|item| item.pr != receipt.pr);
         target.root_auto_merge.push(receipt);
     }
+    for receipt in std::mem::take(&mut source.required_runs) {
+        target.required_runs.retain(|item| item.pr != receipt.pr);
+        target.required_runs.push(receipt);
+    }
+    for problem in std::mem::take(&mut source.missing_required_runs) {
+        required_runs::push_problem(&mut target.missing_required_runs, problem);
+    }
+    for (branch, read) in std::mem::take(&mut source.required_contexts) {
+        target.required_contexts.entry(branch).or_insert(read);
+    }
     target.rebase_plans.append(&mut source.rebase_plans);
     target.rebase_receipts.append(&mut source.rebase_receipts);
     target.paused_caravans.append(&mut source.paused_caravans);
@@ -2701,6 +2798,9 @@ fn merge_sync_progress(target: &mut SyncProgress, mut source: SyncProgress) {
         .head_advancements
         .append(&mut source.head_advancements);
     target.events.append(&mut source.events);
+    // Two convergence passes over the same member inside one tick must not
+    // notify hooks twice about the same exact stall.
+    dedupe_required_runs_events(&mut target.events);
     for observation in source.ci {
         target.ci.retain(|existing| existing.pr != observation.pr);
         target.ci.push(observation);
@@ -3431,6 +3531,25 @@ fn execute(
         force_merge,
         u32::MAX,
         &BTreeMap::new(),
+        RequiredRunsPolicy::default(),
+    )
+}
+
+#[cfg(test)]
+fn execute_with_required_runs(
+    status: &StatusOutput,
+    provider: &impl SyncProvider,
+    required_runs: RequiredRunsPolicy,
+) -> Result<SyncProgress, AppError> {
+    execute_bounded(
+        status,
+        provider,
+        false,
+        false,
+        false,
+        u32::MAX,
+        &BTreeMap::new(),
+        required_runs,
     )
 }
 
@@ -3443,6 +3562,7 @@ fn execute_bounded(
     force_merge: bool,
     mutation_limit: u32,
     rewritten_heads: &BTreeMap<PrNumber, crate::model::CommitOid>,
+    required_runs: RequiredRunsPolicy,
 ) -> Result<SyncProgress, AppError> {
     let mut caravans = select_caravans(status, all)?;
     let paused_caravans = status
@@ -3463,6 +3583,8 @@ fn execute_bounded(
     });
     let synchronized_caravans = caravans.iter().map(|caravan| caravan.id).collect();
     let mut progress = SyncProgress::new(status, synchronized_caravans, mutation_limit);
+    progress.required_runs_grace_secs = required_runs.grace_secs;
+    progress.required_runs_retrigger_enabled = required_runs.retrigger;
     progress.paused_caravans = paused_caravans;
     for pause in &progress.paused_caravans {
         progress.steps.push(MutationStep {
@@ -3518,6 +3640,11 @@ fn reconcile_caravan(
         let observation = progress.observe_ci(provider, &status.repository, number)?;
         let disposition = observation.disposition;
         progress.ci.push(observation.clone());
+        // Required-run coverage is verified per member before any CI stop, so a
+        // head whose required contexts never started a run is visible even when
+        // an earlier member is legitimately failing, and one stalled member
+        // never suppresses another member's evidence.
+        progress.verify_required_runs(provider, &status.repository, caravan.id, number)?;
         if disposition == CiDisposition::Failed {
             if rerun_failed {
                 progress.rerun_exact_failed_runs(
@@ -4382,6 +4509,75 @@ fn event_timestamp() -> String {
         .to_string()
 }
 
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+/// Bounded required-run policy for one tick.
+#[derive(Debug, Clone, Copy)]
+struct RequiredRunsPolicy {
+    grace_secs: u64,
+    retrigger: bool,
+}
+
+impl Default for RequiredRunsPolicy {
+    fn default() -> Self {
+        Self {
+            grace_secs: DEFAULT_MISSING_REQUIRED_RUNS_GRACE_SECS,
+            retrigger: true,
+        }
+    }
+}
+
+impl RequiredRunsPolicy {
+    fn from_config(config: &crate::config::SyncConfig) -> Self {
+        Self {
+            grace_secs: config.missing_required_runs_grace_secs,
+            retrigger: config.retrigger_missing_required_runs,
+        }
+    }
+}
+
+/// Result of the single auditable retrigger plus its one rediscovery.
+#[derive(Debug)]
+struct RequiredRunsRetriggerOutcome {
+    receipt: RequiredRunsRetrigger,
+    assessment: crate::required_runs::RequiredRunsAssessment,
+    rediscovered: bool,
+}
+
+/// The latest provider timestamp that could have triggered CI for this head.
+///
+/// A rebase publishes a commit whose committer date *is* its publication time,
+/// but an old commit can also be pushed onto a branch long after it was
+/// authored. Taking the later of the commit date and the PR's `updated_at`
+/// therefore never starts the grace countdown before the provider could
+/// possibly have known about the head, so a freshly published head is never
+/// prematurely accused of missing its runs.
+fn head_published_at(
+    current: &PullRequestSnapshot,
+    lineage: Option<&HeadRunLineage>,
+) -> Option<String> {
+    let committed = lineage.and_then(|lineage| lineage.head_committed_at.clone());
+    let updated = current.updated_at.clone();
+    match (committed, updated) {
+        (Some(committed), Some(updated)) => {
+            let committed_secs = required_runs::rfc3339_to_unix_secs(&committed);
+            let updated_secs = required_runs::rfc3339_to_unix_secs(&updated);
+            match (committed_secs, updated_secs) {
+                (Some(left), Some(right)) => Some(if right > left { updated } else { committed }),
+                (Some(_), None) => Some(committed),
+                (None, Some(_)) => Some(updated),
+                (None, None) => None,
+            }
+        }
+        (Some(committed), None) => Some(committed),
+        (None, updated) => updated,
+    }
+}
+
 fn select_caravans(status: &StatusOutput, all: bool) -> Result<Vec<Caravan>, AppError> {
     let mut caravans = if all {
         status.analysis.fleet.caravans.clone()
@@ -4760,6 +4956,15 @@ struct SyncProgress {
     steps: Vec<MutationStep>,
     provider_receipts: Vec<GitHubMutationReceipt>,
     root_auto_merge: Vec<RootAutoMergeReceipt>,
+    /// Durable per-member required-run coverage proof for the exact head.
+    required_runs: Vec<RequiredRunsReceipt>,
+    /// Deduplicated, bounded visible problems for stalled required coverage.
+    missing_required_runs: Vec<MissingRequiredRunsProblem>,
+    /// One protection read per distinct base branch per tick.
+    required_contexts: BTreeMap<String, RequiredContextsRead>,
+    /// Bounded required-run policy configuration for this tick.
+    required_runs_grace_secs: u64,
+    required_runs_retrigger_enabled: bool,
     rebase_plans: Vec<crate::physical_rebase::RebasePlan>,
     rebase_receipts: Vec<crate::physical_rebase::RebaseReceipt>,
     synchronized_caravans: Vec<PrNumber>,
@@ -4784,6 +4989,11 @@ impl SyncProgress {
             steps: Vec::new(),
             provider_receipts: Vec::new(),
             root_auto_merge: Vec::new(),
+            required_runs: Vec::new(),
+            missing_required_runs: Vec::new(),
+            required_contexts: BTreeMap::new(),
+            required_runs_grace_secs: DEFAULT_MISSING_REQUIRED_RUNS_GRACE_SECS,
+            required_runs_retrigger_enabled: true,
             rebase_plans: Vec::new(),
             rebase_receipts: Vec::new(),
             synchronized_caravans,
@@ -4969,6 +5179,289 @@ impl SyncProgress {
             failure_diagnostics,
             rerunnable_run_ids,
         })
+    }
+
+    /// Prove that every required context has *some* reporting lineage on the
+    /// exact current head, instead of trusting an empty rollup forever.
+    ///
+    /// A rebase-on-join can publish a head GitHub never starts a run for. The
+    /// PR then reports no pending and no failed check, so a rollup-only
+    /// scheduler waits silently while the whole caravan is dead. This member-
+    /// scoped verification:
+    ///
+    /// 1. discovers required contexts from protection on the exact base branch;
+    /// 2. reads run/check-suite lineage for the exact head only when a required
+    ///    context is absent from the rollup, keeping the healthy path cheap;
+    /// 3. classifies `missing_required_runs` apart from pending, failing,
+    ///    cancelled/superseded and unknown provider state;
+    /// 4. requests at most one auditable check-suite rerequest on the unchanged
+    ///    head and rediscovers exactly once;
+    /// 5. records a sealed receipt plus a deduplicated visible problem instead
+    ///    of failing the tick, so one stalled member never hides another.
+    fn verify_required_runs(
+        &mut self,
+        provider: &impl SyncProvider,
+        repository: &RepositoryId,
+        caravan_id: PrNumber,
+        number: PrNumber,
+    ) -> Result<(), AppError> {
+        let current = self.current.get(&number).expect("sync member").clone();
+        let contexts =
+            self.discover_required_contexts(provider, repository, &current.base.name, number)?;
+        let assessment = self.assess_required_runs(provider, repository, &current, &contexts)?;
+
+        let outcome = match assessment.recovery {
+            RequiredRunsRecovery::RerequestCheckSuite { check_suite_id }
+                if self.required_runs_retrigger_enabled =>
+            {
+                Some(self.retrigger_required_runs(
+                    provider,
+                    repository,
+                    number,
+                    check_suite_id,
+                    &contexts,
+                    &assessment,
+                )?)
+            }
+            _ => None,
+        };
+        // Exactly one rediscovery decides the final receipt, so a successful
+        // retrigger is never reported as a stall and a refused one is never
+        // retried inside the same tick.
+        let (assessment, retrigger) = match outcome {
+            Some(outcome) if outcome.rediscovered => (outcome.assessment, Some(outcome.receipt)),
+            Some(outcome) => (assessment, Some(outcome.receipt)),
+            None => (assessment, None),
+        };
+
+        self.push_required_runs(caravan_id, assessment, retrigger);
+        Ok(())
+    }
+
+    /// Read-only required-run assessment for planning. Never mutates the
+    /// provider, so a dry run reveals an upcoming stall without recovering it.
+    fn observe_required_runs(
+        &mut self,
+        provider: &impl SyncProvider,
+        repository: &RepositoryId,
+        number: PrNumber,
+    ) -> Result<crate::required_runs::RequiredRunsAssessment, AppError> {
+        let current = self.current.get(&number).expect("sync member").clone();
+        let contexts =
+            self.discover_required_contexts(provider, repository, &current.base.name, number)?;
+        self.assess_required_runs(provider, repository, &current, &contexts)
+    }
+
+    /// One protection read per distinct base branch per tick.
+    fn discover_required_contexts(
+        &mut self,
+        provider: &impl SyncProvider,
+        repository: &RepositoryId,
+        branch: &str,
+        number: PrNumber,
+    ) -> Result<RequiredContextsRead, AppError> {
+        if let Some(cached) = self.required_contexts.get(branch) {
+            return Ok(cached.clone());
+        }
+        let read = provider
+            .branch_required_contexts(repository, branch)
+            .map_err(|error| mutation_error(&error, self, Some(number)))?
+            .normalized();
+        self.required_contexts
+            .insert(branch.to_owned(), read.clone());
+        Ok(read)
+    }
+
+    /// Assess one member, reading head lineage only when it can change the answer.
+    fn assess_required_runs(
+        &self,
+        provider: &impl SyncProvider,
+        repository: &RepositoryId,
+        current: &PullRequestSnapshot,
+        contexts: &RequiredContextsRead,
+    ) -> Result<crate::required_runs::RequiredRunsAssessment, AppError> {
+        let reporting = current
+            .checks
+            .iter()
+            .filter(|check| check.state != crate::model::CheckState::Expected)
+            .map(|check| check.name.as_str())
+            .collect::<BTreeSet<_>>();
+        let absent = contexts
+            .contexts
+            .iter()
+            .any(|context| !reporting.contains(context.as_str()));
+        let lineage = if absent && contexts.complete && !contexts.contexts.is_empty() {
+            Some(
+                provider
+                    .head_run_lineage(repository, &PullRequestPrecondition::from(current))
+                    .map_err(|error| mutation_error(&error, self, Some(current.number)))?,
+            )
+        } else {
+            None
+        };
+        Ok(self.assess_with_lineage(current, contexts, lineage.as_ref()))
+    }
+
+    fn assess_with_lineage(
+        &self,
+        current: &PullRequestSnapshot,
+        contexts: &RequiredContextsRead,
+        lineage: Option<&HeadRunLineage>,
+    ) -> crate::required_runs::RequiredRunsAssessment {
+        let published = head_published_at(current, lineage);
+        required_runs::assess(&RequiredRunsInput {
+            pr: current.number,
+            head: &current.head,
+            base: &current.base,
+            contexts,
+            lineage,
+            checks: &current.checks,
+            head_published_at: published.as_deref(),
+            clock: RequiredRunsClock {
+                now_unix: now_unix(),
+                grace_secs: self.required_runs_grace_secs,
+            },
+        })
+    }
+
+    /// Issue the single auditable rerequest and rediscover exactly once.
+    fn retrigger_required_runs(
+        &mut self,
+        provider: &impl SyncProvider,
+        repository: &RepositoryId,
+        number: PrNumber,
+        check_suite_id: u64,
+        contexts: &RequiredContextsRead,
+        before_recovery: &crate::required_runs::RequiredRunsAssessment,
+    ) -> Result<RequiredRunsRetriggerOutcome, AppError> {
+        let before = self.current.get(&number).expect("sync member").clone();
+        self.ensure_mutation_capacity(1)?;
+        let requested =
+            provider.rerequest_check_suite(repository, &self.precondition(number), check_suite_id);
+        let failure = match requested {
+            Ok(receipt) => {
+                self.record(
+                    receipt,
+                    &format!(
+                        "requested check suite {check_suite_id} again on unchanged head {}",
+                        before.head.oid
+                    ),
+                );
+                None
+            }
+            Err(error) => Some(error.to_string()),
+        };
+        if let Some(failure) = failure {
+            // A refused request changes nothing, so the pre-recovery verdict is
+            // still the exact truth about this head.
+            return Ok(RequiredRunsRetriggerOutcome {
+                receipt: RequiredRunsRetrigger {
+                    check_suite_id,
+                    head_oid: before.head.oid.clone(),
+                    attempts: crate::required_runs::REQUIRED_RUNS_RETRIGGER_ATTEMPTS,
+                    requested: false,
+                    rediscovered: false,
+                    status_after: before_recovery.status,
+                    failure: Some(failure),
+                },
+                assessment: before_recovery.clone(),
+                rediscovered: false,
+            });
+        }
+
+        let refreshed = provider
+            .refetch_pull_request(repository, number)
+            .map_err(|error| mutation_error(&error, self, Some(number)))?;
+        // A head that moved during recovery belongs to a different generation;
+        // its coverage is decided by the next bounded tick, never by this one.
+        if refreshed.head.oid != before.head.oid {
+            return Ok(RequiredRunsRetriggerOutcome {
+                receipt: RequiredRunsRetrigger {
+                    check_suite_id,
+                    head_oid: before.head.oid.clone(),
+                    attempts: crate::required_runs::REQUIRED_RUNS_RETRIGGER_ATTEMPTS,
+                    requested: true,
+                    rediscovered: false,
+                    status_after: before_recovery.status,
+                    failure: Some(format!(
+                        "head moved from {} to {} during recovery",
+                        before.head.oid, refreshed.head.oid
+                    )),
+                },
+                assessment: before_recovery.clone(),
+                rediscovered: false,
+            });
+        }
+        self.current.insert(number, refreshed.clone());
+        let lineage = provider
+            .head_run_lineage(repository, &PullRequestPrecondition::from(&refreshed))
+            .map_err(|error| mutation_error(&error, self, Some(number)))?;
+        let assessment = self.assess_with_lineage(&refreshed, contexts, Some(&lineage));
+        Ok(RequiredRunsRetriggerOutcome {
+            receipt: RequiredRunsRetrigger {
+                check_suite_id,
+                head_oid: refreshed.head.oid.clone(),
+                attempts: crate::required_runs::REQUIRED_RUNS_RETRIGGER_ATTEMPTS,
+                requested: true,
+                rediscovered: true,
+                status_after: assessment.status,
+                failure: None,
+            },
+            assessment,
+            rediscovered: true,
+        })
+    }
+
+    /// Seal one receipt, emit bounded deduplicated evidence, and stay visible.
+    fn push_required_runs(
+        &mut self,
+        caravan_id: PrNumber,
+        assessment: crate::required_runs::RequiredRunsAssessment,
+        retrigger: Option<RequiredRunsRetrigger>,
+    ) {
+        let number = assessment.pr;
+        if let Some(problem) = required_runs::problem(caravan_id, &assessment, retrigger.as_ref()) {
+            // Hook evidence is exactly as deduplicated and bounded as the
+            // problem list: an already-visible stall never re-notifies.
+            let event = self.event(
+                EventKind::RequiredRunsMissing,
+                Some(caravan_id),
+                vec![number],
+                Some(problem.message.clone()),
+                BTreeMap::from([
+                    ("problem".to_owned(), json!(problem.clone())),
+                    ("status".to_owned(), json!(assessment.status)),
+                    ("fingerprint".to_owned(), json!(problem.fingerprint.clone())),
+                ]),
+            );
+            if required_runs::push_problem(&mut self.missing_required_runs, problem) {
+                self.events.push(event);
+            }
+        }
+        if let Some(retrigger) = retrigger.as_ref().filter(|item| item.requested) {
+            self.events.push(self.event(
+                EventKind::RequiredRunsRetriggered,
+                Some(caravan_id),
+                vec![number],
+                Some(format!(
+                    "requested check suite {} again on unchanged head {}",
+                    retrigger.check_suite_id, retrigger.head_oid
+                )),
+                BTreeMap::from([
+                    ("retrigger".to_owned(), json!(retrigger.clone())),
+                    ("status_after".to_owned(), json!(retrigger.status_after)),
+                ]),
+            ));
+        }
+        let receipt = required_runs::receipt(
+            &self.repository,
+            caravan_id,
+            assessment,
+            retrigger,
+            required_runs::provenance(&self.operation_id, REQUIRED_RUNS_CONVERGENCE_REASON),
+        );
+        self.required_runs.retain(|existing| existing.pr != number);
+        self.required_runs.push(receipt);
     }
 
     fn rerun_exact_failed_runs(

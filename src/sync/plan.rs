@@ -70,6 +70,9 @@ pub fn plan_sync(context: &AppContext, input: &SyncInput) -> Result<SyncPlanOutp
             selected_ids.clone(),
             context.config.sync.max_mutations_per_tick,
         );
+        progress.required_runs_grace_secs = context.config.sync.missing_required_runs_grace_secs;
+        progress.required_runs_retrigger_enabled =
+            context.config.sync.retrigger_missing_required_runs;
         progress.paused_caravans = status
             .pauses
             .iter()
@@ -395,9 +398,49 @@ pub(super) fn plan_caravan_convergence(
         }
         forced_head |= number == head && disposition == CiDisposition::Forced;
     }
+    // Planning must reveal a head whose required contexts never started a run;
+    // an operator-action stall that only appears after the write barrier would
+    // make the dry run a lie. Recovery itself never happens in a plan.
+    for number in caravan.members.iter().copied() {
+        let assessment = progress.observe_required_runs(provider, &status.repository, number)?;
+        push_plan_action(
+            actions,
+            SyncPlanAction {
+                order: 0,
+                phase: SyncPlanPhase::ProviderConvergence,
+                state: SyncPlanActionState::ReadOnlyObservation,
+                kind: "verify_required_runs".to_owned(),
+                pr: Some(number),
+                caravan_id: Some(caravan.id),
+                expected: status
+                    .analysis
+                    .pull_requests
+                    .get(&number)
+                    .map(PullRequestPrecondition::from),
+                target: Some(json!({
+                    "status": assessment.status,
+                    "required_contexts": assessment.required_contexts,
+                    "missing_contexts": assessment.missing_contexts,
+                    "recovery": assessment.recovery,
+                })),
+                reason:
+                    "required contexts are proven to have reporting run lineage on the exact head"
+                        .to_owned(),
+            },
+        )?;
+        if let Some(problem) = crate::required_runs::problem(caravan.id, &assessment, None) {
+            decisions.push(SyncPlanDecision {
+                code: problem.kind.code().to_owned(),
+                pr: Some(number),
+                reason: problem.message.clone(),
+                next: problem.next.clone(),
+            });
+        }
+    }
     if stopped {
         return Ok(());
     }
+
     if forced_head {
         let mechanically_allowed = force_allowed(status, head_snapshot, force_merge);
         let permission = if mechanically_allowed {

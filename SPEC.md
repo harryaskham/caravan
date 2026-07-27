@@ -416,6 +416,51 @@ review metadata — never blocks required root convergence, because it cannot ma
 arming wrong and treating it as a decision would reintroduce operator
 babysitting.
 
+A head with *no* required-run coverage is a separate failure class from pending
+CI, and it is the one a rollup-only scheduler cannot see. A rebase-on-join can
+publish a head GitHub never starts a workflow run for; the required contexts
+then have zero reporting runs, the PR sits `MERGEABLE`/`BLOCKED` with nothing
+pending and nothing failed, and waiting is futile. Every sync therefore proves,
+per member and on the exact current head, that each protection-declared required
+context has at least one run or check-suite lineage:
+
+- required contexts come from protection on the *exact base branch*, so a member
+  stacked on an unprotected branch requires nothing;
+- an `EXPECTED` rollup placeholder is not reporting evidence, because that is
+  precisely the state which used to look pending forever;
+- lineage is matched on the exact head OID, so a run from a superseded
+  generation is retained as `stale_head_runs` evidence and never as coverage;
+- the expensive lineage read happens only when a required context is absent from
+  the rollup, keeping the healthy path at one protection read per base branch.
+
+The resulting `required_runs` receipt is sealed and carries a typed status:
+`not_required`, `satisfied`, `pending`, `failing`, `cancelled_superseded`,
+`awaiting_grace`, `missing_required_runs`, or `unknown_provider_state`. Nothing
+is declared missing inside the bounded `sync.missing_required_runs_grace_secs`
+window, measured from the latest provider timestamp that could have triggered CI
+for that head, and nothing is ever declared missing from a partial provider read
+or an unparsable head timestamp — those stay `unknown_provider_state`.
+
+Recovery is exactly one auditable check-suite rerequest against the *unchanged*
+head, followed by exactly one rediscovery. The suite is re-read first and
+refused unless it belongs to the exact current head. Empty commits, close/reopen
+loops, force pushes, retargets, and broad reruns are never implicit workarounds:
+head, base, branch, and membership are preserved. When no rerequestable suite
+exists, when the provider refuses, or when the rerequest does not produce
+reporting lineage, the tick emits a typed problem —
+`missing_required_runs` or `cancelled_superseded_required_runs` — naming the
+exact PR, head, and contexts, and the reviewed manual recovery. Engine requests
+emit `required_runs_retriggered`; visible stalls emit `required_runs_missing`
+once per distinct problem fingerprint (kind, PR, head OID, contexts), and both
+problem lists and hook evidence stay bounded.
+
+A stalled member never fails the tick and never contaminates another member: the
+scheduler status degrades instead. `missing_required_runs` in
+`scheduler_status` makes the disposition `operator_action` with wake class
+`operator_action`; `unknown_provider_state` makes it a bounded `retry_tick`;
+`awaiting_grace` members join `waiting_prs` as ordinary CI waits. The scheduler
+is never `healthy` while a caravan cannot start CI at all.
+
 A failed-CI decision contains bounded structured run, job, and failed-step
 facts. For an allowlisted lineage-verification step, Cara requests only the
 first 60 KiB of the job log and retains only a strict
@@ -531,7 +576,9 @@ Core decision kinds include:
 - `unsafe_checkout`;
 - `hook_failure`;
 - `force_merge_denied`;
-- `root_auto_merge_not_durable`.
+- `root_auto_merge_not_durable`;
+- `missing_required_runs` / `cancelled_superseded_required_runs` /
+  `unknown_required_runs_provider_state`.
 
 Human output is concise; `--json` uses stable `mcp-cli` envelopes. Exit status is non-zero for every unresolved decision point.
 
@@ -553,7 +600,9 @@ Hook events include:
 - `ci_failed`;
 - `force_merge_attempted`;
 - `force_merge_completed`;
-- `root_auto_merge_armed`.
+- `root_auto_merge_armed`;
+- `required_runs_missing`;
+- `required_runs_retriggered`.
 
 A hook is a configured shell command. It receives one versioned metadata JSON object on stdin and non-secret context such as `CARA_EVENT`, repository, and PR numbers in environment variables. Hook metadata contains operation/event IDs suitable for external deduplication.
 Before hook delivery, every canonical secret-free event is durably appended with

@@ -35,8 +35,12 @@ after the same check passes.
   run/job/failed-step and exact selected-lineage receipts, and
   `--rerun-failed` reruns only current-generation infrastructure failures.
   Every successful tick includes a versioned `scheduler_status` with exact
-  default/root/tail/member generations and a `healthy`, `waiting_ci`, or `held`
-  disposition. Failed ticks classify `wake_class` as `retry_tick`,
+  default/root/tail/member generations and a `healthy`, `waiting_ci`, `held`,
+  `retry_tick`, or `operator_action` disposition. A successful tick is never
+  `healthy` while a member's required contexts have no reporting run on its
+  exact current head: those members appear in
+  `scheduler_status.missing_required_runs` with the exact PR, head, and
+  contexts. Failed ticks classify `wake_class` as `retry_tick`,
   `external_decision`, or `operator_action`; only an external decision emits a
   repair-wake failure event. Stale provider preconditions are routine retry
   ticks, not merger work. Deterministic unsupported range shapes such as
@@ -466,6 +470,8 @@ sync:
   max_mutations_per_tick: 64
   max_github_requests_per_tick: 256
   max_duration_secs: 120
+  missing_required_runs_grace_secs: 300
+  retrigger_missing_required_runs: true
 loop:
   interval_secs: 60
 journal:
@@ -477,6 +483,21 @@ hooks:
     timeout_secs: 30
     blocking: false
 ```
+
+`sync.missing_required_runs_grace_secs` is the bounded wait before a required
+context with zero reporting run or check-suite lineage on the exact current head
+is reported as `missing_required_runs` instead of pending. GitHub sometimes
+never starts a run for a freshly rebased head; the pull request then sits
+`MERGEABLE`/`BLOCKED` with nothing pending and nothing failed, so waiting is
+futile. Cara reports that member in `scheduler_status.missing_required_runs`
+with the exact PR, head, and contexts, degrades the disposition to
+`operator_action`, and — when `retrigger_missing_required_runs` is enabled and a
+rerequestable check suite exists on the *unchanged* head — issues exactly one
+auditable rerequest and rediscovers once. Cara never pushes an empty commit,
+closes and reopens the PR, force-pushes, or broadly reruns another generation to
+work around it; head, base, branch, and membership are always preserved. A
+partial provider read is reported as `unknown_provider_state` and retried rather
+than being mistaken for an absence.
 
 When enabling cumulative mode, set `sync.max_duration_secs` high enough for
 physical planning plus the typed apply reserve; this repository uses

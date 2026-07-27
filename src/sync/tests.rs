@@ -9,6 +9,14 @@ use crate::model::{
     AutoMergeState, BranchSnapshot, CheckSnapshot, CommitOid, CompatibilityReport,
     RepositorySnapshot,
 };
+use crate::required_runs::{
+    CheckSuiteLineage, HeadRunLineage, MissingRequiredRunsKind, RequiredContextsRead,
+    RequiredRunsStatus, WorkflowRunLineage,
+};
+
+/// Provider timestamp used by every hermetic head in this fixture set. It is
+/// far enough in the past that the default grace period has always elapsed.
+const PUBLISHED_AT: &str = "2020-01-01T00:00:00Z";
 
 struct FakeProvider {
     allows_auto_merge: bool,
@@ -29,6 +37,16 @@ struct FakeProvider {
     branch_head: RefCell<crate::model::CommitOid>,
     audits: RefCell<Vec<ControlLabelAudit>>,
     comments: RefCell<BTreeMap<PrNumber, Vec<String>>>,
+    /// Protection-declared required contexts, keyed by branch name.
+    required_contexts: RefCell<BTreeMap<String, RequiredContextsRead>>,
+    /// Head lineage served for a PR, keyed by PR number.
+    head_lineage: RefCell<BTreeMap<PrNumber, VecDeque<HeadRunLineage>>>,
+    /// Every PR whose head lineage was actually read, in order.
+    lineage_reads: RefCell<Vec<PrNumber>>,
+    /// Check suites the provider will accept a rerequest for.
+    rerequestable_suites: RefCell<BTreeMap<u64, String>>,
+    /// Check-suite rerequests observed, in order.
+    rerequests: RefCell<Vec<(PrNumber, u64)>>,
 }
 
 impl FakeProvider {
@@ -55,7 +73,49 @@ impl FakeProvider {
             branch_head: RefCell::new(branch("main").oid),
             audits: RefCell::new(Vec::new()),
             comments: RefCell::new(BTreeMap::new()),
+            required_contexts: RefCell::new(BTreeMap::new()),
+            head_lineage: RefCell::new(BTreeMap::new()),
+            lineage_reads: RefCell::new(Vec::new()),
+            rerequestable_suites: RefCell::new(BTreeMap::new()),
+            rerequests: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Declare protection-required contexts for one base branch.
+    fn require_contexts(&self, branch: &str, contexts: &[&str]) {
+        self.required_contexts.borrow_mut().insert(
+            branch.to_owned(),
+            RequiredContextsRead {
+                branch: branch.to_owned(),
+                protected: true,
+                contexts: contexts.iter().map(|value| (*value).to_owned()).collect(),
+                complete: true,
+            }
+            .normalized(),
+        );
+    }
+
+    /// Declare an unreadable protection endpoint for one base branch.
+    fn partial_contexts(&self, branch: &str) {
+        self.required_contexts
+            .borrow_mut()
+            .insert(branch.to_owned(), RequiredContextsRead::partial(branch));
+    }
+
+    /// Queue one lineage response; the last queued response repeats.
+    fn serve_lineage(&self, number: PrNumber, lineage: HeadRunLineage) {
+        self.head_lineage
+            .borrow_mut()
+            .entry(number)
+            .or_default()
+            .push_back(lineage);
+    }
+
+    /// Allow one check-suite rerequest against the given head.
+    fn allow_rerequest(&self, check_suite_id: u64, head_sha: &str) {
+        self.rerequestable_suites
+            .borrow_mut()
+            .insert(check_suite_id, head_sha.to_owned());
     }
 
     fn fail_once(&self, kind: MutationKind) {
@@ -453,6 +513,91 @@ impl SyncProvider for FakeProvider {
             "WRITE"
         }
         .to_owned())
+    }
+
+    fn branch_required_contexts(
+        &self,
+        _repository: &RepositoryId,
+        branch: &str,
+    ) -> Result<RequiredContextsRead, MutationError> {
+        Ok(self
+            .required_contexts
+            .borrow()
+            .get(branch)
+            .cloned()
+            .unwrap_or_else(|| RequiredContextsRead::unprotected(branch)))
+    }
+
+    fn head_run_lineage(
+        &self,
+        _repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+    ) -> Result<HeadRunLineage, MutationError> {
+        let current = self
+            .pulls
+            .borrow()
+            .get(&expected.number)
+            .cloned()
+            .expect("fake PR");
+        let actual = PullRequestPrecondition::from(&current);
+        if !actual.mutation_identity_eq(expected) {
+            return Err(MutationError::StalePrecondition {
+                expected: Box::new(expected.clone()),
+                actual: Box::new(actual),
+                changed_fields: vec!["fake_race".to_owned()],
+            });
+        }
+        let mut queued = self.head_lineage.borrow_mut();
+        self.lineage_reads.borrow_mut().push(expected.number);
+        let Some(responses) = queued.get_mut(&expected.number) else {
+            return Ok(HeadRunLineage {
+                head_sha: current.head.oid.0.clone(),
+                check_suites: Vec::new(),
+                workflow_runs: Vec::new(),
+                head_committed_at: Some(PUBLISHED_AT.to_owned()),
+                complete: true,
+            });
+        };
+        if responses.len() > 1 {
+            Ok(responses.pop_front().expect("queued lineage"))
+        } else {
+            Ok(responses.front().cloned().expect("queued lineage"))
+        }
+    }
+
+    fn rerequest_check_suite(
+        &self,
+        _repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+        check_suite_id: u64,
+    ) -> Result<GitHubMutationReceipt, MutationError> {
+        let current = self
+            .pulls
+            .borrow()
+            .get(&expected.number)
+            .cloned()
+            .expect("fake PR");
+        let Some(head_sha) = self
+            .rerequestable_suites
+            .borrow()
+            .get(&check_suite_id)
+            .cloned()
+        else {
+            return Err(MutationError::MissingProviderResource {
+                resource: format!("check-suite/{check_suite_id}"),
+            });
+        };
+        if head_sha != current.head.oid.0 {
+            return Err(MutationError::CheckSuiteHeadMismatch {
+                check_suite_id,
+                expected_head: current.head.oid.0.clone(),
+                actual_head: head_sha,
+            });
+        }
+        self.rerequests
+            .borrow_mut()
+            .push((expected.number, check_suite_id));
+        self.mutate(expected, MutationKind::RequestCheckSuite, |_| {})
     }
 
     fn ensure_control_label_comment(
@@ -1155,8 +1300,14 @@ fn pending_ci_reports_waiting_without_speculative_mutation() {
     assert!(!progress.operation_receipt().changed);
     assert!(progress.events.is_empty());
     assert!(provider.calls.borrow().is_empty());
-    let scheduler =
-        successful_scheduler_status(&status, &progress.ci, &progress.paused_caravans, true);
+    let scheduler = successful_scheduler_status(
+        &status,
+        &progress.ci,
+        &progress.paused_caravans,
+        true,
+        &progress.required_runs,
+        &progress.missing_required_runs,
+    );
     assert_eq!(scheduler.disposition, SchedulerDisposition::WaitingCi);
     assert_eq!(scheduler.wake_class, SchedulerWakeClass::None);
     assert_eq!(
@@ -3175,6 +3326,7 @@ fn rewritten_root_head_is_rearmed_on_the_resulting_generation() {
         false,
         u32::MAX,
         &rewritten,
+        RequiredRunsPolicy::default(),
     )
     .expect("rewritten root converges");
 
@@ -3543,8 +3695,17 @@ fn live_caravan2208_root_converges_without_touching_its_children() {
         "the live generation reproduces the reported auto_merge_invariant"
     );
 
-    let progress = execute_bounded(&status, &provider, true, false, true, u32::MAX, &rewritten)
-        .expect("scheduler converges required root arming");
+    let progress = execute_bounded(
+        &status,
+        &provider,
+        true,
+        false,
+        true,
+        u32::MAX,
+        &rewritten,
+        RequiredRunsPolicy::default(),
+    )
+    .expect("scheduler converges required root arming");
 
     let receipt = root_receipt(&progress, 2208);
     assert!(receipt.hash_is_valid());
@@ -3585,8 +3746,17 @@ fn live_caravan2208_replay_is_a_proven_no_op() {
         CommitOid("79abc31d4efc07a579145cf904c83c1420f8b4ac".to_owned()),
     )]);
 
-    execute_bounded(&status, &provider, true, false, true, u32::MAX, &rewritten)
-        .expect("first tick arms the root");
+    execute_bounded(
+        &status,
+        &provider,
+        true,
+        false,
+        true,
+        u32::MAX,
+        &rewritten,
+        RequiredRunsPolicy::default(),
+    )
+    .expect("first tick arms the root");
     let armed_pulls = provider
         .pulls
         .borrow()
@@ -3596,8 +3766,17 @@ fn live_caravan2208_replay_is_a_proven_no_op() {
     let armed = self::status(armed_pulls, Some(PrNumber(2208)), &clean);
     provider.calls.borrow_mut().clear();
 
-    let progress = execute_bounded(&armed, &provider, true, false, true, u32::MAX, &rewritten)
-        .expect("replay converges without another write");
+    let progress = execute_bounded(
+        &armed,
+        &provider,
+        true,
+        false,
+        true,
+        u32::MAX,
+        &rewritten,
+        RequiredRunsPolicy::default(),
+    )
+    .expect("replay converges without another write");
 
     assert!(provider.calls.borrow().is_empty());
     assert!(armed.analysis.fleet.problems.is_empty());
@@ -4190,4 +4369,710 @@ fn a_fully_retained_chain_still_converges_when_reconciliation_alone_overruns() {
     // Only the hard reserve is held, so the precommit barrier admits the tick.
     assert!(admission.budget.required < deadline);
     assert!(admission.budget.required < admission.complete_budget.required);
+}
+
+// --- Missing required-run detection ------------------------------------------
+//
+// Live caravan2208 evidence: a rebase-on-join published root head
+// `79abc31d…` for which GitHub never started a workflow run. Required contexts
+// `Check & Lint` and `Fast Tests (unit)` had zero reporting runs, so the PR sat
+// MERGEABLE/BLOCKED with nothing pending and nothing failed while Cara reported
+// healthy. These fixtures pin the exact classification and recovery instead.
+
+const CHECK_LINT: &str = "Check & Lint";
+const FAST_TESTS: &str = "Fast Tests (unit)";
+
+fn required_context_names() -> [&'static str; 2] {
+    [CHECK_LINT, FAST_TESTS]
+}
+
+fn head_of(pulls: &[PullRequestSnapshot], number: u64) -> String {
+    pulls
+        .iter()
+        .find(|pull_request| pull_request.number == PrNumber(number))
+        .expect("fixture PR")
+        .head
+        .oid
+        .0
+        .clone()
+}
+
+fn lineage(
+    head_sha: &str,
+    suites: Vec<CheckSuiteLineage>,
+    runs: Vec<WorkflowRunLineage>,
+) -> HeadRunLineage {
+    HeadRunLineage {
+        head_sha: head_sha.to_owned(),
+        check_suites: suites,
+        workflow_runs: runs,
+        head_committed_at: Some(PUBLISHED_AT.to_owned()),
+        complete: true,
+    }
+    .bounded()
+}
+
+fn suite(id: u64, head_sha: &str, status: &str, conclusion: &str) -> CheckSuiteLineage {
+    CheckSuiteLineage {
+        id,
+        head_sha: head_sha.to_owned(),
+        status: status.to_owned(),
+        conclusion: conclusion.to_owned(),
+        app_slug: "github-actions".to_owned(),
+        rerequestable: true,
+    }
+}
+
+fn head_run(run_id: u64, head_sha: &str, status: &str, conclusion: &str) -> WorkflowRunLineage {
+    WorkflowRunLineage {
+        run_id,
+        check_suite_id: run_id,
+        workflow_name: "CI".to_owned(),
+        head_sha: head_sha.to_owned(),
+        status: status.to_owned(),
+        conclusion: conclusion.to_owned(),
+        event: "pull_request".to_owned(),
+    }
+}
+
+fn required_runs_receipt(
+    progress: &SyncProgress,
+    number: u64,
+) -> &crate::required_runs::RequiredRunsReceipt {
+    progress
+        .required_runs
+        .iter()
+        .find(|receipt| receipt.pr == PrNumber(number))
+        .expect("every verified member carries a receipt")
+}
+
+#[test]
+fn a_head_with_zero_required_runs_is_reported_instead_of_waiting_forever() {
+    let pulls = healthy_chain();
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    provider.require_contexts("main", &required_context_names());
+    let status = status(pulls.clone(), Some(PrNumber(1)), &clean);
+
+    let progress =
+        execute(&status, &provider, false, false, false).expect("a stall is not an error");
+
+    let receipt = required_runs_receipt(&progress, 1);
+    assert_eq!(
+        receipt.assessment.status,
+        RequiredRunsStatus::MissingRequiredRuns
+    );
+    assert!(receipt.hash_is_valid());
+    assert_eq!(
+        receipt.assessment.missing_contexts,
+        vec![CHECK_LINT.to_owned(), FAST_TESTS.to_owned()]
+    );
+    assert_eq!(receipt.assessment.observed_check_suites, 0);
+    assert_eq!(receipt.assessment.observed_runs, 0);
+
+    let problem = progress
+        .missing_required_runs
+        .iter()
+        .find(|problem| problem.pr == PrNumber(1))
+        .expect("the stall must be visible");
+    assert_eq!(problem.kind, MissingRequiredRunsKind::MissingRequiredRuns);
+    assert!(problem.operator_action_required);
+    assert_eq!(problem.head.oid.0, head_of(&pulls, 1));
+    assert!(problem.next.contains("close and immediately reopen"));
+
+    // Head, base, branch, and membership stay exactly as they were: no empty
+    // commit, no close/reopen loop, no force, no broad rerun.
+    let after = provider.pulls.borrow()[&PrNumber(1)].clone();
+    assert_eq!(after.head, pulls[0].head);
+    assert_eq!(after.base, pulls[0].base);
+    assert_eq!(after.labels, pulls[0].labels);
+    assert_eq!(after.state, pulls[0].state);
+    assert!(
+        !provider
+            .calls
+            .borrow()
+            .iter()
+            .any(|kind| *kind == MutationKind::RequestCheckSuite
+                || *kind == MutationKind::RerunChecks),
+        "no safe rerequestable suite exists, so nothing may be triggered"
+    );
+
+    let scheduler = successful_scheduler_status(
+        &status,
+        &progress.ci,
+        &progress.paused_caravans,
+        false,
+        &progress.required_runs,
+        &progress.missing_required_runs,
+    );
+    assert_eq!(scheduler.disposition, SchedulerDisposition::OperatorAction);
+    assert_eq!(scheduler.wake_class, SchedulerWakeClass::OperatorAction);
+    assert_eq!(scheduler.missing_required_runs.len(), 1);
+}
+
+#[test]
+fn one_missing_required_context_still_blocks_while_the_other_reports() {
+    let mut pulls = healthy_chain();
+    pulls[0].checks = vec![check(CHECK_LINT, CheckState::Success, Some(7))];
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    provider.require_contexts("main", &required_context_names());
+    let head = head_of(&pulls, 1);
+    provider.serve_lineage(
+        PrNumber(1),
+        lineage(
+            &head,
+            Vec::new(),
+            vec![head_run(7, &head, "completed", "success")],
+        ),
+    );
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+
+    let progress =
+        execute(&status, &provider, false, false, false).expect("a stall is not an error");
+
+    let receipt = required_runs_receipt(&progress, 1);
+    assert_eq!(
+        receipt.assessment.status,
+        RequiredRunsStatus::MissingRequiredRuns
+    );
+    assert_eq!(
+        receipt.assessment.missing_contexts,
+        vec![FAST_TESTS.to_owned()],
+        "only the uncovered context may be named"
+    );
+    assert_eq!(receipt.assessment.observed_runs, 1);
+    let problem = &progress.missing_required_runs[0];
+    assert_eq!(problem.contexts, vec![FAST_TESTS.to_owned()]);
+}
+
+#[test]
+fn a_delayed_run_inside_the_grace_period_is_an_ordinary_ci_wait() {
+    let pulls = healthy_chain();
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    provider.require_contexts("main", &required_context_names());
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+
+    let progress = execute_with_required_runs(
+        &status,
+        &provider,
+        RequiredRunsPolicy {
+            // The fixture head was published in 2020, so only an absurd grace
+            // keeps the tick inside the window.
+            grace_secs: u64::MAX,
+            retrigger: true,
+        },
+    )
+    .expect("waiting is not an error");
+
+    let receipt = required_runs_receipt(&progress, 1);
+    assert_eq!(receipt.assessment.status, RequiredRunsStatus::AwaitingGrace);
+    assert!(!receipt.assessment.grace_elapsed);
+    assert!(
+        progress.missing_required_runs.is_empty(),
+        "nothing may be declared missing inside the bounded grace period"
+    );
+    assert!(
+        progress
+            .events
+            .iter()
+            .all(|event| event.kind != EventKind::RequiredRunsMissing)
+    );
+
+    let scheduler = successful_scheduler_status(
+        &status,
+        &progress.ci,
+        &progress.paused_caravans,
+        false,
+        &progress.required_runs,
+        &progress.missing_required_runs,
+    );
+    assert_eq!(scheduler.disposition, SchedulerDisposition::WaitingCi);
+    assert!(scheduler.waiting_prs.contains(&PrNumber(1)));
+}
+
+#[test]
+fn a_delayed_run_that_finally_arrives_is_pending_not_missing() {
+    let pulls = healthy_chain();
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    provider.require_contexts("main", &required_context_names());
+    let head = head_of(&pulls, 1);
+    provider.serve_lineage(
+        PrNumber(1),
+        lineage(
+            &head,
+            vec![suite(4242, &head, "queued", "")],
+            vec![head_run(30_222_268_397, &head, "queued", "")],
+        ),
+    );
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+
+    let progress = execute(&status, &provider, false, false, false).expect("pending waits");
+
+    assert_eq!(
+        required_runs_receipt(&progress, 1).assessment.status,
+        RequiredRunsStatus::Pending
+    );
+    assert!(progress.missing_required_runs.is_empty());
+    assert!(
+        provider.rerequests.borrow().is_empty(),
+        "a live suite is never retriggered"
+    );
+}
+
+#[test]
+fn a_run_on_a_superseded_head_never_satisfies_the_current_head() {
+    let pulls = healthy_chain();
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    provider.require_contexts("main", &required_context_names());
+    let head = head_of(&pulls, 1);
+    provider.serve_lineage(
+        PrNumber(1),
+        lineage(
+            &head,
+            vec![suite(11, "pre-rebase-generation", "completed", "success")],
+            vec![head_run(
+                30_222_100_000,
+                "pre-rebase-generation",
+                "completed",
+                "success",
+            )],
+        ),
+    );
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+
+    let progress =
+        execute(&status, &provider, false, false, false).expect("a stall is not an error");
+
+    let receipt = required_runs_receipt(&progress, 1);
+    assert_eq!(
+        receipt.assessment.status,
+        RequiredRunsStatus::MissingRequiredRuns
+    );
+    assert_eq!(receipt.assessment.observed_runs, 0);
+    assert_eq!(receipt.assessment.stale_head_runs, 2);
+    assert!(
+        provider.rerequests.borrow().is_empty(),
+        "a superseded generation must never be retriggered"
+    );
+}
+
+#[test]
+fn a_cancelled_superseded_suite_is_retriggered_exactly_once_and_recovers() {
+    let pulls = healthy_chain();
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    provider.require_contexts("main", &required_context_names());
+    let head = head_of(&pulls, 1);
+    provider.allow_rerequest(4242, &head);
+    provider.serve_lineage(
+        PrNumber(1),
+        lineage(
+            &head,
+            vec![suite(4242, &head, "completed", "cancelled")],
+            vec![head_run(30_222_268_000, &head, "completed", "cancelled")],
+        ),
+    );
+    provider.serve_lineage(
+        PrNumber(1),
+        lineage(
+            &head,
+            vec![suite(4242, &head, "queued", "")],
+            vec![head_run(30_222_268_397, &head, "queued", "")],
+        ),
+    );
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+
+    let progress = execute(&status, &provider, false, false, false).expect("recovery converges");
+
+    assert_eq!(
+        *provider.rerequests.borrow(),
+        vec![(PrNumber(1), 4242)],
+        "exactly one auditable request against the unchanged head"
+    );
+    let receipt = required_runs_receipt(&progress, 1);
+    assert_eq!(receipt.assessment.status, RequiredRunsStatus::Pending);
+    let retrigger = receipt.retrigger.as_ref().expect("retrigger receipt");
+    assert!(retrigger.requested);
+    assert!(retrigger.rediscovered);
+    assert_eq!(retrigger.attempts, 1);
+    assert_eq!(retrigger.head_oid.0, head);
+    assert!(retrigger.failure.is_none());
+    assert!(
+        progress.missing_required_runs.is_empty(),
+        "a recovered head is not an operator problem"
+    );
+    assert!(
+        progress
+            .events
+            .iter()
+            .any(|event| event.kind == EventKind::RequiredRunsRetriggered)
+    );
+}
+
+#[test]
+fn a_refused_retrigger_becomes_a_typed_operator_problem() {
+    let pulls = healthy_chain();
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    provider.require_contexts("main", &required_context_names());
+    let head = head_of(&pulls, 1);
+    // The suite is advertised as rerequestable but the provider refuses it.
+    provider.serve_lineage(
+        PrNumber(1),
+        lineage(
+            &head,
+            vec![suite(4242, &head, "completed", "cancelled")],
+            Vec::new(),
+        ),
+    );
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+
+    let progress =
+        execute(&status, &provider, false, false, false).expect("a refusal is not a crash");
+
+    let receipt = required_runs_receipt(&progress, 1);
+    let retrigger = receipt.retrigger.as_ref().expect("retrigger receipt");
+    assert!(!retrigger.requested);
+    assert!(!retrigger.rediscovered);
+    assert!(retrigger.failure.is_some());
+    assert_eq!(
+        retrigger.status_after,
+        RequiredRunsStatus::CancelledSuperseded,
+        "a refused request changes nothing, so the pre-recovery verdict stands"
+    );
+    let problem = progress
+        .missing_required_runs
+        .iter()
+        .find(|problem| problem.pr == PrNumber(1))
+        .expect("a refused recovery stays visible");
+    assert_eq!(
+        problem.kind,
+        MissingRequiredRunsKind::CancelledSupersededRequiredRuns
+    );
+    assert!(problem.operator_action_required);
+    assert!(problem.retrigger.is_some());
+}
+
+#[test]
+fn disabled_retrigger_still_detects_and_reports_the_stall() {
+    let pulls = healthy_chain();
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    provider.require_contexts("main", &required_context_names());
+    let head = head_of(&pulls, 1);
+    provider.allow_rerequest(4242, &head);
+    provider.serve_lineage(
+        PrNumber(1),
+        lineage(
+            &head,
+            vec![suite(4242, &head, "completed", "cancelled")],
+            Vec::new(),
+        ),
+    );
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+
+    let progress = execute_with_required_runs(
+        &status,
+        &provider,
+        RequiredRunsPolicy {
+            grace_secs: 300,
+            retrigger: false,
+        },
+    )
+    .expect("detection never depends on recovery");
+
+    assert!(provider.rerequests.borrow().is_empty());
+    assert_eq!(progress.missing_required_runs.len(), 1);
+    assert!(required_runs_receipt(&progress, 1).retrigger.is_none());
+}
+
+#[test]
+fn a_partial_provider_read_never_claims_a_missing_required_run() {
+    let pulls = healthy_chain();
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    provider.partial_contexts("main");
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+
+    let progress =
+        execute(&status, &provider, false, false, false).expect("unknown is not an error");
+
+    let receipt = required_runs_receipt(&progress, 1);
+    assert_eq!(
+        receipt.assessment.status,
+        RequiredRunsStatus::UnknownProviderState
+    );
+    assert!(!receipt.assessment.provider_reads_complete);
+    assert!(
+        provider.lineage_reads.borrow().is_empty(),
+        "an unreadable protection endpoint must not trigger lineage reads"
+    );
+    let problem = &progress.missing_required_runs[0];
+    assert_eq!(problem.kind, MissingRequiredRunsKind::UnknownProviderState);
+    assert!(!problem.operator_action_required);
+
+    let scheduler = successful_scheduler_status(
+        &status,
+        &progress.ci,
+        &progress.paused_caravans,
+        false,
+        &progress.required_runs,
+        &progress.missing_required_runs,
+    );
+    assert_eq!(scheduler.disposition, SchedulerDisposition::RetryTick);
+    assert_eq!(scheduler.wake_class, SchedulerWakeClass::RetryTick);
+}
+
+#[test]
+fn a_partial_lineage_read_never_claims_a_missing_required_run() {
+    let pulls = healthy_chain();
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    provider.require_contexts("main", &required_context_names());
+    let head = head_of(&pulls, 1);
+    provider.serve_lineage(
+        PrNumber(1),
+        HeadRunLineage {
+            head_sha: head,
+            check_suites: Vec::new(),
+            workflow_runs: Vec::new(),
+            head_committed_at: Some(PUBLISHED_AT.to_owned()),
+            complete: false,
+        },
+    );
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+
+    let progress =
+        execute(&status, &provider, false, false, false).expect("unknown is not an error");
+
+    assert_eq!(
+        required_runs_receipt(&progress, 1).assessment.status,
+        RequiredRunsStatus::UnknownProviderState
+    );
+    assert!(provider.rerequests.borrow().is_empty());
+}
+
+#[test]
+fn a_satisfied_head_reads_no_lineage_and_reports_no_problem() {
+    let mut pulls = healthy_chain();
+    pulls[0].checks = vec![
+        check(CHECK_LINT, CheckState::Success, Some(7)),
+        check(FAST_TESTS, CheckState::Success, Some(8)),
+    ];
+    pulls[1].checks = vec![check("build-test", CheckState::Success, Some(9))];
+    pulls[2].checks = vec![check("build-test", CheckState::Success, Some(10))];
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    provider.require_contexts("main", &required_context_names());
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+
+    let progress = execute(&status, &provider, false, false, false).expect("healthy converges");
+
+    assert_eq!(
+        required_runs_receipt(&progress, 1).assessment.status,
+        RequiredRunsStatus::Satisfied
+    );
+    assert!(
+        provider.lineage_reads.borrow().is_empty(),
+        "the expensive lineage read belongs to the pathological path only"
+    );
+    assert!(progress.missing_required_runs.is_empty());
+
+    let scheduler = successful_scheduler_status(
+        &status,
+        &progress.ci,
+        &progress.paused_caravans,
+        false,
+        &progress.required_runs,
+        &progress.missing_required_runs,
+    );
+    assert_eq!(scheduler.disposition, SchedulerDisposition::Healthy);
+}
+
+#[test]
+fn an_unprotected_base_requires_nothing_from_a_member() {
+    let pulls = healthy_chain();
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    provider.require_contexts("main", &required_context_names());
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+
+    let progress =
+        execute(&status, &provider, false, false, false).expect("a stall is not an error");
+
+    for number in [2_u64, 3] {
+        assert_eq!(
+            required_runs_receipt(&progress, number).assessment.status,
+            RequiredRunsStatus::NotRequired,
+            "member #{number} stacks on an unprotected branch"
+        );
+    }
+    assert!(!provider.lineage_reads.borrow().contains(&PrNumber(2)));
+}
+
+#[test]
+fn one_stalled_member_never_hides_or_contaminates_another() {
+    let mut pulls = healthy_chain();
+    pulls[1].checks = vec![
+        check(CHECK_LINT, CheckState::Success, Some(9)),
+        check(FAST_TESTS, CheckState::InProgress, Some(10)),
+    ];
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    // Both the root and its first child stack on protected branches.
+    provider.require_contexts("main", &required_context_names());
+    provider.require_contexts("one", &required_context_names());
+    let status = status(pulls.clone(), Some(PrNumber(1)), &clean);
+
+    let progress =
+        execute(&status, &provider, false, false, false).expect("a stall is not an error");
+
+    assert_eq!(
+        required_runs_receipt(&progress, 1).assessment.status,
+        RequiredRunsStatus::MissingRequiredRuns
+    );
+    assert_eq!(
+        required_runs_receipt(&progress, 2).assessment.status,
+        RequiredRunsStatus::Pending,
+        "a healthy member must be unaffected by its stalled predecessor"
+    );
+    assert_eq!(progress.missing_required_runs.len(), 1);
+    assert_eq!(progress.missing_required_runs[0].pr, PrNumber(1));
+    assert!(
+        !provider.lineage_reads.borrow().contains(&PrNumber(2)),
+        "a fully reported member never pays for its predecessor's stall"
+    );
+}
+
+#[test]
+fn independently_stalled_members_are_reported_separately() {
+    let pulls = healthy_chain();
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    provider.require_contexts("main", &required_context_names());
+    provider.require_contexts("one", &required_context_names());
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+
+    let progress =
+        execute(&status, &provider, false, false, false).expect("a stall is not an error");
+
+    let stalled = progress
+        .missing_required_runs
+        .iter()
+        .map(|problem| problem.pr)
+        .collect::<Vec<_>>();
+    assert_eq!(stalled, vec![PrNumber(1), PrNumber(2)]);
+    let fingerprints = progress
+        .missing_required_runs
+        .iter()
+        .map(|problem| problem.fingerprint.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        fingerprints.len(),
+        2,
+        "each stalled member owns a distinct identity"
+    );
+}
+
+#[test]
+fn missing_required_run_hook_evidence_is_deduplicated_and_bounded() {
+    let pulls = healthy_chain();
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    provider.require_contexts("main", &required_context_names());
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+
+    // Two caravans over the same member cannot double-report the same stall.
+    let mut progress = execute(&status, &provider, false, false, false).expect("first pass");
+    let replay = execute(&status, &provider, false, false, false).expect("second pass");
+    merge_sync_progress(&mut progress, replay);
+
+    assert_eq!(progress.missing_required_runs.len(), 1);
+    assert_eq!(
+        progress
+            .required_runs
+            .iter()
+            .filter(|receipt| receipt.pr == PrNumber(1))
+            .count(),
+        1,
+        "receipts are keyed by member, never appended per pass"
+    );
+    let emitted = progress
+        .events
+        .iter()
+        .filter(|event| event.kind == EventKind::RequiredRunsMissing)
+        .count();
+    assert_eq!(
+        emitted, 1,
+        "two convergence passes over one member must not notify hooks twice"
+    );
+    let problem = &progress.missing_required_runs[0];
+    assert!(problem.contexts.len() <= crate::required_runs::MAX_REPORTED_CONTEXTS);
+}
+
+#[test]
+fn grace_starts_at_publication_not_at_a_preserved_commit_date() {
+    // Live Cacophony PR2208 evidence: the rebased head
+    // `79abc31d4efc07a579145cf904c83c1420f8b4ac` kept committer date
+    // 2026-07-26T15:27:43Z while the branch was actually published at
+    // 2026-07-26T22:01:09Z (`updatedAt`). Starting the grace countdown at the
+    // preserved commit date would accuse every rebased head of missing its runs
+    // roughly six hours before GitHub could possibly have started one.
+    const PRESERVED_COMMIT_DATE: &str = "2026-07-26T15:27:43Z";
+    const PUBLISHED: &str = "2026-07-26T22:01:09Z";
+
+    let mut pull_request = pull_request(
+        2208,
+        "one",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::squash(),
+    );
+    pull_request.updated_at = Some(PUBLISHED.to_owned());
+    let lineage = HeadRunLineage {
+        head_sha: pull_request.head.oid.0.clone(),
+        check_suites: Vec::new(),
+        workflow_runs: Vec::new(),
+        head_committed_at: Some(PRESERVED_COMMIT_DATE.to_owned()),
+        complete: true,
+    };
+
+    assert_eq!(
+        head_published_at(&pull_request, Some(&lineage)).as_deref(),
+        Some(PUBLISHED),
+        "the later provider timestamp owns the countdown start"
+    );
+
+    // A tick two minutes after publication is still inside the default grace.
+    let published_unix = crate::required_runs::rfc3339_to_unix_secs(PUBLISHED).expect("timestamp");
+    let assessment = crate::required_runs::assess(&crate::required_runs::RequiredRunsInput {
+        pr: pull_request.number,
+        head: &pull_request.head,
+        base: &pull_request.base,
+        contexts: &RequiredContextsRead {
+            branch: "main".to_owned(),
+            protected: true,
+            contexts: vec![CHECK_LINT.to_owned(), FAST_TESTS.to_owned()],
+            complete: true,
+        },
+        lineage: Some(&lineage),
+        checks: &pull_request.checks,
+        head_published_at: head_published_at(&pull_request, Some(&lineage)).as_deref(),
+        clock: crate::required_runs::RequiredRunsClock {
+            now_unix: published_unix + 120,
+            grace_secs: DEFAULT_MISSING_REQUIRED_RUNS_GRACE_SECS,
+        },
+    });
+    assert_eq!(assessment.status, RequiredRunsStatus::AwaitingGrace);
+    assert_eq!(assessment.head_age_secs, Some(120));
+
+    // Well past the grace, the same head is the stalling class.
+    let stalled = crate::required_runs::assess(&crate::required_runs::RequiredRunsInput {
+        pr: pull_request.number,
+        head: &pull_request.head,
+        base: &pull_request.base,
+        contexts: &RequiredContextsRead {
+            branch: "main".to_owned(),
+            protected: true,
+            contexts: vec![CHECK_LINT.to_owned(), FAST_TESTS.to_owned()],
+            complete: true,
+        },
+        lineage: Some(&lineage),
+        checks: &pull_request.checks,
+        head_published_at: head_published_at(&pull_request, Some(&lineage)).as_deref(),
+        clock: crate::required_runs::RequiredRunsClock {
+            now_unix: published_unix + DEFAULT_MISSING_REQUIRED_RUNS_GRACE_SECS + 1,
+            grace_secs: DEFAULT_MISSING_REQUIRED_RUNS_GRACE_SECS,
+        },
+    });
+    assert_eq!(stalled.status, RequiredRunsStatus::MissingRequiredRuns);
 }

@@ -374,6 +374,16 @@ pub enum MutationError {
         /// Provider conclusion.
         conclusion: String,
     },
+    /// A requested check suite belongs to another commit, so retriggering it
+    /// would report against a superseded generation.
+    CheckSuiteHeadMismatch {
+        /// Check suite ID.
+        check_suite_id: u64,
+        /// PR head expected by the caller.
+        expected_head: String,
+        /// Head observed on the check suite.
+        actual_head: String,
+    },
     /// A reviewed single-request provider transition returned without the
     /// complete requested postcondition. Before/after facts make a partial
     /// GraphQL response explicit and resumable rather than guessed.
@@ -434,6 +444,14 @@ impl std::fmt::Display for MutationError {
             Self::RunNotFailed { run_id, conclusion } => write!(
                 formatter,
                 "workflow run {run_id} is not failed (conclusion: {conclusion})"
+            ),
+            Self::CheckSuiteHeadMismatch {
+                check_suite_id,
+                expected_head,
+                actual_head,
+            } => write!(
+                formatter,
+                "check suite {check_suite_id} belongs to {actual_head}, expected unchanged head {expected_head}"
             ),
             Self::AtomicTransactionIncomplete {
                 operation,
@@ -1081,6 +1099,137 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
         let after = self.refetch_pull_request(repository, expected.number)?;
         Ok(GitHubMutationReceipt {
             kind: MutationKind::RerunChecks,
+            before: Some(before),
+            after,
+            provider_output: trimmed_provider_output(&output),
+        })
+    }
+
+    /// Exact protection-declared required contexts for one arbitrary branch.
+    ///
+    /// An unprotected branch deliberately returns an empty *complete* read: it
+    /// requires nothing, so nothing about it can stall a caravan. A protection
+    /// endpoint the token may not read returns an explicitly *partial* read, so
+    /// required-run policy reports unknown provider state instead of inventing a
+    /// missing context from a permission error.
+    pub fn branch_required_contexts(
+        &self,
+        repository: &RepositoryId,
+        branch: &str,
+    ) -> Result<crate::required_runs::RequiredContextsRead, MutationError> {
+        let settings: BranchSettingsJson =
+            match self.json::<BranchSettingsJson>(branch_settings_command(repository, branch)) {
+                Ok(settings) => settings,
+                Err(_) => return Ok(crate::required_runs::RequiredContextsRead::partial(branch)),
+            };
+        if !settings.protected {
+            return Ok(crate::required_runs::RequiredContextsRead::unprotected(
+                branch,
+            ));
+        }
+        let Ok(policy) =
+            self.json::<BranchProtectionJson>(branch_protection_command(repository, branch))
+        else {
+            return Ok(crate::required_runs::RequiredContextsRead::partial(branch));
+        };
+        let mut contexts = policy
+            .required_status_checks
+            .as_ref()
+            .map(|checks| checks.contexts.clone())
+            .unwrap_or_default();
+        if let Some(checks) = policy.required_status_checks.as_ref() {
+            contexts.extend(checks.checks.iter().map(|check| check.context.clone()));
+        }
+        Ok(crate::required_runs::RequiredContextsRead {
+            branch: branch.to_owned(),
+            protected: true,
+            contexts,
+            complete: true,
+        }
+        .normalized())
+    }
+
+    /// Check-suite and workflow-run lineage for the exact verified PR head.
+    ///
+    /// Each sub-read degrades independently: a refused or unparsable response
+    /// marks the lineage incomplete rather than being reported as an absence.
+    pub fn head_run_lineage(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+    ) -> Result<crate::required_runs::HeadRunLineage, MutationError> {
+        let before = self.verify_precondition_with_checks(repository, expected)?;
+        let head_sha = before.head.oid.0.clone();
+        let mut complete = true;
+        let check_suites = self
+            .json::<CheckSuiteListJson>(check_suites_command(repository, head_sha.as_str()))
+            .map_or_else(
+                |_| {
+                    complete = false;
+                    Vec::new()
+                },
+                |list| {
+                    list.check_suites
+                        .into_iter()
+                        .map(Into::into)
+                        .collect::<Vec<_>>()
+                },
+            );
+        let workflow_runs = self
+            .json::<WorkflowRunListJson>(head_runs_command(repository, head_sha.as_str()))
+            .map_or_else(
+                |_| {
+                    complete = false;
+                    Vec::new()
+                },
+                |list| {
+                    list.workflow_runs
+                        .into_iter()
+                        .map(Into::into)
+                        .collect::<Vec<_>>()
+                },
+            );
+        let head_committed_at = self
+            .json::<CommitDetailJson>(commit_command(repository, head_sha.as_str()))
+            .ok()
+            .map(|commit| commit.commit.committer.date);
+        if head_committed_at.is_none() {
+            complete = false;
+        }
+        Ok(crate::required_runs::HeadRunLineage {
+            head_sha,
+            check_suites,
+            workflow_runs,
+            head_committed_at,
+            complete,
+        }
+        .bounded())
+    }
+
+    /// Request exactly one check suite again on the *unchanged* verified head.
+    ///
+    /// The suite is re-read first and refused unless it belongs to the exact
+    /// current head, so a superseded generation can never be retriggered. No
+    /// head, base, branch, or membership fact is touched.
+    pub fn rerequest_check_suite(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+        check_suite_id: u64,
+    ) -> Result<GitHubMutationReceipt, MutationError> {
+        let before = self.verify_precondition_with_checks(repository, expected)?;
+        let suite: CheckSuiteJson = self.json(check_suite_command(repository, check_suite_id))?;
+        if suite.head_sha != before.head.oid.0 {
+            return Err(MutationError::CheckSuiteHeadMismatch {
+                check_suite_id,
+                expected_head: before.head.oid.0.clone(),
+                actual_head: suite.head_sha,
+            });
+        }
+        let output = self.checked(rerequest_check_suite_command(repository, check_suite_id))?;
+        let after = self.refetch_pull_request(repository, expected.number)?;
+        Ok(GitHubMutationReceipt {
+            kind: MutationKind::RequestCheckSuite,
             before: Some(before),
             after,
             provider_output: trimmed_provider_output(&output),
@@ -2232,6 +2381,52 @@ fn rerun_failed_command(repository: &RepositoryId, run_id: u64) -> CommandSpec {
     ])
 }
 
+fn check_suites_command(repository: &RepositoryId, head_oid: &str) -> CommandSpec {
+    CommandSpec::new("gh").args([
+        "api".to_owned(),
+        format!(
+            "repos/{}/commits/{head_oid}/check-suites?per_page=100",
+            repository.slug()
+        ),
+    ])
+}
+
+fn head_runs_command(repository: &RepositoryId, head_oid: &str) -> CommandSpec {
+    CommandSpec::new("gh").args([
+        "api".to_owned(),
+        format!(
+            "repos/{}/actions/runs?head_sha={head_oid}&per_page=100",
+            repository.slug()
+        ),
+    ])
+}
+
+fn commit_command(repository: &RepositoryId, head_oid: &str) -> CommandSpec {
+    CommandSpec::new("gh").args([
+        "api".to_owned(),
+        format!("repos/{}/commits/{head_oid}", repository.slug()),
+    ])
+}
+
+fn check_suite_command(repository: &RepositoryId, check_suite_id: u64) -> CommandSpec {
+    CommandSpec::new("gh").args([
+        "api".to_owned(),
+        format!("repos/{}/check-suites/{check_suite_id}", repository.slug()),
+    ])
+}
+
+fn rerequest_check_suite_command(repository: &RepositoryId, check_suite_id: u64) -> CommandSpec {
+    CommandSpec::new("gh").args([
+        "api".to_owned(),
+        "--method".to_owned(),
+        "POST".to_owned(),
+        format!(
+            "repos/{}/check-suites/{check_suite_id}/rerequest",
+            repository.slug()
+        ),
+    ])
+}
+
 fn branch_settings_command(repository: &RepositoryId, branch: &str) -> CommandSpec {
     CommandSpec::new("gh").args([
         "api".to_owned(),
@@ -2617,6 +2812,103 @@ struct GraphLabelsJson {
 #[derive(Debug, Deserialize)]
 struct BranchSettingsJson {
     protected: bool,
+}
+
+/// One bounded page is authoritative: a commit with a hundred check suites is
+/// self-evidently not missing required runs, and a single request keeps the
+/// pathological path cheap.
+#[derive(Debug, Deserialize)]
+struct CheckSuiteListJson {
+    #[serde(default)]
+    check_suites: Vec<CheckSuiteJson>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CheckSuiteJson {
+    id: u64,
+    head_sha: String,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    conclusion: Option<String>,
+    #[serde(default)]
+    app: Option<CheckSuiteAppJson>,
+    #[serde(default)]
+    rerequestable: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CheckSuiteAppJson {
+    #[serde(default)]
+    slug: String,
+}
+
+impl From<CheckSuiteJson> for crate::required_runs::CheckSuiteLineage {
+    fn from(suite: CheckSuiteJson) -> Self {
+        let app_slug = suite.app.map(|app| app.slug).unwrap_or_default();
+        // A suite with no owning app exposes no safe rerequest primitive, so
+        // policy must fall back to a typed operator problem instead of guessing.
+        let rerequestable = suite.rerequestable.unwrap_or(!app_slug.is_empty());
+        Self {
+            id: suite.id,
+            head_sha: suite.head_sha,
+            status: suite.status.unwrap_or_default(),
+            conclusion: suite.conclusion.unwrap_or_default(),
+            app_slug,
+            rerequestable,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkflowRunListJson {
+    #[serde(default)]
+    workflow_runs: Vec<HeadWorkflowRunJson>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HeadWorkflowRunJson {
+    id: u64,
+    #[serde(default)]
+    check_suite_id: u64,
+    #[serde(default)]
+    name: String,
+    head_sha: String,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    conclusion: Option<String>,
+    #[serde(default)]
+    event: String,
+}
+
+impl From<HeadWorkflowRunJson> for crate::required_runs::WorkflowRunLineage {
+    fn from(run: HeadWorkflowRunJson) -> Self {
+        Self {
+            run_id: run.id,
+            check_suite_id: run.check_suite_id,
+            workflow_name: run.name,
+            head_sha: run.head_sha,
+            status: run.status.unwrap_or_default(),
+            conclusion: run.conclusion.unwrap_or_default(),
+            event: run.event,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CommitDetailJson {
+    commit: CommitMetadataJson,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommitMetadataJson {
+    committer: CommitActorJson,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommitActorJson {
+    date: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -4379,6 +4671,346 @@ mod tests {
                 actual_prs,
             } if actual_prs == vec![PrNumber(7)]
         ));
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn branch_required_contexts_merge_legacy_and_typed_declarations() {
+        let repository = repository();
+        let runner = FakeRunner::new(vec![
+            (
+                branch_settings_command(&repository, "main"),
+                CommandOutput::success(r#"{"protected":true}"#),
+            ),
+            (
+                branch_protection_command(&repository, "main"),
+                CommandOutput::success(
+                    r#"{"required_status_checks":{"strict":false,"contexts":["Check & Lint"],"checks":[{"context":"Fast Tests (unit)"},{"context":"Check & Lint"}]}}"#,
+                ),
+            ),
+        ]);
+        let adapter = GitHubMutationAdapter::new(runner);
+
+        let read = adapter
+            .branch_required_contexts(&repository, "main")
+            .expect("protection read succeeds");
+
+        assert!(read.protected);
+        assert!(read.complete);
+        assert_eq!(
+            read.contexts,
+            vec!["Check & Lint".to_owned(), "Fast Tests (unit)".to_owned()]
+        );
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn an_unprotected_branch_is_a_complete_empty_requirement() {
+        let repository = repository();
+        let runner = FakeRunner::new(vec![(
+            branch_settings_command(&repository, "caravan/2210"),
+            CommandOutput::success(r#"{"protected":false}"#),
+        )]);
+        let adapter = GitHubMutationAdapter::new(runner);
+
+        let read = adapter
+            .branch_required_contexts(&repository, "caravan/2210")
+            .expect("an unprotected branch is readable");
+
+        assert!(!read.protected);
+        assert!(read.complete);
+        assert!(read.contexts.is_empty());
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn an_unreadable_protection_endpoint_is_partial_not_empty() {
+        let repository = repository();
+        let runner = FakeRunner::new(vec![
+            (
+                branch_settings_command(&repository, "main"),
+                CommandOutput::success(r#"{"protected":true}"#),
+            ),
+            (
+                branch_protection_command(&repository, "main"),
+                CommandOutput {
+                    code: Some(1),
+                    stdout: String::new(),
+                    stderr: "HTTP 403: Resource not accessible by integration".to_owned(),
+                },
+            ),
+        ]);
+        let adapter = GitHubMutationAdapter::new(runner);
+
+        let read = adapter
+            .branch_required_contexts(&repository, "main")
+            .expect("a refused read degrades instead of failing the tick");
+
+        assert!(read.protected);
+        assert!(
+            !read.complete,
+            "a permission error must never look like an absence of requirements"
+        );
+        assert!(read.contexts.is_empty());
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn head_run_lineage_preserves_exact_suite_run_and_commit_facts() {
+        let repository = repository();
+        let expected = precondition(12);
+        let runner = FakeRunner::new(vec![
+            (
+                pull_request_command(&repository, "12"),
+                CommandOutput::success(pr_object_json(12, "feature/widget", "acme/widgets")),
+            ),
+            (
+                check_suites_command(&repository, "head-12"),
+                CommandOutput::success(
+                    r#"{"total_count":1,"check_suites":[{"id":4242,"head_sha":"head-12","status":"completed","conclusion":"cancelled","app":{"slug":"github-actions"}}]}"#,
+                ),
+            ),
+            (
+                head_runs_command(&repository, "head-12"),
+                CommandOutput::success(
+                    r#"{"total_count":1,"workflow_runs":[{"id":30222268397,"check_suite_id":4242,"name":"CI","head_sha":"head-12","status":"completed","conclusion":null,"event":"pull_request"}]}"#,
+                ),
+            ),
+            (
+                commit_command(&repository, "head-12"),
+                CommandOutput::success(
+                    r#"{"commit":{"committer":{"date":"2026-07-26T22:03:00Z"}}}"#,
+                ),
+            ),
+        ]);
+        let adapter = GitHubMutationAdapter::new(runner);
+
+        let lineage = adapter
+            .head_run_lineage(&repository, &expected)
+            .expect("lineage read succeeds");
+
+        assert!(lineage.complete);
+        assert_eq!(lineage.head_sha, "head-12");
+        assert_eq!(lineage.check_suites.len(), 1);
+        assert_eq!(lineage.check_suites[0].id, 4242);
+        assert_eq!(lineage.check_suites[0].conclusion, "cancelled");
+        assert!(lineage.check_suites[0].rerequestable);
+        assert_eq!(lineage.workflow_runs[0].run_id, 30_222_268_397);
+        assert_eq!(
+            lineage.workflow_runs[0].conclusion, "",
+            "a null conclusion must stay empty rather than being guessed"
+        );
+        assert_eq!(
+            lineage.head_committed_at.as_deref(),
+            Some("2026-07-26T22:03:00Z")
+        );
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn a_refused_lineage_sub_read_marks_the_whole_read_partial() {
+        let repository = repository();
+        let expected = precondition(12);
+        let runner = FakeRunner::new(vec![
+            (
+                pull_request_command(&repository, "12"),
+                CommandOutput::success(pr_object_json(12, "feature/widget", "acme/widgets")),
+            ),
+            (
+                check_suites_command(&repository, "head-12"),
+                CommandOutput {
+                    code: Some(1),
+                    stdout: String::new(),
+                    stderr: "HTTP 502".to_owned(),
+                },
+            ),
+            (
+                head_runs_command(&repository, "head-12"),
+                CommandOutput::success(r#"{"total_count":0,"workflow_runs":[]}"#),
+            ),
+            (
+                commit_command(&repository, "head-12"),
+                CommandOutput::success(
+                    r#"{"commit":{"committer":{"date":"2026-07-26T22:03:00Z"}}}"#,
+                ),
+            ),
+        ]);
+        let adapter = GitHubMutationAdapter::new(runner);
+
+        let lineage = adapter
+            .head_run_lineage(&repository, &expected)
+            .expect("a partial read is reported, not fatal");
+
+        assert!(!lineage.complete);
+        assert!(lineage.check_suites.is_empty());
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn rerequest_check_suite_refuses_a_superseded_generation() {
+        let repository = repository();
+        let expected = precondition(12);
+        let runner = FakeRunner::new(vec![
+            (
+                pull_request_command(&repository, "12"),
+                CommandOutput::success(pr_object_json(12, "feature/widget", "acme/widgets")),
+            ),
+            (
+                check_suite_command(&repository, 4242),
+                CommandOutput::success(
+                    r#"{"id":4242,"head_sha":"pre-rebase-generation","status":"completed","conclusion":"cancelled","app":{"slug":"github-actions"}}"#,
+                ),
+            ),
+        ]);
+        let adapter = GitHubMutationAdapter::new(runner);
+
+        let error = adapter
+            .rerequest_check_suite(&repository, &expected, 4242)
+            .expect_err("a foreign generation must never be retriggered");
+
+        assert!(matches!(
+            error,
+            MutationError::CheckSuiteHeadMismatch {
+                check_suite_id: 4242,
+                ref expected_head,
+                ref actual_head,
+            } if expected_head == "head-12" && actual_head == "pre-rebase-generation"
+        ));
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn rerequest_check_suite_posts_exactly_once_against_the_unchanged_head() {
+        let repository = repository();
+        let expected = precondition(12);
+        let runner = FakeRunner::new(vec![
+            (
+                pull_request_command(&repository, "12"),
+                CommandOutput::success(pr_object_json(12, "feature/widget", "acme/widgets")),
+            ),
+            (
+                check_suite_command(&repository, 4242),
+                CommandOutput::success(
+                    r#"{"id":4242,"head_sha":"head-12","status":"completed","conclusion":"cancelled","app":{"slug":"github-actions"}}"#,
+                ),
+            ),
+            (
+                rerequest_check_suite_command(&repository, 4242),
+                CommandOutput::success("{}"),
+            ),
+            (
+                pull_request_command(&repository, "12"),
+                CommandOutput::success(pr_object_json(12, "feature/widget", "acme/widgets")),
+            ),
+        ]);
+        let adapter = GitHubMutationAdapter::new(runner);
+
+        let receipt = adapter
+            .rerequest_check_suite(&repository, &expected, 4242)
+            .expect("the unchanged head is retriggerable");
+
+        assert_eq!(receipt.kind, MutationKind::RequestCheckSuite);
+        assert_eq!(receipt.after.head.oid, CommitOid("head-12".to_owned()));
+        assert_eq!(
+            receipt.before.expect("before facts").head.oid,
+            receipt.after.head.oid,
+            "recovery must never change the head it is recovering"
+        );
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn required_run_command_builders_stay_read_scoped_and_exact() {
+        let repository = repository();
+        assert_eq!(
+            check_suites_command(&repository, "head-12"),
+            CommandSpec::new("gh").args([
+                "api",
+                "repos/acme/widgets/commits/head-12/check-suites?per_page=100",
+            ])
+        );
+        assert_eq!(
+            head_runs_command(&repository, "head-12"),
+            CommandSpec::new("gh").args([
+                "api",
+                "repos/acme/widgets/actions/runs?head_sha=head-12&per_page=100",
+            ])
+        );
+        assert_eq!(
+            rerequest_check_suite_command(&repository, 4242),
+            CommandSpec::new("gh").args([
+                "api",
+                "--method",
+                "POST",
+                "repos/acme/widgets/check-suites/4242/rerequest",
+            ])
+        );
+    }
+
+    #[test]
+    fn live_check_suite_payloads_decode_foreign_apps_and_null_conclusions() {
+        // Faithful shape of `repos/harryaskham/cacophony/commits/79abc31d…/
+        // check-suites`: unrelated keys, three foreign-app suites queued, one
+        // cancelled Actions suite, one in-progress Actions suite.
+        let repository = repository();
+        let expected = precondition(12);
+        let runner = FakeRunner::new(vec![
+            (
+                pull_request_command(&repository, "12"),
+                CommandOutput::success(pr_object_json(12, "feature/widget", "acme/widgets")),
+            ),
+            (
+                check_suites_command(&repository, "head-12"),
+                CommandOutput::success(
+                    r#"{"total_count":5,"check_suites":[
+                        {"id":81895334808,"node_id":"x","head_branch":"agent/x","head_sha":"head-12","status":"queued","conclusion":null,"rerequestable":true,"runs_rerequestable":false,"app":{"id":1210556,"slug":"cursor","name":"Cursor"}},
+                        {"id":81895334871,"head_sha":"head-12","status":"queued","conclusion":null,"rerequestable":true,"app":{"slug":"claude"}},
+                        {"id":81895334923,"head_sha":"head-12","status":"queued","conclusion":null,"rerequestable":false,"app":{"slug":"aviator-app"}},
+                        {"id":81895339455,"head_sha":"head-12","status":"completed","conclusion":"cancelled","rerequestable":true,"app":{"slug":"github-actions"}},
+                        {"id":81895922485,"head_sha":"head-12","status":"in_progress","conclusion":null,"rerequestable":true,"app":{"slug":"github-actions"}}
+                    ]}"#,
+                ),
+            ),
+            (
+                head_runs_command(&repository, "head-12"),
+                CommandOutput::success(
+                    r#"{"total_count":2,"workflow_runs":[
+                        {"id":30222268397,"check_suite_id":81895922485,"name":"CI","head_sha":"head-12","status":"in_progress","conclusion":null,"event":"pull_request"},
+                        {"id":30222037735,"check_suite_id":81895339455,"name":"CI","head_sha":"head-12","status":"completed","conclusion":"cancelled","event":"pull_request"}
+                    ]}"#,
+                ),
+            ),
+            (
+                commit_command(&repository, "head-12"),
+                CommandOutput::success(
+                    r#"{"sha":"head-12","commit":{"author":{"date":"2026-07-26T15:27:43Z"},"committer":{"name":"Caravan","date":"2026-07-26T15:27:43Z"}}}"#,
+                ),
+            ),
+        ]);
+        let adapter = GitHubMutationAdapter::new(runner);
+
+        let lineage = adapter
+            .head_run_lineage(&repository, &expected)
+            .expect("the live payload shape decodes");
+
+        assert!(lineage.complete);
+        assert_eq!(lineage.check_suites.len(), 5);
+        assert_eq!(lineage.workflow_runs.len(), 2);
+        assert_eq!(
+            lineage.head_committed_at.as_deref(),
+            Some("2026-07-26T15:27:43Z"),
+            "a rebase can preserve the original commit date"
+        );
+        // The provider's own `rerequestable` flag is authoritative and the
+        // lowest rerequestable suite on the exact head is selected.
+        assert_eq!(
+            crate::required_runs::rerequestable_suite(Some(&lineage), "head-12"),
+            Some(81_895_334_808)
+        );
+        assert!(
+            !lineage.check_suites[2].rerequestable,
+            "a suite the provider refuses to rerequest must never be selected"
+        );
         adapter.runner.assert_exhausted();
     }
 

@@ -2,9 +2,10 @@
 
 use super::{
     AppContext, AppError, BTreeMap, BTreeSet, CaravanEvent, CiDisposition, CiObservation,
-    DecisionKind, DecisionPoint, EventKind, Instant, PrNumber, PullRequestSnapshot, RepositoryId,
-    SchedulerDisposition, SchedulerWakeClass, StatusOutput, StructuredError, SyncCaravanGeneration,
-    SyncFailureSchedulerStatus, SyncMemberGeneration, SyncSchedulerStatus, Value, hooks, json,
+    DecisionKind, DecisionPoint, EventKind, Instant, MissingRequiredRunsProblem, PrNumber,
+    PullRequestSnapshot, RepositoryId, SchedulerDisposition, SchedulerWakeClass, StatusOutput,
+    StructuredError, SyncCaravanGeneration, SyncFailureSchedulerStatus, SyncMemberGeneration,
+    SyncSchedulerStatus, Value, hooks, json,
 };
 
 pub(super) fn checkout_for_decision(
@@ -114,11 +115,14 @@ pub(super) fn decision_checkout_target(decision: &DecisionPoint) -> Option<PrNum
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn successful_scheduler_status(
     status: &StatusOutput,
     ci: &[CiObservation],
     paused: &[crate::pause::PauseStatus],
     rebase_on_join: bool,
+    required_runs: &[crate::required_runs::RequiredRunsReceipt],
+    missing_required_runs: &[MissingRequiredRunsProblem],
 ) -> SyncSchedulerStatus {
     let ci_by_pr = ci
         .iter()
@@ -161,40 +165,71 @@ pub(super) fn successful_scheduler_status(
             }
         })
         .collect::<Vec<_>>();
-    let waiting_prs = ci
+    let mut waiting_prs = ci
         .iter()
         .filter(|observation| observation.disposition == CiDisposition::Waiting)
         .map(|observation| observation.pr)
         .collect::<Vec<_>>();
+    // A member still inside its bounded missing-run grace period is an ordinary
+    // CI wait, not a stall, so it belongs with the other waiting members.
+    for receipt in required_runs {
+        if receipt.assessment.status == crate::required_runs::RequiredRunsStatus::AwaitingGrace
+            && !waiting_prs.contains(&receipt.pr)
+        {
+            waiting_prs.push(receipt.pr);
+        }
+    }
+    waiting_prs.sort_unstable();
+    waiting_prs.dedup();
     let held_caravans = paused
         .iter()
         .map(|pause| pause.record.caravan_head)
         .collect::<Vec<_>>();
-    let (disposition, reason) = if !waiting_prs.is_empty() {
+    let operator_action = missing_required_runs
+        .iter()
+        .any(|problem| problem.operator_action_required);
+    let unknown_provider_state = !missing_required_runs.is_empty() && !operator_action;
+    let (disposition, wake_class, reason) = if operator_action {
+        (
+            SchedulerDisposition::OperatorAction,
+            SchedulerWakeClass::OperatorAction,
+            "one or more caravan members have required contexts with no reporting run on their exact current head; this never resolves by waiting",
+        )
+    } else if unknown_provider_state {
+        (
+            SchedulerDisposition::RetryTick,
+            SchedulerWakeClass::RetryTick,
+            "required-run coverage could not be proven from a partial provider read; rerun the same bounded tick",
+        )
+    } else if !waiting_prs.is_empty() {
         (
             SchedulerDisposition::WaitingCi,
+            SchedulerWakeClass::None,
             "fresh or pending CI is the only incomplete condition; do not wake a repair actor",
         )
     } else if !held_caravans.is_empty() {
         (
             SchedulerDisposition::Held,
+            SchedulerWakeClass::None,
             "one or more caravans are intentionally held; only explicit resume may release them",
         )
     } else {
         (
             SchedulerDisposition::Healthy,
+            SchedulerWakeClass::None,
             "the exact provider graph and selected root-to-tail generations are converged",
         )
     };
     SyncSchedulerStatus {
         schema_version: 1,
         disposition,
-        wake_class: SchedulerWakeClass::None,
+        wake_class,
         rebase_on_join,
         default_branch: status.analysis.fleet.default_branch.clone(),
         caravans,
         waiting_prs,
         held_caravans,
+        missing_required_runs: missing_required_runs.to_vec(),
         reason: reason.to_owned(),
     }
 }

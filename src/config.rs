@@ -73,6 +73,10 @@ fn default_sync_max_duration_secs() -> u64 {
     120
 }
 
+fn default_missing_required_runs_grace_secs() -> u64 {
+    300
+}
+
 fn default_agent_priority_labels() -> Vec<String> {
     vec![
         "caravan-priority:high".to_owned(),
@@ -174,6 +178,16 @@ pub struct SyncConfig {
     pub max_github_requests_per_tick: u32,
     /// Absolute wall-clock ceiling for one complete sync tick.
     pub max_duration_secs: u64,
+    /// Bounded wait, measured from the latest provider timestamp that could
+    /// have triggered CI for the exact head, before a required context with
+    /// zero reporting lineage is declared `missing_required_runs` instead of
+    /// pending. Nothing is claimed missing inside this window.
+    pub missing_required_runs_grace_secs: u64,
+    /// Allow exactly one auditable check-suite rerequest against the unchanged
+    /// head when required contexts have no reporting lineage. Disabling it only
+    /// changes recovery to a typed operator-action problem; detection and the
+    /// visible scheduler degradation always happen.
+    pub retrigger_missing_required_runs: bool,
 }
 
 impl Default for SyncConfig {
@@ -184,6 +198,8 @@ impl Default for SyncConfig {
             max_mutations_per_tick: default_sync_max_mutations_per_tick(),
             max_github_requests_per_tick: default_sync_max_github_requests_per_tick(),
             max_duration_secs: default_sync_max_duration_secs(),
+            missing_required_runs_grace_secs: default_missing_required_runs_grace_secs(),
+            retrigger_missing_required_runs: true,
         }
     }
 }
@@ -694,6 +710,33 @@ hooks:
                 .unwrap_err()
                 .code(),
             "config_parse_failed"
+        );
+    }
+
+    #[test]
+    fn required_run_policy_defaults_without_breaking_existing_sync_policy() {
+        // A deployed config that predates missing-run detection must keep
+        // parsing, and must arrive with detection armed rather than disabled.
+        let parsed = CaravanConfig::parse(
+            "version: 1\nsync:\n  max_duration_secs: 3600\n  max_mutations_per_tick: 64\n",
+        )
+        .expect("an existing sync policy still parses");
+        assert_eq!(parsed.sync.missing_required_runs_grace_secs, 300);
+        assert!(parsed.sync.retrigger_missing_required_runs);
+
+        let explicit = CaravanConfig::parse(
+            "version: 1\nsync:\n  missing_required_runs_grace_secs: 900\n  retrigger_missing_required_runs: false\n",
+        )
+        .expect("the policy is explicitly configurable");
+        assert_eq!(explicit.sync.missing_required_runs_grace_secs, 900);
+        assert!(!explicit.sync.retrigger_missing_required_runs);
+
+        assert_eq!(
+            CaravanConfig::parse("version: 1\nsync:\n  missing_required_runs_grace_sec: 900\n")
+                .unwrap_err()
+                .code(),
+            "config_parse_failed",
+            "a misspelled bound must never silently disable detection"
         );
     }
 

@@ -622,6 +622,9 @@ pub enum MutationKind {
     /// Exact planned branch generation pushed under force-with-lease.
     RebaseBranch,
     RerunChecks,
+    /// One auditable check-suite rerequest against an unchanged head, used only
+    /// to recover required contexts that never started a run.
+    RequestCheckSuite,
     SquashMerge,
     Checkout,
 }
@@ -713,6 +716,13 @@ pub enum EventKind {
     /// Scheduler-owned convergence proved required native SQUASH auto-merge on
     /// the exact current caravan root head.
     RootAutoMergeArmed,
+    /// A required context has zero reporting run or check-suite lineage on the
+    /// exact current head after the bounded grace period, so the caravan cannot
+    /// advance without a visible decision.
+    RequiredRunsMissing,
+    /// Exactly one auditable check-suite rerequest was issued against an
+    /// unchanged head to recover missing required-run coverage.
+    RequiredRunsRetriggered,
 }
 
 impl std::fmt::Display for EventKind {

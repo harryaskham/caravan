@@ -27,6 +27,7 @@ pub mod physical_rebase;
 pub mod priority;
 pub mod read;
 pub mod repair;
+pub mod required_runs;
 pub mod reshape;
 pub mod root_auto_merge;
 pub mod sync;
@@ -79,6 +80,18 @@ CORE MODEL AND INVARIANTS
   `root_auto_merge_not_durable` with cause `provider_did_not_persist_arming`,
   `root_head_moved_during_arming`, or `stale_provider_view`; bounded sync policy
   owns the retry and periodic operator re-arming is never the mechanism.
+- Required CI coverage is proven, not assumed. GitHub sometimes never starts a
+  run for a freshly rebased head, so every sync checks that each context
+  required by protection on the exact base branch has at least one run or
+  check-suite lineage on the exact current head. An `EXPECTED` rollup
+  placeholder is not evidence and a run from a superseded generation is not
+  coverage. Nothing is claimed missing inside the bounded grace period or from a
+  partial provider read. A proven gap is reported as `missing_required_runs`
+  (or `cancelled_superseded_required_runs`) with the exact PR, head, and
+  contexts, degrades `scheduler_status` to `operator_action`, and is recovered
+  only by exactly one auditable check-suite rerequest against the unchanged
+  head. Empty commits, close/reopen loops, force pushes, and broad reruns are
+  never implicit workarounds.
 - Multiple caravans may exist. Cross-caravan compatibility and the configured
   admission bound are checked before automatic changes.
 - Automatic admission is deterministic: configured `caravan-priority:*` labels

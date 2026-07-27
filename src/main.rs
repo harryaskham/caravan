@@ -1928,6 +1928,23 @@ fn render_sync(output: &caravan::sync::SyncOutput) -> String {
             observation.failed_runs.len()
         );
     }
+    for problem in &output.scheduler_status.missing_required_runs {
+        let _ = writeln!(
+            text,
+            "  {} #{} {}@{}: [{}]\n    {}\n    next: {}",
+            if problem.operator_action_required {
+                failure(problem.kind.code())
+            } else {
+                dim(problem.kind.code())
+            },
+            problem.pr,
+            problem.head.name,
+            problem.head.oid,
+            problem.contexts.join(", "),
+            problem.message,
+            problem.next
+        );
+    }
     for step in &output.receipt.completed_steps {
         let _ = writeln!(text, "  {:?} {:?}: {}", step.kind, step.state, step.summary);
     }
