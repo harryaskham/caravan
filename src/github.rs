@@ -1571,16 +1571,25 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
             open_labeled_prs.len().saturating_sub(bounded_members.len());
         let (merge_candidates, default_branch_movements) =
             self.merge_candidate_identities(&repository, &bounded_members, &observed_at)?;
-        let recently_merged_labeled_prs = self.pull_requests(
-            labeled_pr_command(
-                &repository.slug(),
-                "merged",
-                &self.options.label,
-                self.options.merged_limit,
-                true,
-            ),
-            &repository,
-        )?;
+        // bd-cd3be9: generation integrity must see recently merged siblings.
+        // Facts built only from open PRs cannot prove that a candidate is
+        // strictly contained by work that already landed, so a superseded
+        // candidate stayed a live ordered admission attempt forever.
+        let (recently_merged_labeled_prs, merged_generation_facts) = self
+            .pull_requests_with_generation(
+                labeled_pr_command(
+                    &repository.slug(),
+                    "merged",
+                    &self.options.label,
+                    self.options.merged_limit,
+                    true,
+                ),
+                &repository,
+            )?;
+        let generation_facts = generation_facts
+            .into_iter()
+            .chain(merged_generation_facts)
+            .collect::<Vec<_>>();
 
         let mut pull_requests = BTreeMap::new();
         for pull_request in all_open_prs
@@ -3986,6 +3995,65 @@ mod tests {
                 ..
             }
         ));
+        discovery.runner.assert_exhausted();
+    }
+
+    /// bd-cd3be9: generation facts must include recently merged labelled PRs,
+    /// or a candidate strictly contained by already-landed work stays a live
+    /// ordered admission attempt forever.
+    #[test]
+    fn generation_facts_include_recently_merged_labelled_prs() {
+        let repository = repository();
+        let open_json = pr_list_json(12, "feature/widget", "acme/widgets", false);
+        let open_pulls: Vec<model::PullRequestSnapshot> =
+            serde_json::from_str::<Vec<PullRequestJson>>(&open_json)
+                .unwrap()
+                .into_iter()
+                .map(|pull_request| pull_request.into_snapshot(&repository).unwrap())
+                .collect();
+        let runner = FakeRunner::new(vec![
+            (
+                repository_command(),
+                CommandOutput::success(
+                    r#"{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}"#,
+                ),
+            ),
+            (current_branch_command(), CommandOutput::failure(1, "")),
+            (
+                previous_default_command("main"),
+                CommandOutput::failure(128, "unknown revision"),
+            ),
+            (
+                default_branch_command("acme/widgets", "main"),
+                CommandOutput::success(r#"{"object":{"sha":"default-sha"}}"#),
+            ),
+            (
+                open_pr_command("acme/widgets", 1_000),
+                CommandOutput::success(open_json.clone()),
+            ),
+            (
+                merge_candidates_command(&repository, &open_pulls),
+                CommandOutput::success(r#"{"data":{"repository":{"defaultBranchRef":null}}}"#),
+            ),
+            (
+                labeled_pr_command("acme/widgets", "merged", "caravan", 100, true),
+                CommandOutput::success(merged_pr_json()),
+            ),
+        ]);
+        let discovery = GitHubDiscovery::new(runner);
+
+        let snapshot = discovery.discover().expect("discovery succeeds");
+
+        let generation_prs = snapshot
+            .generation_facts
+            .iter()
+            .map(|fact| fact.pr)
+            .collect::<Vec<_>>();
+        assert!(
+            generation_prs.contains(&PrNumber(9)),
+            "merged labelled PR must contribute a generation fact: {generation_prs:?}"
+        );
+        assert!(generation_prs.contains(&PrNumber(12)));
         discovery.runner.assert_exhausted();
     }
 
