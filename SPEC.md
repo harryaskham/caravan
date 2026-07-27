@@ -807,6 +807,13 @@ Hook events include:
 - `required_runs_missing`;
 - `required_runs_retriggered`.
 
+`examples/hooks/caco-repair-dispatch.sh` is the worked example of a
+scheduler-side consumer: it dispatches a repair agent for `external_decision`,
+notifies a human for `operator_action`, stays silent for `none` and
+`retry_tick`, and deduplicates on `decision_fingerprint` so one stuck caravan
+dispatches one agent rather than one per cron tick. Its behaviour is pinned by
+`tests/hook_example.rs` rather than by documentation.
+
 A hook is a configured shell command. It receives one versioned metadata JSON object on stdin and non-secret context such as `CARA_EVENT`, repository, and PR numbers in environment variables. Hook metadata contains operation/event IDs suitable for external deduplication.
 Before hook delivery, every canonical secret-free event is durably appended with
 its exact IDs to a versioned journal under common Git metadata. Secret-free hook

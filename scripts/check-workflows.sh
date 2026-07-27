@@ -16,4 +16,4 @@ command -v shellcheck >/dev/null || {
 }
 
 actionlint -config-file .github/actionlint.yaml .github/workflows/*.yml
-shellcheck scripts/*.sh tests/*.sh
+shellcheck scripts/*.sh tests/*.sh examples/hooks/*.sh
