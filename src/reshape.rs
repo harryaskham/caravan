@@ -206,7 +206,7 @@ fn execute(
         ReshapeOperation::Evict => plan_eviction(&status, &target)?,
         ReshapeOperation::Split => plan_split(&status, &target)?,
     };
-    preflight_result(&virtual_status, checker)?;
+    preflight_result(&status, &virtual_status, checker)?;
     if plan.creates_head {
         preflight_new_head(provider, &status)?;
     }
@@ -492,10 +492,11 @@ fn virtual_status(
     }
 }
 
-fn preflight_result(
+/// Project the exact graph problems a status would report.
+fn projected_problems(
     status: &StatusOutput,
     checker: &impl CompatibilityChecker,
-) -> Result<(), AppError> {
+) -> Result<Vec<crate::model::GraphProblem>, AppError> {
     let snapshot = RepositorySnapshot {
         merge_candidates: Vec::new(),
         merge_candidates_truncated: 0,
@@ -509,17 +510,44 @@ fn preflight_result(
         generation_facts: Vec::new(),
         observed_at: None,
     };
-    let analysis = analyze(&snapshot, checker)?;
-    if analysis.healthy() {
-        Ok(())
-    } else {
-        Err(AppError::structured(
-            ErrorCategory::Validation,
-            "reshape_would_break_fleet",
-            "the proposed reshape does not satisfy Caravan graph/compatibility invariants",
-            Some(json!({ "problems": analysis.fleet.problems })),
-        ))
+    Ok(analyze(&snapshot, checker)?.fleet.problems)
+}
+
+/// Refuse a reshape only when it *introduces* a graph problem.
+///
+/// bd-0dab27: this used to require the whole projected fleet to be healthy, so
+/// any pre-existing problem anywhere blocked every eviction — including
+/// evicting a tail, which cannot introduce a problem because it has no child
+/// and therefore re-links no edge. That made the one tool for dismantling a
+/// broken chain unusable precisely when the chain was broken, and forced raw
+/// provider mutation instead. Reshapes that reduce or preserve the existing
+/// problem set are now allowed, and the refusal names exactly what this
+/// operation would break rather than restating what was already broken.
+fn preflight_result(
+    current: &StatusOutput,
+    projected: &StatusOutput,
+    checker: &impl CompatibilityChecker,
+) -> Result<(), AppError> {
+    let before = projected_problems(current, checker)?;
+    let after = projected_problems(projected, checker)?;
+    let introduced = after
+        .iter()
+        .filter(|problem| !before.contains(problem))
+        .cloned()
+        .collect::<Vec<_>>();
+    if introduced.is_empty() {
+        return Ok(());
     }
+    Err(AppError::structured(
+        ErrorCategory::Validation,
+        "reshape_would_break_fleet",
+        "the proposed reshape would introduce new Caravan graph/compatibility problems",
+        Some(json!({
+            "introduced_problems": introduced,
+            "preexisting_problems": before,
+            "safe_next_action": "resolve the introduced problems, or reshape tail-first so no surviving edge has to be re-linked across a removed member",
+        })),
+    ))
 }
 
 fn preflight_new_head(
@@ -1122,6 +1150,85 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output.affected_prs, vec![PrNumber(2)]);
+    }
+
+    /// Every pair conflicts, so the fleet is unhealthy before and after.
+    struct AlwaysConflicts;
+    impl CompatibilityChecker for AlwaysConflicts {
+        fn check(
+            &self,
+            candidate: &BranchSnapshot,
+            target: &BranchSnapshot,
+        ) -> Result<CompatibilityReport, AppError> {
+            Ok(CompatibilityReport {
+                candidate: candidate.clone(),
+                target: target.clone(),
+                outcome: CompatibilityOutcome::Conflict,
+                conflicting_paths: vec!["src/lib.rs".to_owned()],
+                diagnostic: None,
+            })
+        }
+    }
+
+    /// bd-0dab27 live case: a caravan whose members already conflict must still
+    /// be dismantleable. Evicting the tail removes a node and re-links no edge,
+    /// so it cannot introduce a problem and must not be refused because the
+    /// remaining chain is still broken.
+    #[test]
+    fn evict_tail_succeeds_while_the_rest_of_the_fleet_stays_broken() {
+        let pulls = vec![
+            pull_request(1, "main"),
+            pull_request(2, "pr-1"),
+            pull_request(3, "pr-2"),
+        ];
+        let provider = FakeProvider::new(&pulls);
+
+        let output = execute(
+            status(pulls),
+            &AlwaysConflicts,
+            &provider,
+            ReshapeOperation::Evict,
+            Some(PrNumber(3)),
+            Some("dismantling a broken chain".to_owned()),
+        )
+        .expect("evicting the tail introduces no new problem");
+
+        assert_eq!(output.affected_prs, vec![PrNumber(3)]);
+    }
+
+    /// The middle case still fails closed, because closing the gap creates a
+    /// genuinely new edge, and the refusal names what it would introduce.
+    #[test]
+    fn evict_middle_still_refuses_when_the_new_edge_conflicts() {
+        let pulls = vec![
+            pull_request(1, "main"),
+            pull_request(2, "pr-1"),
+            pull_request(3, "pr-2"),
+        ];
+        let provider = FakeProvider::new(&pulls);
+
+        let error = execute(
+            status(pulls),
+            &AlwaysConflicts,
+            &provider,
+            ReshapeOperation::Evict,
+            Some(PrNumber(2)),
+            Some("middle".to_owned()),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            mcp_cli::StructuredError::code(&error),
+            "reshape_would_break_fleet"
+        );
+        let details = mcp_cli::StructuredError::details(&error).expect("details");
+        assert!(
+            !details["introduced_problems"]
+                .as_array()
+                .expect("introduced problems")
+                .is_empty(),
+            "the refusal must name the problem this reshape introduces"
+        );
     }
 
     #[test]
