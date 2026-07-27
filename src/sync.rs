@@ -6665,8 +6665,10 @@ impl SyncProgress {
                 "cause_code": cause.code(),
                 "trigger": trigger,
                 "trigger_reason": trigger.reason(),
+                "repository": self.repository,
                 "caravan_id": caravan_id,
                 "affected_pr": number,
+                "affected_prs": [number],
                 "default_branch": default_branch,
                 "observed_head": observed.head.oid,
                 "expected_head": expected_head,
@@ -6707,8 +6709,13 @@ impl SyncProgress {
             Some(json!({
                 "cause": cause,
                 "cause_code": cause.code(),
+                // Harvested by the sync_failed repair-wake path so a
+                // cron-dispatched agent receives the exact caravan and PRs
+                // without parsing prose.
+                "repository": self.repository,
                 "caravan_id": caravan_id,
                 "affected_pr": number,
+                "affected_prs": [number],
                 "observed_head": observed.head.oid,
                 "expected_head": expected_head,
                 "observed_state": observed.state,
