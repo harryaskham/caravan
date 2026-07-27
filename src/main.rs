@@ -3197,6 +3197,7 @@ mod tests {
             oid: caravan::model::CommitOid("0".repeat(40)),
         };
         let output = caravan::read::StatusOutput {
+            runtime: caravan::read::RuntimeProvenance::default(),
             provider_api: caravan::model::GitHubApiTelemetry::default(),
             merge_candidates: Vec::new(),
             merge_candidates_truncated: 0,

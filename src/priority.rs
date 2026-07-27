@@ -714,6 +714,7 @@ mod tests {
             compatibility: Vec::new(),
         };
         let status = StatusOutput {
+            runtime: crate::read::RuntimeProvenance::default(),
             provider_api: GitHubApiTelemetry::default(),
             merge_candidates: Vec::new(),
             merge_candidates_truncated: 0,

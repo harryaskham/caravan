@@ -229,7 +229,30 @@ impl Default for SyncBudgetStatus {
     }
 }
 
+/// Seconds reserved per planned provider command.
+///
+/// bd-5528e6: reserving the full `command_timeout_secs` for every slot assumes
+/// every command consumes its entire timeout, which is not a realistic plan but
+/// a worst case. On a six-member caravan that reserve (32 slots x 120s) exceeds
+/// the whole configured run, so sync refuses before mutation and the caravan can
+/// never converge, even for cheap base-retarget and auto-merge arming. Each
+/// command is still individually bounded by `command_timeout_secs`, the whole
+/// tick is still bounded by the operation deadline, and a mid-apply timeout is
+/// an already-handled resumable path -- so a proportional reserve is strictly
+/// safer than guaranteeing zero progress.
+fn reserve_secs_per_command(context: &AppContext) -> u64 {
+    context
+        .config
+        .command_timeout_secs
+        .min(context.config.sync.reserve_secs_per_command)
+}
+
 fn slots_to_duration(context: &AppContext, slots: u64) -> Duration {
+    Duration::from_secs(reserve_secs_per_command(context).saturating_mul(slots))
+}
+
+/// Worst-case duration retained purely as evidence in refusal receipts.
+pub(super) fn slots_to_worst_case_duration(context: &AppContext, slots: u64) -> Duration {
     Duration::from_secs(context.config.command_timeout_secs.saturating_mul(slots))
 }
 

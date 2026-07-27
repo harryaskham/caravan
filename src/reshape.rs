@@ -454,6 +454,7 @@ fn virtual_status(
         status.admission.generation_integrity.clone(),
     );
     StatusOutput {
+        runtime: status.runtime.clone(),
         provider_api: status.provider_api.clone(),
         merge_candidates: Vec::new(),
         merge_candidates_truncated: 0,
@@ -987,6 +988,7 @@ mod tests {
         };
         let analysis = crate::graph::analyze(&snapshot, &Clean).unwrap();
         StatusOutput {
+            runtime: crate::read::RuntimeProvenance::default(),
             provider_api: crate::model::GitHubApiTelemetry::default(),
             merge_candidates: Vec::new(),
             merge_candidates_truncated: 0,

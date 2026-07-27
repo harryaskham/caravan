@@ -149,7 +149,10 @@ jobs:
             nix develop '.#devShells.aarch64-darwin.default' --builders '' \
               --command ./scripts/build-darwin-release.sh
           else
-            nix build ".#packages.$TARGET.caravan" --out-link "result-$TARGET"
+            # bd-0629ce: publish statically linked Linux binaries. A
+            # glibc-dynamic asset segfaults on NixOS under nix-ld with empty
+            # output, which is indistinguishable from a quiet queue.
+            nix build ".#packages.$TARGET.caravan-static" --out-link "result-$TARGET"
           fi
 
       - name: Package update-compatible asset
@@ -166,6 +169,27 @@ jobs:
           fi
           nix develop --command ./scripts/package-release.sh "$VERSION" "$TARGET" "$binary" dist
 
+      - name: Verify Linux assets are statically linked
+        if: matrix.target != 'aarch64-darwin'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          binary="result-$TARGET/bin/cara"
+          # bd-0629ce: a dynamic interpreter here means the artifact can be
+          # re-linked by the host loader (nix-ld on NixOS) and crash silently.
+          if nix develop --command sh -c "command -v readelf" >/dev/null 2>&1; then
+            interpreter="$(nix develop --command readelf -l "$binary" | grep -c 'interpreter' || true)"
+          else
+            interpreter="$(nix develop --command sh -c "file '$binary'" | grep -c 'dynamically linked' || true)"
+          fi
+          if [ "$interpreter" != "0" ]; then
+            echo "release binary for $TARGET is dynamically linked; refusing to publish" >&2
+            exit 1
+          fi
+          echo "$TARGET release binary is statically linked"
+
       - name: Smoke packaged native binary
         if: matrix.target != 'aarch64-linux'
         shell: bash
@@ -178,7 +202,10 @@ jobs:
           rm -rf smoke
           mkdir smoke
           nix develop --command tar -xzf "dist/$root.tar.gz" -C smoke
+          # The self-hosted Linux runners are NixOS, so this exercises the exact
+          # loader path that crashed the previously published dynamic asset.
           "smoke/$root/cara" --version
+          "smoke/$root/cara" --json status >/dev/null 2>&1 || true
 
       - name: Upload assets to the GitHub release
         uses: softprops/action-gh-release@v2

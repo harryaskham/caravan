@@ -761,6 +761,7 @@ fn status(
     };
     let analysis = graph::analyze(&snapshot, checker).expect("analysis");
     StatusOutput {
+        runtime: crate::read::RuntimeProvenance::default(),
         provider_api: crate::model::GitHubApiTelemetry::default(),
         merge_candidates: Vec::new(),
         merge_candidates_truncated: 0,
@@ -3799,6 +3800,10 @@ fn cacophony_context() -> AppContext {
     context.config.rebase_on_join = true;
     context.config.command_timeout_secs = 120;
     context.config.sync.max_duration_secs = 3_600;
+    // These fixtures deliberately assert the strict worst-case cliff model, so
+    // they pin the reserve to the full command timeout. Production defaults to
+    // a proportional reserve (bd-5528e6).
+    context.config.sync.reserve_secs_per_command = 120;
     context
 }
 
@@ -4035,6 +4040,31 @@ fn independent_caravans_grow_round_robin_under_bounded_parallelism() {
     // not the sum of both chains.
     let serial = u64::try_from(admission.admitted[0] + admission.admitted[1]).unwrap() * 3;
     assert!(admission.budget.command_slots < serial + 2);
+}
+
+/// bd-5528e6 live case: caravan 2210 had six members under `max_duration_secs`
+/// 3600 and `command_timeout_secs` 120. The old worst-case reserve wanted 32 slots x 120s
+/// = 3,840,000ms against 3,600,000ms available, so sync refused before any
+/// mutation and even a cheap base-retarget plus arm could never run.
+#[test]
+fn a_six_member_caravan_makes_progress_under_the_proportional_reserve() {
+    let mut context = cacophony_context();
+    // Production default rather than the worst-case pin used by these fixtures.
+    context.config.sync.reserve_secs_per_command =
+        crate::config::SyncConfig::default().reserve_secs_per_command;
+    let deadline = sync_operation_budget(&context);
+    let status = status(linear_chain(6), Some(PrNumber(1)), &clean);
+    let chains = chain_costs(&status);
+
+    let admission = admit_physical_prefix(&context, &chains, deadline);
+
+    assert!(
+        admission.makes_progress(),
+        "a six-member caravan must be able to converge within an hour"
+    );
+    // The whole graph fits, so nothing is deferred purely by the reserve model.
+    assert!(admission.deferred.is_empty());
+    assert!(max_admissible_members(&context, deadline) >= 6);
 }
 
 #[test]

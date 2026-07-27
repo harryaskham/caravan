@@ -372,6 +372,7 @@ mod tests {
                 events: Vec::new(),
                 hook_deliveries: Vec::new(),
                 status: StatusOutput {
+                    runtime: crate::read::RuntimeProvenance::default(),
                     provider_api: crate::model::GitHubApiTelemetry::default(),
                     merge_candidates: Vec::new(),
                     merge_candidates_truncated: 0,

@@ -60,7 +60,13 @@ release-backfill-target tag target:
       *) echo "error: unsupported target: $TARGET" >&2; exit 2 ;;
     esac
     command -v gh >/dev/null 2>&1 || { echo "error: gh CLI is required" >&2; exit 2; }
-    gh auth status >/dev/null 2>&1 || { echo "error: run 'gh auth login' first" >&2; exit 2; }
+    # Check the exact release host: an unrelated enterprise host failure must not
+    # look like a missing github.com login.
+    GH_HOST_NAME="${CARA_RELEASE_GH_HOST:-github.com}"
+    gh auth status --hostname "$GH_HOST_NAME" >/dev/null 2>&1 || {
+      echo "error: not logged into $GH_HOST_NAME; run 'gh auth login --hostname $GH_HOST_NAME' first" >&2
+      exit 2
+    }
 
     git fetch origin --tags --quiet
     git rev-parse --verify "refs/tags/$TAG^{commit}" >/dev/null

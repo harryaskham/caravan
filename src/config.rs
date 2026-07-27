@@ -57,6 +57,10 @@ fn default_journal_max_archives() -> u32 {
     3
 }
 
+const fn default_sync_reserve_secs_per_command() -> u64 {
+    15
+}
+
 fn default_sync_max_candidates_per_tick() -> u32 {
     8
 }
@@ -188,12 +192,18 @@ pub struct SyncConfig {
     /// changes recovery to a typed operator-action problem; detection and the
     /// visible scheduler degradation always happen.
     pub retrigger_missing_required_runs: bool,
+    /// Seconds reserved per planned provider command before the physical apply
+    /// phase (bd-5528e6). Reserving the full `command_timeout_secs` for every
+    /// slot is a worst case, not a plan, and makes larger caravans permanently
+    /// unconvergeable. Capped by `command_timeout_secs`.
+    pub reserve_secs_per_command: u64,
 }
 
 impl Default for SyncConfig {
     fn default() -> Self {
         Self {
             actions: SyncActionsConfig::default(),
+            reserve_secs_per_command: default_sync_reserve_secs_per_command(),
             max_candidates_per_tick: default_sync_max_candidates_per_tick(),
             max_mutations_per_tick: default_sync_max_mutations_per_tick(),
             max_github_requests_per_tick: default_sync_max_github_requests_per_tick(),

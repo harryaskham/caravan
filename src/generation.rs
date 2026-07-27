@@ -558,15 +558,40 @@ pub fn analyze(
             );
         } else {
             let mut relation_rows = Vec::new();
+            let mut unproved_pairs = Vec::new();
+            let mut diverged = false;
             for (index, left) in component.iter().enumerate() {
                 for right in component.iter().skip(index + 1) {
-                    relation_rows.push(format!(
-                        "{left}...{right}={:?}",
-                        relations.get(&(*left, *right))
-                    ));
+                    let relation = relations.get(&(*left, *right));
+                    match relation {
+                        Some(CommitRelation::Diverged) => diverged = true,
+                        Some(CommitRelation::Unknown { reason }) => {
+                            unproved_pairs.push(format!("#{left}...#{right} ({reason})"));
+                        }
+                        _ => {}
+                    }
+                    relation_rows.push(format!("{left}...{right}={relation:?}"));
                 }
             }
             let relation_evidence = relation_rows.join(", ");
+            // bd-7546ea: an unreachable provider comparison is not divergence.
+            // Report the exact unprovable pairs instead of declaring the whole
+            // stream divergent, so one 404 cannot dead-end every sibling.
+            let (reason, safe_next_action) = if diverged || unproved_pairs.is_empty() {
+                (
+                    format!("same-stream open generations are divergent or unproved: {relation_evidence}"),
+                    "the owning agent/controller must choose one exact canonical generation; do not admit, close, or rewrite any sibling automatically".to_owned(),
+                )
+            } else {
+                (
+                    format!(
+                        "same-stream ancestry is unproved because {} provider comparison(s) were unreachable: {}",
+                        unproved_pairs.len(),
+                        unproved_pairs.join(", ")
+                    ),
+                    "no divergence was observed; re-run discovery once the referenced commits are reachable, or declare the exact canonical generation. Cara excludes these rows without wedging selection".to_owned(),
+                )
+            };
             for pr in &component {
                 let (_, provenance) = valid[pr];
                 findings.insert(
@@ -578,10 +603,8 @@ pub fn analyze(
                         related_prs: component.clone(),
                         agent: Some(provenance.agent.clone()),
                         bead_ids: provenance.bead_ids.clone(),
-                        reason: format!(
-                            "same-stream open generations are divergent or unproved: {relation_evidence}"
-                        ),
-                        safe_next_action: "the owning agent/controller must choose one exact canonical generation; do not admit, close, or rewrite any sibling automatically".to_owned(),
+                        reason: reason.clone(),
+                        safe_next_action: safe_next_action.clone(),
                     },
                 );
             }
@@ -854,6 +877,72 @@ mod tests {
                 .findings
                 .iter()
                 .all(|finding| finding.disposition == GenerationDisposition::CurrentGeneration)
+        );
+    }
+
+    /// bd-7546ea: an unreachable provider comparison is reported as exactly
+    /// that, naming the unprovable pair, instead of asserting divergence.
+    #[test]
+    fn unreachable_comparison_is_reported_as_unproved_not_divergent() {
+        let status = analyze(
+            &[
+                fact(1, "agent-a", &["bd-aaaaaa"], 'a', "1"),
+                fact(2, "agent-a", &["bd-aaaaaa"], 'b', "2"),
+            ],
+            |_base, _head| CommitRelation::Unknown {
+                reason: "HTTP 404: No commit found for SHA".to_owned(),
+            },
+        );
+
+        assert!(status.findings.iter().all(|finding| {
+            finding.disposition == GenerationDisposition::AmbiguousGeneration
+                && finding.canonical_pr.is_none()
+        }));
+        let finding = &status.findings[0];
+        assert!(
+            finding.reason.contains("unproved because"),
+            "reason should name unreachability: {}",
+            finding.reason
+        );
+        assert!(finding.reason.contains("#1...#2"));
+        assert!(finding.reason.contains("404"));
+        assert!(
+            !finding.reason.contains("divergent"),
+            "an unreachable comparison must not be reported as divergence"
+        );
+        assert!(
+            finding
+                .safe_next_action
+                .contains("no divergence was observed")
+        );
+        assert!(
+            finding
+                .safe_next_action
+                .contains("without wedging selection")
+        );
+    }
+
+    /// A genuinely diverged component keeps the strict fail-closed wording.
+    #[test]
+    fn divergence_keeps_the_strict_failure_reason() {
+        let status = analyze(
+            &[
+                fact(1, "agent-a", &["bd-aaaaaa"], 'a', "1"),
+                fact(2, "agent-a", &["bd-aaaaaa"], 'b', "2"),
+            ],
+            |_base, _head| CommitRelation::Diverged,
+        );
+
+        let finding = &status.findings[0];
+        assert_eq!(
+            finding.disposition,
+            GenerationDisposition::AmbiguousGeneration
+        );
+        assert!(finding.reason.contains("divergent or unproved"));
+        assert!(
+            finding
+                .safe_next_action
+                .contains("choose one exact canonical")
         );
     }
 

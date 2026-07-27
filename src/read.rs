@@ -64,6 +64,10 @@ fn rebase_on_join_status(context: &AppContext) -> RebaseOnJoinStatus {
 /// Repository-wide live Caravan status.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct StatusOutput {
+    /// Exact binary that produced this receipt. Queue operators must be able to
+    /// prove which build answered when several are installed (bd-0629ce).
+    #[serde(default)]
+    pub runtime: RuntimeProvenance,
     /// Authenticated provider-call counts and latest rate-limit evidence.
     #[serde(default)]
     pub provider_api: crate::model::GitHubApiTelemetry,
@@ -452,6 +456,97 @@ fn attach_provider_api(
 }
 
 /// Discover and validate the real current repository without mutation.
+/// Exact identity of the running Cara binary.
+///
+/// Several Cara builds can be installed at once (a reviewed Nix store closure
+/// and a cargo-installed binary), and PATH order alone decides which answers.
+/// When one of them is broken, a silent crash is indistinguishable from a quiet
+/// queue, so every status receipt records exactly which build produced it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RuntimeProvenance {
+    /// Compiled package version.
+    pub version: String,
+    /// Fully resolved executable path, symlinks followed where possible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable: Option<String>,
+    /// SHA-256 of the exact running executable, when it is readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable_sha256: Option<String>,
+    /// True when the executable resolves inside a Nix store path.
+    pub nix_store: bool,
+}
+
+impl RuntimeProvenance {
+    #[must_use]
+    pub fn detect() -> Self {
+        let executable = std::env::current_exe()
+            .ok()
+            .map(|path| std::fs::canonicalize(&path).unwrap_or(path));
+        let executable_sha256 = executable.as_ref().and_then(|path| {
+            let bytes = std::fs::read(path).ok()?;
+            Some(format!(
+                "sha256:{:x}",
+                <sha2::Sha256 as sha2::Digest>::digest(&bytes)
+            ))
+        });
+        let display = executable.as_ref().map(|path| path.display().to_string());
+        Self {
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            nix_store: display
+                .as_deref()
+                .is_some_and(|path| path.starts_with("/nix/store/")),
+            executable: display,
+            executable_sha256,
+        }
+    }
+}
+
+/// Prove an exact ancestry relation from objects already present locally.
+///
+/// The provider comparison is authoritative when it succeeds. When a ref has
+/// been deleted or is otherwise unreachable, the same commits are frequently
+/// still in the local object database, and an exact local proof is strictly
+/// better than declaring an entire same-stream component unprovable.
+fn local_commit_relation(
+    repository_path: &std::path::Path,
+    base: &crate::model::CommitOid,
+    head: &crate::model::CommitOid,
+) -> Option<crate::generation::CommitRelation> {
+    use crate::command::{CommandRunner, CommandSpec, ProcessRunner};
+    let runner = ProcessRunner::in_directory(repository_path);
+    let known = |oid: &crate::model::CommitOid| {
+        runner
+            .run(&CommandSpec::new("git").args([
+                "cat-file",
+                "-e",
+                &format!("{}^{{commit}}", oid.0),
+            ]))
+            .is_ok_and(|output| output.is_success())
+    };
+    if !known(base) || !known(head) {
+        return None;
+    }
+    if base == head {
+        return Some(crate::generation::CommitRelation::Identical);
+    }
+    let ancestor = |first: &crate::model::CommitOid, second: &crate::model::CommitOid| {
+        runner
+            .run(&CommandSpec::new("git").args([
+                "merge-base",
+                "--is-ancestor",
+                first.0.as_str(),
+                second.0.as_str(),
+            ]))
+            .is_ok_and(|output| output.is_success())
+    };
+    match (ancestor(base, head), ancestor(head, base)) {
+        (true, true) => Some(crate::generation::CommitRelation::Identical),
+        (true, false) => Some(crate::generation::CommitRelation::Ahead),
+        (false, true) => Some(crate::generation::CommitRelation::Behind),
+        (false, false) => Some(crate::generation::CommitRelation::Diverged),
+    }
+}
+
 pub fn status(context: &AppContext) -> Result<StatusOutput, AppError> {
     let budget = std::time::Duration::from_secs(context.config.command_timeout_secs);
     status_with_deadline(context, std::time::Instant::now() + budget)
@@ -597,11 +692,30 @@ fn status_with_discovery_options(
         }
     }
     let generation_integrity = crate::generation::analyze(&generation_facts, |base, head| {
-        label_provider
-            .compare_commits(&snapshot.repository, base, head)
-            .unwrap_or_else(|error| crate::generation::CommitRelation::Unknown {
+        // bd-7546ea: exact local objects are an authoritative ancestry proof.
+        // A provider comparison can be unreachable (deleted ref, 404) or simply
+        // wrong/stale, and reporting a direct parent/child pair as `diverged`
+        // dead-ends the owner. Prefer a local proof of ancestry whenever both
+        // commits are present; otherwise keep the provider's answer.
+        let provider_relation = label_provider.compare_commits(&snapshot.repository, base, head);
+        let local = local_commit_relation(&context.repository_path, base, head);
+        match (provider_relation, local) {
+            // A local ancestry proof is authoritative and overrides an
+            // unreachable or contradictory provider answer.
+            (
+                _,
+                Some(
+                    relation @ (crate::generation::CommitRelation::Ahead
+                    | crate::generation::CommitRelation::Behind
+                    | crate::generation::CommitRelation::Identical),
+                ),
+            )
+            | (Err(_), Some(relation))
+            | (Ok(relation), _) => relation,
+            (Err(error), None) => crate::generation::CommitRelation::Unknown {
                 reason: error.to_string(),
-            })
+            },
+        }
     });
     apply_generation_graph_problems(&mut analysis, &generation_integrity);
     let admission = resolve_admission_with_generation(
@@ -625,6 +739,7 @@ fn status_with_discovery_options(
             .map(|age| u64::try_from(age.as_millis()).unwrap_or(u64::MAX));
     }
     let mut output = StatusOutput {
+        runtime: RuntimeProvenance::detect(),
         provider_api,
         merge_candidates: snapshot.merge_candidates,
         merge_candidates_truncated: snapshot.merge_candidates_truncated,
@@ -2083,6 +2198,7 @@ mod tests {
         let checker = clean_checker;
         let analysis = analyze(&snapshot, &checker).unwrap();
         StatusOutput {
+            runtime: crate::read::RuntimeProvenance::default(),
             provider_api: crate::model::GitHubApiTelemetry::default(),
             merge_candidates: Vec::new(),
             merge_candidates_truncated: 0,
@@ -2651,6 +2767,57 @@ mod tests {
         assert_eq!(details["actual_head_oid"], fresh.head.oid.0);
         assert_eq!(details["mutated"], false);
     }
+
+    /// bd-7546ea live pair: PR2228 head ccc3af5c is the direct parent of
+    /// PR2235 head f0bae700, so an exact local proof must classify it as
+    /// strict-prefix ancestry, never as divergence.
+    #[test]
+    fn local_ancestry_proves_direct_parent_child_instead_of_divergence() {
+        let directory = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(directory.path())
+                .args(args)
+                .output()
+                .expect("git fixture command");
+            assert!(output.status.success(), "git {args:?} failed");
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        run(&["init", "--quiet"]);
+        run(&["config", "user.name", "Caravan Test"]);
+        run(&["config", "user.email", "caravan@example.invalid"]);
+        std::fs::write(directory.path().join("a"), "a\n").unwrap();
+        run(&["add", "a"]);
+        run(&["commit", "-m", "parent"]);
+        let parent = crate::model::CommitOid(run(&["rev-parse", "HEAD"]));
+        std::fs::write(directory.path().join("b"), "b\n").unwrap();
+        run(&["add", "b"]);
+        run(&["commit", "-m", "child"]);
+        let child = crate::model::CommitOid(run(&["rev-parse", "HEAD"]));
+
+        assert_eq!(
+            local_commit_relation(directory.path(), &parent, &child),
+            Some(crate::generation::CommitRelation::Ahead)
+        );
+        assert_eq!(
+            local_commit_relation(directory.path(), &child, &parent),
+            Some(crate::generation::CommitRelation::Behind)
+        );
+        assert_eq!(
+            local_commit_relation(directory.path(), &parent, &parent),
+            Some(crate::generation::CommitRelation::Identical)
+        );
+        // An absent object cannot be proven locally and must stay unproved.
+        assert_eq!(
+            local_commit_relation(
+                directory.path(),
+                &parent,
+                &crate::model::CommitOid("0".repeat(40))
+            ),
+            None
+        );
+    }
+
 
     /// Reviewed operator resolution choice-019f9d34 (bd-afa02d) narrowed the
     /// relaxation to *intent* rather than blanket queue position. bd-7099e8

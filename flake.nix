@@ -95,12 +95,53 @@
             mainProgram = "cara";
           };
         };
+
+        # bd-0629ce: the published Linux release asset must not depend on the
+        # host's dynamic loader. A glibc-dynamic build segfaults on NixOS when
+        # nix-ld substitutes a different glibc, and it does so with empty
+        # stdout/stderr, so a crashing Cara looks like a quiet queue. Linux
+        # release artifacts are therefore statically linked against musl.
+        muslCaravan =
+          let
+            muslPkgs =
+              if system == "x86_64-linux" then
+                pkgs.pkgsCross.musl64
+              else if system == "aarch64-linux" then
+                pkgs.pkgsCross.aarch64-multiplatform-musl
+              else
+                null;
+          in
+          if muslPkgs == null then
+            null
+          else
+            muslPkgs.rustPlatform.buildRustPackage {
+              pname = "caravan-static";
+              version = "0.0.10";
+              src = caravanSrc;
+
+              cargoLock.lockFile = "${caravanSrc}/Cargo.lock";
+              # Cross/static toolchains cannot run the host-linked test binaries
+              # here; the native package above keeps `doCheck = true` and the
+              # release lane still runs the complete suite before publishing.
+              doCheck = false;
+
+              nativeBuildInputs = [ pkgs.pkg-config ];
+
+              RUSTFLAGS = "-C target-feature=+crt-static";
+
+              meta = {
+                description = "Agent-in-the-loop GitHub merge queue (static musl)";
+                license = lib.licenses.mit;
+                mainProgram = "cara";
+              };
+            };
       in
       {
         packages = {
           default = caravan;
           caravan = caravan;
-        };
+        }
+        // lib.optionalAttrs (muslCaravan != null) { caravan-static = muslCaravan; };
 
         apps.default = {
           type = "app";

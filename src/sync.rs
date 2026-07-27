@@ -1110,6 +1110,10 @@ fn physical_sync_budget_error_with_admission(
         "command_timeout_ms": context.config.command_timeout_secs.saturating_mul(1_000),
         "configured_deadline_ms": duration_millis(deadline),
         "required_command_slots": budget.command_slots,
+        "worst_case_required_ms": duration_millis(
+            crate::sync::budget::slots_to_worst_case_duration(context, budget.command_slots),
+        ),
+        "reserve_model": "proportional per-command reserve; each command remains bounded by command_timeout_secs and the tick by the operation deadline",
         "required_mutation_capacity": budget.mutation_reserve,
         "max_admissible_members": capacity,
         "prepared_plan_count": plans.len(),

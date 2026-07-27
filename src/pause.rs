@@ -791,6 +791,7 @@ mod tests {
     }
     fn status(pr: PullRequestSnapshot) -> StatusOutput {
         StatusOutput {
+            runtime: crate::read::RuntimeProvenance::default(),
             provider_api: crate::model::GitHubApiTelemetry::default(),
             merge_candidates: Vec::new(),
             merge_candidates_truncated: 0,
