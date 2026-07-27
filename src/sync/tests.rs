@@ -5596,6 +5596,18 @@ fn caravan_status(
     current: Option<PrNumber>,
     identical_trees: bool,
 ) -> StatusOutput {
+    caravan_status_with_containment(pulls, current, identical_trees, true)
+}
+
+/// As [`caravan_status`], but able to model a default branch the caravan head
+/// does not contain — for example after an operator reverted or discarded an
+/// already-landed ancestor.
+fn caravan_status_with_containment(
+    pulls: Vec<PullRequestSnapshot>,
+    current: Option<PrNumber>,
+    identical_trees: bool,
+    target_reachable_from_candidate: bool,
+) -> StatusOutput {
     let mut status = status(pulls, current, &clean);
     // Caravan-owned merging is opt-in: these fixtures set it explicitly, just
     // as a repository does once every consumer of its config understands the
@@ -5639,6 +5651,7 @@ fn caravan_status(
                 "tree-foreign".to_owned()
             }),
             identical: identical_trees,
+            target_reachable_from_candidate,
         })
         .collect();
     status.healthy = analysis.healthy();
@@ -6160,4 +6173,56 @@ fn an_existing_config_on_a_new_runtime_keeps_the_native_merge_actor() {
     );
     assert!(!progress.root_auto_merge.is_empty());
     assert!(progress.root_merge.is_empty());
+}
+
+#[test]
+fn an_operator_reverted_ancestor_is_refused_never_silently_reintroduced() {
+    // Live migration fixture: cumulative root #2215 was landed and then
+    // discarded/reverted by the operator on the default branch, while
+    // successors #2223/#2225/#2227 still carry its diff because they were
+    // physically rebased on top of it before CI.
+    //
+    // This is the case cumulative tree identity alone cannot catch. The
+    // three-way merge of the successor with the reverted default branch
+    // reapplies #2215's diff and still yields exactly the successor's own tree,
+    // so `identical` stays true. What changed is containment: the default
+    // branch is no longer an ancestor of the successor. Landing here would
+    // silently reintroduce content the operator deliberately removed, so the
+    // tick refuses and leaves the decision to whoever can rescope the content.
+    let pulls = vec![
+        caravan_member(2223, "pr2223", "main"),
+        caravan_member(2225, "pr2225", "pr2223"),
+    ];
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    let status = caravan_status_with_containment(pulls, Some(PrNumber(2223)), true, false);
+
+    let error = execute(&status, &provider, false, false, false)
+        .expect_err("a reverted ancestor is never silently reintroduced");
+
+    assert_eq!(mcp_cli::StructuredError::code(&error), "root_merge_refused");
+    let details = mcp_cli::StructuredError::details(&error).expect("details");
+    assert_eq!(
+        details["cause"],
+        "default_branch_diverged_from_retained_patch_set"
+    );
+    assert_eq!(
+        details["resumable"], false,
+        "rerunning cannot decide whether reverted content should return"
+    );
+    assert_eq!(details["operator_action_required"], true);
+    // The tree proof still reports identical: that is exactly why containment
+    // has to be a separate, load-bearing fact.
+    assert_eq!(details["evidence"]["cumulative_tree"]["identical"], true);
+    assert_eq!(
+        details["evidence"]["cumulative_tree"]["target_reachable_from_candidate"],
+        false
+    );
+    assert!(
+        !provider.calls.borrow().contains(&MutationKind::SquashMerge),
+        "no landing is attempted"
+    );
+    assert!(
+        provider.pulls.borrow()[&PrNumber(2225)].state == PullRequestState::Open,
+        "successors are left untouched for rescoping"
+    );
 }

@@ -82,8 +82,10 @@ CORE MODEL AND INVARIANTS
   exact default branch when its base is anything else, including an
   already-merged predecessor branch; re-read and prove base/ref/head plus the
   required contexts of the new merge identity; prove that merging into the
-  default branch yields exactly the head's already-validated tree; perform one
-  non-admin SQUASH merge fenced on the exact head; prove the merge commit is
+  default branch yields exactly the head's already-validated tree *and* that the
+  default branch is the generation this caravan's retained patch set predicts,
+  so an operator-reverted ancestor is refused rather than silently reintroduced;
+  perform one non-admin SQUASH merge fenced on the exact head; prove the merge commit is
   contained by the freshly fetched default branch; then promote the successor
   and repeat within a bounded per-tick allowance. Administrator merge stays
   reserved for the audited `caravan-force` bypass. Sealed `root_promotion` and
