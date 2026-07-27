@@ -2219,6 +2219,7 @@ mod tests {
             pull_requests: std::collections::BTreeMap::from([(pull_request.number, pull_request)]),
             compatibility: Vec::new(),
             cumulative_trees: Vec::new(),
+            squash_reconciliations: Vec::new(),
         };
         let admission = crate::read::resolve_admission(&analysis, &[]);
         StatusOutput {

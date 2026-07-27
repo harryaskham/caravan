@@ -828,6 +828,7 @@ mod tests {
                 pull_requests: BTreeMap::from([(PrNumber(1), pr)]),
                 compatibility: Vec::new(),
                 cumulative_trees: Vec::new(),
+                squash_reconciliations: Vec::new(),
             },
             pauses: Vec::new(),
             timing: None,

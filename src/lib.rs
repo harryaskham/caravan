@@ -31,6 +31,7 @@ pub mod required_runs;
 pub mod reshape;
 pub mod root_auto_merge;
 pub mod root_merge;
+pub mod squash_equivalence;
 pub mod sync;
 pub mod web;
 
@@ -268,6 +269,34 @@ Before enabling physical mode in an existing repository:
   `cara status`, `cara check`, then one `cara sync --all`, and inspect plans,
   leases, rewritten heads, midpoint facts, and fresh CI;
 - roll back by reverting the config to false. Do not force-push branches back.
+
+SQUASH-EQUIVALENT STACKED HISTORY
+- A landed member arrives on the default branch as one squash commit: identical
+  cumulative content, unrelated commit identity. Later members keep replaying
+  the pre-squash commits, so an attachment can conflict against content that is
+  identical to what it introduces. Git's own patch-identity pruning does not
+  cover a squash that combined several source commits.
+- Every non-clean attachment check (head/default, adjacent pair, head after
+  another caravan tail) also emits exact squash-equivalence evidence for the
+  same revisions. It is evidence, never authority.
+- A prefix is proven only when it is an ancestor-closed linear prefix of the
+  candidate-only range and every path its cumulative diff changes has an
+  identical blob object and file mode on the exact target tip, and only when
+  replaying the retained commits from that boundary is independently clean.
+  Commit messages, subjects, authorship, and patch text are never proof; an
+  identical patch with a different resulting blob is not equivalence; an
+  untouched identical file proves nothing.
+- Outcomes are `reconcilable`, `no_equivalence`, `residual_conflict` (prefix
+  represented, retained commits still diverge), and `indeterminate` (absent or
+  ambiguous merge base, non-linear range, unrepresentable path). Only
+  `reconcilable` authorizes a boundary. Ordinary three-way divergence after the
+  equality point is never reconciled and never resolved by taking either side.
+- Applying reconciliation is a separate explicitly authorized rewrite. It
+  reverifies that the replayed head tree equals the proven cumulative tree and
+  that the rebuilt commit count equals the proven retained set, failing closed
+  before any push. Receipts list dropped/retained commits, the proven boundary
+  and its tree, represented paths with blobs and modes, and the cumulative tree
+  before and after reconciliation.
 
 SYNC-OWNED GREEDY ADMISSION
 - The policy is disabled by default and requires both `sync --all` and

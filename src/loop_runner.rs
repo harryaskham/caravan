@@ -415,6 +415,7 @@ mod tests {
                         pull_requests: BTreeMap::new(),
                         compatibility: Vec::new(),
                         cumulative_trees: Vec::new(),
+                        squash_reconciliations: Vec::new(),
                     },
                     pauses: Vec::new(),
                     sync_budget: crate::sync::SyncBudgetStatus::default(),
