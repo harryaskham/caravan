@@ -225,7 +225,7 @@ fn execute(
                     .as_ref()
                     .expect("an eviction child has a desired base");
                 state.ensure_base(provider, &status.repository, child, desired)?;
-                if plan.creates_head {
+                if plan.creates_head && status.head_merge.actor.github() {
                     state.ensure_squash_auto_merge(provider, &status.repository, child)?;
                 } else {
                     state.ensure_auto_merge_disabled(provider, &status.repository, child)?;
@@ -265,7 +265,11 @@ fn execute(
                 number,
                 &status.analysis.fleet.default_branch,
             )?;
-            state.ensure_squash_auto_merge(provider, &status.repository, number)?;
+            if status.head_merge.actor.github() {
+                state.ensure_squash_auto_merge(provider, &status.repository, number)?;
+            } else {
+                state.ensure_auto_merge_disabled(provider, &status.repository, number)?;
+            }
         }
     }
 
@@ -361,7 +365,7 @@ fn plan_eviction(
     if let (Some(child), Some(base)) = (child, &child_base) {
         let virtual_child = pull_requests.get_mut(&child).expect("child is present");
         virtual_child.base = base.clone();
-        virtual_child.auto_merge = if creates_head {
+        virtual_child.auto_merge = if creates_head && status.head_merge.actor.github() {
             AutoMergeState::squash()
         } else {
             AutoMergeState::disabled()
@@ -401,16 +405,23 @@ fn plan_split(
     let position = caravan
         .position(target.number)
         .expect("containing caravan has target");
-    if position == 0
-        && target.auto_merge.enabled
-        && target.auto_merge.merge_method == Some(MergeMethod::Squash)
-    {
+    // "Already a head" is whatever the configured merge actor makes it. Under
+    // provider-native delegation that is a root carrying squash auto-merge;
+    // under caravan-owned merging nobody is armed, so the exact fact is a root
+    // already targeting the default branch.
+    let already_head = position == 0
+        && if status.head_merge.actor.github() {
+            target.auto_merge.enabled && target.auto_merge.merge_method == Some(MergeMethod::Squash)
+        } else {
+            target.base == status.analysis.fleet.default_branch
+        };
+    if already_head {
         return Err(AppError::validation(
             "split_pr_is_head",
             format!("PR #{} is already a caravan head", target.number),
         ));
     }
-    // A head missing squash auto-merge is treated as a resumable partial split:
+    // A root that has not reached that state yet is a resumable partial split:
     // its base step already landed and only the second provider step remains.
 
     let mut pull_requests = status.analysis.pull_requests.clone();
@@ -418,7 +429,11 @@ fn plan_split(
         .get_mut(&target.number)
         .expect("target is present");
     virtual_target.base = status.analysis.fleet.default_branch.clone();
-    virtual_target.auto_merge = AutoMergeState::squash();
+    virtual_target.auto_merge = if status.head_merge.actor.github() {
+        AutoMergeState::squash()
+    } else {
+        AutoMergeState::disabled()
+    };
     Ok((
         virtual_status(status, pull_requests),
         ReshapePlan {
@@ -447,13 +462,14 @@ fn virtual_status(
         generation_facts: Vec::new(),
         observed_at: None,
     };
-    let analysis = crate::graph::derive(&snapshot);
+    let analysis = crate::graph::derive_for_actor(&snapshot, status.head_merge.actor);
     let admission = crate::read::resolve_admission_with_generation(
         &analysis,
         &status.admission.priority_labels,
         status.admission.generation_integrity.clone(),
     );
     StatusOutput {
+        head_merge: crate::read::HeadMergeStatus::default(),
         runtime: status.runtime.clone(),
         provider_api: status.provider_api.clone(),
         merge_candidates: Vec::new(),
@@ -960,11 +976,8 @@ mod tests {
             base: branch(base, 99),
             cross_repository: false,
             labels: BTreeSet::from([ACTIVE_LABEL.to_owned()]),
-            auto_merge: if base == "main" {
-                AutoMergeState::squash()
-            } else {
-                AutoMergeState::disabled()
-            },
+            // Cara is the merge actor by default: no member is armed.
+            auto_merge: AutoMergeState::disabled(),
             checks: Vec::new(),
             created_at: Some(format!("2026-01-01T00:00:{number:02}Z")),
             merged_at: None,
@@ -988,6 +1001,7 @@ mod tests {
         };
         let analysis = crate::graph::analyze(&snapshot, &Clean).unwrap();
         StatusOutput {
+            head_merge: crate::read::HeadMergeStatus::default(),
             runtime: crate::read::RuntimeProvenance::default(),
             provider_api: crate::model::GitHubApiTelemetry::default(),
             merge_candidates: Vec::new(),
@@ -1073,7 +1087,7 @@ mod tests {
     }
 
     #[test]
-    fn evict_head_promotes_child_with_squash_auto_merge() {
+    fn evict_head_promotes_child_to_the_default_branch_without_arming() {
         let pulls = vec![pull_request(1, "main"), pull_request(2, "pr-1")];
         let provider = FakeProvider::new(&pulls);
         execute(
@@ -1087,7 +1101,8 @@ mod tests {
         .unwrap();
         let state = provider.pull_requests.borrow();
         assert_eq!(state[&PrNumber(2)].base.name, "main");
-        assert_eq!(state[&PrNumber(2)].auto_merge, AutoMergeState::squash());
+        // Cara merges promoted roots itself; the promoted child is never armed.
+        assert_eq!(state[&PrNumber(2)].auto_merge, AutoMergeState::disabled());
     }
 
     #[test]
@@ -1141,7 +1156,7 @@ mod tests {
         .unwrap();
         let state = provider.pull_requests.borrow();
         assert_eq!(state[&PrNumber(2)].base.name, "main");
-        assert_eq!(state[&PrNumber(2)].auto_merge, AutoMergeState::squash());
+        assert_eq!(state[&PrNumber(2)].auto_merge, AutoMergeState::disabled());
         assert_eq!(output.resulting_fleet.caravans.len(), 2);
     }
 

@@ -18,9 +18,19 @@ use crate::required_runs::{
 /// far enough in the past that the default grace period has always elapsed.
 const PUBLISHED_AT: &str = "2020-01-01T00:00:00Z";
 
+#[allow(clippy::struct_excessive_bools)]
 struct FakeProvider {
     allows_auto_merge: bool,
+    allows_squash_merge: bool,
     branch_protected: bool,
+    /// Squash merges the provider accepts but never exposes as merged.
+    unpersisted_merges: RefCell<BTreeMap<PrNumber, u32>>,
+    /// Merge commit reported for a merged PR, keyed by PR number.
+    merge_commits: RefCell<BTreeMap<PrNumber, CommitOid>>,
+    /// Merge commits the fetched default branch does *not* contain.
+    unreachable_merges: RefCell<BTreeSet<CommitOid>>,
+    /// Default-branch head observed after each caravan-owned merge.
+    default_branch_head_after_merge: RefCell<Option<CommitOid>>,
     pulls: RefCell<BTreeMap<PrNumber, PullRequestSnapshot>>,
     /// Scripted stale provider list/read responses served before live facts.
     refetch_overrides: RefCell<BTreeMap<PrNumber, VecDeque<PullRequestSnapshot>>>,
@@ -53,7 +63,12 @@ impl FakeProvider {
     fn with_pull_requests(pulls: Vec<PullRequestSnapshot>) -> Self {
         Self {
             allows_auto_merge: true,
+            allows_squash_merge: true,
             branch_protected: true,
+            unpersisted_merges: RefCell::new(BTreeMap::new()),
+            merge_commits: RefCell::new(BTreeMap::new()),
+            unreachable_merges: RefCell::new(BTreeSet::new()),
+            default_branch_head_after_merge: RefCell::new(None),
             pulls: RefCell::new(
                 pulls
                     .into_iter()
@@ -134,6 +149,18 @@ impl FakeProvider {
     /// Accept `count` arming requests without ever persisting auto-merge.
     fn never_persist_arming(&self, number: PrNumber, count: u32) {
         self.unpersisted_armings.borrow_mut().insert(number, count);
+    }
+
+    /// Accept `count` squash merges without ever exposing a merged PR.
+    fn never_persist_merge(&self, number: PrNumber, count: u32) {
+        self.unpersisted_merges.borrow_mut().insert(number, count);
+    }
+
+    /// Report a merge commit the fetched default branch does not contain.
+    fn serve_unreachable_merge(&self, number: PrNumber, merge_commit: &str) {
+        let oid = CommitOid(merge_commit.to_owned());
+        self.merge_commits.borrow_mut().insert(number, oid.clone());
+        self.unreachable_merges.borrow_mut().insert(oid);
     }
 
     fn mutate(
@@ -249,6 +276,74 @@ impl SyncProvider for FakeProvider {
         _repository: &RepositoryId,
     ) -> Result<bool, MutationError> {
         Ok(self.allows_auto_merge)
+    }
+
+    fn repository_allows_squash_merge(
+        &self,
+        _repository: &RepositoryId,
+    ) -> Result<bool, MutationError> {
+        Ok(self.allows_squash_merge)
+    }
+
+    fn branch_head_oid(
+        &self,
+        _repository: &RepositoryId,
+        _branch: &str,
+    ) -> Result<CommitOid, MutationError> {
+        Ok(self
+            .default_branch_head_after_merge
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| self.branch_head.borrow().clone()))
+    }
+
+    fn compare_commits(
+        &self,
+        _repository: &RepositoryId,
+        base: &CommitOid,
+        _head: &CommitOid,
+    ) -> Result<crate::generation::CommitRelation, MutationError> {
+        if self.unreachable_merges.borrow().contains(base) {
+            return Ok(crate::generation::CommitRelation::Diverged);
+        }
+        Ok(crate::generation::CommitRelation::Ahead)
+    }
+
+    fn merge_commit_oid(
+        &self,
+        _repository: &RepositoryId,
+        number: PrNumber,
+    ) -> Result<Option<CommitOid>, MutationError> {
+        Ok(self.merge_commits.borrow().get(&number).cloned())
+    }
+
+    fn squash_merge(
+        &self,
+        _repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+    ) -> Result<GitHubMutationReceipt, MutationError> {
+        let unpersisted = self
+            .unpersisted_merges
+            .borrow()
+            .get(&expected.number)
+            .copied()
+            .unwrap_or(0);
+        if unpersisted > 0 {
+            self.unpersisted_merges
+                .borrow_mut()
+                .insert(expected.number, unpersisted - 1);
+            // The provider accepts the merge and still exposes an open PR.
+            return self.mutate(expected, MutationKind::SquashMerge, |_| {});
+        }
+        self.merge_commits
+            .borrow_mut()
+            .entry(expected.number)
+            .or_insert_with(|| CommitOid(format!("merge-{}", expected.number.0)));
+        self.mutate(expected, MutationKind::SquashMerge, |pull_request| {
+            pull_request.state = PullRequestState::Merged;
+            pull_request.merged_at = Some("now".to_owned());
+            pull_request.auto_merge = AutoMergeState::disabled();
+        })
     }
 
     fn set_base(
@@ -759,8 +854,16 @@ fn status(
         generation_facts: Vec::new(),
         observed_at: None,
     };
-    let analysis = graph::analyze(&snapshot, checker).expect("analysis");
+    // The historical fixture set exercises provider-native delegation. The
+    // caravan-owned architecture has its own fixtures below.
+    let analysis =
+        graph::analyze_for_actor(&snapshot, checker, crate::model::HeadMergeActor::Github)
+            .expect("analysis");
     StatusOutput {
+        head_merge: crate::read::HeadMergeStatus {
+            actor: crate::model::HeadMergeActor::Github,
+            ..crate::read::HeadMergeStatus::default()
+        },
         runtime: crate::read::RuntimeProvenance::default(),
         provider_api: crate::model::GitHubApiTelemetry::default(),
         merge_candidates: Vec::new(),
@@ -2430,6 +2533,7 @@ fn successful_force_merge_is_one_shot_and_advances_child() {
         vec![
             EventKind::ForceMergeAttempted,
             EventKind::ForceMergeCompleted,
+            EventKind::RootPromoted,
             EventKind::HeadAdvanced,
             EventKind::RootAutoMergeArmed,
         ]
@@ -2794,8 +2898,16 @@ fn repeated_healthy_sync_is_a_noop_with_explicit_steps() {
 
     let progress = execute(&status, &provider, false, false, false).expect("sync converges");
 
-    assert!(!progress.operation_receipt().changed);
-    assert!(provider.calls.borrow().is_empty());
+    assert!(
+        !progress.operation_receipt().changed,
+        "{:#?}",
+        progress.steps
+    );
+    assert!(
+        provider.calls.borrow().is_empty(),
+        "{:?}",
+        provider.calls.borrow()
+    );
     assert_eq!(progress.synchronized_caravans, vec![PrNumber(1)]);
     assert_eq!(progress.steps.len(), 4);
 }
@@ -3499,17 +3611,19 @@ fn a_persistently_stale_head_read_stops_with_a_typed_bounded_cause() {
     let status = status(pulls, Some(PrNumber(1)), &clean);
 
     let error = execute(&status, &provider, false, false, false)
-        .expect_err("a superseded generation is never armed");
+        .expect_err("a superseded generation is never promoted or armed");
 
+    // Promotion is the first fenced step, so a persistently stale provider view
+    // stops there: nothing downstream can arm or merge an unproven generation.
     assert_eq!(
         mcp_cli::StructuredError::code(&error),
-        "root_auto_merge_not_durable"
+        "root_promotion_incomplete"
     );
     let details = mcp_cli::StructuredError::details(&error).expect("details");
     assert_eq!(details["cause"], "stale_provider_view");
     assert_eq!(details["resumable"], true);
     assert_eq!(details["operator_action_required"], false);
-    assert_eq!(details["provenance"]["owner"], "caravan-scheduler");
+    assert_eq!(details["merged"], false);
     assert!(
         !provider
             .calls
@@ -5451,4 +5565,550 @@ fn grace_starts_at_publication_not_at_a_preserved_commit_date() {
         },
     });
     assert_eq!(stalled.status, RequiredRunsStatus::MissingRequiredRuns);
+}
+
+// ---------------------------------------------------------------------------
+// Caravan-owned root promotion and direct squash merge (bd-f8cf99).
+//
+// Live incident: PR2210 squash-landed on `main`; PR2213 stayed based on
+// PR2210's generation branch, was armed with provider-native auto-merge while
+// still `CLEAN`, and merged *instantly into that already-merged predecessor*
+// instead of `main`. Its content never reached `main` and PR2215 inherited both
+// the cumulative content and a dangling base.
+//
+// These fixtures pin the replacement contract: one merge actor, one ordered
+// fenced transaction — promote to the exact default branch, re-verify, prove the
+// already-validated tree is what lands, then squash exactly once and prove it
+// reached the default branch before advancing the root.
+// ---------------------------------------------------------------------------
+
+/// Fleet fixture under the default caravan-owned merge actor.
+fn caravan_status(
+    pulls: Vec<PullRequestSnapshot>,
+    current: Option<PrNumber>,
+    identical_trees: bool,
+) -> StatusOutput {
+    let mut status = status(pulls, current, &clean);
+    status.head_merge = crate::read::HeadMergeStatus::default();
+    let snapshot = RepositorySnapshot {
+        merge_candidates: Vec::new(),
+        merge_candidates_truncated: 0,
+        previous_default_oid: None,
+        default_branch_movements: Vec::new(),
+        repository: repository(),
+        default_branch: branch("main"),
+        current_branch: status.current_branch.clone(),
+        current_pr: status.current_pr,
+        pull_requests: status.analysis.pull_requests.values().cloned().collect(),
+        generation_facts: Vec::new(),
+        observed_at: None,
+    };
+    let mut analysis =
+        graph::analyze_for_actor(&snapshot, &clean, crate::model::HeadMergeActor::Caravan)
+            .expect("analysis");
+    // Members are physically rebased before CI runs, so the exact head SHA
+    // already carries the cumulative reviewed tree. `identical_trees=false`
+    // models a default branch that gained foreign content since then.
+    analysis.cumulative_trees = analysis
+        .fleet
+        .caravans
+        .iter()
+        .flat_map(|caravan| caravan.members.clone())
+        .filter_map(|member| analysis.pull_requests.get(&member).cloned())
+        .map(|head| crate::model::CumulativeTreeProof {
+            candidate: head.head.clone(),
+            target: branch("main"),
+            candidate_tree: CommitOid("tree-validated".to_owned()),
+            merge_result_tree: CommitOid(if identical_trees {
+                "tree-validated".to_owned()
+            } else {
+                "tree-foreign".to_owned()
+            }),
+            identical: identical_trees,
+        })
+        .collect();
+    status.healthy = analysis.healthy();
+    status.analysis = analysis;
+    status
+}
+
+/// One green, disarmed caravan member.
+fn caravan_member(number: u64, head: &str, base: &str) -> PullRequestSnapshot {
+    let mut pull_request = pull_request(
+        number,
+        head,
+        base,
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    pull_request.checks = vec![check("build-test", CheckState::Success, None)];
+    pull_request
+}
+
+#[test]
+fn a_promoted_green_root_is_squash_merged_by_cara_with_sealed_landing_proof() {
+    let pulls = vec![caravan_member(1, "one", "main")];
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    let status = caravan_status(pulls, Some(PrNumber(1)), true);
+
+    let progress = execute(&status, &provider, false, false, false).expect("cara merges the root");
+
+    // Exactly one non-admin squash, and never the administrator bypass.
+    assert_eq!(*provider.calls.borrow(), vec![MutationKind::SquashMerge]);
+    assert_eq!(
+        provider.pulls.borrow()[&PrNumber(1)].state,
+        PullRequestState::Merged
+    );
+    let receipt = progress
+        .root_merge
+        .iter()
+        .find(|receipt| receipt.pr == PrNumber(1))
+        .expect("a landed root carries a durable merge receipt");
+    assert!(receipt.hash_is_valid());
+    assert!(receipt.proves_default_branch_landing());
+    assert_eq!(receipt.merge_method, crate::model::MergeMethod::Squash);
+    assert_eq!(receipt.base.name, "main");
+    assert_eq!(
+        receipt.provenance.owner,
+        crate::root_merge::ROOT_MERGE_OWNER
+    );
+    assert!(receipt.provenance.engine_mutated);
+    assert!(
+        receipt
+            .ancestry
+            .cumulative_tree
+            .as_ref()
+            .is_some_and(|proof| proof.identical),
+        "landing is authorized by the already-validated tree"
+    );
+    assert!(receipt.ancestry.merge_commit.is_some());
+    assert!(
+        progress
+            .events
+            .iter()
+            .any(|event| event.kind == EventKind::RootMerged)
+    );
+    assert!(
+        progress.root_auto_merge.is_empty(),
+        "cara never arms provider auto-merge"
+    );
+}
+
+#[test]
+fn a_root_still_based_on_a_merged_predecessor_is_retargeted_before_any_merge() {
+    // Exactly the PR2210 -> PR2213 -> PR2215 topology: #2210 already merged,
+    // #2213 still pointing at its generation branch, #2215 stacked behind.
+    let merged_predecessor = pull_request(
+        2210,
+        "pr2210",
+        "main",
+        PullRequestState::Merged,
+        AutoMergeState::disabled(),
+    );
+    let mut root = caravan_member(2213, "pr2213", "pr2210");
+    root.labels.insert("caravan".to_owned());
+    let child = caravan_member(2215, "pr2215", "pr2213");
+    let pulls = vec![merged_predecessor, root, child];
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    let mut status = caravan_status(pulls, Some(PrNumber(2213)), true);
+    // One landing per tick keeps this fixture focused on the exact topology
+    // failure: the root must be retargeted before anything merges it.
+    status.head_merge.max_root_merges_per_tick = 1;
+
+    let progress = execute(&status, &provider, false, false, false).expect("promotion converges");
+
+    // The retarget happens first and is proven, and the child is untouched.
+    let promotion = progress
+        .root_promotion
+        .iter()
+        .find(|receipt| receipt.pr == PrNumber(2213))
+        .expect("promoted root carries a durable promotion receipt");
+    assert!(promotion.hash_is_valid());
+    assert!(promotion.proves_default_base());
+    assert_eq!(promotion.base_before.name, "pr2210");
+    assert_eq!(promotion.base_after.name, "main");
+    assert_eq!(promotion.predecessor, Some(PrNumber(2210)));
+    assert!(promotion.predecessor_merged);
+    assert_eq!(
+        promotion.trigger,
+        crate::root_merge::RootPromotionTrigger::MergedPredecessorRetarget
+    );
+    assert_eq!(
+        provider.calls.borrow().first(),
+        Some(&MutationKind::SetBase),
+        "the base is authoritative before any merge mechanism"
+    );
+    assert_eq!(
+        provider.pulls.borrow()[&PrNumber(2213)].base.name,
+        "main",
+        "the root never merges into an already-merged predecessor"
+    );
+    let child_after = provider.pulls.borrow()[&PrNumber(2215)].clone();
+    assert_eq!(
+        child_after.state,
+        PullRequestState::Open,
+        "child content is preserved, never rewritten or dropped"
+    );
+    assert_eq!(
+        child_after.head.oid,
+        status.analysis.pull_requests[&PrNumber(2215)].head.oid,
+        "the child generation is retargeted, never rewritten"
+    );
+    assert_eq!(
+        child_after.base.name, "main",
+        "once its predecessor lands, the child is promoted rather than left dangling"
+    );
+    assert_eq!(
+        child_after.auto_merge,
+        AutoMergeState::disabled(),
+        "the promoted child is never armed with a second merge actor"
+    );
+    assert!(
+        progress
+            .events
+            .iter()
+            .any(|event| event.kind == EventKind::RootPromoted)
+    );
+}
+
+#[test]
+fn a_root_whose_base_is_not_the_default_branch_is_refused_not_merged() {
+    // The provider view drifts back to the predecessor base after promotion:
+    // the exact live hazard. Cara refuses rather than landing on that branch.
+    let pulls = vec![caravan_member(1, "one", "main")];
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    let mut drifted = provider.pulls.borrow()[&PrNumber(1)].clone();
+    drifted.base = branch("predecessor");
+    provider.serve_stale_read(PrNumber(1), drifted.clone());
+    provider.serve_stale_read(PrNumber(1), drifted);
+    let status = caravan_status(pulls, Some(PrNumber(1)), true);
+
+    let error = execute(&status, &provider, false, false, false)
+        .expect_err("a non-default base is never a merge target");
+
+    // Whatever the exact fail-closed class, the invariant is absolute: nothing
+    // merges while the observed base is not the exact default branch.
+    assert!(!provider.calls.borrow().contains(&MutationKind::SquashMerge));
+    let code = mcp_cli::StructuredError::code(&error);
+    assert!(
+        matches!(
+            code.as_str(),
+            "root_merge_refused" | "root_promotion_incomplete" | "stale_precondition"
+        ),
+        "{code}"
+    );
+}
+
+#[test]
+fn pending_and_unsatisfied_required_checks_wait_without_merging() {
+    let mut pending = caravan_member(1, "one", "main");
+    pending.checks = vec![check("build-test", CheckState::InProgress, None)];
+    let pulls = vec![pending];
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    let status = caravan_status(pulls, Some(PrNumber(1)), true);
+
+    let progress =
+        execute(&status, &provider, false, false, false).expect("waiting is not failing");
+
+    assert!(provider.calls.borrow().is_empty());
+    assert!(progress.root_merge.is_empty());
+    assert!(progress.steps.iter().any(|step| {
+        step.kind == MutationKind::SquashMerge
+            && step.state == MutationStepState::AlreadySatisfied
+            && step
+                .summary
+                .contains(crate::root_merge::RootMergeBlock::ChecksNotPassing.reason())
+    }));
+}
+
+#[test]
+fn a_changed_cumulative_tree_revalidates_instead_of_landing_unvalidated_content() {
+    // Retarget-only promotion is sound exactly while the squash lands the tree
+    // CI already validated. A default branch that gained foreign content makes
+    // the merge result differ, so the caravan revalidates instead of merging.
+    let pulls = vec![caravan_member(1, "one", "main")];
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    let status = caravan_status(pulls, Some(PrNumber(1)), false);
+
+    let progress =
+        execute(&status, &provider, false, false, false).expect("a changed tree is a bounded wait");
+
+    assert!(provider.calls.borrow().is_empty());
+    assert!(progress.root_merge.is_empty());
+    assert!(progress.steps.iter().any(|step| {
+        step.kind == MutationKind::SquashMerge
+            && step
+                .summary
+                .contains(crate::root_merge::RootMergeBlock::CumulativeTreeChanged.reason())
+    }));
+}
+
+#[test]
+fn an_unproven_cumulative_tree_never_authorizes_a_landing() {
+    let pulls = vec![caravan_member(1, "one", "main")];
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    let mut status = caravan_status(pulls, Some(PrNumber(1)), true);
+    status.analysis.cumulative_trees.clear();
+
+    let progress = execute(&status, &provider, false, false, false).expect("unproven is a wait");
+
+    assert!(provider.calls.borrow().is_empty());
+    assert!(progress.root_merge.is_empty());
+    assert!(progress.steps.iter().any(|step| {
+        step.summary
+            .contains(crate::root_merge::RootMergeBlock::CumulativeTreeUnproven.reason())
+    }));
+}
+
+#[test]
+fn a_merge_the_default_branch_does_not_contain_never_counts_as_delivered() {
+    let pulls = vec![
+        caravan_member(1, "one", "main"),
+        caravan_member(2, "two", "one"),
+    ];
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    provider.serve_unreachable_merge(PrNumber(1), "3da6addbf0b1334888658413a74ac91f18afb9ea");
+    let status = caravan_status(pulls, Some(PrNumber(1)), true);
+
+    let error = execute(&status, &provider, false, false, false)
+        .expect_err("an unreachable merge commit is not a landing");
+
+    assert_eq!(mcp_cli::StructuredError::code(&error), "root_merge_refused");
+    let details = mcp_cli::StructuredError::details(&error).expect("details");
+    assert_eq!(details["cause"], "merge_not_reachable_from_default");
+    assert_eq!(
+        details["evidence"]["claimed_merge_commit"],
+        "3da6addbf0b1334888658413a74ac91f18afb9ea"
+    );
+    assert!(
+        !provider.calls.borrow().contains(&MutationKind::SetBase),
+        "no successor is promoted without landing proof"
+    );
+}
+
+#[test]
+fn a_provider_that_never_exposes_the_merge_stops_with_a_typed_resumable_cause() {
+    let pulls = vec![caravan_member(1, "one", "main")];
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    provider.never_persist_merge(
+        PrNumber(1),
+        crate::root_merge::ROOT_MERGE_CONFIRMATION_READS,
+    );
+    let status = caravan_status(pulls, Some(PrNumber(1)), true);
+
+    let error = execute(&status, &provider, false, false, false)
+        .expect_err("an unproven merge is never reported as landed");
+
+    assert_eq!(mcp_cli::StructuredError::code(&error), "root_merge_refused");
+    let details = mcp_cli::StructuredError::details(&error).expect("details");
+    assert_eq!(details["cause"], "provider_did_not_persist_merge");
+    assert_eq!(details["resumable"], true);
+    assert_eq!(details["operator_action_required"], false);
+}
+
+#[test]
+fn an_already_merged_root_replays_idempotently_and_advances_the_next_root() {
+    let mut merged = caravan_member(1, "one", "main");
+    merged.state = PullRequestState::Merged;
+    merged.merged_at = Some("now".to_owned());
+    let pulls = vec![merged, caravan_member(2, "two", "one")];
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    let status = caravan_status(pulls, Some(PrNumber(2)), true);
+
+    let progress = execute(&status, &provider, false, false, false).expect("replay converges");
+
+    assert_eq!(
+        provider.pulls.borrow()[&PrNumber(2)].base.name,
+        "main",
+        "the successor is promoted to the default branch"
+    );
+    assert!(
+        progress
+            .root_promotion
+            .iter()
+            .any(|receipt| receipt.pr == PrNumber(2) && receipt.proves_default_base())
+    );
+    assert!(
+        !provider
+            .calls
+            .borrow()
+            .contains(&MutationKind::EnableAutoMerge)
+    );
+}
+
+#[test]
+fn a_whole_green_caravan_drains_in_one_bounded_tick_with_per_root_revalidation() {
+    // Every iteration re-reads exact provider facts, re-promotes, re-observes
+    // CI, and re-proves the cumulative tree before the next landing.
+    let pulls = vec![
+        caravan_member(1, "one", "main"),
+        caravan_member(2, "two", "one"),
+    ];
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    let status = caravan_status(pulls, Some(PrNumber(1)), true);
+
+    let progress = execute(&status, &provider, false, false, false).expect("the caravan drains");
+
+    assert_eq!(
+        provider.pulls.borrow()[&PrNumber(1)].state,
+        PullRequestState::Merged
+    );
+    // The successor is promoted, re-validated, and lands in the same tick
+    // because its own cumulative tree is proven against the exact default
+    // branch. Without that proof it would wait instead.
+    assert_eq!(provider.pulls.borrow()[&PrNumber(2)].base.name, "main");
+    assert_eq!(
+        provider.pulls.borrow()[&PrNumber(2)].state,
+        PullRequestState::Merged
+    );
+    assert_eq!(
+        progress
+            .root_merge
+            .iter()
+            .filter(|receipt| receipt.merged)
+            .count(),
+        2
+    );
+    assert!(
+        progress
+            .root_promotion
+            .iter()
+            .any(|receipt| receipt.pr == PrNumber(2))
+    );
+    assert_eq!(
+        progress.head_advancements.first().map(|item| item.new_head),
+        Some(PrNumber(2))
+    );
+    let landed = progress
+        .root_merge
+        .iter()
+        .find(|receipt| receipt.pr == PrNumber(1))
+        .expect("first root landed");
+    assert_eq!(landed.ancestry.next_root, Some(PrNumber(2)));
+    assert_eq!(landed.ancestry.remaining_members, vec![PrNumber(2)]);
+}
+
+#[test]
+fn a_bounded_merge_allowance_defers_the_rest_of_the_chain_to_the_next_tick() {
+    let pulls = vec![
+        caravan_member(1, "one", "main"),
+        caravan_member(2, "two", "one"),
+    ];
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    let mut status = caravan_status(pulls, Some(PrNumber(1)), true);
+    status.head_merge.max_root_merges_per_tick = 1;
+
+    let progress = execute(&status, &provider, false, false, false).expect("bounded drain");
+
+    assert_eq!(
+        progress
+            .root_merge
+            .iter()
+            .filter(|receipt| receipt.merged)
+            .count(),
+        1
+    );
+    assert!(progress.steps.iter().any(|step| {
+        step.summary
+            .contains(crate::root_merge::RootMergeBlock::MergeBudgetReached.reason())
+    }));
+}
+
+#[test]
+fn a_foreign_auto_merge_request_is_converged_away_or_refused_but_never_raced() {
+    let mut armed = caravan_member(1, "one", "main");
+    armed.auto_merge = AutoMergeState::squash();
+    let pulls = vec![armed];
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    let status = caravan_status(pulls.clone(), Some(PrNumber(1)), true);
+
+    let progress =
+        execute(&status, &provider, false, false, false).expect("foreign request cleared");
+
+    assert_eq!(
+        *provider.calls.borrow(),
+        vec![MutationKind::DisableAutoMerge, MutationKind::SquashMerge],
+        "the foreign merge actor is removed before cara merges"
+    );
+    assert!(progress.steps.iter().any(|step| {
+        step.kind == MutationKind::DisableAutoMerge && step.summary.contains("single merge actor")
+    }));
+
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    let mut refusing = caravan_status(pulls, Some(PrNumber(1)), true);
+    refusing.head_merge.external_auto_merge_policy =
+        crate::root_merge::ExternalAutoMergePolicy::Refuse;
+
+    let error = execute(&refusing, &provider, false, false, false)
+        .expect_err("reviewed policy refuses to race a second merge actor");
+
+    assert_eq!(mcp_cli::StructuredError::code(&error), "root_merge_refused");
+    let details = mcp_cli::StructuredError::details(&error).expect("details");
+    assert_eq!(details["cause"], "foreign_auto_merge_actor");
+    assert!(!provider.calls.borrow().contains(&MutationKind::SquashMerge));
+}
+
+#[test]
+fn disabled_repository_auto_merge_no_longer_refuses_a_caravan_owned_tick() {
+    let pulls = vec![caravan_member(1, "one", "main")];
+    let mut provider = FakeProvider::with_pull_requests(pulls.clone());
+    provider.allows_auto_merge = false;
+    let status = caravan_status(pulls.clone(), Some(PrNumber(1)), true);
+
+    execute(&status, &provider, false, false, false)
+        .expect("a repository that disabled native auto-merge still synchronizes");
+
+    // Squash merging itself remains mandatory: cara performs the squash.
+    let mut provider = FakeProvider::with_pull_requests(pulls.clone());
+    provider.allows_auto_merge = false;
+    provider.allows_squash_merge = false;
+    let error = execute(&status, &provider, false, false, false)
+        .expect_err("cara cannot squash without squash merging");
+    assert_eq!(
+        mcp_cli::StructuredError::code(&error),
+        "squash_merge_not_enabled"
+    );
+}
+
+#[test]
+fn a_caravan_owned_tick_never_mutates_compliant_child_members() {
+    let pulls = vec![
+        caravan_member(1, "one", "main"),
+        caravan_member(2, "two", "one"),
+        caravan_member(3, "three", "two"),
+    ];
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    let mut status = caravan_status(pulls, Some(PrNumber(1)), true);
+    status.head_merge.max_root_merges_per_tick = 1;
+
+    execute(&status, &provider, false, false, false).expect("bounded drain");
+
+    let state = provider.pulls.borrow();
+    assert_eq!(state[&PrNumber(3)].base.name, "two");
+    assert_eq!(state[&PrNumber(3)].auto_merge, AutoMergeState::disabled());
+    assert_eq!(state[&PrNumber(3)].state, PullRequestState::Open);
+}
+
+#[test]
+fn a_default_branch_that_moved_since_discovery_defers_the_landing_to_a_fresh_proof() {
+    // Tree equality is what authorizes a landing, and a proof constructed
+    // against a superseded default-branch generation proves nothing about the
+    // one this merge would land on. Disjoint movement is not refused: the next
+    // tick re-proves against the new generation and still lands when the
+    // cumulative tree is identical.
+    let pulls = vec![caravan_member(1, "one", "main")];
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    *provider.default_branch_head_after_merge.borrow_mut() =
+        Some(CommitOid("main-moved-by-someone-else".to_owned()));
+    let status = caravan_status(pulls, Some(PrNumber(1)), true);
+
+    let progress =
+        execute(&status, &provider, false, false, false).expect("a moved default branch is a wait");
+
+    assert!(!provider.calls.borrow().contains(&MutationKind::SquashMerge));
+    assert!(progress.root_merge.is_empty());
+    assert!(progress.steps.iter().any(|step| {
+        step.summary
+            .contains(crate::root_merge::RootMergeBlock::CumulativeTreeUnproven.reason())
+    }));
 }

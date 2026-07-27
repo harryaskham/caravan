@@ -362,12 +362,12 @@ A sync tick:
 
 1. Acquire the local repository operation lock.
 2. Discover and validate the fresh GitHub graph.
-3. Reconcile merged heads: retarget the child to the default branch and enable squash auto-merge. No history rewrite is required.
+3. Reconcile merged heads: promote the child to the exact default branch in one fenced transaction. No history rewrite is required.
 4. Walk head → tail.
 5. Ensure the head merges cleanly into current default.
 6. Ensure every child merges cleanly into its declared predecessor.
 7. Inspect CI/check state for each PR.
-8. Enforce auto-merge on the head and off on all non-heads.
+8. Enforce exactly one merge actor: under `head_merge_actor: caravan` no member carries native auto-merge and Cara performs the bounded squash merges itself; under `github` exactly the root is armed.
 9. Recheck cross-caravan head/tail compatibility.
 10. Emit events/hooks for observed transitions.
 11. When `sync --all` auto-admission is enabled, rediscover and greedily admit
@@ -395,39 +395,97 @@ For deterministic repair, conflicts and exact semantic grants remain narrow. For
 
 Normal behavior:
 
-- Head: squash auto-merge enabled.
-- Non-head: auto-merge disabled, even if it was enabled externally.
+- Root: promoted to the exact default branch, then squash-merged by Cara itself.
+- Non-root: auto-merge disabled, even if it was enabled externally.
 - Pending CI: sync reports waiting and makes no speculative repair.
 - Failed CI without `caravan-force`: decision point.
 
-Required root squash auto-merge is scheduler-owned convergent state, not an
-operator chore. The provider drops `autoMergeRequest` whenever the root's head
-or base generation is rewritten, and its list projection can still expose the
-pre-rewrite request, so every sync that creates, rebases, renews, or advances a
-caravan root re-reads the exact current root from a fresh single-PR provider
-read and idempotently proves SQUASH auto-merge on the *resulting* head. A member
-is only disarmed before a rewrite that actually happens: an already-satisfied
-ancestry plan retains native arming rather than opening a durability window.
-Root convergence runs before a failing-CI stop, because native auto-merge merges
-only a passing head and a stopped tick must never leave the admitted root
-disarmed.
+`sync.head_merge_actor` names the single merge actor: `caravan` (default) or
+`github`. It is deliberately self-describing — `github` never means "do not
+merge the root", it means the provider's `autoMergeRequest` performs the merge.
+The field is optional and a historical `sync.auto_merge_head` boolean is still
+accepted, because older Cara builds reject unknown configuration keys and a
+repository can only adopt the field once every consumer has upgraded. The
+auto-merge invariant is gated on the same fact, so a repository that
+deliberately disabled provider-native auto-merge never reports a permanently
+unsatisfiable problem: under `caravan` *no* member may carry native auto-merge,
+under `github` exactly the root must.
 
-Every converged root carries a sealed `root_auto_merge` receipt with the exact
-proven head/base, observed auto-merge facts, bounded read/attempt counts, and
-auditable engine provenance (`owner`, `component`, operation ID, derived
-trigger, observed-before state and provider actor, and whether this tick
-performed the write). Triggers are derived, never guessed:
-`idempotent_replay`, `root_admitted`, `root_head_rewritten`,
-`root_base_advanced`, `externally_disarmed`, `non_squash_method`. Engine arming
-emits `root_auto_merge_armed`; an unchanged root emits nothing.
+Provider-native auto-merge cannot be ordered against caravan-owned topology. A
+root armed while its base is still an already-merged predecessor branch merges
+instantly into that predecessor: live PR2210 squash-landed on `main`, PR2213
+then merged into PR2210's already-merged generation branch, its content never
+reached `main`, and PR2215 inherited both the cumulative content and a dangling
+base. Under `caravan` the tick is therefore one ordered fenced transaction per
+root:
 
-When arming cannot be proven the tick fails with `root_auto_merge_not_durable`
-carrying a typed cause — `provider_did_not_persist_arming`,
-`root_head_moved_during_arming`, or `stale_provider_view` — plus
-`operator_action_required=false`. Retry belongs to bounded sync policy: the
-failure is retryable, and periodic operator re-arming is never the convergence
-mechanism. Native auto-merge on an *unadmitted* candidate keeps that candidate
-structurally ineligible; only the admitted root requires it.
+1. re-read the exact current root generation from a fresh single-PR read;
+2. retarget it to the exact default branch when its base is anything else,
+   including an already-merged predecessor branch;
+3. re-read and prove base/ref/head after the retarget, and re-validate the
+   required contexts of the *new* merge identity, because a head proven green
+   against a predecessor base is not proven green against the default branch;
+4. prove the cumulative tree, then perform exactly one **non-admin** SQUASH
+   merge fenced on the exact head. Administrator merge stays reserved for the
+   audited `caravan-force` bypass; routine landings respect branch protection;
+5. prove the merge commit is contained by the freshly fetched default branch
+   before the landing counts, then promote the successor and repeat until the
+   bounded per-tick merge allowance or the first bounded wait.
+
+Retarget alone is sufficient *and* CI-preserving because members are physically
+rebased onto their predecessor before CI runs: the exact head SHA already
+carries the cumulative reviewed content, and retargeting preserves its
+head-attached check runs. That safety is proven mechanically rather than
+assumed. `git merge-tree` constructs the result of merging the root into the
+exact default branch and the tick compares it to the root head's own tree. Equal
+trees mean the squash lands byte-identical already-validated content, so the
+default branch moving underneath is irrelevant. A different tree means the
+default branch gained content this generation never saw; the caravan revalidates
+(physical rebase plus fresh CI) instead of merging. An absent proof is never
+permission.
+
+There is exactly one merge actor. A foreign `autoMergeRequest` observed on any
+member is either converged away (`sync.external_auto_merge_policy: disable`,
+default) or refused with `foreign_auto_merge_actor` (`refuse`); it is never
+raced.
+
+Every promoted root carries a sealed `root_promotion` receipt (exact head,
+base before/after, default branch, predecessor and its merged state, derived
+trigger, bounded reads, engine provenance) and emits `root_promoted` when the
+engine retargeted. Every landing carries a sealed `root_merge` receipt with the
+exact merged head/base, merge method, provider merge commit, default-branch
+generation before and after, the authorizing cumulative-tree proof, and the
+cumulative ancestry: the merged predecessor whose content the root already
+carried, the remaining members, and the successor's base before and after
+promotion. It emits `root_merged`. Together they prove already-merged
+predecessor content is not duplicated and child content is not lost.
+
+Promotion failure is the typed `root_promotion_incomplete` with cause
+`base_retarget_not_observed`, `root_head_moved_during_promotion`, or
+`stale_provider_view`, always before any merge is attempted. Merge refusal is
+the typed `root_merge_refused` with cause `base_not_default_branch`,
+`root_head_moved_before_merge`, `foreign_auto_merge_actor`,
+`provider_did_not_persist_merge`, `merged_into_unexpected_base`, or
+`merge_not_reachable_from_default`. Ordinary bounded waits — pending checks,
+unsatisfied required contexts, an unproven or changed cumulative tree, an
+already-merged root, or the spent per-tick merge allowance — are visible
+no-op steps, never failures.
+
+Under the historical `github` actor the earlier contract still applies. Required
+root squash auto-merge is scheduler-owned convergent state: the provider drops
+`autoMergeRequest` whenever the root's head or base generation is rewritten, and
+its list projection can still expose the pre-rewrite request, so every sync that
+creates, rebases, renews, or advances a caravan root re-reads the exact current
+root and idempotently proves SQUASH auto-merge on the *resulting* head. Root
+convergence runs before a failing-CI stop, because native auto-merge merges only
+a passing head. Every converged root carries a sealed `root_auto_merge` receipt
+with derived triggers `idempotent_replay`, `root_admitted`,
+`root_head_rewritten`, `root_base_advanced`, `externally_disarmed`, or
+`non_squash_method`, emits `root_auto_merge_armed`, and unproven arming fails
+with `root_auto_merge_not_durable` (`provider_did_not_persist_arming`,
+`root_head_moved_during_arming`, `stale_provider_view`). Native auto-merge on an
+*unadmitted* candidate keeps that candidate structurally ineligible under either
+actor.
 
 A raced state, draft, base, `caravan`, or `caravan-evicted` transition observed
 by that fresh read is still an ordinary resumable `stale_precondition` decision
@@ -596,7 +654,10 @@ Core decision kinds include:
 - `unsafe_checkout`;
 - `hook_failure`;
 - `force_merge_denied`;
-- `root_auto_merge_not_durable`;
+- `root_promotion_incomplete`;
+- `root_merge_refused`;
+- `root_auto_merge_not_durable` (historical `head_merge_actor: github`);
+- `squash_merge_not_enabled`;
 - `missing_required_runs` / `cancelled_superseded_required_runs` /
   `unknown_required_runs_provider_state`.
 
@@ -620,7 +681,9 @@ Hook events include:
 - `ci_failed`;
 - `force_merge_attempted`;
 - `force_merge_completed`;
-- `root_auto_merge_armed`;
+- `root_promoted`;
+- `root_merged`;
+- `root_auto_merge_armed` (historical `head_merge_actor: github`);
 - `required_runs_missing`;
 - `required_runs_retriggered`.
 

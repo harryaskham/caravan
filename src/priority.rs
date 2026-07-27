@@ -712,8 +712,10 @@ mod tests {
             },
             pull_requests: BTreeMap::from([(candidate.number, candidate.clone())]),
             compatibility: Vec::new(),
+            cumulative_trees: Vec::new(),
         };
         let status = StatusOutput {
+            head_merge: crate::read::HeadMergeStatus::default(),
             runtime: crate::read::RuntimeProvenance::default(),
             provider_api: GitHubApiTelemetry::default(),
             merge_candidates: Vec::new(),

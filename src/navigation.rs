@@ -950,6 +950,7 @@ mod tests {
             .map(|pull_request| (pull_request.number, pull_request))
             .collect();
         StatusOutput {
+            head_merge: crate::read::HeadMergeStatus::default(),
             runtime: crate::read::RuntimeProvenance::default(),
             provider_api: crate::model::GitHubApiTelemetry::default(),
             merge_candidates: Vec::new(),
@@ -987,6 +988,7 @@ mod tests {
                 },
                 pull_requests,
                 compatibility: Vec::new(),
+                cumulative_trees: Vec::new(),
             },
             pauses: Vec::new(),
             sync_budget: crate::sync::SyncBudgetStatus::default(),

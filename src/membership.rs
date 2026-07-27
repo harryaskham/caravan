@@ -2194,7 +2194,9 @@ fn execute_with_rebase_guard(
         state.ensure_label_absent(provider, &status.repository, EVICTED_LABEL)?;
     }
     state.ensure_label_present(provider, &status.repository, ACTIVE_LABEL)?;
-    if request.operation.is_join() {
+    // Under the caravan-owned merge actor nobody delegates to the provider,
+    // not even a fresh root: cara promotes and squashes it itself.
+    if request.operation.is_join() || status.head_merge.actor.caravan() {
         state.ensure_auto_merge_disabled(provider, &status.repository)?;
     } else {
         state.ensure_squash_auto_merge(provider, &status.repository)?;

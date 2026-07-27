@@ -10,9 +10,9 @@ use serde::{Deserialize, Serialize};
 use crate::AppError;
 use crate::compatibility;
 use crate::model::{
-    BranchSnapshot, Caravan, CaravanFleet, CompatibilityOutcome, CompatibilityReport, GraphProblem,
-    GraphProblemKind, MergeMethod, PrNumber, PullRequestSnapshot, PullRequestState,
-    RepositorySnapshot,
+    BranchSnapshot, Caravan, CaravanFleet, CompatibilityOutcome, CompatibilityReport,
+    CumulativeTreeProof, GraphProblem, GraphProblemKind, HeadMergeActor, MergeMethod, PrNumber,
+    PullRequestSnapshot, PullRequestState, RepositorySnapshot,
 };
 
 /// Full read-only analysis shared by status, show, check, CLI JSON, and MCP.
@@ -24,6 +24,11 @@ pub struct GraphAnalysis {
     /// Exact compatibility evidence collected while validating current chains.
     #[serde(default)]
     pub compatibility: Vec<CompatibilityReport>,
+    /// Exact cumulative-tree evidence for every caravan root against the
+    /// default branch. Consumed by the caravan-owned merge so a retargeted root
+    /// only lands when its squash produces the already-validated head tree.
+    #[serde(default)]
+    pub cumulative_trees: Vec<CumulativeTreeProof>,
 }
 
 impl GraphAnalysis {
@@ -47,6 +52,18 @@ pub trait CompatibilityChecker {
         candidate: &BranchSnapshot,
         target: &BranchSnapshot,
     ) -> Result<CompatibilityReport, AppError>;
+
+    /// Exact cumulative-tree proof for landing `candidate` on `target`.
+    ///
+    /// Fakes keep the default "unproven", which the caravan-owned merge treats
+    /// as "do not merge yet" rather than as permission.
+    fn cumulative_tree(
+        &self,
+        _candidate: &BranchSnapshot,
+        _target: &BranchSnapshot,
+    ) -> Result<Option<CumulativeTreeProof>, AppError> {
+        Ok(None)
+    }
 }
 
 impl<F> CompatibilityChecker for F
@@ -163,6 +180,34 @@ impl CompatibilityChecker for GitCompatibilityChecker {
             )
         }
     }
+
+    fn cumulative_tree(
+        &self,
+        candidate: &BranchSnapshot,
+        target: &BranchSnapshot,
+    ) -> Result<Option<CumulativeTreeProof>, AppError> {
+        let key = |branch: &BranchSnapshot| (branch.name.clone(), branch.oid.0.clone());
+        let cache = self.prepared.borrow();
+        let (Some(candidate_oid), Some(target_oid)) =
+            (cache.get(&key(candidate)), cache.get(&key(target)))
+        else {
+            return Ok(None);
+        };
+        let runner = crate::command::ProcessRunner::in_directory(&self.repository)
+            .with_timeout(self.timeout)
+            .with_operation_deadline(
+                self.operation_deadline
+                    .unwrap_or_else(|| std::time::Instant::now() + self.timeout),
+            );
+        compatibility::cumulative_tree_proof_with_runner(
+            &runner,
+            candidate,
+            target,
+            candidate_oid,
+            target_oid,
+        )
+        .map(Some)
+    }
 }
 
 /// Derive structural chains without executing Git compatibility checks.
@@ -172,6 +217,20 @@ impl CompatibilityChecker for GitCompatibilityChecker {
 #[allow(clippy::too_many_lines)]
 #[must_use]
 pub fn derive(snapshot: &RepositorySnapshot) -> GraphAnalysis {
+    derive_for_actor(snapshot, HeadMergeActor::default())
+}
+
+/// Derive structural chains for one configured head merge actor.
+///
+/// The auto-merge invariant is *gated on the actor*. A repository that
+/// deliberately disabled provider-native auto-merge so Cara can own the merge
+/// must not report a permanent, unsatisfiable "head must have squash auto-merge
+/// enabled" problem; under [`HeadMergeActor::Caravan`] the invariant inverts and
+/// every member — root included — must keep native auto-merge off so there is
+/// exactly one merge actor.
+#[allow(clippy::too_many_lines)]
+#[must_use]
+pub fn derive_for_actor(snapshot: &RepositorySnapshot, actor: HeadMergeActor) -> GraphAnalysis {
     let mut problems = Vec::new();
     let mut pull_requests = BTreeMap::new();
     for pull_request in &snapshot.pull_requests {
@@ -347,21 +406,30 @@ pub fn derive(snapshot: &RepositorySnapshot) -> GraphAnalysis {
             let pull_request = active
                 .get(number)
                 .expect("derived caravan members are active");
-            let valid = if position == 0 {
-                pull_request.auto_merge.enabled
-                    && pull_request.auto_merge.merge_method == Some(MergeMethod::Squash)
+            let native_squash_armed = pull_request.auto_merge.enabled
+                && pull_request.auto_merge.merge_method == Some(MergeMethod::Squash);
+            // Historical delegation arms exactly the root; caravan-owned
+            // merging arms nobody, because there is exactly one merge actor.
+            let root_must_be_armed = actor.github() && position == 0;
+            let valid = if root_must_be_armed {
+                native_squash_armed
             } else {
                 !pull_request.auto_merge.enabled
             };
             if !valid {
+                let message = if root_must_be_armed {
+                    format!("caravan head #{number} must have squash auto-merge enabled")
+                } else if position == 0 {
+                    format!(
+                        "caravan head #{number} must not delegate merging to native auto-merge; cara is the single merge actor"
+                    )
+                } else {
+                    format!("non-head caravan PR #{number} must have auto-merge disabled")
+                };
                 problems.push(GraphProblem {
                     kind: GraphProblemKind::AutoMergeInvariant,
                     prs: vec![*number],
-                    message: if position == 0 {
-                        format!("caravan head #{number} must have squash auto-merge enabled")
-                    } else {
-                        format!("non-head caravan PR #{number} must have auto-merge disabled")
-                    },
+                    message,
                 });
             }
         }
@@ -388,6 +456,7 @@ pub fn derive(snapshot: &RepositorySnapshot) -> GraphAnalysis {
         },
         pull_requests,
         compatibility: Vec::new(),
+        cumulative_trees: Vec::new(),
     }
 }
 
@@ -396,7 +465,17 @@ pub fn analyze(
     snapshot: &RepositorySnapshot,
     checker: &impl CompatibilityChecker,
 ) -> Result<GraphAnalysis, AppError> {
-    let mut analysis = derive(snapshot);
+    analyze_for_actor(snapshot, checker, HeadMergeActor::default())
+}
+
+/// Derive and mechanically validate current chain/fleet invariants for one
+/// configured head merge actor.
+pub fn analyze_for_actor(
+    snapshot: &RepositorySnapshot,
+    checker: &impl CompatibilityChecker,
+    actor: HeadMergeActor,
+) -> Result<GraphAnalysis, AppError> {
+    let mut analysis = derive_for_actor(snapshot, actor);
     let caravans = analysis.fleet.caravans.clone();
     let mut branches = vec![snapshot.default_branch.clone()];
     branches.extend(caravans.iter().flat_map(|caravan| {
@@ -428,6 +507,12 @@ pub fn analyze(
             vec![head_number],
             "caravan head does not merge cleanly into the current default branch",
         );
+        // The caravan-owned merge lands the root's *already-validated* tree or
+        // nothing at all, so the proof is collected with the same exact
+        // revisions the compatibility report used.
+        if let Some(proof) = checker.cumulative_tree(&head_branch, &snapshot.default_branch)? {
+            analysis.cumulative_trees.push(proof);
+        }
         for pair in caravan.members.windows(2) {
             let parent_branch = analysis
                 .pull_requests
@@ -562,7 +647,6 @@ mod tests {
 
     use super::*;
     use crate::model::{AutoMergeState, CheckSnapshot, CommitOid, PullRequestState, RepositoryId};
-
     fn repository() -> RepositoryId {
         RepositoryId {
             owner: "harryaskham".to_owned(),
@@ -589,11 +673,8 @@ mod tests {
             base: branch(base),
             cross_repository: false,
             labels: BTreeSet::from(["caravan".to_owned()]),
-            auto_merge: if base == "main" {
-                AutoMergeState::squash()
-            } else {
-                AutoMergeState::disabled()
-            },
+            // Cara is the merge actor by default, so no member is armed.
+            auto_merge: AutoMergeState::disabled(),
             checks: Vec::<CheckSnapshot>::new(),
             created_at: Some(format!("2026-01-01T00:00:{number:02}Z")),
             merged_at: None,
@@ -790,6 +871,61 @@ mod tests {
         assert!(analysis.fleet.problems.iter().any(|problem| {
             problem.kind == GraphProblemKind::AutoMergeInvariant && problem.prs == vec![PrNumber(2)]
         }));
+    }
+
+    #[test]
+    fn the_auto_merge_invariant_is_gated_on_the_configured_merge_actor() {
+        // A repository that deliberately disabled provider-native auto-merge so
+        // cara can own the merge must not report a permanently unsatisfiable
+        // "head must have squash auto-merge enabled" problem. Under the default
+        // caravan-owned actor the invariant inverts instead: an armed root is a
+        // second merge actor and is the problem.
+        let disarmed = snapshot(vec![
+            pull_request(1, "one", "main"),
+            pull_request(2, "two", "one"),
+        ]);
+        assert!(
+            derive_for_actor(&disarmed, HeadMergeActor::Caravan)
+                .fleet
+                .problems
+                .is_empty(),
+            "a disarmed caravan is healthy when cara owns the merge"
+        );
+        assert!(
+            derive_for_actor(&disarmed, HeadMergeActor::Github)
+                .fleet
+                .problems
+                .iter()
+                .any(
+                    |problem| problem.kind == GraphProblemKind::AutoMergeInvariant
+                        && problem.prs == vec![PrNumber(1)]
+                ),
+            "native delegation still requires the root to be armed"
+        );
+
+        let mut armed_root = pull_request(1, "one", "main");
+        armed_root.auto_merge = AutoMergeState::squash();
+        let armed = snapshot(vec![armed_root, pull_request(2, "two", "one")]);
+        assert!(
+            derive_for_actor(&armed, HeadMergeActor::Github)
+                .fleet
+                .problems
+                .is_empty(),
+            "native delegation is satisfied by an armed root"
+        );
+        let caravan_problem = derive_for_actor(&armed, HeadMergeActor::Caravan)
+            .fleet
+            .problems
+            .iter()
+            .find(|problem| problem.kind == GraphProblemKind::AutoMergeInvariant)
+            .cloned()
+            .expect("an armed root is a second merge actor");
+        assert_eq!(caravan_problem.prs, vec![PrNumber(1)]);
+        assert!(
+            caravan_problem.message.contains("single merge actor"),
+            "{}",
+            caravan_problem.message
+        );
     }
 
     #[test]
