@@ -784,7 +784,7 @@ mod tests {
             base: branch("main"),
             cross_repository: false,
             labels: BTreeSet::from(["caravan".to_owned()]),
-            auto_merge: AutoMergeState::squash(),
+            auto_merge: AutoMergeState::disabled(),
             checks: vec![CheckSnapshot {
                 name: "CI".to_owned(),
                 state: CheckState::Failure,
@@ -823,6 +823,7 @@ mod tests {
         };
         let analysis = graph::analyze(&snapshot, &checker).unwrap();
         StatusOutput {
+            head_merge: crate::read::HeadMergeStatus::default(),
             runtime: crate::read::RuntimeProvenance::default(),
             provider_api: crate::model::GitHubApiTelemetry::default(),
             merge_candidates: Vec::new(),

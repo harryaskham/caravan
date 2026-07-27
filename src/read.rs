@@ -11,14 +11,50 @@ use serde_json::json;
 
 use crate::command::CommandRunError;
 use crate::github::{DiscoveryError, GitHubDiscovery};
-use crate::graph::{CompatibilityChecker, GitCompatibilityChecker, GraphAnalysis, analyze};
+use crate::graph::{
+    CompatibilityChecker, GitCompatibilityChecker, GraphAnalysis, analyze_for_actor,
+};
 use crate::model::{
     Caravan, CompatibilityOutcome, CompatibilityReport, GraphProblem, GraphProblemKind, PrNumber,
     PullRequestSnapshot, PullRequestState, RepositoryId,
 };
 use crate::{AppContext, AppError, CheckInput};
 
+/// Exact configured merge-actor policy shared by every merge-aware surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct HeadMergeStatus {
+    /// Who merges a caravan root into the default branch.
+    pub actor: crate::model::HeadMergeActor,
+    /// What a caravan-owned tick does about a foreign auto-merge request.
+    pub external_auto_merge_policy: crate::root_merge::ExternalAutoMergePolicy,
+    /// Bounded caravan-owned merges per tick.
+    pub max_root_merges_per_tick: u32,
+}
+
+impl Default for HeadMergeStatus {
+    fn default() -> Self {
+        Self {
+            actor: crate::model::HeadMergeActor::default(),
+            external_auto_merge_policy: crate::root_merge::ExternalAutoMergePolicy::default(),
+            max_root_merges_per_tick: crate::config::SyncConfig::default().max_root_merges_per_tick,
+        }
+    }
+}
+
+impl HeadMergeStatus {
+    /// Derive the exact policy from configuration.
+    #[must_use]
+    pub fn from_config(config: &crate::config::SyncConfig) -> Self {
+        Self {
+            actor: config.resolved_head_merge_actor(),
+            external_auto_merge_policy: config.external_auto_merge_policy,
+            max_root_merges_per_tick: config.max_root_merges_per_tick,
+        }
+    }
+}
+
 /// Explicit repository policy and rollout action for physical chain rebuilding.
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RebaseOnJoinStatus {
     pub enabled: bool,
@@ -87,6 +123,12 @@ pub struct StatusOutput {
     /// Explicitly reports enabled/disabled physical chain-rebuild policy.
     #[serde(default)]
     pub rebase_on_join: RebaseOnJoinStatus,
+    /// Exact configured merge-actor policy for caravan roots. Every surface
+    /// that arms, refuses, or performs a merge reads this one fact so the
+    /// auto-merge invariant, membership, reshape, pause, and sync can never
+    /// disagree about who merges.
+    #[serde(default)]
+    pub head_merge: HeadMergeStatus,
     /// Exact sync-owned automatic-admission policy and safety bounds.
     #[serde(default)]
     pub auto_admission: AutoAdmissionStatus,
@@ -624,7 +666,15 @@ fn status_with_discovery_options(
     let checker = GitCompatibilityChecker::new(&context.repository_path, "origin")
         .with_timeout(child_timeout)
         .with_operation_deadline(operation_deadline);
-    let mut analysis = analyze(&snapshot, &checker).map_err(|error| {
+    // The auto-merge invariant is gated on the configured merge actor so a
+    // repository that deliberately disabled native auto-merge never reports a
+    // permanently unsatisfiable problem.
+    let mut analysis = analyze_for_actor(
+        &snapshot,
+        &checker,
+        context.config.sync.resolved_head_merge_actor(),
+    )
+    .map_err(|error| {
         if mcp_cli::StructuredError::category(&error) == ErrorCategory::Timeout {
             AppError::structured(
                 ErrorCategory::Timeout,
@@ -739,6 +789,7 @@ fn status_with_discovery_options(
             .map(|age| u64::try_from(age.as_millis()).unwrap_or(u64::MAX));
     }
     let mut output = StatusOutput {
+        head_merge: HeadMergeStatus::from_config(&context.config.sync),
         runtime: RuntimeProvenance::detect(),
         provider_api,
         merge_candidates: snapshot.merge_candidates,
@@ -2160,11 +2211,8 @@ mod tests {
             } else {
                 BTreeSet::new()
             },
-            auto_merge: if active && base == "main" {
-                AutoMergeState::squash()
-            } else {
-                AutoMergeState::disabled()
-            },
+            // Cara is the merge actor by default: no member is armed.
+            auto_merge: AutoMergeState::disabled(),
             checks: Vec::new(),
             created_at: Some(format!("2026-01-01T00:00:{number:02}Z")),
             merged_at: None,
@@ -2196,8 +2244,11 @@ mod tests {
             observed_at: None,
         };
         let checker = clean_checker;
-        let analysis = analyze(&snapshot, &checker).unwrap();
+        let analysis =
+            analyze_for_actor(&snapshot, &checker, crate::model::HeadMergeActor::default())
+                .unwrap();
         StatusOutput {
+            head_merge: HeadMergeStatus::default(),
             runtime: crate::read::RuntimeProvenance::default(),
             provider_api: crate::model::GitHubApiTelemetry::default(),
             merge_candidates: Vec::new(),
@@ -2817,7 +2868,6 @@ mod tests {
             None
         );
     }
-
 
     /// Reviewed operator resolution choice-019f9d34 (bd-afa02d) narrowed the
     /// relaxation to *intent* rather than blanket queue position. bd-7099e8

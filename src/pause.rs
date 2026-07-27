@@ -272,7 +272,18 @@ pub fn resume(context: &AppContext, input: &ResumeInput) -> Result<PauseOutput, 
     );
     let mut receipts = Vec::new();
     let mut steps = Vec::new();
-    if current.auto_merge == AutoMergeState::squash() {
+    if status.head_merge.actor.caravan() {
+        // Cara is the merge actor, so a resumed caravan is released by removing
+        // the hold itself: there is no provider arming to restore, and arming
+        // one would install a second merge actor on the exact head this hold
+        // was protecting.
+        steps.push(step(
+            MutationKind::EnableAutoMerge,
+            MutationStepState::AlreadySatisfied,
+            head,
+            "cara is the single merge actor; the resumed root is merged by the next bounded sync tick with no provider auto-merge request",
+        ));
+    } else if current.auto_merge == AutoMergeState::squash() {
         steps.push(step(
             MutationKind::EnableAutoMerge,
             MutationStepState::AlreadySatisfied,
@@ -791,6 +802,7 @@ mod tests {
     }
     fn status(pr: PullRequestSnapshot) -> StatusOutput {
         StatusOutput {
+            head_merge: crate::read::HeadMergeStatus::default(),
             runtime: crate::read::RuntimeProvenance::default(),
             provider_api: crate::model::GitHubApiTelemetry::default(),
             merge_candidates: Vec::new(),
@@ -815,6 +827,7 @@ mod tests {
                 },
                 pull_requests: BTreeMap::from([(PrNumber(1), pr)]),
                 compatibility: Vec::new(),
+                cumulative_trees: Vec::new(),
             },
             pauses: Vec::new(),
             timing: None,

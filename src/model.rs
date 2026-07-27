@@ -427,6 +427,53 @@ impl Caravan {
     }
 }
 
+/// Which actor merges the caravan root into the default branch.
+///
+/// Provider-native auto-merge cannot be ordered against caravan-owned topology:
+/// a root armed while its base was still a merged predecessor branch merges
+/// instantly into that predecessor instead of the default branch. The caravan
+/// therefore owns the merge by default and native delegation is a compatibility
+/// policy, not the contract.
+///
+/// The name is deliberately self-describing: `github` never means "do not merge
+/// the head", it means "the provider's `autoMergeRequest` is the merge actor".
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum HeadMergeActor {
+    /// Cara promotes the root to the default branch and performs the exact
+    /// squash merges itself. No caravan member may carry native auto-merge.
+    #[default]
+    Caravan,
+    /// Historical: the provider merges the root through native squash
+    /// auto-merge armed by the scheduler on the exact root head.
+    Github,
+}
+
+impl HeadMergeActor {
+    /// Stable code embedded in receipts, problems, and structured details.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Caravan => "caravan",
+            Self::Github => "github",
+        }
+    }
+
+    /// Whether provider-native auto-merge is the configured merge actor.
+    #[must_use]
+    pub const fn github(self) -> bool {
+        matches!(self, Self::Github)
+    }
+
+    /// Whether the caravan itself is the single merge actor.
+    #[must_use]
+    pub const fn caravan(self) -> bool {
+        matches!(self, Self::Caravan)
+    }
+}
+
 /// Structural/fleet problem classes returned by graph validation.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
@@ -504,6 +551,61 @@ pub struct CompatibilityReport {
     pub conflicting_paths: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostic: Option<String>,
+}
+
+/// Exact cumulative-tree evidence for landing one candidate on one target.
+///
+/// A caravan member is physically rebased onto its predecessor chain *before*
+/// CI runs, so the head SHA already carries the cumulative reviewed content.
+/// Retargeting a promoted root to the default branch preserves that head SHA
+/// and therefore preserves its check history, but it only stays safe while the
+/// squash Cara is about to perform lands *exactly* that reviewed tree.
+///
+/// This proof states that mechanically: the tree `git merge-tree` constructs for
+/// candidate-into-target equals the candidate head's own tree. When it holds,
+/// the default branch moving underneath is irrelevant — the landed content is
+/// byte-identical to what CI already validated. When it does not hold, the
+/// target gained content the candidate never saw, and the caravan must
+/// revalidate (physical rebase plus fresh CI) instead of merging.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CumulativeTreeProof {
+    /// Candidate head branch generation, normally the promoted caravan root.
+    pub candidate: BranchSnapshot,
+    /// Target branch generation, normally the exact default branch.
+    pub target: BranchSnapshot,
+    /// Tree object of the exact candidate head commit.
+    pub candidate_tree: CommitOid,
+    /// Tree object `git merge-tree` constructs for candidate-into-target.
+    pub merge_result_tree: CommitOid,
+    /// Whether the merge result is exactly the already-validated head tree.
+    pub identical: bool,
+}
+
+impl CumulativeTreeProof {
+    /// Stable explanation retained on receipts and structured details.
+    #[must_use]
+    pub fn reason(&self) -> String {
+        if self.identical {
+            format!(
+                "merging {}@{} into {}@{} yields the exact already-validated head tree {}",
+                self.candidate.name,
+                self.candidate.oid,
+                self.target.name,
+                self.target.oid,
+                self.candidate_tree,
+            )
+        } else {
+            format!(
+                "merging {}@{} into {}@{} yields tree {} instead of the already-validated head tree {}",
+                self.candidate.name,
+                self.candidate.oid,
+                self.target.name,
+                self.target.oid,
+                self.merge_result_tree,
+                self.candidate_tree,
+            )
+        }
+    }
 }
 
 /// Exact PR facts which must still hold immediately before a remote mutation.
@@ -713,9 +815,18 @@ pub enum EventKind {
     CiFailed,
     ForceMergeAttempted,
     ForceMergeCompleted,
-    /// Scheduler-owned convergence proved required native SQUASH auto-merge on
-    /// the exact current caravan root head.
+    /// Historical: scheduler-owned convergence proved required native SQUASH
+    /// auto-merge on the exact current caravan root head. Only emitted under the
+    /// explicitly configured [`HeadMergePolicy::NativeAutoMerge`] compatibility
+    /// policy; the caravan-owned merge architecture emits [`Self::RootPromoted`]
+    /// and [`Self::RootMerged`] instead.
     RootAutoMergeArmed,
+    /// The caravan root was proven to target the exact default branch before any
+    /// merge was attempted.
+    RootPromoted,
+    /// The caravan itself squash-merged the exact promoted root head into the
+    /// exact default branch.
+    RootMerged,
     /// A required context has zero reporting run or check-suite lineage on the
     /// exact current head after the bounded grace period, so the caravan cannot
     /// advance without a visible decision.

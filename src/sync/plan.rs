@@ -269,9 +269,9 @@ pub(super) fn plan_caravan_convergence(
                 json!({"branch": status.default_branch, "oid": status.analysis.fleet.default_branch.oid}),
             ),
             reason: if base_satisfied {
-                "caravan head already targets the current default branch".to_owned()
+                "promoted caravan root already targets the current default branch".to_owned()
             } else {
-                "caravan head must target the exact current default branch".to_owned()
+                "promoted caravan root is retargeted to the exact current default branch before any merge mechanism".to_owned()
             },
         },
     )?;
@@ -322,14 +322,26 @@ pub(super) fn plan_caravan_convergence(
                 order: 0,
                 phase: SyncPlanPhase::Rediscovery,
                 state: SyncPlanActionState::DeferredUntilRediscovery,
-                kind: "enable_squash_auto_merge".to_owned(),
+                kind: if progress.head_merge_actor.caravan() {
+                    "squash_merge".to_owned()
+                } else {
+                    "enable_squash_auto_merge".to_owned()
+                },
                 pr: Some(head),
                 caravan_id: Some(caravan.id),
                 expected,
-                target: Some(json!({"enabled": true, "merge_method": "squash"})),
-                reason:
+                target: if progress.head_merge_actor.caravan() {
+                    Some(json!({"merge_method": "squash", "base": status.default_branch}))
+                } else {
+                    Some(json!({"enabled": true, "merge_method": "squash"}))
+                },
+                reason: if progress.head_merge_actor.caravan() {
+                    "revalidate the rewritten head, its cumulative tree, and fresh CI before cara merges it"
+                        .to_owned()
+                } else {
                     "revalidate rewritten head CI and provider facts before enabling auto-merge"
-                        .to_owned(),
+                        .to_owned()
+                },
             },
         )?;
         return Ok(());
@@ -490,7 +502,13 @@ pub(super) fn plan_caravan_convergence(
         return Ok(());
     }
 
-    for number in caravan.members.iter().skip(1).copied() {
+    let caravan_merges = progress.head_merge_actor.caravan();
+    let disarm_members: Vec<_> = if caravan_merges {
+        caravan.members.clone()
+    } else {
+        caravan.members.iter().skip(1).copied().collect()
+    };
+    for number in disarm_members {
         let current = &status.analysis.pull_requests[&number];
         push_plan_action(
             actions,
@@ -509,9 +527,50 @@ pub(super) fn plan_caravan_convergence(
                 caravan_id: Some(caravan.id),
                 expected: Some(PullRequestPrecondition::from(current)),
                 target: Some(json!({"enabled": false})),
-                reason: "only the caravan head may have squash auto-merge enabled".to_owned(),
+                reason: if caravan_merges {
+                    "cara is the single merge actor; no caravan member may carry a provider auto-merge request"
+                        .to_owned()
+                } else {
+                    "only the caravan head may have squash auto-merge enabled".to_owned()
+                },
             },
         )?;
+    }
+    if caravan_merges {
+        let tree_proof = status
+            .analysis
+            .cumulative_trees
+            .iter()
+            .find(|proof| proof.candidate == head_snapshot.head);
+        let landable = base_satisfied
+            && tree_proof.is_some_and(|proof| proof.identical)
+            && head_is_conflict_free_with_default(status, head_snapshot);
+        push_plan_action(
+            actions,
+            SyncPlanAction {
+                order: 0,
+                phase: SyncPlanPhase::ProviderConvergence,
+                state: if deferred || !landable {
+                    SyncPlanActionState::DeferredUntilRediscovery
+                } else {
+                    SyncPlanActionState::WouldMutate
+                },
+                kind: "squash_merge".to_owned(),
+                pr: Some(head),
+                caravan_id: Some(caravan.id),
+                expected: Some(PullRequestPrecondition::from(head_snapshot)),
+                target: Some(json!({
+                    "merge_method": "squash",
+                    "base": status.default_branch,
+                    "admin": false,
+                    "cumulative_tree": tree_proof,
+                })),
+                reason: "cara promotes the root to the exact default branch and performs one non-admin squash merge itself, only while its result tree is exactly the already-validated head tree"
+                    .to_owned(),
+            },
+        )?;
+        would_emit_events.push(EventKind::RootMerged);
+        return Ok(());
     }
     push_plan_action(
         actions,

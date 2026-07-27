@@ -3197,6 +3197,7 @@ mod tests {
             oid: caravan::model::CommitOid("0".repeat(40)),
         };
         let output = caravan::read::StatusOutput {
+            head_merge: caravan::read::HeadMergeStatus::default(),
             runtime: caravan::read::RuntimeProvenance::default(),
             provider_api: caravan::model::GitHubApiTelemetry::default(),
             merge_candidates: Vec::new(),
@@ -3231,6 +3232,7 @@ mod tests {
                 },
                 pull_requests: std::collections::BTreeMap::new(),
                 compatibility: Vec::new(),
+                cumulative_trees: Vec::new(),
             },
             pauses: Vec::new(),
             sync_budget: caravan::sync::SyncBudgetStatus::default(),

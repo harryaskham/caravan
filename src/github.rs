@@ -586,6 +586,64 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
         Ok(settings.allow_auto_merge && settings.allow_squash_merge)
     }
 
+    /// Whether repository settings permit squash merging at all.
+    ///
+    /// This is the only merge capability a caravan-owned tick needs: Cara
+    /// performs the squash itself, so a repository that deliberately disabled
+    /// native auto-merge must still synchronize normally.
+    pub fn repository_allows_squash_merge(
+        &self,
+        repository: &RepositoryId,
+    ) -> Result<bool, MutationError> {
+        let settings: RepositorySettingsJson =
+            self.json(repository_settings_command(repository))?;
+        Ok(settings.allow_squash_merge)
+    }
+
+    /// Exact current head revision of one repository branch.
+    pub fn branch_head_oid(
+        &self,
+        repository: &RepositoryId,
+        branch: &str,
+    ) -> Result<CommitOid, MutationError> {
+        let reference: GitRefJson =
+            self.json(default_branch_command(&repository.slug(), branch))?;
+        Ok(CommitOid(reference.object.sha))
+    }
+
+    /// Exact provider merge commit for one merged pull request, when exposed.
+    pub fn merge_commit_oid(
+        &self,
+        repository: &RepositoryId,
+        number: PrNumber,
+    ) -> Result<Option<CommitOid>, MutationError> {
+        let merged: MergeCommitJson = self.json(merge_commit_command(repository, number))?;
+        Ok(merged
+            .merge_commit
+            .map(|commit| CommitOid(commit.oid))
+            .filter(|oid| !oid.0.is_empty()))
+    }
+
+    /// Squash-merge one pull request as an ordinary authenticated actor.
+    ///
+    /// Deliberately *not* `--admin`: administrator bypass exists for landing
+    /// non-green forced heads, and reusing it for routine caravan landings would
+    /// silently downgrade branch protection. The exact head is fenced by the
+    /// provider through `--match-head-commit`, so a generation that moved during
+    /// the tick cannot be merged.
+    pub fn squash_merge(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+    ) -> Result<GitHubMutationReceipt, MutationError> {
+        self.mutate_pull_request(
+            repository,
+            expected,
+            MutationKind::SquashMerge,
+            squash_merge_command(repository, expected.number, &expected.head_oid),
+        )
+    }
+
     /// List repository label names for mutation preflight.
     pub fn repository_labels(
         &self,
@@ -2539,6 +2597,35 @@ fn admin_squash_merge_command(repository: &RepositoryId, number: PrNumber) -> Co
     ])
 }
 
+fn squash_merge_command(
+    repository: &RepositoryId,
+    number: PrNumber,
+    head: &CommitOid,
+) -> CommandSpec {
+    CommandSpec::new("gh").args([
+        "pr".to_owned(),
+        "merge".to_owned(),
+        number.to_string(),
+        "--repo".to_owned(),
+        repository.slug(),
+        "--squash".to_owned(),
+        "--match-head-commit".to_owned(),
+        head.0.clone(),
+    ])
+}
+
+fn merge_commit_command(repository: &RepositoryId, number: PrNumber) -> CommandSpec {
+    CommandSpec::new("gh").args([
+        "pr".to_owned(),
+        "view".to_owned(),
+        number.to_string(),
+        "--repo".to_owned(),
+        repository.slug(),
+        "--json".to_owned(),
+        "mergeCommit".to_owned(),
+    ])
+}
+
 fn branch_pr_history_command(repository: &str, branch: &str, limit: usize) -> CommandSpec {
     CommandSpec::new("gh").args([
         "pr",
@@ -2955,6 +3042,18 @@ struct RequiredPullRequestReviewsJson {
 struct RepositorySettingsJson {
     allow_auto_merge: bool,
     allow_squash_merge: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MergeCommitJson {
+    #[serde(default)]
+    merge_commit: Option<MergeCommitOidJson>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MergeCommitOidJson {
+    oid: String,
 }
 
 #[derive(Debug, Deserialize)]

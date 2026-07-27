@@ -15,7 +15,9 @@ use crate::command::{
     CommandOutput, CommandRunError, CommandRunner, CommandSpec, DEFAULT_COMMAND_TIMEOUT,
     ProcessRunner,
 };
-use crate::model::{BranchSnapshot, CommitOid, CompatibilityOutcome, CompatibilityReport};
+use crate::model::{
+    BranchSnapshot, CommitOid, CompatibilityOutcome, CompatibilityReport, CumulativeTreeProof,
+};
 
 /// Check a child PR against its declared predecessor.
 pub fn check_adjacent(
@@ -102,6 +104,75 @@ pub(crate) fn check_resolved_compatibility_with_runner(
     candidate_oid: &CommitOid,
     target_oid: &CommitOid,
 ) -> Result<CompatibilityReport, AppError> {
+    let (outcome, merge_tree_oid, conflicting_paths) =
+        merge_tree_with_runner(runner, candidate_oid, target_oid)?;
+    Ok(CompatibilityReport {
+        candidate: candidate.clone(),
+        target: target.clone(),
+        outcome,
+        conflicting_paths,
+        diagnostic: Some(format!("git merge-tree result {merge_tree_oid}")),
+    })
+}
+
+/// Prove whether landing `candidate` on `target` yields exactly the candidate's
+/// already-validated head tree.
+///
+/// This is the safety property that makes *retarget-only* root promotion sound.
+/// Caravan members are physically rebased before CI runs, so the head SHA holds
+/// the cumulative reviewed content and retargeting preserves its check history.
+/// The squash Cara then performs is only safe while its result tree is exactly
+/// that head tree; otherwise the default branch gained foreign content and the
+/// chain must be revalidated rather than merged.
+pub(crate) fn cumulative_tree_proof_with_runner(
+    runner: &impl CommandRunner,
+    candidate: &BranchSnapshot,
+    target: &BranchSnapshot,
+    candidate_oid: &CommitOid,
+    target_oid: &CommitOid,
+) -> Result<CumulativeTreeProof, AppError> {
+    let (_, merge_result_tree, _) = merge_tree_with_runner(runner, candidate_oid, target_oid)?;
+    let candidate_tree = commit_tree_with_runner(runner, candidate_oid)?;
+    Ok(CumulativeTreeProof {
+        candidate: candidate.clone(),
+        target: target.clone(),
+        identical: candidate_tree.0 == merge_result_tree,
+        candidate_tree,
+        merge_result_tree: CommitOid(merge_result_tree),
+    })
+}
+
+/// Exact tree object of one already-fetched commit.
+fn commit_tree_with_runner(
+    runner: &impl CommandRunner,
+    commit: &CommitOid,
+) -> Result<CommitOid, AppError> {
+    let output = git_output(runner, ["rev-parse", &format!("{}^{{tree}}", commit.0)])?;
+    if output.code != Some(0) {
+        return Err(git_failure(
+            "commit_tree_failed",
+            "git rev-parse could not resolve the exact commit tree",
+            output.code,
+            &output,
+        ));
+    }
+    let tree = output.stdout.trim().to_owned();
+    if !valid_full_oid(&tree) {
+        return Err(malformed_git_output(
+            "commit_tree_output_invalid",
+            "git rev-parse returned an invalid tree object ID",
+            &output,
+        ));
+    }
+    Ok(CommitOid(tree))
+}
+
+/// One `git merge-tree` construction shared by compatibility and tree proofs.
+fn merge_tree_with_runner(
+    runner: &impl CommandRunner,
+    candidate_oid: &CommitOid,
+    target_oid: &CommitOid,
+) -> Result<(CompatibilityOutcome, String, Vec<String>), AppError> {
     let output = git_output(
         runner,
         [
@@ -158,14 +229,7 @@ pub(crate) fn check_resolved_compatibility_with_runner(
             &output,
         ));
     }
-
-    Ok(CompatibilityReport {
-        candidate: candidate.clone(),
-        target: target.clone(),
-        outcome,
-        conflicting_paths,
-        diagnostic: Some(format!("git merge-tree result {merge_tree_oid}")),
-    })
+    Ok((outcome, merge_tree_oid, conflicting_paths))
 }
 
 /// Fetch and verify one canonical branch snapshot without updating local refs.

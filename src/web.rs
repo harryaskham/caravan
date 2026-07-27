@@ -2218,9 +2218,11 @@ mod tests {
             },
             pull_requests: std::collections::BTreeMap::from([(pull_request.number, pull_request)]),
             compatibility: Vec::new(),
+            cumulative_trees: Vec::new(),
         };
         let admission = crate::read::resolve_admission(&analysis, &[]);
         StatusOutput {
+            head_merge: crate::read::HeadMergeStatus::default(),
             runtime: crate::read::RuntimeProvenance::default(),
             provider_api: crate::model::GitHubApiTelemetry::default(),
             merge_candidates: Vec::new(),

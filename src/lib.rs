@@ -30,6 +30,7 @@ pub mod repair;
 pub mod required_runs;
 pub mod reshape;
 pub mod root_auto_merge;
+pub mod root_merge;
 pub mod sync;
 pub mod web;
 
@@ -65,21 +66,40 @@ CORE MODEL AND INVARIANTS
   PR number is the caravan ID.
 - Every active member has the `caravan` label and is open, non-draft, and owned
   by the base repository. Fork-only heads are rejected.
-- The head targets the default branch. Each child targets its predecessor's
-  branch. Only the head may have squash auto-merge enabled; non-head auto-merge
-  is disabled even if someone enabled it externally.
-- Required root squash auto-merge is scheduler-owned convergent state. Every
-  sync that creates, rebases, renews, or advances a caravan root re-reads the
-  exact current root from a fresh single-PR provider read and idempotently
-  proves SQUASH auto-merge on the resulting head, never on a pre-rebase
-  generation or a stale list projection. It converges before a failing-CI stop.
-  Each converged root carries a sealed `root_auto_merge` receipt with the proven
-  head/base, bounded read/attempt counts, and auditable engine provenance so a
-  controller can tell engine convergence from human repair; engine arming emits
-  `root_auto_merge_armed`. Unproven arming is the typed retryable
-  `root_auto_merge_not_durable` with cause `provider_did_not_persist_arming`,
-  `root_head_moved_during_arming`, or `stale_provider_view`; bounded sync policy
-  owns the retry and periodic operator re-arming is never the mechanism.
+- The root targets the default branch. Each child targets its predecessor's
+  branch. `sync.head_merge_actor` names the single merge actor: `caravan`
+  (default) or the historical `github`. Under `caravan` no member may carry a
+  provider `autoMergeRequest`; under `github` exactly the root must. The
+  auto-merge invariant is gated on that same fact, so a repository that disabled
+  native auto-merge never reports an unsatisfiable problem. The field is
+  optional and the historical `sync.auto_merge_head` boolean is still accepted,
+  because older Cara builds reject unknown configuration keys.
+- Under `caravan`, a sync tick is the merge actor and treats each root as one
+  ordered fenced transaction: re-read the exact generation; retarget to the
+  exact default branch when its base is anything else, including an
+  already-merged predecessor branch; re-read and prove base/ref/head plus the
+  required contexts of the new merge identity; prove that merging into the
+  default branch yields exactly the head's already-validated tree; perform one
+  non-admin SQUASH merge fenced on the exact head; prove the merge commit is
+  contained by the freshly fetched default branch; then promote the successor
+  and repeat within a bounded per-tick allowance. Administrator merge stays
+  reserved for the audited `caravan-force` bypass. Sealed `root_promotion` and
+  `root_merge` receipts carry the proven base transition, the authorizing
+  cumulative-tree proof, the provider merge commit, the default-branch
+  generation before and after, and the cumulative ancestry; they emit
+  `root_promoted` and `root_merged`. Unproven promotion is
+  `root_promotion_incomplete`, a refused merge is `root_merge_refused`, and
+  ordinary waits (pending checks, unsatisfied required contexts, an unproven or
+  changed cumulative tree, a spent merge allowance) are visible no-op steps.
+  A foreign auto-merge request is converged away or refused, never raced.
+- Under the historical `github` actor, required root squash auto-merge remains
+  scheduler-owned convergent state: every sync that creates, rebases, renews, or
+  advances a caravan root re-reads the exact current root from a fresh single-PR
+  provider read and idempotently proves SQUASH auto-merge on the resulting head,
+  never on a pre-rebase generation or a stale list projection. Each converged
+  root carries a sealed `root_auto_merge` receipt and emits
+  `root_auto_merge_armed`; unproven arming is the typed retryable
+  `root_auto_merge_not_durable`.
 - Required CI coverage is proven, not assumed. GitHub sometimes never starts a
   run for a freshly rebased head, so every sync checks that each context
   required by protection on the exact base branch has at least one run or

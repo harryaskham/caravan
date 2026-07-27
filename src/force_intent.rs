@@ -471,12 +471,18 @@ fn execute(
     }
 
     let desired_present = action == ReviewedForceIntentAction::Apply;
+    // The queue-owned squash postcondition only exists while the *provider* is
+    // the merge actor. Under caravan-owned merging the forced head is landed by
+    // cara's own audited administrator squash, so arming here would install a
+    // second merge actor on an intentionally non-green head.
+    let desired_squash_auto_merge =
+        action == ReviewedForceIntentAction::Apply && status.head_merge.actor.github();
     let atomic = provider
         .update_force_state(
             &status.repository,
             &PullRequestPrecondition::from(&evidence.pull),
             desired_present,
-            action == ReviewedForceIntentAction::Apply,
+            desired_squash_auto_merge,
         )
         .map_err(|error| provider_error(&error, status, input, &steps, &receipts))?;
     let atomic_changed = atomic.transaction_performed;
@@ -489,8 +495,11 @@ fn execute(
         },
         pr: Some(PrNumber(input.pr)),
         summary: match action {
-            ReviewedForceIntentAction::Apply => {
+            ReviewedForceIntentAction::Apply if desired_squash_auto_merge => {
                 "atomically converged exact-head force intent plus squash auto-merge"
+            }
+            ReviewedForceIntentAction::Apply => {
+                "converged exact-head force intent; cara remains the single merge actor"
             }
             ReviewedForceIntentAction::Revoke => {
                 "revoked exact-generation force intent without changing queue-owned auto-merge"
@@ -531,7 +540,7 @@ fn execute(
 
     if current.head.oid.0 != input.head
         || current.has_label(FORCE_LABEL) != desired_present
-        || (action == ReviewedForceIntentAction::Apply
+        || (desired_squash_auto_merge
             && !(current.auto_merge.enabled
                 && current.auto_merge.merge_method == Some(MergeMethod::Squash)))
     {
@@ -1293,8 +1302,16 @@ mod tests {
                 diagnostic: None,
             })
         };
-        let analysis = graph::analyze(&snapshot, &checker).unwrap();
+        // The historical reviewed-force fixtures exercise provider-native
+        // delegation, where force intent also owns the squash postcondition.
+        let analysis =
+            graph::analyze_for_actor(&snapshot, &checker, crate::model::HeadMergeActor::Github)
+                .unwrap();
         StatusOutput {
+            head_merge: crate::read::HeadMergeStatus {
+                actor: crate::model::HeadMergeActor::Github,
+                ..crate::read::HeadMergeStatus::default()
+            },
             runtime: crate::read::RuntimeProvenance::default(),
             provider_api: crate::model::GitHubApiTelemetry::default(),
             merge_candidates: Vec::new(),

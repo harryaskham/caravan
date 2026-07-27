@@ -9,7 +9,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::model::EventKind;
+use crate::model::{EventKind, HeadMergeActor};
+use crate::root_merge::ExternalAutoMergePolicy;
 
 /// Supported config schema version.
 pub const CONFIG_VERSION: u32 = 1;
@@ -79,6 +80,10 @@ fn default_sync_max_duration_secs() -> u64 {
 
 fn default_missing_required_runs_grace_secs() -> u64 {
     300
+}
+
+fn default_sync_max_root_merges_per_tick() -> u32 {
+    8
 }
 
 fn default_agent_priority_labels() -> Vec<String> {
@@ -197,6 +202,55 @@ pub struct SyncConfig {
     /// slot is a worst case, not a plan, and makes larger caravans permanently
     /// unconvergeable. Capped by `command_timeout_secs`.
     pub reserve_secs_per_command: u64,
+    /// Which actor merges the caravan root into the default branch.
+    ///
+    /// `caravan` (default) means Cara promotes the root to the exact default
+    /// branch and performs the squash merges itself, so no caravan member ever
+    /// carries a provider `autoMergeRequest`. `github` keeps the historical
+    /// delegation where the scheduler arms native squash auto-merge on the root.
+    /// The name is deliberately self-describing: `github` never means "do not
+    /// merge the head".
+    ///
+    /// Optional for rollout safety: Cara 0.0.7-0.0.10 reject unknown config
+    /// keys, so a repository must only add this field once every consumer of
+    /// its `.caravan/config.yaml` has upgraded. Absent means the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_merge_actor: Option<HeadMergeActor>,
+    /// Historical boolean spelling of [`Self::head_merge_actor`]. `true` selects
+    /// [`HeadMergeActor::Github`]; `false` selects [`HeadMergeActor::Caravan`].
+    /// Ignored when `head_merge_actor` is set explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_merge_head: Option<bool>,
+    /// What a caravan-owned tick does about a foreign `autoMergeRequest`.
+    ///
+    /// There must be exactly one merge actor: either Cara converges the foreign
+    /// request away (`disable`, default) or it refuses to race it (`refuse`).
+    pub external_auto_merge_policy: ExternalAutoMergePolicy,
+    /// Maximum caravan roots one tick may promote and merge before deferring to
+    /// the next bounded tick. A whole green caravan can drain in one tick, but
+    /// every iteration re-reads exact provider facts and re-proves landing.
+    pub max_root_merges_per_tick: u32,
+}
+
+impl SyncConfig {
+    /// Resolve the configured merge actor from either spelling.
+    ///
+    /// An explicit `head_merge_actor` always wins; the historical
+    /// `auto_merge_head` boolean is honoured for mixed-version rollouts; absent
+    /// configuration keeps the caravan-owned default.
+    #[must_use]
+    pub fn resolved_head_merge_actor(&self) -> HeadMergeActor {
+        self.head_merge_actor.unwrap_or_else(|| {
+            self.auto_merge_head
+                .map_or_else(HeadMergeActor::default, |native| {
+                    if native {
+                        HeadMergeActor::Github
+                    } else {
+                        HeadMergeActor::Caravan
+                    }
+                })
+        })
+    }
 }
 
 impl Default for SyncConfig {
@@ -210,6 +264,10 @@ impl Default for SyncConfig {
             max_duration_secs: default_sync_max_duration_secs(),
             missing_required_runs_grace_secs: default_missing_required_runs_grace_secs(),
             retrigger_missing_required_runs: true,
+            head_merge_actor: None,
+            auto_merge_head: None,
+            external_auto_merge_policy: ExternalAutoMergePolicy::default(),
+            max_root_merges_per_tick: default_sync_max_root_merges_per_tick(),
         }
     }
 }
@@ -597,6 +655,69 @@ impl StructuredError for ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_merge_actor_is_optional_backward_compatible_and_self_describing() {
+        // Rollout hazard: Cara 0.0.7-0.0.10 reject unknown config keys, so a
+        // repository can only add the field once every consumer upgraded. An
+        // old document must therefore keep parsing and keep the safe default.
+        let legacy = CaravanConfig::parse("version: 1\n").expect("old documents still parse");
+        assert_eq!(legacy.sync.head_merge_actor, None);
+        assert_eq!(legacy.sync.auto_merge_head, None);
+        assert_eq!(
+            legacy.sync.resolved_head_merge_actor(),
+            HeadMergeActor::Caravan,
+            "cara owns the merge unless a repository explicitly delegates it"
+        );
+        assert_eq!(
+            legacy.sync.external_auto_merge_policy,
+            ExternalAutoMergePolicy::Disable
+        );
+
+        let explicit = CaravanConfig::parse(
+            "version: 1\nsync:\n  head_merge_actor: github\n  external_auto_merge_policy: refuse\n",
+        )
+        .expect("the typed field parses");
+        assert_eq!(
+            explicit.sync.resolved_head_merge_actor(),
+            HeadMergeActor::Github
+        );
+        assert_eq!(
+            explicit.sync.external_auto_merge_policy,
+            ExternalAutoMergePolicy::Refuse
+        );
+
+        // The historical boolean spelling stays accepted for mixed-version
+        // rollouts; `true` means the provider is the merge actor.
+        let boolean = CaravanConfig::parse("version: 1\nsync:\n  auto_merge_head: true\n")
+            .expect("alias parses");
+        assert_eq!(
+            boolean.sync.resolved_head_merge_actor(),
+            HeadMergeActor::Github
+        );
+        let boolean_off = CaravanConfig::parse("version: 1\nsync:\n  auto_merge_head: false\n")
+            .expect("alias parses");
+        assert_eq!(
+            boolean_off.sync.resolved_head_merge_actor(),
+            HeadMergeActor::Caravan
+        );
+
+        // An explicit typed field always wins over the historical alias.
+        let both = CaravanConfig::parse(
+            "version: 1\nsync:\n  head_merge_actor: caravan\n  auto_merge_head: true\n",
+        )
+        .expect("both spellings parse");
+        assert_eq!(
+            both.sync.resolved_head_merge_actor(),
+            HeadMergeActor::Caravan
+        );
+
+        // A serialized default document never emits the new keys, so a config
+        // written by this runtime is still readable by an older one.
+        let rendered = serde_yaml::to_string(&CaravanConfig::default()).expect("config serializes");
+        assert!(!rendered.contains("head_merge_actor"), "{rendered}");
+        assert!(!rendered.contains("auto_merge_head"), "{rendered}");
+    }
 
     #[test]
     fn empty_document_uses_safe_defaults() {
