@@ -410,6 +410,7 @@ mod tests {
                         compatibility: Vec::new(),
                     },
                     pauses: Vec::new(),
+                    sync_budget: crate::sync::SyncBudgetStatus::default(),
                 },
                 paused_caravans: Vec::new(),
             },

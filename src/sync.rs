@@ -35,8 +35,16 @@ use crate::root_auto_merge::{
 };
 use crate::{AppContext, AppError, CheckInput, SyncInput};
 
+mod budget;
 mod decision;
 mod plan;
+pub use budget::{CaravanBudgetProjection, SyncBudgetStatus, project_status};
+use budget::{
+    ChainCost, MemberCost, PhysicalApplyAdmission, PhysicalCommitBudget, admit_physical_prefix,
+    externally_armed_non_roots, max_admissible_members,
+};
+#[cfg(test)]
+use budget::{ReserveScope, budget_for, chain_costs_from_status, complete_budget};
 #[cfg(test)]
 use decision::decision_checkout_target;
 use decision::{
@@ -49,8 +57,20 @@ use plan::{plan_auto_admission_with_checker, plan_caravan_convergence};
 
 const MAX_SYNC_OPERATION_SECS: u64 = 3_600;
 const MAX_PARALLEL_REBASE_CHAINS: usize = 2;
-const PHYSICAL_APPLY_COMMAND_SLOTS_PER_MEMBER: u64 = 3;
-const PHYSICAL_RECONCILIATION_COMMAND_SLOTS_PER_MEMBER: u64 = 2;
+/// Exact remote range/target verification plus one force-with-lease push.
+const PHYSICAL_APPLY_COMMAND_SLOTS_PER_PENDING_MEMBER: u64 = 3;
+/// A member whose exact cumulative ancestry already holds still revalidates
+/// its range and target generations, but never pushes.
+const PHYSICAL_APPLY_COMMAND_SLOTS_PER_RETAINED_MEMBER: u64 = 2;
+/// Invalidation reserves remove+audit and the complete compensating add+audit
+/// path when branch non-publication is later proven.
+const PHYSICAL_FORCE_INVALIDATION_COMMAND_SLOTS: u64 = 6;
+const PHYSICAL_FORCE_INVALIDATION_MUTATIONS: u64 = 4;
+/// One bounded CI observation per member during ordinary reconciliation.
+const PHYSICAL_RECONCILIATION_COMMAND_SLOTS_PER_MEMBER: u64 = 1;
+/// Root base retarget plus convergent root auto-merge arming per caravan.
+const PHYSICAL_RECONCILIATION_COMMAND_SLOTS_PER_CARAVAN: u64 = 2;
+/// Mandatory midpoint and final rediscovery after the write barrier.
 const PHYSICAL_FIXED_POST_WRITE_COMMAND_SLOTS: u64 = 2;
 const AUTO_ADMISSION_SKIP_LABEL: &str = "caravan-join-skipped";
 /// Labels whose transition changes whether a PR may be an admitted caravan root
@@ -233,6 +253,12 @@ pub enum AutoAdmissionContinuation {
     GithubRequestBudgetExhausted,
     DeadlineExhausted,
     RejectedCanonicalCandidate,
+    /// The exact target chain already holds every member the configured
+    /// deadline can guarantee to drain; the existing prefix keeps draining.
+    CaravanBudgetCapacityExhausted,
+    /// The existing fleet is mid-rebuild after a bounded prefix apply, so no
+    /// candidate is admitted until a tick converges it.
+    RequiresConvergedFleet,
 }
 
 /// Exact live tail generation considered by the greedy heuristic.
@@ -364,6 +390,23 @@ pub struct AutoAdmissionOutput {
     pub skips: Vec<AutoJoinSkipReceipt>,
     #[serde(default)]
     pub remaining_candidates: Vec<PrNumber>,
+    /// Exact capacity refusal evidence when the configured deadline can no
+    /// longer guarantee that a larger chain drains.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_refusal: Option<CaravanCapacityRefusal>,
+}
+
+/// Typed `caravan_budget_capacity_exhausted` evidence for one refused join.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CaravanCapacityRefusal {
+    pub code: String,
+    pub candidate_pr: PrNumber,
+    pub caravan_id: PrNumber,
+    pub caravan_members: u64,
+    pub max_admissible_members: u64,
+    pub configured_deadline_ms: u64,
+    pub command_timeout_ms: u64,
+    pub safe_next_action: String,
 }
 
 impl Default for AutoAdmissionOutput {
@@ -382,6 +425,7 @@ impl Default for AutoAdmissionOutput {
             joins: Vec::new(),
             skips: Vec::new(),
             remaining_candidates: Vec::new(),
+            capacity_refusal: None,
         }
     }
 }
@@ -407,6 +451,7 @@ impl AutoAdmissionOutput {
             joins: Vec::new(),
             skips: Vec::new(),
             remaining_candidates: Vec::new(),
+            capacity_refusal: None,
         }
     }
 }
@@ -431,6 +476,23 @@ pub enum SyncPlanActionState {
     ReadOnlyObservation,
     DeferredUntilRediscovery,
     WouldStop,
+}
+
+/// Exact bounded-prefix apply admission modelled by one planned tick.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SyncApplyAdmissionPlan {
+    /// Members one tick would apply now, in exact root-to-descendant order.
+    #[serde(default)]
+    pub admitted_prefix: Vec<PrNumber>,
+    /// Verified members the same tick would resume on a later tick.
+    #[serde(default)]
+    pub deferred_members: Vec<PrNumber>,
+    pub required_ms: u64,
+    pub complete_graph_required_ms: u64,
+    pub configured_deadline_ms: u64,
+    pub max_admissible_members: u64,
+    /// True when ordinary convergence is intentionally left to the next tick.
+    pub deferred_convergence: bool,
 }
 
 /// One ordered, bounded action in an exact no-provider-write sync plan.
@@ -493,6 +555,9 @@ pub struct SyncPlanOutput {
     pub selected_caravans: Vec<PrNumber>,
     #[serde(default)]
     pub physical_rebase_plans: Vec<crate::physical_rebase::RebasePlan>,
+    /// Exact prefix/deferral the same tick would admit against its deadline.
+    #[serde(default)]
+    pub physical_apply_admission: SyncApplyAdmissionPlan,
     #[serde(default)]
     pub ci: Vec<CiObservation>,
     #[serde(default)]
@@ -515,6 +580,7 @@ impl SyncPlanOutput {
             "all": self.all,
             "selected_caravans": &self.selected_caravans,
             "physical_rebase_plans": &self.physical_rebase_plans,
+            "physical_apply_admission": &self.physical_apply_admission,
             "ci": &self.ci,
             "actions": &self.actions,
             "auto_admission": &self.auto_admission,
@@ -888,75 +954,56 @@ fn sync_operation_budget(context: &AppContext) -> Duration {
 struct PreparedChain {
     caravan: Caravan,
     members: Vec<crate::physical_rebase::PreparedRebase>,
+    /// Leading members admitted for apply this tick, root-to-descendant.
+    admitted: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PhysicalCommitBudget {
-    command_slots: u64,
-    required: Duration,
-    mutation_reserve: u32,
+impl PreparedChain {
+    fn admitted_members(&self) -> impl Iterator<Item = &crate::physical_rebase::PreparedRebase> {
+        self.members.iter().take(self.admitted)
+    }
+
+    fn admitted_plans(&self) -> impl Iterator<Item = crate::physical_rebase::RebasePlan> + '_ {
+        self.admitted_members()
+            .map(|prepared| prepared.plan.clone())
+    }
 }
 
+/// Exact per-member cost inputs taken from approved plans rather than from a
+/// whole-chain worst case, so a completed prefix makes the next tick cheaper.
+fn chain_costs_from_plans(status: &StatusOutput, chains: &[PreparedChain]) -> Vec<ChainCost> {
+    chains
+        .iter()
+        .map(|chain| ChainCost {
+            caravan_id: chain.caravan.id,
+            externally_armed_non_roots: externally_armed_non_roots(status, &chain.caravan),
+            members: chain
+                .members
+                .iter()
+                .map(|prepared| {
+                    let current = status.analysis.pull_requests.get(&prepared.plan.pr);
+                    MemberCost {
+                        pr: prepared.plan.pr,
+                        pending: !prepared.plan.already_satisfied,
+                        auto_merge_enabled: current
+                            .is_some_and(|pull_request| pull_request.auto_merge.enabled),
+                        force_labelled: current
+                            .is_some_and(|pull_request| pull_request.has_label("caravan-force")),
+                    }
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// Worst-case whole-graph reserve used before any Git range is planned.
+#[cfg(test)]
 fn physical_commit_budget(
     context: &AppContext,
     status: &StatusOutput,
     selected: &[Caravan],
 ) -> PhysicalCommitBudget {
-    let member_count = selected
-        .iter()
-        .map(|caravan| u64::try_from(caravan.members.len()).unwrap_or(u64::MAX))
-        .fold(0_u64, u64::saturating_add);
-    let parallel_branch_rounds = selected
-        .chunks(MAX_PARALLEL_REBASE_CHAINS)
-        .map(|batch| {
-            batch
-                .iter()
-                .map(|caravan| u64::try_from(caravan.members.len()).unwrap_or(u64::MAX))
-                .max()
-                .unwrap_or(0)
-        })
-        .fold(0_u64, u64::saturating_add);
-    let (auto_merge_disables, force_heads) = selected
-        .iter()
-        .flat_map(|caravan| caravan.members.iter())
-        .filter_map(|number| status.analysis.pull_requests.get(number))
-        .fold((0_u64, 0_u64), |(auto_merge, force), pull_request| {
-            (
-                auto_merge + u64::from(pull_request.auto_merge.enabled),
-                force + u64::from(pull_request.has_label("caravan-force")),
-            )
-        });
-    // Invalidation reserves remove+audit and the complete compensating
-    // add+audit path when branch non-publication is later proven.
-    let force_command_slots = force_heads.saturating_mul(6);
-    let force_mutations = force_heads.saturating_mul(4);
-    let reconciliation =
-        member_count.saturating_mul(PHYSICAL_RECONCILIATION_COMMAND_SLOTS_PER_MEMBER);
-    let command_slots = auto_merge_disables
-        .saturating_add(force_command_slots)
-        .saturating_add(
-            parallel_branch_rounds.saturating_mul(PHYSICAL_APPLY_COMMAND_SLOTS_PER_MEMBER),
-        )
-        .saturating_add(reconciliation)
-        .saturating_add(PHYSICAL_FIXED_POST_WRITE_COMMAND_SLOTS);
-    let required = Duration::from_secs(
-        context
-            .config
-            .command_timeout_secs
-            .saturating_mul(command_slots),
-    );
-    let mutation_reserve = u32::try_from(
-        auto_merge_disables
-            .saturating_add(force_mutations)
-            .saturating_add(member_count)
-            .saturating_add(reconciliation),
-    )
-    .unwrap_or(u32::MAX);
-    PhysicalCommitBudget {
-        command_slots,
-        required,
-        mutation_reserve,
-    }
+    budget::complete_budget(context, &budget::chain_costs_from_status(status, selected))
 }
 
 fn physical_sync_budget_error(
@@ -966,27 +1013,68 @@ fn physical_sync_budget_error(
     plans: &[crate::physical_rebase::RebasePlan],
     phase: &'static str,
 ) -> AppError {
+    physical_sync_budget_error_with_admission(
+        context,
+        operation_deadline,
+        budget,
+        plans,
+        phase,
+        None,
+    )
+}
+
+/// Typed zero-write refusal carrying the exact reserve model, the configured
+/// deadline, the prefix that could still have drained, and the capacity bound
+/// implied by the configuration.
+fn physical_sync_budget_error_with_admission(
+    context: &AppContext,
+    operation_deadline: Instant,
+    budget: PhysicalCommitBudget,
+    plans: &[crate::physical_rebase::RebasePlan],
+    phase: &'static str,
+    admission: Option<&PhysicalApplyAdmission>,
+) -> AppError {
     let remaining = operation_deadline.saturating_duration_since(Instant::now());
     let plan_material = serde_json::to_vec(plans).expect("physical plans serialize");
+    let deadline = sync_operation_budget(context);
+    let capacity = max_admissible_members(context, deadline);
+    let mut details = json!({
+        "phase": phase,
+        "required_ms": duration_millis(budget.required),
+        "remaining_ms": duration_millis(remaining),
+        "minimum_additional_ms": duration_millis(budget.required.saturating_sub(remaining)),
+        "command_timeout_ms": context.config.command_timeout_secs.saturating_mul(1_000),
+        "configured_deadline_ms": duration_millis(deadline),
+        "required_command_slots": budget.command_slots,
+        "required_mutation_capacity": budget.mutation_reserve,
+        "max_admissible_members": capacity,
+        "prepared_plan_count": plans.len(),
+        "prepared_plan_hash": crate::membership::fnv1a64(&plan_material),
+        "provider_mutations": 0,
+        "branch_mutations": 0,
+        "retryable": false,
+        "config_guidance": "increase sync.max_duration_secs until physical planning completes with required_ms still remaining, or lower command_timeout_secs only when the provider and Git latency bound supports it; the operation deadline is never extended",
+    });
+    if let (Some(admission), Some(object)) = (admission, details.as_object_mut()) {
+        object.insert(
+            "processable_prefix".to_owned(),
+            json!(admission.admitted_prs),
+        );
+        object.insert("deferred_members".to_owned(), json!(admission.deferred));
+        object.insert(
+            "complete_graph_required_ms".to_owned(),
+            json!(duration_millis(admission.complete_budget.required)),
+        );
+        object.insert(
+            "complete_graph_command_slots".to_owned(),
+            json!(admission.complete_budget.command_slots),
+        );
+    }
     AppError::structured(
         ErrorCategory::Validation,
         "physical_sync_budget_insufficient",
         "physical sync cannot enter its mutation phase without the reserved apply budget",
-        Some(json!({
-            "phase": phase,
-            "required_ms": duration_millis(budget.required),
-            "remaining_ms": duration_millis(remaining),
-            "minimum_additional_ms": duration_millis(budget.required.saturating_sub(remaining)),
-            "command_timeout_ms": context.config.command_timeout_secs.saturating_mul(1_000),
-            "required_command_slots": budget.command_slots,
-            "required_mutation_capacity": budget.mutation_reserve,
-            "prepared_plan_count": plans.len(),
-            "prepared_plan_hash": crate::membership::fnv1a64(&plan_material),
-            "provider_mutations": 0,
-            "branch_mutations": 0,
-            "retryable": false,
-            "config_guidance": "increase sync.max_duration_secs until physical planning completes with required_ms still remaining, or lower command_timeout_secs only when the provider and Git latency bound supports it; the operation deadline is never extended",
-        })),
+        Some(details),
     )
 }
 
@@ -1040,12 +1128,44 @@ fn physical_budget_failure(
     )
 }
 
+/// Refusal for the one case bounded prefixes cannot rescue: not even a single
+/// pending member fits the configured deadline.
+fn physical_capacity_failure(
+    context: &AppContext,
+    status: &StatusOutput,
+    operation_deadline: Instant,
+    admission: &PhysicalApplyAdmission,
+    plans: Vec<crate::physical_rebase::RebasePlan>,
+    phase: &'static str,
+) -> AppError {
+    let affected_prs = plans.iter().map(|plan| plan.pr).collect();
+    attach_physical_rebuild(
+        physical_sync_budget_error_with_admission(
+            context,
+            operation_deadline,
+            admission.budget,
+            &plans,
+            phase,
+            Some(admission),
+        ),
+        &PhysicalRebuildOutcome {
+            repository: Some(status.repository.clone()),
+            affected_prs,
+            plans,
+            ..PhysicalRebuildOutcome::default()
+        },
+    )
+}
+
 #[derive(Default)]
 struct PhysicalRebuildOutcome {
     repository: Option<RepositoryId>,
     caravan_id: Option<PrNumber>,
     affected_prs: Vec<PrNumber>,
     plans: Vec<crate::physical_rebase::RebasePlan>,
+    /// Approved members intentionally left for a later tick by the bounded
+    /// prefix admission. Never a failure: their exact plans stay verified.
+    deferred: Vec<PrNumber>,
     receipts: Vec<crate::physical_rebase::RebaseReceipt>,
     provider_receipts: Vec<GitHubMutationReceipt>,
     steps: Vec<MutationStep>,
@@ -1074,18 +1194,25 @@ fn prepare_physical_chains(
     all: bool,
     provider: &impl SyncProvider,
     operation_deadline: Instant,
-) -> Result<(Vec<PreparedChain>, SyncProgress), AppError> {
+) -> Result<(Vec<PreparedChain>, SyncProgress, PhysicalApplyAdmission), AppError> {
     let selected = selected_unpaused_caravans(status, all)?;
     let progress = SyncProgress::new(
         status,
         selected.iter().map(|caravan| caravan.id).collect(),
         context.config.sync.max_mutations_per_tick,
     );
-    let commit_budget = physical_commit_budget(context, status, &selected);
+    // Pre-plan sizing is deliberately worst case (every member still pending)
+    // and deliberately non-fatal: only real plans know which members already
+    // hold their exact cumulative ancestry and therefore cost nothing.
+    let projected = admit_physical_prefix(
+        context,
+        &budget::chain_costs_from_status(status, &selected),
+        operation_deadline.saturating_duration_since(Instant::now()),
+    );
     let planning_budget = PhysicalCommitBudget {
         command_slots: 1,
         required: Duration::from_secs(context.config.command_timeout_secs),
-        mutation_reserve: commit_budget.mutation_reserve,
+        mutation_reserve: projected.budget.mutation_reserve,
     };
     let planning_deadline = physical_precommit_deadline(
         context,
@@ -1103,7 +1230,7 @@ fn prepare_physical_chains(
             },
         )
     })?;
-    progress.ensure_mutation_capacity(commit_budget.mutation_reserve)?;
+    progress.ensure_mutation_capacity(projected.budget.mutation_reserve)?;
     if let Err(error) = preflight_repository(provider, status, &progress) {
         if Instant::now() >= planning_deadline {
             return Err(physical_budget_failure(
@@ -1220,16 +1347,38 @@ fn prepare_physical_chains(
             });
             members.push(prepared);
         }
-        chains.push(PreparedChain { caravan, members });
+        chains.push(PreparedChain {
+            admitted: members.len(),
+            caravan,
+            members,
+        });
     }
     let plans = chains
         .iter()
         .flat_map(|chain| chain.members.iter().map(|item| item.plan.clone()))
         .collect::<Vec<_>>();
+    // Every reserve below is derived from the approved plans, so an already
+    // applied prefix is free and each resumed tick is strictly cheaper.
+    let costs = chain_costs_from_plans(status, &chains);
+    let mut admission = admit_physical_prefix(
+        context,
+        &costs,
+        operation_deadline.saturating_duration_since(Instant::now()),
+    );
+    if !admission.makes_progress() {
+        return Err(physical_capacity_failure(
+            context,
+            status,
+            operation_deadline,
+            &admission,
+            plans,
+            "physical_rebase_global_write_barrier",
+        ));
+    }
     precommit_deadline = physical_precommit_deadline(
         context,
         operation_deadline,
-        commit_budget,
+        admission.budget,
         &plans,
         "physical_rebase_global_write_barrier",
     )
@@ -1238,11 +1387,14 @@ fn prepare_physical_chains(
             context,
             status,
             operation_deadline,
-            commit_budget,
+            admission.budget,
             plans.clone(),
             "physical_rebase_global_write_barrier",
         )
     })?;
+    // The barrier always verifies the complete graph, never only the prefix:
+    // a deferred descendant must still be provably appliable before any
+    // ancestor of it is rewritten.
     if let Err(error) =
         verify_physical_write_barrier(context, status, provider, &chains, Some(precommit_deadline))
     {
@@ -1251,7 +1403,7 @@ fn prepare_physical_chains(
                 context,
                 status,
                 operation_deadline,
-                commit_budget,
+                admission.budget,
                 plans,
                 "physical_rebase_global_write_barrier",
             ));
@@ -1269,10 +1421,27 @@ fn prepare_physical_chains(
             },
         ));
     }
+    // Re-admit against the wall clock the complete-graph barrier actually
+    // consumed, so commitment reserves the exact prefix it is about to write.
+    admission = admit_physical_prefix(
+        context,
+        &costs,
+        operation_deadline.saturating_duration_since(Instant::now()),
+    );
+    if !admission.makes_progress() {
+        return Err(physical_capacity_failure(
+            context,
+            status,
+            operation_deadline,
+            &admission,
+            plans,
+            "physical_rebase_commit_admission",
+        ));
+    }
     physical_precommit_deadline(
         context,
         operation_deadline,
-        commit_budget,
+        admission.budget,
         &plans,
         "physical_rebase_commit_admission",
     )
@@ -1281,12 +1450,15 @@ fn prepare_physical_chains(
             context,
             status,
             operation_deadline,
-            commit_budget,
+            admission.budget,
             plans,
             "physical_rebase_commit_admission",
         )
     })?;
-    Ok((chains, progress))
+    for (chain, admitted) in chains.iter_mut().zip(admission.admitted.iter().copied()) {
+        chain.admitted = admitted;
+    }
+    Ok((chains, progress, admission))
 }
 
 fn validate_rebase_preflight_graph(
@@ -1634,6 +1806,11 @@ fn apply_physical_chains(
         .iter()
         .flat_map(|chain| chain.members.iter().map(|prepared| prepared.plan.clone()))
         .collect::<Vec<_>>();
+    let deferred = chains
+        .iter()
+        .flat_map(|chain| chain.members.iter().skip(chain.admitted))
+        .map(|prepared| prepared.plan.pr)
+        .collect::<Vec<_>>();
     let mut outcome = PhysicalRebuildOutcome {
         repository: Some(status.repository.clone()),
         caravan_id: if chains.len() == 1 {
@@ -1643,10 +1820,11 @@ fn apply_physical_chains(
         },
         affected_prs: plans.iter().map(|plan| plan.pr).collect(),
         plans,
+        deferred,
         ..PhysicalRebuildOutcome::default()
     };
     for chain in chains {
-        for prepared in &chain.members {
+        for prepared in chain.admitted_members() {
             // Only a member whose exact branch generation is actually rewritten
             // needs its native auto-merge dropped first. Disarming an untouched
             // caravan root every tick creates a durability window in which any
@@ -1672,10 +1850,10 @@ fn apply_physical_chains(
         }
     }
     let planned_branch_writes = u32::try_from(
-        outcome
-            .plans
+        chains
             .iter()
-            .filter(|plan| !plan.already_satisfied)
+            .flat_map(PreparedChain::admitted_members)
+            .filter(|prepared| !prepared.plan.already_satisfied)
             .count(),
     )
     .unwrap_or(u32::MAX);
@@ -1697,6 +1875,7 @@ fn apply_physical_chains(
                 .collect(),
         ),
         "branch_writes": 0,
+        "deferred_members": outcome.deferred,
         "next": "apply retained objects under the exact globally verified leases",
     });
     lock.checkpoint(
@@ -1819,8 +1998,8 @@ fn apply_prepared_chain(
     Vec<crate::physical_rebase::RebaseReceipt>,
     Option<(crate::physical_rebase::RebasePlan, AppError)>,
 ) {
-    let mut receipts = Vec::with_capacity(chain.members.len());
-    for prepared in &chain.members {
+    let mut receipts = Vec::with_capacity(chain.admitted);
+    for prepared in chain.admitted_members() {
         match crate::physical_rebase::apply_prepared_after_write_barrier(prepared) {
             Ok(receipt) => receipts.push(receipt),
             Err(error) => return (receipts, Some((prepared.plan.clone(), error))),
@@ -1837,6 +2016,11 @@ fn attach_physical_rebuild(error: AppError, outcome: &PhysicalRebuildOutcome) ->
         object.insert("caravan_id".to_owned(), json!(outcome.caravan_id));
         object.insert("affected_prs".to_owned(), json!(outcome.affected_prs));
         object.insert("rebase_plans".to_owned(), json!(outcome.plans));
+        // A bounded-prefix refusal already carries the exact deferred set; a
+        // later outcome attachment must never blank that evidence.
+        object
+            .entry("deferred_members".to_owned())
+            .or_insert_with(|| json!(outcome.deferred));
         object.insert("rebase_receipts".to_owned(), json!(outcome.receipts));
         object.insert(
             "provider_receipts".to_owned(),
@@ -1907,6 +2091,112 @@ fn attach_physical_rebuild(error: AppError, outcome: &PhysicalRebuildOutcome) ->
         error.message(),
         Some(details),
     )
+}
+
+/// Successful bounded-prefix tick: an exact verified prefix of the complete
+/// approved graph was applied, its receipts are durable, and the remainder
+/// resumes on the next tick without replaying any completed provider mutation.
+#[allow(clippy::too_many_arguments)]
+fn bounded_prefix_output(
+    context: &AppContext,
+    input: &SyncInput,
+    started: Instant,
+    operation_deadline: Instant,
+    initial_status_elapsed: Duration,
+    convergence_elapsed: Duration,
+    admission: &PhysicalApplyAdmission,
+    physical_rebuild: PhysicalRebuildOutcome,
+    status: StatusOutput,
+    lock_recovery: Option<OperationLockRecovery>,
+    lock: &mut OperationLock,
+) -> Result<SyncOutput, AppError> {
+    let selected = selected_unpaused_caravans(&status, input.all)?;
+    let mut progress = SyncProgress::new(
+        &status,
+        selected.iter().map(|caravan| caravan.id).collect(),
+        context.config.sync.max_mutations_per_tick,
+    );
+    progress.steps = physical_rebuild.steps;
+    progress.provider_receipts = physical_rebuild.provider_receipts;
+    progress.rebase_plans = physical_rebuild.plans;
+    progress.rebase_receipts = physical_rebuild.receipts;
+    progress.paused_caravans = status
+        .pauses
+        .iter()
+        .filter(|pause| pause.state.is_effective())
+        .cloned()
+        .collect();
+    let evidence = json!({
+        "admitted_prefix": admission.admitted_prs,
+        "deferred_members": admission.deferred,
+        "required_ms": duration_millis(admission.budget.required),
+        "required_command_slots": admission.budget.command_slots,
+        "complete_graph_required_ms": duration_millis(admission.complete_budget.required),
+        "complete_graph_command_slots": admission.complete_budget.command_slots,
+        "configured_deadline_ms": duration_millis(sync_operation_budget(context)),
+        "max_admissible_members": max_admissible_members(context, sync_operation_budget(context)),
+        "provider_state": sync_checkpoint_evidence(&progress),
+    });
+    lock.checkpoint("physical_rebase_bounded_prefix_complete", evidence, false)?;
+    lock.checkpoint("completed", sync_checkpoint_evidence(&progress), false)?;
+
+    let reason = if admission.deferred.is_empty() {
+        format!(
+            "applied the complete approved graph ({} member(s)) and deferred ordinary convergence to the next tick; completed receipts are durable and are never replayed",
+            admission.admitted_prs.len(),
+        )
+    } else {
+        format!(
+            "applied an exact verified prefix of {} member(s) and deferred {} member(s) plus ordinary convergence to the next tick; completed receipts are durable and are never replayed",
+            admission.admitted_prs.len(),
+            admission.deferred.len(),
+        )
+    };
+    let scheduler_status = SyncSchedulerStatus {
+        wake_class: SchedulerWakeClass::RetryTick,
+        disposition: SchedulerDisposition::RetryTick,
+        reason,
+        ..successful_scheduler_status(
+            &status,
+            &progress.ci,
+            &progress.paused_caravans,
+            context.config.rebase_on_join,
+        )
+    };
+    Ok(SyncOutput {
+        receipt: progress.operation_receipt(),
+        auto_admission: AutoAdmissionOutput {
+            continuation: if context.config.sync.actions.join_unlabelled_prs && input.all {
+                AutoAdmissionContinuation::RequiresConvergedFleet
+            } else {
+                AutoAdmissionOutput::disabled(context, input.all).continuation
+            },
+            mutation_limit: context.config.sync.max_mutations_per_tick,
+            mutations_used: completed_mutation_count(&progress),
+            ..AutoAdmissionOutput::disabled(context, input.all)
+        },
+        scheduler_status,
+        timing: Some(SyncTiming {
+            deadline_ms: duration_millis(operation_deadline.saturating_duration_since(started)),
+            total_ms: duration_millis(started.elapsed()),
+            initial_status_ms: duration_millis(initial_status_elapsed),
+            provider_convergence_ms: duration_millis(convergence_elapsed),
+            final_status_ms: 0,
+        }),
+        lock_recovery,
+        provider_receipts: progress.provider_receipts,
+        root_auto_merge: Vec::new(),
+        rebase_plans: progress.rebase_plans,
+        rebase_receipts: progress.rebase_receipts,
+        historical_predecessor: read::historical_predecessor(&status),
+        synchronized_caravans: progress.synchronized_caravans,
+        paused_caravans: progress.paused_caravans,
+        head_advancements: Vec::new(),
+        ci: Vec::new(),
+        events: Vec::new(),
+        hook_deliveries: Vec::new(),
+        status,
+    })
 }
 
 fn sync_without_hooks(
@@ -1980,23 +2270,34 @@ fn sync_with_lock(
             }),
             false,
         )?;
-        let (prepared, progress) =
+        let (prepared, progress, admission) =
             prepare_physical_chains(context, &status, input.all, &provider, operation_deadline)?;
         let plans = prepared
             .iter()
             .flat_map(|chain| chain.members.iter().map(|item| item.plan.clone()))
             .collect::<Vec<_>>();
+        // Control mutations follow the admitted prefix exactly: a deferred
+        // member keeps its exact-generation force intent because nothing has
+        // rewritten the generation that intent is bound to.
+        let admitted_plans = prepared
+            .iter()
+            .flat_map(PreparedChain::admitted_plans)
+            .collect::<Vec<_>>();
         lock.checkpoint(
             "physical_rebase_global_preflight_complete",
             json!({
                 "rebase_plans": checkpoint_rebase_plans(&plans),
+                "admitted_prefix": admission.admitted_prs,
+                "deferred_members": admission.deferred,
+                "required_ms": duration_millis(admission.budget.required),
+                "complete_graph_required_ms": duration_millis(admission.complete_budget.required),
                 "provider_writes": 0,
                 "branch_writes": 0
             }),
             false,
         )?;
         let mut progress = progress;
-        invalidate_rewritten_force_intents(&status, &provider, &plans, &mut progress)?;
+        invalidate_rewritten_force_intents(&status, &provider, &admitted_plans, &mut progress)?;
         lock.checkpoint(
             "physical_rebase_force_intents_invalidated",
             json!({
@@ -2033,6 +2334,7 @@ fn sync_with_lock(
             json!({
                 "rebase_plans": checkpoint_rebase_plans(&physical_rebuild.plans),
                 "rebase_receipts": checkpoint_rebase_receipts(&physical_rebuild.receipts),
+                "deferred_members": physical_rebuild.deferred,
                 "provider_receipts": checkpoint_provider_receipts(&physical_rebuild.provider_receipts),
             }),
             false,
@@ -2096,6 +2398,26 @@ fn sync_with_lock(
             }
         }
         status = midpoint;
+        // A bounded prefix apply intentionally stops before ordinary
+        // convergence: the chain is mid-rebuild, so CI observation, auto-merge
+        // repair, root arming, and admission all wait for the resumed tick that
+        // finishes the graph. Completed receipts are already durable, so the
+        // resume never replays a provider mutation.
+        if admission.deferred_convergence {
+            return bounded_prefix_output(
+                context,
+                input,
+                started,
+                operation_deadline,
+                initial_status_elapsed,
+                convergence_started.elapsed(),
+                &admission,
+                physical_rebuild,
+                status,
+                lock_recovery,
+                &mut lock,
+            );
+        }
     }
     lock.checkpoint(
         "provider_convergence_in_flight",
@@ -2426,6 +2748,7 @@ fn run_auto_admission(
         joins: Vec::new(),
         skips: Vec::new(),
         remaining_candidates: Vec::new(),
+        capacity_refusal: None,
     };
     progress.current = status.analysis.pull_requests.clone();
     progress.merge_candidates = status
@@ -2628,6 +2951,17 @@ fn run_auto_admission(
                 AutoCandidateTarget::Join(tail) => Some(tail),
                 AutoCandidateTarget::Skip => unreachable!("checked above"),
             };
+            // A chain that already holds every member the configured deadline
+            // can guarantee to drain must stop growing. Refusing admission here
+            // is what keeps the existing processable prefix draining instead of
+            // raising the reserve again on every pass.
+            if let Some(refusal) =
+                caravan_capacity_refusal(context, &status, candidate.number, target_tail)
+            {
+                output.capacity_refusal = Some(refusal);
+                output.continuation = AutoAdmissionContinuation::CaravanBudgetCapacityExhausted;
+                break;
+            }
             let conservative_membership_bound =
                 u32::try_from(context.config.agent_priority_labels.len().saturating_mul(2) + 12)
                     .unwrap_or(u32::MAX);
@@ -2695,6 +3029,69 @@ fn run_auto_admission(
 fn has_mutation_capacity(context: &AppContext, progress: &SyncProgress, reserve: u32) -> bool {
     completed_mutation_count(progress).saturating_add(reserve)
         <= context.config.sync.max_mutations_per_tick
+}
+
+/// Deterministic pre-admission capacity gate for one candidate join.
+///
+/// Returns typed refusal evidence when accepting the candidate would push the
+/// exact target chain past the largest size the configured deadline can still
+/// guarantee to drain. Forming a brand-new caravan is never refused here: an
+/// independent chain has its own bounded prefix.
+pub(crate) fn caravan_capacity_refusal(
+    context: &AppContext,
+    status: &StatusOutput,
+    candidate_pr: PrNumber,
+    target_tail: Option<PrNumber>,
+) -> Option<CaravanCapacityRefusal> {
+    if !context.config.rebase_on_join {
+        return None;
+    }
+    let caravan = status.analysis.fleet.containing(target_tail?)?;
+    let deadline = sync_operation_budget(context);
+    let capacity = max_admissible_members(context, deadline);
+    let members = u64::try_from(caravan.members.len()).unwrap_or(u64::MAX);
+    if members < capacity {
+        return None;
+    }
+    Some(CaravanCapacityRefusal {
+        code: "caravan_budget_capacity_exhausted".to_owned(),
+        candidate_pr,
+        caravan_id: caravan.id,
+        caravan_members: members,
+        max_admissible_members: capacity,
+        configured_deadline_ms: duration_millis(deadline),
+        command_timeout_ms: context.config.command_timeout_secs.saturating_mul(1_000),
+        safe_next_action: format!(
+            "let caravan #{} drain below {capacity} members, or raise sync.max_duration_secs (currently {}s) before admitting #{candidate_pr}; no member is reordered, evicted, or split to make room",
+            caravan.id,
+            deadline.as_secs(),
+        ),
+    })
+}
+
+/// Typed zero-write refusal for an explicit join at chain capacity.
+pub(crate) fn caravan_capacity_error(refusal: &CaravanCapacityRefusal) -> AppError {
+    AppError::structured(
+        ErrorCategory::Validation,
+        "caravan_budget_capacity_exhausted",
+        "the target caravan already holds every member the configured sync deadline can guarantee to drain",
+        Some(json!({
+            "mutated": false,
+            "candidate_pr": refusal.candidate_pr,
+            "caravan_id": refusal.caravan_id,
+            "caravan_members": refusal.caravan_members,
+            "max_admissible_members": refusal.max_admissible_members,
+            "configured_deadline_ms": refusal.configured_deadline_ms,
+            "command_timeout_ms": refusal.command_timeout_ms,
+            "retryable": false,
+            "safe_next_action": refusal.safe_next_action,
+            "suggested_actions": [
+                "run `cara sync --all` until the existing bounded prefix drains members out of the caravan",
+                "raise sync.max_duration_secs, or lower a proven-safe command_timeout_secs, to raise max_admissible_members",
+                "start an independent caravan instead of extending one already at capacity"
+            ],
+        })),
+    )
 }
 
 fn append_membership_progress(

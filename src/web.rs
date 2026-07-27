@@ -2238,6 +2238,7 @@ mod tests {
             analysis,
             pauses: Vec::new(),
             admission,
+            sync_budget: crate::sync::SyncBudgetStatus::default(),
         }
     }
 

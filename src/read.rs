@@ -86,6 +86,11 @@ pub struct StatusOutput {
     /// Exact sync-owned automatic-admission policy and safety bounds.
     #[serde(default)]
     pub auto_admission: AutoAdmissionStatus,
+    /// Deterministic physical-apply reserve projection for the configured
+    /// deadline: required budget, processable prefix, blocked candidate, and
+    /// the safe next action, all visible before any sync refusal.
+    #[serde(default)]
+    pub sync_budget: crate::sync::SyncBudgetStatus,
     pub default_branch: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_branch: Option<String>,
@@ -633,8 +638,10 @@ fn status_with_discovery_options(
         analysis,
         pauses: Vec::new(),
         admission,
+        sync_budget: crate::sync::SyncBudgetStatus::default(),
     };
     crate::pause::apply_to_status(&context.repository_path, &mut output)?;
+    output.sync_budget = crate::sync::project_status(context, &output);
     output.healthy = output.analysis.healthy() && output.initialization.ready;
 
     let total = started.elapsed();
@@ -2039,6 +2046,7 @@ mod tests {
             ),
             analysis,
             pauses: Vec::new(),
+            sync_budget: crate::sync::SyncBudgetStatus::default(),
         }
     }
 

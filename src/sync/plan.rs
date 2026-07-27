@@ -4,11 +4,11 @@ use super::{
     AUTO_ADMISSION_HEURISTIC_VERSION, AppContext, AppError, AutoCandidateTarget, Caravan,
     CiDisposition, Duration, ErrorCategory, EventKind, GitHubMutationAdapter, Instant,
     OperationLock, PullRequestPrecondition, PullRequestSnapshot, PullRequestState, StatusOutput,
-    SyncAutoAdmissionPlan, SyncInput, SyncPlanAction, SyncPlanActionState, SyncPlanDecision,
-    SyncPlanOutput, SyncPlanPhase, SyncProgress, SyncProvider, evaluate_auto_candidate,
-    head_is_conflict_free_with_default, json, merged_predecessor, mutation_error,
-    preflight_repository, prepare_physical_chains, read, selected_unpaused_caravans,
-    sync_operation_budget, validate_graph,
+    SyncApplyAdmissionPlan, SyncAutoAdmissionPlan, SyncInput, SyncPlanAction, SyncPlanActionState,
+    SyncPlanDecision, SyncPlanOutput, SyncPlanPhase, SyncProgress, SyncProvider,
+    evaluate_auto_candidate, head_is_conflict_free_with_default, json, merged_predecessor,
+    mutation_error, preflight_repository, prepare_physical_chains, read,
+    selected_unpaused_caravans, sync_operation_budget, validate_graph,
 };
 
 const MAX_SYNC_PLAN_ACTIONS: usize = 512;
@@ -40,15 +40,30 @@ pub fn plan_sync(context: &AppContext, input: &SyncInput) -> Result<SyncPlanOutp
         .iter()
         .map(|caravan| caravan.id)
         .collect::<Vec<_>>();
-    let (physical_rebase_plans, mut progress) = if context.config.rebase_on_join {
-        let (prepared, progress) =
+    let (physical_rebase_plans, physical_apply_admission, mut progress) = if context
+        .config
+        .rebase_on_join
+    {
+        let (prepared, progress, admission) =
             prepare_physical_chains(context, &status, input.all, &provider, operation_deadline)?;
         let plans = prepared
             .iter()
             .flat_map(|chain| chain.members.iter().map(|item| item.plan.clone()))
             .collect::<Vec<_>>();
         drop(prepared);
-        (plans, progress)
+        let admission = SyncApplyAdmissionPlan {
+            admitted_prefix: admission.admitted_prs.clone(),
+            deferred_members: admission.deferred.clone(),
+            required_ms: super::duration_millis(admission.budget.required),
+            complete_graph_required_ms: super::duration_millis(admission.complete_budget.required),
+            configured_deadline_ms: super::duration_millis(sync_operation_budget(context)),
+            max_admissible_members: super::max_admissible_members(
+                context,
+                sync_operation_budget(context),
+            ),
+            deferred_convergence: admission.deferred_convergence,
+        };
+        (plans, admission, progress)
     } else {
         let mut progress = SyncProgress::new(
             &status,
@@ -73,13 +88,14 @@ pub fn plan_sync(context: &AppContext, input: &SyncInput) -> Result<SyncPlanOutp
             preflight_repository(&provider, &status, &progress)?;
             validate_graph(&status, &selected, &progress, context.config.force_merge)?;
         }
-        (Vec::new(), progress)
+        (Vec::new(), SyncApplyAdmissionPlan::default(), progress)
     };
 
     let mut actions = Vec::new();
     let mut decisions = Vec::new();
     let mut would_emit_events = Vec::new();
     for plan in &physical_rebase_plans {
+        let deferred_member = physical_apply_admission.deferred_members.contains(&plan.pr);
         push_plan_action(
             &mut actions,
             SyncPlanAction {
@@ -87,6 +103,8 @@ pub fn plan_sync(context: &AppContext, input: &SyncInput) -> Result<SyncPlanOutp
                 phase: SyncPlanPhase::PhysicalPreflight,
                 state: if plan.already_satisfied {
                     SyncPlanActionState::AlreadySatisfied
+                } else if deferred_member {
+                    SyncPlanActionState::DeferredUntilRediscovery
                 } else {
                     SyncPlanActionState::WouldMutate
                 },
@@ -109,6 +127,9 @@ pub fn plan_sync(context: &AppContext, input: &SyncInput) -> Result<SyncPlanOutp
                 })),
                 reason: if plan.already_satisfied {
                     "exact cumulative ancestry is already satisfied".to_owned()
+                } else if deferred_member {
+                    "verified plan intentionally deferred: the configured deadline reserves only a bounded prefix this tick"
+                        .to_owned()
                 } else {
                     "exact retained generation passed conflict and dry-run lease preflight"
                         .to_owned()
@@ -175,6 +196,7 @@ pub fn plan_sync(context: &AppContext, input: &SyncInput) -> Result<SyncPlanOutp
         plan_hash: String::new(),
         selected_caravans: selected_ids,
         physical_rebase_plans,
+        physical_apply_admission,
         ci: progress.ci,
         actions,
         auto_admission,

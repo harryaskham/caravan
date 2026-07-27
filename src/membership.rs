@@ -1169,6 +1169,25 @@ fn execute_locked(
                 dispatch_hooks,
             ));
         }
+        // Growing a chain past the size the configured deadline can guarantee
+        // to drain converts a bounded prefix apply into a permanent refusal.
+        // Refuse the join instead, and let the existing prefix keep draining.
+        if let Some(target) = target
+            && let Some(refusal) = crate::sync::caravan_capacity_refusal(
+                context,
+                &status,
+                candidate_pr.map_or(PrNumber(0), PrNumber),
+                Some(target.tail.number),
+            )
+        {
+            return Err(record_join_preflight_failure(
+                context,
+                &status,
+                request,
+                crate::sync::caravan_capacity_error(&refusal),
+                dispatch_hooks,
+            ));
+        }
         let predecessor = selected_predecessor
             .as_ref()
             .expect("join predecessor retained");

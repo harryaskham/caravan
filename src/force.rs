@@ -840,6 +840,7 @@ mod tests {
             admission: crate::read::resolve_admission(&analysis, &[]),
             analysis,
             pauses: Vec::new(),
+            sync_budget: crate::sync::SyncBudgetStatus::default(),
         }
     }
 

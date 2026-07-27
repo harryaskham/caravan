@@ -636,6 +636,7 @@ fn status(
         ),
         analysis,
         pauses: Vec::new(),
+        sync_budget: crate::sync::SyncBudgetStatus::default(),
     }
 }
 
@@ -792,6 +793,7 @@ fn no_write_auto_admission_never_leapfrogs_rejected_canonical_candidate() {
 fn plan_hash_binds_exact_actions_not_telemetry() {
     let status = status(healthy_chain(), Some(PrNumber(1)), &clean);
     let base = SyncPlanOutput {
+        physical_apply_admission: crate::sync::SyncApplyAdmissionPlan::default(),
         schema_version: 1,
         mutated: false,
         provider_writes: 0,
@@ -3605,4 +3607,587 @@ fn live_caravan2208_replay_is_a_proven_no_op() {
         receipt.provenance.trigger,
         crate::root_auto_merge::RootAutoMergeTrigger::IdempotentReplay
     );
+}
+
+// ---------------------------------------------------------------------------
+// bd-e99fe6: bounded forward progress when the apply reserve exceeds one tick.
+// ---------------------------------------------------------------------------
+
+/// Exact live Cacophony configuration that produced the monotonic deadlock:
+/// `sync.max_duration_secs: 3600`, `command_timeout_secs: 120`.
+fn cacophony_context() -> AppContext {
+    let mut context = AppContext::default();
+    context.config.rebase_on_join = true;
+    context.config.command_timeout_secs = 120;
+    context.config.sync.max_duration_secs = 3_600;
+    context
+}
+
+/// A linear caravan of `members` open PRs with only the root armed.
+fn linear_chain(members: u64) -> Vec<PullRequestSnapshot> {
+    (1..=members)
+        .map(|number| {
+            let base = if number == 1 {
+                "main".to_owned()
+            } else {
+                format!("branch-{}", number - 1)
+            };
+            let head = format!("branch-{number}");
+            pull_request(
+                number,
+                &head,
+                &base,
+                PullRequestState::Open,
+                if number == 1 {
+                    AutoMergeState::squash()
+                } else {
+                    AutoMergeState::disabled()
+                },
+            )
+        })
+        .collect()
+}
+
+fn chain_costs(status: &StatusOutput) -> Vec<ChainCost> {
+    chain_costs_from_status(status, &status.analysis.fleet.caravans)
+}
+
+/// Mark a leading prefix as already applied by a previous tick.
+fn with_retained_prefix(mut chains: Vec<ChainCost>, retained: usize) -> Vec<ChainCost> {
+    for chain in &mut chains {
+        for member in chain.members.iter_mut().take(retained) {
+            member.pending = false;
+        }
+    }
+    chains
+}
+
+#[test]
+fn apply_reserve_models_actual_operations_instead_of_a_whole_chain_worst_case() {
+    let mut context = AppContext::default();
+    context.config.command_timeout_secs = 10;
+    let pulls = linear_chain(7);
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+    let chains = chain_costs(&status);
+
+    // One armed root, seven pending rewrites, seven CI observations, one root
+    // base retarget plus arming, and the two mandatory rediscoveries.
+    let pending = complete_budget(&context, &chains);
+    assert_eq!(pending.command_slots, 1 + 7 * 3 + 7 + 2 + 2);
+
+    // The identical graph after a completed prefix is strictly cheaper: no
+    // push, no auto-merge drop, no force invalidation for retained members.
+    let retained = complete_budget(&context, &with_retained_prefix(chains.clone(), 7));
+    assert_eq!(retained.command_slots, 7 * 2 + 7 + 2 + 2);
+    assert!(retained.required < pending.required);
+    assert!(retained.mutation_reserve < pending.mutation_reserve);
+
+    // The bounded-prefix scope drops only the deferrable reconciliation.
+    let prefix = budget_for(
+        &context,
+        &chains,
+        &[chains[0].members.len()],
+        ReserveScope::BoundedPrefix,
+    );
+    assert_eq!(prefix.command_slots, 1 + 7 * 3 + 2);
+}
+
+#[test]
+fn every_chain_size_around_the_threshold_still_drains_at_least_one_member() {
+    let context = cacophony_context();
+    let deadline = sync_operation_budget(&context);
+    let capacity = max_admissible_members(&context, deadline);
+    assert!(capacity >= 7, "live caravan2208 size must stay admissible");
+
+    for members in 1..=capacity {
+        let pulls = linear_chain(members);
+        let status = status(pulls, Some(PrNumber(1)), &clean);
+        let chains = chain_costs(&status);
+        let admission = admit_physical_prefix(&context, &chains, deadline);
+        assert!(
+            admission.makes_progress(),
+            "a {members}-member chain must apply at least one pending member per tick"
+        );
+        assert!(admission.pending_admitted >= 1);
+        assert!(admission.budget.required < deadline);
+
+        // Whatever is admitted is an exact root-to-descendant prefix.
+        let expected = (1..=u64::try_from(admission.admitted_prs.len()).unwrap())
+            .map(PrNumber)
+            .collect::<Vec<_>>();
+        assert_eq!(admission.admitted_prs, expected);
+
+        // The hardest resumable shape: only the last member still pending.
+        let resumed = with_retained_prefix(chains, usize::try_from(members - 1).unwrap());
+        let resumed_admission = admit_physical_prefix(&context, &resumed, deadline);
+        assert!(
+            resumed_admission.makes_progress(),
+            "a resumed {members}-member chain must still drain its trailing member"
+        );
+        assert_eq!(resumed_admission.pending_admitted, 1);
+    }
+}
+
+#[test]
+fn seven_member_caravan2208_drains_in_bounded_ticks_without_reordering() {
+    let context = cacophony_context();
+    let deadline = sync_operation_budget(&context);
+    let pulls = linear_chain(7);
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+    let members = status.analysis.fleet.caravans[0].members.clone();
+    let chains = chain_costs(&status);
+
+    // The whole-graph reserve still does not fit: that refusal was correct.
+    let complete = complete_budget(&context, &chains);
+    assert!(complete.required > deadline);
+
+    // The first tick applies an exact verified prefix and defers convergence.
+    let first = admit_physical_prefix(&context, &chains, deadline);
+    assert!(first.makes_progress());
+    assert!(first.deferred_convergence);
+    assert!(first.pending_admitted >= 1);
+
+    // Ticks are replayed until nothing pending remains. Every tick keeps the
+    // caravan's exact member order; nothing is reordered, evicted, or split.
+    let mut costs = chains;
+    let mut ticks = 0;
+    while costs
+        .iter()
+        .any(|chain| chain.members.iter().any(|member| member.pending))
+    {
+        ticks += 1;
+        assert!(ticks <= 7, "bounded prefixes must converge, not livelock");
+        let admission = admit_physical_prefix(&context, &costs, deadline);
+        assert!(admission.makes_progress());
+        for (chain, admitted) in costs.iter_mut().zip(admission.admitted.iter().copied()) {
+            for member in chain.members.iter_mut().take(admitted) {
+                member.pending = false;
+            }
+        }
+        assert_eq!(
+            costs[0]
+                .members
+                .iter()
+                .map(|member| member.pr)
+                .collect::<Vec<_>>(),
+            members,
+        );
+    }
+
+    // The converged graph now fits one complete tick, so ordinary convergence
+    // runs instead of deferring forever.
+    let final_admission = admit_physical_prefix(&context, &costs, deadline);
+    assert!(final_admission.deferred.is_empty());
+    assert!(!final_admission.deferred_convergence);
+    assert_eq!(final_admission.pending_admitted, 0);
+}
+
+#[test]
+fn an_interrupted_prefix_resumes_without_replaying_completed_mutations() {
+    let context = cacophony_context();
+    let deadline = sync_operation_budget(&context);
+    let status = status(linear_chain(7), Some(PrNumber(1)), &clean);
+    let resumed = with_retained_prefix(chain_costs(&status), 4);
+
+    let admission = admit_physical_prefix(&context, &resumed, deadline);
+
+    // The completed prefix is admitted again (its exact ancestry is revalidated)
+    // but contributes no pending write and no control mutation, so no provider
+    // mutation is ever replayed.
+    assert!(admission.admitted_prs.starts_with(&[
+        PrNumber(1),
+        PrNumber(2),
+        PrNumber(3),
+        PrNumber(4)
+    ]));
+    assert_eq!(admission.pending_admitted, 3);
+    // Resuming after a completed prefix is strictly cheaper, so the graph that
+    // could not fit one tick now finishes inside one.
+    let pending_prefix = budget_for(
+        &context,
+        &chain_costs(&status),
+        &[7],
+        ReserveScope::BoundedPrefix,
+    );
+    let resumed_prefix = budget_for(&context, &resumed, &[7], ReserveScope::BoundedPrefix);
+    assert!(resumed_prefix.required < pending_prefix.required);
+    assert!(resumed_prefix.mutation_reserve < pending_prefix.mutation_reserve);
+    assert!(admission.deferred.is_empty());
+    assert!(!admission.deferred_convergence);
+    assert!(complete_budget(&context, &chain_costs(&status)).required > deadline);
+    assert!(complete_budget(&context, &resumed).required < deadline);
+}
+
+#[test]
+fn independent_caravans_grow_round_robin_under_bounded_parallelism() {
+    let mut context = cacophony_context();
+    // A deadline that cannot hold both complete chains forces a bounded prefix.
+    context.config.sync.max_duration_secs = 1_200;
+    let deadline = sync_operation_budget(&context);
+    let mut pulls = linear_chain(4);
+    pulls.extend([
+        pull_request(
+            11,
+            "other-1",
+            "main",
+            PullRequestState::Open,
+            AutoMergeState::squash(),
+        ),
+        pull_request(
+            12,
+            "other-2",
+            "other-1",
+            PullRequestState::Open,
+            AutoMergeState::disabled(),
+        ),
+    ]);
+    let status = status(pulls, None, &clean);
+    let chains = chain_costs(&status);
+    assert_eq!(chains.len(), 2);
+
+    let admission = admit_physical_prefix(&context, &chains, deadline);
+
+    assert!(admission.makes_progress());
+    // Both independent chains advance in the same bounded parallel round.
+    assert!(admission.admitted[0] >= 1);
+    assert!(admission.admitted[1] >= 1);
+    assert!(admission.admitted[0].abs_diff(admission.admitted[1]) <= 1);
+    // Bounded parallelism means two independent chains cost one shared round,
+    // not the sum of both chains.
+    let serial = u64::try_from(admission.admitted[0] + admission.admitted[1]).unwrap() * 3;
+    assert!(admission.budget.command_slots < serial + 2);
+}
+
+#[test]
+fn a_chain_larger_than_any_deadline_fails_closed_with_capacity_evidence() {
+    let mut context = cacophony_context();
+    // One command slot for the whole tick cannot cover any apply round.
+    context.config.sync.max_duration_secs = 120;
+    let deadline = sync_operation_budget(&context);
+    let status = status(linear_chain(3), Some(PrNumber(1)), &clean);
+    let chains = chain_costs(&status);
+
+    let admission = admit_physical_prefix(&context, &chains, deadline);
+    assert!(!admission.makes_progress());
+    assert_eq!(admission.pending_admitted, 0);
+    assert_eq!(max_admissible_members(&context, deadline), 0);
+
+    let error = physical_capacity_failure(
+        &context,
+        &status,
+        Instant::now() + deadline,
+        &admission,
+        Vec::new(),
+        "physical_rebase_commit_admission",
+    );
+    assert_eq!(error.code(), "physical_sync_budget_insufficient");
+    let details = error.details().expect("capacity evidence");
+    assert_eq!(details["max_admissible_members"], 0);
+    assert_eq!(details["configured_deadline_ms"], 120_000);
+    assert_eq!(details["provider_mutations"], 0);
+    assert_eq!(details["branch_mutations"], 0);
+    assert_eq!(details["processable_prefix"].as_array().unwrap().len(), 0);
+    assert_eq!(details["deferred_members"].as_array().unwrap().len(), 3);
+}
+
+#[test]
+fn admission_at_capacity_is_refused_with_typed_capacity_evidence() {
+    let context = cacophony_context();
+    let deadline = sync_operation_budget(&context);
+    let capacity = max_admissible_members(&context, deadline);
+    let below = status(linear_chain(capacity - 1), None, &clean);
+    let at = status(linear_chain(capacity), None, &clean);
+    let tail = PrNumber(capacity);
+
+    assert!(
+        caravan_capacity_refusal(
+            &context,
+            &below,
+            PrNumber(999),
+            Some(PrNumber(capacity - 1))
+        )
+        .is_none(),
+        "a chain below capacity keeps accepting members"
+    );
+    // A brand-new independent caravan is never refused by chain capacity.
+    assert!(caravan_capacity_refusal(&context, &at, PrNumber(999), None).is_none());
+
+    let refusal = caravan_capacity_refusal(&context, &at, PrNumber(999), Some(tail))
+        .expect("a chain at capacity must refuse further joins");
+    assert_eq!(refusal.code, "caravan_budget_capacity_exhausted");
+    assert_eq!(refusal.caravan_members, capacity);
+    assert_eq!(refusal.max_admissible_members, capacity);
+    assert_eq!(refusal.configured_deadline_ms, 3_600_000);
+    assert!(refusal.safe_next_action.contains("drain"));
+
+    let error = caravan_capacity_error(&refusal);
+    assert_eq!(error.code(), "caravan_budget_capacity_exhausted");
+    let details = error.details().expect("typed refusal evidence");
+    assert_eq!(details["mutated"], false);
+    assert_eq!(details["retryable"], false);
+    assert_eq!(details["max_admissible_members"], capacity);
+
+    // The already-admitted chain still drains while admission stays closed.
+    let admission = admit_physical_prefix(&context, &chain_costs(&at), deadline);
+    assert!(admission.makes_progress());
+}
+
+#[test]
+fn capacity_is_disabled_without_physical_chain_rebuilding() {
+    let mut context = cacophony_context();
+    context.config.rebase_on_join = false;
+    let at = status(linear_chain(64), None, &clean);
+    assert!(caravan_capacity_refusal(&context, &at, PrNumber(999), Some(PrNumber(64))).is_none());
+}
+
+#[test]
+fn capacity_scales_with_the_configured_deadline_and_child_timeout() {
+    let mut context = cacophony_context();
+    let small = max_admissible_members(&context, sync_operation_budget(&context));
+    context.config.command_timeout_secs = 60;
+    let cheaper_children = max_admissible_members(&context, sync_operation_budget(&context));
+    assert!(cheaper_children > small);
+
+    context.config.command_timeout_secs = 120;
+    context.config.sync.max_duration_secs = 1_800;
+    let shorter_deadline = max_admissible_members(&context, sync_operation_budget(&context));
+    assert!(shorter_deadline < small);
+}
+
+#[test]
+fn status_exposes_the_reserve_prefix_and_next_action_before_the_cliff() {
+    let context = cacophony_context();
+    let status = status(linear_chain(7), Some(PrNumber(1)), &clean);
+
+    let projection = crate::sync::project_status(&context, &status);
+
+    assert_eq!(projection.schema_version, 1);
+    assert!(projection.rebase_on_join);
+    assert_eq!(projection.deadline_ms, 3_600_000);
+    assert_eq!(projection.command_timeout_ms, 120_000);
+    assert_eq!(projection.deadline_command_slots, 30);
+    assert!(projection.max_admissible_members >= 7);
+    let caravan = &projection.caravans[0];
+    assert_eq!(caravan.caravan_id, PrNumber(1));
+    assert_eq!(caravan.members.len(), 7);
+    assert!(caravan.required_ms > 0);
+    assert!(caravan.retained_ms < caravan.required_ms);
+    assert!(!caravan.processable_prefix.is_empty());
+    assert_eq!(caravan.processable_prefix[0], PrNumber(1));
+    assert!(!caravan.at_capacity);
+    assert!(caravan.deferred_convergence);
+    assert!(caravan.safe_next_action.contains("cara sync --all"));
+    assert!(
+        projection
+            .safe_next_action
+            .contains("resume on the next tick")
+    );
+    assert!(projection.blocked_candidate.is_none());
+}
+
+#[test]
+fn status_names_the_blocked_candidate_once_every_caravan_is_at_capacity() {
+    let context = cacophony_context();
+    let capacity = max_admissible_members(&context, sync_operation_budget(&context));
+    let mut pulls = linear_chain(capacity);
+    let mut candidate = pull_request(
+        900,
+        "candidate",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    candidate.labels.clear();
+    pulls.push(candidate);
+    let status = status(pulls, None, &clean);
+
+    let projection = crate::sync::project_status(&context, &status);
+
+    assert!(
+        projection
+            .caravans
+            .iter()
+            .all(|caravan| caravan.at_capacity)
+    );
+    assert_eq!(projection.blocked_candidate, Some(PrNumber(900)));
+    assert!(
+        projection
+            .safe_next_action
+            .contains("caravan_budget_capacity_exhausted")
+    );
+    assert!(projection.caravans[0].safe_next_action.contains("drain"));
+}
+
+#[test]
+fn deferred_members_keep_their_exact_generation_force_intent() {
+    // Force invalidation is a control mutation bound to a rewrite. A member
+    // deferred by the bounded prefix is not rewritten, so its exact-generation
+    // intent must not be invalidated and must not be charged to the reserve.
+    let mut context = cacophony_context();
+    context.config.command_timeout_secs = 10;
+    let mut pulls = linear_chain(3);
+    pulls[2].labels.insert("caravan-force".to_owned());
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+    let chains = chain_costs(&status);
+
+    let prefix_without_forced_member =
+        budget_for(&context, &chains, &[2], ReserveScope::BoundedPrefix);
+    let prefix_with_forced_member =
+        budget_for(&context, &chains, &[3], ReserveScope::BoundedPrefix);
+
+    assert_eq!(
+        prefix_with_forced_member.command_slots - prefix_without_forced_member.command_slots,
+        3 + 6,
+        "only an admitted forced member charges its invalidation and compensation"
+    );
+}
+
+#[test]
+fn provider_drift_in_control_state_changes_the_modelled_reserve() {
+    let mut context = cacophony_context();
+    context.config.command_timeout_secs = 10;
+    let quiet = status(linear_chain(3), Some(PrNumber(1)), &clean);
+    let mut drifted_pulls = linear_chain(3);
+    // An external actor armed a non-root member between ticks.
+    drifted_pulls[1].auto_merge = AutoMergeState::squash();
+    let drifted = status(drifted_pulls, Some(PrNumber(1)), &clean);
+
+    let quiet_budget = complete_budget(&context, &chain_costs(&quiet));
+    let drifted_budget = complete_budget(&context, &chain_costs(&drifted));
+
+    // One extra pre-rewrite auto-merge drop plus one reconciliation repair.
+    assert_eq!(
+        drifted_budget.command_slots - quiet_budget.command_slots,
+        2,
+        "exact observed provider state, not a fixed worst case, drives the reserve"
+    );
+    assert!(drifted_budget.mutation_reserve > quiet_budget.mutation_reserve);
+}
+
+#[test]
+fn a_deferred_prefix_tick_succeeds_as_a_retryable_bounded_progress_receipt() {
+    let mut context = cacophony_context();
+    context.config.sync.actions.join_unlabelled_prs = true;
+    let pulls = linear_chain(7);
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+    let chains = chain_costs(&status);
+    let deadline = sync_operation_budget(&context);
+    let admission = admit_physical_prefix(&context, &chains, deadline);
+    assert!(admission.deferred_convergence);
+
+    let receipt = crate::physical_rebase::RebaseReceipt {
+        pr: PrNumber(1),
+        branch: "branch-1".to_owned(),
+        old_head_oid: branch("branch-1").oid,
+        new_head_oid: CommitOid("rewritten0000000000000000000000000000000".to_owned()),
+        old_base_oid: branch("main").oid.clone(),
+        new_base_branch: "main".to_owned(),
+        new_base_oid: branch("main").oid,
+        new_tree_oid: CommitOid("tree000000000000000000000000000000000000".to_owned()),
+        commit_count: 1,
+        merge_topology: None,
+        ci_trigger_workflows: vec!["CI".to_owned()],
+        lease: "--force-with-lease=refs/heads/branch-1:branch-1".to_owned(),
+        already_satisfied: false,
+    };
+    let physical_rebuild = PhysicalRebuildOutcome {
+        repository: Some(repository()),
+        caravan_id: Some(PrNumber(1)),
+        affected_prs: vec![PrNumber(1)],
+        deferred: admission.deferred.clone(),
+        receipts: vec![receipt.clone()],
+        steps: vec![MutationStep {
+            kind: MutationKind::RebaseBranch,
+            state: MutationStepState::Completed,
+            pr: Some(PrNumber(1)),
+            summary: "rebased under exact lease".to_owned(),
+        }],
+        ..PhysicalRebuildOutcome::default()
+    };
+
+    let temporary = tempfile::tempdir().unwrap();
+    assert!(
+        Command::new("git")
+            .current_dir(temporary.path())
+            .args(["init", "--quiet"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut lock = OperationLock::acquire(temporary.path(), "bounded_prefix").unwrap();
+    let started = Instant::now();
+
+    let output = bounded_prefix_output(
+        &context,
+        &SyncInput {
+            all: true,
+            rerun_failed: false,
+        },
+        started,
+        started + deadline,
+        Duration::from_millis(5),
+        Duration::from_millis(7),
+        &admission,
+        physical_rebuild,
+        status,
+        None,
+        &mut lock,
+    )
+    .expect("a bounded prefix tick is forward progress, not a failure");
+
+    // Bounded progress is a success with an explicit retry classification.
+    assert_eq!(
+        output.scheduler_status.disposition,
+        SchedulerDisposition::RetryTick
+    );
+    assert_eq!(
+        output.scheduler_status.wake_class,
+        SchedulerWakeClass::RetryTick
+    );
+    assert!(output.scheduler_status.reason.contains("never replayed"));
+    // Completed branch receipts are durable and reported exactly once.
+    assert_eq!(output.rebase_receipts, vec![receipt]);
+    assert!(output.receipt.changed);
+    assert_eq!(output.receipt.completed_steps.len(), 1);
+    // Ordinary convergence is intentionally skipped, so nothing is armed or
+    // observed against a chain that is still mid-rebuild.
+    assert!(output.ci.is_empty());
+    assert!(output.root_auto_merge.is_empty());
+    assert!(output.head_advancements.is_empty());
+    assert!(output.events.is_empty());
+    // No admission runs while a caravan is draining, and the receipt says why.
+    assert!(output.auto_admission.joins.is_empty());
+    assert_eq!(
+        output.auto_admission.continuation,
+        AutoAdmissionContinuation::RequiresConvergedFleet,
+    );
+    lock.release().unwrap();
+}
+
+#[test]
+fn a_fully_retained_chain_still_converges_when_reconciliation_alone_overruns() {
+    // The livelock the bounded prefix must not create: every member already
+    // rebased, but the deferrable reconciliation reserve no longer fits. The
+    // tick has nothing irreversible left to protect, so convergence must run
+    // instead of deferring forever behind a reserve it can never satisfy.
+    let mut context = cacophony_context();
+    context.config.sync.max_duration_secs = 2_400;
+    let deadline = sync_operation_budget(&context);
+    let status = status(linear_chain(7), Some(PrNumber(1)), &clean);
+    let retained = with_retained_prefix(chain_costs(&status), 7);
+
+    assert!(
+        complete_budget(&context, &retained).required > deadline,
+        "this fixture must exercise the reconciliation overrun"
+    );
+
+    let admission = admit_physical_prefix(&context, &retained, deadline);
+
+    assert!(admission.makes_progress());
+    assert!(admission.deferred.is_empty());
+    assert_eq!(admission.pending_admitted, 0);
+    assert!(!admission.deferred_convergence);
+    // Only the hard reserve is held, so the precommit barrier admits the tick.
+    assert!(admission.budget.required < deadline);
+    assert!(admission.budget.required < admission.complete_budget.required);
 }

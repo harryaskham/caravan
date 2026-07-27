@@ -479,9 +479,12 @@ hooks:
 ```
 
 When enabling cumulative mode, set `sync.max_duration_secs` high enough for
-physical planning plus the typed N-member apply reserve; this repository uses
-900 seconds. `cara plan sync --all` reports the exact required/remaining budget
-without mutation when the configured bound is too small.
+physical planning plus the typed apply reserve; this repository uses
+900 seconds. `cara status` reports the required and retained reserve, the
+processable prefix, the deferred members, the maximum admissible chain size,
+and a safe next action for every caravan before any refusal, and
+`cara plan sync --all` reports the exact prefix a tick would admit without
+mutation.
 
 Cumulative mode rejects fork heads, stale leases, and ambiguous ranges. Before
 `join` creates/updates a PR, rewrites a branch, or changes membership, the
@@ -514,8 +517,20 @@ head into its child. It materializes each generation exactly once in a retained
 detached worktree, then verifies every conflict, PR precondition, remote head,
 dry-run permission, and exact lease across the complete plan before the first
 write. Planning and final no-write verification stop at a precommit deadline
-which preserves an N-member apply reserve inside the one configured operation
-deadline. `physical_sync_budget_insufficient` reports required/remaining time,
+which preserves the apply reserve inside the one configured operation deadline.
+That reserve is derived from the operations the tick actually runs: a member
+whose exact ancestry already holds costs no push, no auto-merge drop, and no
+force invalidation, so a completed prefix makes every later tick cheaper. When
+the complete reserve cannot remain but the irreversible part can, the tick still
+plans and verifies the complete graph and applies the largest exact
+root-to-descendant prefix that fits, checkpoints its receipts, and succeeds with
+a `retry_tick` disposition plus the admitted/deferred member lists; the resumed
+tick never replays a completed provider mutation. Growing a caravan past the
+size the configured deadline can guarantee to drain is refused up front with
+`caravan_budget_capacity_exhausted` while the admitted prefix keeps draining.
+`physical_sync_budget_insufficient` remains for the case where not even one
+pending member fits, and reports required/remaining time, configured deadline,
+maximum admissible chain size, processable prefix,
 partial-or-complete plan count/hash, zero writes, and configuration guidance.
 Only independent, disjoint caravans apply concurrently (at most two); each
 caravan remains strictly parent-to-descendant. Confirmed control mutations are

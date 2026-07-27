@@ -471,6 +471,7 @@ fn virtual_status(
         analysis,
         pauses: status.pauses.clone(),
         admission,
+        sync_budget: status.sync_budget.clone(),
     }
 }
 
@@ -1006,6 +1007,7 @@ mod tests {
             ),
             analysis,
             pauses: Vec::new(),
+            sync_budget: crate::sync::SyncBudgetStatus::default(),
         }
     }
 

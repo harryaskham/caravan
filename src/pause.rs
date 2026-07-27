@@ -826,6 +826,7 @@ mod tests {
                 rejected: Vec::new(),
                 next_candidate: None,
             },
+            sync_budget: crate::sync::SyncBudgetStatus::default(),
         }
     }
     fn record(pr: &PullRequestSnapshot) -> PauseRecord {

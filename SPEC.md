@@ -629,11 +629,39 @@ workflow trigger, PR precondition, remote old head, branch-set disjointness,
 dry-run permission, and exact lease is verified globally before provider or
 branch writes. Planning and this no-write barrier share a precommit deadline
 which is the one operation deadline minus a conservative apply reserve. The
-reserve scales with selected members, serial control mutations, bounded
-parallel branch-write rounds, midpoint/final discovery, and base/CI
-reconciliation at `command_timeout_secs`. If that reserve cannot remain, both
+reserve is derived from the operations the tick will actually run, not from a
+whole-chain worst case: a member whose exact cumulative ancestry already holds
+costs no push, no auto-merge drop, and no force invalidation, so a completed
+prefix makes every later tick strictly cheaper. It splits into a hard part
+(control mutations, bounded parallel branch-apply rounds, mandatory midpoint
+verification) and a deferrable part (base/CI reconciliation and final
+discovery), all at `command_timeout_secs`.
+
+When the complete reserve cannot remain but the hard reserve can, the tick
+applies an exact bounded prefix instead of refusing forever. The complete graph
+is still planned and globally verified; only the largest root-to-descendant
+prefix that provably fits is applied, strictly parent-to-descendant, with
+control mutations and force invalidation restricted to admitted members.
+Completed receipts are checkpointed before return and the tick succeeds with a
+`retry_tick` scheduler disposition, deferred member list, admitted prefix,
+required/complete reserve, and configured deadline. Ordinary convergence,
+root arming, and automatic admission wait for the resumed tick; the resume is
+idempotent and never replays a completed provider mutation. Independent
+caravans grow their prefixes round-robin under the same bounded parallelism and
+no caravan is reordered, evicted, or split to make a reserve fit.
+
+The configured deadline and child timeout imply a maximum admissible chain
+size: the largest chain whose trailing member is still guaranteed to drain in
+one tick. `status` exposes that bound, the required and retained reserves, the
+processable prefix, the deferred members, the blocked candidate, the configured
+deadline and a safe next action before any sync refusal, and `plan sync`
+reports the same prefix/deferral it would admit. Admission fails closed at that
+bound: an explicit `join` returns `caravan_budget_capacity_exhausted` and
+automatic admission stops with the same typed evidence, while the already
+admitted prefix keeps draining. If not even one pending member fits, both
 `sync` and `plan sync` return `physical_sync_budget_insufficient` with
-required/remaining milliseconds, complete-or-partial plan count/hash, zero
+required/remaining milliseconds, configured deadline, maximum admissible chain
+size, processable prefix, complete-or-partial plan count/hash, zero
 provider/branch mutations, and configuration guidance; the absolute deadline
 is never extended and unchanged exhaustion is not a retry tick. Auto-merge is
 disabled only after that barrier, and a durable lock checkpoint records the

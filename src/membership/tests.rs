@@ -330,6 +330,7 @@ fn status(current: PullRequestSnapshot, others: Vec<PullRequestSnapshot>) -> Sta
         ),
         analysis,
         pauses: Vec::new(),
+        sync_budget: crate::sync::SyncBudgetStatus::default(),
     }
 }
 

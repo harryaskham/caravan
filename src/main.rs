@@ -2110,6 +2110,38 @@ fn render_status(output: &caravan::read::StatusOutput) -> String {
             "  {}  {chain}",
             styled("1;35", format!("van #{}", caravan.id))
         );
+        if let Some(projection) = output
+            .sync_budget
+            .caravans
+            .iter()
+            .find(|projection| projection.caravan_id == caravan.id)
+            && output.sync_budget.rebase_on_join
+            && (projection.deferred_convergence || projection.at_capacity)
+        {
+            let _ = writeln!(
+                text,
+                "    {} apply reserve {}ms vs {}ms deadline; prefix {}/{} member(s), {} deferred, capacity {} — {}",
+                if projection.at_capacity {
+                    failure("at capacity")
+                } else {
+                    dim("bounded prefix")
+                },
+                projection.required_ms,
+                output.sync_budget.deadline_ms,
+                projection.processable_prefix.len(),
+                projection.members.len(),
+                projection.deferred.len(),
+                output.sync_budget.max_admissible_members,
+                projection.safe_next_action,
+            );
+        }
+    }
+    if let Some(blocked) = output.sync_budget.blocked_candidate {
+        let _ = writeln!(
+            text,
+            "! caravan_budget_capacity_exhausted: #{blocked} cannot join — {}",
+            output.sync_budget.safe_next_action
+        );
     }
     if output.merge_candidates_truncated > 0 {
         let _ = writeln!(
@@ -3171,6 +3203,7 @@ mod tests {
                 compatibility: Vec::new(),
             },
             pauses: Vec::new(),
+            sync_budget: caravan::sync::SyncBudgetStatus::default(),
         };
         let rendered = render_status(&output);
         assert!(rendered.contains("CARAVAN  harryaskham/caravan @ main  healthy"));
