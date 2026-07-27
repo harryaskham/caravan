@@ -750,6 +750,36 @@ mod tests {
     }
 
     #[test]
+    fn the_merge_actor_key_must_be_nested_under_sync_and_fails_closed_otherwise() {
+        // The migration record depends on this: a misplaced top-level key must
+        // never be silently ignored, because "ignored" reads exactly like
+        // "applied" to an operator and would leave a fleet believing it had
+        // opted in. Strict parsing rejects it at every level, so the whole
+        // policy fails closed and the mistake is visible before any mutation.
+        let error = CaravanConfig::parse("version: 1\nhead_merge_actor: caravan\n")
+            .expect_err("a top-level key is not a merge-actor opt-in");
+        assert_eq!(
+            mcp_cli::StructuredError::code(&error),
+            "config_parse_failed",
+            "a misplaced key fails closed rather than resolving to a default"
+        );
+        let error = CaravanConfig::parse("version: 1\nauto_merge_head: true\n")
+            .expect_err("the historical spelling is also sync-scoped");
+        assert_eq!(
+            mcp_cli::StructuredError::code(&error),
+            "config_parse_failed"
+        );
+
+        // Correctly nested is the only form that opts in.
+        let nested = CaravanConfig::parse("version: 1\nsync:\n  head_merge_actor: caravan\n")
+            .expect("the nested key parses");
+        assert_eq!(
+            nested.sync.resolved_head_merge_actor(),
+            HeadMergeActor::Caravan
+        );
+    }
+
+    #[test]
     fn empty_document_uses_safe_defaults() {
         let config = CaravanConfig::parse("{}\n").expect("defaults parse");
         assert_eq!(config.version, 1);
