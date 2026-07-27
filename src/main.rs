@@ -610,6 +610,12 @@ fn run_next_candidate(cli: &Cli) -> Result<(), i32> {
             for rejected in output.admission.rejected {
                 println!("! #{}: {}", rejected.pr, rejected.reason);
             }
+            // bd-d7aae7: name one exact command so a correct FIFO rejection of
+            // a later PR is not mistaken for a queue fault.
+            if let Some(next) = &output.next_admission_command {
+                println!("next: {}", next.command);
+                println!("  {}", next.reason);
+            }
             Ok(())
         }
         Err(error) => emit_human_error(error),

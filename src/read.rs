@@ -263,6 +263,10 @@ pub struct NextCandidateOutput {
     /// Ordering is selection-only: the chosen PR must still pass `check`/`new`
     /// preflight and a failure must not cause an automatic leapfrog.
     pub attempt_contract: String,
+    /// Exact command to run next, so a correct FIFO rejection of a later PR is
+    /// not mistaken for a queue fault (bd-d7aae7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_admission_command: Option<NextAdmissionCommand>,
     pub admission: AdmissionStatus,
     /// Typed automatic-selection decision for the canonical candidate. This is
     /// the FIFO-bound surface: it is emitted with
@@ -870,6 +874,57 @@ fn status_with_discovery_options(
     Ok(output)
 }
 
+/// One actionable admission instruction with the reason it was chosen.
+///
+/// bd-d7aae7: `next-candidate` already succeeds deterministically and the
+/// attempt contract already says to preflight the exact first candidate, but
+/// nothing surfaced a single command. Operators therefore read a correct FIFO
+/// rejection of a later PR as a queue fault.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct NextAdmissionCommand {
+    /// Exact `cara` invocation to run next.
+    pub command: String,
+    /// Why this is the next step.
+    pub reason: String,
+    /// Canonical candidate the command targets, when one exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr: Option<PrNumber>,
+}
+
+fn next_admission_command(admission: &AdmissionStatus) -> NextAdmissionCommand {
+    admission.next_candidate.map_or_else(
+        || {
+            let blocked = admission
+                .rejected
+                .iter()
+                .find(|candidate| candidate.blocks_order);
+            blocked.map_or_else(
+                || NextAdmissionCommand {
+                    command: "cara status".to_owned(),
+                    reason: "no candidate is currently selectable for automatic admission"
+                        .to_owned(),
+                    pr: None,
+                },
+                |blocked| NextAdmissionCommand {
+                    command: format!("cara check --pr {}", blocked.pr),
+                    reason: format!(
+                        "PR #{} blocks canonical order and must be resolved first: {}",
+                        blocked.pr, blocked.reason
+                    ),
+                    pr: Some(blocked.pr),
+                },
+            )
+        },
+        |pr| NextAdmissionCommand {
+            command: format!("cara check --pr {pr}"),
+            reason: format!(
+                "PR #{pr} is the canonical first automatic-admission attempt; preflight it before any membership mutation"
+            ),
+            pr: Some(pr),
+        },
+    )
+}
+
 /// Return the canonical first automatic-admission candidate without mutation.
 pub fn next_candidate(context: &AppContext) -> Result<NextCandidateOutput, AppError> {
     let status = status(context)?;
@@ -889,9 +944,11 @@ pub fn next_candidate(context: &AppContext) -> Result<NextCandidateOutput, AppEr
                 crate::admission::AdmissionSelection::Automatic,
             )
         });
+    let next_admission_command = Some(next_admission_command(&status.admission));
     Ok(NextCandidateOutput {
         provider_api: status.provider_api,
         repository: status.repository,
+        next_admission_command,
         attempt_contract: "ordered manual admission attempt only; run `cara check --pr N` for this exact first candidate; on rejection fail closed rather than leapfrogging. The separate opt-in sync-owned greedy policy may persist an exact generation-bound mechanical skip before considering a later candidate".to_owned(),
         admission: status.admission,
         automatic_selection,
@@ -2927,6 +2984,46 @@ mod tests {
     /// restores the reviewed 0.0.9 shape it regressed: naming one exact remote
     /// PR is deliberate owner intent for `new` as well as `join`, so an
     /// unadmitted earlier unrelated row cannot wedge another owner.
+    /// bd-d7aae7: next-candidate must name one exact command, and when nothing
+    /// is selectable it must point at whatever blocks canonical order rather
+    /// than leaving the operator to infer a fault.
+    #[test]
+    fn next_candidate_names_one_actionable_command() {
+        let mut admission = AdmissionStatus {
+            policy: String::new(),
+            priority_labels: Vec::new(),
+            generation_integrity: crate::generation::GenerationIntegrityStatus::default(),
+            candidates: Vec::new(),
+            skipped: Vec::new(),
+            rejected: Vec::new(),
+            next_candidate: Some(PrNumber(2113)),
+        };
+
+        let next = next_admission_command(&admission);
+        assert_eq!(next.command, "cara check --pr 2113");
+        assert_eq!(next.pr, Some(PrNumber(2113)));
+        assert!(next.reason.contains("canonical first"));
+
+        admission.next_candidate = None;
+        admission.rejected.push(RejectedAdmissionCandidate {
+            pr: PrNumber(2117),
+            priority_rank: None,
+            created_at: None,
+            blocks_order: true,
+            reason: "fail closed: conflicting priority labels".to_owned(),
+        });
+
+        let blocked = next_admission_command(&admission);
+        assert_eq!(blocked.command, "cara check --pr 2117");
+        assert_eq!(blocked.pr, Some(PrNumber(2117)));
+        assert!(blocked.reason.contains("blocks canonical order"));
+
+        admission.rejected.clear();
+        let idle = next_admission_command(&admission);
+        assert_eq!(idle.command, "cara status");
+        assert_eq!(idle.pr, None);
+    }
+
     #[test]
     fn explicit_remote_new_intent_is_admitted_with_ordering_evidence() {
         let first = pr(10, "first", "main", false);
