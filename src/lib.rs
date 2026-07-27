@@ -1378,18 +1378,14 @@ fn resolve_self_update_install_dir(
             })),
         ));
     }
+    // bd-0308f3/bd-bd58cd: a package-managed binary is a reason to install
+    // ELSEWHERE, not a reason to refuse. The store is immutable and a store path
+    // whose contents no longer match its hash is a corrupted closure, so the
+    // release is installed into a user-owned directory that PATH already
+    // prefers, leaving the managed binary untouched underneath.
     if is_package_manager_binary(&current) {
-        return Err(AppError::structured(
-            ErrorCategory::Validation,
-            "self_update_package_managed",
-            "self-update will not overwrite a Nix or Homebrew managed Cara binary",
-            Some(serde_json::json!({
-                "current_executable": current,
-                "safe_next_action": "upgrade Cara through the package manager that owns this binary"
-            })),
-        ));
+        return package_managed_install_dir(&current, path, home, explicit);
     }
-    require_first_path_executable(&current, expected_name, path)?;
 
     if let Some(explicit) = explicit {
         if !explicit.is_absolute() || !same_directory(&install_dir, explicit) {
@@ -1428,64 +1424,76 @@ fn resolve_self_update_install_dir(
     Ok(install_dir)
 }
 
-fn require_first_path_executable(
+/// Choose a user-owned install directory that shadows a package-managed Cara.
+///
+/// bd-bd58cd: forced self-update stays useful for deliberately pulling a GitHub
+/// release, but it must never write into a Nix store or Homebrew cellar, and it
+/// must refuse rather than silently install a binary PATH would never resolve.
+fn package_managed_install_dir(
     current: &Path,
-    expected_name: &std::ffi::OsStr,
     path: Option<&std::ffi::OsStr>,
-) -> Result<(), AppError> {
-    let visible = path
-        .and_then(|value| {
-            std::env::split_paths(value)
-                .map(|directory| directory.join(expected_name))
-                .find(|candidate| is_executable_file(candidate))
-        })
+    home: Option<&Path>,
+    explicit: Option<&Path>,
+) -> Result<PathBuf, AppError> {
+    let install_dir = explicit.map(Path::to_path_buf).or_else(|| home.map(|home| home.join(".local/bin")))
         .ok_or_else(|| {
             AppError::structured(
                 ErrorCategory::Validation,
-                "self_update_binary_not_path_visible",
-                "the running Cara executable is not discoverable on PATH",
-                Some(serde_json::json!({"current_executable": current})),
+                "self_update_install_dir_unresolved",
+                "no user-owned install directory could be resolved for a package-managed Cara",
+                Some(serde_json::json!({
+                    "current_executable": current,
+                    "safe_next_action": format!("set {SELF_UPDATE_INSTALL_DIR_ENV} to an absolute directory that precedes the managed binary on PATH"),
+                })),
             )
         })?;
-    let visible = visible.canonicalize().map_err(|error| {
-        AppError::structured(
-            ErrorCategory::ExecutionFailure,
-            "self_update_path_executable_unavailable",
-            format!("could not canonicalize the PATH-visible Cara executable: {error}"),
-            Some(serde_json::json!({"path_executable": visible})),
-        )
-    })?;
-    if visible == current {
-        return Ok(());
+    if is_package_manager_binary(&install_dir) {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "self_update_install_dir_managed",
+            "self-update will never write into a Nix store or Homebrew cellar",
+            Some(serde_json::json!({
+                "current_executable": current,
+                "configured_install_dir": install_dir,
+            })),
+        ));
     }
-    Err(AppError::structured(
-        ErrorCategory::Validation,
-        "self_update_binary_shadowed",
-        "the running Cara executable is shadowed by a different earlier PATH entry",
-        Some(serde_json::json!({
-            "current_executable": current,
-            "path_executable": visible,
-            "safe_next_action": "fix PATH ordering or run the first PATH-visible cara binary"
-        })),
-    ))
+    if !precedes_on_path(&install_dir, current, path) {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "self_update_install_dir_not_preferred",
+            "the user-owned install directory does not precede the package-managed Cara on PATH, so the update would never be executed",
+            Some(serde_json::json!({
+                "current_executable": current,
+                "configured_install_dir": install_dir,
+                "safe_next_action": "put the install directory earlier on PATH, or upgrade through the package manager that owns the current binary",
+            })),
+        ));
+    }
+    Ok(install_dir.canonicalize().unwrap_or(install_dir))
 }
 
-fn is_executable_file(path: &Path) -> bool {
-    let Ok(metadata) = path.metadata() else {
+/// Whether `candidate` appears before the directory holding `current` on PATH.
+fn precedes_on_path(candidate: &Path, current: &Path, path: Option<&std::ffi::OsStr>) -> bool {
+    let Some(path) = path else {
         return false;
     };
-    if !metadata.is_file() {
-        return false;
+    let canonical = |value: &Path| value.canonicalize().unwrap_or_else(|_| value.to_path_buf());
+    let candidate = canonical(candidate);
+    let current_dir = current.parent().map(canonical);
+    for directory in std::env::split_paths(path) {
+        let directory = canonical(&directory);
+        if directory == candidate {
+            return true;
+        }
+        if current_dir
+            .as_ref()
+            .is_some_and(|parent| directory == *parent)
+        {
+            return false;
+        }
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
+    false
 }
 
 fn same_directory(actual: &Path, expected: &Path) -> bool {
@@ -1818,8 +1826,11 @@ mod tests {
         );
     }
 
+    /// bd-0308f3: a shadowed-but-user-managed binary is no longer refused. The
+    /// flake pin is the upgrade path of record, so self-update only has to
+    /// avoid writing somewhere the result would never be executed.
     #[test]
-    fn self_update_rejects_shadowed_and_development_binaries() {
+    fn self_update_allows_a_shadowed_user_install() {
         let temporary = tempfile::tempdir().unwrap();
         let home = temporary.path();
         let cargo_bin = home.join(".cargo/bin");
@@ -1832,12 +1843,50 @@ mod tests {
         write_test_executable(&first);
         write_test_executable(&shadowed);
         let path = std::env::join_paths([&cargo_bin, &local_bin]).unwrap();
+
         assert_eq!(
-            resolve_self_update_install_dir(&shadowed, Some(&path), Some(home), None)
+            resolve_self_update_install_dir(&shadowed, Some(&path), Some(home), None).unwrap(),
+            local_bin.canonicalize().unwrap()
+        );
+    }
+
+    /// bd-bd58cd: a Nix-managed binary redirects into a user-owned directory
+    /// that PATH already prefers, instead of refusing outright.
+    #[test]
+    fn self_update_redirects_a_package_managed_binary() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path();
+        let local_bin = home.join(".local/bin");
+        let store_bin = home.join("nix/store/hash-cara/bin");
+        std::fs::create_dir_all(&local_bin).unwrap();
+        std::fs::create_dir_all(&store_bin).unwrap();
+        let name = if cfg!(windows) { "cara.exe" } else { "cara" };
+        let managed = store_bin.join(name);
+        write_test_executable(&managed);
+
+        // The user directory precedes the managed binary, so the install lands
+        // somewhere PATH will actually resolve.
+        let preferred = std::env::join_paths([&local_bin, &store_bin]).unwrap();
+        assert_eq!(
+            package_managed_install_dir(&managed, Some(&preferred), Some(home), None).unwrap(),
+            local_bin.canonicalize().unwrap()
+        );
+
+        // Reversed, the install would never be executed, so it fails closed.
+        let ignored = std::env::join_paths([&store_bin, &local_bin]).unwrap();
+        assert_eq!(
+            package_managed_install_dir(&managed, Some(&ignored), Some(home), None)
                 .unwrap_err()
                 .code(),
-            "self_update_binary_shadowed"
+            "self_update_install_dir_not_preferred"
         );
+    }
+
+    #[test]
+    fn self_update_rejects_development_binaries() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path();
+        let name = if cfg!(windows) { "cara.exe" } else { "cara" };
 
         let debug = home.join("project/target/aarch64-unknown-linux-gnu/debug");
         std::fs::create_dir_all(&debug).unwrap();

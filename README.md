@@ -424,6 +424,18 @@ cara-<version>-<target>.tar.gz
 cara-<version>-<target>.sha256
 ```
 
+When a repository pins Cara through a flake, `flake.lock` is the upgrade path
+of record and `nix flake update` is the normal way to move versions. Self-update
+remains available as a deliberate override for pulling a GitHub release anyway:
+it installs in place for a user-managed binary, and for a Nix- or
+Homebrew-managed binary it installs into a user-owned directory instead
+(`CARA_SELF_UPDATE_INSTALL_DIR`, else `~/.local/bin`). It never writes into a
+store path or cellar, and it refuses when the chosen directory does not precede
+the managed binary on `PATH`, because an install that `PATH` would never resolve
+is worse than a refusal. `cara status` reports the resolved executable, its
+hash, and whether it came from a store path, so a shadowing install is provable
+rather than inferred.
+
 The archive contains `cara-<version>-<target>/cara`, matching
 `updatable-cli`'s default asset strategy. The release workflow tests the tagged
 source, packages each binary, verifies native archives by executing `--version`,
