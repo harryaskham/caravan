@@ -590,11 +590,26 @@ carries the cumulative reviewed content, and retargeting preserves its
 head-attached check runs. That safety is proven mechanically rather than
 assumed. `git merge-tree` constructs the result of merging the root into the
 exact default branch and the tick compares it to the root head's own tree. Equal
-trees mean the squash lands byte-identical already-validated content, so the
-default branch moving underneath is irrelevant. A different tree means the
-default branch gained content this generation never saw; the caravan revalidates
-(physical rebase plus fresh CI) instead of merging. An absent proof is never
-permission.
+trees mean the squash lands byte-identical already-validated content. A
+different tree means the default branch gained content this generation never
+saw; the caravan revalidates (physical rebase plus fresh CI) instead of merging.
+An absent proof, or a proof built against a superseded default-branch
+generation, is never permission.
+
+Tree identity proves *what* would land, not that the default branch still wants
+it, and both are required. The exact default branch must also be the generation
+this caravan's retained patch set predicts: either it is contained by the root
+head — the ordinary case, since members are rebased onto it before CI — or it is
+precisely the generation this tick's own landing produced moments earlier. The
+dangerous instance is an operator reverting or discarding an already-landed
+ancestor: successors still carry that ancestor's diff, a three-way merge
+silently reapplies it, and the result is still exactly the successor's own tree,
+so tree identity alone would authorize reintroducing content the operator
+deliberately removed. That is refused with
+`default_branch_diverged_from_retained_patch_set` rather than waited on, because
+no rerun can decide whether reverted content should return; only proving or
+rescoping the caravan's content can. A rebase would replay the same commits, so
+detection and refusal — never silent reintroduction — is the contract.
 
 There is exactly one merge actor. A foreign `autoMergeRequest` observed on any
 member is either converged away (`sync.external_auto_merge_policy: disable`,
@@ -617,7 +632,13 @@ Promotion failure is the typed `root_promotion_incomplete` with cause
 `stale_provider_view`, always before any merge is attempted. Merge refusal is
 the typed `root_merge_refused` with cause `base_not_default_branch`,
 `root_head_moved_before_merge`, `foreign_auto_merge_actor`,
-`provider_did_not_persist_merge`, `merged_into_unexpected_base`, or
+`provider_did_not_persist_merge`, `merged_into_unexpected_base`,
+`merge_not_reachable_from_default`, or
+`default_branch_diverged_from_retained_patch_set`. Ordinary bounded waits — pending checks,
+unsatisfied required contexts, an unproven or changed cumulative tree, an
+already-merged root, or the spent per-tick merge allowance — are visible
+no-op steps, never failures.
+
 Creation flattens on the same terms as synchronization (bd-abd929): `cara new`
 and `cara renew` authorize root flattening whenever the candidate has no join
 target and `sync.head_merge_actor` is `caravan`. Wiring it into sync alone meant
@@ -632,11 +653,6 @@ re-resolving conflicts its author resolved by hand. Children are never
 flattened, because their ancestry must physically follow the chain, and an
 unauthorized merge-preserving replay still fails closed with
 `rebase_merge_replay_conflict`.
-
-`merge_not_reachable_from_default`. Ordinary bounded waits — pending checks,
-unsatisfied required contexts, an unproven or changed cumulative tree, an
-already-merged root, or the spent per-tick merge allowance — are visible
-no-op steps, never failures.
 
 Under the historical `github` actor the earlier contract still applies. Required
 root squash auto-merge is scheduler-owned convergent state: the provider drops

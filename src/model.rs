@@ -606,6 +606,18 @@ pub struct CumulativeTreeProof {
     pub merge_result_tree: CommitOid,
     /// Whether the merge result is exactly the already-validated head tree.
     pub identical: bool,
+    /// Whether the exact target generation is contained by the candidate.
+    ///
+    /// Tree identity alone is *not* sufficient authority to land. If an
+    /// operator reverts or discards an already-landed ancestor, the target no
+    /// longer contains that content while the candidate still carries it; a
+    /// three-way merge then silently *reintroduces* the reverted ancestor and
+    /// still produces exactly the candidate's own tree, so `identical` stays
+    /// true. Containment is what distinguishes "the target is the generation my
+    /// retained patch set predicts" from "somebody removed content I still
+    /// carry".
+    #[serde(default)]
+    pub target_reachable_from_candidate: bool,
 }
 
 impl CumulativeTreeProof {
