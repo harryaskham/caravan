@@ -30,7 +30,12 @@ jobs:
       - name: Run pinned format, lint, test, and agent-surface gates
         shell: bash
         run: |
-          nix develop --command bash -lc '
+          # Not a login shell: `-l` re-sources the runner's profile files after
+          # `nix develop` has established the devShell, which replaces PATH and
+          # loses cargo/rustc/clippy/rustfmt (`cargo: command not found`, exit
+          # 127, before any compilation). The gate needs no login semantics, so
+          # this stays immune to runner profile drift (bd-07a962).
+          nix develop --command bash -c '
             set -euo pipefail
             cargo fmt --all --check
             cargo clippy --all-targets -- -D warnings
