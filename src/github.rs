@@ -1479,16 +1479,22 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
 
     /// Resolve canonical provider identity/freshness for one exact PR snapshot.
     /// This shares the status/show schema and performs no checkout or mutation.
+    /// Resolve canonical provider identity/freshness for one exact PR snapshot.
+    /// This shares the status/show schema and performs no checkout or mutation.
+    /// `default_branch` supplies the live tip a default-based candidate must be
+    /// compared against; omit it only when that tip is genuinely unknown.
     pub fn merge_candidate_identity(
         &self,
         repository: &RepositoryId,
         pull_request: &model::PullRequestSnapshot,
+        default_branch: Option<&BranchSnapshot>,
     ) -> Result<model::MergeCandidateIdentity, DiscoveryError> {
         let observed_at = provider_observed_at();
         let (mut identities, _) = self.merge_candidate_identities(
             repository,
             std::slice::from_ref(pull_request),
             &observed_at,
+            default_branch,
         )?;
         identities.pop().ok_or_else(|| DiscoveryError::InvalidJson {
             command: merge_candidates_command(repository, std::slice::from_ref(pull_request)),
@@ -1569,8 +1575,12 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
             .collect::<Vec<_>>();
         let merge_candidates_truncated =
             open_labeled_prs.len().saturating_sub(bounded_members.len());
-        let (merge_candidates, default_branch_movements) =
-            self.merge_candidate_identities(&repository, &bounded_members, &observed_at)?;
+        let (merge_candidates, default_branch_movements) = self.merge_candidate_identities(
+            &repository,
+            &bounded_members,
+            &observed_at,
+            Some(&default_branch),
+        )?;
         // bd-cd3be9: generation integrity must see recently merged siblings.
         // Facts built only from open PRs cannot prove that a candidate is
         // strictly contained by work that already landed, so a superseded
@@ -1654,6 +1664,7 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
         repository: &RepositoryId,
         pull_requests: &[model::PullRequestSnapshot],
         observed_at: &str,
+        default_branch: Option<&BranchSnapshot>,
     ) -> Result<
         (
             Vec<model::MergeCandidateIdentity>,
@@ -1684,11 +1695,13 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
                         .map(|parent| CommitOid(parent.oid.clone()))
                         .collect(),
                 });
-                let (freshness, stale_base, stale_head, stale_reasons) = classify_candidate(
-                    synthetic.as_ref(),
-                    &pull_request.base.oid,
-                    &pull_request.head.oid,
-                );
+                let (freshness, compared_base, stale_base, stale_head, stale_reasons) =
+                    classify_candidate(
+                        synthetic.as_ref(),
+                        &pull_request.base,
+                        &pull_request.head.oid,
+                        default_branch,
+                    );
                 Ok(model::MergeCandidateIdentity {
                     pr: pull_request.number,
                     provider_updated_at: pull_request.updated_at.clone().unwrap_or_default(),
@@ -1702,6 +1715,7 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
                         actor: pull_request.auto_merge.actor.clone(),
                     },
                     freshness,
+                    compared_base,
                     stale_base,
                     stale_head,
                     stale_reasons,
@@ -2165,37 +2179,67 @@ fn provider_observed_at() -> String {
         )
 }
 
+/// Classify one synthetic merge candidate against the exact provider
+/// generations it must match.
+///
+/// `default_branch` is the live tip of the repository default branch when it is
+/// known. A pull request based on the default branch is compared against that
+/// tip, never against its own recorded `base.oid`: GitHub keeps serving the
+/// base generation a PR was opened/last-synced against, so comparing against it
+/// would report `stale_base=false` for a base that has been superseded for
+/// hours. The compared generation is returned so receipts can prove the claim.
 fn classify_candidate(
     candidate: Option<&model::SyntheticMergeCandidate>,
-    base: &CommitOid,
+    base: &BranchSnapshot,
     head: &CommitOid,
-) -> (model::MergeCandidateFreshness, bool, bool, Vec<String>) {
+    default_branch: Option<&BranchSnapshot>,
+) -> (
+    model::MergeCandidateFreshness,
+    Option<BranchSnapshot>,
+    bool,
+    bool,
+    Vec<String>,
+) {
+    let compared_base = default_branch
+        .filter(|default| default.name == base.name && default.repository == base.repository)
+        .map_or_else(|| base.clone(), Clone::clone);
+    let mut reasons = Vec::new();
+    let superseded_base = compared_base.oid != base.oid;
+    if superseded_base {
+        reasons.push(format!(
+            "recorded pull-request base {} is superseded by the current {} tip {}",
+            base.oid, compared_base.name, compared_base.oid
+        ));
+    }
     let Some(candidate) = candidate else {
+        reasons.push("synthetic merge ref is unavailable".to_owned());
         return (
             model::MergeCandidateFreshness::Missing,
+            Some(compared_base),
+            superseded_base,
             false,
-            false,
-            vec!["synthetic merge ref is unavailable".to_owned()],
+            reasons,
         );
     };
     if candidate.parents.len() != 2 {
+        reasons.push(format!(
+            "synthetic candidate has {} parents; expected 2",
+            candidate.parents.len()
+        ));
         return (
             model::MergeCandidateFreshness::Unknown,
+            Some(compared_base),
+            superseded_base,
             false,
-            false,
-            vec![format!(
-                "synthetic candidate has {} parents; expected 2",
-                candidate.parents.len()
-            )],
+            reasons,
         );
     }
-    let stale_base = candidate.parents[0] != *base;
+    let stale_base = superseded_base || candidate.parents[0] != compared_base.oid;
     let stale_head = candidate.parents[1] != *head;
-    let mut reasons = Vec::new();
-    if stale_base {
+    if candidate.parents[0] != compared_base.oid {
         reasons.push(format!(
             "first parent {} does not match current base {}",
-            candidate.parents[0], base
+            candidate.parents[0], compared_base.oid
         ));
     }
     if stale_head {
@@ -2211,7 +2255,13 @@ fn classify_candidate(
     } else {
         model::MergeCandidateFreshness::Fresh
     };
-    (freshness, stale_base, stale_head, reasons)
+    (
+        freshness,
+        Some(compared_base),
+        stale_base,
+        stale_head,
+        reasons,
+    )
 }
 
 fn previous_default_command(branch: &str) -> CommandSpec {
@@ -3601,7 +3651,17 @@ mod tests {
         );
         assert_eq!(
             snapshot.merge_candidates[0].freshness,
-            model::MergeCandidateFreshness::Fresh
+            model::MergeCandidateFreshness::StaleBase,
+            "the fixture PR records base-12 while main is default-sha; a superseded base is never fresh"
+        );
+        assert!(snapshot.merge_candidates[0].stale_base);
+        assert_eq!(
+            snapshot.merge_candidates[0]
+                .compared_base
+                .as_ref()
+                .map(|base| base.oid.clone()),
+            Some(CommitOid("default-sha".into())),
+            "receipts expose the live default tip the claim was compared against"
         );
         assert_eq!(
             snapshot.merge_candidates[0].auto_merge.actor.as_deref(),
@@ -4118,15 +4178,117 @@ mod tests {
             ],
         };
 
-        let (freshness, stale_base, stale_head, reasons) = classify_candidate(
+        let (freshness, compared_base, stale_base, stale_head, reasons) = classify_candidate(
             Some(&candidate),
-            &CommitOid("base".to_owned()),
+            &BranchSnapshot {
+                repository: repository(),
+                name: "main".to_owned(),
+                oid: CommitOid("base".to_owned()),
+            },
             &CommitOid("head".to_owned()),
+            None,
         );
 
         assert_eq!(freshness, model::MergeCandidateFreshness::StaleHead);
+        assert_eq!(
+            compared_base.map(|base| base.oid),
+            Some(CommitOid("base".to_owned()))
+        );
         assert!(stale_base);
         assert!(stale_head);
+        assert_eq!(reasons.len(), 2);
+    }
+
+    #[test]
+    fn superseded_default_base_is_never_reported_fresh() {
+        let repository = repository();
+        let recorded_base = BranchSnapshot {
+            repository: repository.clone(),
+            name: "main".to_owned(),
+            oid: CommitOid("1a09ceec".to_owned()),
+        };
+        let current_default = BranchSnapshot {
+            repository,
+            name: "main".to_owned(),
+            oid: CommitOid("9d6278a1".to_owned()),
+        };
+        // The provider still serves the PR's original base generation and a
+        // synthetic candidate built on it, exactly like live PR #2210.
+        let candidate = model::SyntheticMergeCandidate {
+            git_ref: "refs/pull/2210/merge".to_owned(),
+            oid: CommitOid("merge".to_owned()),
+            tree_oid: CommitOid("tree".to_owned()),
+            parents: vec![
+                CommitOid("1a09ceec".to_owned()),
+                CommitOid("head".to_owned()),
+            ],
+        };
+
+        let (freshness, compared_base, stale_base, stale_head, reasons) = classify_candidate(
+            Some(&candidate),
+            &recorded_base,
+            &CommitOid("head".to_owned()),
+            Some(&current_default),
+        );
+
+        assert_eq!(freshness, model::MergeCandidateFreshness::StaleBase);
+        assert!(stale_base, "a superseded base can never be reported fresh");
+        assert!(!stale_head);
+        assert_eq!(
+            compared_base.map(|base| base.oid),
+            Some(CommitOid("9d6278a1".to_owned())),
+            "receipts expose the exact generation the claim was compared against"
+        );
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("superseded by the current main tip"))
+        );
+
+        // The same candidate on the live tip stays fresh.
+        let fresh_base = BranchSnapshot {
+            oid: CommitOid("1a09ceec".to_owned()),
+            ..current_default.clone()
+        };
+        let (freshness, _, stale_base, _, reasons) = classify_candidate(
+            Some(&candidate),
+            &fresh_base,
+            &CommitOid("head".to_owned()),
+            Some(&fresh_base),
+        );
+        assert_eq!(freshness, model::MergeCandidateFreshness::Fresh);
+        assert!(!stale_base);
+        assert!(reasons.is_empty());
+    }
+
+    #[test]
+    fn missing_synthetic_candidate_still_reports_a_superseded_base() {
+        let repository = repository();
+        let recorded_base = BranchSnapshot {
+            repository: repository.clone(),
+            name: "main".to_owned(),
+            oid: CommitOid("old".to_owned()),
+        };
+        let current_default = BranchSnapshot {
+            repository,
+            name: "main".to_owned(),
+            oid: CommitOid("new".to_owned()),
+        };
+
+        let (freshness, compared_base, stale_base, stale_head, reasons) = classify_candidate(
+            None,
+            &recorded_base,
+            &CommitOid("head".to_owned()),
+            Some(&current_default),
+        );
+
+        assert_eq!(freshness, model::MergeCandidateFreshness::Missing);
+        assert!(stale_base);
+        assert!(!stale_head);
+        assert_eq!(
+            compared_base.map(|base| base.oid),
+            Some(CommitOid("new".to_owned()))
+        );
         assert_eq!(reasons.len(), 2);
     }
 

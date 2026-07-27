@@ -390,6 +390,12 @@ pub struct MergeCandidateIdentity {
     pub synthetic: Option<SyntheticMergeCandidate>,
     pub auto_merge: NativeAutoMergeState,
     pub freshness: MergeCandidateFreshness,
+    /// Exact provider generation this freshness claim was compared against.
+    /// For a default-based PR this is the live default tip, not the PR's own
+    /// recorded base OID, so a consumer can verify the claim instead of
+    /// trusting it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compared_base: Option<BranchSnapshot>,
     /// Independent flags preserve a simultaneous base+head generation mismatch.
     pub stale_base: bool,
     pub stale_head: bool,

@@ -1352,7 +1352,11 @@ pub(crate) fn bind_remote_candidate_from_status(
     })?;
     require_fresh_candidate(discovered, &fresh)?;
     let identity = GitHubDiscovery::new(provider_runner.clone())
-        .merge_candidate_identity(&status.repository, &fresh)
+        .merge_candidate_identity(
+            &status.repository,
+            &fresh,
+            Some(&status.analysis.fleet.default_branch),
+        )
         .map_err(|error| discovery_error(&error))?;
     status
         .merge_candidates
@@ -3094,6 +3098,7 @@ mod tests {
                     actor: None,
                 },
                 freshness: crate::model::MergeCandidateFreshness::StaleHead,
+                compared_base: None,
                 stale_base: false,
                 stale_head: true,
                 stale_reasons: vec!["synthetic head parent is stale".to_owned()],
@@ -3144,6 +3149,7 @@ mod tests {
                     actor: None,
                 },
                 freshness: crate::model::MergeCandidateFreshness::StaleBase,
+                compared_base: None,
                 stale_base: true,
                 stale_head: false,
                 stale_reasons: vec!["synthetic base parent is stale".to_owned()],
@@ -3592,6 +3598,7 @@ mod tests {
                     actor: None,
                 },
                 freshness: crate::model::MergeCandidateFreshness::StaleHead,
+                compared_base: None,
                 stale_base: false,
                 stale_head: true,
                 stale_reasons: vec!["synthetic head parent is stale".to_owned()],

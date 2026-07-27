@@ -234,6 +234,8 @@ preconditions.
 - `cara show` — print the current PR's whole caravan and highlight its position.
 - `cara check` — no-update validation. For an active member, check its whole caravan and fleet invariants. Otherwise check whether `new` would succeed.
 - `cara check --pr N` — re-read and preflight exact remote PR `N` without changing checkout, branch, base, labels, or auto-merge. The receipt consumes the canonical provider candidate identity/freshness schema and includes exact head/base repositories and OIDs, draft/labels/auto-merge state, enrollment and canonical-order state, compatibility/conflicting paths, and one mechanical next action: `new`, `join`, `repair`, `wait`, or `reject`. A provider head/ref race fails closed with exact old/new evidence.
+
+Candidate freshness is always measured against a live provider generation, never against the pull request's own recorded base. GitHub keeps serving the base a PR was opened or last synced against, so a default-based candidate is compared to the current default tip; every identity records that `compared_base` generation so a consumer can verify the claim instead of trusting it. A recorded base superseded by the current tip is `stale_base` with an explicit reason, including when the synthetic merge ref is missing or has unexpected topology.
 - `cara check [--pr N] --tail-pr T` — check whether the selected remote/current PR can join after exact tail `T`.
 - `cara check [--pr N] --head-pr H` — resolve caravan `H`, then check against its current tail.
 
