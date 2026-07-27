@@ -51,16 +51,16 @@ pub fn plan_sync(context: &AppContext, input: &SyncInput) -> Result<SyncPlanOutp
             .flat_map(|chain| chain.members.iter().map(|item| item.plan.clone()))
             .collect::<Vec<_>>();
         drop(prepared);
+        let (capacity, capacity_defect) =
+            super::capacity_evidence(context, sync_operation_budget(context));
         let admission = SyncApplyAdmissionPlan {
             admitted_prefix: admission.admitted_prs.clone(),
             deferred_members: admission.deferred.clone(),
             required_ms: super::duration_millis(admission.budget.required),
             complete_graph_required_ms: super::duration_millis(admission.complete_budget.required),
             configured_deadline_ms: super::duration_millis(sync_operation_budget(context)),
-            max_admissible_members: super::max_admissible_members(
-                context,
-                sync_operation_budget(context),
-            ),
+            max_admissible_members: capacity,
+            capacity_defect,
             deferred_convergence: admission.deferred_convergence,
         };
         (plans, admission, progress)

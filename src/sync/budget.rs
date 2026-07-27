@@ -41,6 +41,16 @@ use super::{
 /// cannot turn a deterministic projection into an unbounded loop.
 const MAX_CAPACITY_SEARCH_MEMBERS: u64 = 4_096;
 
+/// Smallest admission bound that can honestly be enforced as ordinary gating.
+///
+/// Gating exists to stop a chain growing past the size the configured deadline
+/// can still guarantee to drain. A bound below two refuses every join to a
+/// caravan that already holds a single member, so no chain could ever form and
+/// no amount of draining could reopen admission. That is a configuration
+/// defect, not capacity gating, so it is reported as a defect instead of being
+/// emitted as a bound (bd-b1c7b7).
+pub(super) const MINIMUM_SOUND_CAPACITY: u64 = 2;
+
 /// Wall clock deliberately left unclaimed between admitting a prefix and
 /// reserving it at the precommit barrier, so the few microseconds spent
 /// deciding can never turn an admitted prefix into a refusal.
@@ -192,6 +202,43 @@ pub struct CaravanBudgetProjection {
     pub safe_next_action: String,
 }
 
+/// Why a computed admission bound cannot be enforced as ordinary gating.
+///
+/// bd-b1c7b7: a non-positive bound used to be emitted as an ordinary capacity
+/// refusal whose only suggested remedy was waiting for a caravan to drain.
+/// Draining cannot raise a bound derived purely from configuration, so the
+/// guidance recommended an action that could never resolve the condition it
+/// described. An unsound bound is now a typed defect carrying the arithmetic
+/// that produced it and the exact configuration change that repairs it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CapacityDefect {
+    pub code: String,
+    /// Bound the configured arithmetic produced, always below the sound floor.
+    pub computed_bound: u64,
+    /// Smallest bound that could have been enforced as gating.
+    pub minimum_sound_bound: u64,
+    pub deadline_ms: u64,
+    pub command_timeout_ms: u64,
+    /// Wall clock the reserve model prices one planned command at.
+    pub reserve_ms_per_command: u64,
+    /// Command slots the smallest sound chain would require.
+    pub minimum_chain_command_slots: u64,
+    /// Deadline that would make the smallest sound chain admissible again.
+    pub minimum_deadline_ms: u64,
+    pub safe_next_action: String,
+}
+
+/// Deterministic disposition of one caravan against the admission bound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum CapacityGate {
+    /// The chain can still accept another member under a sound bound.
+    Open { bound: u64 },
+    /// Ordinary gating: the chain already holds every admissible member.
+    AtCapacity { bound: u64 },
+    /// No sound bound exists, so gating cannot be enforced honestly.
+    Defect(CapacityDefect),
+}
+
 /// Deterministic, provider-free projection of the physical apply reserve.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SyncBudgetStatus {
@@ -200,10 +247,21 @@ pub struct SyncBudgetStatus {
     pub rebase_on_join: bool,
     pub deadline_ms: u64,
     pub command_timeout_ms: u64,
-    /// Whole-tick deadline expressed in `command_timeout_secs` command slots.
+    /// Wall clock the reserve model prices one planned command at. Admission
+    /// and the apply reserve share this price; neither uses the worst-case
+    /// `command_timeout_secs` slot (bd-b1c7b7).
+    pub reserve_ms_per_command: u64,
+    /// Whole-tick deadline expressed in reserve-priced command slots.
     pub deadline_command_slots: u64,
     /// Largest chain size whose last member is still guaranteed to drain.
-    pub max_admissible_members: u64,
+    /// Absent exactly when `capacity_defect` explains why no sound bound
+    /// exists; a zero bound is never emitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_admissible_members: Option<u64>,
+    /// Typed defect when the configured arithmetic cannot produce a bound that
+    /// admission could honestly enforce.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_defect: Option<CapacityDefect>,
     #[serde(default)]
     pub caravans: Vec<CaravanBudgetProjection>,
     /// Canonical candidate that admission would refuse at capacity.
@@ -215,12 +273,14 @@ pub struct SyncBudgetStatus {
 impl Default for SyncBudgetStatus {
     fn default() -> Self {
         Self {
-            schema_version: 1,
+            schema_version: 2,
             rebase_on_join: false,
             deadline_ms: 0,
             command_timeout_ms: 0,
+            reserve_ms_per_command: 0,
             deadline_command_slots: 0,
-            max_admissible_members: 0,
+            max_admissible_members: None,
+            capacity_defect: None,
             caravans: Vec::new(),
             blocked_candidate: None,
             safe_next_action: "physical chain rebuilding is disabled; no apply reserve applies"
@@ -240,7 +300,7 @@ impl Default for SyncBudgetStatus {
 /// tick is still bounded by the operation deadline, and a mid-apply timeout is
 /// an already-handled resumable path -- so a proportional reserve is strictly
 /// safer than guaranteeing zero progress.
-fn reserve_secs_per_command(context: &AppContext) -> u64 {
+pub(super) fn reserve_secs_per_command(context: &AppContext) -> u64 {
     context
         .config
         .command_timeout_secs
@@ -256,12 +316,19 @@ pub(super) fn slots_to_worst_case_duration(context: &AppContext, slots: u64) -> 
     Duration::from_secs(context.config.command_timeout_secs.saturating_mul(slots))
 }
 
-/// Whole-tick deadline expressed in `command_timeout_secs` command slots.
+/// Whole-tick deadline expressed in reserve-priced command slots.
+///
+/// bd-b1c7b7: this used to price every slot at the full `command_timeout_secs`
+/// while the apply reserve priced the identical slots proportionally, so the
+/// two models disagreed by orders of magnitude on the same chain and raising a
+/// proven-safe command timeout silently closed admission. Both now share
+/// `reserve_secs_per_command`, which is itself capped by `command_timeout_secs`.
 pub(super) fn deadline_command_slots(context: &AppContext, deadline: Duration) -> u64 {
-    if context.config.command_timeout_secs == 0 {
+    let secs_per_slot = reserve_secs_per_command(context);
+    if secs_per_slot == 0 {
         return u64::MAX;
     }
-    deadline.as_secs() / context.config.command_timeout_secs
+    deadline.as_secs() / secs_per_slot
 }
 
 /// Worst-case chain costs derived from discovery alone: every member is
@@ -518,29 +585,147 @@ pub(super) fn admit_physical_prefix(
     }
 }
 
-/// Largest chain size whose last member is still guaranteed to drain inside
-/// one configured deadline.
-///
-/// The bound models the hardest ordinary shape: every earlier member already
-/// retained, one trailing pending rewrite, and one native auto-merge drop.
-pub(super) fn max_admissible_members(context: &AppContext, deadline: Duration) -> u64 {
+/// Command slots the hardest ordinary shape of a `size`-member chain needs:
+/// every earlier member already retained, one trailing pending rewrite, and
+/// one native auto-merge drop.
+const fn capacity_command_slots(size: u64) -> u64 {
+    size.saturating_sub(1)
+        .saturating_mul(PHYSICAL_APPLY_COMMAND_SLOTS_PER_RETAINED_MEMBER)
+        .saturating_add(PHYSICAL_APPLY_COMMAND_SLOTS_PER_PENDING_MEMBER)
+        .saturating_add(1)
+        .saturating_add(PHYSICAL_FIXED_POST_WRITE_COMMAND_SLOTS)
+}
+
+/// Raw bound the configured deadline implies under the actual-work reserve.
+fn computed_capacity(context: &AppContext, deadline: Duration) -> u64 {
     let slots = deadline_command_slots(context, deadline);
     let mut admissible = 0;
     let mut size = 1;
     while size <= MAX_CAPACITY_SEARCH_MEMBERS {
-        let required = size
-            .saturating_sub(1)
-            .saturating_mul(PHYSICAL_APPLY_COMMAND_SLOTS_PER_RETAINED_MEMBER)
-            .saturating_add(PHYSICAL_APPLY_COMMAND_SLOTS_PER_PENDING_MEMBER)
-            .saturating_add(1)
-            .saturating_add(PHYSICAL_FIXED_POST_WRITE_COMMAND_SLOTS);
-        if required >= slots {
+        if capacity_command_slots(size) >= slots {
             break;
         }
         admissible = size;
         size += 1;
     }
     admissible
+}
+
+/// Smallest deadline under which the smallest sound chain is admissible.
+fn minimum_sound_deadline(context: &AppContext) -> Duration {
+    let slots = capacity_command_slots(MINIMUM_SOUND_CAPACITY).saturating_add(1);
+    Duration::from_secs(slots.saturating_mul(reserve_secs_per_command(context)))
+}
+
+fn capacity_defect(
+    context: &AppContext,
+    deadline: Duration,
+    computed_bound: u64,
+) -> CapacityDefect {
+    let minimum_deadline = minimum_sound_deadline(context);
+    CapacityDefect {
+        code: "sync_budget_capacity_unsound".to_owned(),
+        computed_bound,
+        minimum_sound_bound: MINIMUM_SOUND_CAPACITY,
+        deadline_ms: super::duration_millis(deadline),
+        command_timeout_ms: context.config.command_timeout_secs.saturating_mul(1_000),
+        reserve_ms_per_command: reserve_secs_per_command(context).saturating_mul(1_000),
+        minimum_chain_command_slots: capacity_command_slots(MINIMUM_SOUND_CAPACITY),
+        minimum_deadline_ms: super::duration_millis(minimum_deadline),
+        safe_next_action: format!(
+            "raise sync.max_duration_secs to at least {}s (currently {}s), or lower sync.reserve_secs_per_command (currently {}s) to a proven-safe value: the configured deadline implies a {computed_bound}-member bound, below the {MINIMUM_SOUND_CAPACITY}-member floor admission can enforce, and draining a caravan can never raise a bound derived from configuration alone",
+            minimum_deadline.as_secs(),
+            deadline.as_secs(),
+            reserve_secs_per_command(context),
+        ),
+    }
+}
+
+/// A bound that gates a caravan holding fewer than two members contradicts
+/// itself: such a chain cannot shrink into admissibility, so no drain can
+/// clear the gate. Reported as a defect rather than silently closing joins.
+fn capacity_contradiction(
+    context: &AppContext,
+    deadline: Duration,
+    members: u64,
+    bound: u64,
+) -> CapacityDefect {
+    CapacityDefect {
+        code: "sync_budget_capacity_contradiction".to_owned(),
+        safe_next_action: format!(
+            "admission reported a {members}-member caravan at a {bound}-member bound, which no drain can ever clear; treat this as a defect and raise sync.max_duration_secs to at least {}s, or lower sync.reserve_secs_per_command (currently {}s), before relying on capacity gating",
+            minimum_sound_deadline(context).as_secs(),
+            reserve_secs_per_command(context),
+        ),
+        ..capacity_defect(context, deadline, bound)
+    }
+}
+
+/// Largest chain size whose last member is still guaranteed to drain inside
+/// one configured deadline, or the typed defect that makes the configured
+/// arithmetic unusable as an admission bound.
+///
+/// The bound models the hardest ordinary shape: every earlier member already
+/// retained, one trailing pending rewrite, and one native auto-merge drop. It
+/// is priced with the same actual-work reserve that produces `required_ms`, so
+/// admission and the apply reserve can never disagree about the same chain.
+pub(super) fn admission_capacity(
+    context: &AppContext,
+    deadline: Duration,
+) -> Result<u64, CapacityDefect> {
+    let computed = computed_capacity(context, deadline);
+    if computed < MINIMUM_SOUND_CAPACITY {
+        return Err(capacity_defect(context, deadline, computed));
+    }
+    Ok(computed)
+}
+
+/// Bound-plus-defect evidence pair, so refusal receipts never carry a zero or
+/// otherwise unsound `max_admissible_members`.
+pub(super) fn capacity_evidence(
+    context: &AppContext,
+    deadline: Duration,
+) -> (Option<u64>, Option<CapacityDefect>) {
+    match admission_capacity(context, deadline) {
+        Ok(bound) => (Some(bound), None),
+        Err(defect) => (None, Some(defect)),
+    }
+}
+
+/// Deterministic disposition of one caravan of `members` members against the
+/// configured admission bound.
+pub(super) fn capacity_gate(
+    context: &AppContext,
+    deadline: Duration,
+    members: u64,
+) -> CapacityGate {
+    match admission_capacity(context, deadline) {
+        Ok(bound) => gate_for_bound(context, deadline, members, bound),
+        Err(defect) => CapacityGate::Defect(defect),
+    }
+}
+
+/// Classify one caravan against an explicit bound.
+///
+/// Gating a caravan that holds fewer than `MINIMUM_SOUND_CAPACITY` members is a
+/// self-evident contradiction: such a chain cannot shrink into admissibility,
+/// so no drain can ever clear the gate. It is reported as a typed defect rather
+/// than quietly closing admission (bd-b1c7b7). A sound bound can never produce
+/// this state; the guard exists so a future arithmetic regression fails loudly
+/// instead of silently stalling the queue.
+pub(super) fn gate_for_bound(
+    context: &AppContext,
+    deadline: Duration,
+    members: u64,
+    bound: u64,
+) -> CapacityGate {
+    if members < bound {
+        CapacityGate::Open { bound }
+    } else if members < MINIMUM_SOUND_CAPACITY {
+        CapacityGate::Defect(capacity_contradiction(context, deadline, members, bound))
+    } else {
+        CapacityGate::AtCapacity { bound }
+    }
 }
 
 /// Deterministic status projection for the configured deadline, computed from
@@ -564,6 +749,47 @@ pub fn project_status(context: &AppContext, status: &StatusOutput) -> SyncBudget
     project(context, status, &selected, deadline)
 }
 
+/// Safe next action for one projected caravan.
+///
+/// Gating guidance is only ever emitted for a sound bound; under a defect the
+/// text names the configuration change that repairs it, never a drain that
+/// provably cannot (bd-b1c7b7).
+fn caravan_next_action(
+    context: &AppContext,
+    deadline: Duration,
+    members: u64,
+    gate: &CapacityGate,
+    admission: &PhysicalApplyAdmission,
+) -> String {
+    if !context.config.rebase_on_join {
+        return "physical chain rebuilding is disabled; no apply reserve applies".to_owned();
+    }
+    let admitted = admission.admitted_prs.len();
+    match gate {
+        CapacityGate::Defect(defect) => format!(
+            "admission capacity is unsound and no drain can repair it: {}",
+            defect.safe_next_action,
+        ),
+        CapacityGate::AtCapacity { bound } => format!(
+            "let this caravan drain before admitting another member: {members} members already reach the {bound}-member bound implied by sync.max_duration_secs={}s and sync.reserve_secs_per_command={}s",
+            deadline.as_secs(),
+            reserve_secs_per_command(context),
+        ),
+        CapacityGate::Open { .. } if !admission.makes_progress() => {
+            "no member can drain inside the configured deadline: raise sync.max_duration_secs or lower a proven-safe sync.reserve_secs_per_command before the next tick".to_owned()
+        }
+        CapacityGate::Open { .. } if !admission.deferred_convergence => {
+            "one `cara sync --all` tick can apply and converge this caravan".to_owned()
+        }
+        CapacityGate::Open { .. } if admission.deferred.is_empty() => format!(
+            "run `cara sync --all`; one tick applies all {admitted} member(s) and converges them on the next tick without replaying completed rewrites"
+        ),
+        CapacityGate::Open { .. } => format!(
+            "run `cara sync --all`; one tick applies {admitted} of {members} member(s) and resumes the rest next tick without replaying completed rewrites"
+        ),
+    }
+}
+
 /// Build the deterministic status projection for the configured deadline.
 fn project(
     context: &AppContext,
@@ -572,7 +798,7 @@ fn project(
     deadline: Duration,
 ) -> SyncBudgetStatus {
     let rebase_on_join = context.config.rebase_on_join;
-    let capacity = max_admissible_members(context, deadline);
+    let capacity = admission_capacity(context, deadline);
     let mut projections = Vec::with_capacity(selected.len());
     for caravan in selected {
         let chains = chain_costs_from_status(status, std::slice::from_ref(caravan));
@@ -596,30 +822,9 @@ fn project(
         let admission = admit_physical_prefix(context, &chains, deadline);
         let processable_prefix = admission.admitted_prs.clone();
         let members = u64::try_from(caravan.members.len()).unwrap_or(u64::MAX);
-        let at_capacity = members >= capacity;
-        let safe_next_action = if !rebase_on_join {
-            "physical chain rebuilding is disabled; no apply reserve applies".to_owned()
-        } else if at_capacity {
-            format!(
-                "let this caravan drain before admitting another member: {members} members already reach the {capacity}-member bound implied by sync.max_duration_secs={}s and command_timeout_secs={}s",
-                deadline.as_secs(),
-                context.config.command_timeout_secs,
-            )
-        } else if !admission.makes_progress() {
-            "no member can drain inside the configured deadline: raise sync.max_duration_secs or lower a proven-safe command_timeout_secs before the next tick".to_owned()
-        } else if !admission.deferred_convergence {
-            "one `cara sync --all` tick can apply and converge this caravan".to_owned()
-        } else if admission.deferred.is_empty() {
-            format!(
-                "run `cara sync --all`; one tick applies all {} member(s) and converges them on the next tick without replaying completed rewrites",
-                processable_prefix.len(),
-            )
-        } else {
-            format!(
-                "run `cara sync --all`; one tick applies {} of {members} member(s) and resumes the rest next tick without replaying completed rewrites",
-                processable_prefix.len(),
-            )
-        };
+        let gate = capacity_gate(context, deadline, members);
+        let at_capacity = matches!(gate, CapacityGate::AtCapacity { .. });
+        let safe_next_action = caravan_next_action(context, deadline, members, &gate, &admission);
         projections.push(CaravanBudgetProjection {
             caravan_id: caravan.id,
             members: caravan.members.clone(),
@@ -641,9 +846,15 @@ fn project(
     });
     let safe_next_action = if !rebase_on_join {
         "physical chain rebuilding is disabled; no apply reserve applies".to_owned()
-    } else if blocked_candidate.is_some() {
+    } else if let Err(defect) = &capacity {
         format!(
-            "every caravan holds the {capacity}-member bound implied by the configured deadline; admission stays closed with caravan_budget_capacity_exhausted until a caravan drains"
+            "admission capacity is unsound, so joins fail loudly with {} instead of being quietly gated; draining cannot repair it: {}",
+            defect.code, defect.safe_next_action,
+        )
+    } else if blocked_candidate.is_some() {
+        let bound = capacity.as_ref().copied().unwrap_or_default();
+        format!(
+            "every caravan holds the {bound}-member bound implied by the configured deadline; admission stays closed with caravan_budget_capacity_exhausted until a caravan drains"
         )
     } else if projections
         .iter()
@@ -654,12 +865,14 @@ fn project(
         "run `cara sync --all`; every selected caravan fits one tick".to_owned()
     };
     SyncBudgetStatus {
-        schema_version: 1,
+        schema_version: 2,
         rebase_on_join,
         deadline_ms: super::duration_millis(deadline),
         command_timeout_ms: context.config.command_timeout_secs.saturating_mul(1_000),
+        reserve_ms_per_command: reserve_secs_per_command(context).saturating_mul(1_000),
         deadline_command_slots: deadline_command_slots(context, deadline),
-        max_admissible_members: capacity,
+        max_admissible_members: capacity.as_ref().copied().ok(),
+        capacity_defect: capacity.err(),
         caravans: projections,
         blocked_candidate,
         safe_next_action,

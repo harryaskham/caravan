@@ -3807,6 +3807,11 @@ fn cacophony_context() -> AppContext {
     context
 }
 
+/// The sound admission bound for a fixture context, which must exist.
+fn capacity_of(context: &AppContext, deadline: Duration) -> u64 {
+    admission_capacity(context, deadline).expect("a sound admission bound")
+}
+
 /// A linear caravan of `members` open PRs with only the root armed.
 fn linear_chain(members: u64) -> Vec<PullRequestSnapshot> {
     (1..=members)
@@ -3880,7 +3885,7 @@ fn apply_reserve_models_actual_operations_instead_of_a_whole_chain_worst_case() 
 fn every_chain_size_around_the_threshold_still_drains_at_least_one_member() {
     let context = cacophony_context();
     let deadline = sync_operation_budget(&context);
-    let capacity = max_admissible_members(&context, deadline);
+    let capacity = capacity_of(&context, deadline);
     assert!(capacity >= 7, "live caravan2208 size must stay admissible");
 
     for members in 1..=capacity {
@@ -4064,7 +4069,7 @@ fn a_six_member_caravan_makes_progress_under_the_proportional_reserve() {
     );
     // The whole graph fits, so nothing is deferred purely by the reserve model.
     assert!(admission.deferred.is_empty());
-    assert!(max_admissible_members(&context, deadline) >= 6);
+    assert!(capacity_of(&context, deadline) >= 6);
 }
 
 #[test]
@@ -4079,7 +4084,11 @@ fn a_chain_larger_than_any_deadline_fails_closed_with_capacity_evidence() {
     let admission = admit_physical_prefix(&context, &chains, deadline);
     assert!(!admission.makes_progress());
     assert_eq!(admission.pending_admitted, 0);
-    assert_eq!(max_admissible_members(&context, deadline), 0);
+    // bd-b1c7b7: a bound this configuration cannot make sound is a defect, not
+    // a zero-member capacity that ordinary gating would pretend to enforce.
+    let defect = admission_capacity(&context, deadline).expect_err("an unsound bound is a defect");
+    assert_eq!(defect.code, "sync_budget_capacity_unsound");
+    assert_eq!(defect.computed_bound, 0);
 
     let error = physical_capacity_failure(
         &context,
@@ -4091,7 +4100,12 @@ fn a_chain_larger_than_any_deadline_fails_closed_with_capacity_evidence() {
     );
     assert_eq!(error.code(), "physical_sync_budget_insufficient");
     let details = error.details().expect("capacity evidence");
-    assert_eq!(details["max_admissible_members"], 0);
+    assert!(
+        details["max_admissible_members"].is_null(),
+        "a zero bound is never emitted"
+    );
+    assert_eq!(details["capacity_defect"]["computed_bound"], 0);
+    assert_eq!(details["capacity_defect"]["minimum_sound_bound"], 2);
     assert_eq!(details["configured_deadline_ms"], 120_000);
     assert_eq!(details["provider_mutations"], 0);
     assert_eq!(details["branch_mutations"], 0);
@@ -4103,7 +4117,7 @@ fn a_chain_larger_than_any_deadline_fails_closed_with_capacity_evidence() {
 fn admission_at_capacity_is_refused_with_typed_capacity_evidence() {
     let context = cacophony_context();
     let deadline = sync_operation_budget(&context);
-    let capacity = max_admissible_members(&context, deadline);
+    let capacity = capacity_of(&context, deadline);
     let below = status(linear_chain(capacity - 1), None, &clean);
     let at = status(linear_chain(capacity), None, &clean);
     let tail = PrNumber(capacity);
@@ -4125,7 +4139,8 @@ fn admission_at_capacity_is_refused_with_typed_capacity_evidence() {
         .expect("a chain at capacity must refuse further joins");
     assert_eq!(refusal.code, "caravan_budget_capacity_exhausted");
     assert_eq!(refusal.caravan_members, capacity);
-    assert_eq!(refusal.max_admissible_members, capacity);
+    assert_eq!(refusal.max_admissible_members, Some(capacity));
+    assert!(refusal.capacity_defect.is_none());
     assert_eq!(refusal.configured_deadline_ms, 3_600_000);
     assert!(refusal.safe_next_action.contains("drain"));
 
@@ -4152,14 +4167,14 @@ fn capacity_is_disabled_without_physical_chain_rebuilding() {
 #[test]
 fn capacity_scales_with_the_configured_deadline_and_child_timeout() {
     let mut context = cacophony_context();
-    let small = max_admissible_members(&context, sync_operation_budget(&context));
+    let small = capacity_of(&context, sync_operation_budget(&context));
     context.config.command_timeout_secs = 60;
-    let cheaper_children = max_admissible_members(&context, sync_operation_budget(&context));
+    let cheaper_children = capacity_of(&context, sync_operation_budget(&context));
     assert!(cheaper_children > small);
 
     context.config.command_timeout_secs = 120;
     context.config.sync.max_duration_secs = 1_800;
-    let shorter_deadline = max_admissible_members(&context, sync_operation_budget(&context));
+    let shorter_deadline = capacity_of(&context, sync_operation_budget(&context));
     assert!(shorter_deadline < small);
 }
 
@@ -4170,12 +4185,14 @@ fn status_exposes_the_reserve_prefix_and_next_action_before_the_cliff() {
 
     let projection = crate::sync::project_status(&context, &status);
 
-    assert_eq!(projection.schema_version, 1);
+    assert_eq!(projection.schema_version, 2);
     assert!(projection.rebase_on_join);
     assert_eq!(projection.deadline_ms, 3_600_000);
     assert_eq!(projection.command_timeout_ms, 120_000);
+    assert_eq!(projection.reserve_ms_per_command, 120_000);
     assert_eq!(projection.deadline_command_slots, 30);
-    assert!(projection.max_admissible_members >= 7);
+    assert!(projection.capacity_defect.is_none());
+    assert!(projection.max_admissible_members.unwrap() >= 7);
     let caravan = &projection.caravans[0];
     assert_eq!(caravan.caravan_id, PrNumber(1));
     assert_eq!(caravan.members.len(), 7);
@@ -4197,7 +4214,7 @@ fn status_exposes_the_reserve_prefix_and_next_action_before_the_cliff() {
 #[test]
 fn status_names_the_blocked_candidate_once_every_caravan_is_at_capacity() {
     let context = cacophony_context();
-    let capacity = max_admissible_members(&context, sync_operation_budget(&context));
+    let capacity = capacity_of(&context, sync_operation_budget(&context));
     let mut pulls = linear_chain(capacity);
     let mut candidate = pull_request(
         900,
@@ -4225,6 +4242,335 @@ fn status_names_the_blocked_candidate_once_every_caravan_is_at_capacity() {
             .contains("caravan_budget_capacity_exhausted")
     );
     assert!(projection.caravans[0].safe_next_action.contains("drain"));
+}
+
+// ---------------------------------------------------------------------------
+// bd-b1c7b7: admission prices slots with the actual-work reserve, and an
+// unsound bound is a defect instead of an impossible zero-member capacity.
+// ---------------------------------------------------------------------------
+
+/// Exact live configuration that produced the impossible bound: the reserve
+/// already priced work proportionally (`sync.reserve_secs_per_command: 15`)
+/// while admission still priced every slot at `command_timeout_secs: 600`.
+fn live_admission_context() -> AppContext {
+    let mut context = AppContext::default();
+    context.config.rebase_on_join = true;
+    context.config.command_timeout_secs = 600;
+    context.config.sync.max_duration_secs = 3_600;
+    assert_eq!(context.config.sync.reserve_secs_per_command, 15);
+    context
+}
+
+/// A candidate PR outside every caravan, so status names a blocked candidate.
+fn unlabelled_candidate() -> PullRequestSnapshot {
+    let mut candidate = pull_request(
+        900,
+        "candidate",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    candidate.labels.clear();
+    candidate
+}
+
+/// Live caravan 2215: four members, 21 command slots, 315000ms required. The
+/// reserve called that under nine percent of an hour while admission, pricing
+/// the identical slots at the full command timeout, called it over capacity.
+#[test]
+fn admission_capacity_uses_the_same_actual_work_reserve_as_the_apply_budget() {
+    let context = live_admission_context();
+    let status = status(linear_chain(4), Some(PrNumber(1)), &clean);
+
+    let projection = crate::sync::project_status(&context, &status);
+
+    assert_eq!(projection.reserve_ms_per_command, 15_000);
+    assert_eq!(projection.command_timeout_ms, 600_000);
+    // Deadline slots are priced by the reserve model, not by the worst case:
+    // 3600s / 15s = 240, never 3600s / 600s = 6.
+    assert_eq!(projection.deadline_command_slots, 240);
+    let caravan = &projection.caravans[0];
+    assert_eq!(caravan.required_command_slots, 21);
+    assert_eq!(caravan.required_ms, 315_000);
+    assert_eq!(
+        caravan.required_ms,
+        caravan.required_command_slots * projection.reserve_ms_per_command,
+        "one model prices both the reserve and the admission bound"
+    );
+    let bound = projection
+        .max_admissible_members
+        .expect("a sound admission bound");
+    assert!(
+        bound > 4,
+        "a chain costing under nine percent of the deadline is not at capacity"
+    );
+    assert!(!caravan.at_capacity);
+    assert!(projection.capacity_defect.is_none());
+    assert!(projection.blocked_candidate.is_none());
+    assert!(!caravan.safe_next_action.contains("drain"));
+}
+
+/// Live caravan 2233: one member, nine command slots, 135000ms required, and
+/// reported at capacity against a zero-member bound. A caravan holding a
+/// single member can never be at capacity under a sound bound.
+#[test]
+fn a_single_member_caravan_is_never_reported_at_capacity() {
+    for command_timeout_secs in [30, 120, 600] {
+        for max_duration_secs in [120, 600, 3_600] {
+            let mut context = live_admission_context();
+            context.config.command_timeout_secs = command_timeout_secs;
+            context.config.sync.max_duration_secs = max_duration_secs;
+            let status = status(linear_chain(1), None, &clean);
+
+            let projection = crate::sync::project_status(&context, &status);
+            let caravan = &projection.caravans[0];
+
+            assert!(
+                !caravan.at_capacity,
+                "a one-member caravan is at capacity only under a self-contradictory bound ({command_timeout_secs}s/{max_duration_secs}s)"
+            );
+            assert!(
+                projection.max_admissible_members != Some(0),
+                "a zero-member bound is never emitted"
+            );
+            assert_eq!(
+                projection.max_admissible_members.is_none(),
+                projection.capacity_defect.is_some(),
+                "an absent bound is always explained by a typed defect"
+            );
+        }
+    }
+
+    let context = live_admission_context();
+    let projection = crate::sync::project_status(&context, &status(linear_chain(1), None, &clean));
+    let caravan = &projection.caravans[0];
+    assert_eq!(caravan.required_command_slots, 9);
+    assert_eq!(caravan.required_ms, 135_000);
+}
+
+/// The stale-checkout control arm: `command_timeout_secs` 120 and 600 must
+/// imply the same admission bound, because a proven-safe per-command timeout
+/// is a ceiling on one command, not the price of every planned slot.
+#[test]
+fn raising_a_proven_safe_command_timeout_no_longer_closes_admission() {
+    let mut context = live_admission_context();
+    context.config.command_timeout_secs = 120;
+    let stale_checkout = capacity_of(&context, sync_operation_budget(&context));
+
+    context.config.command_timeout_secs = 600;
+    let current_checkout = capacity_of(&context, sync_operation_budget(&context));
+
+    assert_eq!(
+        stale_checkout, current_checkout,
+        "raising a proven-safe command timeout must not silently close admission"
+    );
+    assert!(current_checkout > 4);
+}
+
+/// The bound and the reserve must never disagree about the same chain: the
+/// hardest ordinary shape at the bound still fits the configured deadline.
+#[test]
+fn the_admission_bound_and_the_apply_reserve_agree_on_the_same_chain() {
+    let context = live_admission_context();
+    let deadline = sync_operation_budget(&context);
+    let bound = capacity_of(&context, deadline);
+    let retained = usize::try_from(bound - 1).expect("bounded fixture");
+    let status = status(linear_chain(bound), Some(PrNumber(1)), &clean);
+    let chains = with_retained_prefix(chain_costs(&status), retained);
+
+    let budget = budget_for(
+        &context,
+        &chains,
+        &[retained + 1],
+        ReserveScope::BoundedPrefix,
+    );
+
+    assert!(
+        budget.required < deadline,
+        "the bound must never admit a chain the reserve would refuse"
+    );
+    assert!(admit_physical_prefix(&context, &chains, deadline).makes_progress());
+}
+
+/// A non-positive bound is a configuration defect: it is reported as one, no
+/// caravan is gated by it, and the guidance names the configuration change
+/// that repairs it instead of a drain that provably cannot.
+#[test]
+fn an_unsound_bound_is_reported_as_a_defect_instead_of_zero_capacity() {
+    let mut context = live_admission_context();
+    // Four reserve slots for the whole tick cannot cover a two-member chain.
+    context.config.sync.max_duration_secs = 60;
+    let mut pulls = linear_chain(1);
+    pulls.push(unlabelled_candidate());
+    let status = status(pulls, None, &clean);
+
+    let projection = crate::sync::project_status(&context, &status);
+
+    assert_eq!(projection.max_admissible_members, None);
+    let defect = projection.capacity_defect.expect("a typed capacity defect");
+    assert_eq!(defect.code, "sync_budget_capacity_unsound");
+    assert_eq!(defect.computed_bound, 0);
+    assert_eq!(defect.minimum_sound_bound, 2);
+    assert_eq!(defect.reserve_ms_per_command, 15_000);
+    assert!(
+        defect.minimum_deadline_ms > defect.deadline_ms,
+        "the defect names the deadline that repairs it"
+    );
+    assert!(
+        defect
+            .safe_next_action
+            .contains("raise sync.max_duration_secs")
+    );
+
+    // Gating never fires under a defect, so no caravan is quietly closed and
+    // no candidate is reported as blocked behind an impossible bound.
+    assert!(
+        projection
+            .caravans
+            .iter()
+            .all(|caravan| !caravan.at_capacity)
+    );
+    assert_eq!(projection.blocked_candidate, None);
+    assert!(
+        !projection
+            .safe_next_action
+            .contains("until a caravan drains"),
+        "guidance must not recommend an action that cannot resolve the condition"
+    );
+    assert!(
+        projection
+            .safe_next_action
+            .contains("draining cannot repair")
+    );
+    assert!(
+        projection.caravans[0]
+            .safe_next_action
+            .contains("raise sync.max_duration_secs")
+    );
+}
+
+/// The complete filed fleet: a four-member caravan, a one-member caravan, and
+/// a canonical candidate that the impossible bound refused. Admission must be
+/// open for all of them under one shared, actual-work budget model.
+#[test]
+fn the_filed_fleet_reopens_admission_under_one_shared_budget_model() {
+    let context = live_admission_context();
+    let mut pulls = linear_chain(4);
+    pulls.push(pull_request(
+        11,
+        "other-1",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::squash(),
+    ));
+    pulls.push(unlabelled_candidate());
+    let status = status(pulls, None, &clean);
+
+    let projection = crate::sync::project_status(&context, &status);
+
+    assert_eq!(projection.caravans.len(), 2);
+    let four = &projection.caravans[0];
+    let one = &projection.caravans[1];
+    assert_eq!(four.members.len(), 4);
+    assert_eq!(four.required_command_slots, 21);
+    assert_eq!(four.required_ms, 315_000);
+    assert_eq!(one.members.len(), 1);
+    assert_eq!(one.required_command_slots, 9);
+    assert_eq!(one.required_ms, 135_000);
+    assert!(!four.at_capacity);
+    assert!(!one.at_capacity);
+    assert_eq!(projection.blocked_candidate, None);
+    assert!(projection.capacity_defect.is_none());
+    assert!(
+        !projection
+            .safe_next_action
+            .contains("caravan_budget_capacity_exhausted")
+    );
+    assert!(
+        caravan_capacity_refusal(&context, &status, PrNumber(900), Some(PrNumber(4))).is_none(),
+        "the candidate that was blocked by the impossible bound can join again"
+    );
+}
+
+#[test]
+fn gating_a_caravan_below_the_sound_floor_is_reported_as_a_contradiction() {
+    let context = live_admission_context();
+    let deadline = sync_operation_budget(&context);
+
+    // The exact filed shape: a one-member caravan measured against a bound it
+    // could never satisfy. Ordinary gating must never claim this.
+    let gate = gate_for_bound(&context, deadline, 1, 0);
+
+    let CapacityGate::Defect(defect) = gate else {
+        panic!("a one-member caravan at capacity is a contradiction, not gating");
+    };
+    assert_eq!(defect.code, "sync_budget_capacity_contradiction");
+    assert!(defect.safe_next_action.contains("no drain can ever clear"));
+    assert!(
+        defect
+            .safe_next_action
+            .contains("raise sync.max_duration_secs")
+    );
+
+    // A sound bound still gates a chain that genuinely reached it.
+    assert!(matches!(
+        gate_for_bound(&context, deadline, 4, 4),
+        CapacityGate::AtCapacity { bound: 4 }
+    ));
+    assert!(matches!(
+        gate_for_bound(&context, deadline, 3, 4),
+        CapacityGate::Open { bound: 4 }
+    ));
+}
+
+/// Under a defect, a join fails loudly with distinct typed evidence instead of
+/// being quietly refused as ordinary at-capacity gating.
+#[test]
+fn an_unsound_bound_refuses_joins_loudly_instead_of_gating_them() {
+    let mut context = live_admission_context();
+    context.config.sync.max_duration_secs = 60;
+    let at = status(linear_chain(1), None, &clean);
+
+    let refusal = caravan_capacity_refusal(&context, &at, PrNumber(999), Some(PrNumber(1)))
+        .expect("an unsound bound must refuse the join as a defect");
+
+    assert_eq!(refusal.code, "caravan_budget_capacity_defect");
+    assert_eq!(refusal.caravan_members, 1);
+    assert!(
+        refusal.max_admissible_members.is_none(),
+        "a zero bound is never emitted"
+    );
+    let defect = refusal
+        .capacity_defect
+        .as_ref()
+        .expect("typed defect evidence");
+    assert_eq!(defect.minimum_sound_bound, 2);
+    assert!(defect.minimum_deadline_ms > refusal.configured_deadline_ms);
+    assert!(
+        !refusal.safe_next_action.contains("drain below"),
+        "draining cannot clear a bound derived from configuration alone"
+    );
+    assert!(
+        refusal
+            .safe_next_action
+            .contains("raise sync.max_duration_secs")
+    );
+
+    let error = caravan_capacity_error(&refusal);
+    assert_eq!(error.code(), "caravan_budget_capacity_defect");
+    let details = error.details().expect("typed refusal evidence");
+    assert_eq!(details["mutated"], false);
+    assert_eq!(details["retryable"], false);
+    assert!(details["max_admissible_members"].is_null());
+    assert_eq!(details["capacity_defect"]["computed_bound"], 0);
+    let suggested = details["suggested_actions"].as_array().expect("actions");
+    assert!(
+        suggested.iter().all(|action| !action
+            .as_str()
+            .unwrap_or_default()
+            .contains("until the existing bounded prefix drains members out of the caravan")),
+        "no suggested action may be one that cannot resolve the defect"
+    );
 }
 
 #[test]

@@ -561,6 +561,12 @@ a `retry_tick` disposition plus the admitted/deferred member lists; the resumed
 tick never replays a completed provider mutation. Growing a caravan past the
 size the configured deadline can guarantee to drain is refused up front with
 `caravan_budget_capacity_exhausted` while the admitted prefix keeps draining.
+That bound is priced by the same actual-work reserve as `required_ms`, so
+raising a proven-safe `command_timeout_secs` never closes admission. A bound
+below two members is impossible to emit: a one-member caravan is never reported
+at capacity, and an arithmetic result below that floor fails loudly as
+`caravan_budget_capacity_defect` with the deadline that repairs it instead of a
+drain suggestion that cannot.
 `physical_sync_budget_insufficient` remains for the case where not even one
 pending member fits, and reports required/remaining time, configured deadline,
 maximum admissible chain size, processable prefix,

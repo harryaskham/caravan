@@ -704,7 +704,10 @@ costs no push, no auto-merge drop, and no force invalidation, so a completed
 prefix makes every later tick strictly cheaper. It splits into a hard part
 (control mutations, bounded parallel branch-apply rounds, mandatory midpoint
 verification) and a deferrable part (base/CI reconciliation and final
-discovery), all at `command_timeout_secs`.
+discovery), each planned command priced at `sync.reserve_secs_per_command`
+(itself capped by `command_timeout_secs`, which remains the hard ceiling for one
+child). Admission and the reserve share that one price: raising a proven-safe
+`command_timeout_secs` never changes the admissible chain size.
 
 When the complete reserve cannot remain but the hard reserve can, the tick
 applies an exact bounded prefix instead of refusing forever. The complete graph
@@ -719,15 +722,24 @@ idempotent and never replays a completed provider mutation. Independent
 caravans grow their prefixes round-robin under the same bounded parallelism and
 no caravan is reordered, evicted, or split to make a reserve fit.
 
-The configured deadline and child timeout imply a maximum admissible chain
-size: the largest chain whose trailing member is still guaranteed to drain in
-one tick. `status` exposes that bound, the required and retained reserves, the
+The configured deadline and per-command reserve imply a maximum admissible
+chain size: the largest chain whose trailing member is still guaranteed to
+drain in one tick, priced by the same actual-work model that produces the
+required reserve so the two can never disagree about the same chain. `status`
+exposes that bound, the required and retained reserves, the
 processable prefix, the deferred members, the blocked candidate, the configured
 deadline and a safe next action before any sync refusal, and `plan sync`
 reports the same prefix/deferral it would admit. Admission fails closed at that
 bound: an explicit `join` returns `caravan_budget_capacity_exhausted` and
 automatic admission stops with the same typed evidence, while the already
-admitted prefix keeps draining. If not even one pending member fits, both
+admitted prefix keeps draining. A bound below two members is never emitted and
+is never enforced as gating: a caravan holding a single member is never
+reported at capacity, and an arithmetic result below that floor is a typed
+configuration defect (`sync_budget_capacity_unsound`, surfaced to a refused
+join as `caravan_budget_capacity_defect`) carrying the computed bound, the
+sound floor, the per-command reserve and the deadline that repairs it. Defect
+guidance never recommends draining, which cannot change a bound derived from
+configuration alone. If not even one pending member fits, both
 `sync` and `plan sync` return `physical_sync_budget_insufficient` with
 required/remaining milliseconds, configured deadline, maximum admissible chain
 size, processable prefix, complete-or-partial plan count/hash, zero

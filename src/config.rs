@@ -196,6 +196,11 @@ pub struct SyncConfig {
     /// phase (bd-5528e6). Reserving the full `command_timeout_secs` for every
     /// slot is a worst case, not a plan, and makes larger caravans permanently
     /// unconvergeable. Capped by `command_timeout_secs`.
+    ///
+    /// The admission bound shares this price (bd-b1c7b7): the largest
+    /// admissible chain and the reserve required to drain it are computed from
+    /// one model, so raising a proven-safe `command_timeout_secs` never closes
+    /// admission.
     pub reserve_secs_per_command: u64,
 }
 

@@ -42,13 +42,16 @@ use crate::{AppContext, AppError, CheckInput, SyncInput};
 mod budget;
 mod decision;
 mod plan;
-pub use budget::{CaravanBudgetProjection, SyncBudgetStatus, project_status};
+pub use budget::{CapacityDefect, CaravanBudgetProjection, SyncBudgetStatus, project_status};
 use budget::{
-    ChainCost, MemberCost, PhysicalApplyAdmission, PhysicalCommitBudget, admit_physical_prefix,
-    externally_armed_non_roots, max_admissible_members,
+    CapacityGate, ChainCost, MemberCost, PhysicalApplyAdmission, PhysicalCommitBudget,
+    admit_physical_prefix, capacity_evidence, capacity_gate, externally_armed_non_roots,
 };
 #[cfg(test)]
-use budget::{ReserveScope, budget_for, chain_costs_from_status, complete_budget};
+use budget::{
+    ReserveScope, admission_capacity, budget_for, chain_costs_from_status, complete_budget,
+    gate_for_bound,
+};
 #[cfg(test)]
 use decision::decision_checkout_target;
 use decision::{
@@ -269,6 +272,10 @@ pub enum AutoAdmissionContinuation {
     /// The exact target chain already holds every member the configured
     /// deadline can guarantee to drain; the existing prefix keeps draining.
     CaravanBudgetCapacityExhausted,
+    /// The configured admission arithmetic yields no enforceable bound, so
+    /// joins fail loudly as a defect instead of being quietly gated by a bound
+    /// that no drain could ever clear.
+    CaravanBudgetCapacityDefect,
     /// The existing fleet is mid-rebuild after a bounded prefix apply, so no
     /// candidate is admitted until a tick converges it.
     RequiresConvergedFleet,
@@ -409,14 +416,24 @@ pub struct AutoAdmissionOutput {
     pub capacity_refusal: Option<CaravanCapacityRefusal>,
 }
 
-/// Typed `caravan_budget_capacity_exhausted` evidence for one refused join.
+/// Typed capacity evidence for one refused join.
+///
+/// The `code` distinguishes ordinary gating (`caravan_budget_capacity_exhausted`,
+/// clearable by draining) from a configuration defect
+/// (`caravan_budget_capacity_defect`, which no drain can clear).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CaravanCapacityRefusal {
     pub code: String,
     pub candidate_pr: PrNumber,
     pub caravan_id: PrNumber,
     pub caravan_members: u64,
-    pub max_admissible_members: u64,
+    /// Sound admission bound. Absent exactly when `capacity_defect` explains
+    /// why no bound could be enforced; a zero bound is never emitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_admissible_members: Option<u64>,
+    /// Typed defect when the configured arithmetic yields no enforceable bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_defect: Option<CapacityDefect>,
     pub configured_deadline_ms: u64,
     pub command_timeout_ms: u64,
     pub safe_next_action: String,
@@ -503,7 +520,12 @@ pub struct SyncApplyAdmissionPlan {
     pub required_ms: u64,
     pub complete_graph_required_ms: u64,
     pub configured_deadline_ms: u64,
-    pub max_admissible_members: u64,
+    /// Sound admission bound; absent exactly when `capacity_defect` is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_admissible_members: Option<u64>,
+    /// Typed defect when the configured arithmetic yields no sound bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_defect: Option<CapacityDefect>,
     /// True when ordinary convergence is intentionally left to the next tick.
     pub deferred_convergence: bool,
 }
@@ -1101,7 +1123,7 @@ fn physical_sync_budget_error_with_admission(
     let remaining = operation_deadline.saturating_duration_since(Instant::now());
     let plan_material = serde_json::to_vec(plans).expect("physical plans serialize");
     let deadline = sync_operation_budget(context);
-    let capacity = max_admissible_members(context, deadline);
+    let (capacity, capacity_defect) = capacity_evidence(context, deadline);
     let mut details = json!({
         "phase": phase,
         "required_ms": duration_millis(budget.required),
@@ -1116,12 +1138,13 @@ fn physical_sync_budget_error_with_admission(
         "reserve_model": "proportional per-command reserve; each command remains bounded by command_timeout_secs and the tick by the operation deadline",
         "required_mutation_capacity": budget.mutation_reserve,
         "max_admissible_members": capacity,
+        "capacity_defect": capacity_defect,
         "prepared_plan_count": plans.len(),
         "prepared_plan_hash": crate::membership::fnv1a64(&plan_material),
         "provider_mutations": 0,
         "branch_mutations": 0,
         "retryable": false,
-        "config_guidance": "increase sync.max_duration_secs until physical planning completes with required_ms still remaining, or lower command_timeout_secs only when the provider and Git latency bound supports it; the operation deadline is never extended",
+        "config_guidance": "increase sync.max_duration_secs until physical planning completes with required_ms still remaining, or lower sync.reserve_secs_per_command (the per-command price shared by this reserve and the admission bound) only when the provider and Git latency bound supports it; the operation deadline is never extended",
     });
     if let (Some(admission), Some(object)) = (admission, details.as_object_mut()) {
         object.insert(
@@ -2194,6 +2217,8 @@ fn bounded_prefix_output(
         .filter(|pause| pause.state.is_effective())
         .cloned()
         .collect();
+    let (checkpoint_capacity, checkpoint_capacity_defect) =
+        capacity_evidence(context, sync_operation_budget(context));
     let evidence = json!({
         "admitted_prefix": admission.admitted_prs,
         "deferred_members": admission.deferred,
@@ -2202,7 +2227,8 @@ fn bounded_prefix_output(
         "complete_graph_required_ms": duration_millis(admission.complete_budget.required),
         "complete_graph_command_slots": admission.complete_budget.command_slots,
         "configured_deadline_ms": duration_millis(sync_operation_budget(context)),
-        "max_admissible_members": max_admissible_members(context, sync_operation_budget(context)),
+        "max_admissible_members": checkpoint_capacity,
+        "capacity_defect": checkpoint_capacity_defect,
         "provider_state": sync_checkpoint_evidence(&progress),
     });
     lock.checkpoint("physical_rebase_bounded_prefix_complete", evidence, false)?;
@@ -3062,8 +3088,12 @@ fn run_auto_admission(
             if let Some(refusal) =
                 caravan_capacity_refusal(context, &status, candidate.number, target_tail)
             {
+                output.continuation = if refusal.capacity_defect.is_some() {
+                    AutoAdmissionContinuation::CaravanBudgetCapacityDefect
+                } else {
+                    AutoAdmissionContinuation::CaravanBudgetCapacityExhausted
+                };
                 output.capacity_refusal = Some(refusal);
-                output.continuation = AutoAdmissionContinuation::CaravanBudgetCapacityExhausted;
                 break;
             }
             let conservative_membership_bound =
@@ -3139,8 +3169,9 @@ fn has_mutation_capacity(context: &AppContext, progress: &SyncProgress, reserve:
 ///
 /// Returns typed refusal evidence when accepting the candidate would push the
 /// exact target chain past the largest size the configured deadline can still
-/// guarantee to drain. Forming a brand-new caravan is never refused here: an
-/// independent chain has its own bounded prefix.
+/// guarantee to drain, or when the configured arithmetic yields no bound
+/// admission could honestly enforce. Forming a brand-new caravan is never
+/// refused here: an independent chain has its own bounded prefix.
 pub(crate) fn caravan_capacity_refusal(
     context: &AppContext,
     status: &StatusOutput,
@@ -3152,48 +3183,81 @@ pub(crate) fn caravan_capacity_refusal(
     }
     let caravan = status.analysis.fleet.containing(target_tail?)?;
     let deadline = sync_operation_budget(context);
-    let capacity = max_admissible_members(context, deadline);
     let members = u64::try_from(caravan.members.len()).unwrap_or(u64::MAX);
-    if members < capacity {
-        return None;
-    }
+    let (code, bound, defect, safe_next_action) = match capacity_gate(context, deadline, members) {
+        CapacityGate::Open { .. } => return None,
+        CapacityGate::AtCapacity { bound } => (
+            "caravan_budget_capacity_exhausted",
+            Some(bound),
+            None,
+            format!(
+                "let caravan #{} drain below {bound} members, or raise sync.max_duration_secs (currently {}s) before admitting #{candidate_pr}; no member is reordered, evicted, or split to make room",
+                caravan.id,
+                deadline.as_secs(),
+            ),
+        ),
+        // bd-b1c7b7: an unsound bound is a configuration defect, so the
+        // guidance names the configuration change that repairs it instead
+        // of a drain that provably cannot.
+        CapacityGate::Defect(defect) => {
+            let action = format!(
+                "do not wait for caravan #{} to drain: draining cannot repair an unsound admission bound. {}",
+                caravan.id, defect.safe_next_action,
+            );
+            ("caravan_budget_capacity_defect", None, Some(defect), action)
+        }
+    };
     Some(CaravanCapacityRefusal {
-        code: "caravan_budget_capacity_exhausted".to_owned(),
+        code: code.to_owned(),
         candidate_pr,
         caravan_id: caravan.id,
         caravan_members: members,
-        max_admissible_members: capacity,
+        max_admissible_members: bound,
+        capacity_defect: defect,
         configured_deadline_ms: duration_millis(deadline),
         command_timeout_ms: context.config.command_timeout_secs.saturating_mul(1_000),
-        safe_next_action: format!(
-            "let caravan #{} drain below {capacity} members, or raise sync.max_duration_secs (currently {}s) before admitting #{candidate_pr}; no member is reordered, evicted, or split to make room",
-            caravan.id,
-            deadline.as_secs(),
-        ),
+        safe_next_action,
     })
 }
 
-/// Typed zero-write refusal for an explicit join at chain capacity.
+/// Typed zero-write refusal for an explicit join at chain capacity, or for an
+/// admission bound the configuration cannot make sound.
 pub(crate) fn caravan_capacity_error(refusal: &CaravanCapacityRefusal) -> AppError {
+    let defect = refusal.capacity_defect.is_some();
+    let message = if defect {
+        "the configured sync deadline yields no admissible chain size, so admission cannot be gated honestly and the join fails as a defect"
+    } else {
+        "the target caravan already holds every member the configured sync deadline can guarantee to drain"
+    };
+    let suggested_actions = if defect {
+        json!([
+            "raise sync.max_duration_secs until the reported minimum_deadline_ms fits, so a chain of at least two members is admissible again",
+            "lower sync.reserve_secs_per_command to a proven-safe per-command reserve",
+            "start an independent caravan; waiting for an existing caravan to drain cannot repair an unsound bound"
+        ])
+    } else {
+        json!([
+            "run `cara sync --all` until the existing bounded prefix drains members out of the caravan",
+            "raise sync.max_duration_secs, or lower a proven-safe sync.reserve_secs_per_command, to raise max_admissible_members",
+            "start an independent caravan instead of extending one already at capacity"
+        ])
+    };
     AppError::structured(
         ErrorCategory::Validation,
-        "caravan_budget_capacity_exhausted",
-        "the target caravan already holds every member the configured sync deadline can guarantee to drain",
+        refusal.code.clone(),
+        message,
         Some(json!({
             "mutated": false,
             "candidate_pr": refusal.candidate_pr,
             "caravan_id": refusal.caravan_id,
             "caravan_members": refusal.caravan_members,
             "max_admissible_members": refusal.max_admissible_members,
+            "capacity_defect": refusal.capacity_defect,
             "configured_deadline_ms": refusal.configured_deadline_ms,
             "command_timeout_ms": refusal.command_timeout_ms,
             "retryable": false,
             "safe_next_action": refusal.safe_next_action,
-            "suggested_actions": [
-                "run `cara sync --all` until the existing bounded prefix drains members out of the caravan",
-                "raise sync.max_duration_secs, or lower a proven-safe command_timeout_secs, to raise max_admissible_members",
-                "start an independent caravan instead of extending one already at capacity"
-            ],
+            "suggested_actions": suggested_actions,
         })),
     )
 }

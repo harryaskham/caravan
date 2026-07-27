@@ -2156,10 +2156,23 @@ fn render_status(output: &caravan::read::StatusOutput) -> String {
                 projection.processable_prefix.len(),
                 projection.members.len(),
                 projection.deferred.len(),
-                output.sync_budget.max_admissible_members,
+                output
+                    .sync_budget
+                    .max_admissible_members
+                    .map_or_else(|| "unsound".to_owned(), |bound| bound.to_string()),
                 projection.safe_next_action,
             );
         }
+    }
+    if let Some(defect) = &output.sync_budget.capacity_defect {
+        let _ = writeln!(
+            text,
+            "! {}: the configured deadline implies a {}-member admission bound, below the {}-member floor; draining cannot repair it — {}",
+            failure(&defect.code),
+            defect.computed_bound,
+            defect.minimum_sound_bound,
+            defect.safe_next_action,
+        );
     }
     if let Some(blocked) = output.sync_budget.blocked_candidate {
         let _ = writeln!(
