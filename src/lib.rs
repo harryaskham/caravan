@@ -424,7 +424,10 @@ RECOVERY, LOCKS, AND OBSERVABILITY
   before provider mutation. Make it safe or use the Cara repair workspace.
 - `cara log` reads the bounded event journal; hooks consume canonical event IDs
   and must deduplicate retries. Hook failure cannot roll back completed GitHub
-  work; blocking hooks return typed partial receipts.
+  work; blocking hooks return typed partial receipts. `examples/hooks/` contains
+  a complete fast cron-driven setup: a bounded `cara loop --once` tick plus an
+  idempotent hook that files exactly one deduplicated Cacophony bead per
+  canonical event, which normal controller dispatch then routes to an agent.
 - `cara show`, `next`, `prev`, and `van list|next|prev` are navigation surfaces;
   they never authorize skipping admission or mutation preflight. If a clean,
   non-current destination lags a Cara physical rewrite, navigation reverifies

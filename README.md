@@ -532,6 +532,13 @@ work around it; head, base, branch, and membership are always preserved. A
 partial provider read is reported as `unknown_provider_state` and retried rather
 than being mistaken for an absence.
 
+For a complete, fast, agent-dispatching setup, see
+[`examples/hooks/`](examples/hooks/README.md): a `caco` cron entry runs one
+bounded `cara loop --once` tick, and an idempotent hook files exactly one
+deduplicated bead per canonical event, which normal controller dispatch routes
+to an agent. Hooks stay `blocking: false` so a delivery failure can never roll
+back completed provider work.
+
 When enabling cumulative mode, set `sync.max_duration_secs` high enough for
 physical planning plus the typed apply reserve; this repository uses
 900 seconds. `cara status` reports the required and retained reserve, the
