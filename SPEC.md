@@ -587,6 +587,13 @@ Promotion failure is the typed `root_promotion_incomplete` with cause
 the typed `root_merge_refused` with cause `base_not_default_branch`,
 `root_head_moved_before_merge`, `foreign_auto_merge_actor`,
 `provider_did_not_persist_merge`, `merged_into_unexpected_base`, or
+Creation flattens on the same terms as synchronization (bd-abd929): `cara new`
+and `cara renew` authorize root flattening whenever the candidate has no join
+target and `sync.head_merge_actor` is `caravan`. Wiring it into sync alone meant
+a branch that merged the default branch into itself was admitted by a later
+tick but refused at the moment the caravan was created, which is where an
+operator meets it first.
+
 A merge-preserving root that Cara will squash-merge is flattened rather than
 replayed (bd-85b71d): its history is discarded at landing, so the tick commits
 the already-proven merge tree directly onto the exact target instead of

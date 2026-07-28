@@ -1442,6 +1442,8 @@ fn execute_locked(
             ));
         }
         let join_target = initial_join_target.clone();
+        // A root has no tail to follow; only a root is squash-merged by cara.
+        let is_caravan_root = join_target.is_none();
         let desired_base = join_target.as_ref().map_or_else(
             || status.default_branch.clone(),
             |target| target.tail.head.name.clone(),
@@ -1494,7 +1496,19 @@ fn execute_locked(
             crate::physical_rebase::PlannedBase::Remote(target.clone()),
             &status.analysis.fleet.default_branch,
             crate::physical_rebase::RebaseExecutionBudget::new(timeout)
-                .with_deadline(operation_deadline),
+                .with_deadline(operation_deadline)
+                // bd-abd929: bd-85b71d applied this reasoning inside sync but never
+                // here: a caravan ROOT is squash-merged by cara, so its history
+                // is discarded at landing and a merge-preserving replay proves
+                // nothing. Flatten onto the exact target instead of refusing
+                // with `rebase_merge_tree_mismatch`. A member joining behind a
+                // tail is never flattened, because its ancestry must physically
+                // follow the chain.
+                .flattening_squashed_root(
+                    is_caravan_root
+                        && context.config.sync.resolved_head_merge_actor()
+                            == crate::model::HeadMergeActor::Caravan,
+                ),
         )?;
         if let Some(source) = join_source_receipt.as_ref() {
             let planned_base = match &prepared.plan.new_base {
