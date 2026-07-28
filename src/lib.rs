@@ -8,6 +8,7 @@ use std::time::Duration;
 
 pub mod admission;
 pub mod ci;
+pub mod ci_gate;
 pub mod command;
 pub mod compatibility;
 pub mod force;
@@ -1316,6 +1317,71 @@ pub fn updater_config() -> updatable_cli::UpdaterConfig {
         Ok(token) if !token.trim().is_empty() => config.with_github_token(token),
         _ => config,
     }
+}
+
+/// Inputs for the CI-admission gate (bd-2a29c8).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, clap::Args)]
+pub struct CiGateInput {
+    /// Exact pull request to evaluate.
+    #[arg(long, value_name = "PR")]
+    pub pr: u64,
+
+    /// Whether a prior successful required-check run exists for this exact head.
+    ///
+    /// The gate may only assert that existing evidence still applies; it can
+    /// never assert that a head may merge without evidence.
+    #[arg(long)]
+    #[serde(default)]
+    pub head_evidence: bool,
+}
+
+/// Typed CI-admission decision consumed by repository workflows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CiGateDecision {
+    /// Existing head-SHA evidence still applies exactly; no re-run needed.
+    CiValid,
+    /// A new head or changed merge content requires CI.
+    CiRequired,
+    /// Operator explicitly accepted this head's CI state with caravan-force.
+    CiForceAccepted,
+    /// Not a caravan candidate; Caravan has no opinion.
+    CiNotApplicable,
+    /// Nothing could be proven, so CI must run.
+    CiUnknown,
+}
+
+impl CiGateDecision {
+    /// Stable code emitted to workflows.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::CiValid => "ci_valid",
+            Self::CiRequired => "ci_required",
+            Self::CiForceAccepted => "ci_force_accepted",
+            Self::CiNotApplicable => "ci_not_applicable",
+            Self::CiUnknown => "ci_unknown",
+        }
+    }
+
+    /// Whether a consuming workflow should run its expensive jobs.
+    #[must_use]
+    pub const fn runs_ci(self) -> bool {
+        matches!(self, Self::CiRequired | Self::CiUnknown)
+    }
+}
+
+/// Bounded, auditable CI-admission gate result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CiGateOutput {
+    pub schema_version: u32,
+    pub decision: CiGateDecision,
+    pub decision_code: String,
+    pub run_ci: bool,
+    pub pr: crate::model::PrNumber,
+    pub reason: String,
+    /// Exact facts the decision rests on, so a skipped run is auditable.
+    pub evidence: serde_json::Value,
 }
 
 /// Optional explicit directory for one stable PATH-visible Cara installation.

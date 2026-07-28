@@ -309,6 +309,22 @@ the automatic and explicit surfaces can be compared directly from JSON.
 
 `--tail-pr` names the intended merge target. `--head-pr` names a caravan whose tail is resolved at execution time. They are mutually exclusive.
 
+### CI admission gate
+
+`cara ci-gate --pr N [--head-evidence]` answers one question for a consuming
+workflow: is existing CI evidence still exactly valid for this pull request
+generation (bd-2a29c8). It returns `ci_valid`, `ci_required`, `ci_force_accepted`,
+`ci_not_applicable`, or `ci_unknown`, plus `run_ci` and the exact evidence the
+decision rests on, so a skipped run is auditable.
+
+The gate is advisory about **cost**, never about **safety**. It may only assert
+that exact existing evidence still applies; it may never assert that a head can
+merge without evidence. `--head-evidence` is the caller's statement that a prior
+successful required-check run exists for that exact head, and without it the
+answer is always `ci_required`. Anything unproven is `ci_unknown`, which runs CI.
+The bundled `.github/actions/ci-gate` composite action fails open to running CI
+when Cara itself cannot answer.
+
 ### Creation and membership
 
 - `cara new [--pr N | --create-pr]` — create a one-PR caravan from one exact remote Saloon PR, the current branch's unique open PR, or an explicitly created topic-branch PR.

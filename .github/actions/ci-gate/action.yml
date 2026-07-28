@@ -1,0 +1,62 @@
+name: Caravan CI admission gate
+description: >-
+  Decide whether existing CI evidence still applies to one exact pull request,
+  so expensive jobs can be made conditional without re-deriving Caravan
+  semantics from GitHub event shape. Advisory about cost, never about safety.
+
+inputs:
+  pr:
+    description: Exact pull request number to evaluate.
+    required: true
+  head-evidence:
+    description: >-
+      Whether a prior successful required-check run exists for this exact head
+      SHA. The gate can only assert that existing evidence still applies; it
+      never asserts that a head may merge without evidence.
+    required: false
+    default: "false"
+  cara:
+    description: Cara binary to invoke.
+    required: false
+    default: cara
+
+outputs:
+  decision:
+    description: One of ci_valid, ci_required, ci_force_accepted, ci_not_applicable, ci_unknown.
+    value: ${{ steps.gate.outputs.decision }}
+  run-ci:
+    description: Whether the consuming workflow should run its expensive jobs.
+    value: ${{ steps.gate.outputs.run-ci }}
+  reason:
+    description: Exact reason for the decision, for audit.
+    value: ${{ steps.gate.outputs.reason }}
+
+runs:
+  using: composite
+  steps:
+    - id: gate
+      shell: bash
+      env:
+        CARA_BIN: ${{ inputs.cara }}
+        PR: ${{ inputs.pr }}
+        HEAD_EVIDENCE: ${{ inputs.head-evidence }}
+      run: |
+        set -euo pipefail
+        flags=(--json ci-gate --pr "$PR")
+        if [ "$HEAD_EVIDENCE" = "true" ]; then
+          flags+=(--head-evidence)
+        fi
+        # Never fail the gate closed on a Cara error: an unproven decision must
+        # fall open to RUNNING CI, never to skipping it.
+        if ! output="$("$CARA_BIN" "${flags[@]}" 2>/dev/null)"; then
+          echo "decision=ci_unknown" >> "$GITHUB_OUTPUT"
+          echo "run-ci=true" >> "$GITHUB_OUTPUT"
+          echo "reason=cara could not evaluate the gate; running CI" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        decision="$(printf '%s' "$output" | jq -r '.data.decision_code // "ci_unknown"')"
+        run_ci="$(printf '%s' "$output" | jq -r 'if .data.run_ci == false then "false" else "true" end')"
+        reason="$(printf '%s' "$output" | jq -r '.data.reason // "no reason reported"')"
+        echo "decision=$decision" >> "$GITHUB_OUTPUT"
+        echo "run-ci=$run_ci" >> "$GITHUB_OUTPUT"
+        echo "reason=$reason" >> "$GITHUB_OUTPUT"

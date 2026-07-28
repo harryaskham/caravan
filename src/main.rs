@@ -62,6 +62,8 @@ enum Command {
     Log(LogCommand),
     /// Return the canonical next priority-then-FIFO admission without mutation.
     NextCandidate,
+    /// Decide whether existing CI evidence still applies to one exact PR.
+    CiGate(caravan::CiGateInput),
     /// Validate current or proposed caravan state without mutation.
     Check(CheckInput),
     /// Create a one-PR caravan from the current branch.
@@ -351,6 +353,7 @@ fn run(cli: &Cli) -> Result<(), i32> {
         Command::Web(input) => run_web(cli, input),
         Command::Log(command) => run_log(cli, command),
         Command::NextCandidate => run_next_candidate(cli),
+        Command::CiGate(input) => run_ci_gate(cli, input),
         Command::Check(input) => run_check(cli, input),
         Command::New(input) => run_create_membership(cli, input),
         Command::Renew(input) => {
@@ -616,6 +619,23 @@ fn run_next_candidate(cli: &Cli) -> Result<(), i32> {
                 println!("next: {}", next.command);
                 println!("  {}", next.reason);
             }
+            Ok(())
+        }
+        Err(error) => emit_human_error(error),
+    }
+}
+
+fn run_ci_gate(cli: &Cli, input: &caravan::CiGateInput) -> Result<(), i32> {
+    let context = load_context(cli)?;
+    let result = caravan::read::status(&context)
+        .and_then(|status| caravan::ci_gate::evaluate(&status, input));
+    if cli.json {
+        return emit_result(true, result);
+    }
+    match result {
+        Ok(output) => {
+            println!("{} run_ci={}", output.decision_code, output.run_ci);
+            println!("  {}", output.reason);
             Ok(())
         }
         Err(error) => emit_human_error(error),
