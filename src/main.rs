@@ -1052,7 +1052,16 @@ fn run_resume(cli: &Cli, input: &ResumeInput) -> Result<(), i32> {
 
 fn run_sync(cli: &Cli, input: &SyncInput) -> Result<(), i32> {
     let context = load_context(cli)?;
-    let result = caravan::sync::sync(&context, input);
+    // Human sync is a long network operation: stream bounded stage progress so
+    // the terminal is never silent. JSON/MCP callers install no observer and
+    // keep their exact envelope contract.
+    let result = if cli.json {
+        caravan::sync::sync(&context, input)
+    } else {
+        caravan::sync::progress::observing(stream_sync_progress, || {
+            caravan::sync::sync(&context, input)
+        })
+    };
     if cli.json {
         return emit_result(true, result);
     }
@@ -1359,16 +1368,19 @@ fn run_loop(cli: &Cli, input: &LoopInput) -> Result<(), i32> {
             caravan::loop_runner::run(&context, input, |_| {}, |_, _| {}),
         );
     }
-    match caravan::loop_runner::run(
-        &context,
-        input,
-        |tick| {
-            print!("{}", render_loop_tick(tick));
-        },
-        |error, failure| {
-            eprintln!("{}", render_loop_failure(error, failure));
-        },
-    ) {
+    let outcome = caravan::sync::progress::observing(stream_sync_progress, || {
+        caravan::loop_runner::run(
+            &context,
+            input,
+            |tick| {
+                print!("{}", render_loop_tick(tick));
+            },
+            |error, failure| {
+                eprintln!("{}", render_loop_failure(error, failure));
+            },
+        )
+    });
+    match outcome {
         Ok(output) => {
             if output.stopped_by_signal {
                 println!(
@@ -1380,6 +1392,14 @@ fn run_loop(cli: &Cli, input: &LoopInput) -> Result<(), i32> {
         }
         Err(error) => emit_human_error(error),
     }
+}
+
+/// Stream one bounded sync stage line to the terminal.
+fn stream_sync_progress(event: &caravan::sync::progress::SyncProgressEvent) {
+    use std::io::Write as _;
+    let mut stderr = io::stderr().lock();
+    let _ = writeln!(stderr, "{} {}: {}", dim(".."), event.phase, event.detail);
+    let _ = stderr.flush();
 }
 
 fn render_loop_failure(
@@ -1425,7 +1445,9 @@ fn run_manual_loop(context: &AppContext, input: &LoopInput) -> Result<(), i32> {
         ));
     }
     loop {
-        match caravan::loop_runner::tick(context) {
+        match caravan::sync::progress::observing(stream_sync_progress, || {
+            caravan::loop_runner::tick(context)
+        }) {
             Ok(output) => {
                 print!("{}", render_loop_tick(&output));
                 if input.once {

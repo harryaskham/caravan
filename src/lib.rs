@@ -213,6 +213,11 @@ the exact pinned binary. It performs strict parsing and no repository/provider a
    affected PRs, completed steps, provider receipts, suggested actions, and
    resumable command are the continuation contract. Never replace it with a
    generic summary or proceed around it manually.
+8. Human `cara sync` and `cara loop` stream bounded stage progress (discovery,
+   physical planning/apply, midpoint revalidation, provider convergence,
+   auto-admission, final rediscovery) to stderr while the tick runs, so a long
+   network operation is never silent. JSON and MCP callers install no observer
+   and keep byte-identical envelopes.
 
 VIRTUAL CHAINS (SAFE DEFAULT)
 With `rebase_on_join: false` or an absent setting, Caravan does not rewrite PR

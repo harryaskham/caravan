@@ -48,6 +48,7 @@ use crate::{AppContext, AppError, CheckInput, SyncInput};
 mod budget;
 mod decision;
 mod plan;
+pub mod progress;
 pub use budget::{CapacityDefect, CaravanBudgetProjection, SyncBudgetStatus, project_status};
 use budget::{
     CapacityGate, ChainCost, MemberCost, PhysicalApplyAdmission, PhysicalCommitBudget,
@@ -2440,9 +2441,22 @@ fn sync_with_lock(
     let github_budget =
         crate::command::GithubRequestBudget::new(context.config.sync.max_github_requests_per_tick);
     let initial_status_started = Instant::now();
+    progress::emit(
+        "initial_discovery",
+        "reading exact provider graph, checks, and admission order",
+    );
     let mut status =
         read::status_with_deadline_and_budget(context, operation_deadline, Some(&github_budget))?;
     let initial_status_elapsed = initial_status_started.elapsed();
+    progress::emit(
+        "initial_discovery",
+        format!(
+            "discovered {} caravan(s), {} unqueued PR(s) in {}ms",
+            status.analysis.fleet.caravans.len(),
+            status.analysis.fleet.unqueued.len(),
+            duration_millis(initial_status_elapsed),
+        ),
+    );
     crate::initialization::require_ready(&status.initialization)?;
     let runner = crate::command::ProcessRunner::in_directory(&context.repository_path)
         .with_timeout(timeout)
@@ -2470,8 +2484,18 @@ fn sync_with_lock(
             }),
             false,
         )?;
-        let (prepared, progress, admission) =
+        let (prepared, progress_state, admission) =
             prepare_physical_chains(context, &status, input.all, &provider, operation_deadline)?;
+        progress::emit(
+            "physical_rebase_planning",
+            format!(
+                "planned {} chain(s); admitted prefix {:?}, deferred {}",
+                prepared.len(),
+                admission.admitted_prs,
+                admission.deferred.len(),
+            ),
+        );
+        let progress = progress_state;
         let plans = prepared
             .iter()
             .flat_map(|chain| chain.members.iter().map(|item| item.plan.clone()))
@@ -2529,6 +2553,17 @@ fn sync_with_lock(
         })?;
         physical_rebuild =
             apply_physical_chains(&status, &provider, &prepared, progress, &mut lock)?;
+        progress::emit(
+            "physical_rebase_applied",
+            format!(
+                "rewrote {} branch generation(s) under exact leases",
+                physical_rebuild
+                    .receipts
+                    .iter()
+                    .filter(|receipt| !receipt.already_satisfied)
+                    .count(),
+            ),
+        );
         lock.checkpoint(
             "physical_rebase_applied",
             json!({
@@ -2539,6 +2574,10 @@ fn sync_with_lock(
             }),
             false,
         )?;
+        progress::emit(
+            "midpoint_rediscovery",
+            "revalidating every pushed generation before provider convergence",
+        );
         let mut midpoint = read::status_with_deadline_and_budget(
             context,
             operation_deadline,
@@ -2666,6 +2705,18 @@ fn sync_with_lock(
         &rewritten_heads,
         RequiredRunsPolicy::from_config(&context.config.sync),
     )?;
+    progress::emit(
+        "provider_convergence",
+        format!(
+            "converged {} caravan(s) with {} completed provider mutation(s)",
+            progress.synchronized_caravans.len(),
+            progress
+                .steps
+                .iter()
+                .filter(|step| step.state == MutationStepState::Completed)
+                .count(),
+        ),
+    );
     if context.config.rebase_on_join {
         physical_rebuild.steps.append(&mut progress.steps);
         progress.steps = physical_rebuild.steps;
@@ -2692,6 +2743,10 @@ fn sync_with_lock(
     // A fresh graph is the authoritative completion receipt. It detects a
     // default-branch or fleet change that raced after the preflight proof.
     let final_status_started = Instant::now();
+    progress::emit(
+        "final_rediscovery",
+        "reading the authoritative post-mutation graph",
+    );
     let mut final_status = read::status_with_deadline_and_budget(
         context,
         operation_deadline,
@@ -2752,6 +2807,16 @@ fn sync_with_lock(
         .map_err(|error| {
             attach_auto_admission_progress(&error, context, &progress, &github_budget)
         })?;
+        progress::emit(
+            "auto_admission",
+            format!(
+                "considered {} candidate(s): {} join(s), {} skip(s), continuation {:?}",
+                admission.candidates_considered,
+                admission.joins.len(),
+                admission.skips.len(),
+                admission.continuation,
+            ),
+        );
         final_status = admitted_status;
         auto_admission = admission;
 

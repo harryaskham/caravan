@@ -366,7 +366,7 @@ Splitting retargets the selected non-head to the default branch, making it a new
   dry-run lease, CI, convergence, and first auto-admission selection preflight
   without provider writes; return ordered exact actions and rediscovery barriers.
 - `cara sync` — synchronize the current caravan.
-- `cara sync --all` — synchronize every non-paused caravan in deterministic head order.
+- `cara sync --all` — synchronize every non-paused caravan in deterministic head order. Human invocations of `sync` and `loop` stream bounded stage progress to stderr — initial discovery, physical planning and apply, midpoint revalidation, provider convergence, auto-admission, and final rediscovery — so a long network tick is never silent. Progress is observational only: no policy depends on it, details are truncated, and JSON/MCP callers install no observer and keep byte-identical envelopes.
 - `cara repair start --pr N [--target-pr T]` — create or reuse a durable isolated provider-owned workspace at PR `N`'s exact head, and start an exact-target non-committing merge. The target is current default when omitted.
 - `cara repair status --session ID` — inspect the persisted exact head/target/conflict/workspace/publication receipt without mutation.
 - `cara repair authorize-agent-edits --session ID --actor A --reason R [--expires-secs N]` — after exact session/config/provider head+target revalidation, authorize one identity to stage bounded arbitrary repository-content edits in the isolated workspace. Persist repository/PR/head/target/session/config/manifest/actor/reason/expiry; no provider mutation.
