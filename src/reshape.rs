@@ -798,13 +798,18 @@ fn preflight_new_head(
     provider: &impl MembershipProvider,
     status: &StatusOutput,
 ) -> Result<(), AppError> {
-    if !provider
-        .repository_allows_auto_merge(&status.repository)
-        .map_err(|error| provider_error(&error, None))?
+    // bd-4d725c: native auto-merge is a precondition only when the provider
+    // performs the merge. Under `sync.head_merge_actor: caravan` cara merges the
+    // promoted head itself, so a repository that deliberately disabled native
+    // auto-merge must still be able to promote a new head by eviction.
+    if !status.head_merge.actor.caravan()
+        && !provider
+            .repository_allows_auto_merge(&status.repository)
+            .map_err(|error| provider_error(&error, None))?
     {
         return Err(AppError::validation(
             "auto_merge_not_enabled",
-            "repository settings do not permit auto-merge for the new head",
+            "repository settings do not permit auto-merge for the new head; enable it, or set sync.head_merge_actor=\"caravan\" so cara owns the merge",
         ));
     }
     if !provider
@@ -1072,11 +1077,13 @@ mod tests {
 
     struct FakeProvider {
         pull_requests: RefCell<BTreeMap<PrNumber, PullRequestSnapshot>>,
+        allows_auto_merge: bool,
     }
 
     impl FakeProvider {
         fn new(pull_requests: &[PullRequestSnapshot]) -> Self {
             Self {
+                allows_auto_merge: true,
                 pull_requests: RefCell::new(
                     pull_requests
                         .iter()
@@ -1138,7 +1145,7 @@ mod tests {
             &self,
             _repository: &RepositoryId,
         ) -> Result<bool, MutationError> {
-            Ok(true)
+            Ok(self.allows_auto_merge)
         }
 
         fn repository_labels(
@@ -1415,6 +1422,36 @@ mod tests {
                 diagnostic: None,
             })
         }
+    }
+
+    /// bd-4d725c: promoting a new head by eviction must not demand a
+    /// provider-native setting the repository will never use.
+    #[test]
+    fn a_caravan_merge_actor_promotes_a_head_without_native_auto_merge() {
+        let pulls = vec![pull_request(1, "main"), pull_request(2, "pr-1")];
+        let mut provider = FakeProvider::new(&pulls);
+        provider.allows_auto_merge = false;
+        let mut status = status(pulls);
+        status.head_merge.actor = crate::model::HeadMergeActor::Caravan;
+
+        let result = execute(
+            status,
+            &Clean,
+            &provider,
+            ReshapeOperation::Evict,
+            Some(PrNumber(1)),
+            Some("head failed".to_owned()),
+            None,
+        );
+
+        let refused = result
+            .as_ref()
+            .err()
+            .is_some_and(|error| mcp_cli::StructuredError::code(error) == "auto_merge_not_enabled");
+        assert!(
+            !refused,
+            "cara-owned merges must not require native auto-merge: {result:?}"
+        );
     }
 
     /// bd-cef612: retargeting a child does not strip the evicted member's

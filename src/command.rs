@@ -533,22 +533,39 @@ impl ProcessRunner {
     }
 
     fn effective_timeout(&self, request: &CommandSpec) -> Result<Duration, CommandRunError> {
-        let timeout = self.operation_deadline.map_or(self.timeout, |deadline| {
-            self.timeout
-                .min(deadline.saturating_duration_since(Instant::now()))
-        });
-        if timeout.is_zero() {
+        let remaining = self
+            .operation_deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+        let timeout = remaining.map_or(self.timeout, |remaining| self.timeout.min(remaining));
+        // A sliver of budget is not a budget. Launching a command with a
+        // deadline no real command can meet reports the *command* as the
+        // failure, which sends a reader chasing git or the provider when the
+        // true cause is an exhausted operation deadline. Refuse just above zero
+        // and name the real cause instead (bd-89e59f).
+        let exhausted = remaining.is_some_and(|remaining| remaining < MINIMUM_COMMAND_BUDGET);
+        if timeout.is_zero() || exhausted {
             return Err(CommandRunError::Timeout {
                 command: request.clone(),
                 process_group_id: None,
-                timeout_ms: 0,
+                timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
                 stdout: String::new(),
-                stderr: "operation deadline exhausted before this phase".to_owned(),
+                stderr: format!(
+                    "operation deadline exhausted before this phase: {}ms remained, below the {}ms minimum any command can use; raise sync.max_duration_secs or lower sync.max_candidates_per_tick so a tick completes within its budget",
+                    timeout.as_millis(),
+                    MINIMUM_COMMAND_BUDGET.as_millis(),
+                ),
             });
         }
         Ok(timeout)
     }
 }
+
+/// Smallest budget any real command can use.
+///
+/// Below this a launch is guaranteed waste: the child is reaped before it can
+/// finish, and the resulting error names the command rather than the exhausted
+/// deadline that actually caused it.
+const MINIMUM_COMMAND_BUDGET: Duration = Duration::from_millis(750);
 
 fn resolve_github_auth(
     cwd: Option<&Path>,
@@ -1245,6 +1262,30 @@ mod tests {
             .expect("long operation has remaining budget");
         assert!(effective <= Duration::from_secs(30));
         assert!(effective >= Duration::from_secs(29));
+    }
+
+    /// Live shape (cacophony, v0.0.21): an hour-long tick left 285ms, and a
+    /// `git fetch` was launched against it. The refusal must name the exhausted
+    /// deadline, not the command, or a reader debugs git instead of the budget.
+    #[test]
+    fn a_sliver_of_budget_refuses_naming_the_deadline_not_the_command() {
+        let runner = ProcessRunner::in_directory(Path::new("."))
+            .with_timeout(Duration::from_secs(60))
+            .with_operation_deadline(Instant::now() + Duration::from_millis(285));
+
+        let error = runner
+            .run(&CommandSpec::new("git").args(["fetch", "--quiet", "origin"]))
+            .expect_err("a 285ms budget cannot run a fetch");
+
+        let rendered = format!("{error:?}");
+        assert!(
+            rendered.contains("operation deadline exhausted"),
+            "must name the deadline: {rendered}"
+        );
+        assert!(
+            rendered.contains("max_duration_secs"),
+            "must name the actionable knob: {rendered}"
+        );
     }
 
     #[test]

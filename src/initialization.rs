@@ -367,11 +367,13 @@ pub fn init_with_provider(
     let squash_auto_merge_ready = provider
         .allows_auto_merge(repository)
         .map_err(provider_error)?;
-    if !squash_auto_merge_ready {
+    // bd-4d725c: only require the provider-native setting when the provider is
+    // the merge actor; a cara-owned repository never uses it.
+    if !squash_auto_merge_ready && !context.config.sync.resolved_head_merge_actor().caravan() {
         return Err(AppError::structured(
             ErrorCategory::Validation,
             "auto_merge_not_enabled",
-            "enable squash merge and GitHub auto-merge, then rerun `cara init`",
+            "enable squash merge and GitHub auto-merge, or set sync.head_merge_actor=\"caravan\" so cara owns the merge, then rerun `cara init`",
             Some(
                 json!({"repository_preflight": {"permission": permission, "default_branch": default_branch, "squash_auto_merge_ready": false}}),
             ),
