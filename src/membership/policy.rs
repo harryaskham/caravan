@@ -282,6 +282,7 @@ pub(super) fn preflight_eligibility(
     read::check_analysis(&virtual_status, &check_input, checker)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn preflight_repository(
     provider: &impl MembershipProvider,
     repository: &RepositoryId,
@@ -289,6 +290,8 @@ pub(super) fn preflight_repository(
     operation: MembershipOperation,
     priority_labels: &[String],
     require_auto_admission_skip: bool,
+    // Whether cara itself owns the merge for this repository.
+    head_merge_caravan: bool,
     state: &ExecutionState,
 ) -> Result<(), AppError> {
     let labels = provider
@@ -308,7 +311,12 @@ pub(super) fn preflight_repository(
             Some(json!({ "repository": repository, "missing_labels": missing_priorities })),
         ));
     }
+    // Native auto-merge is only a precondition when the *provider* performs the
+    // merge. Under `sync.head_merge_actor: caravan` cara merges the green head
+    // itself, so requiring a repository setting it will never use blocks head
+    // creation for no reason.
     if !operation.is_join()
+        && !head_merge_caravan
         && !provider
             .repository_allows_auto_merge(repository)
             .map_err(|error| mutation_error(&error, state))?
@@ -319,7 +327,8 @@ pub(super) fn preflight_repository(
             "repository settings must allow squash auto-merge before creating a caravan head",
             Some(json!({
                 "repository": repository,
-                "next": "enable GitHub repository auto-merge and keep squash merge enabled, then rerun the same command",
+                "head_merge_actor": "github",
+                "next": "enable GitHub repository auto-merge and keep squash merge enabled, or set sync.head_merge_actor=\"caravan\" so cara owns the merge, then rerun the same command",
             })),
         ));
     }

@@ -1361,6 +1361,7 @@ fn execute_locked(
                 request.operation,
                 &request.agent_priority_labels,
                 context.config.sync.actions.join_unlabelled_prs,
+                status.head_merge.actor.caravan(),
                 &state,
             )?;
             // bd-032049: prove the branch carries unique work BEFORE creating a
@@ -1454,6 +1455,7 @@ fn execute_locked(
             request.operation,
             &request.agent_priority_labels,
             context.config.sync.actions.join_unlabelled_prs,
+            status.head_merge.actor.caravan(),
             &preflight_state,
         )?;
         validate_operation_shape(&candidate, request, &desired_base)?;
@@ -2149,6 +2151,7 @@ fn execute_with_rebase_guard(
         request.operation,
         &request.agent_priority_labels,
         require_auto_admission_skip,
+        status.head_merge.actor.caravan(),
         &state,
     )?;
     let desired_priority_label = request.priority_label.as_deref().map(str::trim);

@@ -1726,6 +1726,44 @@ fn unprotected_default_branch_fails_before_head_mutation() {
     );
 }
 
+/// Live operator report: a repository running `sync.head_merge_actor: caravan`
+/// was refused head creation with `auto_merge_not_enabled`. Native auto-merge is
+/// only a precondition when the provider performs the merge; when cara merges
+/// the green head itself, requiring a repository setting it will never use
+/// blocks the caravan for no reason.
+#[test]
+fn a_caravan_merge_actor_does_not_require_native_auto_merge() {
+    let candidate = pull_request(1, "one", "main", &[]);
+    let mut provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
+    provider.allows_auto_merge = false;
+    let mut status = status(candidate, Vec::new());
+    status.head_merge.actor = crate::model::HeadMergeActor::Caravan;
+
+    let result = execute(
+        status,
+        &clean,
+        &provider,
+        MembershipRequest {
+            operation: MembershipOperation::New,
+            create_pr: false,
+            tail_pr: None,
+            head_pr: None,
+            reason: None,
+            priority_label: None,
+            agent_priority_labels: Vec::new(),
+        },
+    );
+
+    let refused_for_auto_merge = result
+        .as_ref()
+        .err()
+        .is_some_and(|error| mcp_cli::StructuredError::code(error) == "auto_merge_not_enabled");
+    assert!(
+        !refused_for_auto_merge,
+        "cara-owned merges must not require native auto-merge: {result:?}"
+    );
+}
+
 #[test]
 fn disabled_repository_auto_merge_fails_before_head_mutation() {
     let candidate = pull_request(1, "one", "main", &[]);
