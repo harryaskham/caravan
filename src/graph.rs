@@ -549,6 +549,7 @@ pub fn analyze(
 
 /// Derive and mechanically validate current chain/fleet invariants for one
 /// configured head merge actor.
+#[allow(clippy::too_many_lines)]
 pub fn analyze_for_actor(
     snapshot: &RepositorySnapshot,
     checker: &impl CompatibilityChecker,
@@ -648,8 +649,46 @@ pub fn analyze_for_actor(
         }
     }
 
+    // bd-e9fcd7: a candidate Cara has itself proven mechanically unrepairable
+    // must not hold the admission front. Only a bounded number of leading
+    // unqueued candidates are checked, so this never turns status into a
+    // whole-fleet merge sweep, and a conflicting one is recorded as an ordinary
+    // compatibility problem that admission already excludes without wedging
+    // later candidates.
+    for number in analysis
+        .fleet
+        .unqueued
+        .iter()
+        .copied()
+        .take(LEADING_CANDIDATE_COMPATIBILITY_BOUND)
+        .collect::<Vec<_>>()
+    {
+        let Some(candidate) = analysis.pull_requests.get(&number) else {
+            continue;
+        };
+        if candidate.cross_repository || candidate.draft {
+            continue;
+        }
+        let candidate_branch = candidate.head.clone();
+        let report = checker.check(&candidate_branch, &snapshot.default_branch)?;
+        record_compatibility(
+            &mut analysis,
+            checker,
+            report,
+            vec![number],
+            "leading admission candidate does not merge cleanly into the current default branch",
+        )?;
+    }
+
     Ok(analysis)
 }
+
+/// How many leading unqueued candidates are proven against the default branch.
+///
+/// Electing a candidate that cannot merge starves every clean candidate behind
+/// it, but proving every unqueued PR on every status would dominate provider
+/// and Git latency. Bounding it keeps the front honest at fixed cost.
+const LEADING_CANDIDATE_COMPATIBILITY_BOUND: usize = 3;
 
 /// Record one compatibility report plus, for a non-clean attachment, the exact
 /// squash-equivalence evidence for the same revisions.
@@ -1057,6 +1096,36 @@ mod tests {
         let observed = &analysis.pull_requests[&PrNumber(2101)];
         assert_eq!(observed.state, PullRequestState::Merged);
         assert_eq!(observed.merged_at.as_deref(), Some("2026-07-25T01:07:18Z"));
+    }
+
+    /// bd-e9fcd7: a leading candidate that cannot merge into the default branch
+    /// is recorded as a compatibility problem, so admission excludes it instead
+    /// of electing it and starving every clean candidate behind it.
+    #[test]
+    fn a_conflicting_leading_candidate_is_recorded_not_elected() {
+        let checker = |candidate: &BranchSnapshot, target: &BranchSnapshot| {
+            Ok(CompatibilityReport {
+                candidate: candidate.clone(),
+                target: target.clone(),
+                outcome: CompatibilityOutcome::Conflict,
+                conflicting_paths: vec!["src/lib.rs".to_owned()],
+                diagnostic: None,
+            })
+        };
+        let mut unqueued = pull_request(2117, "stuck", "main");
+        unqueued.labels.clear();
+
+        let analysis = analyze(&snapshot(vec![unqueued]), &checker)
+            .expect("a conflicting candidate is evidence, not an execution failure");
+
+        assert!(
+            analysis.fleet.problems.iter().any(|problem| {
+                problem.kind == GraphProblemKind::Incompatible
+                    && problem.prs.contains(&PrNumber(2117))
+            }),
+            "expected the leading candidate conflict to be recorded: {:?}",
+            analysis.fleet.problems
+        );
     }
 
     /// bd-1cf2e1: a merged member's branch name reused by an unrelated active
