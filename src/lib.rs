@@ -682,6 +682,10 @@ pub struct CreateInput {
     pub reason: Option<String>,
 
     /// Exact configured agent-priority label. Without it, admission is FIFO.
+    ///
+    /// This is persistent metadata for AUTOMATIC scheduling order only. It is
+    /// never permission to run an explicit membership action: naming one exact
+    /// candidate already carries owner authority (bd-72d56d).
     #[arg(long, value_name = "LABEL")]
     #[serde(default)]
     pub priority_label: Option<String>,
@@ -716,6 +720,10 @@ pub struct JoinInput {
     pub reason: Option<String>,
 
     /// Exact configured agent-priority label. Without it, admission is FIFO.
+    ///
+    /// This is persistent metadata for AUTOMATIC scheduling order only. It is
+    /// never permission to run an explicit membership action: naming one exact
+    /// candidate already carries owner authority (bd-72d56d).
     #[arg(long, value_name = "LABEL")]
     #[serde(default)]
     pub priority_label: Option<String>,
