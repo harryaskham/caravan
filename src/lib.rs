@@ -22,6 +22,7 @@ pub mod journal;
 pub mod loop_runner;
 pub mod membership;
 pub mod navigation;
+pub mod next;
 pub mod operation_lock;
 pub mod pause;
 pub mod physical_rebase;
@@ -939,9 +940,9 @@ pub fn build_router() -> ToolRouter<AppContext> {
         |context: &AppContext, _input: EmptyInput| read::status(context),
     );
     router.add_typed_tool_with_output_schema(
-        "next_candidate",
-        "Return the canonical first priority-then-FIFO admission attempt without mutation. Selection is not compatibility proof: run check/new preflight, and fail closed rather than leapfrogging on rejection.",
-        |context: &AppContext, _input: EmptyInput| read::next_candidate(context),
+        "queue",
+        "Report the next pull request at a requested queue position (ready, skipped, conflict, evicted) and optionally check it out. Selection is not compatibility proof: run check/new preflight before acting. Nothing matching is an ordinary payload, never an error, so an empty queue is distinguishable from a provider outage.",
+        |context: &AppContext, input: NextInput| next::next(context, &input),
     );
     router.add_typed_tool_with_output_schema(
         "check",
@@ -1322,6 +1323,81 @@ pub fn updater_config() -> updatable_cli::UpdaterConfig {
         Ok(token) if !token.trim().is_empty() => config.with_github_token(token),
         _ => config,
     }
+}
+
+/// Which queue position `cara next` should report (bd-a2407c).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, clap::ValueEnum,
+)]
+#[serde(rename_all = "snake_case")]
+#[value(rename_all = "snake_case")]
+pub enum NextStatus {
+    /// The canonical next automatic-admission candidate.
+    Ready,
+    /// Candidates skipped this generation.
+    Skipped,
+    /// Candidates proven incompatible with the exact default branch.
+    Conflict,
+    /// Previously evicted pull requests.
+    Evicted,
+}
+
+/// Inputs for `cara next` (bd-a2407c).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, clap::Args)]
+pub struct NextInput {
+    /// Queue positions to report, tried in the order given.
+    #[arg(long, value_delimiter = ',', default_value = "ready")]
+    #[serde(default)]
+    pub status: Vec<NextStatus>,
+
+    /// Also move the working tree to the selected branch.
+    ///
+    /// The same JSON is still returned. Refuses on a dirty worktree rather than
+    /// risk uncommitted work, and the receipt names the exact move.
+    #[arg(long)]
+    #[serde(default)]
+    pub checkout: bool,
+}
+
+/// Exact record of a `--checkout` move, so it is auditable and reversible.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CheckoutReceipt {
+    pub pr: crate::model::PrNumber,
+    pub from_branch: String,
+    pub to_branch: String,
+}
+
+/// One reported queue position.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct NextMatch {
+    pub status: NextStatus,
+    pub pr: crate::model::PrNumber,
+    pub branch: String,
+    pub oid: crate::model::CommitOid,
+    pub url: String,
+    pub reason: String,
+}
+
+/// Result of `cara next`.
+///
+/// "Nothing matched" is an ordinary outcome carried in the payload, never an
+/// error: a scheduler must be able to tell an empty queue from a provider
+/// outage, and an error envelope conflates the two.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct NextOutput {
+    pub schema_version: u32,
+    pub repository: crate::model::RepositoryId,
+    pub requested: Vec<NextStatus>,
+    /// First match across the requested statuses, in the requested order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected: Option<NextMatch>,
+    /// Every match found, so a caller can plan more than one step.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matches: Vec<NextMatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout: Option<CheckoutReceipt>,
+    /// Exact next step for a scheduler, including when nothing matched.
+    pub next: String,
 }
 
 /// Inputs for the CI-admission gate (bd-2a29c8).
@@ -1776,7 +1852,7 @@ mod tests {
             "init",
             "log",
             "status",
-            "next_candidate",
+            "queue",
             "check",
             "new",
             "renew",

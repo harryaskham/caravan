@@ -60,8 +60,8 @@ enum Command {
     Web(caravan::web::WebInput),
     /// Read the bounded repository event journal, optionally following new records.
     Log(LogCommand),
-    /// Return the canonical next priority-then-FIFO admission without mutation.
-    NextCandidate,
+    /// Report the next PR at a requested queue position, optionally checking it out.
+    Queue(caravan::NextInput),
     /// Decide whether existing CI evidence still applies to one exact PR.
     CiGate(caravan::CiGateInput),
     /// Validate current or proposed caravan state without mutation.
@@ -352,7 +352,7 @@ fn run(cli: &Cli) -> Result<(), i32> {
         Command::Config(command) => run_config(cli, command),
         Command::Web(input) => run_web(cli, input),
         Command::Log(command) => run_log(cli, command),
-        Command::NextCandidate => run_next_candidate(cli),
+        Command::Queue(input) => run_queue(cli, input),
         Command::CiGate(input) => run_ci_gate(cli, input),
         Command::Check(input) => run_check(cli, input),
         Command::New(input) => run_create_membership(cli, input),
@@ -573,52 +573,33 @@ fn run_status(cli: &Cli) -> Result<(), i32> {
     }
 }
 
-fn run_next_candidate(cli: &Cli) -> Result<(), i32> {
+fn run_queue(cli: &Cli, input: &caravan::NextInput) -> Result<(), i32> {
     let context = load_context(cli)?;
-    let result = caravan::read::next_candidate(&context);
+    let result = caravan::next::next(&context, input);
     if cli.json {
         return emit_result(true, result);
     }
     match result {
         Ok(output) => {
-            if let Some(number) = output.admission.next_candidate {
-                let reason = output
-                    .admission
-                    .candidates
-                    .iter()
-                    .find(|candidate| candidate.pr == number)
-                    .map(|candidate| candidate.reason.as_str())
-                    .or_else(|| {
-                        output
-                            .admission
-                            .rejected
-                            .iter()
-                            .find(|candidate| candidate.pr == number)
-                            .map(|candidate| candidate.reason.as_str())
-                    })
-                    .unwrap_or("fail closed: provider attempt metadata unavailable");
-                println!("next admission attempt: #{number} — {reason}");
-                println!("  {}", output.attempt_contract);
-                if let Some(decision) = &output.automatic_selection {
-                    println!(
-                        "  automatic selection={} order={:?}: {}",
-                        decision.selection.name(),
-                        decision.outcome,
-                        decision.reason,
-                    );
-                }
-            } else {
-                println!("no automatic-admission attempt");
+            match &output.selected {
+                Some(selected) => println!(
+                    "{} #{} {} {}",
+                    heading("QUEUE"),
+                    selected.pr,
+                    styled("1;35", selected.branch.clone()),
+                    dim(selected.reason.clone()),
+                ),
+                // Not an error: an empty queue and a provider outage must never
+                // look the same to a scheduler.
+                None => println!("{}  {}", heading("QUEUE"), dim("no match")),
             }
-            for rejected in output.admission.rejected {
-                println!("! #{}: {}", rejected.pr, rejected.reason);
+            if let Some(receipt) = &output.checkout {
+                println!(
+                    "  checked out {} -> {}",
+                    receipt.from_branch, receipt.to_branch
+                );
             }
-            // bd-d7aae7: name one exact command so a correct FIFO rejection of
-            // a later PR is not mistaken for a queue fault.
-            if let Some(next) = &output.next_admission_command {
-                println!("next: {}", next.command);
-                println!("  {}", next.reason);
-            }
+            println!("  {}", output.next);
             Ok(())
         }
         Err(error) => emit_human_error(error),

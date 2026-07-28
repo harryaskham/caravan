@@ -171,68 +171,54 @@ unwound.
 
 ---
 
-## Open gaps
+## Resolved, and how they were found
 
-Written down because a lifecycle document that only describes the happy path is
-how the gaps below survived as long as they did.
+Every gap this document originally listed was found by an operator hitting it in
+normal use, not by a test. That is the point of writing the tree down.
 
-1. **Historical checkout blocks queue advancement.** §"Fleet decisions never
-   depend on your checkout" is the intent. Today a checkout left on a merged
-   branch can fail closed with `missing_caravan_label` even after the next
-   candidate has been computed — and Cara creates that state itself by retiring
-   merged heads.
+- **Selection ignored compatibility.** A candidate proven unable to merge was
+  still elected, holding the whole queue. Detection had been added without
+  wiring it into selection, so Cara named the problem and then ignored it.
+  Fixed: a proven conflict is skipped with its exact reason and the queue
+  advances, while an owner's explicit rejection still blocks.
+- **An explicit skip looked inert.** Admission excluded a `caravan-join-skipped`
+  PR correctly, but the detection loop kept re-proving and re-reporting it, so
+  the label appeared to do nothing.
+- **A historical checkout blocked the queue.** Fleet reads failed closed because
+  the local branch was merged or ambiguous — a state Cara produces itself by
+  retiring merged heads, so the tool penalised its own happy path. Fixed by
+  making `current_pr` resolution strict only for PR-scoped mutations. That is
+  not a safety relaxation: every such command resolves its subject as
+  `input.pr.or(current_pr).ok_or(current_pr_not_found)`, so an unresolved branch
+  refuses to act rather than acting on a guess.
 
-   Exact seam: `GitHubDiscovery::resolve_current_pr` (`src/github.rs`, the call
-   to `resolve_historical_current_pr`) propagates
-   `DiscoveryError::HistoricalCurrentPullRequest` with `?`, and `src/read.rs`
-   converts it to a hard `AppError`. Because `next_candidate()` calls
-   `status()`, which calls discovery, resolving the *current branch* fails the
-   entire *fleet* read. The operator sees `candidates: [2234]` already computed
-   in the same payload that refuses.
+## Composing repair loops
 
-   The naive fix looks wrong at first glance. Several of those refusals are
-   deliberate safety: `deleted_historical_branch_fails_closed`,
-   `closed_unmerged_historical_branch_fails_closed` and
-   `exact_open_reuse_refuses_conflicting_historical_membership` encode the
-   reused-branch provenance rule, where a recycled branch name must never be
-   allowed to reparent a child.
+A scheduler that cannot host one long-lived `cara loop` reconstructs its routing
+with `cara queue`:
 
-   On inspection the safety property survives, because **`None` is already
-   fail-closed at the command layer**. Every PR-scoped command resolves its
-   subject as `input.pr.or(status.current_pr).ok_or_else(...)` and refuses with
-   `current_pr_not_found` when neither is available (see `read.rs::check`). So a
-   discovery that declines to guess yields a refusal to mutate, not a mutation
-   of the wrong PR. No command silently substitutes a different subject.
+```sh
+cara --json queue --status conflict,evicted,skipped
+```
 
-   That means the `DiscoveryOptions` gate is about preserving **diagnostic
-   quality**, not safety: without it the operator loses the precise reason
-   (`branch_reuse_ambiguous`, `historical_membership_conflict`, ...) and sees
-   only "no current PR, pass --pr". Worth keeping for that reason alone, but the
-   change is far less dangerous than the fail-closed test names suggest.
+It reports the first match across the requested positions, in the order asked
+for, plus every match so a caller can plan more than one step. Positions are
+`ready` (the canonical admission candidate, identical to what sync admits),
+`skipped`, `conflict`, and `evicted`.
 
-   Correct shape: keep the resolution strict for PR-scoped **mutations** and
-   lenient for **selection**, gating on `DiscoveryOptions` in the same way
-   `allow_unlabelled_historical_pr_creation` already is. Read-only fleet
-   commands set it off, get `current_pr: None` plus a retained reason, and any
-   command that genuinely needs "which PR do you mean" raises the typed error
-   naming that reason. The three tests above then assert "resolves to no current
-   PR, and mutation refuses" rather than "discovery errors".
-2. **No status-filtered navigation primitive.** There is no supported way to ask
-   "what is the next conflicting / evicted / failing PR", so scheduler authors
-   cannot compose repair loops without reimplementing selection.
+**Nothing matching is an ordinary payload, never an error.** A cron must be able
+to tell an empty queue from a provider outage; an error envelope for both makes
+an outage look like quiet success.
 
-   Agreed shape: one verb, `cara next --status <set>`, JSON-only, replacing
-   `cara next-candidate` outright rather than aliasing it. Selection under
-   `--status ready` must be byte-identical to what sync admits, or two surfaces
-   will give agents different answers.
+`--checkout` additionally moves the working tree to the selected branch and
+returns the same JSON plus a receipt naming the move. It routes through
+`ensure_safe_worktree` and **refuses on a dirty tree**, because a scheduler that
+clobbers uncommitted work is worse than one that does nothing.
 
-   `--checkout` is an opt-in convenience on `cara next` and `cara loop
-   --manual`: it still returns the same JSON but moves the working tree to the
-   selected branch. Two constraints are load-bearing. It must route through
-   `navigation::ensure_safe_worktree` and **fail closed on a dirty tree**, so a
-   cron can never clobber uncommitted work; and the JSON must carry a receipt of
-   what it moved *from* and *to*, so the move is auditable and reversible.
+`conflict` is read from proven graph evidence rather than a label, so a stale
+label can never route an agent at a PR that has since been force-pushed onto a
+clean generation.
 
-   `--status skipped` must re-derive validity rather than trusting the label,
-   because a skip is bound to the exact head it was proven against; a stale
-   label would otherwise route agents at PRs that have since been force-pushed.
+The verb is `queue`, not `next`: `cara next` already means "check out the next PR
+toward the current caravan tail", and overloading it with queue selection would
+give one word two unrelated meanings.
