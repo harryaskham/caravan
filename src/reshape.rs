@@ -49,6 +49,10 @@ impl ReshapeOperation {
 pub struct ReshapeOutput {
     pub operation: ReshapeOperation,
     pub pr: PrNumber,
+    /// Members that were physically rebased onto the evicted PR and therefore
+    /// still carry its commits after retargeting (bd-cef612).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub descendants_inheriting_evicted_patch: Vec<PrNumber>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     pub receipt: OperationReceipt,
@@ -278,6 +282,7 @@ fn eviction_failed_event(
 // Owning one immutable discovery snapshot prevents a multi-step operation from
 // accidentally swapping in partially refreshed facts mid-transaction.
 #[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::too_many_lines)]
 fn execute(
     status: StatusOutput,
     checker: &impl CompatibilityChecker,
@@ -376,8 +381,19 @@ fn execute(
         }
     }
 
+    // bd-cef612: retargeting a child does not remove the evicted member's
+    // commits from it. Physical joins rebased each member onto its predecessor,
+    // so every descendant still carries the evicted patch and would silently
+    // reintroduce discarded content when it lands. Record exactly which members
+    // are affected instead of letting the receipt imply a clean removal.
+    let descendants_inheriting_evicted_patch = if operation == ReshapeOperation::Evict {
+        descendants_of(&status, number)
+    } else {
+        Vec::new()
+    };
     Ok(ReshapeOutput {
         operation,
+        descendants_inheriting_evicted_patch,
         pr: number,
         reason,
         receipt: state.receipt(),
@@ -395,6 +411,25 @@ struct ReshapePlan {
     child_base: Option<BranchSnapshot>,
     creates_head: bool,
     affected_prs: Vec<PrNumber>,
+}
+
+/// Members physically stacked after `number` in its caravan.
+fn descendants_of(status: &StatusOutput, number: PrNumber) -> Vec<PrNumber> {
+    status
+        .analysis
+        .fleet
+        .containing(number)
+        .and_then(|caravan| {
+            caravan.position(number).map(|position| {
+                caravan
+                    .members
+                    .iter()
+                    .skip(position + 1)
+                    .copied()
+                    .collect::<Vec<_>>()
+            })
+        })
+        .unwrap_or_default()
 }
 
 fn plan_eviction(
@@ -1271,6 +1306,33 @@ mod tests {
                 diagnostic: None,
             })
         }
+    }
+
+    /// bd-cef612: retargeting a child does not strip the evicted member's
+    /// commits from members that were physically rebased onto it.
+    #[test]
+    fn eviction_reports_descendants_that_still_carry_the_evicted_patch() {
+        let pulls = vec![
+            pull_request(1, "main"),
+            pull_request(2, "pr-1"),
+            pull_request(3, "pr-2"),
+        ];
+        let provider = FakeProvider::new(&pulls);
+
+        let output = execute(
+            status(pulls),
+            &Clean,
+            &provider,
+            ReshapeOperation::Evict,
+            Some(PrNumber(1)),
+            Some("head failed".to_owned()),
+        )
+        .expect("head eviction succeeds");
+
+        assert_eq!(
+            output.descendants_inheriting_evicted_patch,
+            vec![PrNumber(2), PrNumber(3)]
+        );
     }
 
     /// bd-0dab27 live case: a caravan whose members already conflict must still

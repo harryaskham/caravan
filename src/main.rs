@@ -2537,6 +2537,18 @@ fn run_evict(cli: &Cli, input: &EvictInput) -> Result<(), i32> {
                 "evicted PR #{}; affected {:?}; changed={}",
                 output.pr, output.affected_prs, output.receipt.changed
             );
+            // bd-cef612: retargeting does not remove the evicted commits from
+            // members that were physically rebased onto it.
+            if !output.descendants_inheriting_evicted_patch.is_empty() {
+                println!(
+                    "! {:?} still contain PR #{}'s commits and would reintroduce them when they land",
+                    output.descendants_inheriting_evicted_patch, output.pr
+                );
+                println!(
+                    "  unwind them before landing: rebase each onto the surviving predecessor, or evict them too with `cara evict --cascade --pr {}`",
+                    output.pr
+                );
+            }
             let mut hooks = String::new();
             append_hook_deliveries(&mut hooks, &output.hook_deliveries);
             print!("{hooks}");
