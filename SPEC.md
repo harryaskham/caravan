@@ -285,6 +285,14 @@ plus `admission_note` evidence on every remote receipt, and explicit owner
 selection is admitted ahead of unrelated unjoined rows for `new` as well as
 `join`. Automatic selection is unchanged.
 
+An owner may declare a canonical generation directly (bd-523dbf). A durable
+provider comment carrying the `caravan-generation-supersession:v1` marker, bound
+to the canonical PR **and its exact head**, names the superseded PRs. Generation
+analysis prefers that declaration over the historical priority-comment
+heuristic, and ignores a declaration written for a different head. This replaces
+the previous recovery path, where a dead-ended diverged stream could only be
+resolved by publishing a hand-crafted containment merge.
+
 Every check receipt and every membership receipt carries a typed
 `admission_intent` decision recording selection, intent, resolved target caravan
 and tail, the canonical candidate at decision time, each ordered row ahead with

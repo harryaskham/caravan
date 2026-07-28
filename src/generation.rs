@@ -329,11 +329,82 @@ pub fn duplicate_stream_prs(facts: &[PullRequestGenerationFact]) -> BTreeSet<PrN
 /// Attach reviewed provider-visible canonical-generation links. The legacy
 /// dogfood controller receipt is accepted only with its deterministic Caravan
 /// priority marker, exact controller actor, and explicit superseding PR list.
+/// Deterministic marker for a first-class owner supersession declaration.
+///
+/// bd-523dbf: the original mechanism piggybacked on a `priority_set` audit
+/// comment authored by one specific controller and parsed PR numbers out of
+/// free-text prose. That made a legitimate recovery path depend on hand-crafted
+/// artefacts, so a dead-ended diverged stream needed a containment octopus
+/// merge to move at all. This marker is explicit, exact, and owner-authored.
+#[must_use]
+pub fn supersession_marker(canonical: PrNumber, canonical_head: &CommitOid) -> String {
+    format!(
+        "<!-- caravan-generation-supersession:v1:{canonical}:{} -->",
+        canonical_head.0
+    )
+}
+
+/// Render the durable declaration body for one exact supersession.
+#[must_use]
+pub fn supersession_body(
+    canonical: PrNumber,
+    canonical_head: &CommitOid,
+    superseded: &BTreeSet<PrNumber>,
+    actor: &str,
+    reason: &str,
+) -> String {
+    let list = superseded
+        .iter()
+        .map(|pr| format!("#{pr}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{}\n\n**Caravan canonical generation declared.**\n\n- **Canonical:** #{canonical} at `{}`\n- **Superseded:** {list}\n- **Actor:** {actor}\n- **Reason:** {reason}\n",
+        supersession_marker(canonical, canonical_head),
+        canonical_head.0,
+    )
+}
+
+/// Read a first-class declaration from provider-visible comments.
+fn declared_supersessions(
+    canonical_pr: PrNumber,
+    canonical_head: &CommitOid,
+    comment_bodies: &[String],
+) -> Option<BTreeSet<PrNumber>> {
+    let marker = supersession_marker(canonical_pr, canonical_head);
+    let body = comment_bodies
+        .iter()
+        .rev()
+        .find(|body| body.contains(&marker))?;
+    let line = body
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("- **Superseded:**"))?;
+    let values = line
+        .split(|character: char| !character.is_ascii_digit())
+        .filter_map(|value| value.parse::<u64>().ok())
+        .filter(|number| *number != 0 && *number != canonical_pr.0)
+        .map(PrNumber)
+        .collect::<BTreeSet<_>>();
+    (!values.is_empty()).then_some(values)
+}
+
 pub fn attach_reviewed_supersession_links(
     facts: &mut [PullRequestGenerationFact],
     canonical_pr: PrNumber,
     comment_bodies: &[String],
 ) {
+    // A first-class owner declaration wins over the historical priority-comment
+    // heuristic, and is bound to the exact canonical head it was written for.
+    if let Some(head) = facts
+        .iter()
+        .find(|fact| fact.pr == canonical_pr)
+        .map(|fact| fact.provider_head.clone())
+        && let Some(declared) = declared_supersessions(canonical_pr, &head, comment_bodies)
+        && let Some(fact) = facts.iter_mut().find(|fact| fact.pr == canonical_pr)
+    {
+        fact.supersedes = declared;
+        return;
+    }
     let marker = format!("<!-- caravan-control-label-audit:v2:priority_set:{canonical_pr}:");
     let priority_prefix = "<!-- caravan-control-label-audit:v2:priority_";
     let supersedes = comment_bodies
@@ -940,6 +1011,34 @@ mod tests {
 
     /// bd-7546ea: an unreachable provider comparison is reported as exactly
     /// that, naming the unprovable pair, instead of asserting divergence.
+    /// bd-523dbf: an exact owner declaration supersedes without requiring a
+    /// hand-crafted containment merge, and is bound to the canonical head.
+    #[test]
+    fn a_first_class_declaration_records_exact_supersession() {
+        let canonical = PrNumber(2220);
+        let mut facts = vec![fact(2220, "agent-a", &["bd-aaaaaa"], 'z', "3")];
+        // The declaration is bound to the exact provider head it was written for.
+        let head = facts[0].provider_head.clone();
+        let body = supersession_body(
+            canonical,
+            &head,
+            &BTreeSet::from([PrNumber(2196), PrNumber(2197), PrNumber(2198)]),
+            "owner",
+            "rebased successor carries all three predecessors",
+        );
+
+        attach_reviewed_supersession_links(&mut facts, canonical, std::slice::from_ref(&body));
+        assert_eq!(
+            facts[0].supersedes,
+            BTreeSet::from([PrNumber(2196), PrNumber(2197), PrNumber(2198)])
+        );
+
+        // A declaration written for a different head must not apply.
+        let mut moved = vec![fact(2220, "agent-a", &["bd-aaaaaa"], 'y', "3")];
+        attach_reviewed_supersession_links(&mut moved, canonical, std::slice::from_ref(&body));
+        assert!(moved[0].supersedes.is_empty());
+    }
+
     #[test]
     fn unreachable_comparison_is_reported_as_unproved_not_divergent() {
         let status = analyze(
