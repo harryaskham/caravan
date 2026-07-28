@@ -377,6 +377,31 @@ fn clean(
     })
 }
 
+/// bd-4e4615: an irreversible branch rewrite must not start without budget for
+/// the mandatory post-rewrite rediscovery and membership writes.
+#[test]
+fn post_rewrite_budget_is_reserved_before_any_branch_rewrite() {
+    let mut context = AppContext::default();
+    context.config.command_timeout_secs = 30;
+
+    // Almost no budget left: refuse before touching the remote.
+    let exhausted = std::time::Instant::now() + std::time::Duration::from_millis(212);
+    let error = super::require_post_rewrite_budget(&context, Some(exhausted), PrNumber(2079))
+        .expect_err("an exhausted budget must refuse before mutation");
+    assert_eq!(
+        mcp_cli::StructuredError::code(&error),
+        "membership_post_rewrite_budget_insufficient"
+    );
+    let details = mcp_cli::StructuredError::details(&error).expect("details");
+    assert_eq!(details["mutated"], false);
+    assert_eq!(details["pr"], 2079);
+
+    // Ample budget proceeds, and an unbounded operation is unaffected.
+    let ample = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    assert!(super::require_post_rewrite_budget(&context, Some(ample), PrNumber(2079)).is_ok());
+    assert!(super::require_post_rewrite_budget(&context, None, PrNumber(2079)).is_ok());
+}
+
 #[test]
 fn join_failure_event_carries_target_fleet_and_error_code() {
     let head = pull_request(1, "one", "main", &[ACTIVE_LABEL]);

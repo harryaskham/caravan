@@ -38,6 +38,10 @@ const ACTIVE_LABEL: &str = "caravan";
 const EVICTED_LABEL: &str = "caravan-evicted";
 const FORCE_LABEL: &str = "caravan-force";
 const SKIPPED_LABEL: &str = "caravan-join-skipped";
+
+/// Provider commands that must still run after an irreversible branch rewrite:
+/// the mandatory exact rediscovery plus the membership label/base writes.
+const POST_REWRITE_COMMAND_RESERVE: u32 = 4;
 const REQUIRED_LABELS: [&str; 3] = [ACTIVE_LABEL, EVICTED_LABEL, FORCE_LABEL];
 
 /// Membership command kind.
@@ -835,6 +839,42 @@ fn source_oid(
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+/// Prove enough budget remains for mandatory post-rewrite provider work.
+///
+/// bd-4e4615: a rewrite that lands remotely and then times out during the
+/// required rediscovery leaves correct but incomplete receipts. Reserving the
+/// phase up front turns that into a clean zero-mutation refusal instead.
+fn require_post_rewrite_budget(
+    context: &AppContext,
+    operation_deadline: Option<std::time::Instant>,
+    pr: PrNumber,
+) -> Result<(), AppError> {
+    let Some(deadline) = operation_deadline else {
+        return Ok(());
+    };
+    // One rediscovery plus the membership writes that must follow it.
+    let timeout = std::time::Duration::from_secs(context.config.command_timeout_secs);
+    let required = timeout.saturating_mul(POST_REWRITE_COMMAND_RESERVE);
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining >= required {
+        return Ok(());
+    }
+    Err(AppError::structured(
+        ErrorCategory::Validation,
+        "membership_post_rewrite_budget_insufficient",
+        "not enough operation budget remains to complete mandatory post-rewrite rediscovery and membership writes; refusing to start an irreversible branch rewrite",
+        Some(json!({
+            "pr": pr,
+            "required_ms": u64::try_from(required.as_millis()).unwrap_or(u64::MAX),
+            "remaining_ms": u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX),
+            "reserved_commands": POST_REWRITE_COMMAND_RESERVE,
+            "mutated": false,
+            "resumable": true,
+            "safe_next_action": "rerun the same command with a fresh operation budget, or raise command_timeout_secs / the sync duration bound",
+        })),
+    ))
+}
+
 /// Refuse to create a pull request for a branch with no unique patch.
 ///
 /// bd-032049: the empty-source refusal already existed, but it ran only after
@@ -1509,6 +1549,11 @@ fn execute_locked(
             invalidation.ensure_control_label_comment(&provider, &repository, &audit)?;
             force_invalidation = Some(invalidation);
         }
+        // bd-4e4615: the branch rewrite is irreversible, and mandatory
+        // post-rewrite rediscovery plus membership writes still have to run.
+        // Starting the push with almost no budget left produced a live
+        // github_mutation_timeout *after* the remote branch had already moved.
+        require_post_rewrite_budget(context, Some(operation_deadline), candidate.number)?;
         let receipt = match crate::physical_rebase::apply_prepared(&prepared) {
             Ok(receipt) => receipt,
             Err(error) => {
