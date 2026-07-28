@@ -76,9 +76,19 @@ fi
 tar -xzf "$archive" -C "$workspace"
 [ "$("$workspace/$asset_root/cara")" = "cara fixture" ]
 
-for target in x86_64-linux aarch64-linux aarch64-darwin; do
+# The CI matrix carries exactly the targets a registered runner can accept.
+# bd-8b6d28: scheduling a leg no runner advertises queued forever and hung the
+# whole release run, so aarch64-darwin is published by backfill instead and must
+# NOT reappear in the matrix until a darwin runner exists.
+for target in x86_64-linux aarch64-linux; do
   grep -q -- "- target: $target" .github/workflows/release.yml
 done
+if grep -q -- '- target: aarch64-darwin' .github/workflows/release.yml; then
+  echo "release.yml schedules aarch64-darwin; register a darwin runner or keep it backfilled" >&2
+  exit 1
+fi
+# The backfill path is the contract for that target, so it must stay available.
+grep -q 'release-backfill-target' justfile
 grep -q 'softprops/action-gh-release@v2' .github/workflows/release.yml
 grep -q 'scripts/package-release.sh' .github/workflows/release.yml
 
