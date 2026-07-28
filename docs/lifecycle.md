@@ -58,6 +58,9 @@ conflict is not a decision anyone made, and no rerun resolves it, so holding the
 whole queue behind it starves every clean candidate. An owner rejection *is* a
 decision, and silently leapfrogging it would discard that decision.
 
+A skipped candidate appears in `admission.skipped` with the exact reason, so
+"skipped" is never indistinguishable from "forgotten".
+
 ---
 
 ## 2. Membership: creating and extending a caravan
@@ -173,22 +176,7 @@ unwound.
 Written down because a lifecycle document that only describes the happy path is
 how the gaps below survived as long as they did.
 
-1. **Selection does not consult compatibility.** §1.3 describes the intended
-   behaviour. Today a mechanically conflicting candidate is *detected and
-   reported* but still elected, so it holds the front anyway.
-
-   Exact seam: `read.rs::next_candidate` orders by priority-then-FIFO alone and
-   never reads `analysis.fleet.problems`. The rule it must not break sits
-   directly above the selection: *"A rejected first attempt remains canonical
-   and therefore cannot be silently leapfrogged"* — that protects an **owner's**
-   `cara check --pr N` rejection, which is a decision someone made. A mechanical
-   conflict against the default branch is not a decision and no rerun resolves
-   it, so the two must be separated rather than sharing one blocking rule.
-
-   Correct shape: a proven mechanical conflict persists a generation-bound
-   `AutoJoinSkipReceipt` and selection advances; an owner rejection keeps
-   blocking exactly as today.
-2. **Historical checkout blocks queue advancement.** §"Fleet decisions never
+1. **Historical checkout blocks queue advancement.** §"Fleet decisions never
    depend on your checkout" is the intent. Today a checkout left on a merged
    branch can fail closed with `missing_caravan_label` even after the next
    candidate has been computed — and Cara creates that state itself by retiring
@@ -229,7 +217,7 @@ how the gaps below survived as long as they did.
    command that genuinely needs "which PR do you mean" raises the typed error
    naming that reason. The three tests above then assert "resolves to no current
    PR, and mutation refuses" rather than "discovery errors".
-3. **No status-filtered navigation primitive.** There is no supported way to ask
+2. **No status-filtered navigation primitive.** There is no supported way to ask
    "what is the next conflicting / evicted / failing PR", so scheduler authors
    cannot compose repair loops without reimplementing selection.
 

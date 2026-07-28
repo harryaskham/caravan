@@ -1135,6 +1135,25 @@ pub fn resolve_admission_with_generation(
             });
             continue;
         }
+        // A candidate Cara has already proven cannot merge into the exact
+        // default branch is skipped rather than elected. Electing it starves
+        // every clean candidate behind it, and no rerun resolves it: only its
+        // owner can. This is deliberately NOT the same as the rejected-attempt
+        // rule below, which keeps an owner's explicit `cara check --pr N`
+        // rejection canonical. A mechanical conflict is not a decision anyone
+        // made, so it must not inherit a decision's blocking authority.
+        if analysis.fleet.problems.iter().any(|problem| {
+            problem.kind == GraphProblemKind::Incompatible && problem.prs.contains(number)
+        }) {
+            skipped.push(SkippedAdmissionCandidate {
+                pr: *number,
+                priority_label: configured.first().map(|(label, _)| (*label).clone()),
+                priority_rank: configured.first().map(|(_, rank)| rank + 1),
+                created_at,
+                reason: "proven mechanically incompatible with the exact current default branch; the owner must reconcile it, and no rerun changes that".to_owned(),
+            });
+            continue;
+        }
         let fifo_reason = created_at.as_ref().map_or_else(
             || format!("provider created_at missing; deterministic PR number #{number} fallback"),
             |created_at| {
@@ -2781,6 +2800,40 @@ mod tests {
         let admission = resolve_admission(&status.analysis, &labels);
         assert_eq!(admission.next_candidate, Some(PrNumber(20)));
         assert_eq!(admission.candidates[0].priority_rank, Some(1));
+    }
+
+    /// Live operator report (PR 2234): Cara proved the leading candidate could
+    /// not merge into the default branch, reported it, and then elected it
+    /// anyway, holding the whole queue behind a PR no rerun can fix. A
+    /// mechanical conflict is not a decision anyone made, so unlike an owner's
+    /// explicit rejection it must not inherit blocking authority.
+    #[test]
+    fn a_mechanically_incompatible_candidate_skips_instead_of_holding_the_front() {
+        let conflicted = pr(10, "conflicted", "main", false);
+        let later = pr(20, "later", "main", false);
+        let mut status = status(conflicted, vec![later]);
+        status.analysis.fleet.problems.push(GraphProblem {
+            kind: GraphProblemKind::Incompatible,
+            prs: vec![PrNumber(10)],
+            message: "does not merge cleanly into the current default branch".to_owned(),
+        });
+        let labels = crate::config::CaravanConfig::default().agent_priority_labels;
+
+        let admission = resolve_admission(&status.analysis, &labels);
+
+        assert_eq!(
+            admission.next_candidate,
+            Some(PrNumber(20)),
+            "a clean later candidate must not be starved by a proven conflict"
+        );
+        assert!(
+            admission
+                .skipped
+                .iter()
+                .any(|candidate| candidate.pr == PrNumber(10)),
+            "the conflicting candidate must be reported as skipped, not silently dropped: {:?}",
+            admission.skipped
+        );
     }
 
     #[test]
