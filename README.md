@@ -431,6 +431,13 @@ cara-<version>-<target>.tar.gz
 cara-<version>-<target>.sha256
 ```
 
+The two Linux targets are built by the tagged release workflow. `aarch64-darwin`
+is published separately with `just release-backfill-target <tag> aarch64-darwin`
+from a Mac, because no registered CI runner advertises that platform; scheduling
+a job nothing can accept made the whole run hang rather than fail, so the matrix
+omits it deliberately (bd-8b6d28). Restore the matrix entry once a darwin runner
+exists.
+
 When a repository pins Cara through a flake, `flake.lock` is the upgrade path
 of record and `nix flake update` is the normal way to move versions. Self-update
 remains available as a deliberate override for pulling a GitHub release anyway:

@@ -116,9 +116,13 @@ jobs:
           - target: aarch64-linux
             runner: [self-hosted, nix, ms-dev-2]
             timeout_minutes: 120
-          - target: aarch64-darwin
-            runner: [self-hosted, nix, aarch64-darwin]
-            timeout_minutes: 60
+          # bd-8b6d28: aarch64-darwin is deliberately absent from this matrix.
+          # No registered runner advertises the label, so scheduling the job
+          # queued it forever and the whole release run never reached a terminal
+          # state — nine consecutive releases read as flaky infrastructure when
+          # the job was simply unschedulable. Darwin assets are published by
+          # `just release-backfill-target <tag> aarch64-darwin` from a Mac until
+          # a darwin runner is registered, at which point restore this entry.
     steps:
       - name: Reset persistent-runner Git URL rewrites
         shell: bash
