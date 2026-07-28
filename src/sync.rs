@@ -2530,7 +2530,11 @@ fn sync_with_lock(
         "reading exact provider graph, checks, and admission order",
     );
     let mut status =
-        read::status_with_deadline_and_budget(context, operation_deadline, Some(&github_budget))?;
+        // A sync tick operates on the whole fleet and addresses every PR
+        // explicitly, so it must not abort because the invoking checkout sits on
+        // a merged or ambiguous branch. That state is one Cara produces itself
+        // by retiring merged heads after a successful landing.
+        read::fleet_status(context, operation_deadline, Some(&github_budget))?;
     let initial_status_elapsed = initial_status_started.elapsed();
     progress::emit(
         "initial_discovery",

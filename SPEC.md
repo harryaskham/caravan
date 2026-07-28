@@ -823,6 +823,16 @@ Hook events include:
 - `required_runs_missing`;
 - `required_runs_retriggered`.
 
+`examples/hooks/caco-bead-dispatch.sh` is the worked scheduler-side consumer:
+it routes on `wake_class`, staying silent for `none` and `retry_tick` because
+the next tick resolves those itself, filing one bead and dispatching one agent
+for `external_decision`, and filing the bead then notifying a human for
+`operator_action` because no agent can change repository settings. It
+deduplicates on `decision_fingerprint` rather than the per-emission event id, so
+a caravan stuck for an hour dispatches one agent instead of one per cron tick.
+Its behaviour is pinned by `tests/hook_example.rs` against a fake `caco`, not by
+this prose.
+
 A hook is a configured shell command. It receives one versioned metadata JSON object on stdin and non-secret context such as `CARA_EVENT`, repository, and PR numbers in environment variables. Hook metadata contains operation/event IDs suitable for external deduplication.
 Before hook delivery, every canonical secret-free event is durably appended with
 its exact IDs to a versioned journal under common Git metadata. Secret-free hook

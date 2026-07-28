@@ -623,7 +623,22 @@ pub(crate) fn status_with_deadline_and_budget(
     operation_deadline: std::time::Instant,
     github_budget: Option<&crate::command::GithubRequestBudget>,
 ) -> Result<StatusOutput, AppError> {
-    status_with_discovery_options(context, operation_deadline, github_budget, false)
+    status_with_discovery_options(context, operation_deadline, github_budget, false, true)
+}
+
+/// Status for a fleet-level read that must not depend on the local checkout.
+///
+/// Admission order and the next candidate are properties of the provider graph.
+/// A checkout left on a merged or ambiguous branch — the state Cara itself
+/// produces by retiring merged heads — must not stop the queue from advancing.
+/// `current_pr` simply resolves to `None`, which every PR-scoped command already
+/// treats as a refusal to act rather than a licence to guess.
+pub(crate) fn fleet_status(
+    context: &AppContext,
+    operation_deadline: std::time::Instant,
+    github_budget: Option<&crate::command::GithubRequestBudget>,
+) -> Result<StatusOutput, AppError> {
+    status_with_discovery_options(context, operation_deadline, github_budget, false, false)
 }
 
 /// Explicit PR-creation discovery permits one safe, advanced, unlabelled
@@ -634,7 +649,7 @@ pub(crate) fn status_for_pr_creation(
     operation_deadline: std::time::Instant,
     github_budget: Option<&crate::command::GithubRequestBudget>,
 ) -> Result<StatusOutput, AppError> {
-    status_with_discovery_options(context, operation_deadline, github_budget, true)
+    status_with_discovery_options(context, operation_deadline, github_budget, true, true)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -643,6 +658,7 @@ fn status_with_discovery_options(
     operation_deadline: std::time::Instant,
     github_budget: Option<&crate::command::GithubRequestBudget>,
     allow_unlabelled_historical_pr_creation: bool,
+    require_current_pr_resolution: bool,
 ) -> Result<StatusOutput, AppError> {
     // Sharing one absolute deadline prevents a large repository from
     // multiplying its budget by provider and compatibility subprocess count.
@@ -658,6 +674,7 @@ fn status_with_discovery_options(
     let discovery = GitHubDiscovery::new(provider_runner.clone()).with_options(
         crate::github::DiscoveryOptions {
             allow_unlabelled_historical_pr_creation,
+            require_current_pr_resolution,
             ..crate::github::DiscoveryOptions::default()
         },
     );
@@ -927,7 +944,10 @@ fn next_admission_command(admission: &AdmissionStatus) -> NextAdmissionCommand {
 
 /// Return the canonical first automatic-admission candidate without mutation.
 pub fn next_candidate(context: &AppContext) -> Result<NextCandidateOutput, AppError> {
-    let status = status(context)?;
+    // Which PR is next is a property of the provider graph, never of the local
+    // checkout, so this read tolerates a merged or ambiguous current branch.
+    let budget = std::time::Duration::from_secs(context.config.command_timeout_secs);
+    let status = fleet_status(context, std::time::Instant::now() + budget, None)?;
     // The automatic surface is FIFO-bound for both intents. Emitting the typed
     // decision here keeps it comparable with, and distinct from, the explicit
     // owner intent recorded on a `cara check --pr N` receipt.

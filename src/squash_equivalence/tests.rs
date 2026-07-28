@@ -31,6 +31,14 @@ impl TestRepo {
             ["init", "--quiet", "--initial-branch=main"],
         );
         git(directory.path(), ["config", "user.name", "Caravan Test"]);
+        // Background maintenance has no place in a fixture: `git commit` can
+        // trigger auto gc/maintenance, and a fixture that races a repacker
+        // reports a Cara defect when the environment reclaimed an object it
+        // had just written. Observed as `merge_base_failed: could not read
+        // <oid>` on some Nix builders while other machines built the same pin
+        // cleanly (bd-f8cf99).
+        git(directory.path(), ["config", "gc.auto", "0"]);
+        git(directory.path(), ["config", "maintenance.auto", "false"]);
         git(
             directory.path(),
             ["config", "user.email", "caravan@example.invalid"],
@@ -101,6 +109,17 @@ fn analyze_fixture(
     candidate: &CommitOid,
     target: &CommitOid,
 ) -> SquashEquivalenceReport {
+    // Prove the fixture before trusting what the analysis says about it, so an
+    // environment that lost a just-written object is reported as a broken
+    // fixture rather than as a Cara reconciliation defect.
+    for oid in [candidate, target] {
+        assert!(
+            object_is_readable(repository, oid),
+            "fixture object {} is unreadable before analysis; the environment \
+             discarded an object this test just created, which is not a Cara defect",
+            oid.0
+        );
+    }
     let report = analyze_with_runner(
         &repository.runner(),
         &TestRepo::branch("feature", candidate),
@@ -112,6 +131,15 @@ fn analyze_fixture(
     assert_eq!(report.policy, SQUASH_EQUIVALENCE_POLICY);
     assert_eq!(report.schema_version, 1);
     report
+}
+
+fn object_is_readable(repository: &TestRepo, oid: &CommitOid) -> bool {
+    std::process::Command::new("git")
+        .args(["-C"])
+        .arg(repository.path())
+        .args(["cat-file", "-e", &format!("{}^{{commit}}", oid.0)])
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 fn tree_of(repository: &TestRepo, commit: &CommitOid) -> String {

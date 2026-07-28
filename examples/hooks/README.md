@@ -121,3 +121,25 @@ CARA_EVENT=ci_failed CARA_EVENT_ID=test-1 CARA_REPOSITORY=owner/name \
 
 `cara log` shows the bounded event journal and hook delivery receipts if a
 delivery fails or times out.
+
+## Verifying the hook without touching anything real
+
+The hook is an ordinary program reading stdin, so a synthetic payload proves the
+wiring before a real failure occurs. Pin `CACO_BIN` at a stub when you do:
+
+```sh
+printf '%s' '{"kind":"sync_failed","metadata":{"decision_fingerprint":"fnv1a64:demo",
+  "scheduler_status":{"wake_class":"external_decision"}}}' |
+  CACO_BIN=/tmp/fake-caco CARA_EVENT=sync_failed CARA_EVENT_ID=e1 \
+  CARA_REPOSITORY=owner/repo CARA_CARAVAN_ID=2223 CARA_PRS=2223 \
+  sh examples/hooks/caco-bead-dispatch.sh
+```
+
+`CACO_BIN` is exported as an absolute path in agent and daemon environments, so
+prepending a fake directory to `PATH` is *not* enough to sandbox a test run: the
+hook would call the real `caco` and file real beads. `tests/hook_example.rs`
+pins it for exactly this reason.
+
+Change `wake_class` to `retry_tick` and the hook must do nothing at all. That
+pair is the whole contract.
+++ b/examples/hooks/caco-bead-dispatch.sh

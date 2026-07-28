@@ -36,6 +36,20 @@ pub struct DiscoveryOptions {
     /// Treat one exact merged unlabelled branch generation as ancestry evidence
     /// for an explicitly requested fresh PR creation.
     pub allow_unlabelled_historical_pr_creation: bool,
+    /// Require the current branch to resolve to an exact caravan pull request.
+    ///
+    /// Fleet-level reads (admission order, status, the next candidate) are
+    /// properties of the provider graph and must not fail because the local
+    /// checkout happens to sit on a merged or ambiguous branch — a state Cara
+    /// itself produces by retiring merged heads. Those callers set this off and
+    /// receive `current_pr: None` plus the retained reason.
+    ///
+    /// PR-scoped mutations keep it on, so an ambiguous branch still yields the
+    /// precise typed refusal rather than a bare "no current PR". Turning it off
+    /// is never a safety relaxation: every PR-scoped command resolves its
+    /// subject as `input.pr.or(current_pr).ok_or(current_pr_not_found)`, so an
+    /// unresolved branch refuses to mutate rather than mutating the wrong PR.
+    pub require_current_pr_resolution: bool,
 }
 
 impl Default for DiscoveryOptions {
@@ -45,6 +59,9 @@ impl Default for DiscoveryOptions {
             open_limit: 1_000,
             merged_limit: 100,
             allow_unlabelled_historical_pr_creation: false,
+            // Strict by default: a caller that has not declared itself a
+            // fleet-level read keeps the precise historical diagnostics.
+            require_current_pr_resolution: true,
         }
     }
 }
@@ -1650,9 +1667,21 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
         let Some(branch) = current_branch.filter(|branch| *branch != default_branch) else {
             return Ok(None);
         };
-        let Some((historical, successor)) =
-            self.resolve_historical_current_pr(repository, branch, pulls)?
-        else {
+        // A fleet-level read must not fail because the local checkout sits on a
+        // merged or ambiguous branch. Resolving "which PR do you mean" is only
+        // required for PR-scoped work, and declining to guess is fail-closed:
+        // every such command refuses with `current_pr_not_found` rather than
+        // substituting a different subject.
+        let resolved = match self.resolve_historical_current_pr(repository, branch, pulls) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                if self.options.require_current_pr_resolution {
+                    return Err(error);
+                }
+                return Ok(None);
+            }
+        };
+        let Some((historical, successor)) = resolved else {
             return Ok(None);
         };
         pulls.entry(historical.number).or_insert(historical);

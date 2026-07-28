@@ -660,6 +660,17 @@ pub fn analyze_for_actor(
         .unqueued
         .iter()
         .copied()
+        .filter(|number| {
+            // An explicitly skipped candidate is not competing for the front of
+            // the queue, so re-proving it every tick spends provider budget to
+            // re-report a decision the operator already made. Reporting it here
+            // is also what made `caravan-join-skipped` look inert: admission had
+            // correctly excluded the PR, while this loop kept naming it.
+            analysis
+                .pull_requests
+                .get(number)
+                .is_none_or(|candidate| !candidate.has_label("caravan-join-skipped"))
+        })
         .take(LEADING_CANDIDATE_COMPATIBILITY_BOUND)
         .collect::<Vec<_>>()
     {
@@ -1096,6 +1107,39 @@ mod tests {
         let observed = &analysis.pull_requests[&PrNumber(2101)];
         assert_eq!(observed.state, PullRequestState::Merged);
         assert_eq!(observed.merged_at.as_deref(), Some("2026-07-25T01:07:18Z"));
+    }
+
+    /// Live operator report: `caravan-join-skipped` was added to a conflicting
+    /// PR and Cara kept naming it, so the label read as if it had done nothing.
+    /// Admission had excluded it correctly all along; this detection loop was
+    /// re-proving and re-reporting the operator's own decision every tick.
+    #[test]
+    fn an_explicitly_skipped_candidate_is_not_reproved_or_reported() {
+        let checker = |candidate: &BranchSnapshot, target: &BranchSnapshot| {
+            Ok(CompatibilityReport {
+                candidate: candidate.clone(),
+                target: target.clone(),
+                outcome: CompatibilityOutcome::Conflict,
+                conflicting_paths: vec!["src/lib.rs".to_owned()],
+                diagnostic: None,
+            })
+        };
+        let mut skipped = pull_request(2234, "stuck", "main");
+        skipped.labels.clear();
+        skipped.labels.insert("caravan-join-skipped".to_owned());
+
+        let analysis = analyze(&snapshot(vec![skipped]), &checker)
+            .expect("a skipped candidate is not an execution failure");
+
+        assert!(
+            !analysis
+                .fleet
+                .problems
+                .iter()
+                .any(|problem| problem.prs.contains(&PrNumber(2234))),
+            "an explicitly skipped PR must not be re-reported: {:?}",
+            analysis.fleet.problems
+        );
     }
 
     /// bd-e9fcd7: a leading candidate that cannot merge into the default branch

@@ -2768,6 +2768,45 @@ fn run_feedback(json: bool, command: &FeedbackCommand) -> Result<(), i32> {
     }
 }
 
+/// Dense, human-first summary of the fields Caravan payloads share.
+///
+/// Rendered before any "see --json" fallback so the terminal always answers
+/// *which PR* and *why*, even when the full evidence is far too large to show.
+fn digest_lines(details: &serde_json::Value) -> String {
+    let mut lines = Vec::new();
+    if let Some(prs) = details["prs"].as_array().filter(|prs| !prs.is_empty()) {
+        let rendered = prs
+            .iter()
+            .filter_map(serde_json::Value::as_u64)
+            .map(|pr| format!("#{pr}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if !rendered.is_empty() {
+            lines.push(format!("  prs:    {rendered}"));
+        }
+    } else if let Some(pr) = details["pr"].as_u64() {
+        lines.push(format!("  pr:     #{pr}"));
+    }
+    for (label, key) in [
+        ("kind", "kind"),
+        ("status", "status"),
+        ("cause", "cause_code"),
+        ("reason", "reason"),
+        ("detail", "message"),
+        ("next", "next"),
+    ] {
+        if let Some(value) = details[key].as_str().filter(|value| !value.is_empty()) {
+            // One dense line each; the full text stays available under --json.
+            let trimmed: String = value.chars().take(160).collect();
+            lines.push(format!("  {label:<7} {trimmed}"));
+        }
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!("{}\n", lines.join("\n"))
+}
+
 fn short_oid(value: &str) -> &str {
     value.get(..value.len().min(9)).unwrap_or(value)
 }
@@ -2890,9 +2929,14 @@ fn human_error_evidence(error: &impl StructuredError) -> Option<String> {
     if encoded.len() <= 4_096 {
         Some(encoded)
     } else {
+        // A payload too large to print is exactly when a reader most needs to
+        // know WHICH pull request and WHY. Dropping straight to "too large" and
+        // a byte count tells them nothing they can act on, so pull the fields
+        // every Caravan payload shares before deferring to --json.
         Some(format!(
-            "{}\n  Re-run with --json for the complete structured evidence ({} bytes).",
-            dim("Structured evidence is too large for the human terminal view."),
+            "{}{}\n  Re-run with --json for the complete structured evidence ({} bytes).",
+            digest_lines(&details),
+            dim("Remaining evidence is too large for the human terminal view."),
             encoded.len()
         ))
     }

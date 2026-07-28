@@ -39,7 +39,49 @@ case "$EVENT" in
     ;;
 esac
 
-DEDUPE_LABEL="cara-event:${EVENT_ID}"
+# Not every failed tick is a problem worth dispatching for. Cara classifies each
+# one, and the wake class is the load-bearing field:
+#
+#   none, retry_tick   a healthy tick or a bounded provider race. The next cron
+#                      tick rediscovers fresh provider state and resolves it, so
+#                      dispatching here spawns work that has already fixed
+#                      itself.
+#   external_decision  a caravan that cannot resolve itself. Dispatch.
+#   operator_action    config, permission, or checkout work no agent can do.
+#
+# Absent (an older Cara, or an event carrying no scheduler status) is treated as
+# dispatchable, because failing open to a human beats silently dropping a stuck
+# caravan.
+WAKE_CLASS="$(
+  printf '%s' "$PAYLOAD" |
+    sed -n 's/.*"wake_class"[[:space:]]*:[[:space:]]*"\([a-z_]*\)".*/\1/p' | head -n 1
+)"
+case "$WAKE_CLASS" in
+  retry_tick|none)
+    echo "cara hook: ${EVENT} ${EVENT_ID} is ${WAKE_CLASS}; the next tick resolves it" >&2
+    exit 0
+    ;;
+esac
+
+# Dedupe across ticks, not just across redeliveries. CARA_EVENT_ID is unique per
+# emission, so a caravan stuck for an hour emits a new id every tick; on a
+# one-minute cron that is sixty beads for one problem. Cara therefore publishes
+# decision_fingerprint, which is stable for as long as the same decision remains
+# unresolved. Prefer it, and fall back to the event id when it is absent.
+FINGERPRINT="$(
+  printf '%s' "$PAYLOAD" |
+    sed -n 's/.*"decision_fingerprint"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1
+)"
+if [ -n "$FINGERPRINT" ]; then
+  DEDUPE_LABEL="cara-decision:$(printf '%s' "$FINGERPRINT" | tr -c 'A-Za-z0-9._-' '-')"
+else
+  DEDUPE_LABEL="cara-event:${EVENT_ID}"
+fi
+  printf -- '- wake_class: %s\n' "${WAKE_CLASS:-unknown}"
+  printf -- '- dedupe: %s\n' "$DEDUPE_LABEL"
+  # shellcheck disable=SC2016 # literal markdown backticks, not substitution
+  # shellcheck disable=SC2016 # literal markdown backticks, not substitution
+
 
 existing="$(
   "$CACO_BIN" bd list --project "$PROJECT" --label "$DEDUPE_LABEL" --count-only --json 2>/dev/null |
@@ -77,3 +119,22 @@ trap 'rm -f "$description_file"' EXIT
   --json > /dev/null
 
 echo "cara hook: filed ${EVENT} ${EVENT_ID} for ${REPOSITORY} ${PRS:-none}" >&2
+
+# Operator action cannot be delegated: an agent cannot change repository
+# settings or clean a dirty checkout. The bead is already filed above, so tell
+# a human and stop rather than dispatching an agent that cannot help.
+if [ "$WAKE_CLASS" = "operator_action" ]; then
+  "$CACO_BIN" msg broadcast --project "$PROJECT" \
+    --body "[cara] ${REPOSITORY} caravan #${CARAVAN_ID:-?} needs operator action: ${EVENT} (${DEDUPE_LABEL})." \
+    > /dev/null 2>&1 || true
+  exit 0
+fi
+
+# Dispatch exactly one agent for this decision. This runs only after the bead is
+# durable and after the dedupe probe, so a repeat delivery of the same decision
+# can never spawn a second agent.
+if [ "${CARA_HOOK_DISPATCH_AGENT:-1}" = "1" ]; then
+  "$CACO_BIN" agent new --project "$PROJECT" --type pi --label "$DEDUPE_LABEL" \
+    > /dev/null 2>&1 ||
+    echo "cara hook: filed ${DEDUPE_LABEL} but could not spawn an agent; dispatch it manually" >&2
+fi

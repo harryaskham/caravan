@@ -25,6 +25,13 @@ after the same check passes.
 
 ## Core model
 
+For the full decision tree — how a PR becomes a candidate, what blocks the
+admission front and what does not, when a root is flattened rather than
+replayed, the four conditions for merging a root, and how failures are typed by
+who can resolve them — see [docs/lifecycle.md](docs/lifecycle.md). It also lists
+the currently known gaps between that intended behaviour and what Cara does
+today.
+
 - A caravan head targets the repository default branch.
 - Each later PR targets its predecessor's branch without routinely rewriting
   history.
