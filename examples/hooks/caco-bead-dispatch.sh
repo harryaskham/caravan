@@ -77,10 +77,6 @@ if [ -n "$FINGERPRINT" ]; then
 else
   DEDUPE_LABEL="cara-event:${EVENT_ID}"
 fi
-  printf -- '- wake_class: %s\n' "${WAKE_CLASS:-unknown}"
-  printf -- '- dedupe: %s\n' "$DEDUPE_LABEL"
-  # shellcheck disable=SC2016 # literal markdown backticks, not substitution
-  # shellcheck disable=SC2016 # literal markdown backticks, not substitution
 
 
 existing="$(
@@ -104,7 +100,11 @@ trap 'rm -f "$description_file"' EXIT
   printf -- '- repository: %s\n' "$REPOSITORY"
   printf -- '- caravan_id: %s\n' "${CARAVAN_ID:-none}"
   printf -- '- prs: %s\n' "${PRS:-none}"
+  printf -- '- wake_class: %s\n' "${WAKE_CLASS:-unknown}"
+  printf -- '- dedupe: %s\n' "$DEDUPE_LABEL"
+  # shellcheck disable=SC2016 # literal markdown backticks, not substitution
   printf '\nExact bounded Cara evidence:\n\n```json\n%s\n```\n' "$PAYLOAD"
+  # shellcheck disable=SC2016 # literal markdown backticks, not substitution
   printf '\nContinuation: rerun the same idempotent `cara sync --all`. '
   printf 'Repair the exact reported PR generation; never hand-merge, force-push, or edit control labels directly.\n'
 } > "$description_file"
