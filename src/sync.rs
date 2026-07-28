@@ -232,6 +232,49 @@ pub struct SyncCaravanGeneration {
     pub members: Vec<SyncMemberGeneration>,
 }
 
+/// Why the exact front of a queue cannot proceed.
+///
+/// Frequency never fixes head-of-line blocking: a conflicted or check-blocked
+/// front member re-confirms the same refusal on every tick while mergeable work
+/// waits behind it. Naming the exact blocking position, its class, and its
+/// remedies is what lets a hook repair or evict *that* member instead of
+/// greedily fixing whichever later member looks cheapest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HeadOfLineBlockKind {
+    /// Textual incompatibility with the exact target; syncing cannot resolve it.
+    Conflict,
+    /// Terminal or unknown CI on the exact current generation.
+    CiFailure,
+    /// Required contexts have no reporting run on the exact head.
+    MissingRequiredRuns,
+    /// Structural graph problem naming this member.
+    InvalidGraph,
+    /// Provider or policy state refuses the canonical admission attempt.
+    AdmissionRejected,
+}
+
+/// Bounded receipt naming the exact member that blocks queue progress.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct HeadOfLineStall {
+    pub kind: HeadOfLineBlockKind,
+    /// Caravan whose front is blocked; absent for an admission-order stall.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caravan_id: Option<PrNumber>,
+    pub blocking_pr: PrNumber,
+    /// One-based position in the blocked ordering.
+    pub position: usize,
+    /// Members or candidates that cannot proceed until this one does.
+    #[serde(default)]
+    pub blocked_prs: Vec<PrNumber>,
+    pub evidence: String,
+    /// Exact operator/hook continuations, ordered most direct first.
+    #[serde(default)]
+    pub remedies: Vec<String>,
+    /// Stable identity for deduplicating receipts and counting no-progress passes.
+    pub fingerprint: String,
+}
+
 /// Stable status consumed by deterministic external tick schedulers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SyncSchedulerStatus {
@@ -251,6 +294,10 @@ pub struct SyncSchedulerStatus {
     /// the scheduler is never healthy while a caravan cannot start CI at all.
     #[serde(default)]
     pub missing_required_runs: Vec<MissingRequiredRunsProblem>,
+    /// Exact members or candidates that block all progress behind them. Empty
+    /// means the tick is genuinely idle rather than silently stuck.
+    #[serde(default)]
+    pub head_of_line: Vec<HeadOfLineStall>,
     pub reason: String,
 }
 

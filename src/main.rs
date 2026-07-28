@@ -1907,6 +1907,21 @@ fn render_sync(output: &caravan::sync::SyncOutput) -> String {
         output.scheduler_status.rebase_on_join,
         output.scheduler_status.reason,
     );
+    for stall in &output.scheduler_status.head_of_line {
+        let _ = writeln!(
+            text,
+            "  {} {:?} at position {} blocks {} PR(s): #{} — {}",
+            warning("head-of-line:"),
+            stall.kind,
+            stall.position,
+            stall.blocked_prs.len(),
+            stall.blocking_pr,
+            stall.evidence,
+        );
+        for remedy in &stall.remedies {
+            let _ = writeln!(text, "    remedy: {remedy}");
+        }
+    }
     let _ = writeln!(
         text,
         "  auto-admission: enabled={} heuristic={} continuation={:?} considered={} joins={} skips={} mutations={}/{} github={}/{} remaining={}",

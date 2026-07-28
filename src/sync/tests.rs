@@ -6161,3 +6161,77 @@ fn an_existing_config_on_a_new_runtime_keeps_the_native_merge_actor() {
     assert!(!progress.root_auto_merge.is_empty());
     assert!(progress.root_merge.is_empty());
 }
+
+#[test]
+fn head_of_line_stall_names_the_exact_blocking_member_and_its_remedies() {
+    // bd-3f99dc: a conflicted front member re-confirms the same refusal on
+    // every tick while mergeable work waits behind it. Frequency cannot fix
+    // that; naming the exact position, class, and remedy can.
+    let mut pulls = healthy_chain();
+    pulls[1].checks = vec![check("build-test", CheckState::Failure, Some(11))];
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+    let ci = vec![
+        CiObservation {
+            pr: PrNumber(1),
+            disposition: CiDisposition::Passing,
+            checks: Vec::new(),
+            failed_runs: Vec::new(),
+            failure_diagnostics: Vec::new(),
+            rerunnable_run_ids: Vec::new(),
+        },
+        CiObservation {
+            pr: PrNumber(2),
+            disposition: CiDisposition::Failed,
+            checks: Vec::new(),
+            failed_runs: Vec::new(),
+            failure_diagnostics: Vec::new(),
+            rerunnable_run_ids: Vec::new(),
+        },
+    ];
+
+    let scheduler = successful_scheduler_status(&status, &ci, &[], true, &[], &[]);
+
+    assert_eq!(scheduler.head_of_line.len(), 1);
+    let stall = &scheduler.head_of_line[0];
+    assert_eq!(stall.blocking_pr, PrNumber(2));
+    assert_eq!(
+        stall.position, 2,
+        "position, not attractiveness, selects work"
+    );
+    assert_eq!(stall.blocked_prs, vec![PrNumber(3)]);
+    assert_eq!(stall.kind, crate::sync::HeadOfLineBlockKind::CiFailure);
+    assert!(stall.remedies.iter().any(|remedy| remedy.contains("evict")));
+    assert!(stall.fingerprint.starts_with("fnv1a64:"));
+    assert_eq!(
+        scheduler.disposition,
+        SchedulerDisposition::ExternalDecision,
+        "a stalled front is never reported as healthy or idle"
+    );
+    assert_eq!(scheduler.wake_class, SchedulerWakeClass::ExternalDecision);
+    assert!(provider.calls.borrow().is_empty());
+}
+
+#[test]
+fn converged_fleet_reports_no_head_of_line_stall() {
+    let pulls = healthy_chain();
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+    let ci = (1..=3)
+        .map(|pr| CiObservation {
+            pr: PrNumber(pr),
+            disposition: CiDisposition::Passing,
+            checks: Vec::new(),
+            failed_runs: Vec::new(),
+            failure_diagnostics: Vec::new(),
+            rerunnable_run_ids: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+
+    let scheduler = successful_scheduler_status(&status, &ci, &[], true, &[], &[]);
+
+    assert!(
+        scheduler.head_of_line.is_empty(),
+        "idle and stuck must stay distinguishable"
+    );
+    assert_eq!(scheduler.disposition, SchedulerDisposition::Healthy);
+}

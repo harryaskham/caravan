@@ -40,7 +40,14 @@ after the same check passes.
   `healthy` while a member's required contexts have no reporting run on its
   exact current head: those members appear in
   `scheduler_status.missing_required_runs` with the exact PR, head, and
-  contexts. Failed ticks classify `wake_class` as `retry_tick`,
+  contexts. A successful tick also names any `head_of_line` stall: the exact
+  blocking PR, its one-based queue position, the members waiting behind it, the
+  block class (conflict, CI failure, missing required runs, invalid graph, or a
+  blocking admission rejection), ordered repair/reshape/evict remedies, and a
+  stable fingerprint for counting no-progress passes. A stalled front is an
+  external decision, never healthy or idle: syncing more often cannot resolve a
+  conflict, and work must be selected by queue position rather than by whichever
+  member is cheapest to fix. Failed ticks classify `wake_class` as `retry_tick`,
   `external_decision`, or `operator_action`; only an external decision emits a
   repair-wake failure event. Stale provider preconditions are routine retry
   ticks, not merger work. Deterministic unsupported range shapes such as

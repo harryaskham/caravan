@@ -116,6 +116,11 @@ CORE MODEL AND INVARIANTS
   only by exactly one auditable check-suite rerequest against the unchanged
   head. Empty commits, close/reopen loops, force pushes, and broad reruns are
   never implicit workarounds.
+- A successful tick names every `head_of_line` stall: the exact blocking PR, its
+  one-based queue position, the members waiting behind it, the block class, and
+  ordered repair/reshape/evict remedies. A stalled front is an external
+  decision, never healthy or idle. Ticking more often cannot resolve a conflict,
+  so select work by queue position, not by whichever member is cheapest to fix.
 - Multiple caravans may exist. Cross-caravan compatibility and the configured
   admission bound are checked before automatic changes.
 - Automatic admission is deterministic: configured `caravan-priority:*` labels

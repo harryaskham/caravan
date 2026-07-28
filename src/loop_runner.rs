@@ -356,6 +356,7 @@ mod tests {
                     waiting_prs: Vec::new(),
                     held_caravans: Vec::new(),
                     missing_required_runs: Vec::new(),
+                    head_of_line: Vec::new(),
                     reason: "test fixture converged".to_owned(),
                 },
                 timing: None,

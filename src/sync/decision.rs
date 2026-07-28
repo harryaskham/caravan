@@ -2,10 +2,10 @@
 
 use super::{
     AppContext, AppError, BTreeMap, BTreeSet, CaravanEvent, CiDisposition, CiObservation,
-    DecisionKind, DecisionPoint, EventKind, Instant, MissingRequiredRunsProblem, PrNumber,
-    PullRequestSnapshot, RepositoryId, SchedulerDisposition, SchedulerWakeClass, StatusOutput,
-    StructuredError, SyncCaravanGeneration, SyncFailureSchedulerStatus, SyncMemberGeneration,
-    SyncSchedulerStatus, Value, hooks, json,
+    DecisionKind, DecisionPoint, EventKind, HeadOfLineBlockKind, HeadOfLineStall, Instant,
+    MissingRequiredRunsProblem, PrNumber, PullRequestSnapshot, RepositoryId, SchedulerDisposition,
+    SchedulerWakeClass, StatusOutput, StructuredError, SyncCaravanGeneration,
+    SyncFailureSchedulerStatus, SyncMemberGeneration, SyncSchedulerStatus, Value, hooks, json,
 };
 
 pub(super) fn checkout_for_decision(
@@ -116,6 +116,184 @@ pub(super) fn decision_checkout_target(decision: &DecisionPoint) -> Option<PrNum
 }
 
 #[allow(clippy::too_many_lines)]
+/// Derive the exact members and candidates that block everything behind them.
+///
+/// Position, not attractiveness, selects the work: a hook that repairs the
+/// cheapest blocked member never moves the front of the queue.
+fn head_of_line_stalls(
+    status: &StatusOutput,
+    ci: &[CiObservation],
+    missing_required_runs: &[MissingRequiredRunsProblem],
+) -> Vec<HeadOfLineStall> {
+    let mut stalls = Vec::new();
+    let conflicts = status
+        .analysis
+        .fleet
+        .problems
+        .iter()
+        .filter(|problem| !problem.prs.is_empty())
+        .collect::<Vec<_>>();
+    let failed_ci = ci
+        .iter()
+        .filter(|observation| observation.disposition == CiDisposition::Failed)
+        .map(|observation| observation.pr)
+        .collect::<BTreeSet<_>>();
+    let missing_runs = missing_required_runs
+        .iter()
+        .map(|problem| problem.pr)
+        .collect::<BTreeSet<_>>();
+
+    for caravan in &status.analysis.fleet.caravans {
+        let blocking = caravan.members.iter().enumerate().find_map(|(index, pr)| {
+            let problem = conflicts
+                .iter()
+                .find(|problem| problem.prs.contains(pr))
+                .copied();
+            let kind = if missing_runs.contains(pr) {
+                Some(HeadOfLineBlockKind::MissingRequiredRuns)
+            } else if failed_ci.contains(pr) {
+                Some(HeadOfLineBlockKind::CiFailure)
+            } else {
+                problem.map(|problem| {
+                    if problem.kind == crate::model::GraphProblemKind::Incompatible {
+                        HeadOfLineBlockKind::Conflict
+                    } else {
+                        HeadOfLineBlockKind::InvalidGraph
+                    }
+                })
+            };
+            kind.map(|kind| {
+                (
+                    index,
+                    *pr,
+                    kind,
+                    problem.map(|problem| problem.message.clone()),
+                )
+            })
+        });
+        let Some((index, blocking_pr, kind, message)) = blocking else {
+            continue;
+        };
+        let blocked_prs = caravan.members[index + 1..].to_vec();
+        let evidence = message.unwrap_or_else(|| match kind {
+            HeadOfLineBlockKind::CiFailure => {
+                format!("PR #{blocking_pr} has terminal or unknown CI on its exact current head")
+            }
+            HeadOfLineBlockKind::MissingRequiredRuns => format!(
+                "PR #{blocking_pr} has required contexts with no reporting run on its exact head"
+            ),
+            _ => format!("PR #{blocking_pr} cannot proceed"),
+        });
+        stalls.push(HeadOfLineStall {
+            kind,
+            caravan_id: Some(caravan.id),
+            blocking_pr,
+            position: index + 1,
+            blocked_prs,
+            evidence,
+            remedies: member_remedies(kind, blocking_pr),
+            fingerprint: stall_fingerprint(
+                status,
+                Some(caravan.id),
+                blocking_pr,
+                kind,
+                status
+                    .analysis
+                    .pull_requests
+                    .get(&blocking_pr)
+                    .map(|pull| pull.head.oid.0.as_str()),
+            ),
+        });
+    }
+
+    // A rejected canonical admission attempt blocks nothing behind it only when
+    // it is explicitly excluded from ordering; a blocking rejection is exactly
+    // the head-of-line case for unenrolled work.
+    if let Some(rejected) = status
+        .admission
+        .rejected
+        .iter()
+        .find(|candidate| candidate.blocks_order)
+        && status.admission.next_candidate == Some(rejected.pr)
+    {
+        let blocked_prs = status
+            .admission
+            .candidates
+            .iter()
+            .map(|candidate| candidate.pr)
+            .collect::<Vec<_>>();
+        stalls.push(HeadOfLineStall {
+            kind: HeadOfLineBlockKind::AdmissionRejected,
+            caravan_id: None,
+            blocking_pr: rejected.pr,
+            position: 1,
+            blocked_prs,
+            evidence: rejected.reason.clone(),
+            remedies: vec![
+                format!(
+                    "resolve the exact reported condition on PR #{}; ordering never leapfrogs an eligible attempt",
+                    rejected.pr
+                ),
+                format!(
+                    "or make it ineligible on purpose: `cara priority clear --pr {} --actor A --reason R`, close it, or repair its metadata",
+                    rejected.pr
+                ),
+            ],
+            fingerprint: stall_fingerprint(
+                status,
+                None,
+                rejected.pr,
+                HeadOfLineBlockKind::AdmissionRejected,
+                None,
+            ),
+        });
+    }
+    stalls
+}
+
+fn member_remedies(kind: HeadOfLineBlockKind, pr: PrNumber) -> Vec<String> {
+    match kind {
+        HeadOfLineBlockKind::Conflict => vec![
+            format!("`cara repair start --pr {pr}` and resolve the exact typed conflict"),
+            format!("or release the front: `cara evict --pr {pr} --reason <text>`"),
+        ],
+        HeadOfLineBlockKind::CiFailure => vec![
+            format!("inspect the bounded run/job/step evidence for PR #{pr} and repair the source"),
+            "or rerun only listed current-generation infrastructure runs with `cara sync --rerun-failed`".to_owned(),
+            format!("or release the front: `cara evict --pr {pr} --reason <text>`"),
+        ],
+        HeadOfLineBlockKind::MissingRequiredRuns => vec![
+            format!("trigger a fresh exact-head run for PR #{pr}; waiting alone never resolves it"),
+            format!("or release the front: `cara evict --pr {pr} --reason <text>`"),
+        ],
+        HeadOfLineBlockKind::InvalidGraph => vec![
+            "repair the reported structural graph problem before any further mutation".to_owned(),
+            format!("or reshape with `cara split --pr {pr}` / `cara evict --pr {pr} --reason <text>`"),
+        ],
+        HeadOfLineBlockKind::AdmissionRejected => Vec::new(),
+    }
+}
+
+fn stall_fingerprint(
+    status: &StatusOutput,
+    caravan_id: Option<PrNumber>,
+    blocking_pr: PrNumber,
+    kind: HeadOfLineBlockKind,
+    head_oid: Option<&str>,
+) -> String {
+    let material = serde_json::to_vec(&json!({
+        "schema_version": 1,
+        "repository": status.repository,
+        "caravan_id": caravan_id,
+        "blocking_pr": blocking_pr,
+        "kind": kind,
+        "head_oid": head_oid,
+    }))
+    .expect("head-of-line fingerprint material serializes");
+    crate::membership::fnv1a64(&material)
+}
+
+#[allow(clippy::too_many_lines)]
 pub(super) fn successful_scheduler_status(
     status: &StatusOutput,
     ci: &[CiObservation],
@@ -188,6 +366,7 @@ pub(super) fn successful_scheduler_status(
     let operator_action = missing_required_runs
         .iter()
         .any(|problem| problem.operator_action_required);
+    let head_of_line = head_of_line_stalls(status, ci, missing_required_runs);
     let unknown_provider_state = !missing_required_runs.is_empty() && !operator_action;
     let (disposition, wake_class, reason) = if operator_action {
         (
@@ -206,6 +385,14 @@ pub(super) fn successful_scheduler_status(
             SchedulerDisposition::WaitingCi,
             SchedulerWakeClass::None,
             "fresh or pending CI is the only incomplete condition; do not wake a repair actor",
+        )
+    } else if !head_of_line.is_empty() {
+        // Head-of-line blocking never clears by ticking again: the exact front
+        // member needs repair, reshape, or eviction.
+        (
+            SchedulerDisposition::ExternalDecision,
+            SchedulerWakeClass::ExternalDecision,
+            "the front of a queue cannot proceed; repair, reshape, or evict the exact blocking member named in head_of_line",
         )
     } else if !held_caravans.is_empty() {
         (
@@ -230,6 +417,7 @@ pub(super) fn successful_scheduler_status(
         waiting_prs,
         held_caravans,
         missing_required_runs: missing_required_runs.to_vec(),
+        head_of_line,
         reason: reason.to_owned(),
     }
 }
