@@ -53,6 +53,9 @@ pub struct ReshapeOutput {
     /// still carry its commits after retargeting (bd-cef612).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub descendants_inheriting_evicted_patch: Vec<PrNumber>,
+    /// Exact per-descendant rewrites that removed the evicted patch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub descendant_rewrites: Vec<crate::physical_rebase::RebaseReceipt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     pub receipt: OperationReceipt,
@@ -216,7 +219,20 @@ fn execute_live(
         crate::command::ProcessRunner::in_directory(&context.repository_path).with_timeout(timeout),
     );
     let requested_reason = reason.clone();
-    let mut output = match execute(status, &checker, &provider, operation, selected, reason) {
+    let rewrite = RewriteContext {
+        repository_path: &context.repository_path,
+        timeout,
+        enabled: context.config.rebase_on_join,
+    };
+    let mut output = match execute(
+        status,
+        &checker,
+        &provider,
+        operation,
+        selected,
+        reason,
+        Some(&rewrite),
+    ) {
         Ok(output) => output,
         Err(error) if operation == ReshapeOperation::Evict => {
             let event = eviction_failed_event(
@@ -283,6 +299,14 @@ fn eviction_failed_event(
 // accidentally swapping in partially refreshed facts mid-transaction.
 #[allow(clippy::needless_pass_by_value)]
 #[allow(clippy::too_many_lines)]
+/// Repository access required to physically unwind descendants (bd-cef612).
+struct RewriteContext<'a> {
+    repository_path: &'a std::path::Path,
+    timeout: std::time::Duration,
+    enabled: bool,
+}
+
+#[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
 fn execute(
     status: StatusOutput,
     checker: &impl CompatibilityChecker,
@@ -290,6 +314,7 @@ fn execute(
     operation: ReshapeOperation,
     selected: Option<PrNumber>,
     reason: Option<String>,
+    rewrite: Option<&RewriteContext<'_>>,
 ) -> Result<ReshapeOutput, AppError> {
     let number = selected.or(status.current_pr).ok_or_else(|| {
         AppError::validation(
@@ -386,14 +411,32 @@ fn execute(
     // so every descendant still carries the evicted patch and would silently
     // reintroduce discarded content when it lands. Record exactly which members
     // are affected instead of letting the receipt imply a clean removal.
-    let descendants_inheriting_evicted_patch = if operation == ReshapeOperation::Evict {
+    let descendants = if operation == ReshapeOperation::Evict {
         descendants_of(&status, number)
+    } else {
+        Vec::new()
+    };
+    // bd-cef612: physically drop the evicted patch from each descendant, so a
+    // descendant that later lands cannot reintroduce discarded content.
+    let descendant_rewrites = match rewrite {
+        Some(rewrite) if rewrite.enabled && !descendants.is_empty() => unwind_descendants(
+            rewrite,
+            &status,
+            number,
+            &descendants,
+            plan.child_base.as_ref(),
+        )?,
+        _ => Vec::new(),
+    };
+    let descendants_inheriting_evicted_patch = if descendant_rewrites.is_empty() {
+        descendants
     } else {
         Vec::new()
     };
     Ok(ReshapeOutput {
         operation,
         descendants_inheriting_evicted_patch,
+        descendant_rewrites,
         pr: number,
         reason,
         receipt: state.receipt(),
@@ -411,6 +454,69 @@ struct ReshapePlan {
     child_base: Option<BranchSnapshot>,
     creates_head: bool,
     affected_prs: Vec<PrNumber>,
+}
+
+/// Rebuild each descendant without the evicted member's commits.
+///
+/// The sequencer normally replays everything in `target..head`, which would
+/// re-apply the evicted patch. Replaying strictly after the evicted head drops
+/// exactly that member's commits while preserving each owner's own work, and
+/// the chain is rebuilt in order so a later descendant stacks on the rewritten
+/// earlier one. Every rewrite is proven before any is published, so a stack is
+/// never left half-unwound.
+fn unwind_descendants(
+    rewrite: &RewriteContext<'_>,
+    status: &StatusOutput,
+    evicted: PrNumber,
+    descendants: &[PrNumber],
+    child_base: Option<&BranchSnapshot>,
+) -> Result<Vec<crate::physical_rebase::RebaseReceipt>, AppError> {
+    let evicted_head = status
+        .analysis
+        .pull_requests
+        .get(&evicted)
+        .expect("evicted PR has a snapshot")
+        .head
+        .clone();
+    let default = &status.analysis.fleet.default_branch;
+    let mut target = crate::physical_rebase::PlannedBase::Remote(
+        child_base.cloned().unwrap_or_else(|| default.clone()),
+    );
+    let mut boundary = evicted_head;
+    let mut prepared = Vec::new();
+    for number in descendants {
+        let candidate = status
+            .analysis
+            .pull_requests
+            .get(number)
+            .expect("descendant has a snapshot");
+        let item = crate::physical_rebase::prepare_candidate(
+            rewrite.repository_path,
+            &status.repository,
+            candidate,
+            crate::physical_rebase::PlannedRangeBase::RemoteBranch {
+                branch: candidate.base.clone(),
+            },
+            target,
+            default,
+            crate::physical_rebase::RebaseExecutionBudget::new(rewrite.timeout)
+                .replaying_after(boundary.oid.clone()),
+        )?;
+        target = crate::physical_rebase::PlannedBase::Simulated(BranchSnapshot {
+            repository: status.repository.clone(),
+            name: candidate.head.name.clone(),
+            oid: item.plan.new_head_oid.clone(),
+        });
+        boundary = candidate.head.clone();
+        prepared.push(item);
+    }
+    for item in &prepared {
+        crate::physical_rebase::verify_prepared(item)?;
+    }
+    prepared
+        .iter()
+        .map(crate::physical_rebase::apply_prepared)
+        .collect()
 }
 
 /// Members physically stacked after `number` in its caravan.
@@ -1246,6 +1352,7 @@ mod tests {
             ReshapeOperation::Evict,
             Some(PrNumber(2)),
             Some("broken".to_owned()),
+            None,
         )
         .unwrap();
         let state = provider.pull_requests.borrow();
@@ -1267,6 +1374,7 @@ mod tests {
             ReshapeOperation::Evict,
             Some(PrNumber(1)),
             Some("head failed".to_owned()),
+            None,
         )
         .unwrap();
         let state = provider.pull_requests.borrow();
@@ -1285,6 +1393,7 @@ mod tests {
             ReshapeOperation::Evict,
             Some(PrNumber(2)),
             Some("tail failed".to_owned()),
+            None,
         )
         .unwrap();
         assert_eq!(output.affected_prs, vec![PrNumber(2)]);
@@ -1326,6 +1435,7 @@ mod tests {
             ReshapeOperation::Evict,
             Some(PrNumber(1)),
             Some("head failed".to_owned()),
+            None,
         )
         .expect("head eviction succeeds");
 
@@ -1355,6 +1465,7 @@ mod tests {
             ReshapeOperation::Evict,
             Some(PrNumber(3)),
             Some("dismantling a broken chain".to_owned()),
+            None,
         )
         .expect("evicting the tail introduces no new problem");
 
@@ -1379,6 +1490,7 @@ mod tests {
             ReshapeOperation::Evict,
             Some(PrNumber(2)),
             Some("middle".to_owned()),
+            None,
         )
         .unwrap_err();
 
@@ -1407,6 +1519,7 @@ mod tests {
             ReshapeOperation::Split,
             Some(PrNumber(1)),
             None,
+            None,
         )
         .unwrap_err();
         assert_eq!(mcp_cli::StructuredError::code(&error), "split_pr_is_head");
@@ -1426,6 +1539,7 @@ mod tests {
             &provider,
             ReshapeOperation::Split,
             Some(PrNumber(2)),
+            None,
             None,
         )
         .unwrap();
@@ -1461,6 +1575,7 @@ mod tests {
             &provider,
             ReshapeOperation::Split,
             Some(PrNumber(2)),
+            None,
             None,
         )
         .unwrap_err();

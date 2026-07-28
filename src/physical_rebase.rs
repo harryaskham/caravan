@@ -21,7 +21,7 @@ use crate::squash_equivalence::{self, SquashEquivalenceReport};
 const MAX_MERGE_PRESERVING_COMMITS: usize = 256;
 
 /// Shared child and whole-operation limits for one prepared generation.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct RebaseExecutionBudget {
     pub command_timeout: Duration,
     pub operation_deadline: Option<Instant>,
@@ -42,6 +42,14 @@ pub struct RebaseExecutionBudget {
     /// default so a child, whose ancestry must physically follow the chain, is
     /// never flattened.
     pub flatten_squashed_root: bool,
+    /// Replay only commits after this exact boundary (bd-cef612).
+    ///
+    /// The sequencer normally uses the target as its upstream, so it replays
+    /// everything in `target..head`. When a member is evicted, its descendants
+    /// must instead replay only their own commits, which means starting from
+    /// the evicted head. Set explicitly by eviction unwind; unset elsewhere so
+    /// no ordinary rewrite silently changes which commits it carries.
+    pub replay_upstream: Option<CommitOid>,
 }
 
 impl RebaseExecutionBudget {
@@ -52,12 +60,20 @@ impl RebaseExecutionBudget {
             operation_deadline: None,
             reconcile_squash_equivalent: false,
             flatten_squashed_root: false,
+            replay_upstream: None,
         }
+    }
+
+    /// Replay only commits after `boundary` (bd-cef612).
+    #[must_use]
+    pub fn replaying_after(mut self, boundary: CommitOid) -> Self {
+        self.replay_upstream = Some(boundary);
+        self
     }
 
     /// Authorize flattening a squash-merged root (bd-85b71d).
     #[must_use]
-    pub const fn flattening_squashed_root(mut self, flatten: bool) -> Self {
+    pub fn flattening_squashed_root(mut self, flatten: bool) -> Self {
         self.flatten_squashed_root = flatten;
         self
     }
@@ -298,6 +314,7 @@ pub fn rewrite_candidate(
 
 /// Materialize one exact rebase generation and retain its worktree through apply.
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::needless_pass_by_value)]
 pub fn prepare_candidate(
     repository_path: &Path,
     repository: &RepositoryId,
@@ -500,9 +517,11 @@ pub fn prepare_candidate(
             &target.oid,
             &candidate.head.oid,
             has_merges,
-            reconciliation
-                .as_ref()
-                .and_then(SquashEquivalenceReport::authorized_range_base),
+            budget.replay_upstream.as_ref().or_else(|| {
+                reconciliation
+                    .as_ref()
+                    .and_then(SquashEquivalenceReport::authorized_range_base)
+            }),
         )?
     };
     if !rebase.is_success() {
@@ -2933,6 +2952,88 @@ mod tests {
         assert_eq!(
             git(&clone, &["ls-remote", "origin", "refs/heads/feature"]),
             before
+        );
+    }
+
+    /// bd-cef612: replaying only after the evicted head drops precisely that
+    /// member's commits from a descendant while keeping the descendant's own
+    /// work. Without the explicit boundary the sequencer uses the target as its
+    /// upstream and replays the evicted commit too, silently reintroducing
+    /// discarded content.
+    #[test]
+    fn replaying_after_the_evicted_head_drops_only_that_patch() {
+        let fixture = fixture();
+
+        git(&fixture.clone, &["checkout", "-b", "evicted", "main"]);
+        std::fs::write(fixture.clone.join("evicted"), "evicted\n").unwrap();
+        git(&fixture.clone, &["add", "evicted"]);
+        git(&fixture.clone, &["commit", "-m", "evicted work"]);
+        let evicted_head = CommitOid(git(&fixture.clone, &["rev-parse", "HEAD"]));
+        git(&fixture.clone, &["push", "-u", "origin", "evicted"]);
+
+        git(&fixture.clone, &["checkout", "-b", "descendant"]);
+        std::fs::write(fixture.clone.join("descendant"), "descendant\n").unwrap();
+        git(&fixture.clone, &["add", "descendant"]);
+        git(&fixture.clone, &["commit", "-m", "descendant work"]);
+        let descendant_head = CommitOid(git(&fixture.clone, &["rev-parse", "HEAD"]));
+        git(&fixture.clone, &["push", "-u", "origin", "descendant"]);
+
+        let target = branch(&fixture.repository, "main", &fixture.new_main);
+        let candidate = PullRequestSnapshot {
+            number: PrNumber(3),
+            title: "descendant".to_owned(),
+            url: "https://example.invalid/3".to_owned(),
+            state: PullRequestState::Open,
+            draft: false,
+            head: branch(&fixture.repository, "descendant", &descendant_head),
+            base: branch(&fixture.repository, "evicted", &evicted_head),
+            cross_repository: false,
+            labels: BTreeSet::new(),
+            auto_merge: AutoMergeState::disabled(),
+            checks: Vec::new(),
+            created_at: None,
+            merged_at: None,
+            updated_at: None,
+        };
+
+        let prepared = prepare_candidate(
+            &fixture.clone,
+            &fixture.repository,
+            &candidate,
+            PlannedRangeBase::RemoteBranch {
+                branch: branch(&fixture.repository, "evicted", &evicted_head),
+            },
+            PlannedBase::Remote(target.clone()),
+            &target,
+            RebaseExecutionBudget::new(TEST_REBASE_BUDGET).replaying_after(evicted_head.clone()),
+        )
+        .expect("descendant rebuilds without the evicted patch");
+        let receipt = apply_prepared(&prepared).expect("apply the unwound descendant");
+
+        let files = git(
+            &fixture.clone,
+            &[
+                "ls-tree",
+                "-r",
+                "--name-only",
+                receipt.new_head_oid.0.as_str(),
+            ],
+        );
+        assert!(
+            files.contains("descendant"),
+            "own patch must survive: {files}"
+        );
+        assert!(
+            !files.contains("evicted"),
+            "evicted patch must be dropped: {files}"
+        );
+        assert_eq!(
+            git(
+                &fixture.clone,
+                &["rev-parse", &format!("{}^", receipt.new_head_oid.0)]
+            ),
+            fixture.new_main.0,
+            "the unwound descendant must sit directly on the exact target"
         );
     }
 

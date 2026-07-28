@@ -380,6 +380,19 @@ members already released and the one that failed, so an interrupted cascade is
 resumable rather than a silently half-dissolved chain. `--cascade` and `--all`
 are mutually exclusive.
 
+Eviction also unwinds the evicted member out of its descendants (bd-cef612).
+Physical joins rebased each member onto its predecessor, so retargeting alone
+leaves the evicted patch inside every descendant, which would silently
+reintroduce discarded content when one lands. Each descendant is therefore
+replayed strictly after the evicted head onto the surviving predecessor (or the
+default branch), dropping exactly that member's commits while preserving the
+descendant's own work, and the chain is rebuilt in order. Every rewrite is
+proven before any is published, so a descendant that cannot be unwound cleanly
+leaves the whole stack untouched. The receipt carries per-descendant rewrites;
+when repository access or `rebase_on_join` is unavailable, the receipt instead
+names the descendants that still carry the evicted patch rather than implying a
+removal that did not happen.
+
 Eviction adds `caravan-evicted`, removes `caravan` and `caravan-force`, and disables auto-merge. If the evicted PR has a child, that child is retargeted to the evicted PR's predecessor (or the default branch when evicting the head), but only if the new edge and fleet are compatible. The command fails before mutation if it cannot safely close the gap. Evicting a tail needs no rejoin.
 
 Splitting retargets the selected non-head to the default branch, making it a new head. Both resulting caravans must satisfy all graph and fleet compatibility invariants.
