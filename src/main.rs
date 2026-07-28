@@ -1890,8 +1890,23 @@ fn render_sync(output: &caravan::sync::SyncOutput) -> String {
     } else {
         success("already converged")
     };
+    // bd-180cd3: one compact, greppable line per pass, first, so "the loop is
+    // running and declining to join" is never mistaken for "the loop is not
+    // running". A rich multi-line render is useless if you are asking whether a
+    // tick happened at all.
     let mut text = format!(
-        "{}  {state}  {}\n",
+        "{} verb={} caravans={} unqueued={} synchronized={} joins={} changed={}\n",
+        dim("tick:"),
+        output.tick.verb,
+        output.tick.caravans,
+        output.tick.unqueued,
+        output.tick.synchronized,
+        output.tick.joins,
+        output.tick.changed,
+    );
+    let _ = writeln!(
+        text,
+        "{}  {state}  {}",
         heading("SYNC"),
         if caravans.is_empty() {
             dim("no caravans")

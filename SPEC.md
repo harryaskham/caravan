@@ -309,6 +309,27 @@ the automatic and explicit surfaces can be compared directly from JSON.
 
 `--tail-pr` names the intended merge target. `--head-pr` names a caravan whose tail is resolved at execution time. They are mutually exclusive.
 
+### Per-pass tick receipts
+
+Every `cara sync` emits one compact leading line naming the verb and the counts
+that pass observed (bd-180cd3):
+
+```
+tick: verb=sync caravans=3 unqueued=7 synchronized=3 joins=0 changed=false
+```
+
+It exists because a fleet once spent hours unable to distinguish *the loop is
+running and declining to join* from *the loop is not running at all*, testing
+hypothesis after hypothesis against a process that did not exist. Non-zero
+`unqueued` with zero `joins` is the first state; absence of the line entirely is
+the second. The same facts are carried structurally as `tick` on `SyncOutput`
+for `--json` and MCP callers.
+
+A bare `while true; do cara sync; sleep N; done` is not a supervision strategy —
+it dies with its terminal, silently. Schedulers should supervise the loop
+(launchd, systemd, tmux) and retain these per-pass receipts, so "no receipts
+since T" is itself the alarm.
+
 ### CI admission gate
 
 `cara ci-gate --pr N [--head-evidence]` answers one question for a consuming

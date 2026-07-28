@@ -328,6 +328,7 @@ mod tests {
     use crate::model::{CaravanFleet, CommitOid, OperationId, OperationReceipt, RepositoryId};
     use crate::read::StatusOutput;
 
+    #[allow(clippy::too_many_lines)]
     fn tick_output() -> LoopTickOutput {
         let repository = RepositoryId {
             owner: "harryaskham".to_owned(),
@@ -335,6 +336,15 @@ mod tests {
         };
         LoopTickOutput {
             sync: SyncOutput {
+                tick: crate::sync::SyncTickReceipt {
+                    schema_version: 1,
+                    verb: "sync".to_owned(),
+                    caravans: 0,
+                    unqueued: 0,
+                    synchronized: 0,
+                    joins: 0,
+                    changed: false,
+                },
                 receipt: OperationReceipt {
                     operation_id: OperationId::new(),
                     operation: "sync".to_owned(),

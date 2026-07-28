@@ -682,10 +682,38 @@ impl SyncPlanOutput {
     }
 }
 
+/// Compact evidence that one sync pass actually ran, and what it saw.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SyncTickReceipt {
+    pub schema_version: u32,
+    /// Verb this pass performed, so a receipt is never ambiguous about which
+    /// command produced it.
+    pub verb: String,
+    /// Caravans observed after the pass.
+    pub caravans: usize,
+    /// Unqueued pull requests observed after the pass. A non-zero count with
+    /// zero joins is the exact shape of "running but not joining".
+    pub unqueued: usize,
+    /// Caravans this pass synchronized.
+    pub synchronized: usize,
+    /// Automatic joins this pass performed.
+    pub joins: usize,
+    /// Whether this pass mutated anything at all.
+    pub changed: bool,
+}
+
 /// Stable result of one converged synchronization tick.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SyncOutput {
     pub receipt: OperationReceipt,
+    /// One compact per-pass receipt (bd-180cd3).
+    ///
+    /// A fleet once spent hours unable to tell "the loop is running and
+    /// declining to join" from "the loop is not running at all", testing
+    /// hypotheses against a process that did not exist. One line per tick
+    /// naming the verb and the counts it saw makes those two states
+    /// distinguishable at a glance, in a log or over a shoulder.
+    pub tick: SyncTickReceipt,
     /// Opt-in sync-owned best-effort admission receipts and continuation.
     #[serde(default)]
     pub auto_admission: AutoAdmissionOutput,
@@ -2336,7 +2364,7 @@ fn attach_physical_rebuild(error: AppError, outcome: &PhysicalRebuildOutcome) ->
 /// Successful bounded-prefix tick: an exact verified prefix of the complete
 /// approved graph was applied, its receipts are durable, and the remainder
 /// resumes on the next tick without replaying any completed provider mutation.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn bounded_prefix_output(
     context: &AppContext,
     input: &SyncInput,
@@ -2410,6 +2438,15 @@ fn bounded_prefix_output(
     };
     Ok(SyncOutput {
         receipt: progress.operation_receipt(),
+        tick: SyncTickReceipt {
+            schema_version: 1,
+            verb: "sync".to_owned(),
+            caravans: status.analysis.fleet.caravans.len(),
+            unqueued: status.analysis.fleet.unqueued.len(),
+            synchronized: progress.synchronized_caravans.len(),
+            joins: 0,
+            changed: progress.operation_receipt().changed,
+        },
         auto_admission: AutoAdmissionOutput {
             continuation: if context.config.sync.actions.join_unlabelled_prs && input.all {
                 AutoAdmissionContinuation::RequiresConvergedFleet
@@ -2932,6 +2969,15 @@ fn sync_with_lock(
     );
     Ok(SyncOutput {
         receipt: progress.operation_receipt(),
+        tick: SyncTickReceipt {
+            schema_version: 1,
+            verb: "sync".to_owned(),
+            caravans: final_status.analysis.fleet.caravans.len(),
+            unqueued: final_status.analysis.fleet.unqueued.len(),
+            synchronized: progress.synchronized_caravans.len(),
+            joins: auto_admission.joins.len(),
+            changed: progress.operation_receipt().changed,
+        },
         auto_admission,
         scheduler_status,
         timing: Some(SyncTiming {
