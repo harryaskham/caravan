@@ -235,6 +235,12 @@ pub enum RootMergeFailureCause {
     /// does not contain, so the content never reached the default branch. The
     /// root is left open and recoverable and no successor is promoted.
     MergeNotReachableFromDefault,
+    /// The exact default branch is not the generation this caravan's retained
+    /// patch set predicts: it neither contains the root head nor is the
+    /// generation this tick's own landing produced. Landing would silently
+    /// reintroduce content the default branch no longer carries, which is what
+    /// an operator revert or discard of an already-landed ancestor looks like.
+    DefaultBranchDivergedFromRetainedPatchSet,
 }
 
 impl RootMergeFailureCause {
@@ -248,6 +254,9 @@ impl RootMergeFailureCause {
             Self::ProviderDidNotPersistMerge => "provider_did_not_persist_merge",
             Self::MergedIntoUnexpectedBase => "merged_into_unexpected_base",
             Self::MergeNotReachableFromDefault => "merge_not_reachable_from_default",
+            Self::DefaultBranchDivergedFromRetainedPatchSet => {
+                "default_branch_diverged_from_retained_patch_set"
+            }
         }
     }
 
@@ -256,7 +265,9 @@ impl RootMergeFailureCause {
     pub const fn resumable(self) -> bool {
         !matches!(
             self,
-            Self::MergedIntoUnexpectedBase | Self::MergeNotReachableFromDefault
+            Self::MergedIntoUnexpectedBase
+                | Self::MergeNotReachableFromDefault
+                | Self::DefaultBranchDivergedFromRetainedPatchSet
         )
     }
 
@@ -281,6 +292,9 @@ impl RootMergeFailureCause {
             }
             Self::MergeNotReachableFromDefault => {
                 "inspect the typed unreachable-merge evidence: the claimed merge commit is not contained by the fetched default branch, so the pull request stays open and recoverable rather than counted as delivered"
+            }
+            Self::DefaultBranchDivergedFromRetainedPatchSet => {
+                "prove or rescope this caravan's content against the exact default branch before it may land: an already-landed ancestor was reverted or discarded, so this generation still carries content the default branch deliberately no longer has"
             }
         }
     }
@@ -484,6 +498,29 @@ impl RootMergeReceipt {
     pub fn proves_default_branch_landing(&self) -> bool {
         self.merged && self.base.name == self.default_branch
     }
+}
+
+/// Whether the exact default-branch generation is the one this caravan's
+/// retained patch set predicts.
+///
+/// Cumulative tree identity proves *what* would land, not *whether the target
+/// still wants it*. Both are required. The default branch is predicted exactly
+/// when it is contained by the root head — the ordinary case, because members
+/// are physically rebased onto it before CI — or when it is precisely the
+/// generation this caravan's own landing produced moments earlier in this tick.
+///
+/// Anything else means the default branch moved in a way this generation never
+/// saw. The dangerous instance is an operator reverting or discarding an
+/// already-landed ancestor: the successor still carries that ancestor's diff,
+/// the three-way merge silently reapplies it, and the result is still exactly
+/// the successor's own tree, so tree identity alone would authorize
+/// reintroducing content the operator deliberately removed.
+#[must_use]
+pub const fn retained_patch_set_holds(
+    default_branch_reachable_from_head: bool,
+    default_branch_landed_by_this_tick: bool,
+) -> bool {
+    default_branch_reachable_from_head || default_branch_landed_by_this_tick
 }
 
 /// Derive the exact promotion transition from observed facts.
@@ -842,6 +879,37 @@ mod tests {
     }
 
     #[test]
+    fn a_reverted_ancestor_invalidates_the_cumulative_successor_tree() {
+        // Live shape: root #2215 landed, an operator then reverted/discarded it
+        // on the default branch, and successors #2223/#2225/#2227 still carry
+        // its diff. A three-way merge silently reapplies that diff and still
+        // produces exactly the successor's own tree, so cumulative tree
+        // identity on its own would authorize reintroducing reverted content.
+        // Containment is what separates the two cases.
+        assert!(
+            !retained_patch_set_holds(false, false),
+            "a default branch that neither contains this head nor came from this tick's own landing is not the predicted generation"
+        );
+        // The ordinary case: members are physically rebased onto the default
+        // branch before CI, so the root contains it.
+        assert!(retained_patch_set_holds(true, false));
+        // The one movement a successor may land against without containing it
+        // is the one this caravan itself just caused.
+        assert!(retained_patch_set_holds(false, true));
+
+        let cause = RootMergeFailureCause::DefaultBranchDivergedFromRetainedPatchSet;
+        assert_eq!(
+            cause.code(),
+            "default_branch_diverged_from_retained_patch_set"
+        );
+        assert!(
+            !cause.resumable(),
+            "rerunning the same tick cannot decide whether reverted content should return"
+        );
+        assert!(cause.next().contains("rescope"));
+    }
+
+    #[test]
     fn typed_causes_expose_bounded_scheduler_next_actions() {
         for cause in [
             RootPromotionFailureCause::BaseRetargetNotObserved,
@@ -862,6 +930,7 @@ mod tests {
             RootMergeFailureCause::ProviderDidNotPersistMerge,
             RootMergeFailureCause::MergedIntoUnexpectedBase,
             RootMergeFailureCause::MergeNotReachableFromDefault,
+            RootMergeFailureCause::DefaultBranchDivergedFromRetainedPatchSet,
         ] {
             assert!(!cause.code().is_empty());
             assert!(!cause.next().is_empty());

@@ -139,7 +139,40 @@ pub(crate) fn cumulative_tree_proof_with_runner(
         identical: candidate_tree.0 == merge_result_tree,
         candidate_tree,
         merge_result_tree: CommitOid(merge_result_tree),
+        target_reachable_from_candidate: is_ancestor_with_runner(
+            runner,
+            target_oid,
+            candidate_oid,
+        )?,
     })
+}
+
+/// Whether `ancestor` is contained by `descendant`, using already-fetched
+/// objects and never touching refs or the worktree.
+fn is_ancestor_with_runner(
+    runner: &impl CommandRunner,
+    ancestor: &CommitOid,
+    descendant: &CommitOid,
+) -> Result<bool, AppError> {
+    let output = git_output(
+        runner,
+        [
+            "merge-base",
+            "--is-ancestor",
+            ancestor.0.as_str(),
+            descendant.0.as_str(),
+        ],
+    )?;
+    match output.code {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        code => Err(git_failure(
+            "merge_base_failed",
+            "git merge-base could not construct containment evidence",
+            code,
+            &output,
+        )),
+    }
 }
 
 /// Exact tree object of one already-fetched commit.

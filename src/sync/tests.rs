@@ -5597,6 +5597,18 @@ fn caravan_status(
     current: Option<PrNumber>,
     identical_trees: bool,
 ) -> StatusOutput {
+    caravan_status_with_containment(pulls, current, identical_trees, true)
+}
+
+/// As [`caravan_status`], but able to model a default branch the caravan head
+/// does not contain — for example after an operator reverted or discarded an
+/// already-landed ancestor.
+fn caravan_status_with_containment(
+    pulls: Vec<PullRequestSnapshot>,
+    current: Option<PrNumber>,
+    identical_trees: bool,
+    target_reachable_from_candidate: bool,
+) -> StatusOutput {
     let mut status = status(pulls, current, &clean);
     // Caravan-owned merging is opt-in: these fixtures set it explicitly, just
     // as a repository does once every consumer of its config understands the
@@ -5640,6 +5652,7 @@ fn caravan_status(
                 "tree-foreign".to_owned()
             }),
             identical: identical_trees,
+            target_reachable_from_candidate,
         })
         .collect();
     status.healthy = analysis.healthy();
@@ -6235,4 +6248,133 @@ fn converged_fleet_reports_no_head_of_line_stall() {
         "idle and stuck must stay distinguishable"
     );
     assert_eq!(scheduler.disposition, SchedulerDisposition::Healthy);
+}
+
+#[test]
+fn an_operator_reverted_ancestor_is_refused_never_silently_reintroduced() {
+    // Live migration fixture: cumulative root #2215 was landed and then
+    // discarded/reverted by the operator on the default branch, while
+    // successors #2223/#2225/#2227 still carry its diff because they were
+    // physically rebased on top of it before CI.
+    //
+    // This is the case cumulative tree identity alone cannot catch. The
+    // three-way merge of the successor with the reverted default branch
+    // reapplies #2215's diff and still yields exactly the successor's own tree,
+    // so `identical` stays true. What changed is containment: the default
+    // branch is no longer an ancestor of the successor. Landing here would
+    // silently reintroduce content the operator deliberately removed, so the
+    // tick refuses and leaves the decision to whoever can rescope the content.
+    let pulls = vec![
+        caravan_member(2223, "pr2223", "main"),
+        caravan_member(2225, "pr2225", "pr2223"),
+    ];
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    let status = caravan_status_with_containment(pulls, Some(PrNumber(2223)), true, false);
+
+    let error = execute(&status, &provider, false, false, false)
+        .expect_err("a reverted ancestor is never silently reintroduced");
+
+    assert_eq!(mcp_cli::StructuredError::code(&error), "root_merge_refused");
+    let details = mcp_cli::StructuredError::details(&error).expect("details");
+    assert_eq!(
+        details["cause"],
+        "default_branch_diverged_from_retained_patch_set"
+    );
+    assert_eq!(
+        details["resumable"], false,
+        "rerunning cannot decide whether reverted content should return"
+    );
+    assert_eq!(details["operator_action_required"], true);
+    // The tree proof still reports identical: that is exactly why containment
+    // has to be a separate, load-bearing fact.
+    assert_eq!(details["evidence"]["cumulative_tree"]["identical"], true);
+    assert_eq!(
+        details["evidence"]["cumulative_tree"]["target_reachable_from_candidate"],
+        false
+    );
+    assert!(
+        !provider.calls.borrow().contains(&MutationKind::SquashMerge),
+        "no landing is attempted"
+    );
+    assert!(
+        provider.pulls.borrow()[&PrNumber(2225)].state == PullRequestState::Open,
+        "successors are left untouched for rescoping"
+    );
+}
+
+#[test]
+fn a_conflicting_caravan_wakes_a_repair_actor_but_a_race_only_reruns_the_tick() {
+    // Scheduler posture: no Actions runtime, a Caco-managed cron tick, and
+    // hooks dispatching repair agents. The cron cannot read prose, so the
+    // caravan-owned merge actor must classify its own refusals: one error code
+    // covers both bounded races and states no rerun can resolve.
+    let pulls = vec![
+        caravan_member(2223, "pr2223", "main"),
+        caravan_member(2225, "pr2225", "pr2223"),
+    ];
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    let status = caravan_status_with_containment(pulls, Some(PrNumber(2223)), true, false);
+
+    let error = execute(&status, &provider, false, false, false).expect_err("refused");
+    let scheduler = super::decision::scheduler_failure_status(&error);
+    assert_eq!(scheduler.wake_class, SchedulerWakeClass::ExternalDecision);
+    assert!(!scheduler.retryable);
+    assert_eq!(scheduler.error_code, "root_merge_refused");
+
+    // The repair-wake event carries the exact caravan and PRs, so a dispatched
+    // agent starts from provider facts rather than from log scraping.
+    let error = super::decision::attach_scheduler_failure(&error, &scheduler);
+    let event = super::decision::sync_failed_event(&error).expect("a conflicting caravan wakes");
+    assert_eq!(event.kind, EventKind::SyncFailed);
+    assert_eq!(event.caravan_id, Some(PrNumber(2223)));
+    assert_eq!(event.prs, vec![PrNumber(2223)]);
+    assert_eq!(event.metadata["error_code"], "root_merge_refused");
+    assert_eq!(
+        event.metadata["scheduler_status"]["wake_class"],
+        "external_decision"
+    );
+    assert!(
+        event.metadata["decision_fingerprint"]
+            .as_str()
+            .is_some_and(|fingerprint| fingerprint.starts_with("fnv1a64:")),
+        "external deduplication needs a stable fingerprint"
+    );
+
+    // A bounded provider race under the same error code is the opposite: rerun
+    // the same idempotent tick and never wake a repair agent.
+    let pulls = vec![caravan_member(1, "one", "main")];
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    provider.never_persist_merge(
+        PrNumber(1),
+        crate::root_merge::ROOT_MERGE_CONFIRMATION_READS,
+    );
+    let status = caravan_status(pulls, Some(PrNumber(1)), true);
+
+    let error = execute(&status, &provider, false, false, false).expect_err("unproven merge");
+    let scheduler = super::decision::scheduler_failure_status(&error);
+    assert_eq!(scheduler.error_code, "root_merge_refused");
+    assert_eq!(scheduler.wake_class, SchedulerWakeClass::RetryTick);
+    assert!(scheduler.retryable);
+    let error = super::decision::attach_scheduler_failure(&error, &scheduler);
+    assert!(
+        super::decision::sync_failed_event(&error).is_none(),
+        "a bounded race never dispatches a repair agent"
+    );
+}
+
+#[test]
+fn a_repository_without_squash_merging_is_operator_action_not_a_retry() {
+    let pulls = vec![caravan_member(1, "one", "main")];
+    let mut provider = FakeProvider::with_pull_requests(pulls.clone());
+    provider.allows_squash_merge = false;
+    let status = caravan_status(pulls, Some(PrNumber(1)), true);
+
+    let error = execute(&status, &provider, false, false, false).expect_err("cannot squash");
+    let scheduler = super::decision::scheduler_failure_status(&error);
+    assert_eq!(scheduler.error_code, "squash_merge_not_enabled");
+    assert_eq!(scheduler.wake_class, SchedulerWakeClass::OperatorAction);
+    assert!(
+        !scheduler.retryable,
+        "repository settings are not fixed by rerunning the tick"
+    );
 }

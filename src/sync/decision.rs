@@ -475,12 +475,36 @@ pub(super) fn scheduler_failure_status(error: &AppError) -> SyncFailureScheduler
                 false,
             )
         }
+        // The caravan-owned merge actor classifies by its *typed cause*, not by
+        // error code, because one code covers both bounded races and states no
+        // rerun can resolve. A Caco-managed cron dispatching repair agents must
+        // be able to tell "run me again" from "send somebody who can decide".
+        None if error_code == "root_merge_refused" => {
+            let resumable = error
+                .details()
+                .and_then(|details| details.get("resumable").and_then(Value::as_bool))
+                .unwrap_or(true);
+            if resumable {
+                (
+                    SchedulerDisposition::RetryTick,
+                    SchedulerWakeClass::RetryTick,
+                    true,
+                )
+            } else {
+                (
+                    SchedulerDisposition::ExternalDecision,
+                    SchedulerWakeClass::ExternalDecision,
+                    false,
+                )
+            }
+        }
         None if matches!(
             error_code.as_str(),
             "default_branch_not_protected"
                 | "physical_sync_budget_insufficient"
                 | "rebase_ci_trigger_missing"
                 | "repository_not_initialized"
+                | "squash_merge_not_enabled"
                 | "unsafe_checkout"
         ) =>
         {

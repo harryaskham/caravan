@@ -6162,14 +6162,33 @@ impl SyncProgress {
     ) -> Result<(), AppError> {
         let mut remaining = caravan.members.clone();
         let mut merged = 0_u32;
+        // The exact default-branch generation this tick's own landing produced.
+        // It is the only movement of the default branch a successor is allowed
+        // to land against without containing it, because it is the only
+        // movement this caravan can prove it caused.
+        let mut landed_default: Option<crate::model::CommitOid> = None;
         while let Some(&root) = remaining.first() {
             if merged >= self.max_root_merges {
                 self.record_merge_wait(root, RootMergeBlock::MergeBudgetReached, None);
                 return Ok(());
             }
-            if !self.merge_root(provider, status, caravan.id, root, &remaining)? {
+            let landed = self.merge_root(
+                provider,
+                status,
+                caravan.id,
+                root,
+                &remaining,
+                landed_default.as_ref(),
+            )?;
+            if !landed {
                 return Ok(());
             }
+            landed_default = self
+                .root_merge
+                .iter()
+                .rev()
+                .find(|receipt| receipt.pr == root)
+                .map(|receipt| receipt.ancestry.default_after.oid.clone());
             merged = merged.saturating_add(1);
             remaining.remove(0);
             let Some(&next) = remaining.first() else {
@@ -6201,6 +6220,7 @@ impl SyncProgress {
         caravan_id: PrNumber,
         number: PrNumber,
         remaining: &[PrNumber],
+        landed_default: Option<&crate::model::CommitOid>,
     ) -> Result<bool, AppError> {
         let repository = status.repository.clone();
         let default_branch = status.default_branch.clone();
@@ -6299,6 +6319,32 @@ impl SyncProgress {
                 Some(tree_proof.reason()),
             );
             return Ok(false);
+        }
+        // Tree identity proves *what* would land, not that the default branch
+        // still wants it. An operator who reverts or discards an already-landed
+        // ancestor leaves the successor carrying that ancestor's diff; the
+        // three-way merge silently reapplies it and still yields exactly the
+        // successor's own tree. Containment is what separates that from the
+        // ordinary case, and it is refused rather than waited on because only
+        // proving or rescoping the caravan's content can resolve it.
+        if !root_merge::retained_patch_set_holds(
+            tree_proof.target_reachable_from_candidate,
+            landed_default.is_some_and(|oid| oid == &observed_default),
+        ) {
+            return Err(self.root_merge_failure(
+                caravan_id,
+                number,
+                RootMergeFailureCause::DefaultBranchDivergedFromRetainedPatchSet,
+                &observed,
+                Some(&expected_head),
+                &json!({
+                    "default_branch": default_branch,
+                    "observed_default_oid": observed_default,
+                    "landed_by_this_tick": landed_default,
+                    "cumulative_tree": tree_proof,
+                    "explanation": "the exact default branch neither contains this head nor is the generation this tick's own landing produced; landing would reintroduce content the default branch no longer carries",
+                }),
+            ));
         }
 
         let default_before = crate::model::BranchSnapshot {
@@ -6781,8 +6827,10 @@ impl SyncProgress {
                 "cause_code": cause.code(),
                 "trigger": trigger,
                 "trigger_reason": trigger.reason(),
+                "repository": self.repository,
                 "caravan_id": caravan_id,
                 "affected_pr": number,
+                "affected_prs": [number],
                 "default_branch": default_branch,
                 "observed_head": observed.head.oid,
                 "expected_head": expected_head,
@@ -6823,8 +6871,13 @@ impl SyncProgress {
             Some(json!({
                 "cause": cause,
                 "cause_code": cause.code(),
+                // Harvested by the sync_failed repair-wake path so a
+                // cron-dispatched agent receives the exact caravan and PRs
+                // without parsing prose.
+                "repository": self.repository,
                 "caravan_id": caravan_id,
                 "affected_pr": number,
+                "affected_prs": [number],
                 "observed_head": observed.head.oid,
                 "expected_head": expected_head,
                 "observed_state": observed.state,
