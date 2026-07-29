@@ -79,10 +79,20 @@ else
 fi
 
 
+# Every `caco` call below is failure-tolerant on purpose. A hook must never
+# fail the tick that observed the problem: `caco` can be absent, unexecutable,
+# or momentarily broken (a sandbox without the interpreter its shebang names is
+# enough), and none of that is a reason to redden a tick whose GitHub work has
+# already completed. Failing here also loses nothing: no dedupe label is
+# recorded, so the next tick retries the same decision.
 existing="$(
   "$CACO_BIN" bd list --project "$PROJECT" --label "$DEDUPE_LABEL" --count-only --json 2>/dev/null |
     sed -n 's/.*"count"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1
 )"
+# Keep the comparison arithmetic-safe even if the probe answered with junk:
+# `[ ... -gt ... ]` on a non-number exits 2, which `set -e` turns into a failed
+# tick. An unreadable probe means "not known to be dispatched", so treat it as 0.
+existing="$(printf '%s' "$existing" | tr -cd '0-9')"
 if [ "${existing:-0}" -gt 0 ]; then
   echo "cara hook: ${EVENT} ${EVENT_ID} already dispatched" >&2
   exit 0
@@ -109,14 +119,17 @@ trap 'rm -f "$description_file"' EXIT
   printf 'Repair the exact reported PR generation; never hand-merge, force-push, or edit control labels directly.\n'
 } > "$description_file"
 
-"$CACO_BIN" bd create \
+if ! "$CACO_BIN" bd create \
   --project "$PROJECT" \
   --title "$title" \
   --type bug \
   --priority "$PRIORITY" \
   --labels "caravan,cara-hook,${EVENT},${DEDUPE_LABEL}" \
   --description-file "$description_file" \
-  --json > /dev/null
+  --json > /dev/null; then
+  echo "cara hook: could not file ${EVENT} ${EVENT_ID} with ${CACO_BIN}; the next tick retries" >&2
+  exit 0
+fi
 
 echo "cara hook: filed ${EVENT} ${EVENT_ID} for ${REPOSITORY} ${PRS:-none}" >&2
 

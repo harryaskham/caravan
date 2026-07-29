@@ -23,6 +23,12 @@ fn event(wake_class: &str, fingerprint: &str) -> String {
 }
 
 /// A fake `caco` that records its invocations instead of dispatching anything.
+///
+/// The shebang is `/bin/sh`, not `/usr/bin/env bash`. POSIX guarantees
+/// `/bin/sh`, and a Nix build sandbox provides exactly that and nothing else:
+/// there is no `/usr` at all, so an `env` shebang becomes a `bad interpreter`
+/// failure (126) that surfaces here as the hook failing its own tick. bd-1d767a
+/// was that failure, and it broke every devshell built on caravan.
 fn fake_caco(root: &Path) -> PathBuf {
     let bin = root.join("bin");
     fs::create_dir_all(&bin).expect("fake bin");
@@ -33,7 +39,7 @@ fn fake_caco(root: &Path) -> PathBuf {
     fs::write(
         &script,
         format!(
-            r#"#!/usr/bin/env bash
+            r#"#!/bin/sh
 log={log}
 labels={labels}
 if [ "$1" = "bd" ] && [ "$2" = "list" ]; then
@@ -73,6 +79,14 @@ fi
 
 fn run(root: &Path, payload: &str) {
     let bin = fake_caco(root);
+    let status = run_hook(&bin, &bin.join("caco"), payload);
+    assert!(
+        status.success(),
+        "a hook must never fail the tick that observed the problem"
+    );
+}
+
+fn run_hook(bin: &Path, caco_bin: &Path, payload: &str) -> std::process::ExitStatus {
     let path = format!(
         "{}:{}",
         bin.display(),
@@ -84,7 +98,7 @@ fn run(root: &Path, payload: &str) {
     let mut child = Command::new("bash")
         .arg(hook_path())
         .env("PATH", path)
-        .env("CACO_BIN", bin.join("caco"))
+        .env("CACO_BIN", caco_bin)
         .env("CARA_HOOK_PROJECT", "cacophony")
         .env("CARA_REPOSITORY", "owner/repo")
         .env("CARA_CARAVAN_ID", "2223")
@@ -103,11 +117,7 @@ fn run(root: &Path, payload: &str) {
         .expect("stdin")
         .write_all(payload.as_bytes())
         .expect("payload");
-    let status = child.wait().expect("hook exits");
-    assert!(
-        status.success(),
-        "a hook must never fail the tick that observed the problem"
-    );
+    child.wait().expect("hook exits")
 }
 
 fn calls(root: &Path) -> Vec<String> {
@@ -177,6 +187,36 @@ fn operator_action_notifies_a_human_instead_of_spawning_an_agent() {
         calls(&root),
         vec!["bd create".to_owned(), "msg broadcast".to_owned()],
         "the work is still recorded, but a human is told: an agent cannot change repository settings or clean a dirty checkout"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// bd-1d767a: the invariant the cases above assert only incidentally, asserted
+/// directly. `caco` can be absent, unexecutable, or momentarily broken — a
+/// sandbox missing the interpreter its shebang names is enough — and none of
+/// that may redden a tick whose GitHub work already completed. Nothing is lost
+/// by staying green: the dedupe label is only recorded on a successful file, so
+/// the next tick retries the same decision.
+#[test]
+fn a_caco_that_cannot_run_still_leaves_the_tick_green() {
+    let root = temp_root("unusable-caco");
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).expect("bin");
+
+    let failing = bin.join("caco-fails");
+    fs::write(&failing, "#!/bin/sh\nexit 70\n").expect("write failing caco");
+    fs::set_permissions(&failing, fs::Permissions::from_mode(0o755)).expect("chmod failing caco");
+
+    for caco in [failing, bin.join("caco-does-not-exist")] {
+        let status = run_hook(&bin, &caco, &event("external_decision", "fnv1a64:ffff"));
+        assert!(
+            status.success(),
+            "a hook must never fail the tick that observed the problem"
+        );
+    }
+    assert!(
+        !root.join("calls.log").exists(),
+        "a caco that cannot run dispatches nothing"
     );
     let _ = fs::remove_dir_all(&root);
 }

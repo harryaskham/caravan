@@ -67,6 +67,11 @@ Deliveries can repeat after an interrupted Cara operation, so every hook must be
 idempotent. `caco-bead-dispatch.sh` uses the `cara-event:<CARA_EVENT_ID>` label
 as its dedupe key and exits cleanly when the bead already exists.
 
+It also exits `0` when `caco` itself is absent, unexecutable, or failing: a hook
+must never redden the tick that observed the problem, and no dedupe label is
+recorded on a failed file, so the next tick retries the same decision. Diagnose
+such a tick from the hook's stderr, not from its exit code.
+
 ## 3. The cron entry
 
 Add a `caco` cron entry that runs one bounded tick. A one-minute schedule keeps
