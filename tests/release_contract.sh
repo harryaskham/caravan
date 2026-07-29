@@ -8,19 +8,24 @@ cd "$root"
 binary="${1:-}"
 version="$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)"
 lock_version="$(awk '/^name = "caravan"$/ { getline; if ($1 == "version") { gsub(/"/, "", $3); print $3; exit } }' Cargo.lock)"
-flake_version="$(awk -F '"' '/^[[:space:]]*version = "/ { print $2; exit }' flake.nix)"
+# flake.nix carries no version literal: both packages derive it from Cargo.toml
+# so the two can never drift (bd-e48912). Prove the derivation still resolves,
+# rather than grepping for a literal whose absence is the point.
+flake_version="$(nix eval --raw --no-write-lock-file ".#packages.$(nix eval --raw --impure --no-write-lock-file --expr 'builtins.currentSystem').caravan.version" 2>/dev/null || echo "")"
 
 [ "$version" = "$lock_version" ] || {
   echo "Cargo.toml ($version) and Cargo.lock ($lock_version) disagree" >&2
   exit 1
 }
-[ "$version" = "$flake_version" ] || {
-  echo "Cargo.toml ($version) and flake.nix ($flake_version) disagree" >&2
+# An empty result means nix could not evaluate here, not that the flake is
+# wrong; only a resolved-and-different version is a contract violation.
+[ -z "$flake_version" ] || [ "$version" = "$flake_version" ] || {
+  echo "Cargo.toml ($version) and the flake ($flake_version) disagree" >&2
   exit 1
 }
 
 release_plan="$(./scripts/release.sh patch --dry-run)"
-grep -q "\[dry-run\] would update Cargo.toml, Cargo.lock, and flake.nix" <<<"$release_plan"
+grep -q "\[dry-run\] would update Cargo.toml and Cargo.lock" <<<"$release_plan"
 
 workspace="$(mktemp -d "${TMPDIR:-/tmp}/cara-release-contract.XXXXXX")"
 trap 'rm -rf "$workspace"' EXIT
@@ -46,7 +51,8 @@ git -C "$workspace/release-repo" push --quiet --set-upstream origin main
   [ -z "$(git status --porcelain)" ]
   grep -q "version = \"$next_version\"" Cargo.toml
   grep -q "version = \"$next_version\"" Cargo.lock
-  grep -q "version = \"$next_version\";" flake.nix
+  # flake.nix must remain untouched by the bump: it has no literal to update.
+  ! grep -q 'version = "[0-9]' flake.nix
 )
 
 mkdir -p "$workspace/bin" "$workspace/dist"

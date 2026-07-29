@@ -58,7 +58,7 @@ tag="v$next"
 echo "==> $current -> $next ($tag)"
 
 if [ "$dry_run" -eq 1 ]; then
-  echo "[dry-run] would update Cargo.toml, Cargo.lock, and flake.nix; commit; tag; push=$do_push"
+  echo "[dry-run] would update Cargo.toml and Cargo.lock; commit; tag; push=$do_push"
   exit 0
 fi
 
@@ -129,7 +129,12 @@ done
 # trusting that it tracks Cargo.toml.
 if command -v nix >/dev/null 2>&1; then
   for attr in caravan caravan-static; do
-    reported="$(nix eval --raw ".#packages.$(nix eval --raw --impure --expr 'builtins.currentSystem').${attr}.version" 2>/dev/null || true)"
+    # --no-write-lock-file: verifying must not mutate the tree it is verifying.
+    # Without it, `nix eval` materialises flake.lock and leaves the release
+    # commit dirty, which the release contract fixture caught.
+    sys="$(nix eval --raw --impure --no-write-lock-file --expr 'builtins.currentSystem' 2>/dev/null || true)"
+    [ -n "$sys" ] || continue
+    reported="$(nix eval --raw --no-write-lock-file ".#packages.${sys}.${attr}.version" 2>/dev/null || true)"
     if [ -n "$reported" ] && [ "$reported" != "$next" ]; then
       echo "flake package $attr reports version $reported, expected $next" >&2
       exit 1
