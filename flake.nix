@@ -58,6 +58,15 @@
                            'mcp-cli = { path = "${mcp-cli}" }'
         '';
 
+        # Single source of truth for the version. Both packages below are built
+        # from the same source, so a literal in either can only ever drift from
+        # Cargo.toml — and the drift is self-concealing: `scripts/release.sh` used
+        # `replace_exact_once` here, which asserts exactly one match, so once the
+        # two literals differed the bump silently patched only one of them and
+        # kept passing. Had they agreed, the single-match assertion would have
+        # failed loudly. Reading the manifest removes the literal entirely.
+        caravanVersion = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
+
         # Replace the three public git dependencies with the pinned flake-input
         # sources. The sandbox therefore performs no network or Git authentication.
         caravanSrc = pkgs.runCommand "caravan-src" { } ''
@@ -79,7 +88,7 @@
 
         caravan = pkgs.rustPlatform.buildRustPackage {
           pname = "caravan";
-          version = "0.0.27";
+          version = caravanVersion;
           src = caravanSrc;
 
           cargoLock.lockFile = "${caravanSrc}/Cargo.lock";
@@ -116,7 +125,7 @@
           else
             muslPkgs.rustPlatform.buildRustPackage {
               pname = "caravan-static";
-              version = "0.0.10";
+              version = caravanVersion;
               src = caravanSrc;
 
               cargoLock.lockFile = "${caravanSrc}/Cargo.lock";

@@ -114,18 +114,30 @@ replace_exact_once Cargo.lock \
 version = \"$current\"" \
   "name = \"caravan\"
 version = \"$next\""
-replace_exact_once flake.nix \
-  "version = \"$current\";" \
-  "version = \"$next\";"
-
-for file in Cargo.toml Cargo.lock flake.nix; do
+# flake.nix is deliberately NOT patched here: both packages read the version
+# from Cargo.toml, so there is no literal to bump. Patching it used to be a
+# single-match replacement, which silently updated only one of the two package
+# versions once they had drifted apart, and kept reporting success (bd-e48912).
+for file in Cargo.toml Cargo.lock; do
   grep -q "$next" "$file" || {
     echo "version bump did not take in $file" >&2
     exit 1
   }
 done
 
-git add Cargo.toml Cargo.lock flake.nix
+# Prove the flake actually reports the version we just committed, rather than
+# trusting that it tracks Cargo.toml.
+if command -v nix >/dev/null 2>&1; then
+  for attr in caravan caravan-static; do
+    reported="$(nix eval --raw ".#packages.$(nix eval --raw --impure --expr 'builtins.currentSystem').${attr}.version" 2>/dev/null || true)"
+    if [ -n "$reported" ] && [ "$reported" != "$next" ]; then
+      echo "flake package $attr reports version $reported, expected $next" >&2
+      exit 1
+    fi
+  done
+fi
+
+git add Cargo.toml Cargo.lock
 git commit -m "release: $tag"
 git tag -a "$tag" -m "$tag"
 echo "==> committed and tagged $tag"
