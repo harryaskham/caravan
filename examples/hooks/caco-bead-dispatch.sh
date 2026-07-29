@@ -15,6 +15,25 @@
 set -eu
 
 CACO_BIN="${CACO_BIN:-caco}"
+
+# Take the first line of a value without a pipeline.
+#
+# `sed ... | head -n 1` looks equivalent and is not: under `set -euo pipefail`,
+# head exits after the first line, sed is killed by SIGPIPE, pipefail propagates
+# 141, and the enclosing command substitution aborts the whole hook.
+#
+# That cannot happen *here*, because PAYLOAD is bounded to 64KiB below and the
+# extraction only shrinks each line, so sed's output never fills the pipe buffer.
+# It is written this way because this file is an example people copy: lift the
+# extraction into a hook without that bound and the abort becomes reachable.
+#
+# sed's own `T;q` would also work but is a GNU extension: BSD sed on macOS
+# rejects it with "invalid command code T" and silently yields an empty field.
+CARA_NEWLINE='
+'
+first_line() {
+  printf '%s' "${1%%"$CARA_NEWLINE"*}"
+}
 PROJECT="${CARA_HOOK_PROJECT:-${CACO_PROJECT:-cacophony}}"
 PRIORITY="${CARA_HOOK_PRIORITY:-1}"
 EVENT="${CARA_EVENT:-unknown}"
@@ -52,10 +71,10 @@ esac
 # Absent (an older Cara, or an event carrying no scheduler status) is treated as
 # dispatchable, because failing open to a human beats silently dropping a stuck
 # caravan.
-WAKE_CLASS="$(
+WAKE_CLASS="$(first_line "$(
   printf '%s' "$PAYLOAD" |
-    sed -n 's/.*"wake_class"[[:space:]]*:[[:space:]]*"\([a-z_]*\)".*/\1/p' | head -n 1
-)"
+    sed -n 's/.*"wake_class"[[:space:]]*:[[:space:]]*"\([a-z_]*\)".*/\1/p'
+)")"
 case "$WAKE_CLASS" in
   retry_tick|none)
     echo "cara hook: ${EVENT} ${EVENT_ID} is ${WAKE_CLASS}; the next tick resolves it" >&2
@@ -68,10 +87,10 @@ esac
 # one-minute cron that is sixty beads for one problem. Cara therefore publishes
 # decision_fingerprint, which is stable for as long as the same decision remains
 # unresolved. Prefer it, and fall back to the event id when it is absent.
-FINGERPRINT="$(
+FINGERPRINT="$(first_line "$(
   printf '%s' "$PAYLOAD" |
-    sed -n 's/.*"decision_fingerprint"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1
-)"
+    sed -n 's/.*"decision_fingerprint"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+)")"
 if [ -n "$FINGERPRINT" ]; then
   DEDUPE_LABEL="cara-decision:$(printf '%s' "$FINGERPRINT" | tr -c 'A-Za-z0-9._-' '-')"
 else
@@ -85,10 +104,10 @@ fi
 # enough), and none of that is a reason to redden a tick whose GitHub work has
 # already completed. Failing here also loses nothing: no dedupe label is
 # recorded, so the next tick retries the same decision.
-existing="$(
+existing="$(first_line "$(
   "$CACO_BIN" bd list --project "$PROJECT" --label "$DEDUPE_LABEL" --count-only --json 2>/dev/null |
-    sed -n 's/.*"count"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1
-)"
+    sed -n 's/.*"count"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p'
+)")"
 # Keep the comparison arithmetic-safe even if the probe answered with junk:
 # `[ ... -gt ... ]` on a non-number exits 2, which `set -e` turns into a failed
 # tick. An unreadable probe means "not known to be dispatched", so treat it as 0.
