@@ -105,6 +105,10 @@ pub struct StatusOutput {
     /// prove which build answered when several are installed (bd-0629ce).
     #[serde(default)]
     pub runtime: RuntimeProvenance,
+    /// Whether the effective configuration is the repository's policy or one
+    /// branch's proposal. Reported only; nothing depends on it yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_provenance: Option<crate::config_provenance::ConfigProvenance>,
     /// Authenticated provider-call counts and latest rate-limit evidence.
     #[serde(default)]
     pub provider_api: crate::model::GitHubApiTelemetry,
@@ -821,6 +825,13 @@ fn status_with_discovery_options(
     let mut output = StatusOutput {
         head_merge: HeadMergeStatus::from_config(&context.config.sync),
         runtime: RuntimeProvenance::detect(),
+        // Reported only: measure how often a checkout is running one branch's
+        // proposed policy before anything is allowed to depend on the answer.
+        config_provenance: Some(crate::config_provenance::resolve(
+            &context.repository_path,
+            &context.config_path,
+            context.config_path.is_absolute(),
+        )),
         provider_api,
         merge_candidates: snapshot.merge_candidates,
         merge_candidates_truncated: snapshot.merge_candidates_truncated,
@@ -2397,6 +2408,7 @@ mod tests {
             analyze_for_actor(&snapshot, &checker, crate::model::HeadMergeActor::default())
                 .unwrap();
         StatusOutput {
+            config_provenance: None,
             head_merge: HeadMergeStatus::default(),
             runtime: crate::read::RuntimeProvenance::default(),
             provider_api: crate::model::GitHubApiTelemetry::default(),

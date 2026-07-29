@@ -823,6 +823,7 @@ mod tests {
         };
         let analysis = graph::analyze(&snapshot, &checker).unwrap();
         StatusOutput {
+            config_provenance: None,
             head_merge: crate::read::HeadMergeStatus::default(),
             runtime: crate::read::RuntimeProvenance::default(),
             provider_api: crate::model::GitHubApiTelemetry::default(),

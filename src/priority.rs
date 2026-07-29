@@ -716,6 +716,7 @@ mod tests {
             squash_reconciliations: Vec::new(),
         };
         let status = StatusOutput {
+            config_provenance: None,
             head_merge: crate::read::HeadMergeStatus::default(),
             runtime: crate::read::RuntimeProvenance::default(),
             provider_api: GitHubApiTelemetry::default(),

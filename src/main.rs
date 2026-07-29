@@ -2104,6 +2104,17 @@ fn render_status(output: &caravan::read::StatusOutput) -> String {
         output.repository,
         output.default_branch,
     );
+    // Only speak up when the effective policy is genuinely one branch's
+    // proposal. Announcing provenance on every healthy run would be noise, and
+    // noise is how the stale-config failure went unnoticed until it bricked a
+    // session.
+    if let Some(provenance) = output
+        .config_provenance
+        .as_ref()
+        .filter(|provenance| provenance.is_branch_local_proposal())
+    {
+        let _ = writeln!(text, "  {} {}", warning("config:"), provenance.reason);
+    }
     let current = output
         .current_pr
         .map_or_else(|| "no open PR".to_owned(), |number| format!("PR #{number}"));
@@ -3385,6 +3396,7 @@ mod tests {
             oid: caravan::model::CommitOid("0".repeat(40)),
         };
         let output = caravan::read::StatusOutput {
+            config_provenance: None,
             head_merge: caravan::read::HeadMergeStatus::default(),
             runtime: caravan::read::RuntimeProvenance::default(),
             provider_api: caravan::model::GitHubApiTelemetry::default(),

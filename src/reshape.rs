@@ -713,6 +713,7 @@ fn virtual_status(
         status.admission.generation_integrity.clone(),
     );
     StatusOutput {
+        config_provenance: None,
         head_merge: crate::read::HeadMergeStatus::default(),
         runtime: status.runtime.clone(),
         provider_api: status.provider_api.clone(),
@@ -1284,6 +1285,7 @@ mod tests {
         };
         let analysis = crate::graph::analyze(&snapshot, &Clean).unwrap();
         StatusOutput {
+            config_provenance: None,
             head_merge: crate::read::HeadMergeStatus::default(),
             runtime: crate::read::RuntimeProvenance::default(),
             provider_api: crate::model::GitHubApiTelemetry::default(),

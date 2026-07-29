@@ -1308,6 +1308,7 @@ mod tests {
             graph::analyze_for_actor(&snapshot, &checker, crate::model::HeadMergeActor::Github)
                 .unwrap();
         StatusOutput {
+            config_provenance: None,
             head_merge: crate::read::HeadMergeStatus {
                 actor: crate::model::HeadMergeActor::Github,
                 ..crate::read::HeadMergeStatus::default()

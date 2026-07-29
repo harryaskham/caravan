@@ -312,6 +312,7 @@ fn status(current: PullRequestSnapshot, others: Vec<PullRequestSnapshot>) -> Sta
     };
     let analysis = analyze(&snapshot, &clean).unwrap();
     StatusOutput {
+        config_provenance: None,
         head_merge: crate::read::HeadMergeStatus::default(),
         runtime: crate::read::RuntimeProvenance::default(),
         provider_api: crate::model::GitHubApiTelemetry::default(),

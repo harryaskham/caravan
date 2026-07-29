@@ -802,6 +802,7 @@ mod tests {
     }
     fn status(pr: PullRequestSnapshot) -> StatusOutput {
         StatusOutput {
+            config_provenance: None,
             head_merge: crate::read::HeadMergeStatus::default(),
             runtime: crate::read::RuntimeProvenance::default(),
             provider_api: crate::model::GitHubApiTelemetry::default(),

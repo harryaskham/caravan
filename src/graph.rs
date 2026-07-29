@@ -682,13 +682,16 @@ pub fn analyze_for_actor(
         }
         let candidate_branch = candidate.head.clone();
         let report = checker.check(&candidate_branch, &snapshot.default_branch)?;
-        record_compatibility(
+        // A candidate that has not been admitted blocks nothing. Recording this
+        // as an ordinary `Incompatible` problem made sync abort the entire tick
+        // with `head_conflict`, because that kind means "a caravan member does
+        // not merge" and is a fleet-level decision point.
+        record_candidate_compatibility(
             &mut analysis,
-            checker,
             report,
-            vec![number],
+            number,
             "leading admission candidate does not merge cleanly into the current default branch",
-        )?;
+        );
     }
 
     Ok(analysis)
@@ -707,6 +710,28 @@ const LEADING_CANDIDATE_COMPATIBILITY_BOUND: usize = 3;
 /// The extra evidence is collected only on conflict, so healthy fleets never
 /// pay for it, and it never changes the compatibility outcome: a conflict stays
 /// a conflict until a reviewed operation acts on the proof.
+/// Record an unqueued candidate's incompatibility as advisory evidence.
+///
+/// Never a decision point: the candidate is skipped by admission and the queue
+/// advances past it. Squash-equivalence reconciliation is deliberately not
+/// collected here, because nothing downstream may act on a candidate that has
+/// not been admitted.
+fn record_candidate_compatibility(
+    analysis: &mut GraphAnalysis,
+    report: CompatibilityReport,
+    pr: PrNumber,
+    message: &str,
+) {
+    if report.outcome != CompatibilityOutcome::Clean {
+        analysis.fleet.problems.push(GraphProblem {
+            kind: GraphProblemKind::CandidateIncompatible,
+            prs: vec![pr],
+            message: message.to_owned(),
+        });
+    }
+    analysis.compatibility.push(report);
+}
+
 fn record_compatibility(
     analysis: &mut GraphAnalysis,
     checker: &impl CompatibilityChecker,
@@ -1109,6 +1134,38 @@ mod tests {
         assert_eq!(observed.merged_at.as_deref(), Some("2026-07-25T01:07:18Z"));
     }
 
+    /// Live regression: recording an unqueued candidate conflict as an ordinary
+    /// `Incompatible` problem made `decision_for_problem` classify it as a
+    /// `HeadConflict` — the fleet-blocking decision meant for a caravan member —
+    /// so one conflicting candidate aborted the entire sync tick before any
+    /// caravan was touched.
+    #[test]
+    fn a_candidate_conflict_is_never_a_fleet_blocking_problem() {
+        let checker = |candidate: &BranchSnapshot, target: &BranchSnapshot| {
+            Ok(CompatibilityReport {
+                candidate: candidate.clone(),
+                target: target.clone(),
+                outcome: CompatibilityOutcome::Conflict,
+                conflicting_paths: vec!["src/lib.rs".to_owned()],
+                diagnostic: None,
+            })
+        };
+        let mut unqueued = pull_request(2234, "stuck", "main");
+        unqueued.labels.clear();
+
+        let analysis = analyze(&snapshot(vec![unqueued]), &checker).expect("advisory, not fatal");
+
+        assert!(
+            !analysis
+                .fleet
+                .problems
+                .iter()
+                .any(|problem| problem.kind == GraphProblemKind::Incompatible),
+            "an unadmitted candidate must never produce a fleet-blocking Incompatible: {:?}",
+            analysis.fleet.problems
+        );
+    }
+
     /// Live operator report: `caravan-join-skipped` was added to a conflicting
     /// PR and Cara kept naming it, so the label read as if it had done nothing.
     /// Admission had excluded it correctly all along; this detection loop was
@@ -1164,10 +1221,10 @@ mod tests {
 
         assert!(
             analysis.fleet.problems.iter().any(|problem| {
-                problem.kind == GraphProblemKind::Incompatible
+                problem.kind == GraphProblemKind::CandidateIncompatible
                     && problem.prs.contains(&PrNumber(2117))
             }),
-            "expected the leading candidate conflict to be recorded: {:?}",
+            "expected the leading candidate conflict to be recorded as candidate-scoped, never as a fleet-blocking Incompatible: {:?}",
             analysis.fleet.problems
         );
     }

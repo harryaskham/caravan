@@ -48,6 +48,7 @@ use crate::command::CommandRunner;
 use crate::config::{CaravanConfig, ConfigError};
 
 pub mod config;
+pub mod config_provenance;
 pub mod model;
 
 /// GitHub release repository used by `updatable-cli`.

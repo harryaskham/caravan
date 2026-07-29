@@ -504,6 +504,16 @@ pub enum GraphProblemKind {
     ForkOnlyPredecessor,
     AutoMergeInvariant,
     Incompatible,
+    /// An *unqueued* admission candidate does not merge cleanly into the exact
+    /// default branch.
+    ///
+    /// Deliberately distinct from [`Self::Incompatible`], which describes a PR
+    /// already inside a caravan and is therefore a fleet-blocking decision
+    /// point. A candidate that has not been admitted blocks nothing: it is
+    /// skipped, the queue advances past it, and only its owner can reconcile
+    /// it. Reusing `Incompatible` here made a single conflicting candidate
+    /// abort the whole tick as a `head_conflict`.
+    CandidateIncompatible,
     /// A child's base branch name resolves to an active head while a merged
     /// caravan member used the same branch name, so provenance is ambiguous.
     ReusedBranchProvenance,

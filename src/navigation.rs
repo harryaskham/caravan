@@ -950,6 +950,7 @@ mod tests {
             .map(|pull_request| (pull_request.number, pull_request))
             .collect();
         StatusOutput {
+            config_provenance: None,
             head_merge: crate::read::HeadMergeStatus::default(),
             runtime: crate::read::RuntimeProvenance::default(),
             provider_api: crate::model::GitHubApiTelemetry::default(),

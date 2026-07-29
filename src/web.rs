@@ -2223,6 +2223,7 @@ mod tests {
         };
         let admission = crate::read::resolve_admission(&analysis, &[]);
         StatusOutput {
+            config_provenance: None,
             head_merge: crate::read::HeadMergeStatus::default(),
             runtime: crate::read::RuntimeProvenance::default(),
             provider_api: crate::model::GitHubApiTelemetry::default(),
