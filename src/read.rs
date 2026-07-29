@@ -1154,7 +1154,12 @@ pub fn resolve_admission_with_generation(
         // rejection canonical. A mechanical conflict is not a decision anyone
         // made, so it must not inherit a decision's blocking authority.
         if analysis.fleet.problems.iter().any(|problem| {
-            problem.kind == GraphProblemKind::Incompatible && problem.prs.contains(number)
+            // Must match the kind graph analysis actually emits for an
+            // unadmitted candidate. This guard silently died once already by
+            // still naming `Incompatible` after the producer moved to
+            // `CandidateIncompatible`, which reinstated the head-of-line stall
+            // with every test still green.
+            problem.kind == GraphProblemKind::CandidateIncompatible && problem.prs.contains(number)
         }) {
             skipped.push(SkippedAdmissionCandidate {
                 pr: *number,
@@ -1649,7 +1654,22 @@ pub fn check_analysis(
         return eligible_or_error(output, remote);
     }
 
-    let mut problems = status.analysis.fleet.problems.clone();
+    // Seed from fleet problems, but never inherit another *unadmitted*
+    // candidate's incompatibility. That is advisory evidence about a PR which is
+    // in no caravan and blocks nothing, so letting it land here made one
+    // conflicting unqueued PR mark every other candidate ineligible — including
+    // the clean one that should have formed the first caravan.
+    let mut problems = status
+        .analysis
+        .fleet
+        .problems
+        .iter()
+        .filter(|problem| {
+            problem.kind != GraphProblemKind::CandidateIncompatible
+                || problem.prs.contains(&current_pr)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     let mut ordering_note: Option<String> = None;
     validate_candidate(pull_request, &mut problems);
     // In physical membership mode the provider's synthetic merge ref is
@@ -2825,7 +2845,7 @@ mod tests {
         let later = pr(20, "later", "main", false);
         let mut status = status(conflicted, vec![later]);
         status.analysis.fleet.problems.push(GraphProblem {
-            kind: GraphProblemKind::Incompatible,
+            kind: GraphProblemKind::CandidateIncompatible,
             prs: vec![PrNumber(10)],
             message: "does not merge cleanly into the current default branch".to_owned(),
         });

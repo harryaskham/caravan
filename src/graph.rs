@@ -44,7 +44,17 @@ pub struct GraphAnalysis {
 impl GraphAnalysis {
     #[must_use]
     pub fn healthy(&self) -> bool {
-        self.fleet.problems.is_empty()
+        // An unadmitted candidate's incompatibility says nothing about the health
+        // of the fleet: it is advisory evidence about a PR that is not in any
+        // caravan and blocks nothing. Counting it here marked the whole fleet
+        // unhealthy, which cascaded into `check` eligibility and stopped an
+        // empty fleet from ever bootstrapping its first caravan while any
+        // unqueued PR happened to conflict with the default branch.
+        !self
+            .fleet
+            .problems
+            .iter()
+            .any(|problem| problem.kind != GraphProblemKind::CandidateIncompatible)
     }
 }
 

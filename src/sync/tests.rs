@@ -1117,6 +1117,96 @@ fn empty_physical_apply_is_valid_before_root_auto_admission() {
     lock.release().unwrap();
 }
 
+/// The exact cacophony shape, which never once worked in production: an empty
+/// fleet, several unqueued PRs, and the FIFO-leading one mechanically unable to
+/// merge into the default branch.
+///
+/// Two separate defects made this unreachable, and each hid the other. The
+/// conflicting candidate HELD the admission front instead of being skipped, and
+/// its conflict was classified as a fleet-blocking `head_conflict`, which
+/// aborted the whole tick before anything could be joined. So a single bad PR
+/// meant no caravan could ever form, no matter how many clean candidates
+/// queued behind it.
+///
+/// The existing empty-fleet test passes a single clean candidate, so it proved
+/// bootstrap worked in a shape the operator never actually had.
+#[test]
+fn a_conflicting_leading_candidate_still_lets_a_clean_one_form_the_first_caravan() {
+    let mut blocked = pull_request(
+        10,
+        "blocked",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    blocked.labels.clear();
+    let mut clean_follower = pull_request(
+        20,
+        "clean-follower",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    clean_follower.labels.clear();
+
+    // Only the leading candidate conflicts with the default branch.
+    let selective = |candidate: &BranchSnapshot,
+                     target: &BranchSnapshot|
+     -> Result<CompatibilityReport, AppError> {
+        let conflicts = candidate.name == "blocked";
+        Ok(CompatibilityReport {
+            candidate: candidate.clone(),
+            target: target.clone(),
+            outcome: if conflicts {
+                CompatibilityOutcome::Conflict
+            } else {
+                CompatibilityOutcome::Clean
+            },
+            conflicting_paths: if conflicts {
+                vec!["src/lib.rs".to_owned()]
+            } else {
+                Vec::new()
+            },
+            diagnostic: None,
+        })
+    };
+
+    let fleet = status(
+        vec![blocked.clone(), clean_follower.clone()],
+        Some(clean_follower.number),
+        &selective,
+    );
+
+    // The conflict is advisory evidence, never a fleet-blocking problem.
+    assert!(
+        !fleet
+            .analysis
+            .fleet
+            .problems
+            .iter()
+            .any(|problem| problem.kind == crate::model::GraphProblemKind::Incompatible),
+        "a conflicting UNADMITTED candidate must not abort the tick: {:?}",
+        fleet.analysis.fleet.problems
+    );
+
+    // The queue advances past it rather than starving every clean candidate.
+    assert_eq!(
+        fleet.admission.next_candidate,
+        Some(clean_follower.number),
+        "the clean follower must be elected, not the conflicting leader"
+    );
+
+    // And the empty fleet can then actually bootstrap its first caravan.
+    let evaluation = evaluate_auto_candidate(&fleet, &clean_follower, &selective)
+        .expect("empty-fleet preflight is evidence, not an execution failure");
+    assert_eq!(
+        evaluation.target,
+        AutoCandidateTarget::New,
+        "reasons: {:?}",
+        evaluation.reasons
+    );
+}
+
 #[test]
 fn greedy_planner_forms_empty_fleet_then_uses_first_compatible_tail() {
     let mut candidate = pull_request(
