@@ -15,6 +15,14 @@
 set -eu
 
 CACO_BIN="${CACO_BIN:-caco}"
+
+# `sed ... | head -n 1` is a trap under `set -euo pipefail`: head exits after the
+# first line, sed is killed by SIGPIPE, pipefail propagates that failure, and the
+# enclosing command substitution aborts the whole hook. It is timing dependent,
+# so it passes on a developer machine and fails in a build sandbox. Ask sed to
+# print the first match and quit instead: it reads no further, so no pipeline is
+# involved and nothing can be signalled.
+FIRST_MATCH_ONLY='T;q'
 PROJECT="${CARA_HOOK_PROJECT:-${CACO_PROJECT:-cacophony}}"
 PRIORITY="${CARA_HOOK_PRIORITY:-1}"
 EVENT="${CARA_EVENT:-unknown}"
@@ -54,7 +62,7 @@ esac
 # caravan.
 WAKE_CLASS="$(
   printf '%s' "$PAYLOAD" |
-    sed -n 's/.*"wake_class"[[:space:]]*:[[:space:]]*"\([a-z_]*\)".*/\1/p' | head -n 1
+    sed -n 's/.*"wake_class"[[:space:]]*:[[:space:]]*"\([a-z_]*\)".*/\1/p;'"$FIRST_MATCH_ONLY"
 )"
 case "$WAKE_CLASS" in
   retry_tick|none)
@@ -70,7 +78,7 @@ esac
 # unresolved. Prefer it, and fall back to the event id when it is absent.
 FINGERPRINT="$(
   printf '%s' "$PAYLOAD" |
-    sed -n 's/.*"decision_fingerprint"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1
+    sed -n 's/.*"decision_fingerprint"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p;'"$FIRST_MATCH_ONLY"
 )"
 if [ -n "$FINGERPRINT" ]; then
   DEDUPE_LABEL="cara-decision:$(printf '%s' "$FINGERPRINT" | tr -c 'A-Za-z0-9._-' '-')"
@@ -85,7 +93,7 @@ fi
 
 existing="$(
   "$CACO_BIN" bd list --project "$PROJECT" --label "$DEDUPE_LABEL" --count-only --json 2>/dev/null |
-    sed -n 's/.*"count"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1
+    sed -n 's/.*"count"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p;'"$FIRST_MATCH_ONLY"
 )"
 if [ "${existing:-0}" -gt 0 ]; then
   echo "cara hook: ${EVENT} ${EVENT_ID} already dispatched" >&2
