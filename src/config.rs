@@ -466,6 +466,44 @@ impl CaravanConfig {
         })
     }
 
+    /// Bounds consumed only by a mutating tick.
+    ///
+    /// Kept out of the always-on path because a read must never be blocked by a
+    /// value it does not use. `cara status` printed nothing at all — no caravan
+    /// count, no candidates, no problems — because a *sync* budget was out of
+    /// range, which removed the only surface capable of diagnosing the queue at
+    /// exactly the moment someone needed it (bd-a4a7e9).
+    pub fn validate_tick_bounds(&self) -> Result<(), ConfigError> {
+        if !(1..=MAX_SYNC_CANDIDATES_PER_TICK).contains(&self.sync.max_candidates_per_tick) {
+            return Err(ConfigError::Validation(format!(
+                "sync.max_candidates_per_tick must be between 1 and {MAX_SYNC_CANDIDATES_PER_TICK}"
+            )));
+        }
+        if !(1..=MAX_SYNC_MUTATIONS_PER_TICK).contains(&self.sync.max_mutations_per_tick) {
+            return Err(ConfigError::Validation(format!(
+                "sync.max_mutations_per_tick must be between 1 and {MAX_SYNC_MUTATIONS_PER_TICK}"
+            )));
+        }
+        if !(1..=MAX_SYNC_GITHUB_REQUESTS_PER_TICK)
+            .contains(&self.sync.max_github_requests_per_tick)
+        {
+            return Err(ConfigError::Validation(format!(
+                "sync.max_github_requests_per_tick must be between 1 and {MAX_SYNC_GITHUB_REQUESTS_PER_TICK}"
+            )));
+        }
+        if !(1..=MAX_SYNC_DURATION_SECS).contains(&self.sync.max_duration_secs) {
+            return Err(ConfigError::Validation(format!(
+                "sync.max_duration_secs must be between 1 and {MAX_SYNC_DURATION_SECS}"
+            )));
+        }
+        if !(1..=MAX_INTERVAL_SECS).contains(&self.loop_config.interval_secs) {
+            return Err(ConfigError::Validation(format!(
+                "loop.interval_secs must be between 1 and {MAX_INTERVAL_SECS}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Validate cross-field bounds after deserialization.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.version != CONFIG_VERSION {
@@ -512,33 +550,6 @@ impl CaravanConfig {
             return Err(ConfigError::Validation(
                 "sync.actions.join_unlabelled_prs requires rebase_on_join: true".to_owned(),
             ));
-        }
-        if !(1..=MAX_SYNC_CANDIDATES_PER_TICK).contains(&self.sync.max_candidates_per_tick) {
-            return Err(ConfigError::Validation(format!(
-                "sync.max_candidates_per_tick must be between 1 and {MAX_SYNC_CANDIDATES_PER_TICK}"
-            )));
-        }
-        if !(1..=MAX_SYNC_MUTATIONS_PER_TICK).contains(&self.sync.max_mutations_per_tick) {
-            return Err(ConfigError::Validation(format!(
-                "sync.max_mutations_per_tick must be between 1 and {MAX_SYNC_MUTATIONS_PER_TICK}"
-            )));
-        }
-        if !(1..=MAX_SYNC_GITHUB_REQUESTS_PER_TICK)
-            .contains(&self.sync.max_github_requests_per_tick)
-        {
-            return Err(ConfigError::Validation(format!(
-                "sync.max_github_requests_per_tick must be between 1 and {MAX_SYNC_GITHUB_REQUESTS_PER_TICK}"
-            )));
-        }
-        if !(1..=MAX_SYNC_DURATION_SECS).contains(&self.sync.max_duration_secs) {
-            return Err(ConfigError::Validation(format!(
-                "sync.max_duration_secs must be between 1 and {MAX_SYNC_DURATION_SECS}"
-            )));
-        }
-        if !(1..=MAX_INTERVAL_SECS).contains(&self.loop_config.interval_secs) {
-            return Err(ConfigError::Validation(format!(
-                "loop.interval_secs must be between 1 and {MAX_INTERVAL_SECS}"
-            )));
         }
         if !(1024..=1024 * 1024 * 1024).contains(&self.journal.max_bytes) {
             return Err(ConfigError::Validation(
@@ -1045,36 +1056,24 @@ hooks:
                 .code(),
             "invalid_config"
         );
-        assert_eq!(
-            CaravanConfig::parse("version: 1\nsync:\n  max_candidates_per_tick: 0\n")
-                .unwrap_err()
-                .code(),
-            "invalid_config"
-        );
-        assert_eq!(
-            CaravanConfig::parse("version: 1\nsync:\n  max_mutations_per_tick: 0\n")
-                .unwrap_err()
-                .code(),
-            "invalid_config"
-        );
-        assert_eq!(
-            CaravanConfig::parse("version: 1\nsync:\n  max_github_requests_per_tick: 0\n")
-                .unwrap_err()
-                .code(),
-            "invalid_config"
-        );
-        assert_eq!(
-            CaravanConfig::parse("version: 1\nsync:\n  max_duration_secs: 0\n")
-                .unwrap_err()
-                .code(),
-            "invalid_config"
-        );
-        assert_eq!(
-            CaravanConfig::parse("version: 1\nloop:\n  interval_secs: 0\n")
-                .unwrap_err()
-                .code(),
-            "invalid_config"
-        );
+        // bd-a4a7e9: per-tick budgets are deliberately NOT load-time failures.
+        // Rejecting them at parse removed every read-only surface, including the
+        // ones needed to diagnose the bad value. They are refused by the tick
+        // that actually consumes them, and only by that tick.
+        for document in [
+            "version: 1\nsync:\n  max_candidates_per_tick: 0\n",
+            "version: 1\nsync:\n  max_mutations_per_tick: 0\n",
+            "version: 1\nsync:\n  max_github_requests_per_tick: 0\n",
+            "version: 1\nsync:\n  max_duration_secs: 0\n",
+            "version: 1\nloop:\n  interval_secs: 0\n",
+        ] {
+            let config = CaravanConfig::parse(document)
+                .expect("a tick-only budget never blocks loading the policy");
+            assert!(
+                config.validate_tick_bounds().is_err(),
+                "a mutating tick still refuses it: {document}"
+            );
+        }
         assert_eq!(
             CaravanConfig::parse("version: 1\nhooks:\n  sync_failed:\n    command: '  '\n")
                 .unwrap_err()
@@ -1142,5 +1141,56 @@ sync:
             default_sync_max_duration_secs(),
             "opting out must not silently change any other bound"
         );
+    }
+}
+
+#[cfg(test)]
+mod read_availability_tests {
+    use super::*;
+
+    /// bd-a4a7e9: `cara status` printed nothing at all because a *sync* budget
+    /// was out of range. Status does not use that value; it only echoes it. A
+    /// read must never be blocked by a bound it does not consume, least of all
+    /// when it is the surface needed to diagnose the queue.
+    #[test]
+    fn an_out_of_range_tick_budget_never_blocks_loading_the_config() {
+        let yaml = r"
+version: 1
+force_merge: false
+rebase_on_join: false
+command_timeout_secs: 30
+sync:
+  max_duration_secs: 65525
+";
+        let config: CaravanConfig =
+            serde_yaml::from_str(yaml).expect("the document itself is well formed");
+
+        config
+            .validate()
+            .expect("load-time validation must ignore tick-only budgets");
+        let error = config
+            .validate_tick_bounds()
+            .expect_err("a mutating tick must still refuse the same value");
+        assert!(
+            error.to_string().contains("sync.max_duration_secs"),
+            "the refusal still names the exact bound: {error}"
+        );
+    }
+
+    /// The historical upper bound is inclusive and must stay that way: the
+    /// documented maximum being rejected by its own message is its own defect.
+    #[test]
+    fn the_documented_maximum_duration_is_accepted() {
+        let config = CaravanConfig {
+            sync: SyncConfig {
+                max_duration_secs: MAX_SYNC_DURATION_SECS,
+                ..SyncConfig::default()
+            },
+            ..CaravanConfig::default()
+        };
+
+        config
+            .validate_tick_bounds()
+            .expect("the exact documented maximum is valid");
     }
 }

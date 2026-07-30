@@ -1120,3 +1120,13 @@ always explained rather than implied. `config_provenance.behind_default_branch`
 reports the distance on every read, and a tick refuses with
 `stale_repository_policy` when the effective config both differs from the
 default branch and comes from a checkout that is behind it.
+
+Configuration validation is two-tier. Structure, version, `min_cara_version`,
+label syntax, command timeouts, journal bounds, and hook policy are always
+enforced at load. Per-tick budgets — `sync.max_candidates_per_tick`,
+`sync.max_mutations_per_tick`, `sync.max_github_requests_per_tick`,
+`sync.max_duration_secs`, and `loop.interval_secs` — are enforced only by a
+mutating tick, which refuses with `invalid_tick_bounds` (`operator_action`). A
+read is never blocked by a bound it does not consume: `cara status`, `cara
+check`, `cara log`, and `cara sync --dry-run` stay available while such a bound
+is invalid, because those are the surfaces needed to diagnose it.

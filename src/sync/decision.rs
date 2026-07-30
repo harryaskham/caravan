@@ -518,6 +518,7 @@ pub(super) fn scheduler_failure_status(error: &AppError) -> SyncFailureScheduler
             error_code.as_str(),
             "default_branch_not_protected"
                 | "stale_repository_policy"
+                | "invalid_tick_bounds"
                 | "physical_sync_budget_insufficient"
                 | "rebase_ci_trigger_missing"
                 | "repository_not_initialized"

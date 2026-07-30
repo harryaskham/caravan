@@ -2596,6 +2596,21 @@ fn sync_with_lock(
     );
     crate::initialization::require_ready(&status.initialization)?;
     require_current_policy(&status)?;
+    // Tick budgets are enforced here rather than at config load, so a bad budget
+    // can never silence the read-only surfaces needed to diagnose it.
+    context.config.validate_tick_bounds().map_err(|error| {
+        AppError::structured(
+            ErrorCategory::Validation,
+            "invalid_tick_bounds",
+            error.to_string(),
+            Some(json!({
+                "resumable": true,
+                "operator_action_required": true,
+                "next": "correct the named sync/loop bound in .caravan/config.yaml, then rerun the same command",
+                "note": "`cara status`, `cara check`, and `cara log` stay available while this bound is invalid",
+            })),
+        )
+    })?;
     let runner = crate::command::ProcessRunner::in_directory(&context.repository_path)
         .with_timeout(timeout)
         .with_operation_deadline(operation_deadline)
