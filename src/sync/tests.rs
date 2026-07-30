@@ -1461,6 +1461,51 @@ fn skip_receipt_round_trips_and_invalidates_on_generation_change() {
     assert!(!skip_receipt_matches(&config_changed, &status, &receipt));
 }
 
+/// An operator holding a large pull request for review applies
+/// `caravan-join-skipped` by hand. There is no Cara receipt, because Cara did
+/// not write the label.
+///
+/// Auto-admission validates a retained skip against its receipt and, when the
+/// receipt does not match, removes the label so the candidate can retry. "No
+/// receipt at all" took that same branch, so a HUMAN hold was stripped by the
+/// very next tick, not on any generation change. The operator would believe the
+/// pull request was protected while it sat as `next_candidate` under
+/// `force_merge: true` (bd-239640).
+#[test]
+fn a_human_applied_join_skip_is_not_stripped_for_lacking_a_cara_receipt() {
+    let mut held = pull_request(
+        2276,
+        "held-for-review",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    held.labels.clear();
+    held.labels.insert(AUTO_ADMISSION_SKIP_LABEL.to_owned());
+
+    let provider = FakeProvider::with_pull_requests(vec![held.clone()]);
+    let status = status(vec![held.clone()], None, &clean);
+    let mut context = AppContext::default();
+    context.config.sync.actions.join_unlabelled_prs = true;
+    let mut progress = SyncProgress::new(&status, Vec::new(), u32::MAX);
+    let github_budget = crate::command::GithubRequestBudget::new(100);
+
+    let (_status, _output) = run_auto_admission(
+        &context,
+        status,
+        &provider,
+        &mut progress,
+        Instant::now() + Duration::from_secs(30),
+        &github_budget,
+    )
+    .expect("auto admission runs");
+
+    assert!(
+        provider.pulls.borrow()[&held.number].has_label(AUTO_ADMISSION_SKIP_LABEL),
+        "a label Cara never wrote is not Cara's to remove: the hold must survive the tick"
+    );
+}
+
 #[test]
 fn forty_candidate_auto_admission_preserves_nonzero_exact_git_budget() {
     let mut candidates = (1..=40)
