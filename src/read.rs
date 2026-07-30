@@ -2023,6 +2023,13 @@ fn validate_candidate(pull_request: &PullRequestSnapshot, problems: &mut Vec<Gra
     if pull_request.cross_repository {
         messages.insert("candidate PR uses a fork-only head branch");
     }
+    // Queueing behind red is guaranteed rework. A failing check has to be fixed,
+    // fixing it rewrites the head, and every member stacked behind it is then
+    // rebased anyway — so admitting a red candidate buys nothing and costs the
+    // whole tail a re-stitch. `caravan-force` remains the audited override.
+    if !pull_request.has_label("caravan-force") && has_failing_check(pull_request) {
+        messages.insert("candidate PR has a failing required check; fix it before admission rather than stacking work behind it");
+    }
     for message in messages {
         problems.push(GraphProblem {
             kind: GraphProblemKind::Unknown,
@@ -2030,6 +2037,23 @@ fn validate_candidate(pull_request: &PullRequestSnapshot, problems: &mut Vec<Gra
             message: message.to_owned(),
         });
     }
+}
+
+/// Whether any check on this exact head is a hard failure.
+///
+/// Deliberately mirrors the sync-side classification: a missing or empty
+/// conclusion is `Unknown`, and Unknown counts as failure rather than success,
+/// because an absent result is not a passing result.
+fn has_failing_check(pull_request: &PullRequestSnapshot) -> bool {
+    pull_request.checks.iter().any(|check| {
+        matches!(
+            check.state,
+            crate::model::CheckState::Failure
+                | crate::model::CheckState::Cancelled
+                | crate::model::CheckState::TimedOut
+                | crate::model::CheckState::ActionRequired
+        )
+    })
 }
 
 /// Record one pairwise report plus, for a non-clean pair, the exact
@@ -2829,6 +2853,79 @@ mod tests {
         let admission = resolve_admission(&status.analysis, &labels);
         assert_eq!(admission.next_candidate, Some(PrNumber(20)));
         assert_eq!(admission.candidates[0].priority_rank, Some(1));
+    }
+
+    /// Operator ruling from cacophony PR 2276: a failing check MUST bar
+    /// admission, because queueing behind red is guaranteed rework. The failure
+    /// has to be fixed, fixing it rewrites the head, and every member stacked
+    /// behind it is rebased anyway, so admitting red buys nothing and costs the
+    /// whole tail a re-stitch.
+    #[test]
+    fn a_candidate_with_a_failing_check_is_not_admissible() {
+        let mut red = pr(10, "red", "main", false);
+        red.checks.push(crate::model::CheckSnapshot {
+            name: "Rust Check & Lint work".to_owned(),
+            state: crate::model::CheckState::Failure,
+            provider_state: Some("FAILURE".to_owned()),
+            details_url: None,
+        });
+        let mut problems = Vec::new();
+
+        validate_candidate(&red, &mut problems);
+
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.message.contains("failing required check")),
+            "a red candidate must be refused admission: {problems:?}"
+        );
+    }
+
+    /// The audited override still works: `caravan-force` is how an operator
+    /// takes responsibility for admitting a red head deliberately.
+    #[test]
+    fn caravan_force_still_admits_a_red_candidate() {
+        let mut forced = pr(11, "forced", "main", false);
+        forced.labels.insert("caravan-force".to_owned());
+        forced.checks.push(crate::model::CheckSnapshot {
+            name: "Rust Check & Lint work".to_owned(),
+            state: crate::model::CheckState::Failure,
+            provider_state: Some("FAILURE".to_owned()),
+            details_url: None,
+        });
+        let mut problems = Vec::new();
+
+        validate_candidate(&forced, &mut problems);
+
+        assert!(
+            !problems
+                .iter()
+                .any(|problem| problem.message.contains("failing required check")),
+            "caravan-force must remain the audited override: {problems:?}"
+        );
+    }
+
+    /// A check still running is not a failure. Refusing on pending would stall
+    /// every candidate for the duration of its own CI.
+    #[test]
+    fn a_pending_check_does_not_bar_admission() {
+        let mut pending = pr(12, "pending", "main", false);
+        pending.checks.push(crate::model::CheckSnapshot {
+            name: "Rust Fast Tests work".to_owned(),
+            state: crate::model::CheckState::InProgress,
+            provider_state: None,
+            details_url: None,
+        });
+        let mut problems = Vec::new();
+
+        validate_candidate(&pending, &mut problems);
+
+        assert!(
+            !problems
+                .iter()
+                .any(|problem| problem.message.contains("failing required check")),
+            "a pending check is not a failure: {problems:?}"
+        );
     }
 
     /// Live operator report (PR 2234): Cara proved the leading candidate could
