@@ -74,9 +74,18 @@ fn default_sync_max_github_requests_per_tick() -> u32 {
     256
 }
 
-/// Historical behaviour: leave the operator on the PR that needs repairing.
+/// Leave the working tree where it was.
+///
+/// Parking on the evaluated PR was the historical behaviour and is a convenient
+/// repair affordance, but it made a well-known worktree silently authoritative
+/// for whatever branch was last inspected. That cost two multi-hour
+/// misdiagnoses: one queue declared dead from a config read off a stale branch,
+/// and one non-existent validator off-by-one escalated to six agents because the
+/// parked branch carried `max_duration_secs: 65525`. Correctness beats
+/// convenience here, and the decision receipt still names the exact PR to check
+/// out (bd-26dc9e).
 const fn default_checkout_on_decision() -> bool {
-    true
+    false
 }
 
 fn default_sync_max_duration_secs() -> u64 {
@@ -1117,12 +1126,15 @@ mod decision_checkout_policy_tests {
     /// whatever PR was last inspected. Interactive use still wants that, so the
     /// historical behaviour stays the default and unattended callers opt out.
     #[test]
-    fn decision_checkout_defaults_to_the_historical_interactive_behaviour() {
-        assert!(CaravanConfig::default().sync.checkout_on_decision);
+    fn decision_checkout_defaults_to_leaving_the_worktree_alone() {
+        assert!(
+            !CaravanConfig::default().sync.checkout_on_decision,
+            "a well-known worktree must not silently become the last PR inspected"
+        );
     }
 
     #[test]
-    fn an_unattended_worktree_can_opt_out_without_touching_other_policy() {
+    fn an_interactive_checkout_can_opt_back_in_without_touching_other_policy() {
         let config: CaravanConfig = serde_yaml::from_str(
             r"
 version: 1
@@ -1130,12 +1142,12 @@ force_merge: false
 rebase_on_join: false
 command_timeout_secs: 30
 sync:
-  checkout_on_decision: false
+  checkout_on_decision: true
 ",
         )
         .expect("partial config uses defaults for every unset field");
 
-        assert!(!config.sync.checkout_on_decision);
+        assert!(config.sync.checkout_on_decision);
         assert_eq!(
             config.sync.max_duration_secs,
             default_sync_max_duration_secs(),

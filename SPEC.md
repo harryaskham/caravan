@@ -1109,14 +1109,15 @@ The first skeleton establishes:
 
 Subsequent beads implement GitHub discovery, graph validation, compatibility, mutations, sync/CI, hooks/loop, and recovery behavior without changing this contract silently.
 
-`sync.checkout_on_decision` (default `true`) leaves the working tree checked out
-on a decision's PR so it can be repaired in place. That is right for an
+`sync.checkout_on_decision` (default `false`) leaves the working tree exactly
+where it was. Setting it `true` restores the historical affordance of checking
+out a decision's PR so it can be repaired in place. That is right for an
 interactive checkout and wrong for an unattended sync worktree, which otherwise
 silently becomes whatever PR was last inspected — one was found parked on a dead
 agent's branch 95 commits behind the default, so every policy value came from
-that old commit. Setting it to `false` leaves the worktree on its base and
-records a `skipped` checkout receipt naming the PR, so the between-runs state is
-always explained rather than implied. `config_provenance.behind_default_branch`
+that old commit. The default records a `skipped` checkout receipt naming the PR, so the
+between-runs state is always explained rather than implied and a well-known
+worktree never silently becomes the last PR inspected. `config_provenance.behind_default_branch`
 reports the distance on every read, and a tick refuses with
 `stale_repository_policy` when the effective config both differs from the
 default branch and comes from a checkout that is behind it.

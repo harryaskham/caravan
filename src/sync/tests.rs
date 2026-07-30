@@ -3284,11 +3284,15 @@ fn decision_checkout_targets_the_repair_pr_only_when_unambiguous() {
 #[test]
 fn unsafe_decision_checkout_preserves_the_original_decision_error() {
     let temp = tempfile::tempdir().unwrap();
+    // This test is specifically about the opt-in checkout path, which must
+    // preserve the decision even when the checkout itself fails.
+    let mut config = crate::config::CaravanConfig::default();
+    config.sync.checkout_on_decision = true;
     let context = AppContext {
         repository_path: temp.path().to_path_buf(),
         config_path: temp.path().join("config.yaml"),
         config_existed: false,
-        config: crate::config::CaravanConfig::default(),
+        config,
     };
     let pull_request = pull_request(
         1,
@@ -7079,4 +7083,56 @@ fn a_tick_refuses_policy_read_from_a_checkout_behind_the_default_branch() {
     });
     crate::sync::require_current_policy(&status)
         .expect("a current branch proposal is legitimate policy");
+}
+
+/// bd-26dc9e: a well-known worktree that silently becomes the last PR inspected
+/// cost two multi-hour misdiagnoses, so the default is now to leave it alone and
+/// say so rather than to park on the PR.
+#[test]
+fn a_decision_leaves_the_worktree_alone_by_default_and_records_why() {
+    let temp = tempfile::tempdir().unwrap();
+    let context = AppContext {
+        repository_path: temp.path().to_path_buf(),
+        config_path: temp.path().join("config.yaml"),
+        config_existed: false,
+        config: crate::config::CaravanConfig::default(),
+    };
+    let pull_request = pull_request(
+        1,
+        "one",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::squash(),
+    );
+    let decision = DecisionPoint {
+        kind: DecisionKind::CiFailure,
+        operation_id: OperationId::new(),
+        repository: repository(),
+        caravan_id: Some(PrNumber(1)),
+        affected_prs: vec![PrNumber(1)],
+        message: "repair".to_owned(),
+        evidence: BTreeMap::from([("pull_request".to_owned(), json!(pull_request))]),
+        completed_steps: Vec::new(),
+        resumable: true,
+        suggested_actions: Vec::new(),
+    };
+    let error = AppError::structured(
+        ErrorCategory::Validation,
+        "ci_failure",
+        "repair",
+        Some(json!({ "decision": decision })),
+    );
+
+    let error = checkout_for_decision(&context, error, Instant::now() + Duration::from_secs(1));
+
+    assert_eq!(error.code(), "ci_failure", "the decision is preserved");
+    let details = error.details().unwrap();
+    assert_eq!(details["checkout"]["state"], "skipped");
+    assert_eq!(details["checkout"]["pr"], 1);
+    assert!(
+        details["checkout"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("checkout_on_decision")),
+        "the receipt names the policy that left the worktree alone: {details}"
+    );
 }
