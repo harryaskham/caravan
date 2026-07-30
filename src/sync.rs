@@ -669,6 +669,15 @@ pub struct SyncPlanOutput {
     pub schema_version: u32,
     pub mutated: bool,
     pub provider_writes: u32,
+    /// Why a real tick would refuse to start, when the plan itself still renders.
+    ///
+    /// Tick bounds are enforced in `sync_with_lock` rather than at config load,
+    /// so a bad budget cannot silence read-only surfaces. Without this the plan
+    /// described operations a tick would never reach, which converts "I checked"
+    /// into false confidence in the one surface consulted precisely by people who
+    /// do not yet trust the tick (bd-765c65).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tick_refusal: Option<String>,
     pub local_ephemeral_preflight: bool,
     pub repository: RepositoryId,
     pub default_branch: crate::model::BranchSnapshot,

@@ -55,6 +55,17 @@ fn plan_sync_inner(context: &AppContext, input: &SyncInput) -> Result<SyncPlanOu
     let status =
         read::status_with_deadline_and_budget(context, operation_deadline, Some(&github_budget))?;
     crate::initialization::require_ready(&status.initialization)?;
+    // A plan for a tick that cannot start is worse than no plan: it converts
+    // "I checked" into false confidence. Tick bounds moved out of config load so
+    // a bad budget could not silence read-only surfaces (bd-a4a7e9), which was
+    // right, but the preview was never taught that the check had moved. Reported
+    // rather than refused, because refusing would re-break the very surface an
+    // operator needs in order to diagnose the bad budget (bd-765c65).
+    let tick_refusal = context
+        .config
+        .validate_tick_bounds()
+        .err()
+        .map(|error| error.to_string());
     let timeout = Duration::from_secs(context.config.command_timeout_secs);
     let runner = crate::command::ProcessRunner::in_directory(&context.repository_path)
         .with_timeout(timeout)
@@ -229,6 +240,7 @@ fn plan_sync_inner(context: &AppContext, input: &SyncInput) -> Result<SyncPlanOu
     let provider_writes = super::completed_mutation_count(&progress);
     let output = SyncPlanOutput {
         schema_version: 1,
+        tick_refusal,
         mutated: provider_writes > 0,
         provider_writes,
         local_ephemeral_preflight: context.config.rebase_on_join,

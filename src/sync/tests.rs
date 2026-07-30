@@ -1106,6 +1106,7 @@ fn plan_hash_binds_exact_actions_not_telemetry() {
         schema_version: 1,
         mutated: false,
         provider_writes: 0,
+        tick_refusal: None,
         local_ephemeral_preflight: false,
         repository: status.repository.clone(),
         default_branch: status.analysis.fleet.default_branch.clone(),
@@ -1145,6 +1146,18 @@ fn plan_hash_binds_exact_actions_not_telemetry() {
     telemetry_changed.status.provider_api.calls = 99;
     let second = telemetry_changed.finalize_hash();
     assert_eq!(first.plan_hash, second.plan_hash);
+
+    // A tick refusal is DIAGNOSTIC, not an action: it reports that the tick this
+    // plan describes would not start, without changing which operations were
+    // planned. Binding it into the hash would make the same plan hash
+    // differently purely because the config was wrong (bd-765c65).
+    let mut refused = base.clone();
+    refused.tick_refusal = Some("sync.max_duration_secs must be between 1 and 3600".to_owned());
+    assert_eq!(
+        first.plan_hash,
+        refused.finalize_hash().plan_hash,
+        "a refusal notice must not change the identity of the planned operations"
+    );
 
     let mut changed = base;
     changed.actions[0].reason = "different exact action".to_owned();

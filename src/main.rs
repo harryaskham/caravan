@@ -1859,6 +1859,14 @@ fn render_sync_plan(output: &caravan::sync::SyncPlanOutput) -> String {
         output.repository,
         output.plan_hash
     );
+    if let Some(refusal) = &output.tick_refusal {
+        // Stated before the steps, because the steps are what it invalidates.
+        let _ = writeln!(
+            text,
+            "  {} a real tick would REFUSE to start: {refusal}",
+            failure("!"),
+        );
+    }
     let _ = writeln!(
         text,
         "  default {}@{} · caravans {} · github reads {}",
