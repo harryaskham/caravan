@@ -2050,7 +2050,14 @@ fn validate_candidate(pull_request: &PullRequestSnapshot, problems: &mut Vec<Gra
     // rebased anyway — so admitting a red candidate buys nothing and costs the
     // whole tail a re-stitch. `caravan-force` remains the audited override.
     if !pull_request.has_label("caravan-force") && has_failing_check(pull_request) {
-        messages.insert("candidate PR has a failing required check; fix it before admission rather than stacking work behind it");
+        messages.insert(if has_cancelled_check(pull_request) {
+            // Naming the cancellation is the whole point: the reader must not
+            // treat this as a code failure and evict or repair on the strength
+            // of it.
+            "candidate PR has a cancelled check, so its failures may be consequences rather than verdicts; rerun the cancelled jobs before treating this as a code failure"
+        } else {
+            "candidate PR has a failing required check; fix it before admission rather than stacking work behind it"
+        });
     }
     for message in messages {
         problems.push(GraphProblem {
@@ -2076,6 +2083,24 @@ fn has_failing_check(pull_request: &PullRequestSnapshot) -> bool {
                 | crate::model::CheckState::ActionRequired
         )
     })
+}
+
+/// Whether any check was CANCELLED rather than genuinely failing.
+///
+/// A cancellation cascades: aggregate checks downstream of a cancelled producer
+/// conclude `failure` in seconds without building or running anything, so the
+/// remaining failures on such a pull request may be consequences rather than
+/// verdicts. Cara cannot tell which from the rollup alone, because the aggregate
+/// reports only its own conclusion. What it CAN do is say so, so whoever reads
+/// the refusal knows to rerun rather than to repair or evict.
+///
+/// Measured by an operator across three live cases: two of the three failures
+/// were spurious in exactly this way (bd-c04d9b).
+fn has_cancelled_check(pull_request: &PullRequestSnapshot) -> bool {
+    pull_request
+        .checks
+        .iter()
+        .any(|check| check.state == crate::model::CheckState::Cancelled)
 }
 
 /// Record one pairwise report plus, for a non-clean pair, the exact
@@ -2932,6 +2957,49 @@ mod tests {
                 .any(|candidate| candidate.pr == PrNumber(10)),
             "the red candidate must be visibly skipped, not silently dropped: {:?}",
             admission.skipped
+        );
+    }
+
+    /// bd-c04d9b live shape (caravan #2287): five producers CANCELLED under
+    /// capacity pressure, two aggregates then concluding FAILURE in seconds
+    /// without building anything. An operator measured two of three such cases
+    /// as spurious.
+    ///
+    /// Cara cannot tell an aggregate-consequence failure from a real one, because
+    /// the rollup reports only the aggregate's own conclusion. What it can do is
+    /// refuse for the RIGHT STATED REASON, so the reader reruns rather than
+    /// repairing or evicting on the strength of a consequence.
+    #[test]
+    fn a_cancellation_is_named_so_the_reader_reruns_rather_than_evicts() {
+        let mut cancelled = pr(2287, "member", "main", false);
+        cancelled.checks.push(crate::model::CheckSnapshot {
+            name: "Public Fast Tests preparation".to_owned(),
+            state: crate::model::CheckState::Cancelled,
+            provider_state: Some("CANCELLED".to_owned()),
+            details_url: None,
+        });
+        cancelled.checks.push(crate::model::CheckSnapshot {
+            name: "Check & Lint".to_owned(),
+            state: crate::model::CheckState::Failure,
+            provider_state: Some("FAILURE".to_owned()),
+            details_url: None,
+        });
+        let mut problems = Vec::new();
+
+        validate_candidate(&cancelled, &mut problems);
+
+        let reason = problems
+            .iter()
+            .map(|problem| problem.message.clone())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            reason.contains("cancelled") && reason.contains("rerun"),
+            "the refusal must name the cancellation and point at a rerun: {reason}"
+        );
+        assert!(
+            !reason.contains("fix it before admission"),
+            "it must NOT read as a code failure the owner should repair: {reason}"
         );
     }
 
