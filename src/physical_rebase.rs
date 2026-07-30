@@ -21,6 +21,14 @@ use crate::squash_equivalence::{self, SquashEquivalenceReport};
 const MAX_MERGE_PRESERVING_COMMITS: usize = 256;
 
 /// Shared child and whole-operation limits for one prepared generation.
+/// Smallest timeout allowed for creating an isolated worktree.
+///
+/// Chosen from measurement rather than taste: the slowest observed cold run was
+/// 23.6s on macOS for a 3801-file tree, so 60s leaves headroom for a larger
+/// repository without ever being the thing that bounds a healthy tick. The
+/// operation deadline remains the real bound.
+const WORKTREE_SETUP_FLOOR: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Clone)]
 pub struct RebaseExecutionBudget {
     pub command_timeout: Duration,
@@ -62,6 +70,24 @@ impl RebaseExecutionBudget {
             flatten_squashed_root: false,
             replay_upstream: None,
         }
+    }
+
+    /// Timeout for creating the isolated worktree.
+    ///
+    /// Worktree creation is a fixed setup cost proportional to TREE SIZE, not to
+    /// the work being replayed, so pricing it at the same per-command share as
+    /// every other step mis-prices it. Measured on an identical repository
+    /// (3801 tracked files): 0.7-3.2s on every Linux node, but 12-23s on macOS,
+    /// against an observed 10176ms sub-deadline. That made macOS structurally
+    /// unable to complete a physical rebase at all, and physical rebase is how
+    /// members stack (bd-1a4e28).
+    ///
+    /// The operation deadline still bounds this: `effective_timeout` clamps every
+    /// command to the remaining tick budget, so a larger floor cannot overrun
+    /// the tick, it only stops a slow filesystem being mistaken for a hang.
+    #[must_use]
+    pub fn worktree_setup_timeout(&self) -> Duration {
+        self.command_timeout.max(WORKTREE_SETUP_FLOOR)
     }
 
     /// Replay only commits after `boundary` (bd-cef612).
@@ -476,7 +502,7 @@ pub fn prepare_candidate(
     let worktree = TemporaryWorktree::create(
         repository_path,
         &candidate.head.oid,
-        budget.command_timeout,
+        budget.worktree_setup_timeout(),
         budget.operation_deadline,
     )?;
     let worktree_runner = process_runner(
@@ -2966,6 +2992,28 @@ mod tests {
         assert_eq!(
             git(&clone, &["ls-remote", "origin", "refs/heads/feature"]),
             before
+        );
+    }
+
+    /// bd-1a4e28: worktree creation is a fixed setup cost proportional to tree
+    /// size, so pricing it at the same per-command share as every replay step
+    /// made macOS structurally unable to rebase at all: 12-23s measured there
+    /// against an observed 10176ms sub-deadline, versus 0.7-3.2s on Linux.
+    #[test]
+    fn worktree_setup_is_not_priced_like_an_ordinary_command() {
+        let tight = RebaseExecutionBudget::new(Duration::from_millis(10_176));
+
+        assert!(
+            tight.worktree_setup_timeout() >= Duration::from_secs(24),
+            "the floor must clear the slowest measured macOS cold run (23.6s)"
+        );
+
+        // A generous configured timeout is never reduced by the floor.
+        let generous = RebaseExecutionBudget::new(Duration::from_secs(300));
+        assert_eq!(
+            generous.worktree_setup_timeout(),
+            Duration::from_secs(300),
+            "the floor raises a tight budget, it never lowers a deliberate one"
         );
     }
 
