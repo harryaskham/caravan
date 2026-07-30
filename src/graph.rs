@@ -54,7 +54,7 @@ impl GraphAnalysis {
             .fleet
             .problems
             .iter()
-            .any(|problem| problem.kind != GraphProblemKind::CandidateIncompatible)
+            .any(|problem| problem.kind.blocks_fleet())
     }
 }
 

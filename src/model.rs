@@ -523,6 +523,90 @@ pub enum GraphProblemKind {
     Unknown,
 }
 
+impl GraphProblemKind {
+    /// Whether this problem describes the *fleet*, rather than one pull request
+    /// that is not in any caravan.
+    ///
+    /// Deliberately an exhaustive `match` rather than a `!=` comparison. A guard
+    /// written as `kind != CandidateIncompatible` silently stopped firing once
+    /// the producer moved to a new variant, which reinstated a head-of-line
+    /// stall with every test still green (bd-299d3e). Classifying here means a
+    /// new variant fails to compile until somebody decides what it means.
+    #[must_use]
+    pub const fn blocks_fleet(self) -> bool {
+        match self {
+            Self::MissingHead
+            | Self::MultipleHeads
+            | Self::Branching
+            | Self::Cycle
+            | Self::DanglingBase
+            | Self::ActiveAndEvicted
+            | Self::DuplicateMember
+            | Self::ForkOnlyPredecessor
+            | Self::AutoMergeInvariant
+            | Self::Incompatible
+            | Self::ReusedBranchProvenance
+            | Self::SupersededGeneration
+            | Self::AmbiguousGeneration
+            | Self::InvalidGenerationMetadata
+            | Self::Unknown => true,
+            // An unadmitted candidate blocks nothing: it is in no caravan, and
+            // only its own owner can resolve it.
+            Self::CandidateIncompatible => false,
+        }
+    }
+
+    /// Whether this problem is scoped to one unadmitted admission candidate.
+    #[must_use]
+    pub const fn is_candidate_scoped(self) -> bool {
+        !self.blocks_fleet()
+    }
+}
+
+#[cfg(test)]
+mod graph_problem_kind_tests {
+    use super::GraphProblemKind;
+
+    /// The classification must stay total. This is the guard that would have
+    /// caught a consumer still naming an old variant after the producer moved:
+    /// the exhaustive `match` in `blocks_fleet` cannot compile once a variant is
+    /// added without a decision, and this test proves the two halves partition.
+    #[test]
+    fn every_kind_is_classified_exactly_once() {
+        for kind in [
+            GraphProblemKind::MissingHead,
+            GraphProblemKind::MultipleHeads,
+            GraphProblemKind::Branching,
+            GraphProblemKind::Cycle,
+            GraphProblemKind::DanglingBase,
+            GraphProblemKind::ActiveAndEvicted,
+            GraphProblemKind::DuplicateMember,
+            GraphProblemKind::ForkOnlyPredecessor,
+            GraphProblemKind::AutoMergeInvariant,
+            GraphProblemKind::Incompatible,
+            GraphProblemKind::CandidateIncompatible,
+            GraphProblemKind::ReusedBranchProvenance,
+            GraphProblemKind::SupersededGeneration,
+            GraphProblemKind::AmbiguousGeneration,
+            GraphProblemKind::InvalidGenerationMetadata,
+            GraphProblemKind::Unknown,
+        ] {
+            assert_ne!(
+                kind.blocks_fleet(),
+                kind.is_candidate_scoped(),
+                "{kind:?} must be exactly one of fleet-blocking or candidate-scoped"
+            );
+        }
+    }
+
+    /// The one variant whose misclassification stopped every caravan forming.
+    #[test]
+    fn an_unadmitted_candidate_conflict_never_blocks_the_fleet() {
+        assert!(!GraphProblemKind::CandidateIncompatible.blocks_fleet());
+        assert!(GraphProblemKind::Incompatible.blocks_fleet());
+    }
+}
+
 /// One graph problem with the relevant PRs and evidence summary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct GraphProblem {

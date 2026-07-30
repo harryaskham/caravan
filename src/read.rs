@@ -1159,7 +1159,7 @@ pub fn resolve_admission_with_generation(
             // still naming `Incompatible` after the producer moved to
             // `CandidateIncompatible`, which reinstated the head-of-line stall
             // with every test still green.
-            problem.kind == GraphProblemKind::CandidateIncompatible && problem.prs.contains(number)
+            problem.kind.is_candidate_scoped() && problem.prs.contains(number)
         }) {
             skipped.push(SkippedAdmissionCandidate {
                 pr: *number,
@@ -1664,10 +1664,7 @@ pub fn check_analysis(
         .fleet
         .problems
         .iter()
-        .filter(|problem| {
-            problem.kind != GraphProblemKind::CandidateIncompatible
-                || problem.prs.contains(&current_pr)
-        })
+        .filter(|problem| problem.kind.blocks_fleet() || problem.prs.contains(&current_pr))
         .cloned()
         .collect::<Vec<_>>();
     let mut ordering_note: Option<String> = None;
