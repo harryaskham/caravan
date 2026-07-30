@@ -689,6 +689,9 @@ fn status_with_discovery_options(
                 discovery_timeout_error(
                     &error,
                     discovery_phase(command),
+                    // Discovery is the first phase, so its own cost is the
+                    // elapsed budget: nothing ran before it to spend any.
+                    started.elapsed(),
                     started.elapsed(),
                     operation_budget,
                 )
@@ -741,6 +744,7 @@ fn status_with_discovery_options(
                 discovery_timeout_error(
                     provider,
                     "repository_label_inventory",
+                    started.elapsed().saturating_sub(analysis_elapsed),
                     started.elapsed(),
                     operation_budget,
                 )
@@ -2278,6 +2282,9 @@ fn discovery_error(error: &DiscoveryError) -> AppError {
         return discovery_timeout_error(
             error,
             discovery_phase(command),
+            // A single command that hit its own timeout: the phase cost and the
+            // budget are the same number here, and legitimately so.
+            std::time::Duration::from_millis(*timeout_ms),
             std::time::Duration::from_millis(*timeout_ms),
             std::time::Duration::from_millis(*timeout_ms),
         );
@@ -2362,9 +2369,19 @@ fn discovery_phase(command: &crate::command::CommandSpec) -> &'static str {
     }
 }
 
+/// Build the typed discovery timeout, distinguishing the phase's OWN cost from
+/// the total elapsed budget.
+///
+/// These are different numbers and conflating them sends a reader after the
+/// wrong command. The operation deadline expires during whichever phase happens
+/// to be running, so reporting total elapsed under that phase's name reads as
+/// "this phase took 68 seconds". It cost 0.8s; earlier phases spent the budget.
+/// An operator and two agents chased `gh label list` on the strength of exactly
+/// that reading (bd-1d6b1a).
 fn discovery_timeout_error(
     error: &DiscoveryError,
     phase: &str,
+    phase_elapsed: std::time::Duration,
     elapsed: std::time::Duration,
     deadline: std::time::Duration,
 ) -> AppError {
@@ -2380,11 +2397,18 @@ fn discovery_timeout_error(
     AppError::structured(
         ErrorCategory::Timeout,
         "github_discovery_timeout",
-        format!("GitHub discovery phase `{phase}` exceeded the status deadline"),
+        format!(
+            "GitHub discovery exceeded the status deadline during phase `{phase}`; that phase itself took {}ms of {}ms total",
+            phase_elapsed.as_millis(),
+            elapsed.as_millis()
+        ),
         Some(json!({
             "stage": "github_discovery",
             "phase": phase,
             "command": command,
+            // The phase that was running when the budget ran out, NOT necessarily
+            // the phase that consumed it.
+            "phase_elapsed_ms": u64::try_from(phase_elapsed.as_millis()).unwrap_or(u64::MAX),
             "elapsed_ms": u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
             "deadline_ms": u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
             "timeout_ms": u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
@@ -2717,6 +2741,39 @@ mod tests {
         );
     }
 
+    /// The phase that was RUNNING when the budget expired is not necessarily the
+    /// phase that CONSUMED it, and reporting one number under the other's name
+    /// sends readers after the wrong command. Live case: the label inventory was
+    /// blamed for 68 seconds when it costs under one, because earlier phases had
+    /// spent the budget (bd-1d6b1a).
+    #[test]
+    fn a_deadline_error_separates_phase_cost_from_total_elapsed() {
+        let provider = DiscoveryError::Runner(CommandRunError::Timeout {
+            command: crate::command::CommandSpec::new("gh").args(["label", "list"]),
+            process_group_id: None,
+            timeout_ms: 250,
+            stdout: String::new(),
+            stderr: "stalled".to_owned(),
+        });
+
+        let error = discovery_timeout_error(
+            &provider,
+            "repository_label_inventory",
+            std::time::Duration::from_millis(819),
+            std::time::Duration::from_millis(68_644),
+            std::time::Duration::from_secs(60),
+        );
+
+        let details = mcp_cli::StructuredError::details(&error).unwrap();
+        assert_eq!(details["phase_elapsed_ms"], 819);
+        assert_eq!(details["elapsed_ms"], 68_644);
+        let message = mcp_cli::StructuredError::message(&error);
+        assert!(
+            message.contains("819") && message.contains("68644"),
+            "the human message must show both, or the cheap phase reads as the expensive one: {message}"
+        );
+    }
+
     #[test]
     fn status_deadline_error_reports_total_elapsed_and_phase() {
         let provider = DiscoveryError::Runner(CommandRunError::Timeout {
@@ -2729,6 +2786,7 @@ mod tests {
         let error = discovery_timeout_error(
             &provider,
             "compatibility_prepare",
+            std::time::Duration::from_millis(875),
             std::time::Duration::from_millis(875),
             std::time::Duration::from_secs(1),
         );
