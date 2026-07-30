@@ -1678,6 +1678,64 @@ fn pending_ci_reports_waiting_without_speculative_mutation() {
     assert_eq!(encoded["caravans"][0]["members"][0]["pr"], 1);
 }
 
+/// A red MEMBER must never be evicted by a tick. Eviction re-links the chain
+/// around the member and is only ever an operator decision.
+///
+/// This is asserted rather than assumed because the guarantee is load-bearing
+/// OUTSIDE the code: an operator set cancellation policy on the strength of my
+/// telling them twice that no sync path evicts, and that claim rested on having
+/// grepped for eviction calls once. A grep is a point-in-time observation; it
+/// does not survive somebody adding a call tomorrow. Five pull requests went red
+/// and returned green untouched in a single session, so evict-on-red would have
+/// been wrong five times out of five (bd-c04d9b).
+///
+/// Covers red, CANCELLED, and the rerun path together, because eviction could be
+/// introduced on any one of them independently.
+#[test]
+fn no_sync_path_evicts_a_member_whose_ci_is_red_or_cancelled() {
+    let evicting_calls = |provider: &FakeProvider| -> Vec<String> {
+        provider
+            .calls
+            .borrow()
+            .iter()
+            .map(|call| format!("{call:?}"))
+            .filter(|call| call.contains("caravan-evicted") || call.contains("RemoveLabel"))
+            .collect()
+    };
+
+    for (label, state, rerun) in [
+        ("red", CheckState::Failure, false),
+        ("cancelled", CheckState::Cancelled, false),
+        ("cancelled with --rerun-failed", CheckState::Cancelled, true),
+    ] {
+        let mut pulls = healthy_chain();
+        pulls[0].checks = vec![check("build-test", state, Some(10))];
+        let matching = failed_run(10, &pulls[0]);
+        let provider = FakeProvider::with_pull_requests(pulls.clone());
+        provider
+            .failed_runs
+            .borrow_mut()
+            .insert(PrNumber(1), vec![matching]);
+        let status = status(pulls, Some(PrNumber(1)), &clean);
+
+        let _ = execute(&status, &provider, false, false, rerun);
+
+        assert!(
+            evicting_calls(&provider).is_empty(),
+            "{label}: a tick must never evict a member; eviction is an operator decision, got {:?}",
+            evicting_calls(&provider)
+        );
+        assert!(
+            !provider.pulls.borrow()[&PrNumber(1)].has_label("caravan-evicted"),
+            "{label}: the member must not be labelled evicted"
+        );
+        assert!(
+            provider.pulls.borrow()[&PrNumber(1)].has_label("caravan"),
+            "{label}: the member must remain in its caravan"
+        );
+    }
+}
+
 #[test]
 fn unforced_failure_returns_exact_ci_decision_and_canonical_event() {
     let mut pulls = healthy_chain();
