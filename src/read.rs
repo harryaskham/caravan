@@ -2307,7 +2307,7 @@ fn discovery_error(error: &DiscoveryError) -> AppError {
                 "stderr": evidence.stderr,
                 "streams_combined": false,
                 "resumable": true,
-                "next": "inspect the separate stdout/stderr excerpts, repair malformed provider stdout, and retry",
+                "next": "inspect the separate stdout/stderr excerpts; the message names the exact record where one could be identified. Provider output that is unusual is not necessarily malformed, so confirm the shape before treating it as corruption",
             })),
         );
     }

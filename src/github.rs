@@ -2152,13 +2152,54 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
         ),
         DiscoveryError,
     > {
-        let pulls = self.json::<Vec<PullRequestJson>>(command)?;
+        let pulls = self.pull_request_records(command)?;
         let generation_facts = pulls.iter().map(PullRequestJson::generation_fact).collect();
         let snapshots = pulls
             .into_iter()
             .map(|pull_request| pull_request.into_snapshot(repository))
             .collect::<Result<Vec<_>, _>>()?;
         Ok((snapshots, generation_facts))
+    }
+
+    /// Decode a PR list record-by-record so one unusable record cannot discard
+    /// the other twenty-seven.
+    ///
+    /// A single closed pull request took out every read of the repository:
+    /// discovery is phase one of a tick, so nothing downstream ran at all. The
+    /// error also reported only a byte column, and its guidance named GitHub's
+    /// normal output as malformed provider stdout, which sent the reader off to
+    /// repair the wrong thing. A skipped record is now named by PR number
+    /// wherever the payload still yields one (bd-4e0430).
+    fn pull_request_records(
+        &self,
+        command: CommandSpec,
+    ) -> Result<Vec<PullRequestJson>, DiscoveryError> {
+        let rows = self.json::<Vec<serde_json::Value>>(command.clone())?;
+        let mut records = Vec::with_capacity(rows.len());
+        let mut skipped = Vec::new();
+        for row in rows {
+            let number = row.get("number").and_then(serde_json::Value::as_u64);
+            match serde_json::from_value::<PullRequestJson>(row) {
+                Ok(record) => records.push(record),
+                Err(error) => skipped.push((number, error.to_string())),
+            }
+        }
+        // Every record unusable is a real provider or schema break rather than
+        // one odd row, so that still fails closed.
+        if records.is_empty() && !skipped.is_empty() {
+            return Err(DiscoveryError::InvalidJson {
+                command,
+                message: format!(
+                    "no pull request record could be decoded; first failure {}",
+                    describe_skipped_record(&skipped[0])
+                ),
+                evidence: Box::new(JsonDecodeEvidence {
+                    stdout: diagnostic_excerpt(&skipped_summary(&skipped)),
+                    stderr: String::new(),
+                }),
+            });
+        }
+        Ok(records)
     }
 
     fn json<T: DeserializeOwned>(&self, command: CommandSpec) -> Result<T, DiscoveryError> {
@@ -2179,6 +2220,23 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
             }),
         })
     }
+}
+
+/// Name one skipped provider record by PR number where the payload supplied one.
+fn describe_skipped_record(skipped: &(Option<u64>, String)) -> String {
+    match skipped.0 {
+        Some(number) => format!("PR #{number}: {}", skipped.1),
+        None => format!("record without a number field: {}", skipped.1),
+    }
+}
+
+/// Bounded summary of every skipped record, for evidence.
+fn skipped_summary(skipped: &[(Option<u64>, String)]) -> String {
+    skipped
+        .iter()
+        .map(describe_skipped_record)
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn validate_active_heads(
@@ -3524,6 +3582,39 @@ mod tests {
             parsed[0].status_check_rollup.is_empty(),
             "a null rollup means no checks, not an error"
         );
+    }
+
+    /// bd-4e0430: one closed pull request with an unusable shape aborted the
+    /// entire discovery phase, so no admission, chain planning, or merge ran at
+    /// all. A 28-record response must not be all-or-nothing, and the failure
+    /// must name the record rather than only a byte column.
+    #[test]
+    fn one_unusable_record_is_skipped_and_named_while_the_rest_survive() {
+        let good = pr_list_json(2300, "topic", "acme/widgets", false);
+        let mut rows: Vec<serde_json::Value> = serde_json::from_str(&good).unwrap();
+        let mut broken = rows[0].clone();
+        broken["number"] = serde_json::json!(2308);
+        broken["headRefOid"] = serde_json::json!(null);
+        rows.push(broken);
+
+        let mut records = Vec::new();
+        let mut skipped = Vec::new();
+        for row in rows {
+            let number = row.get("number").and_then(serde_json::Value::as_u64);
+            match serde_json::from_value::<PullRequestJson>(row) {
+                Ok(record) => records.push(record),
+                Err(error) => skipped.push((number, error.to_string())),
+            }
+        }
+
+        assert_eq!(records.len(), 1, "the usable record still arrives");
+        assert_eq!(skipped.len(), 1);
+        let described = describe_skipped_record(&skipped[0]);
+        assert!(
+            described.starts_with("PR #2308:"),
+            "the reader is told which record, not just a byte column: {described}"
+        );
+        assert!(skipped_summary(&skipped).contains("PR #2308"));
     }
 
     /// bd-cd3be9: generation facts must include recently merged labelled PRs,

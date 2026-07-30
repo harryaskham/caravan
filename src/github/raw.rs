@@ -504,7 +504,7 @@ pub(super) struct PullRequestJson {
     pub(super) is_cross_repository: bool,
     pub(super) base_ref_name: String,
     pub(super) base_ref_oid: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty_vec")]
     pub(super) labels: Vec<LabelJson>,
     pub(super) auto_merge_request: Option<AutoMergeJson>,
     // GitHub returns an explicit `null` here for a pull request that never ran
@@ -690,5 +690,42 @@ impl CheckJson {
             provider_state,
             details_url: self.details_url.or(self.target_url),
         }
+    }
+}
+
+#[cfg(test)]
+mod null_label_sequence_tests {
+    use super::*;
+
+    /// bd-640b8d, completing bd-54222d: the rollup was made null-tolerant, but
+    /// `labels` sits in the same provider payload and had the same
+    /// `serde(default)` gap. `default` covers an absent field, never a present
+    /// null, and a single such pull request makes the whole repository
+    /// undiscoverable rather than merely unlabelled.
+    #[test]
+    fn a_null_label_list_reads_as_unlabelled_rather_than_failing_discovery() {
+        let json = r#"{
+            "number": 2308,
+            "title": "closed with nothing attached",
+            "state": "CLOSED",
+            "isDraft": false,
+            "headRefName": "topic",
+            "headRefOid": "head",
+            "isCrossRepository": false,
+            "baseRefName": "main",
+            "baseRefOid": "base",
+            "labels": null,
+            "statusCheckRollup": null,
+            "createdAt": "2026-07-30T00:00:00Z",
+            "mergedAt": null,
+            "url": "https://example.test/pr/2308",
+            "updatedAt": "2026-07-30T00:00:00Z"
+        }"#;
+
+        let parsed: PullRequestJson =
+            serde_json::from_str(json).expect("an explicit null sequence is not a provider defect");
+
+        assert!(parsed.labels.is_empty(), "unlabelled, not undiscoverable");
+        assert!(parsed.status_check_rollup.is_empty());
     }
 }
