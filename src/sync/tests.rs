@@ -1464,6 +1464,57 @@ fn skip_receipt_round_trips_and_invalidates_on_generation_change() {
     assert!(!skip_receipt_matches(&config_changed, &status, &receipt));
 }
 
+/// `status` reporting a healthy fleet and a tick aborting on the same data is
+/// the worst of both: an operator reads healthy, authorises, and the tick fails
+/// on a pull request closed days ago that nothing can now change.
+///
+/// The two sync gates skipped problems by asking `is_candidate_scoped()`, which
+/// names ONE non-blocking category. Adding a second, historical, meant a
+/// dissolution fell through into `InvalidGraph` while `healthy()` ignored it.
+/// The gates now ask what they actually mean: does this problem gate the fleet
+/// (bd-226a07).
+///
+/// Asserts the two halves TOGETHER, because each was individually correct and
+/// only their disagreement was the defect.
+#[test]
+fn a_non_blocking_problem_neither_gates_the_fleet_nor_aborts_a_tick() {
+    for kind in [
+        GraphProblemKind::DissolvedMember,
+        GraphProblemKind::CandidateIncompatible,
+    ] {
+        assert!(
+            !kind.blocks_fleet(),
+            "{kind:?} is non-blocking by classification"
+        );
+
+        let mut status = status(healthy_chain(), Some(PrNumber(1)), &clean);
+        status
+            .analysis
+            .fleet
+            .problems
+            .push(crate::model::GraphProblem {
+                kind,
+                prs: vec![PrNumber(2200)],
+                message: "closed without merging".to_owned(),
+            });
+
+        assert!(
+            status.analysis.healthy(),
+            "{kind:?} must not gate the fleet"
+        );
+
+        let provider = FakeProvider::with_pull_requests(healthy_chain());
+        let progress = execute(&status, &provider, false, false, false);
+        assert!(
+            progress.is_ok(),
+            "{kind:?} must not abort a tick: status reporting healthy while every tick fails is worse than either consistent outcome, got {:?}",
+            progress
+                .err()
+                .map(|error| mcp_cli::StructuredError::code(&error).clone())
+        );
+    }
+}
+
 /// A dry-run's whole safety claim is `NO PROVIDER WRITES`. It must be COUNTED,
 /// never constructed.
 ///

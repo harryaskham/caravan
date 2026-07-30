@@ -1775,7 +1775,14 @@ fn validate_rebase_preflight_graph(
         // and automatic admission is never reached, which is why a fleet with
         // zero caravans and one conflicting candidate could never form its
         // first caravan (bd-550b0e).
-        if problem.kind.is_candidate_scoped() {
+        //
+        // Gated on `blocks_fleet()` rather than `is_candidate_scoped()`: a tick
+        // must stop for exactly the problems that gate the fleet, and no others.
+        // Naming one non-blocking CATEGORY meant a second category, historical
+        // dissolutions, fell through into a blocking decision, so `status`
+        // reported healthy while every tick aborted with `invalid_graph`
+        // (bd-226a07).
+        if !problem.kind.blocks_fleet() {
             continue;
         }
         let auto_merge = problem.kind == GraphProblemKind::AutoMergeInvariant
@@ -5191,7 +5198,8 @@ fn validate_graph(
     force_merge: bool,
 ) -> Result<(), AppError> {
     for problem in &status.analysis.fleet.problems {
-        if problem.kind.is_candidate_scoped() {
+        // See `blocks_fleet()` above: stop for what gates the fleet, nothing else.
+        if !problem.kind.blocks_fleet() {
             continue;
         }
         let correctable_auto_merge = problem.kind == GraphProblemKind::AutoMergeInvariant
