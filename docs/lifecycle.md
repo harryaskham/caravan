@@ -49,9 +49,12 @@ statement about one exact set of objects, never a permanent verdict about a PR.
 | Condition | Front of queue? | Who resolves |
 |---|---|---|
 | Mechanically conflicts with the default branch | **skipped, queue advances** | an agent or human, out of band |
+| A required check has **failed** | **skipped, queue advances** | the PR's owner |
+| A required check is still **running** | admitted; the tick then waits | nobody — automatic |
 | Owner rejected it via `cara check --pr N` | **stays canonical, blocks** | the owner |
 | Behind the default branch but compatible | admitted; Cara rebases it | nobody — automatic |
 | Your checkout is on a merged/historical branch | irrelevant to selection | nobody — automatic |
+| Forge reports `mergeStateStatus: BLOCKED` | **irrelevant to admission** | see §1.4 |
 
 The distinction in the first two rows is the important one. A mechanical
 conflict is not a decision anyone made, and no rerun resolves it, so holding the
@@ -60,6 +63,32 @@ decision, and silently leapfrogging it would discard that decision.
 
 A skipped candidate appears in `admission.skipped` with the exact reason, so
 "skipped" is never indistinguishable from "forgotten".
+
+### 1.4 Red bars admission; pending does not; the forge verdict is not consulted
+
+A **failed** required check bars admission outright. Queueing behind red is
+guaranteed rework: the failure has to be fixed, fixing it rewrites the head, and
+every member stacked behind is rebased anyway. Admitting a red candidate buys
+nothing and costs the whole tail a re-stitch, which is the cost the queue exists
+to avoid. `caravan-force` remains the audited override.
+
+A **running** check is not a failure. Refusing on pending would stall every
+candidate for the duration of its own CI.
+
+A **missing or empty** conclusion is `Unknown`, and Unknown is grouped with
+failures rather than successes. An absent result is not a passing result.
+
+The forge's own `mergeStateStatus` is deliberately **not** consulted for
+admission, and that is measured rather than assumed. On live data a clean,
+correctly-elected candidate reported `BLOCKED` identically to a red one, because
+the forge returns `BLOCKED` whenever branch protection is unsatisfied — including
+required checks that are merely still running. Gating admission on it would
+refuse every candidate whose CI had not finished. It is consulted only at merge
+time (§3.1), where the checks are already proven green, so a forge that still
+declines knows something Cara does not.
+
+A hold that is not expressed as pull request state is not a hold. Draft status
+and the `caravan-join-skipped` label are visible to Cara; an intention is not.
 
 ---
 
@@ -116,7 +145,15 @@ Cara merges the root only when all of these hold:
 1. The root's base **is** the default branch.
 2. Required checks are green on the **exact current head**.
 3. The cumulative merge tree is proven unchanged.
-4. The merge commit is an **ancestor of freshly fetched main** afterwards.
+4. The forge does not itself refuse the merge.
+5. The merge commit is an **ancestor of freshly fetched main** afterwards.
+
+Condition 4 is where `mergeStateStatus` is consulted, and the only place it is.
+By this point the required checks are already proven green, so `BLOCKED`,
+`DIRTY` or `DRAFT` here means an unsatisfied protection rule, a required review,
+or a rule added since discovery — something Cara does not otherwise know.
+Attempting the merge anyway just produces a confusing provider error. The
+refusal is typed `forge_refuses_merge`.
 
 An absent proof is never permission. Ordinary waits — pending checks, an
 unproven tree, a spent per-tick allowance — are visible no-op steps, not
@@ -175,6 +212,39 @@ unwound.
 
 Every gap this document originally listed was found by an operator hitting it in
 normal use, not by a test. That is the point of writing the tree down.
+
+### The failure mode worth remembering
+
+Six separate defects here were one mistake repeated: **a rule applied at one site
+and not at its siblings**, with every test still green because each site was
+tested alone against inputs the test constructed itself.
+
+The worst instance: the producer moved from `Incompatible` to
+`CandidateIncompatible`, and the consumer guard kept comparing against the old
+variant. The head-of-line skip silently stopped working for four releases. Its
+unit test kept passing because it *injected* a problem carrying the old kind, so
+it exercised a path production could no longer reach.
+
+Three things that actually caught these, in order of usefulness:
+
+1. **Test the composition, not the unit.** A test that builds its own inputs can
+   certify a disconnected path indefinitely. The bootstrap failure was found by
+   writing a test for the operator's real shape — empty fleet, several unqueued
+   PRs, the leading one conflicting — rather than the one-clean-candidate shape
+   the existing test used.
+2. **Make the compiler ask the question.** Classification now lives in exhaustive
+   `match` (`GraphProblemKind::blocks_fleet`), so a new variant fails to build
+   until someone decides what it means. Note this only helps at call sites that
+   *use* the classifier: a `_ =>` wildcard is the compiler being told not to
+   help, and one such wildcard was the fifth site.
+3. **Verify the mechanism in situ, not in isolation.** A mechanism reproduced
+   standalone may be unreachable in place. One reported bug was real in a
+   scratch script and impossible in the actual hook, because an input bound
+   several lines earlier made it so.
+
+And one for measurements: a number taken from a degraded machine describes the
+machine, not the platform. A worktree timing that "proved" macOS could not
+physically rebase failed to reproduce by 3-22x once the node was healthy.
 
 - **Selection ignored compatibility.** A candidate proven unable to merge was
   still elected, holding the whole queue. Detection had been added without
