@@ -50,6 +50,10 @@ pub struct DiscoveryOptions {
     /// subject as `input.pr.or(current_pr).ok_or(current_pr_not_found)`, so an
     /// unresolved branch refuses to mutate rather than mutating the wrong PR.
     pub require_current_pr_resolution: bool,
+    /// Exact `owner/name` from configuration. Managed checkouts point at a local
+    /// daemon mirror, so git-remote inference cannot name the repository and
+    /// `gh` has no other input (bd-ff639b).
+    pub repository: Option<String>,
 }
 
 impl Default for DiscoveryOptions {
@@ -62,6 +66,7 @@ impl Default for DiscoveryOptions {
             // Strict by default: a caller that has not declared itself a
             // fleet-level read keeps the precise historical diagnostics.
             require_current_pr_resolution: true,
+            repository: None,
         }
     }
 }
@@ -502,6 +507,9 @@ impl From<DiscoveryError> for MutationError {
 #[derive(Debug, Clone)]
 pub struct GitHubMutationAdapter<R> {
     runner: R,
+    /// Exact `owner/name` from configuration, when the checkout cannot supply
+    /// it. Provider identity is never guessed from a mirror remote.
+    configured_repository: Option<String>,
 }
 
 impl GitHubMutationAdapter<ProcessRunner> {
@@ -516,13 +524,24 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
     /// Construct an adapter over an injected command runner.
     #[must_use]
     pub const fn new(runner: R) -> Self {
-        Self { runner }
+        Self {
+            runner,
+            configured_repository: None,
+        }
+    }
+
+    /// Name the exact repository instead of inferring it from git remotes.
+    #[must_use]
+    pub fn with_configured_repository(mut self, slug: Option<String>) -> Self {
+        self.configured_repository = slug;
+        self
     }
 
     /// Resolve only repository identity and default-branch name. This bounded
     /// initialization read deliberately performs no PR or Git-ref discovery.
     pub fn repository_identity(&self) -> Result<(RepositoryId, String), MutationError> {
-        let repository_json: RepositoryJson = self.json(repository_command())?;
+        let repository_json: RepositoryJson =
+            self.json(repository_command(self.configured_repository.as_deref()))?;
         let default_branch = repository_json
             .default_branch_ref
             .ok_or(DiscoveryError::MissingDefaultBranch)?
@@ -1533,7 +1552,8 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
             return Err(DiscoveryError::InvalidLimit("merged_limit"));
         }
 
-        let repository_json: RepositoryJson = self.json(repository_command())?;
+        let repository_json: RepositoryJson =
+            self.json(repository_command(self.options.repository.as_deref()))?;
         let default_branch_name = repository_json
             .default_branch_ref
             .ok_or(DiscoveryError::MissingDefaultBranch)?
@@ -2167,8 +2187,19 @@ fn repository_id(slug: &str) -> Result<RepositoryId, DiscoveryError> {
     })
 }
 
-fn repository_command() -> CommandSpec {
-    CommandSpec::new("gh").args(["repo", "view", "--json", "nameWithOwner,defaultBranchRef"])
+fn repository_command(configured: Option<&str>) -> CommandSpec {
+    // `gh repo view` infers identity from git remotes and takes the repository
+    // POSITIONALLY: `-R`/`--repo` are rejected, and `GH_REPO` is not honoured.
+    // A managed checkout whose origin is a local daemon mirror therefore has
+    // nothing to infer from, and Cara died before reaching the queue at all
+    // (bd-ff639b). Naming the repository explicitly is the only input that was
+    // ever missing.
+    let spec = CommandSpec::new("gh").args(["repo", "view"]);
+    let spec = match configured {
+        Some(slug) => spec.args([slug]),
+        None => spec,
+    };
+    spec.args(["--json", "nameWithOwner,defaultBranchRef"])
 }
 
 fn merge_candidates_command(
@@ -2900,7 +2931,7 @@ mod tests {
         );
         vec![
             (
-                repository_command(),
+                repository_command(None),
                 CommandOutput::success(
                     r#"{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}"#,
                 ),
@@ -2994,7 +3025,7 @@ mod tests {
     #[test]
     fn initialization_identity_never_queries_prs_or_moving_refs() {
         let runner = FakeRunner::new(vec![(
-            repository_command(),
+            repository_command(None),
             CommandOutput::success(
                 r#"{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}"#,
             ),
@@ -3458,7 +3489,7 @@ mod tests {
                 .collect();
         let runner = FakeRunner::new(vec![
             (
-                repository_command(),
+                repository_command(None),
                 CommandOutput::success(
                     r#"{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}"#,
                 ),
@@ -3746,7 +3777,7 @@ mod tests {
     fn detached_head_is_represented_without_a_current_pr_query() {
         let runner = FakeRunner::new(vec![
             (
-                repository_command(),
+                repository_command(None),
                 CommandOutput::success(
                     r#"{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}"#,
                 ),
@@ -4963,6 +4994,48 @@ mod tests {
             default_branch_command("acme/widgets", "release/next"),
             CommandSpec::new("gh")
                 .args(["api", "repos/acme/widgets/git/ref/heads/release%2Fnext",])
+        );
+    }
+}
+
+#[cfg(test)]
+mod configured_repository_tests {
+    use super::*;
+
+    /// bd-ff639b: a managed agent checkout points at a local daemon mirror, so
+    /// `gh` can infer nothing. The repository must be named positionally —
+    /// `-R`/`--repo` are rejected by `gh repo view` and `GH_REPO` is ignored.
+    #[test]
+    fn configured_repository_is_passed_positionally_before_json_selection() {
+        let inferred = repository_command(None);
+        assert_eq!(
+            inferred.args,
+            vec![
+                "repo".to_owned(),
+                "view".to_owned(),
+                "--json".to_owned(),
+                "nameWithOwner,defaultBranchRef".to_owned(),
+            ]
+        );
+
+        let configured = repository_command(Some("harryaskham/cacophony"));
+        assert_eq!(
+            configured.args,
+            vec![
+                "repo".to_owned(),
+                "view".to_owned(),
+                "harryaskham/cacophony".to_owned(),
+                "--json".to_owned(),
+                "nameWithOwner,defaultBranchRef".to_owned(),
+            ],
+            "the slug must precede --json; gh takes the repository positionally"
+        );
+        assert!(
+            !configured
+                .args
+                .iter()
+                .any(|arg| arg == "-R" || arg == "--repo"),
+            "gh 2.96 rejects -R/--repo on `repo view`"
         );
     }
 }

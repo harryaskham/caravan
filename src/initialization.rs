@@ -272,7 +272,8 @@ pub fn init(context: &AppContext) -> Result<InitOutput, AppError> {
         crate::command::ProcessRunner::in_directory(&context.repository_path).with_timeout(
             std::time::Duration::from_secs(context.config.command_timeout_secs),
         ),
-    );
+    )
+    .with_configured_repository(context.config.repository.clone());
     let (repository, default_branch) = provider.repository_identity().map_err(provider_error)?;
     init_with_provider(context, &repository, &default_branch, &provider)
 }

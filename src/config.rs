@@ -324,6 +324,15 @@ pub struct CaravanConfig {
     pub agent_priority_labels: Vec<String>,
     /// Hard deadline for each lightweight Git or GitHub CLI subprocess.
     pub command_timeout_secs: u64,
+    /// Exact `owner/name` this policy governs.
+    ///
+    /// `gh repo view` infers identity from git remotes only, takes the
+    /// repository positionally, and does not honour `GH_REPO`. A managed agent
+    /// checkout whose origin is a local daemon mirror therefore cannot name its
+    /// own repository, and Cara failed before reaching the queue. Declaring it
+    /// here removes the guess entirely (bd-ff639b).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
     pub repair: RepairConfig,
     pub sync: SyncConfig,
     #[serde(rename = "loop")]
@@ -341,6 +350,7 @@ impl Default for CaravanConfig {
             rebase_on_join: false,
             agent_priority_labels: default_agent_priority_labels(),
             command_timeout_secs: default_command_timeout_secs(),
+            repository: None,
             repair: RepairConfig::default(),
             sync: SyncConfig::default(),
             loop_config: LoopConfig::default(),

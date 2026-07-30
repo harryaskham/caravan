@@ -909,6 +909,11 @@ Minimal config shape:
 
 ```yaml
 version: 1
+# Optional. Name the exact repository when the checkout cannot: `gh repo view`
+# infers identity from git remotes only, takes the repository positionally, and
+# ignores `GH_REPO`, so a managed checkout pointing at a local daemon mirror has
+# no other input.
+repository: owner/name
 force_merge: false
 rebase_on_join: false
 agent_priority_labels:

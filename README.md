@@ -524,6 +524,7 @@ it is disabled by default and never mutates the caller's worktree:
 
 ```yaml
 version: 1
+repository: owner/name  # optional; required only when git remotes cannot name it
 force_merge: false
 rebase_on_join: false
 command_timeout_secs: 30

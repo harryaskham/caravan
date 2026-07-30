@@ -679,6 +679,7 @@ fn status_with_discovery_options(
         crate::github::DiscoveryOptions {
             allow_unlabelled_historical_pr_creation,
             require_current_pr_resolution,
+            repository: context.config.repository.clone(),
             ..crate::github::DiscoveryOptions::default()
         },
     );
