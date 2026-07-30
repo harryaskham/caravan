@@ -110,7 +110,15 @@ jobs:
         include:
           - target: x86_64-linux
             runner: [self-hosted, nix, x86_64-linux]
-            timeout_minutes: 60
+            # 120, not 60: this leg builds `caravan-static`, a full musl
+            # cross-compile of the whole dependency tree, where darwin builds
+            # natively. With a warm Nix cache it finishes in minutes; with a cold
+            # or unreachable one it rebuilds everything from source. v0.0.42 was
+            # cancelled at exactly 60:18 on this step while the darwin leg took
+            # 95 seconds, after the internal binary cache had been observed
+            # timing out earlier the same night (bd-dcec46). The removed
+            # aarch64-linux entry already carried 120 for the same reason.
+            timeout_minutes: 120
           # bd-8b6d28 removed this entry because no runner advertised the label
           # and the job queued forever. `caravan-ms-mac` now registers
           # `self-hosted,nix,macOS,ARM64,aarch64-darwin`, so the documented
