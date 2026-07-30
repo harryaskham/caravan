@@ -14,6 +14,18 @@ use std::collections::BTreeMap;
 
 use super::{DiscoveryError, WorkflowRunSnapshot, normalize_check_state, repository_id};
 use crate::model;
+
+/// Deserialize an absent-or-null JSON list as an empty list.
+///
+/// A provider that distinguishes "no checks" as `null` rather than `[]` is not
+/// malformed, and refusing it takes down every read-only surface at once.
+fn null_as_empty_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
+}
 use crate::model::{
     AutoMergeState, BranchSnapshot, CommitOid, MergeMethod, PrNumber, RepositoryId,
 };
@@ -495,7 +507,13 @@ pub(super) struct PullRequestJson {
     #[serde(default)]
     pub(super) labels: Vec<LabelJson>,
     pub(super) auto_merge_request: Option<AutoMergeJson>,
-    #[serde(default)]
+    // GitHub returns an explicit `null` here for a pull request that never ran
+    // checks, and `#[serde(default)]` covers a MISSING field, not a null one.
+    // Closed pull requests were never fetched before dissolution detection, so
+    // the shape could not occur; the first closed member with no checks broke
+    // `cara status` entirely with "invalid type: null, expected a sequence"
+    // (bd-54222d).
+    #[serde(default, deserialize_with = "null_as_empty_vec")]
     pub(super) status_check_rollup: Vec<CheckJson>,
     pub(super) created_at: String,
     pub(super) merged_at: Option<String>,

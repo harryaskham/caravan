@@ -3507,6 +3507,30 @@ mod tests {
     /// or a candidate strictly contained by already-landed work stays a live
     /// ordered admission attempt forever.
     #[test]
+    /// GitHub returns an explicit null rollup for a pull request that never ran
+    /// checks, and `#[serde(default)]` covers a MISSING field, not a null one.
+    ///
+    /// Closed pull requests were not fetched before dissolution detection, so the
+    /// shape could not occur. The first closed member with no checks broke
+    /// `cara status` ENTIRELY, not just the new capability: no caravans, no
+    /// candidates, no problems. Measured live, exactly one of 28 closed labelled
+    /// pull requests had a null rollup, and it was the dissolved member the
+    /// feature exists to report (bd-54222d).
+    #[test]
+    fn a_null_check_rollup_deserializes_as_no_checks() {
+        let payload = r#"[{"number":2308,"title":"t","body":"","state":"CLOSED","isDraft":false,"headRefName":"b","headRefOid":"abc","headRepository":{"name":"widgets","nameWithOwner":"acme/widgets"},"headRepositoryOwner":{"login":"acme"},"isCrossRepository":false,"baseRefName":"main","baseRefOid":"def","labels":[{"name":"caravan"}],"autoMergeRequest":null,"statusCheckRollup":null,"createdAt":"2026-07-30T10:00:00Z","mergedAt":null,"url":"https://example.test/pr/2308","updatedAt":"2026-07-30T11:00:00Z"}]"#;
+
+        let parsed = serde_json::from_str::<Vec<PullRequestJson>>(payload)
+            .expect("a null rollup is not malformed: refusing it costs every read-only surface");
+
+        assert_eq!(parsed.len(), 1);
+        assert!(
+            parsed[0].status_check_rollup.is_empty(),
+            "a null rollup means no checks, not an error"
+        );
+    }
+
+    #[test]
     fn generation_facts_include_recently_merged_labelled_prs() {
         let repository = repository();
         let open_json = pr_list_json(12, "feature/widget", "acme/widgets", false);
