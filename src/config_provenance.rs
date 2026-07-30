@@ -78,8 +78,21 @@ impl ConfigProvenance {
     /// stale-worktree shape: the operator's current policy was never read.
     #[must_use]
     pub fn is_stale_policy(&self) -> bool {
-        self.relation == ConfigRelation::DiffersFromDefaultBranch
-            && self.behind_default_branch.is_some_and(|behind| behind > 0)
+        // Exhaustive rather than a single-variant comparison. This guard is what
+        // stops a tick reading policy from a checkout parked 95 commits behind
+        // main, and a `==` answers only for the variant it names: a later
+        // variant, exactly the kind someone would add to describe a new parked
+        // shape, would silently not be stale and the refusal would not fire.
+        // The same construct in `is_historical` was corrected today for the same
+        // reason (bd-41f4bc).
+        let differs = match self.relation {
+            ConfigRelation::DiffersFromDefaultBranch => true,
+            ConfigRelation::Explicit
+            | ConfigRelation::DefaultBranch
+            | ConfigRelation::MatchesDefaultBranch
+            | ConfigRelation::Unknown => false,
+        };
+        differs && self.behind_default_branch.is_some_and(|behind| behind > 0)
     }
 }
 
@@ -88,7 +101,60 @@ impl ConfigProvenance {
     /// repository's own.
     #[must_use]
     pub const fn is_branch_local_proposal(&self) -> bool {
-        matches!(self.relation, ConfigRelation::DiffersFromDefaultBranch)
+        match self.relation {
+            ConfigRelation::DiffersFromDefaultBranch => true,
+            ConfigRelation::Explicit
+            | ConfigRelation::DefaultBranch
+            | ConfigRelation::MatchesDefaultBranch
+            | ConfigRelation::Unknown => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod classification_tests {
+    use super::{ConfigProvenance, ConfigRelation};
+
+    /// The stale-policy guard must answer for EVERY relation, not just the one
+    /// it names.
+    ///
+    /// It refuses a tick whose policy came from a stale checkout, and a
+    /// single-variant `==` silently answers false for any variant added later.
+    /// The variant most likely to be added is one describing a new parked shape,
+    /// which is exactly what this guard exists to catch (bd-41f4bc).
+    #[test]
+    fn every_relation_is_classified_and_only_a_differing_one_is_stale() {
+        let stale = |relation, behind| {
+            ConfigProvenance {
+                schema_version: 1,
+                relation,
+                current_branch: None,
+                default_branch_ref: None,
+                behind_default_branch: behind,
+                reason: String::new(),
+            }
+            .is_stale_policy()
+        };
+
+        assert!(
+            stale(ConfigRelation::DiffersFromDefaultBranch, Some(95)),
+            "differing policy from a checkout that is behind is the stale shape"
+        );
+        // Differing but CURRENT is a deliberate branch proposal, not staleness.
+        assert!(!stale(ConfigRelation::DiffersFromDefaultBranch, Some(0)));
+        assert!(!stale(ConfigRelation::DiffersFromDefaultBranch, None));
+
+        for relation in [
+            ConfigRelation::Explicit,
+            ConfigRelation::DefaultBranch,
+            ConfigRelation::MatchesDefaultBranch,
+            ConfigRelation::Unknown,
+        ] {
+            assert!(
+                !stale(relation, Some(95)),
+                "{relation:?} is not stale policy even from a checkout that is behind"
+            );
+        }
     }
 }
 
