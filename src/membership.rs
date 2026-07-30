@@ -172,6 +172,16 @@ pub struct MembershipOutput {
     pub join_receipt: Option<JoinReceipt>,
     pub pull_request: PullRequestSnapshot,
     pub caravan_id: PrNumber,
+    /// Caravans that already existed when a ROOT admission created a separate
+    /// one, so the caller can see the choice made on their behalf.
+    ///
+    /// Advisory only. `new` is often exactly right, and Cara cannot know the
+    /// caller's intent, so this neither refuses nor recommends. It exists
+    /// because every caravan on a live fleet was created with `new` while clean
+    /// candidates queued behind an existing caravan nobody joined, and nothing
+    /// in the output revealed that an alternative was available (bd-5891bb).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub coexisting_caravans: Vec<PrNumber>,
     /// Typed intent-aware admission-order decision bound to this operation,
     /// including exact provider-mutation and idempotency evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2330,6 +2340,20 @@ fn execute_with_rebase_guard(
     if let Some(decision) = admission_intent.as_mut() {
         decision.record_execution(receipt.changed);
     }
+    // Only for a ROOT admission: a join already names its target, so the caller
+    // has plainly seen the alternative.
+    let coexisting_caravans = if request.operation.is_join() {
+        Vec::new()
+    } else {
+        status
+            .analysis
+            .fleet
+            .caravans
+            .iter()
+            .map(|caravan| caravan.id)
+            .filter(|id| *id != caravan_id)
+            .collect()
+    };
     Ok(MembershipOutput {
         receipt,
         rebase_receipt: None,
@@ -2337,6 +2361,7 @@ fn execute_with_rebase_guard(
         join_receipt: None,
         pull_request,
         caravan_id,
+        coexisting_caravans,
         admission_intent,
         events: Vec::new(),
         hook_deliveries: Vec::new(),

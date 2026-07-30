@@ -2097,6 +2097,24 @@ fn render_membership(output: &caravan::membership::MembershipOutput) -> String {
         ),
         styled("1;35", format!("caravan #{}", output.caravan_id)),
     );
+    if !output.coexisting_caravans.is_empty() {
+        let ids = output
+            .coexisting_caravans
+            .iter()
+            .map(|id| format!("#{id}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let tail = output
+            .coexisting_caravans
+            .first()
+            .map_or_else(String::new, |id| format!(" --tail-pr {id}"));
+        let _ = writeln!(
+            text,
+            "  {} separate caravan created; {ids} already existed. `cara join --pr {}{tail}` would have stacked instead",
+            dim("note:"),
+            output.pull_request.number,
+        );
+    }
     if let Some(join) = &output.join_receipt {
         let _ = writeln!(
             text,

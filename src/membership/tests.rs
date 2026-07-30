@@ -1363,6 +1363,70 @@ fn root_new_receipt_uses_default_branch_predecessor_bd_d15ba3() {
 }
 
 #[test]
+fn a_root_admission_reports_the_caravans_it_declined_to_join() {
+    // An existing single-member caravan, and a candidate that creates its own.
+    let existing = pull_request(50, "existing", "main", &[ACTIVE_LABEL]);
+    let candidate = pull_request(1, "one", "main", &[]);
+    let provider = FakeProvider::with_pull_requests(vec![existing.clone(), candidate.clone()]);
+
+    let output = execute(
+        status(candidate.clone(), vec![existing]),
+        &clean,
+        &provider,
+        MembershipRequest {
+            operation: MembershipOperation::New,
+            create_pr: false,
+            tail_pr: None,
+            head_pr: None,
+            reason: None,
+            priority_label: None,
+            agent_priority_labels: Vec::new(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        output.coexisting_caravans,
+        vec![PrNumber(50)],
+        "a root admission must name the caravan it created a separate one alongside: every caravan on the live fleet was made with `new` while candidates queued behind one nobody joined"
+    );
+    assert_eq!(
+        output.caravan_id,
+        PrNumber(1),
+        "advisory only: the operation itself is unchanged"
+    );
+}
+
+/// The advisory must not fire when there is nothing to advise, or the note
+/// becomes noise that readers learn to skip.
+#[test]
+fn a_root_admission_on_an_empty_fleet_reports_no_alternative() {
+    let candidate = pull_request(1, "one", "main", &[]);
+    let provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
+
+    let output = execute(
+        status(candidate, Vec::new()),
+        &clean,
+        &provider,
+        MembershipRequest {
+            operation: MembershipOperation::New,
+            create_pr: false,
+            tail_pr: None,
+            head_pr: None,
+            reason: None,
+            priority_label: None,
+            agent_priority_labels: Vec::new(),
+        },
+    )
+    .unwrap();
+
+    assert!(
+        output.coexisting_caravans.is_empty(),
+        "the first caravan on a fleet declined nothing"
+    );
+}
+
+#[test]
 fn new_applies_active_label_and_squash_auto_merge() {
     let candidate = pull_request(1, "one", "main", &[]);
     let provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
