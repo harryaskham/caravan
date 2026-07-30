@@ -131,6 +131,34 @@ pub struct LogOutput {
     pub limit: usize,
     pub matching_records: usize,
     pub truncated: bool,
+    /// Exact journal this snapshot was read from.
+    ///
+    /// The journal lives in the invoking checkout's Git common directory, so a
+    /// tick run from one checkout is invisible from another checkout of the
+    /// same repository. Without provenance, `matching_records: 0` reads as "no
+    /// tick has ever run" — which produced a wrong answer to an operator while
+    /// 248 records sat in a sibling checkout (bd-768f80).
+    pub source: JournalSource,
+}
+
+/// Where a journal snapshot came from, and whether one existed at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct JournalSource {
+    /// Absolute path of the active journal file for this checkout.
+    pub path: String,
+    /// Whether that file exists. False means this checkout has never written a
+    /// journal record, never that the repository has never been synchronized.
+    pub present: bool,
+    /// Count of archived journal segments alongside the active file.
+    pub archives: usize,
+}
+
+impl JournalSource {
+    /// True when an empty result proves nothing about the repository.
+    #[must_use]
+    pub const fn empty_result_is_uninformative(&self) -> bool {
+        !self.present
+    }
 }
 
 /// Append an event before any configured hook is started.
@@ -206,6 +234,11 @@ pub fn snapshot(context: &AppContext, input: &LogInput) -> Result<LogOutput, App
             limit: input.limit,
             matching_records,
             truncated: start > 0,
+            source: JournalSource {
+                path: paths.active.display().to_string(),
+                present: paths.active.exists(),
+                archives: archive_count(&paths),
+            },
         }
     });
     let _ = FileExt::unlock(&lock);
@@ -484,6 +517,14 @@ fn open_lock(path: &Path) -> Result<File, AppError> {
         .map_err(|error| io_error("journal_lock_open_failed", &error))
 }
 
+/// Count archived segments beside the active journal, so provenance reports the
+/// complete local evidence rather than only the newest file.
+fn archive_count(paths: &JournalPaths) -> usize {
+    (1..=u32::MAX)
+        .take_while(|index| archive_path(&paths.active, *index).exists())
+        .count()
+}
+
 fn archive_path(active: &Path, index: u32) -> PathBuf {
     PathBuf::from(format!("{}.{index}", active.display()))
 }
@@ -674,6 +715,46 @@ mod tests {
                 .records
                 .len(),
             2
+        );
+    }
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
+
+    /// bd-768f80: `matching_records: 0` was read as "no tick has ever run" while
+    /// 248 records sat in a sibling checkout's common dir. An empty result must
+    /// carry the exact file it consulted, and whether that file exists at all.
+    #[test]
+    fn an_absent_journal_is_reported_as_uninformative_not_as_absence_of_ticks() {
+        let source = JournalSource {
+            path: "/checkout-b/.git/caravan/events-v1.jsonl".to_owned(),
+            present: false,
+            archives: 0,
+        };
+
+        assert!(
+            source.empty_result_is_uninformative(),
+            "no journal here proves nothing about the repository"
+        );
+    }
+
+    #[test]
+    fn a_present_journal_makes_an_empty_result_meaningful() {
+        let source = JournalSource {
+            path: "/checkout-a/.git/caravan/events-v1.jsonl".to_owned(),
+            present: true,
+            archives: 2,
+        };
+
+        assert!(
+            !source.empty_result_is_uninformative(),
+            "a real journal with no matching records is a genuine answer"
+        );
+        assert_eq!(
+            source.archives, 2,
+            "archived segments are local evidence too"
         );
     }
 }

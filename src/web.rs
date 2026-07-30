@@ -2517,6 +2517,11 @@ mod tests {
             limit: 1,
             matching_records: 1,
             truncated: false,
+            source: crate::journal::JournalSource {
+                path: "/tmp/test/events-v1.jsonl".to_owned(),
+                present: true,
+                archives: 0,
+            },
         });
         assert!(bounded.records.is_empty());
         assert!(bounded.truncated);

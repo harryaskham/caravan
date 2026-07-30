@@ -458,6 +458,26 @@ fn run_log(cli: &Cli, command: &LogCommand) -> Result<(), i32> {
                 for record in &output.records {
                     println!("{}", render_journal_record(record));
                 }
+                // The journal lives in this checkout's Git common directory.
+                // An empty result from a checkout that never wrote one is not
+                // evidence that no tick ran anywhere: 248 records once sat in a
+                // sibling checkout while this surface reported nothing
+                // (bd-768f80). Name the exact file rather than stay silent.
+                if output.matching_records == 0 {
+                    if output.source.empty_result_is_uninformative() {
+                        eprintln!(
+                            "{} no journal at {} — journals are per-checkout, so this is not evidence that no tick ran",
+                            warning("log:"),
+                            output.source.path
+                        );
+                    } else {
+                        eprintln!(
+                            "{} no matching records in {}",
+                            dim("log:"),
+                            output.source.path
+                        );
+                    }
+                }
                 Ok(())
             }
             Err(error) => emit_human_error(error),
