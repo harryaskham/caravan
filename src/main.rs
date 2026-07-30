@@ -93,6 +93,9 @@ enum Command {
     /// Explicitly revalidate and resume one paused caravan.
     Resume(ResumeInput),
     /// Idempotently synchronize one or all caravans until a decision point.
+    ///
+    /// Pass `--dry-run` to preview the exact tick without any provider
+    /// mutation; it is identical to `cara plan sync`.
     Sync(SyncInput),
     /// Preview exact domain operations without provider mutation.
     #[command(subcommand)]
@@ -1053,6 +1056,21 @@ fn run_resume(cli: &Cli, input: &ResumeInput) -> Result<(), i32> {
 
 fn run_sync(cli: &Cli, input: &SyncInput) -> Result<(), i32> {
     let context = load_context(cli)?;
+    // A dry-run must be reachable from the mutating command itself. Routing it
+    // here keeps exactly one planner rather than a second, drift-prone preview.
+    if input.dry_run {
+        let result = caravan::sync::plan_sync(&context, input);
+        if cli.json {
+            return emit_result(true, result);
+        }
+        return match result {
+            Ok(output) => {
+                print!("{}", render_sync_plan(&output));
+                Ok(())
+            }
+            Err(error) => emit_human_error(error),
+        };
+    }
     // Human sync is a long network operation: stream bounded stage progress so
     // the terminal is never silent. JSON/MCP callers install no observer and
     // keep their exact envelope contract.

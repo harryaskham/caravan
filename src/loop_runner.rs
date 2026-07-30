@@ -143,6 +143,7 @@ pub fn tick(context: &AppContext) -> Result<LoopTickOutput, AppError> {
         &SyncInput {
             all: true,
             rerun_failed: false,
+            dry_run: false,
         },
     ) {
         Ok(sync) => {

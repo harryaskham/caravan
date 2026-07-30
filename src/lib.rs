@@ -781,6 +781,18 @@ pub struct SyncInput {
     #[serde(default)]
     pub all: bool,
 
+    /// Preview the exact tick without any provider mutation.
+    ///
+    /// Identical to `cara plan sync`. Offered here because the person deciding
+    /// whether a tick is safe is already typing `cara sync`, and a dry-run
+    /// nobody can find is a dry-run nobody uses: an agent asked to predict a
+    /// tick read admission rules from source instead, mixed the admission-time
+    /// rule with the merge-time rule, and told an operator the wrong outcome
+    /// (bd-3119d9).
+    #[arg(long)]
+    #[serde(default)]
+    pub dry_run: bool,
+
     /// Rerun only the exact failed workflow runs identified by the first CI decision.
     #[arg(long)]
     #[serde(default)]

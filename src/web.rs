@@ -1631,6 +1631,7 @@ fn enqueue_webhook_sync(repository: &Arc<RepositoryEntry>) -> bool {
                     action: WebAction::Sync(SyncInput {
                         all: true,
                         rerun_failed: false,
+                        dry_run: false,
                     }),
                 },
                 expected_mutation_fingerprint,

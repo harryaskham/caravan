@@ -229,3 +229,23 @@ fn self_update_refuses_the_cargo_target_development_binary() {
     let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(envelope["error"]["code"], "self_update_development_binary");
 }
+
+/// bd-3119d9: a dry-run nobody can find is a dry-run nobody uses. The preview
+/// must be reachable from the mutating command itself, and must never mutate.
+#[test]
+fn sync_dry_run_is_discoverable_from_the_mutating_command() {
+    let help = std::process::Command::new(env!("CARGO_BIN_EXE_cara"))
+        .args(["sync", "--help"])
+        .output()
+        .expect("cara sync --help runs");
+    let text = String::from_utf8_lossy(&help.stdout);
+
+    assert!(
+        text.contains("--dry-run"),
+        "the person deciding whether a tick is safe is already typing `cara sync`: {text}"
+    );
+    assert!(
+        text.contains("plan sync"),
+        "the help must name the identical planner so there is one source of truth: {text}"
+    );
+}

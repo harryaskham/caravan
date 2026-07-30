@@ -1956,6 +1956,7 @@ fn resume_or_return(
         &SyncInput {
             all: true,
             rerun_failed: false,
+            dry_run: false,
         },
     ) {
         Ok(sync) => {

@@ -990,6 +990,7 @@ fn no_write_caravan_plan_records_actions_without_provider_mutation() {
         &SyncInput {
             all: true,
             rerun_failed: false,
+            dry_run: false,
         },
         false,
         false,
@@ -1038,6 +1039,7 @@ fn no_write_auto_admission_plans_only_first_exact_candidate() {
         &SyncInput {
             all: true,
             rerun_failed: false,
+            dry_run: false,
         },
         false,
         &mut actions,
@@ -1080,6 +1082,7 @@ fn no_write_auto_admission_never_leapfrogs_rejected_canonical_candidate() {
         &SyncInput {
             all: true,
             rerun_failed: false,
+            dry_run: false,
         },
         false,
         &mut actions,
@@ -5100,6 +5103,7 @@ fn a_deferred_prefix_tick_succeeds_as_a_retryable_bounded_progress_receipt() {
         &context,
         &SyncInput {
             all: true,
+            dry_run: false,
             rerun_failed: false,
         },
         started,
