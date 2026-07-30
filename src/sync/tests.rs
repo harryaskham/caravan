@@ -6616,6 +6616,55 @@ fn a_conflicting_unqueued_candidate_never_aborts_the_tick() {
     );
 }
 
+/// Operator report, caravan #2287: `Check & Lint` and `Fast Tests (unit)`
+/// concluded FAILURE in seconds while every producer job was CANCELLED, and no
+/// source step ran at all. The aggregates are consequences of a cancelled
+/// preparation, not verdicts on the code.
+///
+/// An aggregate that concluded `failure` with ZERO failing jobs did not do the
+/// work it reports on. Guarded so "no failing job" cannot be confused with "we
+/// did not look": a truncated list or an unknown job count is not evidence.
+#[test]
+fn an_aggregate_failure_with_no_failing_job_is_infrastructure() {
+    let diagnostic = |failed: Vec<crate::ci::WorkflowJobFailureDiagnostic>,
+                      jobs_total: usize,
+                      truncated: bool| {
+        crate::ci::WorkflowRunFailureDiagnostic {
+            run_id: 1,
+            attempt: 1,
+            workflow_id: 1,
+            check_suite_id: 1,
+            workflow_name: "Check & Lint".to_owned(),
+            event: "pull_request".to_owned(),
+            status: "completed".to_owned(),
+            conclusion: "failure".to_owned(),
+            head_branch: "feature".to_owned(),
+            head_sha: CommitOid("head".to_owned()),
+            expected_pr: PrNumber(2287),
+            expected_head_oid: CommitOid("head".to_owned()),
+            expected_base_oid: CommitOid("base".to_owned()),
+            pull_requests: Vec::new(),
+            failed_jobs: failed,
+            jobs_total,
+            jobs_truncated: truncated,
+        }
+    };
+
+    assert!(
+        retryable_infrastructure(&diagnostic(Vec::new(), 7, false)),
+        "an aggregate that failed while seven jobs ran and none failed did not do its work"
+    );
+    // "No failing job" must mean exactly that, never "we did not look".
+    assert!(
+        !retryable_infrastructure(&diagnostic(Vec::new(), 0, false)),
+        "an unknown job count is not evidence of infrastructure"
+    );
+    assert!(
+        !retryable_infrastructure(&diagnostic(Vec::new(), 7, true)),
+        "a truncated job list is not evidence of infrastructure"
+    );
+}
+
 /// bd-c04d9b live shape (cacophony PR2208, run 30222268397): every producer job
 /// was CANCELLED under runner-capacity pressure, the aggregate required checks
 /// went FAILURE in six seconds without a single test or lint step failing, and a

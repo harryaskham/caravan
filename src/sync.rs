@@ -4812,6 +4812,27 @@ fn workflow_run_generation(
 }
 
 fn retryable_infrastructure(diagnostic: &WorkflowRunFailureDiagnostic) -> bool {
+    const INFRA_CONCLUSIONS: [&str; 6] = [
+        "timed_out",
+        "startup_failure",
+        "stale",
+        "action_required",
+        "cancelled",
+        "canceled",
+    ];
+    // An aggregate that concluded `failure` while NO job failed did not run the
+    // work it reports on. That is the shape of a gate short-circuiting because a
+    // prerequisite never produced a result: `Check & Lint` going red in seconds
+    // with zero failing steps, downstream of a cancelled preparation job.
+    //
+    // Guarded on `jobs_total > 0` and `!jobs_truncated` so "no failing job" means
+    // exactly that, and never "we did not look" or "the list was cut short".
+    let failed_without_a_failing_job = !diagnostic.failed_jobs.is_empty()
+        || diagnostic.jobs_total == 0
+        || diagnostic.jobs_truncated;
+    if !failed_without_a_failing_job {
+        return true;
+    }
     // A cancellation is a capacity or supersession event, not a verdict on the
     // code: no test or lint step failed, the producer simply never produced a
     // result. Excluding it from this set meant an operator freeing a busy runner
@@ -4823,14 +4844,6 @@ fn retryable_infrastructure(diagnostic: &WorkflowRunFailureDiagnostic) -> bool {
     // eligible for the bounded rerun path, which is already opt-in via
     // `--rerun-failed` and already bound to the exact current head, so a stale
     // superseded generation is never resurrected.
-    const INFRA_CONCLUSIONS: [&str; 6] = [
-        "timed_out",
-        "startup_failure",
-        "stale",
-        "action_required",
-        "cancelled",
-        "canceled",
-    ];
     let conclusion_is_infra = |value: &str| {
         INFRA_CONCLUSIONS
             .iter()
