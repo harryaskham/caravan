@@ -111,18 +111,28 @@ jobs:
           - target: x86_64-linux
             runner: [self-hosted, nix, x86_64-linux]
             timeout_minutes: 60
-          # ms-dev-2 advertises aarch64-linux in Nix extra-platforms, so this
-          # remains a pinned Nix build instead of depending on apt cross tools.
-          - target: aarch64-linux
-            runner: [self-hosted, nix, ms-dev-2]
-            timeout_minutes: 120
-          # bd-8b6d28: aarch64-darwin is deliberately absent from this matrix.
-          # No registered runner advertises the label, so scheduling the job
-          # queued it forever and the whole release run never reached a terminal
-          # state — nine consecutive releases read as flaky infrastructure when
-          # the job was simply unschedulable. Darwin assets are published by
-          # `just release-backfill-target <tag> aarch64-darwin` from a Mac until
-          # a darwin runner is registered, at which point restore this entry.
+          # bd-8b6d28 removed this entry because no runner advertised the label
+          # and the job queued forever. `caravan-ms-mac` now registers
+          # `self-hosted,nix,macOS,ARM64,aarch64-darwin`, so the documented
+          # restore condition is met and darwin builds in CI again instead of
+          # being hand-backfilled after every release.
+          - target: aarch64-darwin
+            runner: [self-hosted, nix, aarch64-darwin]
+            timeout_minutes: 90
+          # bd-893ff0: aarch64-linux is NOT in this matrix, for the same reason
+          # darwin was removed and by the same remedy. Only ms-dev-2 advertises
+          # aarch64 in Nix extra-platforms, so the job is pinned to that one host.
+          # The labels match, so this is starvation rather than unschedulability:
+          # ms-dev-2 has been continuously busy and the job sat queued, leaving
+          # every release since v0.0.31 non-terminal. `continue-on-error` does not
+          # help, because it applies to a job that FAILED, not to one that never
+          # started. Publish the asset with
+          # `just release-backfill-target <tag> aarch64-linux`, and restore this
+          # entry once ms-dev-2 has spare capacity or a second aarch64-capable
+          # runner is registered:
+          #   - target: aarch64-linux
+          #     runner: [self-hosted, nix, ms-dev-2]
+          #     timeout_minutes: 120
     steps:
       - name: Reset persistent-runner Git URL rewrites
         shell: bash

@@ -82,15 +82,17 @@ fi
 tar -xzf "$archive" -C "$workspace"
 [ "$("$workspace/$asset_root/cara")" = "cara fixture" ]
 
-# The CI matrix carries exactly the targets a registered runner can accept.
-# bd-8b6d28: scheduling a leg no runner advertises queued forever and hung the
-# whole release run, so aarch64-darwin is published by backfill instead and must
-# NOT reappear in the matrix until a darwin runner exists.
-for target in x86_64-linux aarch64-linux; do
+# The CI matrix carries exactly the targets a runner can actually pick up.
+# A leg no runner can accept, or one pinned to a permanently busy host, sits
+# queued and leaves the whole release non-terminal: that is bd-8b6d28 for darwin
+# and bd-893ff0 for aarch64-linux. Darwin is back because caravan-ms-mac now
+# advertises the label; aarch64-linux is out until ms-dev-2 has spare capacity
+# or a second aarch64-capable runner exists.
+for target in x86_64-linux aarch64-darwin; do
   grep -q -- "- target: $target" .github/workflows/release.yml
 done
-if grep -q -- '- target: aarch64-darwin' .github/workflows/release.yml; then
-  echo "release.yml schedules aarch64-darwin; register a darwin runner or keep it backfilled" >&2
+if grep -q -- '^ *- target: aarch64-linux' .github/workflows/release.yml; then
+  echo "release.yml schedules aarch64-linux; it is starved on ms-dev-2, so keep it backfilled until another aarch64 runner exists" >&2
   exit 1
 fi
 # The backfill path is the contract for that target, so it must stay available.
