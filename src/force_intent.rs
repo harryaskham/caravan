@@ -790,7 +790,8 @@ fn validate_apply_policy(
 ) -> Result<(), AppError> {
     let pr = PrNumber(input.pr);
     let unrelated_problems = status.analysis.fleet.problems.iter().filter(|problem| {
-        problem.kind != GraphProblemKind::AutoMergeInvariant || !problem.prs.contains(&pr)
+        problem.kind.blocks_fleet()
+            && (problem.kind != GraphProblemKind::AutoMergeInvariant || !problem.prs.contains(&pr))
     });
     let problems = unrelated_problems.cloned().collect::<Vec<_>>();
     if !problems.is_empty() {

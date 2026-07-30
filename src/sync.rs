@@ -1736,6 +1736,14 @@ fn validate_rebase_preflight_graph(
     force_merge: bool,
 ) -> Result<(), AppError> {
     for problem in &status.analysis.fleet.problems {
+        // An unadmitted candidate is in no caravan, so it can never block a
+        // member rewrite. Without this the whole tick aborts as `invalid_graph`
+        // and automatic admission is never reached, which is why a fleet with
+        // zero caravans and one conflicting candidate could never form its
+        // first caravan (bd-550b0e).
+        if problem.kind.is_candidate_scoped() {
+            continue;
+        }
         let auto_merge = problem.kind == GraphProblemKind::AutoMergeInvariant
             && problem.prs.iter().all(|number| {
                 selected
@@ -5083,6 +5091,9 @@ fn validate_graph(
     force_merge: bool,
 ) -> Result<(), AppError> {
     for problem in &status.analysis.fleet.problems {
+        if problem.kind.is_candidate_scoped() {
+            continue;
+        }
         let correctable_auto_merge = problem.kind == GraphProblemKind::AutoMergeInvariant
             && problem.prs.iter().all(|number| {
                 selected

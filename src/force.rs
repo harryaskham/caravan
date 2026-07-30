@@ -327,7 +327,13 @@ fn execute(
             input,
         ));
     }
-    if !status.analysis.fleet.problems.is_empty() {
+    if status
+        .analysis
+        .fleet
+        .problems
+        .iter()
+        .any(|problem| problem.kind.blocks_fleet())
+    {
         return Err(force_validation(
             "force_graph_invalid",
             "force intent cannot bypass unresolved Caravan graph problems",

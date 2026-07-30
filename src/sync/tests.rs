@@ -6521,3 +6521,45 @@ fn an_absent_conclusion_is_never_treated_as_passing() {
         "an unknown conclusion must never classify as passing"
     );
 }
+
+/// bd-550b0e: live on Cacophony (2026-07-30) a fleet with zero caravans, eight
+/// unqueued PRs, and two `candidate_incompatible` problems aborted every tick
+/// with `invalid_graph`, so automatic admission was never reached and the first
+/// caravan could never form. `blocks_fleet` classified the kind correctly, but
+/// the two sync-tick guards never consulted it.
+#[test]
+fn a_conflicting_unqueued_candidate_never_aborts_the_tick() {
+    let pulls = healthy_chain();
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    let mut status = status(pulls, Some(PrNumber(1)), &clean);
+    status
+        .analysis
+        .fleet
+        .problems
+        .push(crate::model::GraphProblem {
+            kind: GraphProblemKind::CandidateIncompatible,
+            prs: vec![PrNumber(2245)],
+            message:
+                "leading admission candidate does not merge cleanly into the current default branch"
+                    .to_owned(),
+        });
+    status.healthy = status.analysis.healthy();
+    assert!(
+        status.healthy,
+        "an unadmitted candidate is not fleet ill-health"
+    );
+
+    let progress = execute(&status, &provider, true, false, false)
+        .expect("a non-member candidate conflict must never abort the tick");
+
+    assert!(!progress.synchronized_caravans.is_empty());
+    assert!(
+        status
+            .analysis
+            .fleet
+            .problems
+            .iter()
+            .any(|problem| problem.kind == GraphProblemKind::CandidateIncompatible),
+        "the conflict stays reported for the candidate's owner"
+    );
+}
