@@ -6468,3 +6468,55 @@ fn a_repository_without_squash_merging_is_operator_action_not_a_retry() {
         "repository settings are not fixed by rerunning the tick"
     );
 }
+
+/// Operator report, cacophony PR 2276: the forge said `mergeStateStatus=BLOCKED`
+/// with `Rust Check & Lint: FAILURE` and `Rust Fast Tests` still pending, yet
+/// Cara did not treat the PR as failed.
+///
+/// `classify_checks` evaluated `pending` BEFORE `failed`, so any concurrently
+/// running check masked a hard failure. A failing required check does not become
+/// successful by waiting, so failure must be decisive: admitting it would stack
+/// every following PR on top of known-red work, which is the exact re-stitching
+/// cost the queue exists to prevent.
+#[test]
+fn a_hard_failure_is_not_masked_by_a_still_running_check() {
+    let failed_then_pending = vec![
+        CheckSnapshot {
+            name: "Rust Check & Lint work".to_owned(),
+            state: crate::model::CheckState::Failure,
+            provider_state: Some("FAILURE".to_owned()),
+            details_url: None,
+        },
+        CheckSnapshot {
+            name: "Rust Fast Tests work".to_owned(),
+            state: crate::model::CheckState::InProgress,
+            provider_state: None,
+            details_url: None,
+        },
+    ];
+
+    assert_eq!(
+        classify_checks(&failed_then_pending, false),
+        CiDisposition::Failed,
+        "a FAILURE must not be reported as merely waiting because a sibling check is still running"
+    );
+}
+
+/// An absent conclusion is not a success. GitHub reports a check with no
+/// conclusion while it is still running, and coercing that to passing would
+/// admit work whose result nobody has seen.
+#[test]
+fn an_absent_conclusion_is_never_treated_as_passing() {
+    let unknown = vec![CheckSnapshot {
+        name: "Rust Fast Tests work".to_owned(),
+        state: crate::model::CheckState::Unknown,
+        provider_state: None,
+        details_url: None,
+    }];
+
+    assert_ne!(
+        classify_checks(&unknown, false),
+        CiDisposition::Passing,
+        "an unknown conclusion must never classify as passing"
+    );
+}

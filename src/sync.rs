@@ -4830,13 +4830,6 @@ fn classify_checks(checks: &[CheckSnapshot], forced: bool) -> CiDisposition {
         return CiDisposition::Forced;
     }
 
-    let pending = checks.is_empty()
-        || checks.iter().any(|check| {
-            matches!(
-                check.state,
-                CheckState::Expected | CheckState::Queued | CheckState::InProgress
-            )
-        });
     let failed = checks.iter().any(|check| {
         matches!(
             check.state,
@@ -4847,10 +4840,24 @@ fn classify_checks(checks: &[CheckSnapshot], forced: bool) -> CiDisposition {
                 | CheckState::Unknown
         )
     });
+    // Failure is decisive, and is deliberately evaluated BEFORE pending. A
+    // failing required check does not become successful by waiting, so treating
+    // the row as merely waiting because a sibling job is still running hides a
+    // hard failure for as long as anything else is in flight — long enough to
+    // admit known-red work and stack every following PR on top of it
+    // (operator report, cacophony PR 2276).
+    if failed {
+        return CiDisposition::Failed;
+    }
+    let pending = checks.is_empty()
+        || checks.iter().any(|check| {
+            matches!(
+                check.state,
+                CheckState::Expected | CheckState::Queued | CheckState::InProgress
+            )
+        });
     if pending {
         CiDisposition::Waiting
-    } else if failed {
-        CiDisposition::Failed
     } else {
         CiDisposition::Passing
     }
