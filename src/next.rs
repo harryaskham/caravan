@@ -226,6 +226,94 @@ fn checkout_selected(
 mod tests {
     use super::*;
 
+    /// The bug this exists to prevent: `--status conflict` returned ZERO matches
+    /// on a fleet that visibly carried two conflicting candidates, because this
+    /// module filtered on a variant the producer had stopped emitting.
+    ///
+    /// Every unit test here passed throughout, because they asserted status
+    /// codes and fail-open behaviour and never asked the real graph analysis
+    /// what it emits. So this one drives `collect` with output from `analyze`
+    /// itself rather than a hand-built problem: if the producer changes what it
+    /// emits again, this fails where a hand-injected fixture would not.
+    #[test]
+    fn conflict_matches_what_graph_analysis_actually_emits() {
+        use crate::graph::analyze;
+        use crate::model::{
+            BranchSnapshot, CommitOid, CompatibilityOutcome, CompatibilityReport, PrNumber,
+            PullRequestState, RepositoryId, RepositorySnapshot,
+        };
+
+        let repository = RepositoryId {
+            owner: "acme".to_owned(),
+            name: "widgets".to_owned(),
+        };
+        let branch = |name: &str| BranchSnapshot {
+            repository: repository.clone(),
+            name: name.to_owned(),
+            oid: CommitOid(format!("oid-{name}")),
+        };
+        let mut candidate = crate::model::PullRequestSnapshot {
+            number: PrNumber(2245),
+            title: "stuck".to_owned(),
+            url: "https://example.invalid/2245".to_owned(),
+            state: PullRequestState::Open,
+            draft: false,
+            head: branch("stuck"),
+            base: branch("main"),
+            cross_repository: false,
+            merge_state_status: None,
+            labels: std::collections::BTreeSet::new(),
+            auto_merge: crate::model::AutoMergeState::disabled(),
+            checks: Vec::new(),
+            created_at: None,
+            merged_at: None,
+            updated_at: None,
+        };
+        candidate.labels.clear();
+
+        let conflicting = |candidate: &BranchSnapshot, target: &BranchSnapshot| {
+            Ok(CompatibilityReport {
+                candidate: candidate.clone(),
+                target: target.clone(),
+                outcome: CompatibilityOutcome::Conflict,
+                conflicting_paths: vec!["src/lib.rs".to_owned()],
+                diagnostic: None,
+            })
+        };
+        let analysis = analyze(
+            &RepositorySnapshot {
+                merge_candidates: Vec::new(),
+                merge_candidates_truncated: 0,
+                previous_default_oid: None,
+                default_branch_movements: Vec::new(),
+                repository: repository.clone(),
+                default_branch: branch("main"),
+                current_branch: None,
+                current_pr: None,
+                pull_requests: vec![candidate],
+                generation_facts: Vec::new(),
+                observed_at: None,
+            },
+            &conflicting,
+        )
+        .expect("a conflicting candidate is evidence, not an execution failure");
+
+        let found: Vec<_> = analysis
+            .fleet
+            .problems
+            .iter()
+            .filter(|problem| problem.kind.is_candidate_scoped())
+            .flat_map(|problem| problem.prs.clone())
+            .collect();
+
+        assert_eq!(
+            found,
+            vec![PrNumber(2245)],
+            "`--status conflict` reads exactly this set; an empty result here is \
+             reported to a scheduler as a healthy empty queue"
+        );
+    }
+
     /// A scheduler must be able to tell "nothing to do" from "provider down".
     /// Returning an error envelope for an empty queue conflates them, and the
     /// cron then treats an outage as quiet success.
