@@ -629,17 +629,53 @@ pub struct GraphProblem {
     pub message: String,
 }
 
+/// Bounded evidence that caravans have formed before now.
+///
+/// `caravans` answers "what is in flight at this instant". Readers repeatedly
+/// took an empty list to mean "no caravan has ever formed" — asserted six times
+/// in one day, including inside durable incident records, while 23 labelled
+/// members had merged over the preceding eleven days. Re-measuring never
+/// exposed the error because the field was always correct; only the question
+/// was wrong. Carrying history beside it makes the wrong reading impossible
+/// (bd-8c9916).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CaravanHistory {
+    /// Merged caravan members observed within the bounded discovery window.
+    pub merged_members_observed: usize,
+    /// Exact provider timestamp of the earliest observed merged member.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub earliest_merged_at: Option<String>,
+    /// Exact provider timestamp of the most recent observed merged member.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_merged_at: Option<String>,
+}
+
+impl CaravanHistory {
+    /// True when caravans have demonstrably formed before, whatever is in
+    /// flight right now.
+    #[must_use]
+    pub const fn has_formed_before(&self) -> bool {
+        self.merged_members_observed > 0
+    }
+}
+
 /// Validated repository-level Caravan view.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CaravanFleet {
     pub repository: RepositoryId,
     pub default_branch: BranchSnapshot,
+    /// Caravans in flight at this exact instant. An empty list means "none in
+    /// flight now", never "none has ever formed" — consult `history` for that.
     #[serde(default)]
     pub caravans: Vec<Caravan>,
     #[serde(default)]
     pub unqueued: Vec<PrNumber>,
     #[serde(default)]
     pub problems: Vec<GraphProblem>,
+    /// Bounded proof of prior formation, so current state cannot be read as
+    /// lifetime state.
+    #[serde(default)]
+    pub history: CaravanHistory,
 }
 
 impl CaravanFleet {
@@ -1090,6 +1126,7 @@ mod tests {
             caravans: vec![Caravan::new(vec![PrNumber(1), PrNumber(2)]).unwrap()],
             unqueued: vec![PrNumber(3)],
             problems: Vec::new(),
+            history: crate::model::CaravanHistory::default(),
         };
         assert_eq!(
             fleet.caravan(PrNumber(1)).unwrap().tail(),

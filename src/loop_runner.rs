@@ -423,6 +423,7 @@ mod tests {
                             caravans: Vec::new(),
                             unqueued: Vec::new(),
                             problems: Vec::new(),
+                            history: crate::model::CaravanHistory::default(),
                         },
                         pull_requests: BTreeMap::new(),
                         compatibility: Vec::new(),

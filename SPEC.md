@@ -230,6 +230,13 @@ preconditions.
 ### Inspection
 
 - `cara status` — repository overview: current PR, all caravans, the canonical priority-then-FIFO admission list with per-PR reasons, invalid graph fragments, and pending decision points.
+
+`status.analysis.fleet.caravans` answers **now**, never **ever**: an empty list
+means no caravan is in flight at this instant. `fleet.history` carries the
+lifetime answer from the same bounded snapshot — `merged_members_observed`,
+`earliest_merged_at`, `latest_merged_at` — so a current-state read can never be
+mistaken for a lifetime claim. Human `cara status` prints "N in flight now" and,
+when the list is empty, states explicitly that this is not a lifetime claim.
 - `cara next-candidate` — return the same canonical first ordered admission attempt and complete reasoning without mutation; it explicitly requires subsequent membership preflight and never authorizes leapfrogging a rejected first attempt.
 - `cara show` — print the current PR's whole caravan and highlight its position.
 - `cara check` — no-update validation. For an active member, check its whole caravan and fleet invariants. Otherwise check whether `new` would succeed.

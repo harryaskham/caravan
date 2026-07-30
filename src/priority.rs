@@ -710,6 +710,7 @@ mod tests {
                 caravans: Vec::new(),
                 unqueued: vec![candidate.number],
                 problems: Vec::new(),
+                history: crate::model::CaravanHistory::default(),
             },
             pull_requests: BTreeMap::from([(candidate.number, candidate.clone())]),
             compatibility: Vec::new(),

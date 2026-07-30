@@ -534,6 +534,27 @@ pub fn derive_for_actor(snapshot: &RepositorySnapshot, actor: HeadMergeActor) ->
         .map(|pull_request| pull_request.number)
         .collect();
 
+    // Prior formation is already in the bounded snapshot: discovery fetches
+    // recently merged labelled PRs. Reporting it beside the live list costs no
+    // extra provider request and removes the "[] means never" misreading.
+    let merged_members = snapshot
+        .pull_requests
+        .iter()
+        .filter(|pull_request| {
+            pull_request.state == PullRequestState::Merged && pull_request.has_label("caravan")
+        })
+        .collect::<Vec<_>>();
+    let mut merged_timestamps = merged_members
+        .iter()
+        .filter_map(|pull_request| pull_request.merged_at.clone())
+        .collect::<Vec<_>>();
+    merged_timestamps.sort_unstable();
+    let history = crate::model::CaravanHistory {
+        merged_members_observed: merged_members.len(),
+        earliest_merged_at: merged_timestamps.first().cloned(),
+        latest_merged_at: merged_timestamps.last().cloned(),
+    };
+
     GraphAnalysis {
         fleet: CaravanFleet {
             repository: snapshot.repository.clone(),
@@ -541,6 +562,7 @@ pub fn derive_for_actor(snapshot: &RepositorySnapshot, actor: HeadMergeActor) ->
             caravans,
             unqueued,
             problems,
+            history,
         },
         pull_requests,
         compatibility: Vec::new(),
@@ -1399,5 +1421,46 @@ mod tests {
                 .iter()
                 .any(|problem| problem.kind == GraphProblemKind::Incompatible)
         );
+    }
+
+    /// bd-8c9916: an empty live list was repeatedly read as "no caravan has
+    /// ever formed" on a repository that had merged members for eleven days.
+    /// The live field was always right, so re-measuring never exposed the
+    /// error; only carrying the historical answer beside it can.
+    #[test]
+    fn an_empty_live_fleet_still_proves_prior_formation() {
+        let mut merged = pull_request(2008, "landed", "main");
+        merged.state = PullRequestState::Merged;
+        merged.merged_at = Some("2026-07-18T01:38:58Z".to_owned());
+        let mut later = pull_request(2234, "landed-later", "main");
+        later.state = PullRequestState::Merged;
+        later.merged_at = Some("2026-07-28T17:27:45Z".to_owned());
+
+        let analysis = derive(&snapshot(vec![merged, later]));
+
+        assert!(
+            analysis.fleet.caravans.is_empty(),
+            "nothing is in flight right now"
+        );
+        let history = &analysis.fleet.history;
+        assert!(history.has_formed_before());
+        assert_eq!(history.merged_members_observed, 2);
+        assert_eq!(
+            history.earliest_merged_at.as_deref(),
+            Some("2026-07-18T01:38:58Z")
+        );
+        assert_eq!(
+            history.latest_merged_at.as_deref(),
+            Some("2026-07-28T17:27:45Z")
+        );
+    }
+
+    #[test]
+    fn a_repository_without_merged_members_claims_no_history() {
+        let analysis = derive(&snapshot(vec![pull_request(1, "open", "main")]));
+
+        assert!(!analysis.fleet.history.has_formed_before());
+        assert_eq!(analysis.fleet.history.merged_members_observed, 0);
+        assert!(analysis.fleet.history.latest_merged_at.is_none());
     }
 }

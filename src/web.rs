@@ -2216,6 +2216,7 @@ mod tests {
                 caravans: Vec::new(),
                 unqueued: vec![pull_request.number],
                 problems: Vec::new(),
+                history: crate::model::CaravanHistory::default(),
             },
             pull_requests: std::collections::BTreeMap::from([(pull_request.number, pull_request)]),
             compatibility: Vec::new(),

@@ -2179,12 +2179,40 @@ fn render_status(output: &caravan::read::StatusOutput) -> String {
         output.auto_admission.max_github_requests_per_tick,
         output.auto_admission.max_duration_secs,
     );
+    let history = &output.analysis.fleet.history;
     let _ = writeln!(
         text,
         "\n{}  {}",
         heading("CARAVANS"),
-        dim(format!("{} active", output.analysis.fleet.caravans.len()))
+        dim(format!(
+            "{} in flight now",
+            output.analysis.fleet.caravans.len()
+        ))
     );
+    // "Now" and "ever" are different questions. An empty live list was read as
+    // "no caravan has ever formed" on a repository that had merged 23 members
+    // over eleven days, and re-measuring only ever confirmed the correct value
+    // (bd-8c9916). State the historical answer beside the live one.
+    if output.analysis.fleet.caravans.is_empty() {
+        let _ = writeln!(
+            text,
+            "  {}",
+            if history.has_formed_before() {
+                dim(format!(
+                    "none in flight now; this is not a lifetime claim — {} merged caravan member(s) observed{}",
+                    history.merged_members_observed,
+                    history
+                        .latest_merged_at
+                        .as_deref()
+                        .map_or_else(String::new, |latest| format!(", latest {latest}"))
+                ))
+            } else {
+                dim(
+                    "none in flight now, and no merged caravan member within the bounded discovery window",
+                )
+            }
+        );
+    }
     if let Some(previous) = &output.previous_default_oid {
         let _ = writeln!(text, "previous observed default: {previous}");
     }
@@ -3429,6 +3457,7 @@ mod tests {
                     caravans: Vec::new(),
                     unqueued: Vec::new(),
                     problems: Vec::new(),
+                    history: caravan::model::CaravanHistory::default(),
                 },
                 pull_requests: std::collections::BTreeMap::new(),
                 compatibility: Vec::new(),

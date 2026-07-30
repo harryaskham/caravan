@@ -826,6 +826,7 @@ mod tests {
                     caravans: vec![Caravan::new(vec![PrNumber(1), PrNumber(2)]).unwrap()],
                     unqueued: Vec::new(),
                     problems: Vec::new(),
+                    history: crate::model::CaravanHistory::default(),
                 },
                 pull_requests: BTreeMap::from([(PrNumber(1), pr)]),
                 compatibility: Vec::new(),

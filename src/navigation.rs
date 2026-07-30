@@ -987,6 +987,7 @@ mod tests {
                     ],
                     unqueued: Vec::new(),
                     problems: Vec::new(),
+                    history: crate::model::CaravanHistory::default(),
                 },
                 pull_requests,
                 compatibility: Vec::new(),
