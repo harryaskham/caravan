@@ -1208,6 +1208,58 @@ fn a_conflicting_leading_candidate_still_lets_a_clean_one_form_the_first_caravan
     );
 }
 
+/// The live cacophony shape, and the step that has never once happened in
+/// production: a caravan that already exists with EXACTLY ONE member, and a
+/// clean candidate behind it.
+///
+/// Forming the first caravan proves admission; joining a second member proves
+/// STACKING, which is the harder half and the whole point of a merge queue. The
+/// existing coverage joins behind a TWO-member caravan, so the single-member
+/// case — where head and tail are the same pull request — was never exercised.
+#[test]
+fn a_clean_candidate_joins_behind_a_single_member_caravan() {
+    // The existing caravan: one labelled member, head == tail.
+    let root = pull_request(
+        2287,
+        "root",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::squash(),
+    );
+    // The candidate that should stack behind it.
+    let mut follower = pull_request(
+        2292,
+        "follower",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    follower.labels.clear();
+
+    let fleet = status(vec![root, follower.clone()], Some(follower.number), &clean);
+
+    assert_eq!(
+        fleet.analysis.fleet.caravans.len(),
+        1,
+        "fixture must model one existing caravan"
+    );
+    assert_eq!(
+        fleet.analysis.fleet.caravans[0].members,
+        vec![PrNumber(2287)],
+        "and it must be single-member, which is the untested shape"
+    );
+
+    let evaluation =
+        evaluate_auto_candidate(&fleet, &follower, &clean).expect("join preflight is evidence");
+
+    assert_eq!(
+        evaluation.target,
+        AutoCandidateTarget::Join(PrNumber(2287)),
+        "a clean candidate must stack behind the sole member, not form a rival caravan: {:?}",
+        evaluation.reasons
+    );
+}
+
 #[test]
 fn greedy_planner_forms_empty_fleet_then_uses_first_compatible_tail() {
     let mut candidate = pull_request(
