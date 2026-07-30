@@ -1111,7 +1111,11 @@ Subsequent beads implement GitHub discovery, graph validation, compatibility, mu
 
 `sync.checkout_on_decision` (default `false`) leaves the working tree exactly
 where it was. Setting it `true` restores the historical affordance of checking
-out a decision's PR so it can be repaired in place. That is right for an
+out a decision's PR so it can be repaired in place. `CARA_CHECKOUT_ON_DECISION`
+overrides the configured value for one invocation, so a scheduled hook or an
+interactive shell can differ from repository policy without editing a shared
+file. Only unambiguous values are honoured (`1/true/yes/on`, `0/false/no/off`);
+anything else leaves configuration in force rather than guessing. That is right for an
 interactive checkout and wrong for an unattended sync worktree, which otherwise
 silently becomes whatever PR was last inspected — one was found parked on a dead
 agent's branch 95 commits behind the default, so every policy value came from

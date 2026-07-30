@@ -74,6 +74,25 @@ fn default_sync_max_github_requests_per_tick() -> u32 {
     256
 }
 
+/// Parse a strict boolean environment override.
+///
+/// Only unambiguous values are honoured. A typo must not silently select a
+/// policy: an unrecognised value leaves configuration in force rather than
+/// guessing which side the operator meant.
+fn environment_flag(name: &str) -> Option<bool> {
+    parse_environment_flag(&std::env::var(name).ok()?)
+}
+
+/// Pure half of [`environment_flag`], so the accepted vocabulary is testable
+/// without mutating process environment.
+fn parse_environment_flag(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
 /// Leave the working tree where it was.
 ///
 /// Parking on the evaluated PR was the historical behaviour and is a convenient
@@ -390,12 +409,26 @@ impl CaravanConfig {
     /// Parse YAML and validate the complete policy.
     pub fn parse(yaml: &str) -> Result<Self, ConfigError> {
         Self::check_reader_compatibility(yaml, CARA_VERSION)?;
-        let config: Self = serde_yaml::from_str(yaml).map_err(|error| ConfigError::Parse {
+        let mut config: Self = serde_yaml::from_str(yaml).map_err(|error| ConfigError::Parse {
             path: None,
             message: error.to_string(),
         })?;
+        config.apply_environment_overrides();
         config.validate()?;
         Ok(config)
+    }
+
+    /// Apply per-invocation environment overrides after parsing.
+    ///
+    /// Applied here rather than at each read site so every consumer — and every
+    /// echo of the effective config — reports the value actually in force. One
+    /// caller can differ from repository policy for its own invocation without
+    /// editing a shared file, which is what a scheduled hook needs
+    /// (bd-a082cd).
+    fn apply_environment_overrides(&mut self) {
+        if let Some(value) = environment_flag("CARA_CHECKOUT_ON_DECISION") {
+            self.sync.checkout_on_decision = value;
+        }
     }
 
     /// Check a repository's declared reader floor before strict schema parsing.
@@ -462,10 +495,15 @@ impl CaravanConfig {
                     message: "configured path does not exist".to_owned(),
                 });
             }
+            // The override must hold even where no config file exists, or a
+            // caller's explicit choice would silently depend on whether the
+            // repository happened to commit a policy file.
+            let mut config = Self::default();
+            config.apply_environment_overrides();
             return Ok(LoadedConfig {
                 path: resolved,
                 existed: false,
-                config: Self::default(),
+                config,
             });
         }
         Ok(LoadedConfig {
@@ -1204,5 +1242,49 @@ sync:
         config
             .validate_tick_bounds()
             .expect("the exact documented maximum is valid");
+    }
+}
+
+#[cfg(test)]
+mod environment_override_tests {
+    use super::*;
+
+    /// bd-a082cd: a scheduled unattended caller must be able to differ from
+    /// repository policy for its own invocation without editing a shared file.
+    #[test]
+    fn a_strict_boolean_override_is_parsed_and_a_typo_is_ignored() {
+        for raw in ["1", "true", "YES", "on", " True "] {
+            assert_eq!(parse_environment_flag(raw), Some(true), "raw {raw}");
+        }
+        for raw in ["0", "false", "No", "off", " OFF "] {
+            assert_eq!(parse_environment_flag(raw), Some(false), "raw {raw}");
+        }
+        for raw in ["ture", "", "2", "maybe"] {
+            assert_eq!(
+                parse_environment_flag(raw),
+                None,
+                "a typo must never silently select a policy: {raw}"
+            );
+        }
+    }
+
+    /// An unset or unrecognised override leaves repository policy in force.
+    #[test]
+    fn an_absent_override_leaves_configuration_untouched() {
+        let mut config = CaravanConfig {
+            sync: SyncConfig {
+                checkout_on_decision: true,
+                ..SyncConfig::default()
+            },
+            ..CaravanConfig::default()
+        };
+        let before = config.sync.checkout_on_decision;
+
+        config.apply_environment_overrides();
+
+        assert_eq!(
+            config.sync.checkout_on_decision, before,
+            "no override is set in this test process"
+        );
     }
 }

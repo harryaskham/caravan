@@ -148,3 +148,17 @@ pins it for exactly this reason.
 Change `wake_class` to `retry_tick` and the hook must do nothing at all. That
 pair is the whole contract.
 ++ b/examples/hooks/caco-bead-dispatch.sh
+
+## Decision checkout in unattended runs
+
+`sync.checkout_on_decision` defaults to `false`, so a scheduled tick never leaves
+the worktree parked on the PR it evaluated. An interactive shell can opt in for a
+single invocation without changing repository policy:
+
+```sh
+CARA_CHECKOUT_ON_DECISION=true cara sync
+```
+
+The same variable disables it for one invocation where a repository has opted in
+globally. Only `1/true/yes/on` and `0/false/no/off` are accepted; an unrecognised
+value leaves the configured policy in force rather than guessing.
