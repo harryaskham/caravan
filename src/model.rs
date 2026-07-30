@@ -597,7 +597,29 @@ impl GraphProblemKind {
     /// owner can still fix it. History is reported, never gated on.
     #[must_use]
     pub const fn is_historical(self) -> bool {
-        matches!(self, Self::DissolvedMember)
+        // Exhaustive for the same reason `blocks_fleet` is: a `matches!` answers
+        // for the variants it names and silently answers `false` for every
+        // variant added later. Written as `matches!` first, which is precisely
+        // the shape this classification exists to prevent (bd-58ad85).
+        match self {
+            Self::DissolvedMember => true,
+            Self::MissingHead
+            | Self::MultipleHeads
+            | Self::Branching
+            | Self::Cycle
+            | Self::DanglingBase
+            | Self::ActiveAndEvicted
+            | Self::DuplicateMember
+            | Self::ForkOnlyPredecessor
+            | Self::AutoMergeInvariant
+            | Self::Incompatible
+            | Self::CandidateIncompatible
+            | Self::ReusedBranchProvenance
+            | Self::SupersededGeneration
+            | Self::AmbiguousGeneration
+            | Self::InvalidGenerationMetadata
+            | Self::Unknown => false,
+        }
     }
 
     /// Whether this problem is scoped to one unadmitted admission candidate.
@@ -631,14 +653,24 @@ mod graph_problem_kind_tests {
             GraphProblemKind::CandidateIncompatible,
             GraphProblemKind::ReusedBranchProvenance,
             GraphProblemKind::SupersededGeneration,
+            GraphProblemKind::DissolvedMember,
             GraphProblemKind::AmbiguousGeneration,
             GraphProblemKind::InvalidGenerationMetadata,
             GraphProblemKind::Unknown,
         ] {
-            assert_ne!(
-                kind.blocks_fleet(),
-                kind.is_candidate_scoped(),
-                "{kind:?} must be exactly one of fleet-blocking or candidate-scoped"
+            // THREE categories, not two. The original assertion compared
+            // fleet-blocking against candidate-scoped, which partitions only
+            // while those are the only options. `DissolvedMember` is neither: it
+            // is history, so it gates nothing and belongs to no live candidate.
+            // The variant was added without being added HERE, so the guard that
+            // keeps this classification total was blind to the variant whose
+            // misrouting aborted every tick (bd-58ad85).
+            let categories = u8::from(kind.blocks_fleet())
+                + u8::from(kind.is_candidate_scoped())
+                + u8::from(kind.is_historical());
+            assert_eq!(
+                categories, 1,
+                "{kind:?} must be exactly one of fleet-blocking, candidate-scoped, or historical"
             );
         }
     }
