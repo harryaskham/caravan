@@ -315,6 +315,22 @@ pub fn derive_for_actor(snapshot: &RepositorySnapshot, actor: HeadMergeActor) ->
         if pull_request.state == PullRequestState::Merged && pull_request.has_label("caravan") {
             merged_by_head.insert(pull_request.head.name.clone(), pull_request.number);
         }
+        // A member closed WITHOUT merging took its caravan with it. Membership is
+        // derived from open-or-merged pull requests, so a closed one is simply
+        // absent: where a tail survived it dangles and the fleet stops, but a
+        // sole member leaves nothing behind and the caravan silently ceases to
+        // exist. The label outlives the close, so the evidence is right here
+        // (bd-461c8b).
+        if pull_request.state == PullRequestState::Closed && pull_request.has_label("caravan") {
+            problems.push(GraphProblem {
+                kind: GraphProblemKind::DissolvedMember,
+                prs: vec![pull_request.number],
+                message: format!(
+                    "caravan member #{} was closed without merging, so its caravan no longer exists; requeue the work through its successor or remove the `caravan` label to acknowledge the dissolution",
+                    pull_request.number.0
+                ),
+            });
+        }
         if pull_request.state == PullRequestState::Open
             && pull_request.has_label("caravan")
             && pull_request.has_label("caravan-evicted")
@@ -887,6 +903,76 @@ mod tests {
             merged_at: None,
             updated_at: None,
         }
+    }
+
+    /// Live loss (cacophony #2287, bd-461c8b): the sole member of a caravan was
+    /// closed after being republished as a new generation, and the caravan
+    /// ceased to exist with NOTHING reported. It was found only by noticing that
+    /// no open pull request carried the `caravan` label any more.
+    ///
+    /// Asserts BOTH shapes, because they fail differently and only one of them
+    /// was ever detected:
+    ///   - a MIDDLE member leaves a tail behind, which dangles, so the fleet
+    ///     already stopped on `DanglingBase`;
+    ///   - a SOLE member leaves nothing behind, so there was no dangling base,
+    ///     no problem, and no caravan.
+    #[test]
+    fn a_member_closed_without_merging_is_reported_not_silently_absent() {
+        let checker = |candidate: &BranchSnapshot, target: &BranchSnapshot| {
+            Ok(CompatibilityReport {
+                candidate: candidate.clone(),
+                target: target.clone(),
+                outcome: CompatibilityOutcome::Clean,
+                conflicting_paths: Vec::new(),
+                diagnostic: None,
+            })
+        };
+        let dissolved = |analysis: &GraphAnalysis| -> Vec<u64> {
+            analysis
+                .fleet
+                .problems
+                .iter()
+                .filter(|problem| problem.kind == GraphProblemKind::DissolvedMember)
+                .flat_map(|problem| problem.prs.iter().map(|pr| pr.0))
+                .collect()
+        };
+
+        // The shape that actually happened: one member, closed, no tail.
+        let sole = {
+            let mut pr = pull_request(2287, "member", "main");
+            pr.state = PullRequestState::Closed;
+            pr
+        };
+        let analysis = analyze(&snapshot(vec![sole]), &checker).expect("analysis runs");
+        assert_eq!(
+            dissolved(&analysis),
+            vec![2287],
+            "a sole closed member leaves nothing to dangle, so the dissolution must be reported directly"
+        );
+        assert!(
+            !analysis.healthy(),
+            "a dissolved caravan is a decision point, not a healthy fleet"
+        );
+
+        // The shape with a survivor: still reported, and still dangling.
+        let head = pull_request(1, "a", "main");
+        let middle = {
+            let mut pr = pull_request(2, "b", "a");
+            pr.state = PullRequestState::Closed;
+            pr
+        };
+        let tail = pull_request(3, "c", "b");
+        let analysis =
+            analyze(&snapshot(vec![head, middle, tail]), &checker).expect("analysis runs");
+        assert_eq!(dissolved(&analysis), vec![2]);
+        assert!(
+            analysis
+                .fleet
+                .problems
+                .iter()
+                .any(|problem| problem.kind == GraphProblemKind::DanglingBase),
+            "the orphaned tail must still dangle: that is what stops the fleet"
+        );
     }
 
     fn snapshot(pull_requests: Vec<PullRequestSnapshot>) -> RepositorySnapshot {

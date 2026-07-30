@@ -531,6 +531,17 @@ pub enum GraphProblemKind {
     /// caravan member used the same branch name, so provenance is ambiguous.
     ReusedBranchProvenance,
     SupersededGeneration,
+    /// A caravan member was CLOSED without merging, so the caravan it belonged
+    /// to no longer exists.
+    ///
+    /// Membership is derived from open-or-merged pull requests carrying the
+    /// `caravan` label, so a closed member is simply absent. Where the caravan
+    /// had a tail, the orphan surfaces as [`Self::DanglingBase`] and the fleet
+    /// stops. Where the closed member was the ONLY member, nothing is left
+    /// behind to dangle and the caravan silently ceases to exist: exactly what
+    /// happened to cacophony #2287, found only by noticing no open pull request
+    /// carried the label any more (bd-461c8b).
+    DissolvedMember,
     AmbiguousGeneration,
     InvalidGenerationMetadata,
     Unknown,
@@ -560,6 +571,7 @@ impl GraphProblemKind {
             | Self::Incompatible
             | Self::ReusedBranchProvenance
             | Self::SupersededGeneration
+            | Self::DissolvedMember
             | Self::AmbiguousGeneration
             | Self::InvalidGenerationMetadata
             | Self::Unknown => true,

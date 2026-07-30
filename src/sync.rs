@@ -3245,6 +3245,24 @@ fn run_auto_admission(
             continue;
         }
 
+        // A stale receipt authorises removal; an ABSENT receipt does not.
+        //
+        // `retained` is None when nobody posted a receipt, which is exactly the
+        // state of a label applied BY A HUMAN to hold a pull request. Removing it
+        // strips a marker Cara never wrote, and the hold evaporates on the next
+        // tick rather than on any generation change — so an operator who believes
+        // the PR is protected finds it admitted. That is worse than no hold at
+        // all (bd-239640).
+        if retained.is_none() {
+            validated_skips.insert(skipped.pr);
+            progress.already(
+                MutationKind::RemoveLabel,
+                skipped.pr,
+                "left a foreign admission skip alone: no Cara receipt, so the label is not ours to remove",
+            );
+            continue;
+        }
+
         if !has_mutation_capacity(context, progress, 2) {
             output.continuation = AutoAdmissionContinuation::MutationBudgetExhausted;
             break;
@@ -4588,10 +4606,7 @@ fn ci_decision_error(
         Some("unforced terminal or unknown CI state requires a decision".to_owned()),
         BTreeMap::from([
             ("ci".to_owned(), json!(observation)),
-            (
-                "cancellation".to_owned(),
-                json!(observation.cancellation),
-            ),
+            ("cancellation".to_owned(), json!(observation.cancellation)),
             (
                 "pull_request".to_owned(),
                 json!(progress.current.get(&observation.pr)),
@@ -5348,6 +5363,10 @@ fn decision_for_problem(
         | GraphProblemKind::AutoMergeInvariant
         | GraphProblemKind::ReusedBranchProvenance
         | GraphProblemKind::SupersededGeneration
+        // A dissolved member needs a human: the caravan is gone, and whether its
+        // work should be requeued depends on whether a successor exists and is
+        // chain-compatible, which only its owner knows.
+        | GraphProblemKind::DissolvedMember
         | GraphProblemKind::AmbiguousGeneration
         | GraphProblemKind::InvalidGenerationMetadata
         | GraphProblemKind::Unknown => DecisionKind::InvalidGraph,
