@@ -5229,13 +5229,38 @@ fn decision_for_problem(
     status: &StatusOutput,
     progress: &SyncProgress,
 ) -> DecisionPoint {
+    // Deliberately exhaustive, with no `_` arm. A wildcard here is what let
+    // `CandidateIncompatible` inherit a fleet-fatal `InvalidGraph` decision by
+    // default when it was introduced: the compiler had been told not to help,
+    // so a single unqueued conflicting candidate aborted every tick and no test
+    // failed (bd-550b0e). `blocks_fleet` being exhaustive only protects call
+    // sites that ask the classifier, and this one never did. Adding a variant
+    // must now fail to compile until somebody chooses its decision.
     let kind = match problem.kind {
         GraphProblemKind::Incompatible if problem.prs.len() == 1 => DecisionKind::HeadConflict,
         GraphProblemKind::Incompatible if is_adjacent_pair(status, &problem.prs) => {
             DecisionKind::LinkConflict
         }
         GraphProblemKind::Incompatible => DecisionKind::CrossCaravanConflict,
-        _ => DecisionKind::InvalidGraph,
+        // A candidate-scoped problem never reaches a decision on the healthy
+        // path: every fleet gate skips it before deciding. It is mapped
+        // explicitly rather than by wildcard so that the classification stays
+        // visible if a caller ever does reach here.
+        GraphProblemKind::CandidateIncompatible => DecisionKind::InvalidGraph,
+        GraphProblemKind::MissingHead
+        | GraphProblemKind::MultipleHeads
+        | GraphProblemKind::Branching
+        | GraphProblemKind::Cycle
+        | GraphProblemKind::DanglingBase
+        | GraphProblemKind::ActiveAndEvicted
+        | GraphProblemKind::DuplicateMember
+        | GraphProblemKind::ForkOnlyPredecessor
+        | GraphProblemKind::AutoMergeInvariant
+        | GraphProblemKind::ReusedBranchProvenance
+        | GraphProblemKind::SupersededGeneration
+        | GraphProblemKind::AmbiguousGeneration
+        | GraphProblemKind::InvalidGenerationMetadata
+        | GraphProblemKind::Unknown => DecisionKind::InvalidGraph,
     };
     let caravan_id = problem.prs.iter().find_map(|number| {
         status
