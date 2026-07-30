@@ -1256,6 +1256,7 @@ mod tests {
 
     fn pull() -> PullRequestSnapshot {
         PullRequestSnapshot {
+            merge_state_status: None,
             number: PrNumber(1),
             title: "head".to_owned(),
             url: "https://example.invalid/1".to_owned(),

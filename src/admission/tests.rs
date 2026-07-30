@@ -28,6 +28,7 @@ fn branch(name: &str) -> BranchSnapshot {
 
 fn pr(number: u64, head: &str, base: &str, active: bool) -> PullRequestSnapshot {
     PullRequestSnapshot {
+        merge_state_status: None,
         number: PrNumber(number),
         title: format!("PR {number}"),
         url: format!("https://example.invalid/{number}"),

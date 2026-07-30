@@ -501,6 +501,10 @@ pub(super) struct PullRequestJson {
     pub(super) merged_at: Option<String>,
     pub(super) url: String,
     pub(super) updated_at: String,
+    /// Forge verdict on mergeability. Optional because the history query does
+    /// not request it and older captured fixtures predate the field.
+    #[serde(default)]
+    pub(super) merge_state_status: Option<String>,
 }
 
 impl PullRequestJson {
@@ -564,6 +568,7 @@ impl PullRequestJson {
                 oid: CommitOid(self.base_ref_oid),
             },
             cross_repository: self.is_cross_repository,
+            merge_state_status: self.merge_state_status,
             labels: self.labels.into_iter().map(|label| label.name).collect(),
             auto_merge,
             checks: self

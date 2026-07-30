@@ -2416,6 +2416,7 @@ mod tests {
 
     fn pr(number: u64, head: &str, base: &str, active: bool) -> PullRequestSnapshot {
         PullRequestSnapshot {
+            merge_state_status: None,
             number: PrNumber(number),
             title: format!("PR {number}"),
             url: format!("https://example.invalid/{number}"),
@@ -2874,6 +2875,28 @@ mod tests {
         let admission = resolve_admission(&status.analysis, &labels);
         assert_eq!(admission.next_candidate, Some(PrNumber(20)));
         assert_eq!(admission.candidates[0].priority_rank, Some(1));
+    }
+
+    /// Measured on live cacophony: PR 2279 was CLEAN and correctly elected, yet
+    /// the forge reported `mergeStateStatus=BLOCKED` for it exactly as it did
+    /// for the red PR 2276. BLOCKED means "protection not yet satisfied", which
+    /// includes required checks that are merely still running.
+    ///
+    /// So the forge verdict must NOT gate admission: doing so would refuse every
+    /// candidate whose CI has not finished and stall the queue completely. It is
+    /// consulted only at merge time, where the checks are already proven green.
+    #[test]
+    fn a_blocked_forge_verdict_does_not_bar_admission() {
+        let mut blocked = pr(20, "clean-but-blocked", "main", false);
+        blocked.merge_state_status = Some("BLOCKED".to_owned());
+        let mut problems = Vec::new();
+
+        validate_candidate(&blocked, &mut problems);
+
+        assert!(
+            problems.is_empty(),
+            "a forge BLOCKED verdict must not bar admission, or no candidate with running CI could ever be admitted: {problems:?}"
+        );
     }
 
     /// Two surfaces must not disagree about the same PR. On cacophony PR 2276,

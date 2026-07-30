@@ -6354,6 +6354,32 @@ impl SyncProgress {
             ));
         }
 
+        // Independent forge cross-check, deliberately placed HERE and not at
+        // admission. Measured on live cacophony, `BLOCKED` does not distinguish
+        // red from clean: a PR whose required checks are merely still running
+        // reports it exactly like one whose checks failed, so refusing admission
+        // on it would stall every candidate. By this point the required checks
+        // are already proven green, so a forge that still declines knows
+        // something we do not, and attempting the merge only produces a
+        // confusing provider error.
+        if let Some(status) = observed
+            .merge_state_status
+            .as_deref()
+            .filter(|status| matches!(*status, "BLOCKED" | "DIRTY" | "DRAFT"))
+        {
+            return Err(self.root_merge_failure(
+                caravan_id,
+                number,
+                RootMergeFailureCause::ForgeRefusesMerge,
+                &observed,
+                Some(&expected_head),
+                &json!({
+                    "merge_state_status": status,
+                    "explanation": "required checks are green but the forge still refuses this exact head; an unsatisfied protection rule or required review is the usual cause",
+                }),
+            ));
+        }
+
         let default_before = crate::model::BranchSnapshot {
             repository: repository.clone(),
             name: default_branch.clone(),

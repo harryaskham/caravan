@@ -2193,6 +2193,7 @@ mod tests {
             oid: crate::model::CommitOid(oid.to_owned()),
         };
         let pull_request = crate::model::PullRequestSnapshot {
+            merge_state_status: None,
             number: crate::model::PrNumber(1),
             title: "candidate".to_owned(),
             url: "https://example.invalid/1".to_owned(),
@@ -2252,6 +2253,7 @@ mod tests {
         let mut status = authority_status("candidate-head");
         let repository = status.repository.clone();
         let tail = crate::model::PullRequestSnapshot {
+            merge_state_status: None,
             number: crate::model::PrNumber(2),
             title: "tail".to_owned(),
             url: "https://example.invalid/2".to_owned(),

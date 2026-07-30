@@ -844,6 +844,7 @@ mod tests {
 
     fn pull_request(number: u64, head: &str, base: &str) -> PullRequestSnapshot {
         PullRequestSnapshot {
+            merge_state_status: None,
             number: PrNumber(number),
             title: format!("PR {number}"),
             url: format!("https://example.invalid/{number}"),

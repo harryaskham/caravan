@@ -14,7 +14,7 @@ use crate::model::{
     PullRequestPrecondition, RepositoryId,
 };
 
-const PR_JSON_FIELDS: &str = "number,title,body,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository,baseRefName,baseRefOid,labels,autoMergeRequest,statusCheckRollup,createdAt,mergedAt,url,updatedAt";
+const PR_JSON_FIELDS: &str = "number,title,body,state,isDraft,mergeStateStatus,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository,baseRefName,baseRefOid,labels,autoMergeRequest,statusCheckRollup,createdAt,mergedAt,url,updatedAt";
 // Merged predecessors are graph history, never CI candidates. Omitting the
 // rollup prevents old check suites from dominating provider response size.
 const PR_HISTORY_JSON_FIELDS: &str = "number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository,baseRefName,baseRefOid,labels,autoMergeRequest,createdAt,mergedAt,url,updatedAt";

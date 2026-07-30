@@ -331,6 +331,7 @@ mod tests {
 
     fn snapshot(head_oid: &str, base_oid: &str, auto_merge: AutoMergeState) -> PullRequestSnapshot {
         PullRequestSnapshot {
+            merge_state_status: None,
             number: PrNumber(2208),
             title: "root".to_owned(),
             url: "https://example.invalid/2208".to_owned(),

@@ -918,6 +918,7 @@ mod tests {
 
     fn pull_request(number: u64, base: &str) -> PullRequestSnapshot {
         PullRequestSnapshot {
+            merge_state_status: None,
             number: PrNumber(number),
             title: format!("PR {number}"),
             url: format!("https://example.invalid/{number}"),
@@ -1296,6 +1297,7 @@ mod tests {
         assert_eq!(missing.status.code(), Some(1));
 
         let pull_request = PullRequestSnapshot {
+            merge_state_status: None,
             number: PrNumber(2),
             title: "Remote-only fixture".to_owned(),
             url: "https://example.invalid/2".to_owned(),
@@ -1417,6 +1419,7 @@ mod tests {
         let provider_oid = git_stdout(source.path(), ["rev-parse", "HEAD"]);
 
         let pull_request = PullRequestSnapshot {
+            merge_state_status: None,
             number: PrNumber(2),
             title: "Rewritten parent fixture".to_owned(),
             url: "https://example.invalid/2".to_owned(),

@@ -1873,6 +1873,7 @@ mod tests {
 
     fn stacked_candidate(fixture: &StackedFixture) -> PullRequestSnapshot {
         PullRequestSnapshot {
+            merge_state_status: None,
             number: crate::model::PrNumber(2227),
             title: "stacked tail".to_owned(),
             url: "https://example.invalid/2227".to_owned(),
@@ -2038,6 +2039,7 @@ mod tests {
         let before_head = git(&fixture.clone, &["rev-parse", "HEAD"]);
         let before_status = git(&fixture.clone, &["status", "--porcelain"]);
         let candidate = PullRequestSnapshot {
+            merge_state_status: None,
             number: crate::model::PrNumber(7),
             title: "candidate".to_owned(),
             url: "https://example.invalid/7".to_owned(),
@@ -2098,6 +2100,7 @@ mod tests {
     fn external_default_advance_refreshes_range_without_weakening_head_lease() {
         let fixture = fixture();
         let mut candidate = PullRequestSnapshot {
+            merge_state_status: None,
             number: crate::model::PrNumber(7),
             title: "candidate".to_owned(),
             url: "https://example.invalid/7".to_owned(),
@@ -2176,6 +2179,7 @@ mod tests {
         );
         git(&fixture.clone, &["checkout", "feature"]);
         let candidate = PullRequestSnapshot {
+            merge_state_status: None,
             number: crate::model::PrNumber(7),
             title: "candidate".to_owned(),
             url: "https://example.invalid/7".to_owned(),
@@ -2258,6 +2262,7 @@ mod tests {
         let nonlinear_head = CommitOid(git(&fixture.clone, &["rev-parse", "HEAD"]));
         git(&fixture.clone, &["push", "origin", "feature"]);
         let candidate = PullRequestSnapshot {
+            merge_state_status: None,
             number: PrNumber(7),
             title: "nonlinear candidate".to_owned(),
             url: "https://example.invalid/7".to_owned(),
@@ -2340,6 +2345,7 @@ mod tests {
         git(&fixture.clone, &["push", "origin", "main"]);
         git(&fixture.clone, &["checkout", "feature"]);
         let candidate = PullRequestSnapshot {
+            merge_state_status: None,
             number: PrNumber(7),
             title: "main-merge candidate".to_owned(),
             url: "https://example.invalid/7".to_owned(),
@@ -2405,6 +2411,7 @@ mod tests {
         let child_head = CommitOid(git(&fixture.clone, &["rev-parse", "HEAD"]));
         git(&fixture.clone, &["push", "-u", "origin", "child"]);
         let parent = PullRequestSnapshot {
+            merge_state_status: None,
             number: PrNumber(7),
             title: "parent".to_owned(),
             url: "https://example.invalid/7".to_owned(),
@@ -2421,6 +2428,7 @@ mod tests {
             updated_at: None,
         };
         let child = PullRequestSnapshot {
+            merge_state_status: None,
             number: PrNumber(8),
             title: "child".to_owned(),
             url: "https://example.invalid/8".to_owned(),
@@ -2500,6 +2508,7 @@ mod tests {
         git(&fixture.clone, &["push", "origin", "feature"]);
 
         let parent = PullRequestSnapshot {
+            merge_state_status: None,
             number: PrNumber(7),
             title: "parent".to_owned(),
             url: "https://example.invalid/7".to_owned(),
@@ -2516,6 +2525,7 @@ mod tests {
             updated_at: None,
         };
         let child = PullRequestSnapshot {
+            merge_state_status: None,
             number: PrNumber(8),
             title: "child".to_owned(),
             url: "https://example.invalid/8".to_owned(),
@@ -2605,6 +2615,7 @@ mod tests {
         let head = CommitOid(git(&fixture.clone, &["rev-parse", "HEAD"]));
         git(&fixture.clone, &["push", "origin", "feature"]);
         let candidate = PullRequestSnapshot {
+            merge_state_status: None,
             number: PrNumber(7),
             title: "octopus".to_owned(),
             url: "https://example.invalid/7".to_owned(),
@@ -2670,6 +2681,7 @@ mod tests {
         let head = CommitOid(git(&fixture.clone, &["rev-parse", "HEAD"]));
         git(&fixture.clone, &["push", "origin", "feature"]);
         let candidate = PullRequestSnapshot {
+            merge_state_status: None,
             number: PrNumber(7),
             title: "external candidate".to_owned(),
             url: "https://example.invalid/7".to_owned(),
@@ -2774,6 +2786,7 @@ mod tests {
                 old_heads[index].clone()
             };
             candidates.push(PullRequestSnapshot {
+                merge_state_status: None,
                 number: PrNumber(pr_numbers[index]),
                 title: name.to_owned(),
                 url: format!("https://example.invalid/{}", pr_numbers[index]),
@@ -2917,6 +2930,7 @@ mod tests {
             name: "repo".to_owned(),
         };
         let candidate = PullRequestSnapshot {
+            merge_state_status: None,
             number: PrNumber(7),
             title: "feature".to_owned(),
             url: "https://example.invalid/7".to_owned(),
@@ -2980,6 +2994,7 @@ mod tests {
 
         let target = branch(&fixture.repository, "main", &fixture.new_main);
         let candidate = PullRequestSnapshot {
+            merge_state_status: None,
             number: PrNumber(3),
             title: "descendant".to_owned(),
             url: "https://example.invalid/3".to_owned(),
@@ -3076,6 +3091,7 @@ mod tests {
         git(&fixture.clone, &["push", "origin", "feature"]);
 
         let candidate = PullRequestSnapshot {
+            merge_state_status: None,
             number: PrNumber(2215),
             title: "cumulative root".to_owned(),
             url: "https://example.invalid/2215".to_owned(),
@@ -3166,6 +3182,7 @@ mod tests {
         git(&fixture.clone, &["push", "origin", "feature"]);
 
         let candidate = PullRequestSnapshot {
+            merge_state_status: None,
             number: PrNumber(2216),
             title: "child".to_owned(),
             url: "https://example.invalid/2216".to_owned(),
@@ -3228,6 +3245,7 @@ mod tests {
         let head = CommitOid(git(&fixture.clone, &["rev-parse", "HEAD"]));
         git(&fixture.clone, &["push", "origin", "feature"]);
         let candidate = PullRequestSnapshot {
+            merge_state_status: None,
             number: PrNumber(7),
             title: "conflict".to_owned(),
             url: "https://example.invalid/7".to_owned(),
@@ -3273,6 +3291,7 @@ mod tests {
     fn apply_time_lease_race_preserves_the_external_head() {
         let fixture = fixture();
         let candidate = PullRequestSnapshot {
+            merge_state_status: None,
             number: PrNumber(7),
             title: "candidate".to_owned(),
             url: "https://example.invalid/7".to_owned(),
@@ -3322,6 +3341,7 @@ mod tests {
     fn barrier_apply_revalidates_moved_default_before_branch_push() {
         let fixture = fixture();
         let candidate = PullRequestSnapshot {
+            merge_state_status: None,
             number: PrNumber(7),
             title: "candidate".to_owned(),
             url: "https://example.invalid/7".to_owned(),
@@ -3371,6 +3391,7 @@ mod tests {
     fn stale_snapshot_is_typed_and_never_overwrites_remote() {
         let fixture = fixture();
         let candidate = PullRequestSnapshot {
+            merge_state_status: None,
             number: crate::model::PrNumber(7),
             title: String::new(),
             url: String::new(),

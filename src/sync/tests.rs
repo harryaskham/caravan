@@ -763,6 +763,7 @@ fn pull_request(
     auto_merge: AutoMergeState,
 ) -> PullRequestSnapshot {
     PullRequestSnapshot {
+        merge_state_status: None,
         number: PrNumber(number),
         title: format!("PR {number}"),
         url: format!("https://example.invalid/{number}"),

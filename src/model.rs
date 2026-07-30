@@ -178,6 +178,19 @@ pub struct PullRequestSnapshot {
     pub merged_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
+    /// The forge's own verdict on whether this pull request can merge.
+    ///
+    /// Used only as a **merge-time** cross-check, never for admission. Measured
+    /// on live cacophony, `BLOCKED` does not distinguish red from clean: a PR
+    /// whose required checks are merely still running reports `BLOCKED` exactly
+    /// like one whose checks failed, so refusing admission on it would stall
+    /// every candidate. At merge time the required checks must already be green,
+    /// so a forge that still refuses is telling us something we do not know.
+    ///
+    /// `None` means the field was not fetched or the forge had not computed it
+    /// (`UNKNOWN`), which is neither permission nor refusal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_state_status: Option<String>,
 }
 
 impl PullRequestSnapshot {
@@ -1008,6 +1021,7 @@ mod tests {
 
     fn pull_request() -> PullRequestSnapshot {
         PullRequestSnapshot {
+            merge_state_status: None,
             number: PrNumber(42),
             title: "A queue change".to_owned(),
             url: "https://example.invalid/pull/42".to_owned(),

@@ -683,6 +683,7 @@ mod tests {
             oid: CommitOid(oid.to_owned()),
         };
         let candidate = PullRequestSnapshot {
+            merge_state_status: None,
             number: PrNumber(7),
             title: "candidate".to_owned(),
             url: "https://example.invalid/7".to_owned(),

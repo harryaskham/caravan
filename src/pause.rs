@@ -779,6 +779,7 @@ mod tests {
     }
     fn head(auto_merge: AutoMergeState, oid: &str, check: CheckState) -> PullRequestSnapshot {
         PullRequestSnapshot {
+            merge_state_status: None,
             number: PrNumber(1),
             title: "head".to_owned(),
             url: "https://invalid/1".to_owned(),

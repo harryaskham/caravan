@@ -241,6 +241,14 @@ pub enum RootMergeFailureCause {
     /// reintroduce content the default branch no longer carries, which is what
     /// an operator revert or discard of an already-landed ancestor looks like.
     DefaultBranchDivergedFromRetainedPatchSet,
+    /// The forge itself still refuses to merge this exact head.
+    ///
+    /// An independent cross-check, deliberately applied only here. By merge time
+    /// the required checks are already proven green, so a forge that still
+    /// declines knows something Cara does not — an unsatisfied protection rule,
+    /// a required review, a rule added since discovery. Attempting the merge
+    /// anyway just burns an API call and produces a confusing provider error.
+    ForgeRefusesMerge,
 }
 
 impl RootMergeFailureCause {
@@ -257,6 +265,7 @@ impl RootMergeFailureCause {
             Self::DefaultBranchDivergedFromRetainedPatchSet => {
                 "default_branch_diverged_from_retained_patch_set"
             }
+            Self::ForgeRefusesMerge => "forge_refuses_merge",
         }
     }
 
@@ -286,6 +295,9 @@ impl RootMergeFailureCause {
             }
             Self::ProviderDidNotPersistMerge => {
                 "rerun the same idempotent bounded sync tick; an already-merged root is observed as such and advances the caravan"
+            }
+            Self::ForgeRefusesMerge => {
+                "the forge still refuses this exact head even though required checks are green: inspect branch protection for an unsatisfied rule or a required review, then rerun the same bounded sync tick"
             }
             Self::MergedIntoUnexpectedBase => {
                 "inspect the provider merge receipt: the root landed on a branch other than the exact default branch and the caravan must be reconciled before further merges"
@@ -695,6 +707,7 @@ mod tests {
         auto_merge: AutoMergeState,
     ) -> PullRequestSnapshot {
         PullRequestSnapshot {
+            merge_state_status: None,
             number: PrNumber(2213),
             title: "root".to_owned(),
             url: "https://example.invalid/2213".to_owned(),
