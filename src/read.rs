@@ -1136,6 +1136,27 @@ pub fn resolve_admission_with_generation(
         }
 
         let created_at = pull_request.created_at.clone();
+        // A red candidate is skipped, not elected, and specifically NOT treated as
+        // an order-blocking rejection. Queueing behind red is guaranteed rework:
+        // the failure must be fixed, fixing it rewrites the head, and everything
+        // stacked behind is rebased anyway. So the queue advances past it and a
+        // clean candidate can form the caravan instead of waiting on a red head.
+        //
+        // This mirrors `validate_candidate`, which refuses the same shape on the
+        // `check` path. Both must agree: when only `check` refused, `cara status`
+        // still elected the red PR as next_candidate while `cara check --pr N`
+        // called it ineligible, and the two surfaces disagreed about the same PR
+        // (observed on cacophony PR 2276).
+        if !pull_request.has_label("caravan-force") && has_failing_check(pull_request) {
+            skipped.push(SkippedAdmissionCandidate {
+                pr: *number,
+                priority_label: configured.first().map(|(label, _)| (*label).clone()),
+                priority_rank: configured.first().map(|(_, rank)| rank + 1),
+                created_at,
+                reason: "candidate has a failing required check; queueing behind red only guarantees a later rebase, so the queue advances until it is fixed".to_owned(),
+            });
+            continue;
+        }
         if pull_request.has_label("caravan-join-skipped") {
             skipped.push(SkippedAdmissionCandidate {
                 pr: *number,
@@ -2853,6 +2874,41 @@ mod tests {
         let admission = resolve_admission(&status.analysis, &labels);
         assert_eq!(admission.next_candidate, Some(PrNumber(20)));
         assert_eq!(admission.candidates[0].priority_rank, Some(1));
+    }
+
+    /// Two surfaces must not disagree about the same PR. On cacophony PR 2276,
+    /// `check --pr 2276` reported ineligible while `status` still elected it as
+    /// `next_candidate`, because the CI refusal lived only on the check path.
+    /// Ordering now applies the same rule, and skips rather than blocks so the
+    /// queue advances to a clean candidate instead of waiting on a red head.
+    #[test]
+    fn a_red_candidate_is_skipped_so_the_queue_advances() {
+        let mut red = pr(10, "red", "main", false);
+        red.checks.push(crate::model::CheckSnapshot {
+            name: "Rust Check & Lint work".to_owned(),
+            state: crate::model::CheckState::Failure,
+            provider_state: Some("FAILURE".to_owned()),
+            details_url: None,
+        });
+        let green = pr(20, "green", "main", false);
+        let status = status(red, vec![green]);
+        let labels = crate::config::CaravanConfig::default().agent_priority_labels;
+
+        let admission = resolve_admission(&status.analysis, &labels);
+
+        assert_eq!(
+            admission.next_candidate,
+            Some(PrNumber(20)),
+            "a red PR must not hold the admission front"
+        );
+        assert!(
+            admission
+                .skipped
+                .iter()
+                .any(|candidate| candidate.pr == PrNumber(10)),
+            "the red candidate must be visibly skipped, not silently dropped: {:?}",
+            admission.skipped
+        );
     }
 
     /// Operator ruling from cacophony PR 2276: a failing check MUST bar
