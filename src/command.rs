@@ -25,6 +25,14 @@ const MAX_STDERR_CAPTURE_BYTES: usize = 64 * 1024;
 const OUTPUT_LIMIT_EVIDENCE_BYTES: usize = 4 * 1024;
 const GITHUB_AUTH_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Whether one checkout's `origin` names a GitHub repository at all.
+///
+/// Separates "Cara could not determine the repository" from "Cara could not
+/// authenticate" so a diagnostic never sends a reader to rotate credentials for
+/// a remote-configuration problem (bd-ce545f).
+static GITHUB_REMOTE_IS_GITHUB: OnceLock<Mutex<HashMap<std::path::PathBuf, bool>>> =
+    OnceLock::new();
+
 static GITHUB_AUTH_CACHE: OnceLock<Mutex<HashMap<String, Option<GithubAuthSelection>>>> =
     OnceLock::new();
 
@@ -462,6 +470,20 @@ impl ProcessRunner {
         resolve_github_auth(self.cwd.as_deref(), self.operation_deadline)
     }
 
+    /// True when this checkout's origin was probed and is not a GitHub remote.
+    fn origin_is_not_github(&self) -> bool {
+        let Some(cwd) = self.cwd.as_deref() else {
+            return false;
+        };
+        GITHUB_REMOTE_IS_GITHUB.get().is_some_and(|cache| {
+            cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(cwd)
+                .is_some_and(|is_github| !is_github)
+        })
+    }
+
     fn record_github_request(&self, request: &CommandSpec, auth: Option<&GithubAuthSelection>) {
         if !is_gh_request(request) {
             return;
@@ -494,6 +516,13 @@ impl ProcessRunner {
                     .filter(|value| !value.trim().is_empty())
                     .unwrap_or_else(|| "ambient_token".to_owned()),
                 Some(GithubAuthSelection::Token(_)) => "gh_auth_account".to_owned(),
+                // Never claim an auth verdict Cara did not reach. A checkout
+                // whose origin is not GitHub cannot name a repository to probe
+                // against, and reporting that as `unauthenticated` misdirects
+                // the reader toward credentials (bd-ce545f).
+                None if self.origin_is_not_github() => {
+                    "repository_unresolved_from_git_remotes".to_owned()
+                }
                 None => "gh_default_or_unauthenticated".to_owned(),
             }
         });
@@ -582,7 +611,17 @@ fn resolve_github_auth(
         .run(&CommandSpec::new("git").args(["config", "--get", "remote.origin.url"]))
         .ok()
         .filter(CommandOutput::is_success)?;
-    let repository = parse_github_remote(remote.stdout.trim())?;
+    let parsed = parse_github_remote(remote.stdout.trim());
+    // Record why a probe could not run. Collapsing "this checkout's origin is
+    // not GitHub" into an auth verdict sent readers to re-run `gh auth login`,
+    // mutating real credential state for a problem that was never about
+    // credentials (bd-ce545f).
+    GITHUB_REMOTE_IS_GITHUB
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(cwd.to_path_buf(), parsed.is_some());
+    let repository = parsed?;
     let key = repository.cache_key();
     let cache = GITHUB_AUTH_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(selection) = cache
@@ -1430,6 +1469,70 @@ mod tests {
         assert!(
             stderr.starts_with("diagnostic"),
             "the child's diagnostic must be preserved before any platform shell termination text: {stderr:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod repository_resolution_diagnostics_tests {
+    use super::*;
+
+    fn git(directory: &Path, args: &[&str]) {
+        let runner = ProcessRunner::in_directory(directory).without_github_auth_inference();
+        runner
+            .run(&CommandSpec::new("git").args(args.iter().copied()))
+            .expect("git command runs");
+    }
+
+    /// bd-ce545f: a managed checkout points at a local daemon mirror, so Cara
+    /// never reaches an auth verdict at all. Reporting that as
+    /// `gh_default_or_unauthenticated` sent readers to re-run `gh auth login`,
+    /// which mutates credential state for a problem that is not about
+    /// credentials.
+    #[test]
+    fn a_non_github_origin_is_reported_as_repository_resolution_not_auth() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path();
+        git(path, &["init", "-q", "."]);
+        git(
+            path,
+            &["remote", "add", "origin", "/tmp/local-daemon-mirror.git"],
+        );
+
+        let selection = resolve_github_auth(Some(path), None);
+        assert!(
+            selection.is_none(),
+            "a non-GitHub origin cannot name a repository to probe"
+        );
+
+        let runner = ProcessRunner::in_directory(path);
+        assert!(
+            runner.origin_is_not_github(),
+            "the probe must record why it could not run"
+        );
+    }
+
+    #[test]
+    fn a_github_origin_is_never_blamed_on_repository_resolution() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path();
+        git(path, &["init", "-q", "."]);
+        git(
+            path,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "ssh://git@github.com/harryaskham/caravan.git",
+            ],
+        );
+
+        let _ = resolve_github_auth(Some(path), None);
+
+        let runner = ProcessRunner::in_directory(path);
+        assert!(
+            !runner.origin_is_not_github(),
+            "a real GitHub remote keeps ordinary auth reporting"
         );
     }
 }
