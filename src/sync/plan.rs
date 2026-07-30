@@ -188,10 +188,18 @@ pub fn plan_sync(context: &AppContext, input: &SyncInput) -> Result<SyncPlanOutp
     )?;
     would_emit_events.sort();
     would_emit_events.dedup();
+    // MEASURED, not asserted. These two fields are the entire safety claim of a
+    // dry-run: every caller reads "NO PROVIDER WRITES" and authorises on it.
+    // Hardcoding them meant the plan would report zero even if a shared helper
+    // had written, because `prepare_physical_chains` runs against a real
+    // `GitHubMutationAdapter` and is the same code the mutating tick uses. A
+    // guarantee reported as a literal is a claim; counting it makes a violation
+    // visible instead of invisible (bd-216da5).
+    let provider_writes = super::completed_mutation_count(&progress);
     let output = SyncPlanOutput {
         schema_version: 1,
-        mutated: false,
-        provider_writes: 0,
+        mutated: provider_writes > 0,
+        provider_writes,
         local_ephemeral_preflight: context.config.rebase_on_join,
         repository: status.repository.clone(),
         default_branch: status.analysis.fleet.default_branch.clone(),

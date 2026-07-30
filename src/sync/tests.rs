@@ -1464,6 +1464,44 @@ fn skip_receipt_round_trips_and_invalidates_on_generation_change() {
     assert!(!skip_receipt_matches(&config_changed, &status, &receipt));
 }
 
+/// A dry-run's whole safety claim is `NO PROVIDER WRITES`. It must be COUNTED,
+/// never constructed.
+///
+/// `plan_sync` builds a real `GitHubMutationAdapter` and calls
+/// `prepare_physical_chains`, the same path the mutating tick uses. While
+/// `provider_writes` was a hardcoded `0`, a write introduced on that shared path
+/// would have been performed AND reported as zero, because the number was
+/// derived from nothing (bd-216da5).
+///
+/// Asserts the counter itself, so the plan's field cannot drift back to a
+/// literal without this failing.
+#[test]
+fn a_plan_counts_its_provider_writes_rather_than_asserting_none() {
+    let mut progress = SyncProgress::new(
+        &status(healthy_chain(), Some(PrNumber(1)), &clean),
+        Vec::new(),
+        u32::MAX,
+    );
+    assert_eq!(
+        completed_mutation_count(&progress),
+        0,
+        "a plan that performed nothing must count zero"
+    );
+
+    // One completed mutation must be visible to the same counter the plan reports.
+    progress.steps.push(crate::model::MutationStep {
+        kind: MutationKind::AddLabel,
+        state: MutationStepState::Completed,
+        pr: Some(PrNumber(1)),
+        summary: "simulated write on the shared physical path".to_owned(),
+    });
+    assert_eq!(
+        completed_mutation_count(&progress),
+        1,
+        "a write on the shared path must raise the count the plan reports, or the guarantee is unfalsifiable"
+    );
+}
+
 /// An operator holding a large pull request for review applies
 /// `caravan-join-skipped` by hand. There is no Cara receipt, because Cara did
 /// not write the label.
