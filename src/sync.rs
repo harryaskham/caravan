@@ -4812,8 +4812,25 @@ fn workflow_run_generation(
 }
 
 fn retryable_infrastructure(diagnostic: &WorkflowRunFailureDiagnostic) -> bool {
-    const INFRA_CONCLUSIONS: [&str; 4] =
-        ["timed_out", "startup_failure", "stale", "action_required"];
+    // A cancellation is a capacity or supersession event, not a verdict on the
+    // code: no test or lint step failed, the producer simply never produced a
+    // result. Excluding it from this set meant an operator freeing a busy runner
+    // turned a whole caravan red and required a human to re-trigger, because
+    // recovery only reruns what it classifies as infrastructure (bd-c04d9b).
+    //
+    // This does NOT make a cancelled run count as success anywhere. Absent
+    // validation still fails closed for admission and for merge; it only becomes
+    // eligible for the bounded rerun path, which is already opt-in via
+    // `--rerun-failed` and already bound to the exact current head, so a stale
+    // superseded generation is never resurrected.
+    const INFRA_CONCLUSIONS: [&str; 6] = [
+        "timed_out",
+        "startup_failure",
+        "stale",
+        "action_required",
+        "cancelled",
+        "canceled",
+    ];
     let conclusion_is_infra = |value: &str| {
         INFRA_CONCLUSIONS
             .iter()

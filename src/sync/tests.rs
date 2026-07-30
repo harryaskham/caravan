@@ -6563,3 +6563,49 @@ fn a_conflicting_unqueued_candidate_never_aborts_the_tick() {
         "the conflict stays reported for the candidate's owner"
     );
 }
+
+/// bd-c04d9b live shape (cacophony PR2208, run 30222268397): every producer job
+/// was CANCELLED under runner-capacity pressure, the aggregate required checks
+/// went FAILURE in six seconds without a single test or lint step failing, and a
+/// five-member caravan could not advance.
+///
+/// A cancellation is a capacity or supersession event, not a verdict on the
+/// code. Excluding it from the infrastructure set meant an operator freeing a
+/// busy runner turned a caravan red and needed a human to re-trigger.
+#[test]
+fn a_cancelled_producer_is_retryable_infrastructure_not_a_code_failure() {
+    let diagnostic = |conclusion: &str| crate::ci::WorkflowRunFailureDiagnostic {
+        run_id: 30_222_268_397,
+        attempt: 1,
+        workflow_id: 1,
+        check_suite_id: 1,
+        workflow_name: "Check & Lint".to_owned(),
+        event: "pull_request".to_owned(),
+        status: "completed".to_owned(),
+        conclusion: conclusion.to_owned(),
+        head_branch: "feature".to_owned(),
+        head_sha: CommitOid("79abc31d4efc07a579145cf904c83c1420f8b4ac".to_owned()),
+        expected_pr: PrNumber(2208),
+        expected_head_oid: CommitOid("79abc31d4efc07a579145cf904c83c1420f8b4ac".to_owned()),
+        expected_base_oid: CommitOid("base".to_owned()),
+        pull_requests: Vec::new(),
+        failed_jobs: Vec::new(),
+        jobs_total: 0,
+        jobs_truncated: false,
+    };
+
+    assert!(
+        retryable_infrastructure(&diagnostic("cancelled")),
+        "a cancelled producer must be recoverable by the bounded rerun path"
+    );
+    assert!(
+        retryable_infrastructure(&diagnostic("canceled")),
+        "the American spelling is the same event"
+    );
+    // A real code failure must NOT be swept into the retryable set: rerunning it
+    // would loop forever on work that will never go green by itself.
+    assert!(
+        !retryable_infrastructure(&diagnostic("failure")),
+        "a genuine failure is not infrastructure"
+    );
+}
