@@ -602,12 +602,22 @@ fn resolve_repository_root(directory: &Path) -> Result<PathBuf, ConfigError> {
     let runner =
         command::ProcessRunner::in_directory(directory).with_timeout(Duration::from_secs(5));
     let request = command::CommandSpec::new("git").args(["rev-parse", "--show-toplevel"]);
-    let output = runner
-        .run(&request)
-        .map_err(|error| ConfigError::RepositoryNotFound {
+    let output = runner.run(&request).map_err(|error| {
+        // A probe that did not FINISH is not a repository that does not EXIST.
+        // Mapping every runner failure to `RepositoryNotFound` sent readers to
+        // check paths and permissions after a 5s deadline expired under load on
+        // a perfectly valid checkout (bd-f42a5e).
+        if matches!(error, command::CommandRunError::Timeout { .. }) {
+            return ConfigError::RepositoryProbeTimeout {
+                path: directory.to_path_buf(),
+                message: error.to_string(),
+            };
+        }
+        ConfigError::RepositoryNotFound {
             path: directory.to_path_buf(),
             message: error.to_string(),
-        })?;
+        }
+    })?;
     if !output.is_success() || output.stdout.trim().is_empty() {
         let stderr = output.stderr.trim();
         return Err(ConfigError::RepositoryNotFound {
@@ -1808,6 +1818,33 @@ mod tests {
             context.repository_path,
             directory.path().canonicalize().unwrap()
         );
+    }
+
+    /// A probe that did not FINISH is not a repository that does not EXIST.
+    ///
+    /// The two need opposite responses: "not found" is terminal and sends a
+    /// reader to check paths, symlinks and permissions; a timed-out
+    /// `git rev-parse --show-toplevel` means the checkout is probably fine and
+    /// the filesystem was slow. Live: the 5s deadline expired twice under load
+    /// on a valid repository whose root resolved instantly by hand (bd-f42a5e).
+    #[test]
+    fn a_timed_out_repository_probe_is_not_a_missing_repository() {
+        let timeout = ConfigError::RepositoryProbeTimeout {
+            path: std::path::PathBuf::from("/repo"),
+            message: "`git rev-parse --show-toplevel` exceeded its 5000ms deadline".to_owned(),
+        };
+
+        assert_eq!(
+            mcp_cli::StructuredError::code(&timeout),
+            "repository_probe_timeout",
+            "a slow probe must not be reported as a missing worktree"
+        );
+        let details = mcp_cli::StructuredError::details(&timeout).expect("details");
+        assert_eq!(
+            details["retryable"], true,
+            "the remedy is to retry, not to go looking for the repository"
+        );
+        assert_eq!(details["mutated"], false);
     }
 
     #[test]

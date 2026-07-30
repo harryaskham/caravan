@@ -569,6 +569,18 @@ pub enum ConfigError {
         path: PathBuf,
         message: String,
     },
+    /// The repository probe did not FAIL, it did not FINISH.
+    ///
+    /// Distinct from [`Self::RepositoryNotFound`] because the remedy is
+    /// opposite: "not found" is terminal and sends a reader to check paths,
+    /// symlinks, and permissions, while a timed-out `git rev-parse` means the
+    /// repository is probably fine and the filesystem was slow. Live: a 5s probe
+    /// deadline expired twice under load on a valid checkout whose path resolved
+    /// instantly when run by hand (bd-f42a5e).
+    RepositoryProbeTimeout {
+        path: PathBuf,
+        message: String,
+    },
     Read {
         path: PathBuf,
         message: String,
@@ -606,6 +618,13 @@ impl std::fmt::Display for ConfigError {
             Self::RepositoryNotFound { path, message } => {
                 write!(formatter, "repository {}: {message}", path.display())
             }
+            Self::RepositoryProbeTimeout { path, message } => {
+                write!(
+                    formatter,
+                    "repository probe for {} did not finish: {message}",
+                    path.display()
+                )
+            }
             Self::Read { path, message } => {
                 write!(formatter, "read {}: {message}", path.display())
             }
@@ -636,6 +655,7 @@ impl StructuredError for ConfigError {
     fn code(&self) -> String {
         match self {
             Self::RepositoryNotFound { .. } => "repository_not_found",
+            Self::RepositoryProbeTimeout { .. } => "repository_probe_timeout",
             Self::Read { .. } => "config_read_failed",
             Self::Parse { .. } => "config_parse_failed",
             Self::UnsupportedVersion { .. } => "unsupported_config_version",
@@ -655,6 +675,13 @@ impl StructuredError for ConfigError {
                 "path": path,
                 "mutated": false,
                 "safe_next_action": "run Cara from inside a non-bare Git worktree"
+            })),
+            Self::RepositoryProbeTimeout { path, .. } => Some(json!({
+                "path": path,
+                "mutated": false,
+                "retryable": true,
+                "resumable": true,
+                "safe_next_action": "retry; the repository resolved but `git rev-parse --show-toplevel` exceeded its deadline, which is filesystem or load pressure rather than a missing worktree"
             })),
             Self::Read { path, .. } => Some(json!({ "path": path })),
             Self::Parse { path, .. } => path.as_ref().map(|path| json!({ "path": path })),

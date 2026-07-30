@@ -14,8 +14,39 @@ use super::{
 const MAX_SYNC_PLAN_ACTIONS: usize = 512;
 
 /// Build an exact, bounded sync plan without invoking any provider mutation.
-#[allow(clippy::too_many_lines)]
 pub fn plan_sync(context: &AppContext, input: &SyncInput) -> Result<SyncPlanOutput, AppError> {
+    // A plan cannot fail a mutation, because it performs none. The machinery is
+    // shared with the real tick, so a provider READ failure surfaced under the
+    // real tick's name: a TLS timeout on `gh api repos/...` was reported as
+    // `github_mutation_failed`, which tells the one reader who most needs the
+    // truth that a write was attempted (bd-070cdf).
+    plan_sync_inner(context, input).map_err(rename_mutation_failure_for_plan)
+}
+
+/// Rename a shared-machinery mutation failure for the no-write plan path.
+///
+/// Only the mutation name is corrected. Every other failure keeps its own
+/// identity, because the point is accuracy rather than suppression.
+pub(crate) fn rename_mutation_failure_for_plan(error: AppError) -> AppError {
+    if mcp_cli::StructuredError::code(&error) != "github_mutation_failed" {
+        return error;
+    }
+    let details = mcp_cli::StructuredError::details(&error);
+    AppError::structured(
+        mcp_cli::ErrorCategory::ExecutionFailure,
+        "plan_provider_unavailable",
+        format!("planning could not reach the provider: {error}"),
+        Some(details.unwrap_or_else(|| {
+            serde_json::json!({
+                "mutated": false,
+                "provider_writes": 0,
+            })
+        })),
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn plan_sync_inner(context: &AppContext, input: &SyncInput) -> Result<SyncPlanOutput, AppError> {
     let _lock = OperationLock::acquire(&context.repository_path, "plan-sync")?;
     let started = Instant::now();
     let operation_deadline = started + sync_operation_budget(context);

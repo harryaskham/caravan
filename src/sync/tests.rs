@@ -1515,6 +1515,43 @@ fn a_non_blocking_problem_neither_gates_the_fleet_nor_aborts_a_tick() {
     }
 }
 
+/// A plan cannot fail a mutation, because it performs none.
+///
+/// The machinery is shared with the real tick, so a provider READ failure
+/// surfaced under the real tick's name: a TLS timeout on `gh api repos/...`
+/// during repository preflight was reported as `github_mutation_failed`. That
+/// tells the one reader who most needs the truth, someone deciding whether to
+/// authorise a real tick, that a write was attempted (bd-070cdf).
+#[test]
+fn a_plan_never_reports_a_mutation_failure() {
+    let mutation_flavoured = AppError::structured(
+        mcp_cli::ErrorCategory::ExecutionFailure,
+        "github_mutation_failed",
+        "`gh api repos/owner/name` failed: TLS handshake timeout".to_owned(),
+        Some(serde_json::json!({"provider_receipts": [], "resumable": true})),
+    );
+
+    let mapped = crate::sync::plan::rename_mutation_failure_for_plan(mutation_flavoured);
+
+    assert_eq!(
+        mcp_cli::StructuredError::code(&mapped),
+        "plan_provider_unavailable",
+        "a no-write plan must not name a mutation it cannot perform"
+    );
+    // An unrelated failure keeps its own identity.
+    let other = AppError::structured(
+        mcp_cli::ErrorCategory::Timeout,
+        "github_discovery_timeout",
+        "slow".to_owned(),
+        None,
+    );
+    assert_eq!(
+        mcp_cli::StructuredError::code(&crate::sync::plan::rename_mutation_failure_for_plan(other)),
+        "github_discovery_timeout",
+        "only the mutation name is corrected; other failures are untouched"
+    );
+}
+
 /// A dry-run's whole safety claim is `NO PROVIDER WRITES`. It must be COUNTED,
 /// never constructed.
 ///
