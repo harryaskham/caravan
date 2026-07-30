@@ -311,6 +311,14 @@ pub fn derive_for_actor(snapshot: &RepositorySnapshot, actor: HeadMergeActor) ->
 
     let mut active = BTreeMap::new();
     let mut merged_by_head = BTreeMap::new();
+    // A caravan member that is CLOSED rather than merged has left the chain
+    // without landing, which is what a republished generation looks like: the
+    // author opens a successor PR on a new branch and closes this one. Membership
+    // is recomputed from labels on every read, so the departure leaves no trace
+    // of itself — the only evidence is a surviving child still based on the
+    // branch. Remember those branches so the resulting dangling base can name
+    // what left instead of reporting an anonymous non-member branch (bd-d897cc).
+    let mut departed_by_head = BTreeMap::new();
     for pull_request in pull_requests.values() {
         if pull_request.state == PullRequestState::Merged && pull_request.has_label("caravan") {
             merged_by_head.insert(pull_request.head.name.clone(), pull_request.number);
@@ -330,6 +338,10 @@ pub fn derive_for_actor(snapshot: &RepositorySnapshot, actor: HeadMergeActor) ->
                     pull_request.number.0
                 ),
             });
+            // Remember the branch too, so the surviving tail bd-461c8b names
+            // above can say WHICH member it lost rather than reporting an
+            // anonymous non-member branch (bd-d897cc).
+            departed_by_head.insert(pull_request.head.name.clone(), pull_request.number);
         }
         if pull_request.state == PullRequestState::Open
             && pull_request.has_label("caravan")
@@ -437,25 +449,33 @@ pub fn derive_for_actor(snapshot: &RepositorySnapshot, actor: HeadMergeActor) ->
             None => {
                 roots.insert(pull_request.number);
                 let merged = merged_by_head.get(&pull_request.base.name).copied();
+                let departed = merged
+                    .is_none()
+                    .then(|| departed_by_head.get(&pull_request.base.name).copied())
+                    .flatten();
                 problems.push(GraphProblem {
                     kind: GraphProblemKind::DanglingBase,
                     prs: std::iter::once(pull_request.number)
                         .chain(merged)
+                        .chain(departed)
                         .collect(),
-                    message: merged.map_or_else(
-                        || {
-                            format!(
-                                "PR #{} targets non-member branch `{}`",
-                                pull_request.number, pull_request.base.name
-                            )
-                        },
-                        |merged| {
-                            format!(
-                                "PR #{} still targets merged predecessor #{}; sync must advance it to `{}`",
-                                pull_request.number, merged, snapshot.default_branch.name
-                            )
-                        },
-                    ),
+                    message: match (merged, departed) {
+                        (Some(merged), _) => format!(
+                            "PR #{} still targets merged predecessor #{}; sync must advance it to `{}`",
+                            pull_request.number, merged, snapshot.default_branch.name
+                        ),
+                        (None, Some(departed)) => format!(
+                            "PR #{} is stranded on branch `{}` of caravan member #{departed}, which was closed without merging; \
+                             the caravan lost that member and this PR must be rebased onto `{}` or evicted",
+                            pull_request.number,
+                            pull_request.base.name,
+                            snapshot.default_branch.name
+                        ),
+                        (None, None) => format!(
+                            "PR #{} targets non-member branch `{}`",
+                            pull_request.number, pull_request.base.name
+                        ),
+                    },
                 });
             }
         }
@@ -1219,6 +1239,57 @@ mod tests {
         evicted.labels = BTreeSet::from(["caravan-evicted".to_owned()]);
         let analysis = derive(&snapshot(vec![ready, draft, evicted]));
         assert_eq!(analysis.fleet.unqueued, vec![PrNumber(1)]);
+    }
+
+    /// Live regression (bd-d897cc): the first caravan on Cacophony dissolved
+    /// when its member was republished as a new generation — the author closed
+    /// the member without merging and opened a successor on a new branch.
+    /// Membership is recomputed from labels on every read, so the departure
+    /// left no trace, and any surviving child reported only that it targeted an
+    /// anonymous "non-member branch". A stranded tail must name the member that
+    /// left, or the operator cannot tell a republished chain apart from a PR
+    /// pointed at a branch that never belonged to a caravan.
+    #[test]
+    fn a_child_stranded_by_a_closed_member_names_the_member_that_left() {
+        let mut departed = pull_request(2287, "first-caravan", "main");
+        departed.state = PullRequestState::Closed;
+        let analysis = derive(&snapshot(vec![
+            departed,
+            pull_request(2288, "stacked-on-it", "first-caravan"),
+        ]));
+
+        let problem = analysis
+            .fleet
+            .problems
+            .iter()
+            .find(|problem| problem.kind == GraphProblemKind::DanglingBase)
+            .expect("a child of a departed member is a dangling base");
+        assert_eq!(problem.prs, vec![PrNumber(2288), PrNumber(2287)]);
+        assert!(
+            problem.message.contains("#2287"),
+            "the departed member must be named, got: {}",
+            problem.message
+        );
+        assert!(
+            problem.message.contains("closed without merging"),
+            "the reason for the strand must be stated, got: {}",
+            problem.message
+        );
+    }
+
+    /// A base branch that never belonged to a caravan stays anonymous: only a
+    /// departed *member* earns the named diagnosis above.
+    #[test]
+    fn a_child_of_an_unrelated_branch_is_still_an_anonymous_dangling_base() {
+        let analysis = derive(&snapshot(vec![pull_request(11, "next", "someones-branch")]));
+        let problem = analysis
+            .fleet
+            .problems
+            .iter()
+            .find(|problem| problem.kind == GraphProblemKind::DanglingBase)
+            .expect("an unrelated base is still dangling");
+        assert_eq!(problem.prs, vec![PrNumber(11)]);
+        assert!(problem.message.contains("non-member branch"));
     }
 
     #[test]
