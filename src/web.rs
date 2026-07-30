@@ -2521,6 +2521,7 @@ mod tests {
                 path: "/tmp/test/events-v1.jsonl".to_owned(),
                 present: true,
                 archives: 0,
+                unreadable_records: 0,
             },
         });
         assert!(bounded.records.is_empty());

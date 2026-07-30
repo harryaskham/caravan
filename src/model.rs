@@ -544,6 +544,16 @@ pub enum GraphProblemKind {
     DissolvedMember,
     AmbiguousGeneration,
     InvalidGenerationMetadata,
+    /// Any kind this reader does not know, including one written by a newer
+    /// Cara.
+    ///
+    /// Without `serde(other)`, an older reader hitting a newer variant aborts
+    /// the whole operation on a journal that is perfectly valid: a 0.0.22 cron
+    /// died on `candidate_incompatible` written by 0.0.51, and the failure read
+    /// as journal corruption rather than version skew. An unknown kind is
+    /// treated as fleet-blocking, so tolerance here never silently downgrades a
+    /// problem a newer Cara considered serious (bd-35a9fd).
+    #[serde(other)]
     Unknown,
 }
 

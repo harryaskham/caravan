@@ -1135,3 +1135,11 @@ mutating tick, which refuses with `invalid_tick_bounds` (`operator_action`). A
 read is never blocked by a bound it does not consume: `cara status`, `cara
 check`, `cara log`, and `cara sync --dry-run` stay available while such a bound
 is invalid, because those are the surfaces needed to diagnose it.
+
+The journal is append-only observability, never a decision input, so a record
+this binary cannot parse is skipped and counted rather than aborting the
+operation. `log.source.unreadable_records` reports the count and human `cara log`
+names it, because a non-zero value usually means a newer Cara wrote record types
+this binary does not know. Unknown `GraphProblemKind` values likewise deserialize
+to `unknown`, which is fleet-blocking, so forward tolerance never downgrades a
+problem a newer Cara considered serious.

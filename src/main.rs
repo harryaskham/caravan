@@ -463,6 +463,14 @@ fn run_log(cli: &Cli, command: &LogCommand) -> Result<(), i32> {
                 // evidence that no tick ran anywhere: 248 records once sat in a
                 // sibling checkout while this surface reported nothing
                 // (bd-768f80). Name the exact file rather than stay silent.
+                if output.source.unreadable_records > 0 {
+                    eprintln!(
+                        "{} skipped {} unreadable record(s) in {} — usually a newer Cara wrote record types this binary does not know",
+                        warning("log:"),
+                        output.source.unreadable_records,
+                        output.source.path
+                    );
+                }
                 if output.matching_records == 0 {
                     if output.source.empty_result_is_uninformative() {
                         eprintln!(

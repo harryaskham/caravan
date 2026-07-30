@@ -151,6 +151,13 @@ pub struct JournalSource {
     pub present: bool,
     /// Count of archived journal segments alongside the active file.
     pub archives: usize,
+    /// Records this reader could not parse and skipped rather than aborting on.
+    ///
+    /// Non-zero usually means a newer Cara wrote record types this binary does
+    /// not know. Tolerating them keeps the queue running; reporting them keeps
+    /// the tolerance visible (bd-35a9fd).
+    #[serde(default)]
+    pub unreadable_records: usize,
 }
 
 impl JournalSource {
@@ -209,38 +216,41 @@ pub fn snapshot(context: &AppContext, input: &LogInput) -> Result<LogOutput, App
         .map_err(|error| io_error("journal_directory_failed", &error))?;
     let lock = open_lock(&paths.lock)?;
     FileExt::lock_shared(&lock).map_err(|error| io_error("journal_lock_failed", &error))?;
-    let result = read_all_locked(&paths, context.config.journal.max_archives).map(|records| {
-        let filtered: Vec<_> = records
-            .into_iter()
-            .filter(|record| kind.is_none_or(|kind| record.kind() == kind))
-            .filter(|record| input.pr.is_none_or(|pr| record.contains_pr(PrNumber(pr))))
-            .filter(|record| {
-                input
-                    .since
-                    .as_deref()
-                    .is_none_or(|since| record.timestamp() >= since)
-            })
-            .filter(|record| {
-                input
-                    .until
-                    .as_deref()
-                    .is_none_or(|until| record.timestamp() <= until)
-            })
-            .collect();
-        let matching_records = filtered.len();
-        let start = matching_records.saturating_sub(input.limit);
-        LogOutput {
-            records: filtered.into_iter().skip(start).collect(),
-            limit: input.limit,
-            matching_records,
-            truncated: start > 0,
-            source: JournalSource {
-                path: paths.active.display().to_string(),
-                present: paths.active.exists(),
-                archives: archive_count(&paths),
-            },
-        }
-    });
+    let result = read_all_locked(&paths, context.config.journal.max_archives).map(
+        |(records, unreadable)| {
+            let filtered: Vec<_> = records
+                .into_iter()
+                .filter(|record| kind.is_none_or(|kind| record.kind() == kind))
+                .filter(|record| input.pr.is_none_or(|pr| record.contains_pr(PrNumber(pr))))
+                .filter(|record| {
+                    input
+                        .since
+                        .as_deref()
+                        .is_none_or(|since| record.timestamp() >= since)
+                })
+                .filter(|record| {
+                    input
+                        .until
+                        .as_deref()
+                        .is_none_or(|until| record.timestamp() <= until)
+                })
+                .collect();
+            let matching_records = filtered.len();
+            let start = matching_records.saturating_sub(input.limit);
+            LogOutput {
+                records: filtered.into_iter().skip(start).collect(),
+                limit: input.limit,
+                matching_records,
+                truncated: start > 0,
+                source: JournalSource {
+                    path: paths.active.display().to_string(),
+                    present: paths.active.exists(),
+                    archives: archive_count(&paths),
+                    unreadable_records: unreadable,
+                },
+            }
+        },
+    );
     let _ = FileExt::unlock(&lock);
     result
 }
@@ -309,6 +319,7 @@ fn append(
         recover_truncated_tail(&paths.active)?;
         if matches!(record, JournalRecord::Event { .. })
             && read_all_locked(&paths, config.max_archives)?
+                .0
                 .iter()
                 .any(|existing| {
                     matches!(existing, JournalRecord::Event { .. })
@@ -384,19 +395,20 @@ fn rotate(paths: &JournalPaths, max_archives: u32) -> Result<(), AppError> {
 fn read_all_locked(
     paths: &JournalPaths,
     max_archives: u32,
-) -> Result<Vec<JournalRecord>, AppError> {
+) -> Result<(Vec<JournalRecord>, usize), AppError> {
     let mut records = Vec::new();
+    let mut unreadable = 0;
     for index in (1..=max_archives).rev() {
-        read_file(&archive_path(&paths.active, index), &mut records)?;
+        unreadable += read_file(&archive_path(&paths.active, index), &mut records)?;
     }
-    read_file(&paths.active, &mut records)?;
-    Ok(records)
+    unreadable += read_file(&paths.active, &mut records)?;
+    Ok((records, unreadable))
 }
 
-fn read_file(path: &Path, records: &mut Vec<JournalRecord>) -> Result<(), AppError> {
+fn read_file(path: &Path, records: &mut Vec<JournalRecord>) -> Result<usize, AppError> {
     let file = match File::open(path) {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(error) => return Err(io_error("journal_read_failed", &error)),
     };
     let length = file
@@ -405,6 +417,7 @@ fn read_file(path: &Path, records: &mut Vec<JournalRecord>) -> Result<(), AppErr
         .len();
     let mut reader = BufReader::new(file);
     let mut consumed = 0_u64;
+    let mut skipped = 0_usize;
     loop {
         let mut line = String::new();
         let bytes = reader
@@ -420,20 +433,15 @@ fn read_file(path: &Path, records: &mut Vec<JournalRecord>) -> Result<(), AppErr
         match serde_json::from_str(line.trim_end()) {
             Ok(record) => records.push(record),
             Err(_) if consumed == length && !line.ends_with('\n') => break,
-            Err(error) => {
-                return Err(AppError::structured(
-                    ErrorCategory::SerializationError,
-                    "journal_record_invalid",
-                    format!(
-                        "invalid complete journal record in {}: {error}",
-                        path.display()
-                    ),
-                    None,
-                ));
-            }
+            // The journal is append-only observability, never a decision input.
+            // Aborting on one line it cannot parse killed every scheduled sync
+            // on a file that was perfectly valid, because an older reader met a
+            // record type a newer Cara had written. Skipping keeps the queue
+            // running and the operator still sees the count (bd-35a9fd).
+            Err(_) => skipped += 1,
         }
     }
-    Ok(())
+    Ok(skipped)
 }
 
 fn validate_input(input: &LogInput) -> Result<(), AppError> {
@@ -732,6 +740,7 @@ mod provenance_tests {
             path: "/checkout-b/.git/caravan/events-v1.jsonl".to_owned(),
             present: false,
             archives: 0,
+            unreadable_records: 0,
         };
 
         assert!(
@@ -746,6 +755,7 @@ mod provenance_tests {
             path: "/checkout-a/.git/caravan/events-v1.jsonl".to_owned(),
             present: true,
             archives: 2,
+            unreadable_records: 0,
         };
 
         assert!(
@@ -755,6 +765,63 @@ mod provenance_tests {
         assert_eq!(
             source.archives, 2,
             "archived segments are local evidence too"
+        );
+    }
+}
+
+#[cfg(test)]
+mod forward_compatibility_tests {
+    use super::*;
+
+    /// bd-35a9fd: a 0.0.22 cron died on `candidate_incompatible` written by
+    /// 0.0.51 and reported it as an invalid journal. The journal was perfectly
+    /// valid; the reader was too old to know the word. An append-only
+    /// observability log must never stop the queue.
+    #[test]
+    fn an_unparseable_record_is_skipped_and_counted_not_fatal() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events-v1.jsonl");
+        let known = serde_json::to_string(&JournalRecord::Event {
+            version: JOURNAL_VERSION,
+            event: crate::hooks::event(
+                crate::model::EventKind::SyncFailed,
+                crate::model::OperationId::new(),
+                crate::model::RepositoryId {
+                    owner: "acme".to_owned(),
+                    name: "widgets".to_owned(),
+                },
+                None,
+                Vec::new(),
+                None,
+                None,
+                std::collections::BTreeMap::new(),
+            ),
+        })
+        .unwrap();
+        std::fs::write(
+            &path,
+            format!("{known}\n{{\"kind\":\"from_a_newer_cara\",\"v\":99}}\n{known}\n"),
+        )
+        .unwrap();
+
+        let mut records = Vec::new();
+        let skipped = read_file(&path, &mut records).expect("an unknown record is never fatal");
+
+        assert_eq!(records.len(), 2, "every readable record still arrives");
+        assert_eq!(skipped, 1, "the tolerance is counted, never silent");
+    }
+
+    /// A newer graph-problem kind must degrade to `Unknown`, and `Unknown` is
+    /// fleet-blocking so tolerance never downgrades a serious problem.
+    #[test]
+    fn an_unknown_graph_problem_kind_deserializes_and_still_blocks() {
+        let kind: crate::model::GraphProblemKind =
+            serde_json::from_str("\"some_future_kind\"").expect("unknown kinds are tolerated");
+
+        assert_eq!(kind, crate::model::GraphProblemKind::Unknown);
+        assert!(
+            kind.blocks_fleet(),
+            "an unrecognised problem is never assumed harmless"
         );
     }
 }
