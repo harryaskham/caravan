@@ -7045,3 +7045,38 @@ fn a_real_failing_step_is_never_reported_as_cancellation_only() {
         "a named failing step is a genuine verdict"
     );
 }
+
+/// bd-6f234e: a stale sync worktree applied policy the repository had already
+/// replaced, for days, while every question it answered looked plausible. A
+/// mutating tick must refuse; a deliberate branch proposal must not.
+#[test]
+fn a_tick_refuses_policy_read_from_a_checkout_behind_the_default_branch() {
+    let stale = crate::config_provenance::ConfigProvenance {
+        schema_version: 1,
+        relation: crate::config_provenance::ConfigRelation::DiffersFromDefaultBranch,
+        current_branch: Some("agent/ms-dev-3/cacophony/abandoned".to_owned()),
+        default_branch_ref: Some("origin/main".to_owned()),
+        reason: "stale".to_owned(),
+        behind_default_branch: Some(95),
+    };
+    let mut status = status(healthy_chain(), Some(PrNumber(1)), &clean);
+    status.config_provenance = Some(stale.clone());
+
+    let error = crate::sync::require_current_policy(&status)
+        .expect_err("a tick must never mutate under superseded policy");
+    assert_eq!(
+        mcp_cli::StructuredError::code(&error),
+        "stale_repository_policy"
+    );
+    let details = mcp_cli::StructuredError::details(&error).expect("evidence");
+    assert_eq!(details["provenance"]["behind_default_branch"], 95);
+    assert_eq!(details["operator_action_required"], true);
+
+    // An up-to-date branch deliberately proposing different policy still runs.
+    status.config_provenance = Some(crate::config_provenance::ConfigProvenance {
+        behind_default_branch: Some(0),
+        ..stale
+    });
+    crate::sync::require_current_policy(&status)
+        .expect("a current branch proposal is legitimate policy");
+}

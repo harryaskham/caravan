@@ -2169,7 +2169,14 @@ fn render_status(output: &caravan::read::StatusOutput) -> String {
         .as_ref()
         .filter(|provenance| provenance.is_branch_local_proposal())
     {
-        let _ = writeln!(text, "  {} {}", warning("config:"), provenance.reason);
+        // A stale checkout is louder than a deliberate proposal: the operator's
+        // current policy was never read at all (bd-6f234e).
+        let label = if provenance.is_stale_policy() {
+            "STALE CONFIG:"
+        } else {
+            "config:"
+        };
+        let _ = writeln!(text, "  {} {}", warning(label), provenance.reason);
     }
     let current = output
         .current_pr

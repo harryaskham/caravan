@@ -60,6 +60,27 @@ pub struct ConfigProvenance {
     pub default_branch_ref: Option<String>,
     /// Exact explanation, safe to show an operator.
     pub reason: String,
+    /// Commits this checkout is behind the recorded default branch.
+    ///
+    /// A sync worktree was found parked on a dead agent's branch 95 commits
+    /// behind main, so every policy value came from a three-day-old commit and
+    /// nothing noticed. The distance is locally available and costs one
+    /// `rev-list --count`, so it is always reported (bd-6f234e).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behind_default_branch: Option<usize>,
+}
+
+impl ConfigProvenance {
+    /// Whether the effective policy is provably an older generation's.
+    ///
+    /// Differing content alone is a deliberate branch proposal, which is
+    /// legitimate. Differing content *from a checkout that is behind* is the
+    /// stale-worktree shape: the operator's current policy was never read.
+    #[must_use]
+    pub fn is_stale_policy(&self) -> bool {
+        self.relation == ConfigRelation::DiffersFromDefaultBranch
+            && self.behind_default_branch.is_some_and(|behind| behind > 0)
+    }
 }
 
 impl ConfigProvenance {
@@ -81,6 +102,7 @@ pub fn resolve(repository_path: &Path, config_relative: &Path, explicit: bool) -
             current_branch: None,
             default_branch_ref: None,
             reason: "explicit --config always wins over repository policy".to_owned(),
+            behind_default_branch: None,
         };
     }
     let runner = ProcessRunner::in_directory(repository_path).with_timeout(Duration::from_secs(5));
@@ -97,6 +119,7 @@ pub fn resolve(repository_path: &Path, config_relative: &Path, explicit: bool) -
             current_branch,
             default_branch_ref,
             reason: "no local refs/remotes/origin/HEAD, so the default branch is unknown; the working tree config is being used unchecked".to_owned(),
+            behind_default_branch: None,
         };
     };
     // `origin/trunk` -> `trunk`. The default branch is never assumed to be
@@ -104,6 +127,14 @@ pub fn resolve(repository_path: &Path, config_relative: &Path, explicit: bool) -
     let default_branch = default_ref
         .split_once('/')
         .map_or(default_ref.as_str(), |(_, branch)| branch);
+
+    // One cheap local count. Nothing else in Cara noticed that a worktree can
+    // be arbitrarily far behind while still answering every question.
+    let behind_default_branch = probe(
+        &runner,
+        &["rev-list", "--count", &format!("HEAD..{default_ref}")],
+    )
+    .and_then(|value| value.trim().parse::<usize>().ok());
 
     if current_branch.as_deref() == Some(default_branch) {
         return ConfigProvenance {
@@ -114,6 +145,7 @@ pub fn resolve(repository_path: &Path, config_relative: &Path, explicit: bool) -
             reason: format!(
                 "checkout is on the default branch `{default_branch}`, so the working tree is the repository policy"
             ),
+            behind_default_branch,
         };
     }
 
@@ -144,12 +176,22 @@ pub fn resolve(repository_path: &Path, config_relative: &Path, explicit: bool) -
         ),
         _ => format!("could not compare the working tree config against `{default_ref}`"),
     };
+    let reason = match behind_default_branch {
+        Some(behind) if behind > 0 && relation == ConfigRelation::DiffersFromDefaultBranch => {
+            format!(
+                "{reason}; the checkout is also {behind} commit(s) behind, so this policy is an older generation, not a current proposal"
+            )
+        }
+        Some(behind) if behind > 0 => format!("{reason}; checkout is {behind} commit(s) behind"),
+        _ => reason,
+    };
     ConfigProvenance {
         schema_version: 1,
         relation,
         current_branch,
         default_branch_ref,
         reason,
+        behind_default_branch,
     }
 }
 
@@ -190,8 +232,45 @@ mod tests {
                 current_branch: None,
                 default_branch_ref: None,
                 reason: String::new(),
+                behind_default_branch: None,
             }
             .is_branch_local_proposal()
+        );
+    }
+
+    /// bd-6f234e: a sync worktree parked on a dead agent's branch 95 commits
+    /// behind main read every policy value from a three-day-old commit, and
+    /// nothing noticed. Differing config alone is a legitimate branch proposal;
+    /// differing config from a checkout that is *behind* is stale policy.
+    #[test]
+    fn a_behind_checkout_with_differing_config_is_stale_policy_not_a_proposal() {
+        let stale = ConfigProvenance {
+            schema_version: 1,
+            relation: ConfigRelation::DiffersFromDefaultBranch,
+            current_branch: Some("agent/ms-dev-3/cacophony/abandoned".to_owned()),
+            default_branch_ref: Some("origin/main".to_owned()),
+            reason: String::new(),
+            behind_default_branch: Some(95),
+        };
+        assert!(stale.is_stale_policy());
+        assert!(stale.is_branch_local_proposal());
+
+        let current_proposal = ConfigProvenance {
+            behind_default_branch: Some(0),
+            ..stale.clone()
+        };
+        assert!(
+            !current_proposal.is_stale_policy(),
+            "an up-to-date branch proposing new policy is legitimate"
+        );
+
+        let identical_but_behind = ConfigProvenance {
+            relation: ConfigRelation::MatchesDefaultBranch,
+            ..stale
+        };
+        assert!(
+            !identical_but_behind.is_stale_policy(),
+            "byte-identical policy is unaffected by unrelated commits"
         );
     }
 }

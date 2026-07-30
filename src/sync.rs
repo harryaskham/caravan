@@ -2595,6 +2595,7 @@ fn sync_with_lock(
         ),
     );
     crate::initialization::require_ready(&status.initialization)?;
+    require_current_policy(&status)?;
     let runner = crate::command::ProcessRunner::in_directory(&context.repository_path)
         .with_timeout(timeout)
         .with_operation_deadline(operation_deadline)
@@ -7367,4 +7368,36 @@ fn classify_cancellation(
         failures_without_failing_step,
         cancellation_only,
     }
+}
+
+/// Refuse a mutating tick whose policy provably came from an older generation.
+///
+/// A sync worktree was found parked on a dead agent's branch 95 commits behind
+/// main. Every value the queue read — including its own duration budget — came
+/// from a three-day-old commit, the operator's current policy was never read,
+/// and nothing noticed for days. The distance was locally available the whole
+/// time; only nothing consulted it. A deliberate branch proposal is still
+/// allowed: refusal requires differing policy *and* a checkout that is behind
+/// (bd-6f234e).
+fn require_current_policy(status: &StatusOutput) -> Result<(), AppError> {
+    let Some(provenance) = status
+        .config_provenance
+        .as_ref()
+        .filter(|provenance| provenance.is_stale_policy())
+    else {
+        return Ok(());
+    };
+    Err(AppError::structured(
+        ErrorCategory::Validation,
+        "stale_repository_policy",
+        "the effective configuration came from a checkout behind the default branch",
+        Some(json!({
+            "provenance": provenance,
+            "resumable": true,
+            "operator_action_required": true,
+            "next": "update this checkout to the current default branch, then rerun the same idempotent sync",
+            "safe_next_action": "`git fetch origin` then reset or check out the recorded default branch in the sync worktree",
+            "why": "every admission, budget, and hook decision is read from this config; an older generation silently applies policy the repository has already replaced",
+        })),
+    ))
 }

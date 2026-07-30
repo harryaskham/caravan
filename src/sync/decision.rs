@@ -422,6 +422,7 @@ pub(super) fn successful_scheduler_status(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn scheduler_failure_status(error: &AppError) -> SyncFailureSchedulerStatus {
     let error_code = error.code();
     let decision = error.details().and_then(|details| {
@@ -501,6 +502,7 @@ pub(super) fn scheduler_failure_status(error: &AppError) -> SyncFailureScheduler
         None if matches!(
             error_code.as_str(),
             "default_branch_not_protected"
+                | "stale_repository_policy"
                 | "physical_sync_budget_insufficient"
                 | "rebase_ci_trigger_missing"
                 | "repository_not_initialized"
