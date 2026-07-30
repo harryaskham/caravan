@@ -26,6 +26,21 @@ pub(super) fn checkout_for_decision(
     let Some(target) = target else {
         return error;
     };
+    // An unattended sync worktree must not silently become whatever PR was last
+    // inspected. Skipping is recorded, not implied, so the between-runs state of
+    // the worktree is always explained (bd-6f234e).
+    if !context.config.sync.checkout_on_decision {
+        return attach_checkout_evidence(
+            &error,
+            details,
+            json!({
+                "state": "skipped",
+                "pr": target,
+                "reason": "sync.checkout_on_decision is disabled, so the working tree is left on its base",
+                "next": "check out the affected PR explicitly to repair it, or re-enable sync.checkout_on_decision for interactive use",
+            }),
+        );
+    }
     let Some(pull_request) = decision_checkout_pull_request(&decision, target) else {
         return attach_checkout_evidence(
             &error,

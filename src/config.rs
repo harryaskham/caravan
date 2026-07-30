@@ -74,6 +74,11 @@ fn default_sync_max_github_requests_per_tick() -> u32 {
     256
 }
 
+/// Historical behaviour: leave the operator on the PR that needs repairing.
+const fn default_checkout_on_decision() -> bool {
+    true
+}
+
 fn default_sync_max_duration_secs() -> u64 {
     120
 }
@@ -179,6 +184,17 @@ pub struct SyncActionsConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct SyncConfig {
     pub actions: SyncActionsConfig,
+    /// Leave the working tree checked out on a decision's PR so it can be
+    /// repaired in place.
+    ///
+    /// True is the historical behaviour and is right for an interactive
+    /// checkout. It is wrong for an unattended sync worktree: cara checks out a
+    /// PR to evaluate a decision and never returns, so the worktree silently
+    /// becomes whatever PR was last inspected. One was found parked on a dead
+    /// agent's branch 95 commits behind main, and every value read from it came
+    /// from that old commit (bd-6f234e).
+    #[serde(default = "default_checkout_on_decision")]
+    pub checkout_on_decision: bool,
     /// Maximum fresh candidate generations considered by one `sync --all` tick.
     pub max_candidates_per_tick: u32,
     /// Maximum completed provider/branch mutations retained by one tick.
@@ -271,6 +287,7 @@ impl Default for SyncConfig {
             max_candidates_per_tick: default_sync_max_candidates_per_tick(),
             max_mutations_per_tick: default_sync_max_mutations_per_tick(),
             max_github_requests_per_tick: default_sync_max_github_requests_per_tick(),
+            checkout_on_decision: default_checkout_on_decision(),
             max_duration_secs: default_sync_max_duration_secs(),
             missing_required_runs_grace_secs: default_missing_required_runs_grace_secs(),
             retrigger_missing_required_runs: true,
@@ -1089,5 +1106,41 @@ hooks:
         let error = CaravanConfig::load(&path).unwrap_err();
         assert_eq!(error.code(), "config_parse_failed");
         assert_eq!(error.details().unwrap()["path"], json!(path));
+    }
+}
+
+#[cfg(test)]
+mod decision_checkout_policy_tests {
+    use super::*;
+
+    /// bd-6f234e: cara checks out a PR to evaluate a decision and never returns
+    /// the worktree to its base, so an unattended sync worktree silently becomes
+    /// whatever PR was last inspected. Interactive use still wants that, so the
+    /// historical behaviour stays the default and unattended callers opt out.
+    #[test]
+    fn decision_checkout_defaults_to_the_historical_interactive_behaviour() {
+        assert!(CaravanConfig::default().sync.checkout_on_decision);
+    }
+
+    #[test]
+    fn an_unattended_worktree_can_opt_out_without_touching_other_policy() {
+        let config: CaravanConfig = serde_yaml::from_str(
+            r"
+version: 1
+force_merge: false
+rebase_on_join: false
+command_timeout_secs: 30
+sync:
+  checkout_on_decision: false
+",
+        )
+        .expect("partial config uses defaults for every unset field");
+
+        assert!(!config.sync.checkout_on_decision);
+        assert_eq!(
+            config.sync.max_duration_secs,
+            default_sync_max_duration_secs(),
+            "opting out must not silently change any other bound"
+        );
     }
 }

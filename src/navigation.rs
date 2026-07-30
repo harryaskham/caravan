@@ -98,8 +98,7 @@ pub fn checkout_decision_snapshot(
             context.config.command_timeout_secs,
         ))
         .with_operation_deadline(operation_deadline);
-    ensure_safe_worktree(&context.repository_path, &context.config_path, &runner)?;
-    // The decision already embeds the exact provider snapshot. checkout_exact
+    ensure_safe_worktree(&context.repository_path, &context.config_path, &runner)?; // The decision already embeds the exact provider snapshot. checkout_exact
     // verifies the remote branch still advertises that OID, avoiding a third
     // full repository discovery during an already-bounded sync decision.
     let _reconciliation = checkout_exact(
