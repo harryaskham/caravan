@@ -3503,10 +3503,6 @@ mod tests {
         discovery.runner.assert_exhausted();
     }
 
-    /// bd-cd3be9: generation facts must include recently merged labelled PRs,
-    /// or a candidate strictly contained by already-landed work stays a live
-    /// ordered admission attempt forever.
-    #[test]
     /// GitHub returns an explicit null rollup for a pull request that never ran
     /// checks, and `#[serde(default)]` covers a MISSING field, not a null one.
     ///
@@ -3530,6 +3526,9 @@ mod tests {
         );
     }
 
+    /// bd-cd3be9: generation facts must include recently merged labelled PRs,
+    /// or a candidate strictly contained by already-landed work stays a live
+    /// ordered admission attempt forever.
     #[test]
     fn generation_facts_include_recently_merged_labelled_prs() {
         let repository = repository();
