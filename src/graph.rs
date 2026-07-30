@@ -969,9 +969,13 @@ mod tests {
             vec![2287],
             "a sole closed member leaves nothing to dangle, so the dissolution must be reported directly"
         );
+        // Reported, NOT gated. Wiring the detection to real discovery surfaced
+        // three historical dissolutions at once; blocking on them turned the
+        // live fleet unhealthy with no action available that would ever clear
+        // it, because a closed pull request never changes (bd-61024a).
         assert!(
-            !analysis.healthy(),
-            "a dissolved caravan is a decision point, not a healthy fleet"
+            analysis.healthy(),
+            "a dissolution already happened: there is no chain left to protect, so it must not wedge the fleet"
         );
 
         // The shape with a survivor: still reported, and still dangling.

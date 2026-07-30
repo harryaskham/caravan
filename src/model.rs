@@ -571,20 +571,39 @@ impl GraphProblemKind {
             | Self::Incompatible
             | Self::ReusedBranchProvenance
             | Self::SupersededGeneration
-            | Self::DissolvedMember
             | Self::AmbiguousGeneration
             | Self::InvalidGenerationMetadata
             | Self::Unknown => true,
+            // Neither of these gates the fleet, for DIFFERENT reasons, and both
+            // are stated because the distinction decides where each is surfaced.
+            //
             // An unadmitted candidate blocks nothing: it is in no caravan, and
             // only its own owner can resolve it.
-            Self::CandidateIncompatible => false,
+            //
+            // A dissolution ALREADY HAPPENED. The caravan is gone, so there is
+            // no chain left to protect and no merge left to stop. Blocking on it
+            // wedges the fleet permanently, because a closed pull request never
+            // changes: wiring the detection to real data surfaced three historical
+            // dissolutions at once and turned `healthy` false with no action
+            // available that would ever clear it (bd-61024a).
+            Self::CandidateIncompatible | Self::DissolvedMember => false,
         }
+    }
+
+    /// Whether this problem describes something that has ALREADY happened and
+    /// cannot be resolved by acting on the current fleet.
+    ///
+    /// Distinct from candidate-scoped, which describes a live pull request whose
+    /// owner can still fix it. History is reported, never gated on.
+    #[must_use]
+    pub const fn is_historical(self) -> bool {
+        matches!(self, Self::DissolvedMember)
     }
 
     /// Whether this problem is scoped to one unadmitted admission candidate.
     #[must_use]
     pub const fn is_candidate_scoped(self) -> bool {
-        !self.blocks_fleet()
+        !self.blocks_fleet() && !self.is_historical()
     }
 }
 

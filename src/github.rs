@@ -1633,6 +1633,28 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
                 ),
                 &repository,
             )?;
+        // bd-61024a: a member CLOSED without merging took its caravan with it,
+        // and `DissolvedMember` cannot report what discovery never fetches. Open
+        // and merged were both requested; closed was not, so the detection was
+        // dead code against the live fleet while passing a test whose fixture
+        // supplied the closed pull request by hand.
+        //
+        // `--state closed` also returns merged rows, so genuinely-unmerged ones
+        // are kept explicitly rather than by trusting the filter.
+        let (closed_labeled_prs, _closed_generation_facts) = self.pull_requests_with_generation(
+            labeled_pr_command(
+                &repository.slug(),
+                "closed",
+                &self.options.label,
+                self.options.merged_limit,
+                true,
+            ),
+            &repository,
+        )?;
+        let dissolved_labeled_prs = closed_labeled_prs
+            .into_iter()
+            .filter(|pull_request| pull_request.state == model::PullRequestState::Closed)
+            .collect::<Vec<_>>();
         let generation_facts = generation_facts
             .into_iter()
             .chain(merged_generation_facts)
@@ -1643,6 +1665,7 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
             .into_iter()
             .chain(open_labeled_prs)
             .chain(recently_merged_labeled_prs)
+            .chain(dissolved_labeled_prs)
             .chain(current_pr.clone())
         {
             pull_requests
@@ -2962,6 +2985,12 @@ mod tests {
                 labeled_pr_command("acme/widgets", "merged", "caravan", 100, true),
                 CommandOutput::success(merged_pr_json()),
             ),
+            // bd-61024a: closed labelled pull requests are fetched so a member
+            // closed WITHOUT merging is reported rather than vanishing.
+            (
+                labeled_pr_command("acme/widgets", "closed", "caravan", 100, true),
+                CommandOutput::success("[]"),
+            ),
         ]
     }
 
@@ -3515,6 +3544,10 @@ mod tests {
                 labeled_pr_command("acme/widgets", "merged", "caravan", 100, true),
                 CommandOutput::success(merged_pr_json()),
             ),
+            (
+                labeled_pr_command("acme/widgets", "closed", "caravan", 100, true),
+                CommandOutput::success("[]"),
+            ),
         ]);
         let discovery = GitHubDiscovery::new(runner);
 
@@ -3543,7 +3576,7 @@ mod tests {
         ));
         assert_eq!(
             calls.len(),
-            8,
+            9,
             "non-PR branches add only one bounded history lookup"
         );
         let merged_command = &calls[6].0;
@@ -3753,6 +3786,7 @@ mod tests {
     fn rejects_fork_only_active_caravan_heads() {
         let fork_prs = pr_list_json(14, "fork-feature", "someone/widgets", true);
         let mut calls = successful_discovery_calls(&fork_prs);
+        calls.pop(); // closed-labelled dissolution query
         calls.pop(); // merged-history query
         calls.pop(); // lineage/history query; active-head validation stops before it
         let runner = FakeRunner::new(calls);
@@ -3801,6 +3835,10 @@ mod tests {
             ),
             (
                 labeled_pr_command("acme/widgets", "merged", "caravan", 100, true),
+                CommandOutput::success("[]"),
+            ),
+            (
+                labeled_pr_command("acme/widgets", "closed", "caravan", 100, true),
                 CommandOutput::success("[]"),
             ),
         ]);
