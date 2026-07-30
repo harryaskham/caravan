@@ -177,6 +177,40 @@ pub struct CiObservation {
     /// Exact current-generation infrastructure runs safe to rerun.
     #[serde(default)]
     pub rerunnable_run_ids: Vec<u64>,
+    /// Whether the red evidence is cancellation rather than a verdict.
+    #[serde(default)]
+    pub cancellation: CiCancellationSummary,
+}
+
+/// Exact classification separating "did not finish" from "was judged and failed".
+///
+/// Cancellation is not a verdict: it usually means contended runner capacity, a
+/// superseded push, or a killed upstream producer, so the change was never
+/// evaluated. Aggregate required checks that convert a cancelled prerequisite
+/// into a terminal failure make the two indistinguishable in the forge summary,
+/// and two of three cancellations measured on a live repository were spurious.
+/// Any actor deciding on "red" therefore needs this distinction inline, without
+/// another provider round-trip (bd-1ac172).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CiCancellationSummary {
+    /// Required checks the provider reported as cancelled.
+    #[serde(default)]
+    pub cancelled_checks: Vec<String>,
+    /// Terminal failures whose bounded diagnostics name no failing step, which
+    /// is the shape an aggregate check produces from a cancelled prerequisite.
+    #[serde(default)]
+    pub failures_without_failing_step: Vec<String>,
+    /// True when every piece of terminal red evidence is cancellation or a
+    /// stepless aggregate conversion, and nothing was actually judged to fail.
+    pub cancellation_only: bool,
+}
+
+impl CiCancellationSummary {
+    /// True when any cancellation evidence exists at all.
+    #[must_use]
+    pub fn observed(&self) -> bool {
+        !self.cancelled_checks.is_empty() || !self.failures_without_failing_step.is_empty()
+    }
 }
 
 /// Bounded whole-sync phase timings.
@@ -4555,6 +4589,10 @@ fn ci_decision_error(
         BTreeMap::from([
             ("ci".to_owned(), json!(observation)),
             (
+                "cancellation".to_owned(),
+                json!(observation.cancellation),
+            ),
+            (
                 "pull_request".to_owned(),
                 json!(progress.current.get(&observation.pr)),
             ),
@@ -4585,6 +4623,23 @@ fn ci_decision_error(
         ),
         "apply caravan-force only for a known acceptable failure".to_owned(),
     ];
+    // Cancellation is not a verdict, so eviction must never be the leading
+    // advice for it: two of three live cancellations were spurious, and one was
+    // the only member of the first caravan the repository ever formed
+    // (bd-1ac172). Cara never evicts automatically; this keeps the advice it
+    // hands an agent honest too.
+    if observation.cancellation.cancellation_only {
+        suggested_actions.insert(
+            0,
+            "re-run the cancelled checks: nothing was judged to fail, so this is not evidence to evict on"
+                .to_owned(),
+        );
+        suggested_actions.push(format!(
+            "cancellation evidence: cancelled={:?}, stepless aggregate failures={:?}",
+            observation.cancellation.cancelled_checks,
+            observation.cancellation.failures_without_failing_step,
+        ));
+    }
     if observation
         .failure_diagnostics
         .iter()
@@ -5678,6 +5733,7 @@ impl SyncProgress {
             .collect::<Vec<_>>();
         rerunnable_run_ids.sort_unstable();
         rerunnable_run_ids.dedup();
+        let cancellation = classify_cancellation(&current.checks, &failure_diagnostics);
         Ok(CiObservation {
             pr: number,
             disposition,
@@ -5685,6 +5741,7 @@ impl SyncProgress {
             failed_runs,
             failure_diagnostics,
             rerunnable_run_ids,
+            cancellation,
         })
     }
 
@@ -7243,3 +7300,44 @@ fn mutation_error(
 
 #[cfg(test)]
 mod tests;
+
+/// Separate "did not finish" from "was judged and failed".
+///
+/// A cancelled required check is not a verdict, and an aggregate check that
+/// converts a cancelled prerequisite into a terminal failure looks identical to
+/// a real failure in the forge summary. The distinguishing fact is bounded and
+/// already fetched: a genuine failure names at least one failing step, while an
+/// aggregate conversion names none (bd-1ac172).
+fn classify_cancellation(
+    checks: &[CheckSnapshot],
+    diagnostics: &[ClassifiedWorkflowRunFailure],
+) -> CiCancellationSummary {
+    let cancelled_checks = checks
+        .iter()
+        .filter(|check| check.state == CheckState::Cancelled)
+        .map(|check| check.name.clone())
+        .collect::<Vec<_>>();
+    let stepless = |diagnostic: &ClassifiedWorkflowRunFailure| {
+        diagnostic
+            .diagnostic
+            .failed_jobs
+            .iter()
+            .all(|job| job.failed_steps.is_empty())
+    };
+    let failures_without_failing_step = diagnostics
+        .iter()
+        .filter(|diagnostic| stepless(diagnostic))
+        .map(|diagnostic| diagnostic.diagnostic.workflow_name.clone())
+        .collect::<Vec<_>>();
+    let judged_failure_exists = checks
+        .iter()
+        .any(|check| check.state == CheckState::Failure)
+        && diagnostics.iter().any(|diagnostic| !stepless(diagnostic));
+    let cancellation_only = !judged_failure_exists
+        && (!cancelled_checks.is_empty() || !failures_without_failing_step.is_empty());
+    CiCancellationSummary {
+        cancelled_checks,
+        failures_without_failing_step,
+        cancellation_only,
+    }
+}

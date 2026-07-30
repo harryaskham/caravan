@@ -791,6 +791,61 @@ fn check(name: &str, state: CheckState, run_id: Option<u64>) -> CheckSnapshot {
     }
 }
 
+fn check_named(name: &str, state: CheckState) -> CheckSnapshot {
+    check(name, state, Some(1))
+}
+
+fn classified_failure(
+    workflow: &str,
+    failed_steps: Vec<String>,
+) -> crate::sync::ClassifiedWorkflowRunFailure {
+    crate::sync::ClassifiedWorkflowRunFailure {
+        diagnostic: crate::ci::WorkflowRunFailureDiagnostic {
+            run_id: 1,
+            attempt: 1,
+            workflow_id: 1,
+            check_suite_id: 1,
+            workflow_name: workflow.to_owned(),
+            event: "push".to_owned(),
+            status: "completed".to_owned(),
+            conclusion: "failure".to_owned(),
+            head_branch: "topic".to_owned(),
+            head_sha: CommitOid("head".to_owned()),
+            expected_pr: PrNumber(1),
+            expected_head_oid: CommitOid("head".to_owned()),
+            expected_base_oid: CommitOid("base".to_owned()),
+            pull_requests: Vec::new(),
+            failed_jobs: vec![crate::ci::WorkflowJobFailureDiagnostic {
+                job_id: 1,
+                name: workflow.to_owned(),
+                status: "completed".to_owned(),
+                conclusion: "failure".to_owned(),
+                url: "https://example.test/job".to_owned(),
+                runner_name: None,
+                runner_labels: Vec::new(),
+                failed_steps: failed_steps
+                    .into_iter()
+                    .map(|name| crate::ci::WorkflowStepFailureDiagnostic {
+                        name,
+                        number: 1,
+                        status: "completed".to_owned(),
+                        conclusion: "failure".to_owned(),
+                    })
+                    .collect(),
+                steps_truncated: false,
+                selected_lineage: None,
+                lineage_evidence_status: crate::ci::LineageEvidenceStatus::default(),
+            }],
+            jobs_total: 1,
+            jobs_truncated: false,
+        },
+        generation: crate::sync::WorkflowRunGeneration::Current,
+        classification: crate::sync::WorkflowFailureClass::SourceOrTestFailure,
+        action: crate::sync::WorkflowFailureAction::WaitOrInspect,
+        reasons: Vec::new(),
+    }
+}
+
 fn selected_lineage_receipt(
     pull_request: &PullRequestSnapshot,
 ) -> crate::ci::SelectedRefLineageReceipt {
@@ -6336,6 +6391,7 @@ fn head_of_line_stall_names_the_exact_blocking_member_and_its_remedies() {
             failed_runs: Vec::new(),
             failure_diagnostics: Vec::new(),
             rerunnable_run_ids: Vec::new(),
+            cancellation: crate::sync::CiCancellationSummary::default(),
         },
         CiObservation {
             pr: PrNumber(2),
@@ -6344,6 +6400,7 @@ fn head_of_line_stall_names_the_exact_blocking_member_and_its_remedies() {
             failed_runs: Vec::new(),
             failure_diagnostics: Vec::new(),
             rerunnable_run_ids: Vec::new(),
+            cancellation: crate::sync::CiCancellationSummary::default(),
         },
     ];
 
@@ -6381,6 +6438,7 @@ fn converged_fleet_reports_no_head_of_line_stall() {
             failed_runs: Vec::new(),
             failure_diagnostics: Vec::new(),
             rerunnable_run_ids: Vec::new(),
+            cancellation: crate::sync::CiCancellationSummary::default(),
         })
         .collect::<Vec<_>>();
 
@@ -6708,5 +6766,49 @@ fn a_cancelled_producer_is_retryable_infrastructure_not_a_code_failure() {
     assert!(
         !retryable_infrastructure(&diagnostic("failure")),
         "a genuine failure is not infrastructure"
+    );
+}
+
+/// bd-1ac172: measured live on Cacophony, PR #2284 reported FAILURE in the
+/// forge summary while the API conclusion was CANCELLED with zero failing
+/// steps. Two of three cancellations that day were spurious, and one was the
+/// only member of the first caravan the repository ever formed. Cancellation
+/// must be reported as "did not finish", never as a verdict to evict on.
+#[test]
+fn a_stepless_aggregate_failure_is_classified_as_cancellation_not_verdict() {
+    let checks = vec![
+        check_named("Public Fast Tests preparation", CheckState::Cancelled),
+        check_named("Check & Lint", CheckState::Failure),
+    ];
+    let diagnostics = vec![classified_failure("Check & Lint", Vec::new())];
+
+    let summary = crate::sync::classify_cancellation(&checks, &diagnostics);
+
+    assert!(summary.observed());
+    assert_eq!(summary.cancelled_checks, ["Public Fast Tests preparation"]);
+    assert_eq!(summary.failures_without_failing_step, ["Check & Lint"]);
+    assert!(
+        summary.cancellation_only,
+        "no failing step anywhere means nothing was judged to fail"
+    );
+}
+
+#[test]
+fn a_real_failing_step_is_never_reported_as_cancellation_only() {
+    let checks = vec![
+        check_named("Public Fast Tests preparation", CheckState::Cancelled),
+        check_named("Check & Lint", CheckState::Failure),
+    ];
+    let diagnostics = vec![classified_failure(
+        "Check & Lint",
+        vec!["clippy::correctness".to_owned()],
+    )];
+
+    let summary = crate::sync::classify_cancellation(&checks, &diagnostics);
+
+    assert!(summary.observed(), "the cancellation is still reported");
+    assert!(
+        !summary.cancellation_only,
+        "a named failing step is a genuine verdict"
     );
 }
