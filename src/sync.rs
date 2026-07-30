@@ -5224,6 +5224,11 @@ fn merged_predecessor<'a>(
     matches.next().is_none().then_some(predecessor)
 }
 
+// `match_same_arms` is allowed deliberately: the candidate-scoped arm shares a
+// body with the fleet-fatal ones, but collapsing it would hide the one
+// classification that has already caused an outage by defaulting silently. The
+// arm exists to be visible, not to compute a different value.
+#[allow(clippy::match_same_arms)]
 fn decision_for_problem(
     problem: &GraphProblem,
     status: &StatusOutput,

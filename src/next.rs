@@ -115,7 +115,14 @@ fn collect(status: &StatusOutput, kind: NextStatus) -> Vec<NextMatch> {
             .fleet
             .problems
             .iter()
-            .filter(|problem| problem.kind == crate::model::GraphProblemKind::Incompatible)
+            // Must match what graph analysis actually emits for an unadmitted
+            // candidate. This read `Incompatible` — the variant the producer
+            // stopped emitting when `CandidateIncompatible` was introduced — so
+            // `--status conflict` silently returned nothing while the fleet
+            // plainly carried conflicts. Same producer/consumer drift as
+            // bd-299d3e, in code written after that fix, and invisible to unit
+            // tests because they never asked the real analysis for a kind.
+            .filter(|problem| problem.kind.is_candidate_scoped())
             .flat_map(|problem| {
                 problem
                     .prs

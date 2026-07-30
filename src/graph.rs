@@ -1177,6 +1177,50 @@ mod tests {
         );
     }
 
+    /// The kind emitted for an unadmitted candidate conflict is a WIRE CONTRACT
+    /// between graph analysis and everything that reads it. `cara queue
+    /// --status conflict` silently returned nothing for weeks because it
+    /// compared against `Incompatible`, the variant the producer had stopped
+    /// emitting; unit tests missed it because they injected the kind by hand
+    /// instead of asking the real analysis what it produces.
+    ///
+    /// This asserts the producer's actual output, so any consumer can be checked
+    /// against a fact rather than an assumption.
+    #[test]
+    fn an_unadmitted_candidate_conflict_is_emitted_as_candidate_scoped() {
+        let checker = |candidate: &BranchSnapshot, target: &BranchSnapshot| {
+            Ok(CompatibilityReport {
+                candidate: candidate.clone(),
+                target: target.clone(),
+                outcome: CompatibilityOutcome::Conflict,
+                conflicting_paths: vec!["src/lib.rs".to_owned()],
+                diagnostic: None,
+            })
+        };
+        let mut unqueued = pull_request(2245, "stuck", "main");
+        unqueued.labels.clear();
+
+        let analysis = analyze(&snapshot(vec![unqueued]), &checker).expect("advisory evidence");
+
+        let emitted: Vec<_> = analysis
+            .fleet
+            .problems
+            .iter()
+            .filter(|problem| problem.prs.contains(&PrNumber(2245)))
+            .map(|problem| problem.kind)
+            .collect();
+
+        assert_eq!(
+            emitted,
+            vec![GraphProblemKind::CandidateIncompatible],
+            "consumers filter on this exact kind; changing it silently breaks them"
+        );
+        assert!(
+            emitted.iter().all(|kind| kind.is_candidate_scoped()),
+            "and it must classify as candidate-scoped, or it blocks the fleet"
+        );
+    }
+
     /// Live operator report: `caravan-join-skipped` was added to a conflicting
     /// PR and Cara kept naming it, so the label read as if it had done nothing.
     /// Admission had excluded it correctly all along; this detection loop was
