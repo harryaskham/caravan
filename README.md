@@ -63,25 +63,20 @@ today.
   explicit repair/reshape/strategy continuations. Stale synthetic generations
   require a fresh candidate trigger; raw logs and unrelated log text are never
   retained or exposed.
-- `caravan-force` is explicit operator intent to bypass any CI state that is
-  not fully successful, including pending, running, failed, mixed, and empty
-  checks. A forced head is admin-squashed only when repository policy permits
-  it, the exact head/default compatibility proof is still current, and GitHub
-  reports admin permission. Cara-owned physical rewrites consume and audit any
-  force label bound to the old head; the new generation requires a fresh
-  audited `cara force --pr N --actor A --reason R` operation, while routine
-  membership never carries force intent. `cara force revoke` removes only the
-  exact current-generation intent and posts the matching durable audit. If Cara
-  invalidates old-generation intent before a physical rewrite and then proves
-  that generation was not published, it restores the old label under a fresh
-  precondition plus deterministic recovery audit; published or indeterminate
-  outcomes never restore it. Controller-reviewed exceptions additionally use
-  `cara --json force-intent preview|apply|revoke` with exact head, membership
-  generation, CI-decision fingerprint, reason, expiry, and squash method. Preview
-  is zero-write; apply revalidates all evidence and converges force intent plus
-  missing squash auto-merge state in one GraphQL mutation; revoke remains
-  exact-generation, expiry-safe, idempotent, and preserves queue-owned
-  auto-merge. Matching MCP tools expose the same receipts.
+- `caravan-force` is durable PR-scoped operator intent: when that PR reaches
+  caravan root, if it is mechanically mergeable, Cara ignores every CI state
+  (successful, pending, running, failed, mixed, unknown, or empty) and performs
+  the administrator squash immediately. `cara force --pr N --actor A --reason R`
+  may arm any active member after exact current-edge, selected-Caravan hold/graph,
+  permission, branch, and PR preflight. The label follows the PR through
+  Cara-owned history rewrites, membership/base changes, and position changes;
+  unrelated admission candidates cannot block it. At root, Cara freshly proves
+  the exact root/default compatibility, provider head/base, repository policy,
+  ADMIN permission, and lease before merging. Explicit revoke, eviction, or a
+  successful merge consumes intent. Controller-reviewed transitions additionally
+  use `cara --json force-intent preview|apply|revoke` with exact transition
+  evidence; that authorization is generation-bound, but the resulting PR intent
+  is durable. Matching MCP tools expose the same receipts.
 - Optional sync-owned auto-admission is strictly opt-in. After the existing
   fleet converges, `sync --all` considers unlabelled PRs in configured-priority
   then immutable-FIFO order and greedily joins the first compatible live tail.
@@ -631,8 +626,9 @@ dry-run permission, and exact lease across the complete plan before the first
 write. Planning and final no-write verification stop at a precommit deadline
 which preserves the apply reserve inside the one configured operation deadline.
 That reserve is derived from the operations the tick actually runs: a member
-whose exact ancestry already holds costs no push, no auto-merge drop, and no
-force invalidation, so a completed prefix makes every later tick cheaper. When
+whose exact ancestry already holds costs no push or auto-merge drop, and durable
+force labels add no rewrite control mutation, so a completed prefix makes every
+later tick cheaper. When
 the complete reserve cannot remain but the irreversible part can, the tick still
 plans and verifies the complete graph and applies the largest exact
 root-to-descendant prefix that fits, checkpoints its receipts, and succeeds with

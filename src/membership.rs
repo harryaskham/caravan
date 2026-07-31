@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use mcp_cli::{ErrorCategory, StructuredError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::json;
 
 use crate::command::{CommandRunError, CommandRunner, CommandSpec, ProcessRunner};
 use crate::github::{
@@ -145,12 +145,13 @@ pub struct JoinResultReceipt {
     pub state: PullRequestState,
 }
 
-/// Operator-only force intent cannot silently survive routine atomic join.
+/// Durable PR-scoped force intent is preserved across membership and Cara-owned
+/// history rewrites until explicit revoke, eviction, or successful merge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum JoinForceIntent {
     Absent,
-    RemovedStaleGeneration,
+    Preserved,
 }
 
 /// Versioned, additive contract consumed by Cacophony `pr_cara_join`.
@@ -1372,7 +1373,6 @@ fn execute_locked(
             ));
         }
     }
-    let mut force_invalidation = None;
     let mut creation_state = None;
     let mut rewrite_comment_receipt = None;
     let rebase_receipt = if context.config.rebase_on_join {
@@ -1607,36 +1607,15 @@ fn execute_locked(
             ));
         }
         revalidate_generation_before_membership(&status, candidate.number, &provider)?;
-        if candidate.has_label(FORCE_LABEL) && !prepared.plan.already_satisfied {
-            let mut invalidation = ExecutionState::new(request.operation);
-            invalidation.current = Some(candidate.clone());
-            invalidation.ensure_label_absent(&provider, &repository, FORCE_LABEL)?;
-            let audit = force_rewrite_invalidation_audit(
-                &candidate,
-                invalidation.current.as_ref().expect("force label removed"),
-                &prepared.plan,
-            );
-            invalidation.ensure_control_label_comment(&provider, &repository, &audit)?;
-            force_invalidation = Some(invalidation);
-        }
+        // `caravan-force` is durable PR-scoped intent. Rewriting the branch does
+        // not change PR identity and GitHub naturally retains its labels, so no
+        // invalidate/restore transaction belongs before this push (bd-91e96a).
         // bd-4e4615: the branch rewrite is irreversible, and mandatory
         // post-rewrite rediscovery plus membership writes still have to run.
         // Starting the push with almost no budget left produced a live
         // github_mutation_timeout *after* the remote branch had already moved.
         require_post_rewrite_budget(context, Some(operation_deadline), candidate.number)?;
-        let receipt = match crate::physical_rebase::apply_prepared(&prepared) {
-            Ok(receipt) => receipt,
-            Err(error) => {
-                return Err(restore_membership_force_after_nonpublication(
-                    &provider,
-                    &repository,
-                    &candidate,
-                    &prepared.plan,
-                    force_invalidation.as_mut(),
-                    error,
-                ));
-            }
-        };
+        let receipt = crate::physical_rebase::apply_prepared(&prepared)?;
         // GitHub is authoritative after a push. Never apply base/label changes
         // against the stale pre-rewrite PR snapshot.
         if let Some(candidate) = candidate_pr {
@@ -1701,12 +1680,7 @@ fn execute_locked(
         rebase_receipt.as_ref(),
         context.config.sync.actions.join_unlabelled_prs,
     )
-    .map_err(|error| {
-        attach_force_invalidation(
-            attach_rebase_receipt(error, rebase_receipt.as_ref()),
-            force_invalidation.as_ref(),
-        )
-    });
+    .map_err(|error| attach_rebase_receipt(error, rebase_receipt.as_ref()));
     let mut output = match execution {
         Ok(output) => output,
         Err(error) if request.operation.is_join() => {
@@ -1746,17 +1720,6 @@ fn execute_locked(
             .provider_receipts
             .append(&mut output.provider_receipts);
         output.provider_receipts = created.provider_receipts;
-    }
-    if let Some(mut invalidation) = force_invalidation {
-        invalidation
-            .steps
-            .append(&mut output.receipt.completed_steps);
-        output.receipt.completed_steps = invalidation.steps;
-        output.receipt.changed = true;
-        invalidation
-            .provider_receipts
-            .append(&mut output.provider_receipts);
-        output.provider_receipts = invalidation.provider_receipts;
     }
     let kind = if request.operation.is_join() {
         EventKind::PrJoined
@@ -1850,13 +1813,13 @@ fn build_join_receipt(
             Some(json!({"candidate_pr": output.pull_request.number})),
         ));
     }
-    let force_intent = if before
+    let force_was_present = before
         .analysis
         .pull_requests
         .get(&output.pull_request.number)
-        .is_some_and(|candidate| candidate.has_label(FORCE_LABEL))
-    {
-        JoinForceIntent::RemovedStaleGeneration
+        .is_some_and(|candidate| candidate.has_label(FORCE_LABEL));
+    let force_intent = if force_was_present {
+        JoinForceIntent::Preserved
     } else {
         JoinForceIntent::Absent
     };
@@ -1872,7 +1835,7 @@ fn build_join_receipt(
         })
     });
     let membership_durable = output.pull_request.has_label(ACTIVE_LABEL)
-        && !output.pull_request.has_label(FORCE_LABEL)
+        && output.pull_request.has_label(FORCE_LABEL) == force_was_present
         && output.pull_request.base.name == predecessor.branch
         && output.pull_request.base.oid == predecessor.head_oid;
     let mut receipt = JoinReceipt {
@@ -1922,205 +1885,6 @@ fn membership_config_fingerprint(context: &AppContext) -> String {
     }))
     .expect("validated config serializes");
     fnv1a64(&contract)
-}
-
-fn force_rewrite_invalidation_audit(
-    before: &PullRequestSnapshot,
-    after: &PullRequestSnapshot,
-    plan: &crate::physical_rebase::RebasePlan,
-) -> ControlLabelAudit {
-    let target = match &plan.new_base {
-        crate::physical_rebase::PlannedBase::Remote(branch)
-        | crate::physical_rebase::PlannedBase::Simulated(branch) => branch,
-    };
-    ControlLabelAudit {
-        operation: "force_invalidate_rewrite".to_owned(),
-        marker: control_label_marker(
-            "force_invalidate_rewrite",
-            before.number,
-            &before.head.oid,
-            &before.labels,
-            &after.labels,
-        ),
-        before_labels: before.labels.clone(),
-        after_labels: after.labels.clone(),
-        actor: "cara membership physical-rebase policy".to_owned(),
-        reason: format!(
-            "invalidated caravan-force intent bound to old head {} before Cara-owned rewrite to {} onto {}@{}",
-            before.head.oid, plan.new_head_oid, target.name, target.oid
-        ),
-        reason_source: "deterministic exact-generation safety policy".to_owned(),
-        compatibility_evidence:
-            "membership and exact target compatibility preflight passed before invalidation"
-                .to_owned(),
-        clean_squash_evidence:
-            "not applicable: force intent is removed before branch history changes".to_owned(),
-        admission_priority_basis: "unchanged from the membership request".to_owned(),
-    }
-}
-
-#[allow(clippy::too_many_lines)]
-fn restore_membership_force_after_nonpublication(
-    provider: &impl MembershipProvider,
-    repository: &RepositoryId,
-    candidate: &PullRequestSnapshot,
-    plan: &crate::physical_rebase::RebasePlan,
-    invalidation: Option<&mut ExecutionState>,
-    original_error: AppError,
-) -> AppError {
-    let Some(invalidation) = invalidation else {
-        return original_error;
-    };
-    let observed = match provider.refetch_pull_request(repository, candidate.number) {
-        Ok(observed) => observed,
-        Err(error) => {
-            return attach_force_restoration_evidence(
-                attach_force_invalidation(original_error, Some(invalidation)),
-                json!({
-                    "state": "indeterminate",
-                    "provider_error": error.to_string(),
-                    "restored": false,
-                }),
-            );
-        }
-    };
-    if observed.head.oid == plan.new_head_oid {
-        return attach_force_restoration_evidence(
-            attach_force_invalidation(original_error, Some(invalidation)),
-            json!({
-                "state": "published",
-                "observed_head_oid": observed.head.oid,
-                "restored": false,
-            }),
-        );
-    }
-    if observed.head.oid != plan.old_head_oid {
-        return attach_force_restoration_evidence(
-            attach_force_invalidation(original_error, Some(invalidation)),
-            json!({
-                "state": "indeterminate",
-                "old_head_oid": plan.old_head_oid,
-                "planned_head_oid": plan.new_head_oid,
-                "observed_head_oid": observed.head.oid,
-                "restored": false,
-            }),
-        );
-    }
-
-    invalidation.current = Some(observed.clone());
-    let mut audit_before_labels = observed.labels.clone();
-    audit_before_labels.remove(FORCE_LABEL);
-    let mut restored_labels = audit_before_labels.clone();
-    restored_labels.insert(FORCE_LABEL.to_owned());
-    let audit = ControlLabelAudit {
-        operation: "force_restore_nonpublication".to_owned(),
-        marker: control_label_marker(
-            "force_restore_nonpublication",
-            candidate.number,
-            &plan.old_head_oid,
-            &audit_before_labels,
-            &restored_labels,
-        ),
-        before_labels: audit_before_labels,
-        after_labels: restored_labels,
-        actor: "cara membership physical-rebase recovery policy".to_owned(),
-        reason: format!(
-            "restored caravan-force intent on unchanged old head {} after planned generation {} was proven not published ({})",
-            plan.old_head_oid,
-            plan.new_head_oid,
-            original_error.code(),
-        ),
-        reason_source: "exact provider non-publication proof after failed branch apply".to_owned(),
-        compatibility_evidence:
-            "membership physical plan failed before provider exposed its planned head".to_owned(),
-        clean_squash_evidence:
-            "old-generation intent only; any later successful rewrite invalidates it again"
-                .to_owned(),
-        admission_priority_basis: "unchanged from the membership request".to_owned(),
-    };
-    let restore = (|| -> Result<(), AppError> {
-        invalidation.ensure_label_present(provider, repository, FORCE_LABEL)?;
-        invalidation.ensure_control_label_comment(provider, repository, &audit)
-    })();
-    match restore {
-        Ok(()) => attach_force_restoration_evidence(
-            original_error,
-            json!({
-                "state": "restored",
-                "old_head_oid": plan.old_head_oid,
-                "planned_head_oid": plan.new_head_oid,
-                "observed_head_oid": invalidation.current.as_ref().map(|pr| &pr.head.oid),
-                "restored": true,
-                "audit_marker": audit.marker,
-                "completed_steps": invalidation.steps,
-                "provider_receipts": invalidation.provider_receipts,
-            }),
-        ),
-        Err(restore_error) => AppError::structured(
-            ErrorCategory::ExecutionFailure,
-            "force_intent_restore_failed",
-            "rewrite non-publication was proven but old-generation force intent restoration did not complete",
-            Some(json!({
-                "pr": candidate.number,
-                "old_head_oid": plan.old_head_oid,
-                "planned_head_oid": plan.new_head_oid,
-                "original_error": {
-                    "category": original_error.category(),
-                    "code": original_error.code(),
-                    "message": original_error.message(),
-                    "details": original_error.details(),
-                },
-                "restore_error": {
-                    "category": restore_error.category(),
-                    "code": restore_error.code(),
-                    "message": restore_error.message(),
-                    "details": restore_error.details(),
-                },
-                "completed_steps": invalidation.steps,
-                "provider_receipts": invalidation.provider_receipts,
-                "resumable": true,
-                "next": "rediscover the exact old head and rerun the same membership command; restoration audit markers deduplicate",
-            })),
-        ),
-    }
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn attach_force_restoration_evidence(error: AppError, restoration: Value) -> AppError {
-    let mut details = error.details().unwrap_or_else(|| json!({}));
-    if let Some(object) = details.as_object_mut() {
-        object.insert("force_intent_restoration".to_owned(), restoration);
-    }
-    AppError::structured(
-        error.category(),
-        error.code(),
-        error.message(),
-        Some(details),
-    )
-}
-
-fn attach_force_invalidation(error: AppError, state: Option<&ExecutionState>) -> AppError {
-    let Some(state) = state else {
-        return error;
-    };
-    let mut details = error.details().unwrap_or_else(|| json!({}));
-    if let Some(object) = details.as_object_mut() {
-        object.insert(
-            "force_intent_invalidation".to_owned(),
-            json!({
-                "completed_steps": state.steps,
-                "provider_receipts": state.provider_receipts,
-                "resumable": true,
-                "next": "the old-generation force intent was consumed; repair the error and explicitly reapply caravan-force only to the intended current head generation",
-            }),
-        );
-    }
-    AppError::structured(
-        error.category(),
-        error.code(),
-        error.message(),
-        Some(details),
-    )
 }
 
 fn attach_rebase_receipt(
@@ -2366,7 +2130,8 @@ fn execute_with_rebase_guard(
     state.current = Some(candidate);
 
     state.ensure_base(provider, &status.repository, &desired_base)?;
-    state.ensure_label_absent(provider, &status.repository, FORCE_LABEL)?;
+    // Durable force intent follows the PR through base/position changes. Only
+    // explicit revoke, eviction, or successful merge consumes it (bd-91e96a).
     // A generation-bound automatic skip is advisory only; every explicit
     // membership operation is a manual override and consumes it.
     state.ensure_label_absent(provider, &status.repository, SKIPPED_LABEL)?;

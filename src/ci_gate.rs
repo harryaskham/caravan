@@ -39,8 +39,8 @@ pub fn evaluate(status: &StatusOutput, input: &CiGateInput) -> Result<CiGateOutp
         return Ok(output(
             CiGateDecision::CiForceAccepted,
             pr,
-            "operator explicitly accepted this head's CI state with caravan-force".to_owned(),
-            json!({ "head": candidate.head.oid, "label": "caravan-force" }),
+            "durable PR-scoped caravan-force intent bypasses CI for the member's current generation".to_owned(),
+            json!({ "head": candidate.head.oid, "label": "caravan-force", "scope": "pull_request" }),
         ));
     }
     if !input.head_evidence {

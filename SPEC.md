@@ -772,42 +772,37 @@ evict/split, or arm a known acceptable failure with audited `cara force --pr N
 --actor A --reason R`. Raw label edits, nested worktrees, manual `update-ref`, and
 force publication are not valid Cara decision continuations.
 
-`caravan-force` is explicit operator intent to bypass any CI state that is not fully successful, including expected, queued, running, failed, unknown, mixed, or empty checks. When it becomes head, `cara sync` may force-squash it only when:
+`caravan-force` is durable PR-scoped operator intent to bypass every CI state, including successful, expected, queued, running, failed, unknown, mixed, or empty checks. When that PR becomes head, `cara sync` force-squashes it immediately only when:
 
 1. `.caravan/config.yaml` sets `force_merge: true`;
 2. the open head has `caravan-force`;
 3. it remains mechanically conflict-free with the default branch;
 4. the authenticated actor has repository ADMIN permission.
 
-An exact force-labelled head armed through the ordinary `cara force` surface may
-keep provider-native auto-merge disabled while Cara validates this policy. Sync
-posts the generation-bound audit and invokes the administrator squash primitive
-directly; that ordinary surface never arms native auto-merge as a force
-prerequisite, because repositories without a holding requirement could otherwise
-merge before Cara records its authorization. The separately reviewed
-`force-intent apply` transaction below is explicitly authorized to repair the
-missing squash auto-merge postcondition before it arms its exact label field. A targeted sync may
-defer this one repairable disabled-auto-merge invariant on an unrelated
-force-labelled head when `force_merge: true`; structural graph errors,
-non-squash or externally enabled auto-merge, ordinary unlabelled head gaps, and
-selected-head drift remain blocking through final rediscovery.
+A force-labelled head armed through the ordinary `cara force` surface may keep
+provider-native auto-merge disabled while Cara validates this policy. Sync posts
+the durable PR-intent acceptance audit and invokes the administrator squash
+primitive directly; that ordinary surface never arms native auto-merge as a
+force prerequisite, because repositories without a holding requirement could
+otherwise merge before Cara records its authorization. The separately reviewed
+`force-intent apply` transaction likewise arms durable intent while ensuring
+native auto-merge is disabled. A targeted sync may defer this intentional
+disabled-auto-merge invariant on an unrelated force-labelled head when
+`force_merge: true`; structural selected-Caravan errors, non-squash or
+externally enabled auto-merge, ordinary unlabelled head gaps, and selected-head
+drift remain blocking through final rediscovery.
 
-Force intent is bound to the exact labelled head generation. `cara force` and
-`cara force revoke` rediscover exact PR/default facts, require the current active
-head, clean compatibility, no hold/graph problem, and ADMIN permission, then
-change only `caravan-force` under exact preconditions and post a deterministic
-actor/reason/check audit. Both operations are idempotent; revoke never touches
-unrelated labels. Before any Cara-owned physical rewrite, sync/join removes
-`caravan-force` from the old head and posts a durable old→planned-generation
-invalidation audit; a force merge of the rewritten generation requires a fresh
-`cara force` operation. An already-satisfied plan does not consume intent
-because its head OID did not change. Routine membership never adds or carries
-force intent. If invalidation completes but branch publication fails, Cara
-refetches the provider head: only an exact old-head observation proves
-non-publication and permits restoring `caravan-force` under a fresh PR
-precondition plus deterministic recovery audit. An observed planned head keeps
-intent invalidated; any other head or failed refetch is indeterminate and never
-restores intent. Partial restoration receipts remain explicit and resumable.
+Force intent is bound to PR identity, not one head OID. `cara force` and `cara
+force revoke` rediscover exact provider facts, accept any active owned Caravan
+member, require a mechanically clean current Caravan edge, selected-Caravan
+hold/graph safety, and ADMIN permission, then change only `caravan-force` under
+exact transition preconditions and post a deterministic actor/reason audit.
+Problems on unrelated admission candidates or other caravans do not block the
+transition. Both operations are idempotent; revoke never touches unrelated
+labels. Cara-owned physical rewrites, joins, rebases, and position/base changes
+preserve the label naturally on the same PR and perform no invalidate/restore
+control mutations. Explicit revoke, eviction, or successful merge consumes
+intent.
 
 The controller-reviewed exception contract is a separate exact machine surface:
 `cara --json force-intent preview|apply|revoke --pr N --head OID
@@ -822,25 +817,27 @@ sync decision, exact check evidence, and current decision evidence.
 Preview is always zero-write and returns the current provider head, membership,
 checks, decision, fingerprint, and expiry. Apply requires unexpired authority,
 `force_merge: true`, exact supplied head/generation/fingerprint, a current CI
-failure, active owned head membership, clean compatibility, no hold or unrelated
-graph problem, fresh default/head/check preconditions, and ADMIN permission. It
-converges `caravan-force` plus missing squash auto-merge fields in one GraphQL
-provider mutation and independently refetches the complete postcondition; a
+failure, active owned membership, clean current-edge compatibility, no selected-Caravan
+hold/graph problem, fresh default/head/check preconditions, and ADMIN permission. It
+converges durable `caravan-force` while disabling native auto-merge in one
+GraphQL provider mutation and independently refetches the complete postcondition; a
 partially applied aliased response is a typed resumable error with before/after
-evidence. The selected head's disabled-auto-merge invariant is the one repairable
-graph gap; all unrelated graph failures remain blocking. Revoke accepts expired
-authority, removes only exact-generation force intent, preserves queue-owned
-squash auto-merge, and is idempotent. Apply and revoke post a deterministic
+evidence. The selected member's disabled-auto-merge invariant is repairable;
+problems intersecting the selected Caravan remain blocking while unrelated
+admission/Caravan problems do not. Revoke accepts expired
+authority, removes only durable PR force intent, preserves queue-owned squash
+auto-merge, and is idempotent. Apply and revoke post a deterministic
 GitHub-visible audit bound to the complete reviewed authority; audit failure
 retains provider receipts for exact retry. This reviewed surface does not consume
 intent or merge: normal sync remains the sole queue actor.
 
-Before consuming armed `caravan-force`, sync/loop posts its separate durable
-acceptance audit containing the exact observed checks (including pending,
-running, failed, mixed, or empty observations), enabled force policy,
-authenticated ADMIN permission, exact clean compatibility proof, and squash
-action. Comment failure is resumable and prevents the force merge. The attempt
-and result are emitted as audit events. Force never bypasses textual conflicts.
+Before consuming armed `caravan-force`, sync/loop skips CI and required-run
+provider reads, then posts its separate durable acceptance audit containing the
+currently visible checks for context, enabled force policy, authenticated ADMIN
+permission, exact clean root/default compatibility proof, and squash action.
+Comment failure is resumable and prevents the force merge. The attempt and
+result are emitted as audit events. Force never bypasses textual conflicts,
+stale provider facts, holds, ownership, permissions, or leases.
 
 ## 8. Decision points and errors
 
@@ -1014,8 +1011,8 @@ branch writes. Planning and this no-write barrier share a precommit deadline
 which is the one operation deadline minus a conservative apply reserve. The
 reserve is derived from the operations the tick will actually run, not from a
 whole-chain worst case: a member whose exact cumulative ancestry already holds
-costs no push, no auto-merge drop, and no force invalidation, so a completed
-prefix makes every later tick strictly cheaper. It splits into a hard part
+costs no push or auto-merge drop, and durable force labels add no rewrite
+control mutation, so a completed prefix makes every later tick strictly cheaper. It splits into a hard part
 (control mutations, bounded parallel branch-apply rounds, mandatory midpoint
 verification) and a deferrable part (base/CI reconciliation and final
 discovery), each planned command priced at `sync.reserve_secs_per_command`
@@ -1026,8 +1023,8 @@ child). Admission and the reserve share that one price: raising a proven-safe
 When the complete reserve cannot remain but the hard reserve can, the tick
 applies an exact bounded prefix instead of refusing forever. The complete graph
 is still planned and globally verified; only the largest root-to-descendant
-prefix that provably fits is applied, strictly parent-to-descendant, with
-control mutations and force invalidation restricted to admitted members.
+prefix that provably fits is applied strictly parent-to-descendant; durable
+force intent remains on every admitted or deferred PR without control mutation.
 Completed receipts are checkpointed before return and the tick succeeds with a
 `retry_tick` scheduler disposition, deferred member list, admitted prefix,
 required/complete reserve, and configured deadline. Ordinary convergence,

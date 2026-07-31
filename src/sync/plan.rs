@@ -398,7 +398,19 @@ pub(super) fn plan_caravan_convergence(
         return Ok(());
     }
 
-    let mut forced_head = false;
+    if head_snapshot.has_label("caravan-force") {
+        return plan_forced_head(
+            status,
+            provider,
+            caravan,
+            head_snapshot,
+            force_merge,
+            actions,
+            decisions,
+            would_emit_events,
+        );
+    }
+
     let mut stopped = false;
     for number in caravan.members.iter().copied() {
         let observation = progress.observe_ci(provider, &status.repository, number)?;
@@ -459,7 +471,6 @@ pub(super) fn plan_caravan_convergence(
             stopped = true;
             break;
         }
-        forced_head |= number == head && disposition == CiDisposition::Forced;
     }
     // Planning must reveal a head whose required contexts never started a run;
     // an operator-action stall that only appears after the write barrier would
@@ -501,55 +512,6 @@ pub(super) fn plan_caravan_convergence(
         }
     }
     if stopped {
-        return Ok(());
-    }
-
-    if forced_head {
-        let mechanically_allowed = force_allowed(status, head_snapshot, force_merge);
-        let permission = if mechanically_allowed {
-            Some(
-                provider
-                    .viewer_permission(&status.repository)
-                    .map_err(|error| mutation_error(&error, progress, Some(head)))?,
-            )
-        } else {
-            None
-        };
-        let can_force = mechanically_allowed && permission.as_deref() == Some("ADMIN");
-        push_plan_action(
-            actions,
-            SyncPlanAction {
-                order: 0,
-                phase: SyncPlanPhase::ProviderConvergence,
-                state: if can_force && !deferred {
-                    SyncPlanActionState::WouldMutate
-                } else if deferred {
-                    SyncPlanActionState::DeferredUntilRediscovery
-                } else {
-                    SyncPlanActionState::WouldStop
-                },
-                kind: "force_squash_merge".to_owned(),
-                pr: Some(head),
-                caravan_id: Some(caravan.id),
-                expected,
-                target: Some(json!({"merge_method": "squash", "permission": permission})),
-                reason: "explicit exact-generation caravan-force intent requires configured policy and fresh ADMIN preflight"
-                    .to_owned(),
-            },
-        )?;
-        if can_force {
-            would_emit_events.push(EventKind::ForceMergeAttempted);
-            would_emit_events.push(EventKind::ForceMergeCompleted);
-        } else {
-            decisions.push(SyncPlanDecision {
-                code: "force_merge_denied".to_owned(),
-                pr: Some(head),
-                reason: "force intent lacks configured policy, exact clean compatibility, or ADMIN permission"
-                    .to_owned(),
-                next: "repair the exact policy/permission evidence or remove stale force intent, then plan again"
-                    .to_owned(),
-            });
-        }
         return Ok(());
     }
 
@@ -644,6 +606,74 @@ pub(super) fn plan_caravan_convergence(
                 .to_owned(),
         },
     )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_forced_head(
+    status: &StatusOutput,
+    provider: &impl SyncProvider,
+    caravan: &Caravan,
+    head_snapshot: &PullRequestSnapshot,
+    force_merge: bool,
+    actions: &mut Vec<SyncPlanAction>,
+    decisions: &mut Vec<SyncPlanDecision>,
+    would_emit_events: &mut Vec<EventKind>,
+) -> Result<(), AppError> {
+    let head = caravan.head().expect("caravan head");
+    let mechanically_allowed = force_allowed(status, head_snapshot, force_merge);
+    let permission = if mechanically_allowed {
+        Some(
+            provider
+                .viewer_permission(&status.repository)
+                .map_err(|error| {
+                    mutation_error(
+                        &error,
+                        &SyncProgress::new(status, vec![caravan.id], u32::MAX),
+                        Some(head),
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
+    let can_force = mechanically_allowed && permission.as_deref() == Some("ADMIN");
+    push_plan_action(
+        actions,
+        SyncPlanAction {
+            order: 0,
+            phase: SyncPlanPhase::ProviderConvergence,
+            state: if can_force {
+                SyncPlanActionState::WouldMutate
+            } else {
+                SyncPlanActionState::WouldStop
+            },
+            kind: "force_squash_merge".to_owned(),
+            pr: Some(head),
+            caravan_id: Some(caravan.id),
+            expected: Some(PullRequestPrecondition::from(head_snapshot)),
+            target: Some(json!({
+                "merge_method": "squash",
+                "permission": permission,
+                "ci": "bypassed_without_observation",
+            })),
+            reason: "durable PR-scoped caravan-force intent merges immediately once the PR is a mechanically mergeable caravan root"
+                .to_owned(),
+        },
+    )?;
+    if can_force {
+        would_emit_events.push(EventKind::ForceMergeAttempted);
+        would_emit_events.push(EventKind::ForceMergeCompleted);
+    } else {
+        decisions.push(SyncPlanDecision {
+            code: "force_merge_denied".to_owned(),
+            pr: Some(head),
+            reason: "force intent lacks configured policy, exact clean compatibility, or ADMIN permission"
+                .to_owned(),
+            next: "repair the exact policy/permission evidence or explicitly revoke durable force intent, then plan again"
+                .to_owned(),
+        });
+    }
     Ok(())
 }
 

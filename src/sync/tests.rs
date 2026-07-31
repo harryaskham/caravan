@@ -2410,7 +2410,12 @@ fn unrelated_disabled_force_head_does_not_block_targeted_force_sync() {
     selected.checks = vec![check("build-test", CheckState::Failure, Some(42))];
     let pulls = vec![unrelated, selected];
     let provider = FakeProvider::with_pull_requests(pulls.clone());
-    let initial_status = status(pulls, Some(PrNumber(2)), &clean);
+    let mut initial_status = status(pulls, Some(PrNumber(2)), &clean);
+    initial_status.analysis.fleet.problems.push(GraphProblem {
+        kind: GraphProblemKind::Incompatible,
+        prs: vec![PrNumber(2245)],
+        message: "unrelated admission candidate conflicts with main".to_owned(),
+    });
     let selected_caravan = initial_status
         .analysis
         .fleet
@@ -2429,8 +2434,7 @@ fn unrelated_disabled_force_head_does_not_block_targeted_force_sync() {
     let progress = execute(&initial_status, &provider, false, false, true)
         .expect("unrelated force gap does not block selected force head");
 
-    assert_eq!(progress.ci.len(), 1);
-    assert_eq!(progress.ci[0].pr, PrNumber(2));
+    assert!(progress.ci.is_empty(), "selected durable force skips CI");
     assert_eq!(
         provider.pulls.borrow()[&PrNumber(1)].state,
         PullRequestState::Open
@@ -2453,7 +2457,7 @@ fn unrelated_disabled_force_head_does_not_block_targeted_force_sync() {
 }
 
 #[test]
-fn unrelated_auto_merge_gap_without_force_policy_still_fails_closed() {
+fn unrelated_auto_merge_gap_does_not_block_selected_durable_force() {
     let unrelated = pull_request(
         1,
         "one",
@@ -2474,11 +2478,18 @@ fn unrelated_auto_merge_gap_without_force_policy_still_fails_closed() {
     let provider = FakeProvider::with_pull_requests(pulls.clone());
     let initial_status = status(pulls, Some(PrNumber(2)), &clean);
 
-    let error = execute(&initial_status, &provider, false, false, true)
-        .expect_err("an unrelated ordinary head invariant stays strict");
+    let progress = execute(&initial_status, &provider, false, false, true)
+        .expect("unrelated Caravan state cannot block selected durable force");
 
-    assert_eq!(error.code(), "invalid_graph");
-    assert!(provider.calls.borrow().is_empty());
+    assert_eq!(progress.current[&PrNumber(1)].state, PullRequestState::Open);
+    assert_eq!(
+        progress.current[&PrNumber(2)].state,
+        PullRequestState::Merged
+    );
+    assert_eq!(
+        *provider.calls.borrow(),
+        vec![MutationKind::Comment, MutationKind::SquashMerge]
+    );
 }
 
 #[test]
@@ -2499,16 +2510,19 @@ fn stale_forced_head_stops_before_admin_attempt() {
         .borrow_mut()
         .get_mut(&PrNumber(1))
         .expect("head")
-        .labels
-        .insert("external-change".to_owned());
+        .head
+        .oid = CommitOid("externally-moved-head".to_owned());
 
     let error =
         execute(&status, &provider, false, false, true).expect_err("stale head fails closed");
 
-    assert_eq!(mcp_cli::StructuredError::code(&error), "stale_precondition");
+    assert_eq!(
+        mcp_cli::StructuredError::code(&error),
+        "root_promotion_incomplete"
+    );
     assert!(provider.calls.borrow().is_empty());
     let details = mcp_cli::StructuredError::details(&error).expect("details");
-    assert_eq!(details["decision"]["evidence"]["events"], json!([]));
+    assert_eq!(details["events"], json!([]));
 }
 
 #[test]
@@ -2569,7 +2583,10 @@ fn force_comment_failure_is_structured_and_prevents_admin_merge() {
         json!(extracted[0].event_id),
         details["events"][0]["event_id"]
     );
-    assert_eq!(*provider.calls.borrow(), vec![MutationKind::Comment]);
+    assert_eq!(
+        *provider.calls.borrow(),
+        vec![MutationKind::DisableAutoMerge, MutationKind::Comment]
+    );
 }
 
 #[test]
@@ -2599,333 +2616,6 @@ fn force_merge_permission_denial_preserves_attempt_event() {
     assert!(provider.calls.borrow().is_empty());
 }
 
-fn force_rewrite_plan(status: &StatusOutput) -> crate::physical_rebase::RebasePlan {
-    let old_head = status.analysis.pull_requests[&PrNumber(1)].head.clone();
-    crate::physical_rebase::RebasePlan {
-        pr: PrNumber(1),
-        branch: old_head.name.clone(),
-        old_head_oid: old_head.oid.clone(),
-        old_base_oid: status.analysis.fleet.default_branch.oid.clone(),
-        range_source: crate::physical_rebase::PlannedRangeBase::RemoteBranch {
-            branch: status.analysis.fleet.default_branch.clone(),
-        },
-        new_base: crate::physical_rebase::PlannedBase::Remote(
-            status.analysis.fleet.default_branch.clone(),
-        ),
-        new_head_oid: CommitOid("rewritten0000000000000000000000000000000".to_owned()),
-        new_tree_oid: CommitOid("tree000000000000000000000000000000000000".to_owned()),
-        commit_count: 1,
-        merge_topology: None,
-        squash_reconciliation: None,
-        ci_trigger_workflows: vec!["CI".to_owned()],
-        lease: format!("refs/heads/{}:{}", old_head.name, old_head.oid),
-        already_satisfied: false,
-        rewrite_reason: crate::physical_rebase::BranchRewriteReason::Unspecified,
-    }
-}
-
-#[test]
-fn failed_rewrite_restores_force_only_after_proven_nonpublication() {
-    let mut pulls = healthy_chain();
-    pulls.truncate(1);
-    pulls[0].labels.insert("caravan-force".to_owned());
-    let provider = FakeProvider::with_pull_requests(pulls.clone());
-    let status = status(pulls, Some(PrNumber(1)), &clean);
-    let plan = force_rewrite_plan(&status);
-    let mut progress = SyncProgress::new(&status, vec![PrNumber(1)], u32::MAX);
-    invalidate_rewritten_force_intents(
-        &status,
-        &provider,
-        std::slice::from_ref(&plan),
-        &mut progress,
-    )
-    .unwrap();
-    assert!(!provider.pulls.borrow()[&PrNumber(1)].has_label("caravan-force"));
-    let mut outcome = PhysicalRebuildOutcome::default();
-    let error = restore_force_intent_after_nonpublication(
-        &status,
-        &provider,
-        &plan,
-        &mut progress,
-        &mut outcome,
-        AppError::validation("rebase_stale_lease", "push refused"),
-    );
-
-    assert_eq!(error.code(), "rebase_stale_lease");
-    assert!(provider.pulls.borrow()[&PrNumber(1)].has_label("caravan-force"));
-    assert_eq!(outcome.force_intent_restorations[0]["state"], "restored");
-    assert_eq!(outcome.force_intent_restorations[0]["restored"], true);
-    assert_eq!(
-        provider.calls.borrow().as_slice(),
-        [
-            MutationKind::RemoveLabel,
-            MutationKind::Comment,
-            MutationKind::AddLabel,
-            MutationKind::Comment,
-        ]
-    );
-    assert_eq!(
-        provider.audits.borrow()[1].operation,
-        "force_restore_nonpublication"
-    );
-
-    let mut repeated_outcome = PhysicalRebuildOutcome::default();
-    let repeated = restore_force_intent_after_nonpublication(
-        &status,
-        &provider,
-        &plan,
-        &mut progress,
-        &mut repeated_outcome,
-        AppError::validation("rebase_stale_lease", "push refused"),
-    );
-    assert_eq!(repeated.code(), "rebase_stale_lease");
-    assert_eq!(
-        repeated_outcome.force_intent_restorations[0]["state"],
-        "restored"
-    );
-    assert_eq!(provider.comments.borrow()[&PrNumber(1)].len(), 2);
-    assert_eq!(
-        provider.comments.borrow()[&PrNumber(1)]
-            .iter()
-            .filter(|body| body.contains("force_restore_nonpublication"))
-            .count(),
-        1
-    );
-}
-
-#[test]
-fn published_or_indeterminate_rewrite_never_restores_old_force_intent() {
-    for observed_oid in [
-        CommitOid("rewritten0000000000000000000000000000000".to_owned()),
-        CommitOid("thirdparty000000000000000000000000000000".to_owned()),
-    ] {
-        let mut pulls = healthy_chain();
-        pulls.truncate(1);
-        pulls[0].labels.insert("caravan-force".to_owned());
-        let provider = FakeProvider::with_pull_requests(pulls.clone());
-        let status = status(pulls, Some(PrNumber(1)), &clean);
-        let plan = force_rewrite_plan(&status);
-        let mut progress = SyncProgress::new(&status, vec![PrNumber(1)], u32::MAX);
-        invalidate_rewritten_force_intents(
-            &status,
-            &provider,
-            std::slice::from_ref(&plan),
-            &mut progress,
-        )
-        .unwrap();
-        provider
-            .pulls
-            .borrow_mut()
-            .get_mut(&PrNumber(1))
-            .unwrap()
-            .head
-            .oid = observed_oid.clone();
-        let mut outcome = PhysicalRebuildOutcome::default();
-        let error = restore_force_intent_after_nonpublication(
-            &status,
-            &provider,
-            &plan,
-            &mut progress,
-            &mut outcome,
-            AppError::validation("rebase_stale_lease", "push outcome"),
-        );
-        assert_eq!(error.code(), "rebase_stale_lease");
-        assert!(!provider.pulls.borrow()[&PrNumber(1)].has_label("caravan-force"));
-        assert_eq!(
-            outcome.force_intent_restorations[0]["state"],
-            if observed_oid == plan.new_head_oid {
-                "published"
-            } else {
-                "indeterminate"
-            }
-        );
-        assert_eq!(provider.calls.borrow().len(), 2);
-    }
-}
-
-#[test]
-fn force_restore_comment_failure_retains_partial_label_receipt() {
-    let mut pulls = healthy_chain();
-    pulls.truncate(1);
-    pulls[0].labels.insert("caravan-force".to_owned());
-    let provider = FakeProvider::with_pull_requests(pulls.clone());
-    let status = status(pulls, Some(PrNumber(1)), &clean);
-    let plan = force_rewrite_plan(&status);
-    let mut progress = SyncProgress::new(&status, vec![PrNumber(1)], u32::MAX);
-    invalidate_rewritten_force_intents(
-        &status,
-        &provider,
-        std::slice::from_ref(&plan),
-        &mut progress,
-    )
-    .unwrap();
-    provider.fail_once(MutationKind::Comment);
-    let mut outcome = PhysicalRebuildOutcome::default();
-    let error = restore_force_intent_after_nonpublication(
-        &status,
-        &provider,
-        &plan,
-        &mut progress,
-        &mut outcome,
-        AppError::validation("rebase_stale_lease", "push refused"),
-    );
-    assert_eq!(error.code(), "force_intent_restore_failed");
-    assert!(provider.pulls.borrow()[&PrNumber(1)].has_label("caravan-force"));
-    let details = error.details().unwrap();
-    assert_eq!(details["original_error"]["code"], "rebase_stale_lease");
-    assert!(details["provider_receipts"].as_array().unwrap().len() >= 3);
-}
-
-#[test]
-fn physical_rewrite_invalidates_force_intent_bound_to_old_head_generation() {
-    let mut pulls = healthy_chain();
-    pulls.truncate(1);
-    pulls[0].labels.insert("caravan-force".to_owned());
-    let provider = FakeProvider::with_pull_requests(pulls.clone());
-    let status = status(pulls, Some(PrNumber(1)), &clean);
-    let old_head = status.analysis.pull_requests[&PrNumber(1)].head.clone();
-    let plan = crate::physical_rebase::RebasePlan {
-        pr: PrNumber(1),
-        branch: old_head.name.clone(),
-        old_head_oid: old_head.oid.clone(),
-        old_base_oid: status.analysis.fleet.default_branch.oid.clone(),
-        range_source: crate::physical_rebase::PlannedRangeBase::RemoteBranch {
-            branch: status.analysis.fleet.default_branch.clone(),
-        },
-        new_base: crate::physical_rebase::PlannedBase::Remote(
-            status.analysis.fleet.default_branch.clone(),
-        ),
-        new_head_oid: CommitOid("rewritten0000000000000000000000000000000".to_owned()),
-        new_tree_oid: CommitOid("tree000000000000000000000000000000000000".to_owned()),
-        commit_count: 1,
-        merge_topology: None,
-        squash_reconciliation: None,
-        ci_trigger_workflows: vec!["CI".to_owned()],
-        lease: format!("refs/heads/{}:{}", old_head.name, old_head.oid),
-        already_satisfied: false,
-        rewrite_reason: crate::physical_rebase::BranchRewriteReason::Unspecified,
-    };
-    let mut progress = SyncProgress::new(&status, vec![PrNumber(1)], u32::MAX);
-
-    invalidate_rewritten_force_intents(&status, &provider, &[plan], &mut progress)
-        .expect("old-generation force intent is invalidated before rewrite");
-
-    assert!(!progress.current[&PrNumber(1)].has_label("caravan-force"));
-    assert_eq!(
-        *provider.calls.borrow(),
-        vec![MutationKind::RemoveLabel, MutationKind::Comment]
-    );
-    assert_eq!(progress.provider_receipts.len(), 2);
-    let audits = provider.audits.borrow();
-    assert_eq!(audits[0].operation, "force_invalidate_rewrite");
-    assert!(audits[0].reason.contains(&old_head.oid.0));
-    assert!(audits[0].reason.contains("rewritten"));
-}
-
-#[test]
-fn already_satisfied_generation_preserves_explicit_force_intent() {
-    let mut pulls = healthy_chain();
-    pulls.truncate(1);
-    pulls[0].labels.insert("caravan-force".to_owned());
-    let provider = FakeProvider::with_pull_requests(pulls.clone());
-    let status = status(pulls, Some(PrNumber(1)), &clean);
-    let head = status.analysis.pull_requests[&PrNumber(1)].head.clone();
-    let plan = crate::physical_rebase::RebasePlan {
-        pr: PrNumber(1),
-        branch: head.name.clone(),
-        old_head_oid: head.oid.clone(),
-        old_base_oid: status.analysis.fleet.default_branch.oid.clone(),
-        range_source: crate::physical_rebase::PlannedRangeBase::RemoteBranch {
-            branch: status.analysis.fleet.default_branch.clone(),
-        },
-        new_base: crate::physical_rebase::PlannedBase::Remote(
-            status.analysis.fleet.default_branch.clone(),
-        ),
-        new_head_oid: head.oid.clone(),
-        new_tree_oid: CommitOid("tree000000000000000000000000000000000000".to_owned()),
-        commit_count: 1,
-        merge_topology: None,
-        squash_reconciliation: None,
-        ci_trigger_workflows: vec!["CI".to_owned()],
-        lease: format!("refs/heads/{}:{}", head.name, head.oid),
-        already_satisfied: true,
-        rewrite_reason: crate::physical_rebase::BranchRewriteReason::Unspecified,
-    };
-    let mut progress = SyncProgress::new(&status, vec![PrNumber(1)], u32::MAX);
-
-    invalidate_rewritten_force_intents(&status, &provider, &[plan], &mut progress)
-        .expect("unchanged generation retains explicit force intent");
-
-    assert!(progress.current[&PrNumber(1)].has_label("caravan-force"));
-    assert!(provider.calls.borrow().is_empty());
-    assert!(provider.audits.borrow().is_empty());
-}
-
-#[test]
-fn fresh_force_reapplication_on_rewritten_generation_can_enter_force_path() {
-    let mut pulls = healthy_chain();
-    pulls.truncate(1);
-    pulls[0].labels.insert("caravan-force".to_owned());
-    let provider = FakeProvider::with_pull_requests(pulls.clone());
-    let initial_status = status(pulls, Some(PrNumber(1)), &clean);
-    let head = initial_status.analysis.pull_requests[&PrNumber(1)]
-        .head
-        .clone();
-    let rewritten_oid = CommitOid("rewritten0000000000000000000000000000000".to_owned());
-    let plan = crate::physical_rebase::RebasePlan {
-        pr: PrNumber(1),
-        branch: head.name.clone(),
-        old_head_oid: head.oid.clone(),
-        old_base_oid: initial_status.analysis.fleet.default_branch.oid.clone(),
-        range_source: crate::physical_rebase::PlannedRangeBase::RemoteBranch {
-            branch: initial_status.analysis.fleet.default_branch.clone(),
-        },
-        new_base: crate::physical_rebase::PlannedBase::Remote(
-            initial_status.analysis.fleet.default_branch.clone(),
-        ),
-        new_head_oid: rewritten_oid.clone(),
-        new_tree_oid: CommitOid("tree000000000000000000000000000000000000".to_owned()),
-        commit_count: 1,
-        merge_topology: None,
-        squash_reconciliation: None,
-        ci_trigger_workflows: vec!["CI".to_owned()],
-        lease: format!("refs/heads/{}:{}", head.name, head.oid),
-        already_satisfied: false,
-        rewrite_reason: crate::physical_rebase::BranchRewriteReason::Unspecified,
-    };
-    let mut progress = SyncProgress::new(&initial_status, vec![PrNumber(1)], u32::MAX);
-    invalidate_rewritten_force_intents(&initial_status, &provider, &[plan], &mut progress)
-        .expect("old-generation force is consumed");
-
-    let rewritten = {
-        let mut provider_pulls = provider.pulls.borrow_mut();
-        let rewritten = provider_pulls.get_mut(&PrNumber(1)).expect("head");
-        rewritten.head.oid = rewritten_oid;
-        rewritten.checks.clear();
-        rewritten.labels.insert("caravan-force".to_owned());
-        rewritten.clone()
-    };
-    let rewritten_status = status(vec![rewritten], Some(PrNumber(1)), &clean);
-
-    let progress = execute(&rewritten_status, &provider, false, false, true)
-        .expect("fresh force label on exact rewritten generation is accepted");
-
-    assert_eq!(progress.ci[0].disposition, CiDisposition::Forced);
-    assert_eq!(
-        progress.current[&PrNumber(1)].state,
-        PullRequestState::Merged
-    );
-    assert_eq!(
-        *provider.calls.borrow(),
-        vec![
-            MutationKind::RemoveLabel,
-            MutationKind::Comment,
-            MutationKind::Comment,
-            MutationKind::SquashMerge,
-        ]
-    );
-}
-
 #[test]
 fn forced_head_bypasses_queued_expected_in_progress_and_empty_checks() {
     for checks in [
@@ -2944,10 +2634,18 @@ fn forced_head_bypasses_queued_expected_in_progress_and_empty_checks() {
         let progress = execute(&status, &provider, false, false, true)
             .expect("explicit force bypasses every non-successful CI state");
 
-        assert_eq!(progress.ci[0].disposition, CiDisposition::Forced);
+        assert!(progress.ci.is_empty(), "durable force skips CI observation");
+        assert!(
+            progress.required_runs.is_empty(),
+            "durable force skips required-run observation"
+        );
         assert_eq!(
             *provider.calls.borrow(),
-            vec![MutationKind::Comment, MutationKind::SquashMerge]
+            vec![
+                MutationKind::DisableAutoMerge,
+                MutationKind::Comment,
+                MutationKind::SquashMerge,
+            ]
         );
         assert_eq!(
             progress.current[&PrNumber(1)].state,
@@ -2971,17 +2669,17 @@ fn forced_head_bypasses_mixed_pending_and_failed_checks_with_accurate_audit() {
     let progress = execute(&status, &provider, false, false, true)
         .expect("explicit force bypasses mixed pending and failed checks");
 
-    assert_eq!(progress.ci[0].disposition, CiDisposition::Forced);
+    assert!(progress.ci.is_empty(), "durable force skips CI observation");
     let audits = provider.audits.borrow();
     assert_eq!(audits.len(), 1);
-    assert!(audits[0].reason.contains("observed checks"));
+    assert!(audits[0].reason.contains("current visible checks"));
     assert!(audits[0].reason.contains("INPROGRESS"));
     assert!(audits[0].reason.contains("FAILURE"));
     assert!(!audits[0].reason.contains("failed checks:"));
 }
 
 #[test]
-fn passing_checks_with_stale_force_label_use_normal_auto_merge() {
+fn passing_checks_with_durable_force_still_merge_immediately() {
     let mut pulls = healthy_chain();
     pulls.truncate(1);
     pulls[0].labels.insert("caravan-force".to_owned());
@@ -2991,12 +2689,12 @@ fn passing_checks_with_stale_force_label_use_normal_auto_merge() {
     let status = status(pulls, Some(PrNumber(1)), &clean);
 
     let progress = execute(&status, &provider, false, false, true)
-        .expect("successful CI does not invoke exceptional force");
+        .expect("durable force merges without consulting successful CI");
 
-    assert_eq!(progress.ci[0].disposition, CiDisposition::Passing);
+    assert!(progress.ci.is_empty());
     assert_eq!(
         *provider.calls.borrow(),
-        vec![MutationKind::EnableAutoMerge]
+        vec![MutationKind::Comment, MutationKind::SquashMerge]
     );
     assert_eq!(
         progress
@@ -3004,9 +2702,15 @@ fn passing_checks_with_stale_force_label_use_normal_auto_merge() {
             .iter()
             .map(|event| event.kind)
             .collect::<Vec<_>>(),
-        vec![EventKind::RootAutoMergeArmed]
+        vec![
+            EventKind::ForceMergeAttempted,
+            EventKind::ForceMergeCompleted
+        ]
     );
-    assert!(provider.audits.borrow().is_empty());
+    assert_eq!(
+        progress.current[&PrNumber(1)].state,
+        PullRequestState::Merged
+    );
 }
 
 #[test]
@@ -3037,7 +2741,8 @@ fn successful_force_merge_is_one_shot_and_advances_child() {
     assert_eq!(progress.current[&PrNumber(2)].base.name, "main");
     assert_eq!(
         progress.current[&PrNumber(2)].auto_merge,
-        AutoMergeState::squash()
+        AutoMergeState::disabled(),
+        "forced successor stays under Cara's direct merge actor"
     );
     assert_eq!(
         *provider.calls.borrow(),
@@ -3045,7 +2750,6 @@ fn successful_force_merge_is_one_shot_and_advances_child() {
             MutationKind::Comment,
             MutationKind::SquashMerge,
             MutationKind::SetBase,
-            MutationKind::EnableAutoMerge,
         ]
     );
     assert_eq!(progress.head_advancements[0].new_head, PrNumber(2));
@@ -3060,7 +2764,6 @@ fn successful_force_merge_is_one_shot_and_advances_child() {
             EventKind::ForceMergeCompleted,
             EventKind::RootPromoted,
             EventKind::HeadAdvanced,
-            EventKind::RootAutoMergeArmed,
         ]
     );
     assert_eq!(
@@ -5224,10 +4927,10 @@ fn an_unsound_bound_refuses_joins_loudly_instead_of_gating_them() {
 }
 
 #[test]
-fn deferred_members_keep_their_exact_generation_force_intent() {
-    // Force invalidation is a control mutation bound to a rewrite. A member
-    // deferred by the bounded prefix is not rewritten, so its exact-generation
-    // intent must not be invalidated and must not be charged to the reserve.
+fn durable_force_intent_never_changes_the_physical_apply_reserve() {
+    // Durable PR-scoped force intent needs no invalidate/restore control
+    // transaction. Admitting the labelled member therefore adds only that
+    // member's ordinary branch-apply slots.
     let mut context = cacophony_context();
     context.config.command_timeout_secs = 10;
     let mut pulls = linear_chain(3);
@@ -5242,8 +4945,8 @@ fn deferred_members_keep_their_exact_generation_force_intent() {
 
     assert_eq!(
         prefix_with_forced_member.command_slots - prefix_without_forced_member.command_slots,
-        3 + 6,
-        "only an admitted forced member charges its invalidation and compensation"
+        3,
+        "durable force adds no control-mutation reserve"
     );
 }
 

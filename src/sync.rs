@@ -76,10 +76,6 @@ const PHYSICAL_APPLY_COMMAND_SLOTS_PER_PENDING_MEMBER: u64 = 3;
 /// A member whose exact cumulative ancestry already holds still revalidates
 /// its range and target generations, but never pushes.
 const PHYSICAL_APPLY_COMMAND_SLOTS_PER_RETAINED_MEMBER: u64 = 2;
-/// Invalidation reserves remove+audit and the complete compensating add+audit
-/// path when branch non-publication is later proven.
-const PHYSICAL_FORCE_INVALIDATION_COMMAND_SLOTS: u64 = 6;
-const PHYSICAL_FORCE_INVALIDATION_MUTATIONS: u64 = 4;
 /// One bounded CI observation per member during ordinary reconciliation.
 const PHYSICAL_RECONCILIATION_COMMAND_SLOTS_PER_MEMBER: u64 = 1;
 /// Root base retarget plus convergent root auto-merge arming per caravan.
@@ -1259,11 +1255,6 @@ impl PreparedChain {
     fn admitted_members(&self) -> impl Iterator<Item = &crate::physical_rebase::PreparedRebase> {
         self.members.iter().take(self.admitted)
     }
-
-    fn admitted_plans(&self) -> impl Iterator<Item = crate::physical_rebase::RebasePlan> + '_ {
-        self.admitted_members()
-            .map(|prepared| prepared.plan.clone())
-    }
 }
 
 /// Exact per-member cost inputs taken from approved plans rather than from a
@@ -1284,8 +1275,6 @@ fn chain_costs_from_plans(status: &StatusOutput, chains: &[PreparedChain]) -> Ve
                         pending: !prepared.plan.already_satisfied,
                         auto_merge_enabled: current
                             .is_some_and(|pull_request| pull_request.auto_merge.enabled),
-                        force_labelled: current
-                            .is_some_and(|pull_request| pull_request.has_label("caravan-force")),
                     }
                 })
                 .collect(),
@@ -1471,7 +1460,6 @@ struct PhysicalRebuildOutcome {
     receipts: Vec<crate::physical_rebase::RebaseReceipt>,
     provider_receipts: Vec<GitHubMutationReceipt>,
     steps: Vec<MutationStep>,
-    force_intent_restorations: Vec<Value>,
 }
 
 fn selected_unpaused_caravans(status: &StatusOutput, all: bool) -> Result<Vec<Caravan>, AppError> {
@@ -1798,7 +1786,7 @@ fn validate_rebase_preflight_graph(
         // dissolutions, fell through into a blocking decision, so `status`
         // reported healthy while every tick aborted with `invalid_graph`
         // (bd-226a07).
-        if !problem.kind.blocks_fleet() {
+        if !problem.kind.blocks_fleet() || !problem_affects_selected_caravans(problem, selected) {
             continue;
         }
         let auto_merge = problem.kind == GraphProblemKind::AutoMergeInvariant
@@ -1889,217 +1877,6 @@ fn verify_physical_write_barrier(
         }
     }
     Ok(())
-}
-
-fn invalidate_rewritten_force_intents(
-    status: &StatusOutput,
-    provider: &impl SyncProvider,
-    plans: &[crate::physical_rebase::RebasePlan],
-    progress: &mut SyncProgress,
-) -> Result<(), AppError> {
-    for plan in plans.iter().filter(|plan| !plan.already_satisfied) {
-        let current = progress
-            .current
-            .get(&plan.pr)
-            .expect("planned PR has current provider facts")
-            .clone();
-        if !current.has_label("caravan-force") {
-            continue;
-        }
-
-        let mut after_labels = current.labels.clone();
-        after_labels.remove("caravan-force");
-        let audit = ControlLabelAudit {
-            operation: "force_invalidate_rewrite".to_owned(),
-            marker: control_label_marker(
-                "force_invalidate_rewrite",
-                plan.pr,
-                &plan.old_head_oid,
-                &current.labels,
-                &after_labels,
-            ),
-            before_labels: current.labels.clone(),
-            after_labels,
-            actor: "cara sync physical-rebase policy".to_owned(),
-            reason: format!(
-                "invalidated caravan-force intent bound to old head {} before Cara-owned rewrite to {}",
-                plan.old_head_oid, plan.new_head_oid
-            ),
-            reason_source: "deterministic exact-generation safety policy".to_owned(),
-            compatibility_evidence: format!(
-                "physical rebase plan for PR #{} passed the global write barrier",
-                plan.pr
-            ),
-            clean_squash_evidence:
-                "not applicable: force intent is removed before branch history changes".to_owned(),
-            admission_priority_basis: "not applicable: caravan order is unchanged".to_owned(),
-        };
-        progress.ensure_mutation_capacity(1)?;
-        let receipt = provider
-            .remove_label(
-                &status.repository,
-                &progress.precondition(plan.pr),
-                "caravan-force",
-            )
-            .map_err(|error| mutation_error(&error, progress, Some(plan.pr)))?;
-        progress.record(
-            receipt,
-            "removed caravan-force before rewriting its exact head generation",
-        );
-        progress.ensure_control_label_comment(provider, &status.repository, plan.pr, &audit)?;
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_lines)]
-fn restore_force_intent_after_nonpublication(
-    status: &StatusOutput,
-    provider: &impl SyncProvider,
-    plan: &crate::physical_rebase::RebasePlan,
-    progress: &mut SyncProgress,
-    outcome: &mut PhysicalRebuildOutcome,
-    original_error: AppError,
-) -> AppError {
-    let Some(original) = status.analysis.pull_requests.get(&plan.pr) else {
-        return original_error;
-    };
-    if plan.already_satisfied || !original.has_label("caravan-force") {
-        return original_error;
-    }
-    let observed = match provider.refetch_pull_request(&status.repository, plan.pr) {
-        Ok(observed) => observed,
-        Err(error) => {
-            outcome.force_intent_restorations.push(json!({
-                "pr": plan.pr,
-                "state": "indeterminate",
-                "old_head_oid": plan.old_head_oid,
-                "planned_head_oid": plan.new_head_oid,
-                "provider_error": error.to_string(),
-                "restored": false,
-            }));
-            return original_error;
-        }
-    };
-    if observed.head.oid == plan.new_head_oid {
-        outcome.force_intent_restorations.push(json!({
-            "pr": plan.pr,
-            "state": "published",
-            "observed_head_oid": observed.head.oid,
-            "restored": false,
-            "reason": "planned generation is provider-visible; old-generation intent stays invalidated",
-        }));
-        return original_error;
-    }
-    if observed.head.oid != plan.old_head_oid {
-        outcome.force_intent_restorations.push(json!({
-            "pr": plan.pr,
-            "state": "indeterminate",
-            "old_head_oid": plan.old_head_oid,
-            "planned_head_oid": plan.new_head_oid,
-            "observed_head_oid": observed.head.oid,
-            "restored": false,
-        }));
-        return original_error;
-    }
-
-    progress.current.insert(plan.pr, observed.clone());
-    let mut audit_before_labels = observed.labels.clone();
-    audit_before_labels.remove("caravan-force");
-    let mut after_labels = audit_before_labels.clone();
-    after_labels.insert("caravan-force".to_owned());
-    let audit = ControlLabelAudit {
-        operation: "force_restore_nonpublication".to_owned(),
-        marker: control_label_marker(
-            "force_restore_nonpublication",
-            plan.pr,
-            &plan.old_head_oid,
-            &audit_before_labels,
-            &after_labels,
-        ),
-        before_labels: audit_before_labels,
-        after_labels,
-        actor: "cara physical-rebase recovery policy".to_owned(),
-        reason: format!(
-            "restored caravan-force intent on unchanged old head {} after planned generation {} was proven not published ({})",
-            plan.old_head_oid,
-            plan.new_head_oid,
-            original_error.code(),
-        ),
-        reason_source: "exact provider non-publication proof after failed branch apply".to_owned(),
-        compatibility_evidence: format!(
-            "retained physical plan for PR #{} failed before provider exposed the planned head",
-            plan.pr
-        ),
-        clean_squash_evidence:
-            "old-generation intent only; any later successful rewrite invalidates it again"
-                .to_owned(),
-        admission_priority_basis: "not applicable: restoration does not change caravan order"
-            .to_owned(),
-    };
-
-    let restore = (|| -> Result<(), AppError> {
-        if observed.has_label("caravan-force") {
-            progress.already(
-                MutationKind::AddLabel,
-                plan.pr,
-                "old-generation force intent already restored",
-            );
-        } else {
-            progress.ensure_mutation_capacity(1)?;
-            let receipt = provider
-                .add_label(
-                    &status.repository,
-                    &progress.precondition(plan.pr),
-                    "caravan-force",
-                )
-                .map_err(|error| mutation_error(&error, progress, Some(plan.pr)))?;
-            progress.record(
-                receipt,
-                "restored caravan-force after proven rewrite non-publication",
-            );
-        }
-        progress.ensure_control_label_comment(provider, &status.repository, plan.pr, &audit)
-    })();
-    match restore {
-        Ok(()) => {
-            outcome.force_intent_restorations.push(json!({
-                "pr": plan.pr,
-                "state": "restored",
-                "old_head_oid": plan.old_head_oid,
-                "planned_head_oid": plan.new_head_oid,
-                "observed_head_oid": progress.current.get(&plan.pr).map(|pr| &pr.head.oid),
-                "restored": true,
-                "audit_marker": audit.marker,
-            }));
-            original_error
-        }
-        Err(restore_error) => AppError::structured(
-            ErrorCategory::ExecutionFailure,
-            "force_intent_restore_failed",
-            "rewrite non-publication was proven but old-generation force intent restoration did not complete",
-            Some(json!({
-                "pr": plan.pr,
-                "old_head_oid": plan.old_head_oid,
-                "planned_head_oid": plan.new_head_oid,
-                "original_error": {
-                    "category": original_error.category(),
-                    "code": original_error.code(),
-                    "message": original_error.message(),
-                    "details": original_error.details(),
-                },
-                "restore_error": {
-                    "category": restore_error.category(),
-                    "code": restore_error.code(),
-                    "message": restore_error.message(),
-                    "details": restore_error.details(),
-                },
-                "completed_steps": progress.steps,
-                "provider_receipts": progress.provider_receipts,
-                "resumable": true,
-                "next": "rediscover the exact old head and rerun sync; restoration audits deduplicate by exact transition",
-            })),
-        ),
-    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2257,15 +2034,7 @@ fn apply_physical_chains(
                 Err(_) => {}
             }
         }
-        for (plan, error) in failed_plans {
-            let error = restore_force_intent_after_nonpublication(
-                status,
-                provider,
-                &plan,
-                &mut progress,
-                &mut outcome,
-                error,
-            );
+        for (_plan, error) in failed_plans {
             if first_error.is_none() {
                 first_error = Some(error);
             }
@@ -2383,10 +2152,6 @@ fn attach_physical_rebuild(error: AppError, outcome: &PhysicalRebuildOutcome) ->
             json!(outcome.provider_receipts),
         );
         object.insert("completed_steps".to_owned(), json!(outcome.steps));
-        object.insert(
-            "force_intent_restorations".to_owned(),
-            json!(outcome.force_intent_restorations),
-        );
         object.insert("resumable".to_owned(), json!(true));
         let deterministic_history_decision = matches!(
             error.code().as_str(),
@@ -2692,13 +2457,6 @@ fn sync_with_lock(
             .iter()
             .flat_map(|chain| chain.members.iter().map(|item| item.plan.clone()))
             .collect::<Vec<_>>();
-        // Control mutations follow the admitted prefix exactly: a deferred
-        // member keeps its exact-generation force intent because nothing has
-        // rewritten the generation that intent is bound to.
-        let admitted_plans = prepared
-            .iter()
-            .flat_map(PreparedChain::admitted_plans)
-            .collect::<Vec<_>>();
         lock.checkpoint(
             "physical_rebase_global_preflight_complete",
             json!({
@@ -2712,37 +2470,9 @@ fn sync_with_lock(
             }),
             false,
         )?;
-        let mut progress = progress;
-        invalidate_rewritten_force_intents(&status, &provider, &admitted_plans, &mut progress)?;
-        lock.checkpoint(
-            "physical_rebase_force_intents_invalidated",
-            json!({
-                "rebase_plans": checkpoint_rebase_plans(&plans),
-                "provider_receipts": checkpoint_provider_receipts(&progress.provider_receipts),
-                "completed_steps": bounded_checkpoint_sequence(
-                    progress
-                        .steps
-                        .iter()
-                        .map(|step| serde_json::to_value(step).expect("mutation step serializes"))
-                        .collect(),
-                ),
-                "branch_writes": 0,
-            }),
-            false,
-        )
-        .map_err(|error| {
-            attach_physical_rebuild(
-                error,
-                &PhysicalRebuildOutcome {
-                    repository: Some(status.repository.clone()),
-                    affected_prs: plans.iter().map(|plan| plan.pr).collect(),
-                    plans: plans.clone(),
-                    provider_receipts: progress.provider_receipts.clone(),
-                    steps: progress.steps.clone(),
-                    ..PhysicalRebuildOutcome::default()
-                },
-            )
-        })?;
+        // `caravan-force` is durable PR-scoped intent. Branch pushes retain PR
+        // labels, so physical apply carries it through without provider control
+        // mutations or compensation choreography (bd-91e96a).
         physical_rebuild =
             apply_physical_chains(&status, &provider, &prepared, progress, &mut lock)?;
         progress::emit(
@@ -4164,7 +3894,25 @@ fn reconcile_caravan(
         progress.ensure_no_foreign_auto_merge(provider, &status.repository, caravan.id, number)?;
     }
 
-    let mut forced_head = false;
+    // Durable force intent is a PR-level instruction, not a classification of
+    // one check generation. Once that PR is the root, skip every CI and
+    // required-run read for the caravan and attempt the fresh mechanical/admin
+    // force transaction immediately (bd-91e96a).
+    if progress
+        .current
+        .get(&head)
+        .is_some_and(|current| current.has_label("caravan-force"))
+    {
+        return force_merge_head(
+            status,
+            provider,
+            caravan,
+            force_merge,
+            rewritten_heads,
+            progress,
+        );
+    }
+
     let mut ci_failure = None;
     for number in caravan.members.iter().copied() {
         let observation = progress.observe_ci(provider, &status.repository, number)?;
@@ -4190,18 +3938,6 @@ fn reconcile_caravan(
             ci_failure = Some(observation);
             break;
         }
-        forced_head |= number == head && disposition == CiDisposition::Forced;
-    }
-
-    if forced_head {
-        return force_merge_head(
-            status,
-            provider,
-            caravan,
-            force_merge,
-            rewritten_heads,
-            progress,
-        );
     }
 
     if progress.head_merge_actor.github() {
@@ -4242,20 +3978,7 @@ fn force_merge_head(
     progress: &mut SyncProgress,
 ) -> Result<(), AppError> {
     let head = caravan.head().expect("caravan head");
-    // An exceptional non-green administrator merge binds the *exact discovery*
-    // generation it was authorized against. Promotion deliberately tolerates
-    // unrelated churn so routine convergence is not operator babysitting, but
-    // force is not routine: any drift since discovery fails closed here, before
-    // any provider write.
-    if let Some(discovered) = status.analysis.pull_requests.get(&head) {
-        provider
-            .verify_pull_request(
-                &status.repository,
-                &PullRequestPrecondition::from(discovered),
-            )
-            .map_err(|error| mutation_error(&error, progress, Some(head)))?;
-    }
-    let current = progress
+    let mut current = progress
         .current
         .get(&head)
         .expect("current head facts")
@@ -4292,6 +4015,9 @@ fn force_merge_head(
     }
 
     provider
+        .verify_pull_request(&status.repository, &PullRequestPrecondition::from(&current))
+        .map_err(|error| mutation_error(&error, progress, Some(head)))?;
+    provider
         .verify_branch_head(
             &status.repository,
             &status.default_branch,
@@ -4303,7 +4029,7 @@ fn force_merge_head(
         EventKind::ForceMergeAttempted,
         Some(caravan.id),
         vec![head],
-        Some("non-successful CI state accepted by explicit caravan-force policy".to_owned()),
+        Some("durable caravan-force intent bypassed CI and authorized immediate mechanical/admin merge".to_owned()),
         force_event_metadata(progress, head),
     ));
 
@@ -4324,13 +4050,21 @@ fn force_merge_head(
         ));
     }
 
+    // Durable force has one merge actor: Cara's administrator squash. Remove a
+    // historical native auto-merge request only after all zero-write policy and
+    // permission checks pass, then rebind the final write to that exact row.
+    progress.ensure_auto_merge_disabled(provider, &status.repository, head)?;
+    current = progress
+        .current
+        .get(&head)
+        .expect("forced head remains current after auto-merge disarm")
+        .clone();
+    provider
+        .verify_pull_request(&status.repository, &PullRequestPrecondition::from(&current))
+        .map_err(|error| mutation_error(&error, progress, Some(head)))?;
+
     let mut before_labels = current.labels.clone();
     before_labels.remove("caravan-force");
-    let observation = progress
-        .ci
-        .iter()
-        .find(|item| item.pr == head)
-        .expect("forced head has CI observation");
     let compatibility = status
         .analysis
         .compatibility
@@ -4353,8 +4087,8 @@ fn force_merge_head(
         after_labels: current.labels.clone(),
         actor: "authenticated GitHub comment author; cara sync/loop force policy".to_owned(),
         reason: format!(
-            "observed external `caravan-force`; force_merge=true; ADMIN permission confirmed; observed checks (including pending, running, failed, or empty): {}",
-            serde_json::to_string(&observation.checks).expect("checks serialize")
+            "observed durable `caravan-force`; force_merge=true; ADMIN permission confirmed; CI bypassed without waiting; current visible checks: {}",
+            serde_json::to_string(&current.checks).expect("checks serialize")
         ),
         reason_source: "deterministic evidence from GitHub checks, external label, repository config, and permission preflight".to_owned(),
         compatibility_evidence: format!(
@@ -4410,7 +4144,11 @@ fn force_merge_head(
         for number in caravan.members.iter().skip(2).copied() {
             progress.ensure_auto_merge_disabled(provider, &status.repository, number)?;
         }
-        if progress.head_merge_actor.github() {
+        let successor_forced = progress
+            .current
+            .get(&new_head)
+            .is_some_and(|pull| pull.has_label("caravan-force"));
+        if progress.head_merge_actor.github() && !successor_forced {
             progress.ensure_root_squash_auto_merge(
                 provider,
                 &status.repository,
@@ -4420,6 +4158,9 @@ fn force_merge_head(
                 rewritten_heads.get(&new_head),
             )?;
         } else {
+            // A durable forced successor must never be handed to native
+            // auto-merge. The next fresh tick re-proves it against the advanced
+            // default and performs the immediate administrator squash.
             progress.ensure_no_foreign_auto_merge(
                 provider,
                 &status.repository,
@@ -4648,9 +4389,10 @@ fn sync_checkpoint_evidence(progress: &SyncProgress) -> Value {
 fn force_event_metadata(progress: &SyncProgress, head: PrNumber) -> BTreeMap<String, Value> {
     let mut metadata = BTreeMap::new();
     metadata.insert("head".to_owned(), json!(progress.current.get(&head)));
+    metadata.insert("ci_bypassed".to_owned(), json!(true));
     metadata.insert(
-        "ci".to_owned(),
-        json!(progress.ci.iter().find(|item| item.pr == head)),
+        "visible_checks".to_owned(),
+        json!(progress.current.get(&head).map(|pull| &pull.checks)),
     );
     metadata.insert(
         "operation_receipt".to_owned(),
@@ -5040,14 +4782,7 @@ fn retryable_infrastructure(diagnostic: &WorkflowRunFailureDiagnostic) -> bool {
 }
 
 fn classify_checks(checks: &[CheckSnapshot], forced: bool) -> CiDisposition {
-    let fully_successful = !checks.is_empty()
-        && checks.iter().all(|check| {
-            matches!(
-                check.state,
-                CheckState::Success | CheckState::Neutral | CheckState::Skipped
-            )
-        });
-    if forced && !fully_successful {
+    if forced {
         return CiDisposition::Forced;
     }
 
@@ -5297,6 +5032,15 @@ fn preflight_repository(
     Ok(())
 }
 
+fn problem_affects_selected_caravans(problem: &GraphProblem, selected: &[Caravan]) -> bool {
+    problem.prs.is_empty()
+        || problem.prs.iter().any(|number| {
+            selected
+                .iter()
+                .any(|caravan| caravan.members.contains(number))
+        })
+}
+
 fn validate_graph(
     status: &StatusOutput,
     selected: &[Caravan],
@@ -5304,8 +5048,10 @@ fn validate_graph(
     force_merge: bool,
 ) -> Result<(), AppError> {
     for problem in &status.analysis.fleet.problems {
-        // See `blocks_fleet()` above: stop for what gates the fleet, nothing else.
-        if !problem.kind.blocks_fleet() {
+        // A targeted tick owns only the selected caravans. Problems scoped to
+        // unrelated admission rows or caravans cannot block this transaction;
+        // empty-PR problems remain repository-global and fail closed.
+        if !problem.kind.blocks_fleet() || !problem_affects_selected_caravans(problem, selected) {
             continue;
         }
         let correctable_auto_merge = problem.kind == GraphProblemKind::AutoMergeInvariant
@@ -5375,6 +5121,17 @@ fn first_blocking_completion_problem<'a>(
         // that does not merge cleanly into main, and aborted with invalid_graph
         // (bd-c39de4).
         if !problem.kind.blocks_fleet() {
+            return false;
+        }
+        if !problem.prs.is_empty()
+            && !problem.prs.iter().any(|number| {
+                status
+                    .analysis
+                    .fleet
+                    .containing(*number)
+                    .is_some_and(|caravan| progress.synchronized_caravans.contains(&caravan.id))
+            })
+        {
             return false;
         }
         let Some(number) = force_head_auto_merge_gap(status, problem, force_merge) else {

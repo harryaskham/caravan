@@ -1,4 +1,4 @@
-//! Reviewed exact-head force-intent preview, apply, and revoke contract.
+//! Reviewed authorization for durable PR-scoped force-intent transitions.
 //!
 //! This is the machine contract consumed by Cacophony's controller-gated
 //! `caco cara force-*` surface.  It is deliberately separate from the compact
@@ -257,7 +257,7 @@ pub fn preview(
     execute_live(context, input, ReviewedForceIntentAction::Preview)
 }
 
-/// Apply exact-head force intent and squash auto-merge through one provider mutation.
+/// Apply durable PR-scoped force intent through one reviewed provider mutation.
 pub fn apply(
     context: &AppContext,
     input: &ReviewedForceIntentInput,
@@ -265,7 +265,7 @@ pub fn apply(
     execute_live(context, input, ReviewedForceIntentAction::Apply)
 }
 
-/// Revoke exact-generation force intent, including after authority expiry.
+/// Revoke durable PR-scoped force intent, including after authority expiry.
 pub fn revoke(
     context: &AppContext,
     input: &ReviewedForceIntentInput,
@@ -471,12 +471,11 @@ fn execute(
     }
 
     let desired_present = action == ReviewedForceIntentAction::Apply;
-    // The queue-owned squash postcondition only exists while the *provider* is
-    // the merge actor. Under caravan-owned merging the forced head is landed by
-    // cara's own audited administrator squash, so arming here would install a
-    // second merge actor on an intentionally non-green head.
-    let desired_squash_auto_merge =
-        action == ReviewedForceIntentAction::Apply && status.head_merge.actor.github();
+    // Durable force is always consumed by Cara's immediate administrator
+    // squash when the PR reaches root. Native auto-merge waits on CI and can
+    // merge a non-root into its predecessor, so force arming must never install
+    // that second merge actor under either configured backend.
+    let desired_squash_auto_merge = false;
     let atomic = provider
         .update_force_state(
             &status.repository,
@@ -496,13 +495,13 @@ fn execute(
         pr: Some(PrNumber(input.pr)),
         summary: match action {
             ReviewedForceIntentAction::Apply if desired_squash_auto_merge => {
-                "atomically converged exact-head force intent plus squash auto-merge"
+                "atomically converged durable PR force intent plus squash auto-merge"
             }
             ReviewedForceIntentAction::Apply => {
-                "converged exact-head force intent; cara remains the single merge actor"
+                "converged durable PR force intent; cara remains the single merge actor"
             }
             ReviewedForceIntentAction::Revoke => {
-                "revoked exact-generation force intent without changing queue-owned auto-merge"
+                "revoked durable PR force intent without changing queue-owned auto-merge"
             }
             ReviewedForceIntentAction::Preview => unreachable!(),
         }
@@ -533,7 +532,7 @@ fn execute(
             MutationStepState::Completed
         },
         pr: Some(PrNumber(input.pr)),
-        summary: "persisted reviewed exact-generation force-intent audit".to_owned(),
+        summary: "persisted reviewed durable PR force-intent audit".to_owned(),
     });
     current = comment.after.clone();
     receipts.push(comment);
@@ -547,7 +546,7 @@ fn execute(
         return Err(AppError::structured(
             ErrorCategory::ExecutionFailure,
             "force_intent_postcondition_failed",
-            "provider state did not retain the reviewed exact-head force postcondition",
+            "provider state did not retain the reviewed durable PR force postcondition",
             Some(json!({
                 "expected_head": input.head,
                 "actual": current,
@@ -617,15 +616,6 @@ fn current_evidence(
             None,
         )
     })?;
-    if caravan.head() != Some(pr) {
-        return Err(force_validation(
-            "force_intent_pr_not_head",
-            "reviewed force intent is scoped only to the current Caravan head",
-            status,
-            input,
-            Some(json!({"caravan": caravan})),
-        ));
-    }
     let members = caravan
         .members
         .iter()
@@ -778,7 +768,7 @@ fn validate_supplied_evidence(
                 "failure_fingerprint": evidence.failure_fingerprint,
             },
             "mutated": false,
-            "safe_next_action": "review current evidence and issue a new exact bounded authority; never reuse stale force intent",
+            "safe_next_action": "review current evidence and issue fresh authorization for the durable PR intent transition",
         })),
     ))
 }
@@ -789,25 +779,30 @@ fn validate_apply_policy(
     evidence: &CurrentEvidence,
 ) -> Result<(), AppError> {
     let pr = PrNumber(input.pr);
-    let unrelated_problems = status.analysis.fleet.problems.iter().filter(|problem| {
-        problem.kind.blocks_fleet()
-            && (problem.kind != GraphProblemKind::AutoMergeInvariant || !problem.prs.contains(&pr))
-    });
-    let problems = unrelated_problems.cloned().collect::<Vec<_>>();
-    if !problems.is_empty() {
-        return Err(force_validation(
-            "force_intent_graph_invalid",
-            "reviewed force intent cannot bypass unrelated Caravan graph problems",
-            status,
-            input,
-            Some(json!({"blocking_problems": problems})),
-        ));
-    }
     let caravan = status
         .analysis
         .fleet
         .containing(pr)
         .expect("current evidence proved membership");
+    let selected_problems = status.analysis.fleet.problems.iter().filter(|problem| {
+        problem.kind.blocks_fleet()
+            && (problem.prs.is_empty()
+                || problem
+                    .prs
+                    .iter()
+                    .any(|number| caravan.members.contains(number)))
+            && (problem.kind != GraphProblemKind::AutoMergeInvariant || !problem.prs.contains(&pr))
+    });
+    let problems = selected_problems.cloned().collect::<Vec<_>>();
+    if !problems.is_empty() {
+        return Err(force_validation(
+            "force_intent_graph_invalid",
+            "reviewed force intent cannot bypass selected-Caravan graph problems",
+            status,
+            input,
+            Some(json!({"blocking_problems": problems})),
+        ));
+    }
     if status
         .pauses
         .iter()
@@ -822,14 +817,12 @@ fn validate_apply_policy(
         ));
     }
     let clean = status.analysis.compatibility.iter().any(|report| {
-        report.candidate == evidence.pull.head
-            && report.target == status.analysis.fleet.default_branch
-            && report.outcome == CompatibilityOutcome::Clean
+        report.candidate == evidence.pull.head && report.outcome == CompatibilityOutcome::Clean
     });
     if !clean {
         return Err(force_validation(
             "force_intent_compatibility_not_clean",
-            "reviewed force intent requires exact clean head/default compatibility",
+            "reviewed force intent requires a mechanically clean current Caravan edge",
             status,
             input,
             None,
@@ -891,7 +884,7 @@ fn output(
                 "review this exact evidence, then apply the identical bounded authority before expiry"
             }
             ReviewedForceIntentAction::Apply => {
-                "run normal Cara sync; it remains the sole consumer of this one-shot force intent"
+                "intent follows the PR until it reaches root; normal Cara sync then performs the immediate mechanical/admin force merge"
             }
             ReviewedForceIntentAction::Revoke => {
                 "force intent is absent; normal queue ownership and CI policy remain authoritative"
@@ -929,7 +922,7 @@ fn audit_body(
     marker: &str,
 ) -> String {
     format!(
-        "{marker}\n### Reviewed Caravan force intent: `{}`\n\n- **PR/head:** #{} `{}`\n- **Membership generation:** `{}`\n- **Failure fingerprint:** `{}`\n- **Expiry (Unix ms):** `{}`\n- **Auto-merge:** `squash`\n- **Reason:** {}\n- **Current decision:** `{}`\n\nThis authority is exact-generation, one-shot, and does not bypass compatibility, holds, ownership, permission, or lease checks.\n",
+        "{marker}\n### Reviewed Caravan force intent: `{}`\n\n- **PR/head:** #{} `{}`\n- **Membership generation:** `{}`\n- **Failure fingerprint:** `{}`\n- **Expiry (Unix ms):** `{}`\n- **Auto-merge:** `squash`\n- **Reason:** {}\n- **Current decision:** `{}`\n\nThe transition authority is generation-bound and audited; the resulting PR intent is durable across Cara-owned rewrites and positions. It does not bypass final compatibility, holds, ownership, permission, or lease checks.\n",
         action.name(),
         input.pr,
         input.head,
@@ -1407,7 +1400,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_converges_force_and_squash_in_one_provider_transaction_and_replays() {
+    fn apply_converges_durable_force_without_native_auto_merge_and_replays() {
         let now = 1_000_000;
         let initial = pull();
         let status = make_status(initial.clone());
@@ -1423,7 +1416,7 @@ mod tests {
         )
         .unwrap();
         assert!(first.force_intent_applied);
-        assert!(first.squash_auto_merge_enabled);
+        assert!(!first.squash_auto_merge_enabled);
         assert!(first.atomic_provider_transaction);
         let caco_evidence = serde_json::to_value(&first).unwrap();
         assert_eq!(caco_evidence["action"], "apply");
@@ -1452,7 +1445,7 @@ mod tests {
         );
         assert_eq!(caco_evidence["expires_at_ms"], input.expires_at_ms);
         assert_eq!(caco_evidence["force_intent_applied"], true);
-        assert_eq!(caco_evidence["squash_auto_merge_enabled"], true);
+        assert_eq!(caco_evidence["squash_auto_merge_enabled"], false);
         assert_eq!(caco_evidence["atomic_provider_transaction"], true);
         assert_eq!(provider.transactions.get(), 1);
         assert_eq!(provider.comments.borrow().len(), 1);
@@ -1631,7 +1624,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code(), "force_intent_audit_failed");
         assert!(provider.pull.borrow().has_label(FORCE_LABEL));
-        assert!(provider.pull.borrow().auto_merge.enabled);
+        assert!(!provider.pull.borrow().auto_merge.enabled);
         let details = error.details().unwrap();
         assert_eq!(details["provider_receipts"].as_array().unwrap().len(), 1);
         assert_eq!(details["mutated"], true);
@@ -1672,7 +1665,7 @@ mod tests {
     }
 
     #[test]
-    fn unrelated_graph_problem_remains_a_hard_stop_but_selected_auto_merge_gap_is_repairable() {
+    fn unrelated_graph_problem_is_ignored_but_selected_problem_still_blocks() {
         let now = 1_000_000;
         let initial = pull();
         let mut status = make_status(initial.clone());
@@ -1695,6 +1688,23 @@ mod tests {
             now,
         )
         .expect("selected auto-merge invariant is repaired atomically");
+
+        let mut unrelated = make_status(initial.clone());
+        unrelated.analysis.fleet.problems.push(GraphProblem {
+            kind: GraphProblemKind::Incompatible,
+            prs: vec![PrNumber(2245)],
+            message: "unrelated admission candidate".to_owned(),
+        });
+        let unrelated_input = exact_input(&unrelated, now);
+        execute(
+            &unrelated,
+            &FakeProvider::new(initial.clone()),
+            &context(),
+            &unrelated_input,
+            ReviewedForceIntentAction::Apply,
+            now,
+        )
+        .expect("unrelated admission problem cannot block selected PR intent");
 
         status.analysis.fleet.problems.push(GraphProblem {
             kind: GraphProblemKind::Cycle,

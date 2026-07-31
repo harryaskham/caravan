@@ -1,8 +1,8 @@
-//! Audited, exact-generation force-intent arm and revoke operations.
+//! Audited, durable PR-scoped force-intent arm and revoke operations.
 //!
-//! These operations only manage the one-shot `caravan-force` intent label.
-//! Normal sync remains the sole owner of final CI observation and administrator
-//! squash merge execution.
+//! These operations manage the `caravan-force` intent label across ordinary
+//! membership and Cara-owned rewrites. Normal sync remains the sole owner of
+//! final mechanical preflight and administrator squash merge execution.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -33,7 +33,7 @@ const MAX_REASON_BYTES: usize = 2_000;
 /// Exact operator identity and rationale for force-intent mutation.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Args)]
 pub struct ForceIntentInput {
-    /// Exact active caravan head PR.
+    /// Active Caravan PR whose intent follows it until merge/revoke/eviction.
     #[arg(long, value_name = "PR")]
     pub pr: u64,
     /// Audited operator identity (non-secret).
@@ -211,12 +211,12 @@ impl ForceState {
     }
 }
 
-/// Arm exact-generation one-shot force intent.
+/// Arm durable PR-scoped force intent.
 pub fn arm(context: &AppContext, input: &ForceIntentInput) -> Result<ForceIntentOutput, AppError> {
     execute_live(context, input, ForceIntentOperation::Arm)
 }
 
-/// Revoke exact-generation one-shot force intent.
+/// Revoke durable PR-scoped force intent.
 pub fn revoke(
     context: &AppContext,
     input: &ForceIntentInput,
@@ -306,7 +306,7 @@ fn execute(
     {
         return Err(force_validation(
             "force_pr_ineligible",
-            "force intent requires an open, non-draft, owned, non-evicted active head",
+            "force intent requires an open, non-draft, owned, non-evicted active member",
             status,
             input,
         ));
@@ -319,24 +319,17 @@ fn execute(
             input,
         )
     })?;
-    if caravan.head() != Some(pr) {
-        return Err(force_validation(
-            "force_pr_not_head",
-            "force intent may be armed or revoked only on the current caravan head",
-            status,
-            input,
-        ));
-    }
-    if status
-        .analysis
-        .fleet
-        .problems
-        .iter()
-        .any(|problem| problem.kind.blocks_fleet())
-    {
+    if status.analysis.fleet.problems.iter().any(|problem| {
+        problem.kind.blocks_fleet()
+            && (problem.prs.is_empty()
+                || problem
+                    .prs
+                    .iter()
+                    .any(|number| caravan.members.contains(number)))
+    }) {
         return Err(force_validation(
             "force_graph_invalid",
-            "force intent cannot bypass unresolved Caravan graph problems",
+            "force intent cannot bypass unresolved problems in the selected Caravan",
             status,
             input,
         ));
@@ -354,14 +347,12 @@ fn execute(
         ));
     }
     let compatibility = status.analysis.compatibility.iter().find(|report| {
-        report.candidate == current.head
-            && report.target == status.analysis.fleet.default_branch
-            && report.outcome == CompatibilityOutcome::Clean
+        report.candidate == current.head && report.outcome == CompatibilityOutcome::Clean
     });
     if compatibility.is_none() {
         return Err(force_validation(
             "force_compatibility_not_clean",
-            "force intent requires exact clean textual compatibility with the current default branch",
+            "force intent requires the member's current Caravan edge to be mechanically clean",
             status,
             input,
         ));
@@ -394,26 +385,26 @@ fn execute(
         ForceIntentOperation::Arm if intent_present => {
             state.already(
                 MutationKind::AddLabel,
-                "exact-generation force intent already armed",
+                "durable PR-scoped force intent already armed",
             );
         }
         ForceIntentOperation::Arm => {
             let receipt = provider
                 .add_label(&status.repository, &state.precondition(), FORCE_LABEL)
                 .map_err(|error| force_provider_error(&error, status, input, Some(&state)))?;
-            state.record(receipt, "armed exact-generation caravan-force intent");
+            state.record(receipt, "armed durable PR-scoped caravan-force intent");
         }
         ForceIntentOperation::Revoke if !intent_present => {
             state.already(
                 MutationKind::RemoveLabel,
-                "exact-generation force intent already absent",
+                "durable PR-scoped force intent already absent",
             );
         }
         ForceIntentOperation::Revoke => {
             let receipt = provider
                 .remove_label(&status.repository, &state.precondition(), FORCE_LABEL)
                 .map_err(|error| force_provider_error(&error, status, input, Some(&state)))?;
-            state.record(receipt, "revoked exact-generation caravan-force intent");
+            state.record(receipt, "revoked durable PR-scoped caravan-force intent");
         }
     }
 
@@ -439,10 +430,7 @@ fn execute(
         );
         state.current = comment.after;
     } else {
-        state.record(
-            comment,
-            "posted durable exact-generation force-intent audit",
-        );
+        state.record(comment, "posted durable PR-scoped force-intent audit");
     }
 
     let receipt = state.operation_receipt();
@@ -463,7 +451,7 @@ fn execute(
         provider_receipts: state.provider_receipts,
         next: match operation {
             ForceIntentOperation::Arm => {
-                "run `cara sync` to revalidate and consume this one-shot exact-generation intent"
+                "intent follows this PR across Cara-owned rewrites and position changes; sync merges it immediately once it is a mechanically mergeable root"
                     .to_owned()
             }
             ForceIntentOperation::Revoke => {
@@ -519,8 +507,7 @@ fn force_audit(
         .compatibility
         .iter()
         .find(|report| {
-            report.candidate == current.head
-                && report.target == status.analysis.fleet.default_branch
+            report.candidate == current.head && report.outcome == CompatibilityOutcome::Clean
         })
         .expect("force policy proved compatibility");
     ControlLabelAudit {
@@ -550,7 +537,7 @@ fn force_audit(
             compatibility.outcome,
         ),
         clean_squash_evidence:
-            "exact head/default compatibility is clean; force intent arms only normal sync's final ADMIN squash path"
+            "the current Caravan edge is mechanically clean; final root/default compatibility and ADMIN authority are re-proven immediately before merge"
                 .to_owned(),
         admission_priority_basis:
             "not applicable: force intent never changes Caravan admission order".to_owned(),
@@ -870,7 +857,7 @@ mod tests {
     }
 
     #[test]
-    fn arm_and_rerun_are_generation_bound_and_idempotent() {
+    fn arm_and_rerun_are_pr_scoped_and_idempotent() {
         let pull = pull();
         let initial_status = status(pull.clone());
         let provider = FakeProvider::new(pull);
@@ -911,7 +898,79 @@ mod tests {
     }
 
     #[test]
-    fn revoke_is_exact_audited_and_idempotent() {
+    fn non_head_member_can_arm_durable_intent() {
+        let root = pull();
+        let mut child = pull();
+        child.number = PrNumber(2);
+        child.title = "child".to_owned();
+        child.head = branch("child");
+        child.base = root.head.clone();
+        child.auto_merge = AutoMergeState::disabled();
+        let mut current_status = status(root.clone());
+        current_status
+            .analysis
+            .pull_requests
+            .insert(child.number, child.clone());
+        current_status.analysis.fleet.caravans[0]
+            .members
+            .push(child.number);
+        current_status
+            .analysis
+            .compatibility
+            .push(crate::model::CompatibilityReport {
+                candidate: child.head.clone(),
+                target: root.head.clone(),
+                outcome: CompatibilityOutcome::Clean,
+                conflicting_paths: Vec::new(),
+                diagnostic: None,
+            });
+        let provider = FakeProvider::new(root);
+        provider
+            .pulls
+            .borrow_mut()
+            .insert(child.number, child.clone());
+        let mut child_input = input();
+        child_input.pr = 2;
+
+        let output = execute(
+            &current_status,
+            &provider,
+            &context(),
+            &child_input,
+            ForceIntentOperation::Arm,
+        )
+        .expect("durable force can be armed before the member reaches root");
+
+        assert!(output.intent_present);
+        assert!(provider.pulls.borrow()[&PrNumber(2)].has_label(FORCE_LABEL));
+        assert!(output.next.contains("position changes"));
+    }
+
+    #[test]
+    fn unrelated_graph_problem_does_not_block_force_intent() {
+        let candidate = pull();
+        let mut current_status = status(candidate.clone());
+        current_status.analysis.fleet.problems.push(GraphProblem {
+            kind: crate::model::GraphProblemKind::Incompatible,
+            prs: vec![PrNumber(2245)],
+            message: "unrelated admission candidate conflicts with main".to_owned(),
+        });
+        let provider = FakeProvider::new(candidate);
+
+        let output = execute(
+            &current_status,
+            &provider,
+            &context(),
+            &input(),
+            ForceIntentOperation::Arm,
+        )
+        .expect("unrelated admission candidates cannot block selected Caravan intent");
+
+        assert!(output.intent_present);
+    }
+
+    #[test]
+    fn revoke_is_pr_scoped_audited_and_idempotent() {
         let mut armed = pull();
         armed.labels.insert(FORCE_LABEL.to_owned());
         armed.labels.insert("unrelated".to_owned());
@@ -1123,7 +1182,7 @@ mod tests {
             )
             .unwrap();
             assert!(output.intent_present);
-            assert!(output.next.contains("cara sync"));
+            assert!(output.next.contains("mechanically mergeable root"));
             assert_eq!(
                 provider.pulls.borrow()[&PrNumber(1)].state,
                 PullRequestState::Open

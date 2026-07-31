@@ -199,9 +199,9 @@ the exact pinned binary. It performs strict parsing and no repository/provider a
    source is a durable zero-mutation no-op. It rebases only the unique source patch
    onto the tail, re-reads provider facts, refuses admission
    if the tail moved, sets the provider base,
-   and returns a versioned exact join receipt. Routine join accepts no force
-   option and proves any stale-generation `caravan-force` intent was absent or
-   removed. Membership operations are optimistic and resumable; rerun the same
+   and returns a versioned exact join receipt. Routine membership carries any
+   durable PR-scoped `caravan-force` intent unchanged across base and history
+   transitions. Membership operations are optimistic and resumable; rerun the same
    command after an indeterminate provider response rather than inventing state.
 5. Run `cara plan sync` (usually `--all`) to inspect the exact current
    physical/conflict/lease and first auto-admission plan with zero provider
@@ -366,25 +366,24 @@ RESHAPING AND EXPLICIT INTENT
 - `cara evict --pr N --reason ...` removes a member and reconnects its child only
   after exact compatibility proof. `split` makes the selected PR a new head.
   `renew` and `rejoin` re-evaluate an evicted PR from fresh facts.
-- `cara force --pr N --actor A --reason R` is the only supported way to arm
-  exact-generation `caravan-force` intent for non-successful CI; raw label edits
-  are not an operator contract. It requires `force_merge: true`, an open
-  non-draft active head, clean exact default/head compatibility, no hold/graph
-  issue, ADMIN permission, and a durable actor/reason/check audit. `cara force
-  revoke` removes only current-generation intent and is audited/idempotent.
-  Sync alone consumes armed intent for a one-shot squash. If a rewrite fails,
-  old-generation intent is restored only after a fresh provider read proves the
-  old head remained unpublished; planned or indeterminate generations never
-  receive restored intent. Force never bypasses textual conflicts, stale facts,
-  ownership, holds, permissions, or leases.
+- `cara force --pr N --actor A --reason R` is the supported way to arm durable
+  PR-scoped `caravan-force` intent; raw label edits are not an operator contract.
+  It requires `force_merge: true`, an open non-draft active member, a clean
+  current Caravan edge, no selected-Caravan hold/graph issue, ADMIN permission,
+  and a durable actor/reason audit. Intent follows the PR through Cara-owned
+  rewrites and position changes. When that PR reaches root, sync skips all CI
+  observation and immediately performs fresh exact root/default compatibility,
+  ownership, permission, and lease preflight before the ADMIN squash. Explicit
+  revoke, eviction, or successful merge consumes intent; unrelated admission
+  candidates never block it.
 - Controller-reviewed exact exceptions use `cara --json force-intent
   preview|apply|revoke --pr N --head OID --membership-generation G
   --failure-fingerprint F --reason R --expires-at-ms T --auto-merge squash`
   and matching MCP tools. CI decisions expose the same deterministic fingerprint.
   Preview performs no writes. Apply independently re-reads exact head,
   membership, checks, decision, default branch, compatibility, holds, graph,
-  and permission, then converges force intent plus missing squash auto-merge in
-  one provider mutation and refetches the complete postcondition. Revoke accepts
+  and permission, then converges durable force intent with native auto-merge
+  disabled in one provider mutation and refetches the complete postcondition. Revoke accepts
   expired authority, removes only force intent, preserves queue-owned auto-merge,
   and is idempotent. Partial provider/audit results retain exact retry receipts.
 - Use audited `cara priority set|clear` to change one exact unenrolled PR's
@@ -989,7 +988,7 @@ pub fn build_router() -> ToolRouter<AppContext> {
     );
     router.add_typed_tool_with_output_schema(
         "renew",
-        "After complete preflight, reevaluate an evicted current PR as a new caravan; remove eviction/force labels only when safe and enable head auto-merge. On typed failure repair the evidence and rerun.",
+        "After complete preflight, reevaluate an evicted current PR as a new caravan; remove eviction while preserving any newly armed durable force intent, then converge the configured merge actor. On typed failure repair the evidence and rerun.",
         |context: &AppContext, input: CreateInput| membership::renew(context, &input),
     );
     router.add_typed_tool_with_output_schema(
@@ -1045,12 +1044,12 @@ pub fn build_router() -> ToolRouter<AppContext> {
     );
     router.add_typed_tool_with_output_schema(
         "force_arm",
-        "Arm exact-generation one-shot caravan-force intent on an eligible active head after clean compatibility, policy, hold, permission, branch and PR preflight. Posts a durable audited comment; sync remains the sole final merge owner.",
+        "Arm durable PR-scoped caravan-force intent on an eligible active member after clean current-edge, policy, selected-Caravan hold/graph, permission, branch and PR preflight. Intent follows Cara-owned rewrites and positions; sync merges immediately once it reaches a mechanically mergeable root.",
         |context: &AppContext, input: force::ForceIntentInput| force::arm(context, &input),
     );
     router.add_typed_tool_with_output_schema(
         "force_revoke",
-        "Idempotently revoke exact-generation caravan-force intent from an eligible active head under exact preconditions and post a durable audit without touching unrelated labels.",
+        "Idempotently revoke durable PR-scoped caravan-force intent from an eligible active member under exact preconditions and post an audit without touching unrelated labels.",
         |context: &AppContext, input: force::ForceIntentInput| force::revoke(context, &input),
     );
     router.add_typed_tool_with_output_schema(
@@ -1062,14 +1061,14 @@ pub fn build_router() -> ToolRouter<AppContext> {
     );
     router.add_typed_tool_with_output_schema(
         "force_intent_apply",
-        "Validate exact reviewed force evidence and converge caravan-force plus squash auto-merge through one provider transaction under fresh head/check preconditions and durable audit.",
+        "Validate exact reviewed transition evidence and converge durable caravan-force with native auto-merge disabled through one provider transaction under fresh head/check preconditions and durable audit.",
         |context: &AppContext, input: force_intent::ReviewedForceIntentInput| {
             force_intent::apply(context, &input)
         },
     );
     router.add_typed_tool_with_output_schema(
         "force_intent_revoke",
-        "Idempotently revoke one exact-generation reviewed force intent, including after expiry, while preserving normal queue ownership of squash auto-merge.",
+        "Idempotently revoke one reviewed durable PR force intent, including after expiry, while preserving normal queue ownership of squash auto-merge.",
         |context: &AppContext, input: force_intent::ReviewedForceIntentInput| {
             force_intent::revoke(context, &input)
         },

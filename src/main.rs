@@ -101,9 +101,9 @@ enum Command {
     Next,
     /// Check out the previous PR toward the current caravan head.
     Prev,
-    /// Arm or revoke audited exact-generation one-shot force intent.
+    /// Arm or revoke audited durable PR-scoped force intent.
     Force(ForceCommand),
-    /// Reviewed exact-head force authority consumed by Cacophony controllers.
+    /// Reviewed transition authority for durable PR-scoped force intent.
     #[command(subcommand)]
     ForceIntent(ReviewedForceIntentCommand),
     /// Explicitly freeze one caravan and disable only its head auto-merge.
@@ -204,7 +204,7 @@ struct ForceCommand {
 
 #[derive(Debug, Subcommand)]
 enum ForceSubcommand {
-    /// Revoke current exact-generation force intent.
+    /// Revoke current durable PR-scoped force intent.
     Revoke(caravan::force::ForceIntentInput),
 }
 
@@ -212,9 +212,9 @@ enum ForceSubcommand {
 enum ReviewedForceIntentCommand {
     /// Re-read exact provider/membership/check/decision evidence without mutation.
     Preview(caravan::force_intent::ReviewedForceIntentInput),
-    /// Atomically converge exact-head force intent plus squash auto-merge.
+    /// Atomically converge durable PR force intent plus squash auto-merge.
     Apply(caravan::force_intent::ReviewedForceIntentInput),
-    /// Idempotently revoke exact-generation force intent, including after expiry.
+    /// Idempotently revoke durable PR force intent, including after expiry.
     Revoke(caravan::force_intent::ReviewedForceIntentInput),
 }
 

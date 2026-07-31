@@ -16,8 +16,8 @@
 //!   prefix and defers convergence to the next tick.
 //!
 //! Every cost is derived from the operations a tick will actually run:
-//! members whose exact cumulative ancestry already holds cost no push, no
-//! auto-merge disable, and no force invalidation, so completed prefixes make
+//! members whose exact cumulative ancestry already holds cost no push or
+//! auto-merge disable; durable force labels never add rewrite work, so completed prefixes make
 //! each subsequent tick strictly cheaper instead of strictly more expensive.
 
 use std::time::Duration;
@@ -32,7 +32,6 @@ use crate::read::StatusOutput;
 use super::{
     MAX_PARALLEL_REBASE_CHAINS, PHYSICAL_APPLY_COMMAND_SLOTS_PER_PENDING_MEMBER,
     PHYSICAL_APPLY_COMMAND_SLOTS_PER_RETAINED_MEMBER, PHYSICAL_FIXED_POST_WRITE_COMMAND_SLOTS,
-    PHYSICAL_FORCE_INVALIDATION_COMMAND_SLOTS, PHYSICAL_FORCE_INVALIDATION_MUTATIONS,
     PHYSICAL_RECONCILIATION_COMMAND_SLOTS_PER_CARAVAN,
     PHYSICAL_RECONCILIATION_COMMAND_SLOTS_PER_MEMBER,
 };
@@ -64,19 +63,15 @@ pub(super) struct MemberCost {
     pub pending: bool,
     /// Native auto-merge must be dropped before rewriting this member.
     pub auto_merge_enabled: bool,
-    /// An exact-generation force intent must be invalidated and possibly
-    /// compensated before/after rewriting this member.
-    pub force_labelled: bool,
 }
 
 impl MemberCost {
     /// Worst-case shape used by projections that cannot plan Git ranges.
-    const fn worst_case(pr: PrNumber, auto_merge_enabled: bool, force_labelled: bool) -> Self {
+    const fn worst_case(pr: PrNumber, auto_merge_enabled: bool) -> Self {
         Self {
             pr,
             pending: true,
             auto_merge_enabled,
-            force_labelled,
         }
     }
 
@@ -92,13 +87,7 @@ impl MemberCost {
         if !self.pending {
             return 0;
         }
-        let auto_merge: u64 = if self.auto_merge_enabled { 1 } else { 0 };
-        let force = if self.force_labelled {
-            PHYSICAL_FORCE_INVALIDATION_COMMAND_SLOTS
-        } else {
-            0
-        };
-        auto_merge.saturating_add(force)
+        if self.auto_merge_enabled { 1 } else { 0 }
     }
 
     const fn control_mutations(self) -> u64 {
@@ -106,13 +95,9 @@ impl MemberCost {
             return 0;
         }
         let auto_merge: u64 = if self.auto_merge_enabled { 1 } else { 0 };
-        let force = if self.force_labelled {
-            PHYSICAL_FORCE_INVALIDATION_MUTATIONS
-        } else {
-            0
-        };
-        // One marked comment after every actual branch generation write.
-        auto_merge.saturating_add(force).saturating_add(1)
+        // One marked attribution comment after every actual branch generation
+        // write. Durable force itself adds no control mutation.
+        auto_merge.saturating_add(1)
     }
 }
 
@@ -346,13 +331,9 @@ pub(super) fn chain_costs_from_status(
                 .iter()
                 .map(|number| {
                     status.analysis.pull_requests.get(number).map_or_else(
-                        || MemberCost::worst_case(*number, false, false),
+                        || MemberCost::worst_case(*number, false),
                         |pull_request| {
-                            MemberCost::worst_case(
-                                *number,
-                                pull_request.auto_merge.enabled,
-                                pull_request.has_label("caravan-force"),
-                            )
+                            MemberCost::worst_case(*number, pull_request.auto_merge.enabled)
                         },
                     )
                 })
