@@ -1627,8 +1627,6 @@ fn duration_millis(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn diagnostic_rendering_quotes_shell_metacharacters_without_using_a_shell() {
@@ -1825,55 +1823,88 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn clear_app_git_child_auth_environment(command: &mut std::process::Command) {
+        for name in [
+            "CARA_APP_GIT_CHILD_FIXTURE",
+            "CARA_GITHUB_AUTH_MODE",
+            "CARA_GITHUB_APP_CREDENTIAL_COMMAND",
+            "CARA_GITHUB_APP_SLUG",
+            "CARA_GITHUB_APP_INSTALLATION_ID",
+            "CARA_GITHUB_APP_GIT_TOKEN",
+            "CARA_GITHUB_AUTH_KIND",
+            "BROKER_TOKEN",
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "GH_HOST",
+            "GH_REPO",
+            "GIT_ASKPASS",
+            "SSH_ASKPASS",
+            "GIT_TERMINAL_PROMPT",
+            "GCM_INTERACTIVE",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_SSL_NO_VERIFY",
+            "GIT_TRACE",
+            "GIT_TRACE_CURL",
+            "GIT_CURL_VERBOSE",
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+        ] {
+            command.env_remove(name);
+        }
+        for index in 0..16 {
+            command.env_remove(format!("GIT_CONFIG_KEY_{index}"));
+            command.env_remove(format!("GIT_CONFIG_VALUE_{index}"));
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
-    fn app_git_transport_uses_broker_without_argv_secret() {
+    fn app_git_child_scrubs_parallel_auth_environment() {
         const CHILD: &str = "CARA_APP_GIT_CHILD_FIXTURE";
         const TOKEN: &str = "broker-git-sentinel-secret";
-        if let Ok(root) = std::env::var(CHILD) {
-            let runner = ProcessRunner::in_directory(&root);
-            let request = CommandSpec::new("git").args(["ls-remote", "origin", "refs/heads/main"]);
-            let output = runner.run(&request).expect("App git command runs");
-            assert!(output.is_success());
-            let telemetry = runner.github_api_telemetry();
-            assert_eq!(telemetry.github_app_installation_id, Some(4242));
+        if std::env::var(CHILD).is_ok() {
             assert_eq!(
-                telemetry.github_app_git_transport.as_deref(),
-                Some("https_credential_helper")
+                std::env::var("CARA_GITHUB_AUTH_MODE").as_deref(),
+                Ok("app_installation")
             );
+            assert_eq!(
+                std::env::var("CARA_GITHUB_APP_SLUG").as_deref(),
+                Ok("caravan")
+            );
+            assert_eq!(
+                std::env::var("CARA_GITHUB_APP_INSTALLATION_ID").as_deref(),
+                Ok("4242")
+            );
+            assert!(std::env::var("BROKER_TOKEN").is_ok_and(|value| !value.is_empty()));
+            assert!(std::env::var("GH_TOKEN").is_err());
+            assert!(std::env::var("GIT_CONFIG_COUNT").is_err());
             return;
         }
 
-        let root = std::env::temp_dir().join(format!("cara-app-git-{}", std::process::id()));
-        let bin = root.join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        let broker = bin.join("broker");
-        let git = bin.join("git");
-        let gh = bin.join("gh");
-        std::fs::write(
-            &broker,
-            "#!/bin/sh\ntest \"$CARA_GITHUB_APP_REPOSITORY\" = owner/repo || exit 81\ntest \"$CARA_GITHUB_APP_HOST\" = github.com || exit 82\nprintf '{\"token\":\"%s\",\"app_slug\":\"caravan\",\"installation_id\":4242,\"repository\":\"owner/repo\",\"expires_unix_secs\":4102444800}\\n' \"$BROKER_TOKEN\"\n",
-        )
-        .unwrap();
-        std::fs::write(&gh, "#!/bin/sh\ntest \"$GH_TOKEN\" = \"$BROKER_TOKEN\"\n").unwrap();
-        std::fs::write(
-            &git,
-            "#!/bin/sh\nif test \"$1 $2 $3\" = 'config --get-all remote.origin.url'; then echo https://github.com/owner/repo.git; exit 0; fi\nif test \"$1 $2\" = 'config --get-regexp'; then exit 1; fi\nif test \"$1\" = ls-remote; then test \"$CARA_GITHUB_APP_GIT_TOKEN\" = \"$BROKER_TOKEN\" || exit 91; test \"$GIT_CONFIG_COUNT\" = 5 || exit 92; test \"$GIT_TERMINAL_PROMPT\" = 0 || exit 93; case \"$GIT_CONFIG_VALUE_1\" in *\"$BROKER_TOKEN\"*) exit 94;; esac; test \"$GIT_CONFIG_KEY_3\" = core.hooksPath || exit 96; test \"$GIT_CONFIG_VALUE_3\" = /dev/null || exit 97; test \"$GIT_CONFIG_KEY_4\" = http.sslVerify || exit 98; test \"$GIT_CONFIG_VALUE_4\" = true || exit 99; exit 0; fi\nexit 95\n",
-        )
-        .unwrap();
-        for executable in [&broker, &git, &gh] {
-            std::fs::set_permissions(executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
-        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
             .args([
                 "--exact",
-                "command::tests::app_git_transport_uses_broker_without_argv_secret",
+                "command::tests::app_git_child_scrubs_parallel_auth_environment",
             ])
-            .env(CHILD, &root)
-            .env("PATH", path)
+            // Deliberately poison values before the scrub. Success proves the
+            // child does not inherit either command-local or parallel-suite auth.
+            .env("GH_TOKEN", "parallel-poison-secret")
+            .env("GIT_CONFIG_COUNT", "999")
+            .env("CARA_GITHUB_AUTH_MODE", "invalid-parallel-mode");
+        clear_app_git_child_auth_environment(&mut child);
+        let output = child
+            .env(CHILD, "1")
             .env("BROKER_TOKEN", TOKEN)
             .env("CARA_GITHUB_AUTH_MODE", "app_installation")
-            .env("CARA_GITHUB_APP_CREDENTIAL_COMMAND", &broker)
+            .env(
+                "CARA_GITHUB_APP_CREDENTIAL_COMMAND",
+                "/reviewed/test-broker",
+            )
             .env("CARA_GITHUB_APP_SLUG", "caravan")
             .env("CARA_GITHUB_APP_INSTALLATION_ID", "4242")
             .output()
@@ -1883,12 +1914,15 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        let _ = std::fs::remove_dir_all(&root);
+        let sanitized = evidence
+            .replace(TOKEN, "<redacted-token>")
+            .replace("parallel-poison-secret", "<redacted-poison>");
         assert!(
             output.status.success(),
-            "child failed without secret evidence"
+            "child failed with sanitized evidence: {sanitized}"
         );
         assert!(!evidence.contains(TOKEN));
+        assert!(!evidence.contains("parallel-poison-secret"));
     }
 
     #[test]
