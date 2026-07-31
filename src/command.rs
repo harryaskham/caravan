@@ -67,6 +67,13 @@ struct GithubAppGitAuth {
     repository: GithubRepository,
 }
 
+#[derive(Clone)]
+struct GithubAppMode {
+    credential_command: String,
+    expected_slug: String,
+    expected_installation_id: u64,
+}
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GithubAppCredentialResponse {
@@ -580,17 +587,26 @@ impl ProcessRunner {
         {
             return None;
         }
-        resolve_github_auth(self.cwd.as_deref(), self.operation_deadline)
+        match github_app_mode() {
+            Err(message) => Some(GithubAuthSelection::Refused(message)),
+            Ok(Some(_)) => resolve_github_auth(self.cwd.as_deref(), self.operation_deadline)
+                .or_else(|| {
+                    Some(GithubAuthSelection::Refused(
+                        "App mode could not resolve the exact repository".to_owned(),
+                    ))
+                }),
+            Ok(None) => resolve_github_auth(self.cwd.as_deref(), self.operation_deadline),
+        }
     }
 
     fn inferred_github_app_git_auth(
         &self,
         request: &CommandSpec,
     ) -> Result<Option<GithubAppGitAuth>, String> {
-        if !self.infer_github_auth
-            || github_app_credential_command().is_none()
-            || !is_remote_git_request(request)
-        {
+        if !self.infer_github_auth || !is_remote_git_request(request) {
+            return Ok(None);
+        }
+        if github_app_mode()?.is_none() {
             return Ok(None);
         }
         let cwd = self.cwd.as_deref().unwrap_or_else(|| Path::new("."));
@@ -821,7 +837,7 @@ fn resolve_github_auth_for_repository(
     runner: &ProcessRunner,
     repository: &GithubRepository,
 ) -> Option<GithubAuthSelection> {
-    let app_mode = github_app_credential_command().is_some();
+    let app_mode = !matches!(github_app_mode(), Ok(None));
     let key = repository.cache_key();
     let cache = GITHUB_AUTH_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     // Retain this guard through refresh. Broker/token exchange is infrequent and
@@ -851,13 +867,17 @@ fn resolve_github_auth_uncached(
     runner: &ProcessRunner,
     repository: &GithubRepository,
 ) -> Option<GithubAuthSelection> {
-    if let Some(command) = github_app_credential_command() {
-        return Some(
-            match resolve_github_app_credential(runner, repository, &command) {
-                Ok(credential) => GithubAuthSelection::AppInstallation(credential),
-                Err(message) => GithubAuthSelection::Refused(message),
-            },
-        );
+    match github_app_mode() {
+        Err(message) => return Some(GithubAuthSelection::Refused(message)),
+        Ok(Some(mode)) => {
+            return Some(
+                match resolve_github_app_credential(runner, repository, &mode) {
+                    Ok(credential) => GithubAuthSelection::AppInstallation(credential),
+                    Err(message) => GithubAuthSelection::Refused(message),
+                },
+            );
+        }
+        Ok(None) => {}
     }
 
     let ambient = std::env::var("GH_TOKEN")
@@ -918,22 +938,55 @@ fn current_unix_secs() -> u64 {
         .map_or(0, |duration| duration.as_secs())
 }
 
-fn github_app_credential_command() -> Option<String> {
-    std::env::var("CARA_GITHUB_APP_CREDENTIAL_COMMAND")
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
+fn github_app_mode_from_values(
+    mode: &str,
+    credential_command: Option<String>,
+    expected_slug: Option<String>,
+    expected_installation_id: Option<String>,
+) -> Result<Option<GithubAppMode>, String> {
+    match mode.trim() {
+        "" | "ambient" => Ok(None),
+        "app_installation" => {
+            let credential_command = credential_command
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "App mode requires a credential broker command".to_owned())?;
+            let expected_slug = expected_slug
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "App mode requires an expected App slug".to_owned())?;
+            let expected_installation_id = expected_installation_id
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .filter(|installation_id| *installation_id > 0)
+                .ok_or_else(|| "App mode requires an expected installation ID".to_owned())?;
+            Ok(Some(GithubAppMode {
+                credential_command,
+                expected_slug,
+                expected_installation_id,
+            }))
+        }
+        _ => Err("unknown CARA_GITHUB_AUTH_MODE; expected ambient or app_installation".to_owned()),
+    }
+}
+
+fn github_app_mode() -> Result<Option<GithubAppMode>, String> {
+    github_app_mode_from_values(
+        &std::env::var("CARA_GITHUB_AUTH_MODE").unwrap_or_default(),
+        std::env::var("CARA_GITHUB_APP_CREDENTIAL_COMMAND").ok(),
+        std::env::var("CARA_GITHUB_APP_SLUG").ok(),
+        std::env::var("CARA_GITHUB_APP_INSTALLATION_ID").ok(),
+    )
 }
 
 fn resolve_github_app_credential(
     runner: &ProcessRunner,
     repository: &GithubRepository,
-    command: &str,
+    mode: &GithubAppMode,
 ) -> Result<GithubAppCredential, String> {
     let expected_repository = format!("{}/{}", repository.owner, repository.name);
     let output = runner
         .run(
-            &CommandSpec::new(command)
+            &CommandSpec::new(&mode.credential_command)
                 .env("CARA_GITHUB_APP_REPOSITORY", &expected_repository)
                 .env("CARA_GITHUB_APP_HOST", &repository.host),
         )
@@ -944,16 +997,10 @@ fn resolve_github_app_credential(
     let response: GithubAppCredentialResponse = serde_json::from_str(&output.stdout)
         .map_err(|_| "credential broker returned invalid JSON".to_owned())?;
     let credential = validate_github_app_credential(response, repository)?;
-    if let Ok(expected) = std::env::var("CARA_GITHUB_APP_SLUG")
-        && !expected.trim().is_empty()
-        && credential.app_slug != expected.trim()
-    {
+    if credential.app_slug != mode.expected_slug {
         return Err("credential broker response names a different App slug".to_owned());
     }
-    if let Ok(expected) = std::env::var("CARA_GITHUB_APP_INSTALLATION_ID")
-        && !expected.trim().is_empty()
-        && expected.trim().parse::<u64>().ok() != Some(credential.installation_id)
-    {
+    if credential.installation_id != mode.expected_installation_id {
         return Err("credential broker response names a different installation".to_owned());
     }
     bind_github_app_principal(repository, &credential)?;
@@ -1603,6 +1650,38 @@ mod tests {
     }
 
     #[test]
+    fn app_broker_requires_an_independent_explicit_mode() {
+        let broker = Some("/secure/broker".to_owned());
+        assert!(
+            github_app_mode_from_values("", broker.clone(), None, None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            github_app_mode_from_values("ambient", broker.clone(), None, None)
+                .unwrap()
+                .is_none()
+        );
+        let missing_identity =
+            github_app_mode_from_values("app_installation", broker.clone(), None, None)
+                .err()
+                .expect("identity is mandatory");
+        assert!(missing_identity.contains("expected App slug"));
+        let valid = github_app_mode_from_values(
+            "app_installation",
+            broker,
+            Some("caravan".to_owned()),
+            Some("42".to_owned()),
+        )
+        .unwrap();
+        assert!(valid.is_some());
+        let unknown = github_app_mode_from_values("surprise", None, None, None)
+            .err()
+            .expect("unknown mode refuses");
+        assert!(unknown.contains("unknown CARA_GITHUB_AUTH_MODE"));
+    }
+
+    #[test]
     fn app_credential_is_exact_repository_scoped_and_expiry_bounded() {
         let repository = GithubRepository {
             host: "github.com".to_owned(),
@@ -1793,7 +1872,10 @@ mod tests {
             .env(CHILD, &root)
             .env("PATH", path)
             .env("BROKER_TOKEN", TOKEN)
+            .env("CARA_GITHUB_AUTH_MODE", "app_installation")
             .env("CARA_GITHUB_APP_CREDENTIAL_COMMAND", &broker)
+            .env("CARA_GITHUB_APP_SLUG", "caravan")
+            .env("CARA_GITHUB_APP_INSTALLATION_ID", "4242")
             .output()
             .unwrap();
         let evidence = format!(

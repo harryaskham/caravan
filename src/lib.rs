@@ -462,10 +462,11 @@ RECOVERY, LOCKS, AND OBSERVABILITY
   login, and finally probes other successful `gh` accounts. Selection is cached
   only for the process; Cara never runs `gh auth switch`, stores a preferred
   account in project config, or exposes a token in commands/errors/receipts.
-  Opt-in `CARA_GITHUB_APP_CREDENTIAL_COMMAND` may supply one exact-repository
-  installation credential JSON; Cara validates identity/expiry, single-flights
-  refresh, exposes only secret-free App telemetry, and never falls back to
-  ambient auth on broker failure. Remote Git operations use that same cached
+  Opt-in App auth requires `CARA_GITHUB_AUTH_MODE=app_installation`, a
+  `CARA_GITHUB_APP_CREDENTIAL_COMMAND`, expected App slug, and installation ID.
+  A broker path alone never activates. Cara validates exact identity/expiry,
+  single-flights refresh, exposes only secret-free App telemetry, and never
+  falls back to ambient auth on incomplete/invalid App settings or broker failure. Remote Git operations use that same cached
   principal through an environment-only HTTPS credential helper. SSH, plaintext
   HTTP, local/mismatched remotes, and credential-bearing URLs fail before Git.
 - `cara self-update status|check|run` updates only the exact running first-PATH

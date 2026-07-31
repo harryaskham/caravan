@@ -407,12 +407,15 @@ account from `gh auth` and injects its token without printing it. Explicit
 ambient tokens are validated by the first real provider request rather than a
 redundant per-process REST probe.
 
-Opt-in local GitHub App API mode sets
-`CARA_GITHUB_APP_CREDENTIAL_COMMAND` to one executable credential broker. Cara
-passes exact repository/host in secret-free environment and accepts one JSON
-object containing `token`, `app_slug`, `installation_id`, `repository`, and
-`expires_unix_secs`. The repository and optional expected
-`CARA_GITHUB_APP_SLUG`/`CARA_GITHUB_APP_INSTALLATION_ID` must match; expired or
+Opt-in local GitHub App mode requires all four non-secret deployment settings:
+`CARA_GITHUB_AUTH_MODE=app_installation`, one executable
+`CARA_GITHUB_APP_CREDENTIAL_COMMAND`, expected `CARA_GITHUB_APP_SLUG`, and
+expected `CARA_GITHUB_APP_INSTALLATION_ID`. A broker path alone never activates
+App mode; absent/`ambient` mode preserves stored/ambient `gh` behavior. Unknown
+mode or incomplete App settings fail closed without falling back. Cara passes
+exact repository/host to the broker in secret-free environment and accepts one
+JSON object containing `token`, `app_slug`, `installation_id`, `repository`, and
+`expires_unix_secs`. Repository and expected identity must match; expired or
 near-expiry responses fail closed. Valid credentials are process-cached with a
 60-second refresh margin and concurrent refresh is single-flight. Broker stdout
 is parsed but never rendered.
