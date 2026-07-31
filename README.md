@@ -407,9 +407,22 @@ account from `gh auth` and injects its token without printing it. Explicit
 ambient tokens are validated by the first real provider request rather than a
 redundant per-process REST probe.
 
+Opt-in local GitHub App API mode sets
+`CARA_GITHUB_APP_CREDENTIAL_COMMAND` to one executable credential broker. Cara
+passes exact repository/host in secret-free environment and accepts one JSON
+object containing `token`, `app_slug`, `installation_id`, `repository`, and
+`expires_unix_secs`. The repository and optional expected
+`CARA_GITHUB_APP_SLUG`/`CARA_GITHUB_APP_INSTALLATION_ID` must match; expired or
+near-expiry responses fail closed. Valid credentials are process-cached with a
+60-second refresh margin and concurrent refresh is single-flight. Broker stdout
+is parsed but never rendered. Until the separate App git-transport slice lands,
+this mode refuses every `git push` before execution rather than attributing API
+writes to the App and force-pushes to the ambient human.
+
 Status, check, sync, loop, JSON, and MCP receipts expose secret-free provider
 telemetry: authenticated source class, total/GraphQL/REST/gh-CLI call counts,
-and the latest GraphQL cost/remaining/reset evidence. The merge-candidate query
+App slug/installation/expiry when selected, and the latest GraphQL
+cost/remaining/reset evidence. The merge-candidate query
 collects `rateLimit` in-band, so observing budget costs no extra request. Set
 `CARA_GITHUB_AUTH_KIND=github_app_installation` beside an installation token to
 make that non-secret identity explicit in receipts.

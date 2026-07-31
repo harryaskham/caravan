@@ -238,6 +238,12 @@ pub struct GitHubApiTelemetry {
     pub authenticated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_app_slug: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_app_installation_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_app_token_expires_unix_secs: Option<u64>,
     pub calls: u64,
     pub graphql_calls: u64,
     pub rest_calls: u64,
@@ -255,6 +261,15 @@ impl GitHubApiTelemetry {
         self.authenticated |= other.authenticated;
         if other.auth_source.is_some() {
             self.auth_source = other.auth_source;
+        }
+        if other.github_app_slug.is_some() {
+            self.github_app_slug = other.github_app_slug;
+        }
+        if other.github_app_installation_id.is_some() {
+            self.github_app_installation_id = other.github_app_installation_id;
+        }
+        if other.github_app_token_expires_unix_secs.is_some() {
+            self.github_app_token_expires_unix_secs = other.github_app_token_expires_unix_secs;
         }
         self.calls = self.calls.saturating_add(other.calls);
         self.graphql_calls = self.graphql_calls.saturating_add(other.graphql_calls);

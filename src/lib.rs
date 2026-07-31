@@ -462,6 +462,11 @@ RECOVERY, LOCKS, AND OBSERVABILITY
   login, and finally probes other successful `gh` accounts. Selection is cached
   only for the process; Cara never runs `gh auth switch`, stores a preferred
   account in project config, or exposes a token in commands/errors/receipts.
+  Opt-in `CARA_GITHUB_APP_CREDENTIAL_COMMAND` may supply one exact-repository
+  installation credential JSON; Cara validates identity/expiry, single-flights
+  refresh, exposes only slug/installation/expiry telemetry, and never falls
+  back to ambient auth on broker failure. Until App git transport is configured,
+  every git push refuses before execution so API and branch actors cannot split.
 - `cara self-update status|check|run` updates only the exact running first-PATH
   stable user binary (`~/.cargo/bin`, `~/.local/bin`, or an exact explicit
   `CARA_SELF_UPDATE_INSTALL_DIR`). Shadowed, renamed/test, Cargo target, and

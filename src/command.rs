@@ -40,6 +40,32 @@ static GITHUB_AUTH_CACHE: OnceLock<Mutex<HashMap<String, Option<GithubAuthSelect
 enum GithubAuthSelection {
     Ambient,
     Token(String),
+    AppInstallation(GithubAppCredential),
+    Refused(String),
+}
+
+#[derive(Clone)]
+struct GithubAppCredential {
+    token: String,
+    app_slug: String,
+    installation_id: u64,
+    expires_unix_secs: u64,
+}
+
+impl GithubAppCredential {
+    fn usable(&self) -> bool {
+        current_unix_secs().saturating_add(60) < self.expires_unix_secs
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GithubAppCredentialResponse {
+    token: String,
+    app_slug: String,
+    installation_id: u64,
+    repository: String,
+    expires_unix_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,6 +237,15 @@ pub enum CommandRunError {
         /// Requests already reserved by this operation.
         used: u32,
     },
+    /// Explicit GitHub App mode could not produce a valid exact-repository
+    /// installation credential. It never falls back to ambient user auth.
+    GithubAppAuthRefused {
+        command: CommandSpec,
+        message: String,
+    },
+    /// App API identity is configured but direct git transport still lacks the
+    /// same installation credential, so a push must fail before execution.
+    GithubAppGitTransportUnavailable { command: CommandSpec },
     /// The executable could not be started or waited for.
     Spawn {
         /// Requested command.
@@ -263,6 +298,16 @@ impl std::fmt::Display for CommandRunError {
             } => write!(
                 formatter,
                 "`{}` would exceed the GitHub request budget ({used}/{limit} already used)",
+                command.display()
+            ),
+            Self::GithubAppAuthRefused { command, message } => write!(
+                formatter,
+                "GitHub App authentication refused `{}`: {message}",
+                command.display()
+            ),
+            Self::GithubAppGitTransportUnavailable { command } => write!(
+                formatter,
+                "GitHub App API identity is active, but git transport identity is not configured; refusing `{}` before push",
                 command.display()
             ),
             Self::Spawn { command, message } => {
@@ -369,6 +414,7 @@ pub struct ProcessRunner {
     operation_deadline: Option<Instant>,
     github_request_budget: Option<GithubRequestBudget>,
     infer_github_auth: bool,
+    github_app_auth_retry: bool,
     stdout_capture_limit: usize,
     stderr_capture_limit: usize,
     github_api_telemetry: Arc<Mutex<crate::model::GitHubApiTelemetry>>,
@@ -382,6 +428,7 @@ impl Default for ProcessRunner {
             operation_deadline: None,
             github_request_budget: None,
             infer_github_auth: true,
+            github_app_auth_retry: true,
             stdout_capture_limit: MAX_STDOUT_CAPTURE_BYTES,
             stderr_capture_limit: MAX_STDERR_CAPTURE_BYTES,
             github_api_telemetry: Arc::new(Mutex::new(crate::model::GitHubApiTelemetry::default())),
@@ -405,6 +452,7 @@ impl ProcessRunner {
             operation_deadline: None,
             github_request_budget: None,
             infer_github_auth: true,
+            github_app_auth_retry: true,
             stdout_capture_limit: MAX_STDOUT_CAPTURE_BYTES,
             stderr_capture_limit: MAX_STDERR_CAPTURE_BYTES,
             github_api_telemetry: Arc::new(Mutex::new(crate::model::GitHubApiTelemetry::default())),
@@ -506,7 +554,8 @@ impl ProcessRunner {
             telemetry.gh_cli_calls = telemetry.gh_cli_calls.saturating_add(1);
         }
         let explicit = request.has_env("GH_TOKEN") || request.has_env("GITHUB_TOKEN");
-        telemetry.authenticated = explicit || auth.is_some();
+        telemetry.authenticated = explicit
+            || auth.is_some_and(|selection| !matches!(selection, GithubAuthSelection::Refused(_)));
         telemetry.auth_source = Some(if explicit {
             "explicit_command_token".to_owned()
         } else {
@@ -516,6 +565,14 @@ impl ProcessRunner {
                     .filter(|value| !value.trim().is_empty())
                     .unwrap_or_else(|| "ambient_token".to_owned()),
                 Some(GithubAuthSelection::Token(_)) => "gh_auth_account".to_owned(),
+                Some(GithubAuthSelection::AppInstallation(credential)) => {
+                    telemetry.github_app_slug = Some(credential.app_slug.clone());
+                    telemetry.github_app_installation_id = Some(credential.installation_id);
+                    telemetry.github_app_token_expires_unix_secs =
+                        Some(credential.expires_unix_secs);
+                    "github_app_installation".to_owned()
+                }
+                Some(GithubAuthSelection::Refused(_)) => "github_app_refused".to_owned(),
                 // Never claim an auth verdict Cara did not reach. A checkout
                 // whose origin is not GitHub cannot name a repository to probe
                 // against, and reporting that as `unauthenticated` misdirects
@@ -596,6 +653,17 @@ impl ProcessRunner {
 /// deadline that actually caused it.
 const MINIMUM_COMMAND_BUDGET: Duration = Duration::from_millis(750);
 
+fn invalidate_github_app_auth_cache() {
+    if let Some(cache) = GITHUB_AUTH_CACHE.get() {
+        cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|_, selection| {
+                !matches!(selection, Some(GithubAuthSelection::AppInstallation(_)))
+            });
+    }
+}
+
 fn resolve_github_auth(
     cwd: Option<&Path>,
     operation_deadline: Option<Instant>,
@@ -624,19 +692,22 @@ fn resolve_github_auth(
     let repository = parsed?;
     let key = repository.cache_key();
     let cache = GITHUB_AUTH_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(selection) = cache
+    // Retain this guard through refresh. Broker/token exchange is infrequent and
+    // this gives all concurrent runners one process-wide single-flight instead
+    // of minting several installation tokens for the same expiry boundary.
+    let mut cache = cache
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&key)
-        .cloned()
-    {
-        return selection;
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(selection) = cache.get(&key).cloned() {
+        match &selection {
+            Some(GithubAuthSelection::AppInstallation(credential)) if !credential.usable() => {}
+            _ => return selection,
+        }
     }
     let selection = resolve_github_auth_uncached(&runner, &repository);
-    cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(key, selection.clone());
+    if !matches!(selection, Some(GithubAuthSelection::Refused(_))) {
+        cache.insert(key, selection.clone());
+    }
     selection
 }
 
@@ -644,6 +715,15 @@ fn resolve_github_auth_uncached(
     runner: &ProcessRunner,
     repository: &GithubRepository,
 ) -> Option<GithubAuthSelection> {
+    if let Some(command) = github_app_credential_command() {
+        return Some(
+            match resolve_github_app_credential(runner, repository, &command) {
+                Ok(credential) => GithubAuthSelection::AppInstallation(credential),
+                Err(message) => GithubAuthSelection::Refused(message),
+            },
+        );
+    }
+
     let ambient = std::env::var("GH_TOKEN")
         .ok()
         .filter(|token| !token.trim().is_empty())
@@ -694,6 +774,81 @@ fn resolve_github_auth_uncached(
         }
     }
     None
+}
+
+fn current_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+fn github_app_credential_command() -> Option<String> {
+    std::env::var("CARA_GITHUB_APP_CREDENTIAL_COMMAND")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn resolve_github_app_credential(
+    runner: &ProcessRunner,
+    repository: &GithubRepository,
+    command: &str,
+) -> Result<GithubAppCredential, String> {
+    let expected_repository = format!("{}/{}", repository.owner, repository.name);
+    let output = runner
+        .run(
+            &CommandSpec::new(command)
+                .env("CARA_GITHUB_APP_REPOSITORY", &expected_repository)
+                .env("CARA_GITHUB_APP_HOST", &repository.host),
+        )
+        .map_err(|_| "credential broker could not be executed".to_owned())?;
+    if !output.is_success() {
+        return Err("credential broker returned a nonzero exit status".to_owned());
+    }
+    let response: GithubAppCredentialResponse = serde_json::from_str(&output.stdout)
+        .map_err(|_| "credential broker returned invalid JSON".to_owned())?;
+    let credential = validate_github_app_credential(response, repository)?;
+    if let Ok(expected) = std::env::var("CARA_GITHUB_APP_SLUG")
+        && !expected.trim().is_empty()
+        && credential.app_slug != expected.trim()
+    {
+        return Err("credential broker response names a different App slug".to_owned());
+    }
+    if let Ok(expected) = std::env::var("CARA_GITHUB_APP_INSTALLATION_ID")
+        && !expected.trim().is_empty()
+        && expected.trim().parse::<u64>().ok() != Some(credential.installation_id)
+    {
+        return Err("credential broker response names a different installation".to_owned());
+    }
+    if !github_token_can_access(runner, repository, &credential.token) {
+        return Err("App installation token cannot access the exact repository".to_owned());
+    }
+    Ok(credential)
+}
+
+fn validate_github_app_credential(
+    response: GithubAppCredentialResponse,
+    repository: &GithubRepository,
+) -> Result<GithubAppCredential, String> {
+    if response.token.trim().is_empty() {
+        return Err("credential broker returned an empty token".to_owned());
+    }
+    if response.repository != format!("{}/{}", repository.owner, repository.name) {
+        return Err("credential broker response names a different repository".to_owned());
+    }
+    if response.app_slug.trim().is_empty() || response.installation_id == 0 {
+        return Err("credential broker returned invalid App installation identity".to_owned());
+    }
+    let credential = GithubAppCredential {
+        token: response.token,
+        app_slug: response.app_slug,
+        installation_id: response.installation_id,
+        expires_unix_secs: response.expires_unix_secs,
+    };
+    if !credential.usable() {
+        return Err("credential broker returned an expired or near-expiry token".to_owned());
+    }
+    Ok(credential)
 }
 
 fn github_token_for_login(
@@ -812,12 +967,47 @@ fn is_gh_request(request: &CommandSpec) -> bool {
         .is_some_and(|name| name == "gh")
 }
 
+fn should_refresh_github_app_auth(
+    selection: Option<&GithubAuthSelection>,
+    output: &CommandOutput,
+    retry_allowed: bool,
+) -> bool {
+    retry_allowed
+        && matches!(selection, Some(GithubAuthSelection::AppInstallation(_)))
+        && output.code == Some(1)
+        && (output.stderr.contains("HTTP 401")
+            || output
+                .stderr
+                .to_ascii_lowercase()
+                .contains("bad credentials"))
+}
+
+fn enforce_github_app_git_transport_boundary(
+    request: &CommandSpec,
+    app_mode: bool,
+) -> Result<(), CommandRunError> {
+    let is_git_push = Path::new(&request.program)
+        .file_name()
+        .is_some_and(|name| name == "git")
+        && request.args.iter().any(|argument| argument == "push");
+    if app_mode && is_git_push {
+        return Err(CommandRunError::GithubAppGitTransportUnavailable {
+            command: request.clone(),
+        });
+    }
+    Ok(())
+}
+
 impl CommandRunner for ProcessRunner {
     #[allow(clippy::too_many_lines)]
     fn run(&self, request: &CommandSpec) -> Result<CommandOutput, CommandRunError> {
         let is_gh = Path::new(&request.program)
             .file_name()
             .is_some_and(|name| name == "gh");
+        enforce_github_app_git_transport_boundary(
+            request,
+            github_app_credential_command().is_some(),
+        )?;
         if is_gh {
             if let Some(budget) = &self.github_request_budget {
                 budget.reserve(request)?;
@@ -826,14 +1016,24 @@ impl CommandRunner for ProcessRunner {
         let timeout = self.effective_timeout(request)?;
         let github_auth = self.inferred_github_auth(request);
         self.record_github_request(request, github_auth.as_ref());
+        if let Some(GithubAuthSelection::Refused(message)) = &github_auth {
+            return Err(CommandRunError::GithubAppAuthRefused {
+                command: request.clone(),
+                message: message.clone(),
+            });
+        }
         let mut command = Command::new(&request.program);
         command
             .args(&request.args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if let Some(GithubAuthSelection::Token(token)) = &github_auth {
-            command.env("GH_TOKEN", token);
-        }
+        match &github_auth {
+            Some(GithubAuthSelection::Token(token)) => command.env("GH_TOKEN", token),
+            Some(GithubAuthSelection::AppInstallation(credential)) => {
+                command.env("GH_TOKEN", &credential.token)
+            }
+            _ => &mut command,
+        };
         if let Some(io) = &request.io {
             command.envs(&io.env);
             if io.stdin.is_some() {
@@ -952,6 +1152,13 @@ impl CommandRunner for ProcessRunner {
             stdout,
             stderr,
         };
+        if should_refresh_github_app_auth(github_auth.as_ref(), &output, self.github_app_auth_retry)
+        {
+            invalidate_github_app_auth_cache();
+            let mut retry = self.clone();
+            retry.github_app_auth_retry = false;
+            return retry.run(request);
+        }
         self.record_github_response(request, &output);
         Ok(output)
     }
@@ -1113,6 +1320,138 @@ mod tests {
             Some(expected)
         );
         assert_eq!(parse_github_remote("/tmp/local.git"), None);
+    }
+
+    #[test]
+    fn app_credential_is_exact_repository_scoped_and_expiry_bounded() {
+        let repository = GithubRepository {
+            host: "github.com".to_owned(),
+            owner: "owner".to_owned(),
+            name: "repo".to_owned(),
+        };
+        let response = GithubAppCredentialResponse {
+            token: "installation-secret".to_owned(),
+            app_slug: "caravan".to_owned(),
+            installation_id: 42,
+            repository: "owner/repo".to_owned(),
+            expires_unix_secs: current_unix_secs() + 3_600,
+        };
+        let credential = validate_github_app_credential(response, &repository).unwrap();
+        assert!(credential.usable());
+        assert_eq!(credential.app_slug, "caravan");
+        assert_eq!(credential.installation_id, 42);
+
+        let wrong = GithubAppCredentialResponse {
+            token: "never-render-me".to_owned(),
+            app_slug: "caravan".to_owned(),
+            installation_id: 42,
+            repository: "owner/other".to_owned(),
+            expires_unix_secs: current_unix_secs() + 3_600,
+        };
+        let error = validate_github_app_credential(wrong, &repository)
+            .err()
+            .expect("repository mismatch refuses");
+        assert!(error.contains("different repository"));
+        assert!(!error.contains("never-render-me"));
+    }
+
+    #[test]
+    fn app_credential_near_expiry_fails_without_exposing_token() {
+        let repository = GithubRepository {
+            host: "github.com".to_owned(),
+            owner: "owner".to_owned(),
+            name: "repo".to_owned(),
+        };
+        let response = GithubAppCredentialResponse {
+            token: "near-expiry-secret".to_owned(),
+            app_slug: "caravan".to_owned(),
+            installation_id: 42,
+            repository: "owner/repo".to_owned(),
+            expires_unix_secs: current_unix_secs() + 30,
+        };
+        let error = validate_github_app_credential(response, &repository)
+            .err()
+            .expect("near-expiry credential refuses");
+        assert!(error.contains("expired or near-expiry"));
+        assert!(!error.contains("near-expiry-secret"));
+    }
+
+    #[test]
+    fn app_api_mode_refuses_git_push_before_process_execution() {
+        let request = CommandSpec::new("git").args(["push", "origin", "HEAD:refs/heads/x"]);
+        let error = enforce_github_app_git_transport_boundary(&request, true)
+            .expect_err("App API identity cannot silently mix with ambient git push identity");
+        assert!(matches!(
+            error,
+            CommandRunError::GithubAppGitTransportUnavailable { .. }
+        ));
+        enforce_github_app_git_transport_boundary(&request, false)
+            .expect("ordinary local gh mode retains git transport behavior");
+    }
+
+    #[test]
+    fn app_telemetry_names_installation_but_never_token() {
+        let runner = ProcessRunner::new();
+        let request = CommandSpec::new("gh").args(["api", "repos/owner/repo"]);
+        let selection = GithubAuthSelection::AppInstallation(GithubAppCredential {
+            token: "telemetry-secret".to_owned(),
+            app_slug: "caravan".to_owned(),
+            installation_id: 42,
+            expires_unix_secs: current_unix_secs() + 3_600,
+        });
+        runner.record_github_request(&request, Some(&selection));
+        let telemetry = runner.github_api_telemetry();
+        assert_eq!(
+            telemetry.auth_source.as_deref(),
+            Some("github_app_installation")
+        );
+        assert_eq!(telemetry.github_app_slug.as_deref(), Some("caravan"));
+        assert_eq!(telemetry.github_app_installation_id, Some(42));
+        let encoded = serde_json::to_string(&telemetry).unwrap();
+        assert!(!encoded.contains("telemetry-secret"));
+    }
+
+    #[test]
+    fn app_401_refreshes_once_and_never_for_ambient_tokens() {
+        let app = GithubAuthSelection::AppInstallation(GithubAppCredential {
+            token: "refresh-secret".to_owned(),
+            app_slug: "caravan".to_owned(),
+            installation_id: 42,
+            expires_unix_secs: current_unix_secs() + 3_600,
+        });
+        let unauthorized = CommandOutput {
+            code: Some(1),
+            stdout: String::new(),
+            stderr: "HTTP 401: Bad credentials".to_owned(),
+        };
+        assert!(should_refresh_github_app_auth(
+            Some(&app),
+            &unauthorized,
+            true
+        ));
+        assert!(!should_refresh_github_app_auth(
+            Some(&app),
+            &unauthorized,
+            false
+        ));
+        assert!(!should_refresh_github_app_auth(
+            Some(&GithubAuthSelection::Token("ambient-secret".to_owned())),
+            &unauthorized,
+            true
+        ));
+    }
+
+    #[test]
+    fn refused_app_auth_is_never_reported_as_authenticated() {
+        let runner = ProcessRunner::new();
+        let request = CommandSpec::new("gh").args(["api", "repos/owner/repo"]);
+        runner.record_github_request(
+            &request,
+            Some(&GithubAuthSelection::Refused("broker failed".to_owned())),
+        );
+        let telemetry = runner.github_api_telemetry();
+        assert!(!telemetry.authenticated);
+        assert_eq!(telemetry.auth_source.as_deref(), Some("github_app_refused"));
     }
 
     #[test]
