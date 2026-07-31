@@ -1166,6 +1166,78 @@ fn plan_hash_binds_exact_actions_not_telemetry() {
 }
 
 #[test]
+fn exact_rewrite_comment_posts_once_and_noop_posts_nothing() {
+    let observed = pull_request(
+        7,
+        "rewritten",
+        "parent",
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    let mut receipt = crate::physical_rebase::RebaseReceipt {
+        pr: observed.number,
+        branch: observed.head.name.clone(),
+        old_head_oid: CommitOid("a".repeat(40)),
+        new_head_oid: observed.head.oid.clone(),
+        old_base_oid: observed.base.oid.clone(),
+        new_base_branch: observed.base.name.clone(),
+        new_base_oid: observed.base.oid.clone(),
+        new_tree_oid: CommitOid("b".repeat(40)),
+        commit_count: 1,
+        merge_topology: None,
+        squash_reconciliation: None,
+        ci_trigger_workflows: Vec::new(),
+        lease: "exact".to_owned(),
+        already_satisfied: false,
+        rewrite_reason: crate::physical_rebase::BranchRewriteReason::ParentAdvanced {
+            parent_pr: PrNumber(6),
+        },
+    };
+    let provider = FakeProvider::with_pull_requests(vec![observed.clone()]);
+
+    let first = ensure_branch_rewrite_comment(&provider, &repository(), &observed, &receipt)
+        .unwrap()
+        .expect("an actual rewrite posts");
+    assert_eq!(first.kind, MutationKind::Comment);
+    let second = ensure_branch_rewrite_comment(&provider, &repository(), &observed, &receipt)
+        .unwrap()
+        .expect("an exact retry proves the marker");
+    assert!(
+        second
+            .provider_output
+            .unwrap()
+            .starts_with("existing GitHub comment")
+    );
+    let comments = provider.comments.borrow();
+    assert_eq!(comments[&PrNumber(7)].len(), 1);
+    assert_eq!(comments[&PrNumber(7)][0].lines().count(), 1);
+    assert!(comments[&PrNumber(7)][0].contains("parent #6 advanced"));
+    drop(comments);
+
+    let retry_provider = FakeProvider::with_pull_requests(vec![observed.clone()]);
+    retry_provider.fail_once(MutationKind::Comment);
+    let recovered =
+        ensure_branch_rewrite_comment(&retry_provider, &repository(), &observed, &receipt)
+            .unwrap()
+            .expect("a bounded marked retry recovers a partial provider response");
+    assert!(
+        recovered
+            .provider_output
+            .unwrap()
+            .starts_with("existing GitHub comment")
+    );
+    assert_eq!(retry_provider.comments.borrow()[&PrNumber(7)].len(), 1);
+
+    receipt.already_satisfied = true;
+    assert!(
+        ensure_branch_rewrite_comment(&provider, &repository(), &observed, &receipt)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(provider.comments.borrow()[&PrNumber(7)].len(), 1);
+}
+
+#[test]
 fn empty_physical_apply_is_valid_before_root_auto_admission() {
     let status = status(Vec::new(), None, &clean);
     let provider = FakeProvider::with_pull_requests(Vec::new());
@@ -2548,6 +2620,7 @@ fn force_rewrite_plan(status: &StatusOutput) -> crate::physical_rebase::RebasePl
         ci_trigger_workflows: vec!["CI".to_owned()],
         lease: format!("refs/heads/{}:{}", old_head.name, old_head.oid),
         already_satisfied: false,
+        rewrite_reason: crate::physical_rebase::BranchRewriteReason::Unspecified,
     }
 }
 
@@ -2730,6 +2803,7 @@ fn physical_rewrite_invalidates_force_intent_bound_to_old_head_generation() {
         ci_trigger_workflows: vec!["CI".to_owned()],
         lease: format!("refs/heads/{}:{}", old_head.name, old_head.oid),
         already_satisfied: false,
+        rewrite_reason: crate::physical_rebase::BranchRewriteReason::Unspecified,
     };
     let mut progress = SyncProgress::new(&status, vec![PrNumber(1)], u32::MAX);
 
@@ -2775,6 +2849,7 @@ fn already_satisfied_generation_preserves_explicit_force_intent() {
         ci_trigger_workflows: vec!["CI".to_owned()],
         lease: format!("refs/heads/{}:{}", head.name, head.oid),
         already_satisfied: true,
+        rewrite_reason: crate::physical_rebase::BranchRewriteReason::Unspecified,
     };
     let mut progress = SyncProgress::new(&status, vec![PrNumber(1)], u32::MAX);
 
@@ -2816,6 +2891,7 @@ fn fresh_force_reapplication_on_rewritten_generation_can_enter_force_path() {
         ci_trigger_workflows: vec!["CI".to_owned()],
         lease: format!("refs/heads/{}:{}", head.name, head.oid),
         already_satisfied: false,
+        rewrite_reason: crate::physical_rebase::BranchRewriteReason::Unspecified,
     };
     let mut progress = SyncProgress::new(&initial_status, vec![PrNumber(1)], u32::MAX);
     invalidate_rewritten_force_intents(&initial_status, &provider, &[plan], &mut progress)
@@ -3068,6 +3144,7 @@ fn sync_lock_checkpoint_stays_bounded_for_large_fleet_receipts() {
                     .collect(),
                 lease: format!("--force-with-lease=refs/heads/feature-{index}:old-{index}"),
                 already_satisfied: false,
+                rewrite_reason: crate::physical_rebase::BranchRewriteReason::Unspecified,
             });
         progress
             .rebase_receipts
@@ -3086,6 +3163,7 @@ fn sync_lock_checkpoint_stays_bounded_for_large_fleet_receipts() {
                 ci_trigger_workflows: Vec::new(),
                 lease: format!("--force-with-lease=refs/heads/feature-{index}:old-{index}"),
                 already_satisfied: false,
+                rewrite_reason: crate::physical_rebase::BranchRewriteReason::Unspecified,
             });
         let mut after = template.clone();
         after.number = pr;
@@ -3162,7 +3240,8 @@ fn physical_commit_budget_scales_with_chain_and_fails_before_any_write() {
     let budget = physical_commit_budget(&context, &status, &selected);
     assert_eq!(budget.command_slots, 13);
     assert_eq!(budget.required, Duration::from_secs(130));
-    assert_eq!(budget.mutation_reserve, 7);
+    // Two pending branch generations each reserve one marked attribution comment.
+    assert_eq!(budget.mutation_reserve, 9);
     let plan = crate::physical_rebase::RebasePlan {
         pr: PrNumber(1),
         branch: "one".to_owned(),
@@ -3180,6 +3259,7 @@ fn physical_commit_budget_scales_with_chain_and_fails_before_any_write() {
         ci_trigger_workflows: vec!["CI".to_owned()],
         lease: "--force-with-lease=refs/heads/one:one".to_owned(),
         already_satisfied: false,
+        rewrite_reason: crate::physical_rebase::BranchRewriteReason::Unspecified,
     };
 
     let plans = vec![plan];
@@ -5215,6 +5295,7 @@ fn a_deferred_prefix_tick_succeeds_as_a_retryable_bounded_progress_receipt() {
         ci_trigger_workflows: vec!["CI".to_owned()],
         lease: "--force-with-lease=refs/heads/branch-1:branch-1".to_owned(),
         already_satisfied: false,
+        rewrite_reason: crate::physical_rebase::BranchRewriteReason::Unspecified,
     };
     let physical_rebuild = PhysicalRebuildOutcome {
         repository: Some(repository()),

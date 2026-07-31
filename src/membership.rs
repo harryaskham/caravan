@@ -1374,6 +1374,7 @@ fn execute_locked(
     }
     let mut force_invalidation = None;
     let mut creation_state = None;
+    let mut rewrite_comment_receipt = None;
     let rebase_receipt = if context.config.rebase_on_join {
         if request.create_pr && status.current_pr.is_none() {
             let current_branch = status.current_branch.clone().ok_or_else(|| {
@@ -1508,6 +1509,12 @@ fn execute_locked(
         )?;
         validate_operation_shape(&candidate, request, &desired_base)?;
         preflight_eligibility(&status, &candidate, request, join_target.as_ref(), &checker)?;
+        let rewrite_reason = join_target.as_ref().map_or(
+            crate::physical_rebase::BranchRewriteReason::CurrentDefaultAdvanced,
+            |target| crate::physical_rebase::BranchRewriteReason::JoinedCaravan {
+                parent_pr: target.tail.number,
+            },
+        );
         let target = join_target.map_or_else(
             || status.analysis.fleet.default_branch.clone(),
             |target| target.tail.head,
@@ -1543,6 +1550,7 @@ fn execute_locked(
             &status.analysis.fleet.default_branch,
             crate::physical_rebase::RebaseExecutionBudget::new(timeout)
                 .with_deadline(operation_deadline)
+                .because(rewrite_reason)
                 // bd-abd929: bd-85b71d applied this reasoning inside sync but never
                 // here: a caravan ROOT is squash-merged by cara, so its history
                 // is discarded at landing and a merge-preserving replay proves
@@ -1676,6 +1684,11 @@ fn execute_locked(
                 ),
             ));
         }
+        rewrite_comment_receipt =
+            crate::sync::ensure_branch_rewrite_comment(&provider, &repository, observed, &receipt)
+                .map_err(|error| {
+                    attach_rebase_receipt(mutation_error(&error, &preflight_state), Some(&receipt))
+                })?;
         Some(receipt)
     } else {
         None
@@ -1707,6 +1720,24 @@ fn execute_locked(
         }
         Err(error) => return Err(error),
     };
+    if let Some(comment) = rewrite_comment_receipt {
+        let already = comment
+            .provider_output
+            .as_deref()
+            .is_some_and(|value| value.starts_with("existing GitHub comment"));
+        output.receipt.completed_steps.push(MutationStep {
+            kind: MutationKind::Comment,
+            state: if already {
+                MutationStepState::AlreadySatisfied
+            } else {
+                MutationStepState::Completed
+            },
+            pr: Some(comment.after.number),
+            summary: "posted one-line branch rewrite reason".to_owned(),
+        });
+        output.provider_receipts.push(comment);
+        output.receipt.changed = true;
+    }
     if let Some(mut created) = creation_state {
         created.steps.append(&mut output.receipt.completed_steps);
         output.receipt.completed_steps = created.steps;

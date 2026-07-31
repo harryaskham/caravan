@@ -247,6 +247,7 @@ fn execute_live(
         }
         Err(error) => return Err(error),
     };
+    post_rewrite_comments(&provider, &repository, &mut output)?;
     let kind = match operation {
         ReshapeOperation::Evict => EventKind::Evicted,
         ReshapeOperation::Split => EventKind::Split,
@@ -267,6 +268,71 @@ fn execute_live(
     output.events.push(event);
     output.hook_deliveries = hooks::dispatch_events(context, &output.events)?;
     Ok(output)
+}
+
+fn post_rewrite_comments<R: crate::command::CommandRunner>(
+    provider: &GitHubMutationAdapter<R>,
+    repository: &crate::model::RepositoryId,
+    output: &mut ReshapeOutput,
+) -> Result<(), AppError> {
+    for rewrite in output.descendant_rewrites.clone() {
+        let observed = provider
+            .refetch_pull_request(repository, rewrite.pr)
+            .map_err(|error| rewrite_comment_error(&error, output, &rewrite))?;
+        if observed.head.oid != rewrite.new_head_oid {
+            return Err(AppError::structured(
+                ErrorCategory::Validation,
+                "reshape_rewrite_comment_head_stale",
+                "provider did not expose the exact rewritten head before its attribution comment",
+                Some(
+                    json!({"rewrite": rewrite, "observed_head": observed.head.oid, "mutated": true, "resumable": true}),
+                ),
+            ));
+        }
+        let Some(comment) =
+            crate::sync::ensure_branch_rewrite_comment(provider, repository, &observed, &rewrite)
+                .map_err(|error| rewrite_comment_error(&error, output, &rewrite))?
+        else {
+            continue;
+        };
+        let already = comment
+            .provider_output
+            .as_deref()
+            .is_some_and(|value| value.starts_with("existing GitHub comment"));
+        output.receipt.completed_steps.push(MutationStep {
+            kind: MutationKind::Comment,
+            state: if already {
+                MutationStepState::AlreadySatisfied
+            } else {
+                MutationStepState::Completed
+            },
+            pr: Some(rewrite.pr),
+            summary: "posted one-line branch rewrite reason".to_owned(),
+        });
+        output.provider_receipts.push(comment);
+        output.receipt.changed = true;
+    }
+    Ok(())
+}
+
+fn rewrite_comment_error(
+    error: &MutationError,
+    output: &ReshapeOutput,
+    rewrite: &crate::physical_rebase::RebaseReceipt,
+) -> AppError {
+    AppError::structured(
+        ErrorCategory::ExecutionFailure,
+        "reshape_rewrite_comment_failed",
+        format!("branch rewrite completed but its one-line attribution comment failed: {error}"),
+        Some(json!({
+            "rewrite": rewrite,
+            "descendant_rewrites": output.descendant_rewrites,
+            "provider_receipts": output.provider_receipts,
+            "mutated": true,
+            "resumable": true,
+            "safe_next_action": "the branch rewrite is complete; preserve the exact pushed head and recover only the missing marked comment after provider access returns — do not force-push the branch again",
+        })),
+    )
 }
 
 fn eviction_failed_event(
@@ -501,7 +567,10 @@ fn unwind_descendants(
             target,
             default,
             crate::physical_rebase::RebaseExecutionBudget::new(rewrite.timeout)
-                .replaying_after(boundary.oid.clone()),
+                .replaying_after(boundary.oid.clone())
+                .because(crate::physical_rebase::BranchRewriteReason::ParentEvicted {
+                    parent_pr: evicted,
+                }),
         )?;
         target = crate::physical_rebase::PlannedBase::Simulated(BranchSnapshot {
             repository: status.repository.clone(),

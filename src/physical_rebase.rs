@@ -29,6 +29,71 @@ const MAX_MERGE_PRESERVING_COMMITS: usize = 256;
 /// operation deadline remains the real bound.
 const WORKTREE_SETUP_FLOOR: Duration = Duration::from_secs(60);
 
+/// Why Caravan is authorized to replace one exact branch generation.
+///
+/// Selected before the rewrite and retained in the immutable plan/receipt, so
+/// the GitHub-visible reason cannot be inferred incorrectly after publication
+/// (bd-8e97bf).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BranchRewriteReason {
+    #[default]
+    Unspecified,
+    CurrentDefaultAdvanced,
+    ParentAdvanced {
+        parent_pr: PrNumber,
+    },
+    JoinedCaravan {
+        parent_pr: PrNumber,
+    },
+    ParentEvicted {
+        parent_pr: PrNumber,
+    },
+    CaravanReshaped,
+    ReviewedRepair {
+        operation_id: String,
+    },
+}
+
+impl BranchRewriteReason {
+    /// One visible line plus a same-line hidden idempotency marker.
+    #[must_use]
+    pub fn comment(&self, receipt: &RebaseReceipt) -> Option<(String, String)> {
+        if receipt.already_satisfied {
+            return None;
+        }
+        let reason = match self {
+            Self::Unspecified => return None,
+            Self::CurrentDefaultAdvanced => "current default advanced".to_owned(),
+            Self::ParentAdvanced { parent_pr } => format!("parent #{parent_pr} advanced"),
+            Self::JoinedCaravan { parent_pr } => {
+                format!("it joined the caravan behind parent #{parent_pr}")
+            }
+            Self::ParentEvicted { parent_pr } => format!("parent #{parent_pr} was evicted"),
+            Self::CaravanReshaped => "the caravan was reshaped".to_owned(),
+            Self::ReviewedRepair { operation_id } => {
+                let bounded = operation_id
+                    .chars()
+                    .filter(|character| !character.is_control())
+                    .take(32)
+                    .collect::<String>();
+                format!("reviewed repair {bounded} was applied")
+            }
+        };
+        let marker = format!(
+            "<!-- caravan-branch-rewrite:v1:{}:{}:{} -->",
+            receipt.pr, receipt.old_head_oid, receipt.new_head_oid
+        );
+        let short = |oid: &CommitOid| oid.0.chars().take(7).collect::<String>();
+        let body = format!(
+            "Caravan updated this branch because {reason}; branch {} → {}. {marker}",
+            short(&receipt.old_head_oid),
+            short(&receipt.new_head_oid),
+        );
+        Some((marker, body))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RebaseExecutionBudget {
     pub command_timeout: Duration,
@@ -58,6 +123,8 @@ pub struct RebaseExecutionBudget {
     /// the evicted head. Set explicitly by eviction unwind; unset elsewhere so
     /// no ordinary rewrite silently changes which commits it carries.
     pub replay_upstream: Option<CommitOid>,
+    /// Immutable reason attached to the exact prepared generation.
+    pub rewrite_reason: BranchRewriteReason,
 }
 
 impl RebaseExecutionBudget {
@@ -69,6 +136,7 @@ impl RebaseExecutionBudget {
             reconcile_squash_equivalent: false,
             flatten_squashed_root: false,
             replay_upstream: None,
+            rewrite_reason: BranchRewriteReason::Unspecified,
         }
     }
 
@@ -94,6 +162,13 @@ impl RebaseExecutionBudget {
     #[must_use]
     pub fn replaying_after(mut self, boundary: CommitOid) -> Self {
         self.replay_upstream = Some(boundary);
+        self
+    }
+
+    /// Bind the operation's reason to this exact prepared generation.
+    #[must_use]
+    pub fn because(mut self, reason: BranchRewriteReason) -> Self {
+        self.rewrite_reason = reason;
         self
     }
 
@@ -296,6 +371,8 @@ pub struct RebasePlan {
     pub ci_trigger_workflows: Vec<String>,
     pub lease: String,
     pub already_satisfied: bool,
+    #[serde(default)]
+    pub rewrite_reason: BranchRewriteReason,
 }
 
 /// A plan plus the exact temporary object/worktree generation that created it.
@@ -328,6 +405,8 @@ pub struct RebaseReceipt {
     pub lease: String,
     /// True when no push was needed because the exact ancestry already held.
     pub already_satisfied: bool,
+    #[serde(default)]
+    pub rewrite_reason: BranchRewriteReason,
 }
 
 /// Rebase `candidate`'s candidate-only linear series onto `new_base`.
@@ -718,6 +797,7 @@ pub fn prepare_candidate(
         ci_trigger_workflows,
         lease,
         already_satisfied,
+        rewrite_reason: budget.rewrite_reason.clone(),
     };
     Ok(PreparedRebase { plan, worktree })
 }
@@ -1502,6 +1582,7 @@ fn push_prepared(prepared: &PreparedRebase) -> Result<RebaseReceipt, AppError> {
         ci_trigger_workflows: prepared.plan.ci_trigger_workflows.clone(),
         lease: prepared.plan.lease.clone(),
         already_satisfied: prepared.plan.already_satisfied,
+        rewrite_reason: prepared.plan.rewrite_reason.clone(),
     })
 }
 
@@ -1970,6 +2051,49 @@ mod tests {
             "date amend failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    fn rewrite_receipt(reason: BranchRewriteReason) -> RebaseReceipt {
+        RebaseReceipt {
+            pr: PrNumber(2330),
+            branch: "child".to_owned(),
+            old_head_oid: CommitOid("a".repeat(40)),
+            new_head_oid: CommitOid("b".repeat(40)),
+            old_base_oid: CommitOid("c".repeat(40)),
+            new_base_branch: "parent".to_owned(),
+            new_base_oid: CommitOid("d".repeat(40)),
+            new_tree_oid: CommitOid("e".repeat(40)),
+            commit_count: 1,
+            merge_topology: None,
+            squash_reconciliation: None,
+            ci_trigger_workflows: Vec::new(),
+            lease: "exact".to_owned(),
+            already_satisfied: false,
+            rewrite_reason: reason,
+        }
+    }
+
+    #[test]
+    fn rewrite_reason_is_one_visible_line_and_exact_generation_marked() {
+        let receipt = rewrite_receipt(BranchRewriteReason::ParentAdvanced {
+            parent_pr: PrNumber(2331),
+        });
+        let (marker, body) = receipt.rewrite_reason.comment(&receipt).unwrap();
+        assert_eq!(body.lines().count(), 1);
+        assert!(body.len() < 240);
+        assert!(body.contains("parent #2331 advanced"));
+        assert!(body.contains("aaaaaaa → bbbbbbb"));
+        assert!(body.ends_with(&marker));
+        assert!(marker.contains(":2330:"));
+    }
+
+    #[test]
+    fn unspecified_or_already_satisfied_rewrite_never_claims_an_update() {
+        let receipt = rewrite_receipt(BranchRewriteReason::Unspecified);
+        assert!(receipt.rewrite_reason.comment(&receipt).is_none());
+        let mut noop = rewrite_receipt(BranchRewriteReason::CurrentDefaultAdvanced);
+        noop.already_satisfied = true;
+        assert!(noop.rewrite_reason.comment(&noop).is_none());
     }
 
     fn assert_dates_not_before(directory: &Path, child: &CommitOid, parent: &CommitOid) {
@@ -2770,11 +2894,21 @@ mod tests {
             remote_range(&candidate),
             PlannedBase::Remote(target.clone()),
             &workflow_source,
-            RebaseExecutionBudget::new(TEST_REBASE_BUDGET),
+            RebaseExecutionBudget::new(TEST_REBASE_BUDGET).because(
+                BranchRewriteReason::ParentAdvanced {
+                    parent_pr: PrNumber(2331),
+                },
+            ),
         )
         .expect("Caravan's own stack output must pass its ancestry proof");
 
         assert!(!prepared.plan.already_satisfied);
+        assert_eq!(
+            prepared.plan.rewrite_reason,
+            BranchRewriteReason::ParentAdvanced {
+                parent_pr: PrNumber(2331)
+            }
+        );
         assert!(
             is_ancestor(
                 &process_runner(&fixture.clone, TEST_REBASE_BUDGET, None),
@@ -2800,7 +2934,9 @@ mod tests {
         );
         assert_dates_not_before(&fixture.clone, &prepared.plan.new_head_oid, &parent_head);
 
-        apply_prepared(&prepared).expect("publish the exact prepared test generation");
+        let published =
+            apply_prepared(&prepared).expect("publish the exact prepared test generation");
+        assert_eq!(published.rewrite_reason, prepared.plan.rewrite_reason);
         candidate.head.oid = prepared.plan.new_head_oid.clone();
         candidate.base = target.clone();
         let next = prepare_candidate(

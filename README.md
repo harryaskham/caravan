@@ -613,8 +613,13 @@ unsafe topology drift, misleading merge provenance, timestamp reversal, or tree
 mismatch stop before any write. When any other Git replay changes the commit
 count, `rebase_topology_changed` reports source/rebuilt/dropped counts and OIDs,
 likely already-present/empty-patch causes, and a safe source-rebase or
-reviewed-repair next action. Membership rewrites one candidate. After the
-mandatory provider rediscovery, `join`/`rejoin` require the exact live tail from
+reviewed-repair next action. Every exact branch generation that Cara actually
+rewrites receives one GitHub-visible line naming the typed reason (default
+advanced, parent advanced, join, eviction, reshape, or reviewed repair) and the
+short old/new head OIDs. A same-line hidden marker deduplicates provider retries;
+dry-runs, failed pushes, and already-satisfied generations post nothing.
+Membership rewrites one candidate. After the mandatory provider rediscovery,
+`join`/`rejoin` require the exact live tail from
 the rebase receipt, while `new`/`renew` require the exact current default and no
 inferred candidate membership; a new caravan correctly has no join tail.
 Candidate-head/default/tail drift stops before membership writes with an

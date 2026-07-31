@@ -111,7 +111,8 @@ impl MemberCost {
         } else {
             0
         };
-        auto_merge.saturating_add(force)
+        // One marked comment after every actual branch generation write.
+        auto_merge.saturating_add(force).saturating_add(1)
     }
 }
 

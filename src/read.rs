@@ -242,6 +242,110 @@ fn apply_stack_backend_mutation_policy(
         });
 }
 
+fn validate_native_stack_entries(
+    stack: &crate::github::GitHubStackSnapshot,
+    analysis: &GraphAnalysis,
+    problems: &mut Vec<StackBackendProblem>,
+    consistency: &mut StackConsistency,
+) {
+    for (index, entry) in stack.pull_requests.iter().enumerate() {
+        let number = PrNumber(entry.number);
+        let Some(pull) = analysis.pull_requests.get(&number) else {
+            problems.push(StackBackendProblem {
+                code: "github_stack_pr_missing".to_owned(),
+                message: format!(
+                    "Stack #{} PR #{} is absent from Cara discovery",
+                    stack.number, number
+                ),
+            });
+            *consistency = StackConsistency::Drifted;
+            continue;
+        };
+        if pull.head.oid != entry.head.sha || pull.head.name != entry.head.ref_name {
+            problems.push(StackBackendProblem {
+                code: "github_stack_head_drift".to_owned(),
+                message: format!(
+                    "Stack #{} PR #{} head generation differs from Cara discovery",
+                    stack.number, number
+                ),
+            });
+            *consistency = StackConsistency::Drifted;
+        }
+        let expected_base = if index == 0 {
+            analysis.fleet.default_branch.name.as_str()
+        } else {
+            stack.pull_requests[index - 1].head.ref_name.as_str()
+        };
+        if pull.base.name != expected_base {
+            problems.push(StackBackendProblem {
+                code: "github_stack_pr_base_drift".to_owned(),
+                message: format!(
+                    "Stack #{} PR #{} targets `{}` instead of `{expected_base}`",
+                    stack.number, number, pull.base.name
+                ),
+            });
+            *consistency = StackConsistency::Drifted;
+        }
+    }
+}
+
+fn native_stack_status(
+    stack: crate::github::GitHubStackSnapshot,
+    analysis: &GraphAnalysis,
+    represented: &mut BTreeSet<PrNumber>,
+) -> NativeStackStatus {
+    let members = stack
+        .pull_requests
+        .iter()
+        .map(|pull| PrNumber(pull.number))
+        .collect::<Vec<_>>();
+    let caravan = members
+        .first()
+        .and_then(|member| analysis.fleet.containing(*member));
+    let mut problems = Vec::new();
+    let (caravan_id, mut consistency) = if let Some(caravan) = caravan {
+        represented.insert(caravan.id);
+        if caravan.members == members {
+            (Some(caravan.id), StackConsistency::Exact)
+        } else {
+            problems.push(StackBackendProblem {
+                code: "github_stack_member_order_drift".to_owned(),
+                message: format!(
+                    "Stack #{} members {:?} do not equal caravan #{} members {:?}",
+                    stack.number, members, caravan.id, caravan.members
+                ),
+            });
+            (Some(caravan.id), StackConsistency::Drifted)
+        }
+    } else {
+        problems.push(StackBackendProblem {
+            code: "github_stack_orphaned".to_owned(),
+            message: format!(
+                "Stack #{} does not map to any current Caravan",
+                stack.number
+            ),
+        });
+        (None, StackConsistency::Orphaned)
+    };
+    if stack.base.ref_name != analysis.fleet.default_branch.name {
+        problems.push(StackBackendProblem {
+            code: "github_stack_base_drift".to_owned(),
+            message: format!(
+                "Stack #{} targets `{}` instead of `{}`",
+                stack.number, stack.base.ref_name, analysis.fleet.default_branch.name
+            ),
+        });
+        consistency = StackConsistency::Drifted;
+    }
+    validate_native_stack_entries(&stack, analysis, &mut problems, &mut consistency);
+    NativeStackStatus {
+        stack,
+        caravan_id,
+        consistency,
+        problems,
+    }
+}
+
 fn stack_backend_status(
     configured: crate::config::StackType,
     provider: &impl NativeStackInventoryProvider,
@@ -281,98 +385,11 @@ fn stack_backend_status(
     };
 
     let mut represented = BTreeSet::new();
-    let mut native_stacks = Vec::with_capacity(inventory.stacks.len());
-    for stack in inventory.stacks {
-        let members = stack
-            .pull_requests
-            .iter()
-            .map(|pull| PrNumber(pull.number))
-            .collect::<Vec<_>>();
-        let caravan = members
-            .first()
-            .and_then(|member| analysis.fleet.containing(*member));
-        let mut problems = Vec::new();
-        let (caravan_id, mut consistency) = if let Some(caravan) = caravan {
-            represented.insert(caravan.id);
-            if caravan.members == members {
-                (Some(caravan.id), StackConsistency::Exact)
-            } else {
-                problems.push(StackBackendProblem {
-                    code: "github_stack_member_order_drift".to_owned(),
-                    message: format!(
-                        "Stack #{} members {:?} do not equal caravan #{} members {:?}",
-                        stack.number, members, caravan.id, caravan.members
-                    ),
-                });
-                (Some(caravan.id), StackConsistency::Drifted)
-            }
-        } else {
-            problems.push(StackBackendProblem {
-                code: "github_stack_orphaned".to_owned(),
-                message: format!(
-                    "Stack #{} does not map to any current Caravan",
-                    stack.number
-                ),
-            });
-            (None, StackConsistency::Orphaned)
-        };
-
-        if stack.base.ref_name != analysis.fleet.default_branch.name {
-            problems.push(StackBackendProblem {
-                code: "github_stack_base_drift".to_owned(),
-                message: format!(
-                    "Stack #{} targets `{}` instead of `{}`",
-                    stack.number, stack.base.ref_name, analysis.fleet.default_branch.name
-                ),
-            });
-            consistency = StackConsistency::Drifted;
-        }
-        for (index, entry) in stack.pull_requests.iter().enumerate() {
-            let number = PrNumber(entry.number);
-            let Some(pull) = analysis.pull_requests.get(&number) else {
-                problems.push(StackBackendProblem {
-                    code: "github_stack_pr_missing".to_owned(),
-                    message: format!(
-                        "Stack #{} PR #{} is absent from Cara discovery",
-                        stack.number, number
-                    ),
-                });
-                consistency = StackConsistency::Drifted;
-                continue;
-            };
-            if pull.head.oid != entry.head.sha || pull.head.name != entry.head.ref_name {
-                problems.push(StackBackendProblem {
-                    code: "github_stack_head_drift".to_owned(),
-                    message: format!(
-                        "Stack #{} PR #{} head generation differs from Cara discovery",
-                        stack.number, number
-                    ),
-                });
-                consistency = StackConsistency::Drifted;
-            }
-            let expected_base = if index == 0 {
-                analysis.fleet.default_branch.name.as_str()
-            } else {
-                stack.pull_requests[index - 1].head.ref_name.as_str()
-            };
-            if pull.base.name != expected_base {
-                problems.push(StackBackendProblem {
-                    code: "github_stack_pr_base_drift".to_owned(),
-                    message: format!(
-                        "Stack #{} PR #{} targets `{}` instead of `{expected_base}`",
-                        stack.number, number, pull.base.name
-                    ),
-                });
-                consistency = StackConsistency::Drifted;
-            }
-        }
-        native_stacks.push(NativeStackStatus {
-            stack,
-            caravan_id,
-            consistency,
-            problems,
-        });
-    }
+    let native_stacks = inventory
+        .stacks
+        .into_iter()
+        .map(|stack| native_stack_status(stack, analysis, &mut represented))
+        .collect::<Vec<_>>();
 
     let missing_caravans = if inventory.truncated {
         Vec::new()

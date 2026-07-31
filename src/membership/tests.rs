@@ -363,6 +363,7 @@ fn rebase_receipt(
             candidate.head.name, candidate.head.oid
         ),
         already_satisfied: true,
+        rewrite_reason: crate::physical_rebase::BranchRewriteReason::Unspecified,
     }
 }
 
@@ -1124,6 +1125,7 @@ fn atomic_join_rejects_live_tail_drift_after_physical_rebase() {
             candidate.head.name, candidate.head.oid
         ),
         already_satisfied: false,
+        rewrite_reason: crate::physical_rebase::BranchRewriteReason::Unspecified,
     };
 
     let error = execute_with_rebase_guard(
@@ -1170,6 +1172,7 @@ fn force_rewrite_plan(candidate: &PullRequestSnapshot) -> crate::physical_rebase
             candidate.head.name, candidate.head.oid
         ),
         already_satisfied: false,
+        rewrite_reason: crate::physical_rebase::BranchRewriteReason::Unspecified,
     }
 }
 
@@ -1282,6 +1285,7 @@ fn join_receipt_proves_exact_tail_ancestry_and_stale_force_removal() {
             candidate.head.name, candidate.head.oid
         ),
         already_satisfied: true,
+        rewrite_reason: crate::physical_rebase::BranchRewriteReason::Unspecified,
     };
     let mut context = AppContext::default();
     context.config.rebase_on_join = true;
@@ -1385,6 +1389,7 @@ fn root_new_receipt_uses_default_branch_predecessor_bd_d15ba3() {
             candidate.head.name, candidate.head.oid
         ),
         already_satisfied: true,
+        rewrite_reason: crate::physical_rebase::BranchRewriteReason::Unspecified,
     };
     let mut context = AppContext::default();
     context.config.rebase_on_join = true;

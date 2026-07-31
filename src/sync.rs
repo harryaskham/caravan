@@ -1607,6 +1607,13 @@ fn prepare_physical_chains(
                 &status.analysis.fleet.default_branch,
                 crate::physical_rebase::RebaseExecutionBudget::new(timeout)
                     .with_deadline(precommit_deadline)
+                    .because(if index == 0 {
+                        crate::physical_rebase::BranchRewriteReason::CurrentDefaultAdvanced
+                    } else {
+                        crate::physical_rebase::BranchRewriteReason::ParentAdvanced {
+                            parent_pr: caravan.members[index - 1],
+                        }
+                    })
                     // bd-85b71d: only the root is squash-merged by Cara, and
                     // only then is its history discarded at landing. A child's
                     // ancestry must still physically follow the chain, so it is
@@ -2183,8 +2190,11 @@ fn apply_physical_chains(
             .count(),
     )
     .unwrap_or(u32::MAX);
+    // Every actual branch write is followed by one idempotent marked comment.
+    // Reserve both before crossing the write barrier so attribution cannot be
+    // silently starved by later provider work (bd-8e97bf).
     progress
-        .ensure_mutation_capacity(planned_branch_writes)
+        .ensure_mutation_capacity(planned_branch_writes.saturating_mul(2))
         .map_err(|error| attach_physical_rebuild(error, &outcome))?;
     outcome
         .provider_receipts
@@ -2300,8 +2310,8 @@ fn apply_physical_chains(
                 &outcome,
             ));
         }
-        progress.current.insert(receipt.pr, observed);
-        outcome.steps.push(MutationStep {
+        progress.current.insert(receipt.pr, observed.clone());
+        progress.steps.push(MutationStep {
             kind: MutationKind::RebaseBranch,
             state: if receipt.already_satisfied {
                 MutationStepState::AlreadySatisfied
@@ -2314,7 +2324,27 @@ fn apply_physical_chains(
                 receipt.branch, receipt.old_head_oid, receipt.new_head_oid, receipt.new_base_oid
             ),
         });
+        if let Some(comment) =
+            ensure_branch_rewrite_comment(provider, &status.repository, &observed, receipt)
+                .map_err(|error| {
+                    attach_physical_rebuild(
+                        mutation_error(&error, &progress, Some(receipt.pr)),
+                        &outcome,
+                    )
+                })?
+        {
+            record_marked_comment(
+                &mut progress,
+                comment,
+                receipt.pr,
+                "posted one-line branch rewrite reason",
+            );
+        }
     }
+    outcome
+        .provider_receipts
+        .clone_from(&progress.provider_receipts);
+    outcome.steps.clone_from(&progress.steps);
     Ok(outcome)
 }
 
@@ -3920,6 +3950,36 @@ fn persist_auto_skip(
         progress.record(labelled, "added generation-bound automatic admission skip");
     }
     Ok(())
+}
+
+/// Post one exact-generation rewrite reason, or prove no comment is required.
+///
+/// Shared by sync, atomic membership, and reshape so every physical write uses
+/// the same one-line/idempotency contract (bd-8e97bf).
+pub(crate) fn ensure_branch_rewrite_comment(
+    provider: &impl SyncProvider,
+    repository: &RepositoryId,
+    observed: &PullRequestSnapshot,
+    receipt: &crate::physical_rebase::RebaseReceipt,
+) -> Result<Option<GitHubMutationReceipt>, MutationError> {
+    let Some((marker, body)) = receipt.rewrite_reason.comment(receipt) else {
+        return Ok(None);
+    };
+    let expected = PullRequestPrecondition::from(observed);
+    let mut last_provider_error = None;
+    for attempt in 0..3 {
+        match provider.ensure_marked_comment(repository, &expected, &marker, &body) {
+            Ok(receipt) => return Ok(Some(receipt)),
+            Err(error @ MutationError::Provider(_)) if attempt < 2 => {
+                // The comment write may have succeeded before a read/refetch
+                // failed. The marker makes the retry safe and turns that case
+                // into AlreadySatisfied instead of a duplicate line.
+                last_provider_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_provider_error.expect("a bounded provider retry retains its error"))
 }
 
 fn record_marked_comment(
