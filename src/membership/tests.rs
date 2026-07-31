@@ -379,6 +379,50 @@ fn clean(
     })
 }
 
+/// bd-84f82d: the post-rewrite reserve must be priced against a deadline that
+/// can actually hold it.
+///
+/// `require_post_rewrite_budget` requires `POST_REWRITE_COMMAND_RESERVE * timeout`
+/// (four commands). The exact-candidate binding returned its OWN one-command
+/// window and that was assigned back over the operation deadline, so the guard
+/// measured four against one and could never pass. No configuration value fixes
+/// that: raising `command_timeout_secs` scales both sides and the ratio stays 4:1.
+///
+/// The candidate share must therefore be at least the reserve, and still bounded
+/// so one candidate cannot consume the tick.
+#[test]
+fn a_candidate_share_can_hold_the_reserve_it_will_be_asked_for() {
+    let mut context = AppContext::default();
+    context.config.command_timeout_secs = 60;
+    let timeout = std::time::Duration::from_secs(context.config.command_timeout_secs);
+    let reserve = timeout * super::POST_REWRITE_COMMAND_RESERVE;
+
+    // A generous tick: the candidate share must leave room for the reserve.
+    let tick = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+    let share = super::candidate_operation_deadline(&context, tick);
+    assert!(
+        share.saturating_duration_since(std::time::Instant::now()) >= reserve,
+        "the share must hold the reserve the guard will demand, or the rewrite path is unreachable"
+    );
+    assert!(
+        super::require_post_rewrite_budget(&context, Some(share), PrNumber(2317)).is_ok(),
+        "the guard must pass on a healthy tick"
+    );
+
+    // The single-command window that used to be assigned here cannot hold it.
+    let one_command = std::time::Instant::now() + timeout;
+    assert!(
+        super::require_post_rewrite_budget(&context, Some(one_command), PrNumber(2317)).is_err(),
+        "four commands against one is the defect: this must still refuse"
+    );
+
+    // And a candidate must not swallow the whole tick.
+    assert!(
+        share < tick,
+        "the share must remain bounded below the tick deadline"
+    );
+}
+
 /// bd-4e4615: an irreversible branch rewrite must not start without budget for
 /// the mandatory post-rewrite rediscovery and membership writes.
 #[test]

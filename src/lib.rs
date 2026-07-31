@@ -560,7 +560,10 @@ impl AppContext {
         Self::load_from_directory(&invocation_directory, path)
     }
 
-    fn load_from_directory(
+    /// Load policy for an explicit repository directory rather than the
+    /// invocation directory, so `--repo` can target a checkout the caller is not
+    /// standing in.
+    pub fn load_from_directory(
         invocation_directory: &Path,
         path: Option<&Path>,
     ) -> Result<Self, ConfigError> {

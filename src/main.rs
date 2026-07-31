@@ -43,6 +43,18 @@ struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     config: Option<PathBuf>,
 
+    /// Repository to operate on, instead of inferring one from the working
+    /// directory.
+    ///
+    /// Every command except `web` resolved its repository from the invocation
+    /// directory, so answering a question about a repository required standing
+    /// in it. That is a real constraint rather than a preference: an operator or
+    /// agent watching one checkout could not read another without changing
+    /// directory, and `web` already took `--repo`, so the capability existed and
+    /// was reachable from exactly one subcommand (bd-3c0d9e).
+    #[arg(long, global = true, value_name = "PATH")]
+    repo: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -435,7 +447,11 @@ fn run_web(cli: &Cli, input: &caravan::web::WebInput) -> Result<(), i32> {
 }
 
 fn load_context(cli: &Cli) -> Result<AppContext, i32> {
-    AppContext::load(cli.config.as_deref()).map_err(|error| {
+    let loaded = match cli.repo.as_deref() {
+        Some(repository) => AppContext::load_from_directory(repository, cli.config.as_deref()),
+        None => AppContext::load(cli.config.as_deref()),
+    };
+    loaded.map_err(|error| {
         if cli.json {
             emit_result::<serde_json::Value, _>(true, Err(error))
                 .expect_err("an error envelope returns a nonzero exit code")

@@ -249,3 +249,38 @@ fn sync_dry_run_is_discoverable_from_the_mutating_command() {
         "the help must name the identical planner so there is one source of truth: {text}"
     );
 }
+
+/// `--repo` must be global, not a `web` privilege.
+///
+/// Every other command resolved its repository from the invocation directory,
+/// so answering a question about a repository required standing in it. The
+/// general form already existed as `AppContext::load_from_directory` and was
+/// reachable from exactly one subcommand (bd-3c0d9e).
+#[test]
+fn repo_is_a_global_argument_not_a_web_privilege() {
+    for args in [
+        vec!["--repo", "/tmp", "status", "--help"],
+        vec!["--repo", "/tmp", "check", "--help"],
+        vec!["--repo", "/tmp", "log", "--help"],
+    ] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_cara"))
+            .args(&args)
+            .output()
+            .expect("cara runs");
+        assert!(
+            output.status.success(),
+            "`cara {}` must accept a global --repo: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let help = std::process::Command::new(env!("CARGO_BIN_EXE_cara"))
+        .arg("--help")
+        .output()
+        .expect("cara --help runs");
+    assert!(
+        String::from_utf8_lossy(&help.stdout).contains("--repo"),
+        "the global option must be discoverable from the top-level help"
+    );
+}

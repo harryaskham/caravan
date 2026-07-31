@@ -42,6 +42,31 @@ const SKIPPED_LABEL: &str = "caravan-join-skipped";
 /// Provider commands that must still run after an irreversible branch rewrite:
 /// the mandatory exact rediscovery plus the membership label/base writes.
 const POST_REWRITE_COMMAND_RESERVE: u32 = 4;
+
+/// Commands one candidate may spend before the tick reclaims the budget.
+///
+/// The exact-candidate binding read builds its OWN runner bounded by its own
+/// `exact_deadline`, so that read is already contained. Assigning that deadline
+/// back over the operation deadline collapsed the whole remaining operation to a
+/// single command window, and the post-rewrite guard then priced
+/// `POST_REWRITE_COMMAND_RESERVE * timeout` against `1 * timeout`. Four against
+/// one cannot pass, at any value of `command_timeout_secs`, because raising it
+/// scales both sides (bd-84f82d).
+///
+/// A candidate still must not consume the tick, so the deadline is bounded
+/// rather than merely restored: the reserve it will need, plus the rewrite work
+/// that precedes it, and never beyond the caller's tick deadline.
+const CANDIDATE_OPERATION_COMMAND_BUDGET: u32 = POST_REWRITE_COMMAND_RESERVE * 2;
+
+/// Bound one candidate's share without collapsing it to a single command.
+fn candidate_operation_deadline(
+    context: &AppContext,
+    tick_deadline: std::time::Instant,
+) -> std::time::Instant {
+    let share = std::time::Duration::from_secs(context.config.command_timeout_secs)
+        .saturating_mul(CANDIDATE_OPERATION_COMMAND_BUDGET);
+    std::cmp::min(tick_deadline, std::time::Instant::now() + share)
+}
 const REQUIRED_LABELS: [&str; 3] = [ACTIVE_LABEL, EVICTED_LABEL, FORCE_LABEL];
 
 /// Membership command kind.
@@ -1208,7 +1233,9 @@ fn execute_locked(
                 github_budget,
             )?
         };
-        operation_deadline = bound.exact_deadline;
+        // Not `bound.exact_deadline`: that is the binding read's own one-command
+        // window, already applied to its own runner (bd-84f82d).
+        operation_deadline = candidate_operation_deadline(context, operation_deadline);
         bound.status
     } else if request.create_pr {
         read::status_for_pr_creation(context, operation_deadline, github_budget)?
@@ -1612,7 +1639,9 @@ fn execute_locked(
                 rediscovery_deadline,
                 github_budget,
             )?;
-            operation_deadline = bound.exact_deadline;
+            // Same as the binding above: keep a candidate-scoped share of the
+            // tick, never a single command window (bd-84f82d).
+            operation_deadline = candidate_operation_deadline(context, operation_deadline);
             status = bound.status;
             checker = GitCompatibilityChecker::new(&context.repository_path, "origin")
                 .with_timeout(timeout)
