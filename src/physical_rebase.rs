@@ -264,6 +264,12 @@ pub struct MergePreservingTopology {
     /// same globally verified batch. Absent for ordinary remote targets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_replacement: Option<RebaseTopologyParentReplacement>,
+    /// Source merges Git safely elided because every external parent was already
+    /// in exact target ancestry and the independently proven final tree still
+    /// matched. This is explicit in the receipt rather than hidden as a changed
+    /// commit count (bd-a720be).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub elided_target_merges: Vec<CommitOid>,
 }
 
 /// Serializable immutable plan produced once and pushed without recomputation.
@@ -500,9 +506,9 @@ pub fn prepare_candidate(
     let has_merges = old_topology.iter().any(|commit| commit.parents.len() == 2);
     // A simulated target is the same parent branch rewritten earlier in this
     // globally verified batch. A nonlinear child can legitimately carry the
-    // exact old provider base as one merge parent; the sequencer must replace
-    // that one boundary with the retained planned parent rather than classify
-    // it as unrelated cousin history (bd-b7568d).
+    // exact old provider base as one merge parent; retain that exact replacement
+    // proof while moving all candidate cousins onto the planned parent
+    // (bd-b7568d, bd-a720be).
     let replay_parent_boundary =
         matches!(&new_base, PlannedBase::Simulated(_)).then(|| range_branch.oid.clone());
     let replaced_parent_boundary = replay_parent_boundary.as_ref().filter(|old_parent| {
@@ -510,14 +516,26 @@ pub fn prepare_candidate(
             .iter()
             .any(|commit| commit.parents.contains(old_parent))
     });
+    // A previous Cara generation may already contain the exact selected target
+    // as a merge parent. v0.0.60 produced precisely that shape and then refused
+    // its own first-parent cousin history on the next tick. Target ancestry plus
+    // the independently proven result tree is sufficient to treat the branch as
+    // already stacked (bd-a720be).
+    let target_is_ancestor = is_ancestor(&runner, &target.oid, &candidate.head.oid)?;
+    let reuse_existing_head = target_is_ancestor
+        && !budget.flatten_squashed_root
+        && !budget.reconcile_squash_equivalent
+        && budget.replay_upstream.is_none();
     let expected_merge_tree = if has_merges {
-        validate_merge_preserving_topology(
-            &runner,
-            &old_topology,
-            target,
-            replaced_parent_boundary,
-            candidate.number,
-        )?;
+        if !target_is_ancestor {
+            validate_merge_preserving_topology(
+                &runner,
+                &old_topology,
+                target,
+                replaced_parent_boundary,
+                candidate.number,
+            )?;
+        }
         Some(expected_merge_tree(
             &runner,
             target,
@@ -542,16 +560,17 @@ pub fn prepare_candidate(
     // Reconciliation is opt-in and additionally requires exact proof, so a
     // routine rewrite never silently drops history. A merge-preserving range
     // is excluded: only an ancestor-closed linear range can be proven here.
-    let reconciliation = if budget.reconcile_squash_equivalent && !has_merges {
-        authorized_reconciliation(&runner, candidate, target, &range_base)?
-    } else {
-        None
-    };
+    let reconciliation =
+        if !reuse_existing_head && budget.reconcile_squash_equivalent && !has_merges {
+            authorized_reconciliation(&runner, candidate, target, &range_base)?
+        } else {
+            None
+        };
     // bd-85b71d: a merge-preserving root that Cara will squash-merge does not
     // need its history replayed. `expected_merge_tree` has already proven the
     // exact content that will land, so build that commit directly instead of
     // re-resolving conflicts the author already resolved by hand.
-    let flattened = if has_merges && budget.flatten_squashed_root {
+    let flattened = if !reuse_existing_head && has_merges && budget.flatten_squashed_root {
         Some(flatten_to_target(
             &worktree_runner,
             candidate,
@@ -563,7 +582,7 @@ pub fn prepare_candidate(
     } else {
         None
     };
-    let rebase = if flattened.is_some() {
+    let rebase = if reuse_existing_head || flattened.is_some() {
         CommandOutput::success(String::new())
     } else {
         run_rebase(
@@ -618,6 +637,20 @@ pub fn prepare_candidate(
     }
     let new_head = rev_parse(&worktree_runner, "HEAD")?;
     let new_tree = rev_parse(&worktree_runner, "HEAD^{tree}")?;
+    if new_head != candidate.head.oid {
+        let rewritten_topology = collect_range_topology(
+            &worktree_runner,
+            &[&target.oid],
+            &new_head,
+            "rebase_result_invalid",
+        )?;
+        validate_rewritten_metadata(
+            &worktree_runner,
+            &rewritten_topology,
+            target,
+            candidate.number,
+        )?;
+    }
     if let Some(report) = &reconciliation {
         verify_reconciled_replay(
             &worktree_runner,
@@ -636,7 +669,6 @@ pub fn prepare_candidate(
                 &old_topology,
                 &target.oid,
                 &new_head,
-                &new_tree,
                 expected,
                 replaced_parent_boundary,
                 candidate.number,
@@ -850,6 +882,113 @@ fn flatten_to_target(
     Ok(head)
 }
 
+#[derive(Debug)]
+struct CommitMetadata {
+    author_seconds: i64,
+    committer_seconds: i64,
+    subject: String,
+}
+
+fn commit_metadata(
+    runner: &impl CommandRunner,
+    oid: &CommitOid,
+) -> Result<CommitMetadata, AppError> {
+    let output = require_success(
+        runner,
+        CommandSpec::new("git").args(["show", "-s", "--format=%at%x1f%ct%x1f%s", oid.0.as_str()]),
+        "rebase_metadata_unavailable",
+        "rewritten commit metadata could not be read before push",
+    )?;
+    let mut fields = output.stdout.trim_end().splitn(3, '\u{1f}');
+    let parse_seconds = |value: Option<&str>, field: &'static str| {
+        value
+            .unwrap_or_default()
+            .parse::<i64>()
+            .map_err(|error| {
+                decision(
+                    "rebase_metadata_unavailable",
+                    "rewritten commit timestamp is not an integer",
+                    json!({"commit": oid, "field": field, "error": error.to_string(), "mutated": false, "resumable": true}),
+                )
+            })
+    };
+    Ok(CommitMetadata {
+        author_seconds: parse_seconds(fields.next(), "author_seconds")?,
+        committer_seconds: parse_seconds(fields.next(), "committer_seconds")?,
+        subject: fields.next().unwrap_or_default().to_owned(),
+    })
+}
+
+/// Verify metadata on every object Cara just created before any push.
+///
+/// `--reset-author-date` supplies the intended values, but the postcondition is
+/// the authority: a skewed clock or future-dated parent must fail closed rather
+/// than publishing a commit that predates one of its own parents. A reconstructed
+/// merge directly naming the selected target must likewise name that real branch
+/// instead of retaining a stale `Merge branch 'main'` subject (bd-a720be).
+fn validate_rewritten_metadata(
+    runner: &impl CommandRunner,
+    topology: &[RebaseTopologyCommit],
+    target: &BranchSnapshot,
+    pr: PrNumber,
+) -> Result<(), AppError> {
+    for commit in topology {
+        let metadata = commit_metadata(runner, &commit.oid)?;
+        let mut parent_floor = i64::MIN;
+        for parent in &commit.parents {
+            let parent_metadata = commit_metadata(runner, parent)?;
+            parent_floor = parent_floor
+                .max(parent_metadata.author_seconds)
+                .max(parent_metadata.committer_seconds);
+        }
+        if metadata.author_seconds < parent_floor || metadata.committer_seconds < parent_floor {
+            return Err(decision(
+                "rebase_non_monotonic_timestamp",
+                "Caravan generated a commit whose author or committer date predates one of its parents; the pull request owner cannot repair a Caravan-authored object",
+                json!({
+                    "pr": pr,
+                    "commit": commit.oid,
+                    "author_seconds": metadata.author_seconds,
+                    "committer_seconds": metadata.committer_seconds,
+                    "minimum_parent_seconds": parent_floor,
+                    "responsible_component": "caravan",
+                    "owner_actionable": false,
+                    "mutated": false,
+                    "resumable": true,
+                    "safe_next_action": "upgrade or repair Caravan; do not route this generated-history defect to the pull request owner",
+                }),
+            ));
+        }
+        // In Git's ordered parent list the first parent is the checked-out
+        // branch and the second is what was merged into it. Only the latter can
+        // truthfully require the selected target's name; target as first parent
+        // means some internal candidate side was merged, whose ref name is not
+        // recoverable from the commit object.
+        if commit.parents.len() == 2
+            && commit.parents.get(1) == Some(&target.oid)
+            && !metadata.subject.contains(&target.name)
+        {
+            return Err(decision(
+                "rebase_misleading_merge_subject",
+                "Caravan reconstructed a merge of the selected target but retained a subject naming a different branch; the pull request owner cannot repair a Caravan-authored object",
+                json!({
+                    "pr": pr,
+                    "commit": commit.oid,
+                    "subject": metadata.subject,
+                    "actual_merged_branch": target.name,
+                    "actual_merged_oid": target.oid,
+                    "responsible_component": "caravan",
+                    "owner_actionable": false,
+                    "mutated": false,
+                    "resumable": true,
+                    "safe_next_action": "upgrade or repair Caravan; do not route this generated-history defect to the pull request owner",
+                }),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn expected_merge_tree(
     runner: &impl CommandRunner,
     target: &BranchSnapshot,
@@ -904,23 +1043,36 @@ fn run_rebase(
     ];
     if preserve_merges {
         arguments.extend([
-            "--rebase-merges=no-rebase-cousins".to_owned(),
+            // A stacked target is normally a cousin of the source head. Keeping
+            // cousins on their original roots produced a Caravan-authored merge
+            // whose first parent was still rooted on a stale release commit,
+            // then the ancestry guard correctly refused that exact object. The
+            // sequencer must move candidate cousins onto the selected target;
+            // the independently proven result tree and topology proof below
+            // remain the content/shape authority (bd-a720be).
+            "--rebase-merges=rebase-cousins".to_owned(),
             "--reapply-cherry-picks".to_owned(),
             "--empty=keep".to_owned(),
         ]);
     }
-    // Use the exact target as the upstream for both sequencers. Git can then
-    // omit patch-equivalent commits already represented on the target while
-    // replaying only genuinely unique source commits. The separately retained
-    // range_base still binds and validates source provenance.
+    // Use the exact target as the upstream so target-side commits represented in
+    // an old merge are excluded rather than replayed. The independently retained
+    // range base still binds and validates source provenance; changing the
+    // upstream to that older boundary replays target advances and grows the
+    // candidate topology. The live stale-root defect was `no-rebase-cousins`,
+    // not this target exclusion (bd-a720be).
     //
-    // A reconciled upstream replaces it only when squash-equivalence analysis
-    // proved, path by path, that the target already holds that boundary's
-    // cumulative content; the replay then starts from proven-landed history
-    // instead of re-applying it against itself.
+    // A reconciled upstream replaces the target only when squash-equivalence
+    // analysis proved, path by path, that the target already holds that
+    // boundary's cumulative content; eviction may likewise supply an explicit
+    // boundary.
     let upstream = reconciled_upstream.unwrap_or(target);
     arguments.extend([
-        "--committer-date-is-author-date".to_owned(),
+        // These are NEW Caravan-authored objects. Copying each old author date
+        // into the committer date made a merge predate its newly selected parent.
+        // Reset both dates at replay time; a postcondition below verifies every
+        // emitted object is parent-monotonic before any push (bd-a720be).
+        "--reset-author-date".to_owned(),
         "--onto".to_owned(),
         target.0.clone(),
         upstream.0.clone(),
@@ -1060,17 +1212,50 @@ fn topology_commit_count_changed(
     )
 }
 
+/// Select the source commits that still require one-to-one mapping after Git
+/// safely removes target-only merge scaffolding.
+fn mapped_replay_source<'a>(
+    old_topology: &'a [RebaseTopologyCommit],
+    new_topology: &[RebaseTopologyCommit],
+    pr: PrNumber,
+) -> Result<(Vec<&'a RebaseTopologyCommit>, Vec<CommitOid>), AppError> {
+    if new_topology.len() == old_topology.len() {
+        return Ok((old_topology.iter().collect(), Vec::new()));
+    }
+    let old_without_merges = old_topology
+        .iter()
+        .filter(|commit| commit.parents.len() != 2)
+        .collect::<Vec<_>>();
+    if new_topology.len() == old_without_merges.len()
+        && new_topology.iter().all(|commit| commit.parents.len() != 2)
+    {
+        return Ok((
+            old_without_merges,
+            old_topology
+                .iter()
+                .filter(|commit| commit.parents.len() == 2)
+                .map(|commit| commit.oid.clone())
+                .collect(),
+        ));
+    }
+    Err(topology_commit_count_changed(
+        pr,
+        old_topology,
+        new_topology,
+    ))
+}
+
 fn build_merge_topology_proof(
     runner: &impl CommandRunner,
     old_topology: &[RebaseTopologyCommit],
     target: &CommitOid,
     new_head: &CommitOid,
-    new_tree: &CommitOid,
     expected_tree: CommitOid,
     replaced_parent_boundary: Option<&CommitOid>,
     pr: PrNumber,
 ) -> Result<MergePreservingTopology, AppError> {
-    if new_tree != &expected_tree {
+    let new_tree = rev_parse(runner, &format!("{}^{{tree}}", new_head.0))?;
+    if new_tree != expected_tree {
         return Err(decision(
             "rebase_merge_tree_mismatch",
             "merge-preserving replay tree differs from the independently computed clean merge tree",
@@ -1079,20 +1264,18 @@ fn build_merge_topology_proof(
     }
     let new_topology =
         collect_range_topology(runner, &[target], new_head, "rebase_result_invalid")?;
-    if new_topology.len() != old_topology.len() {
-        return Err(topology_commit_count_changed(
-            pr,
-            old_topology,
-            &new_topology,
-        ));
-    }
-    let oid_mapping = old_topology
+
+    // `rebase-cousins` turns `stale-root fix -- merge old-main` into one
+    // fix directly on the target. External-parent validation and exact tree
+    // equality make that elision explicit and bounded (bd-a720be).
+    let (mapped_old, elided_target_merges) = mapped_replay_source(old_topology, &new_topology, pr)?;
+    let oid_mapping = mapped_old
         .iter()
         .zip(&new_topology)
         .map(|(old, new)| (old.oid.clone(), new.oid.clone()))
         .collect::<std::collections::BTreeMap<_, _>>();
-    let mut mapping = Vec::with_capacity(old_topology.len());
-    for (old, new) in old_topology.iter().zip(&new_topology) {
+    let mut mapping = Vec::with_capacity(mapped_old.len());
+    for (old, new) in mapped_old.into_iter().zip(&new_topology) {
         if old.parents.len() != new.parents.len() {
             return Err(decision(
                 "rebase_topology_changed",
@@ -1139,9 +1322,9 @@ fn build_merge_topology_proof(
     }
     Ok(MergePreservingTopology {
         strategy: if replaced_parent_boundary.is_some() {
-            "git_rebase_merges_no_rebase_cousins_v2_replaced_parent"
+            "git_rebase_merges_rebase_cousins_v3_replaced_parent"
         } else {
-            "git_rebase_merges_no_rebase_cousins_v1"
+            "git_rebase_merges_rebase_cousins_v2"
         }
         .to_owned(),
         expected_merge_tree_oid: expected_tree,
@@ -1154,6 +1337,7 @@ fn build_merge_topology_proof(
                 new_parent: target.clone(),
             }
         }),
+        elided_target_merges,
     })
 }
 
@@ -1768,6 +1952,35 @@ mod tests {
             .to_owned()
     }
 
+    fn amend_head_dates(directory: &Path, date: &str) {
+        let output = Command::new("git")
+            .current_dir(directory)
+            .env("GIT_COMMITTER_DATE", date)
+            .args(["commit", "--amend", "--no-edit", "--date", date])
+            .output()
+            .expect("amend fixture dates");
+        assert!(
+            output.status.success(),
+            "date amend failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn assert_dates_not_before(directory: &Path, child: &CommitOid, parent: &CommitOid) {
+        let dates = git(directory, &["show", "-s", "--format=%at %ct", &child.0]);
+        let parent_dates = git(directory, &["show", "-s", "--format=%at %ct", &parent.0]);
+        let floor = parent_dates
+            .split_whitespace()
+            .map(|value| value.parse::<i64>().unwrap())
+            .max()
+            .unwrap();
+        assert!(
+            dates
+                .split_whitespace()
+                .all(|value| value.parse::<i64>().unwrap() >= floor)
+        );
+    }
+
     #[test]
     fn topology_count_refusal_explains_dropped_commits_and_recovery() {
         let topology = |oid: char| RebaseTopologyCommit {
@@ -1862,6 +2075,31 @@ mod tests {
             repository: repository.clone(),
             name: name.to_owned(),
             oid: oid.clone(),
+        }
+    }
+
+    fn open_candidate(
+        number: u64,
+        title: &str,
+        head: BranchSnapshot,
+        base: BranchSnapshot,
+    ) -> PullRequestSnapshot {
+        PullRequestSnapshot {
+            merge_state_status: None,
+            number: PrNumber(number),
+            title: title.to_owned(),
+            url: format!("https://example.invalid/{number}"),
+            state: PullRequestState::Open,
+            draft: false,
+            head,
+            base,
+            cross_repository: false,
+            labels: BTreeSet::new(),
+            auto_merge: AutoMergeState::disabled(),
+            checks: Vec::new(),
+            created_at: None,
+            merged_at: None,
+            updated_at: None,
         }
     }
 
@@ -2373,7 +2611,7 @@ mod tests {
         )
         .expect("owned two-parent topology is preserved");
         let topology = receipt.merge_topology.as_ref().expect("topology receipt");
-        assert_eq!(topology.strategy, "git_rebase_merges_no_rebase_cousins_v1");
+        assert_eq!(topology.strategy, "git_rebase_merges_rebase_cousins_v2");
         assert_eq!(topology.old_commits.len(), topology.new_commits.len());
         assert_eq!(topology.mapping.len(), topology.old_commits.len());
         assert_eq!(
@@ -2411,8 +2649,12 @@ mod tests {
         assert_eq!(second.new_head_oid, receipt.new_head_oid);
     }
 
+    /// A merge whose external side is already exact target ancestry contributes
+    /// no independent patch. Rebase-cousins may elide it only while the proven
+    /// final tree remains identical, and the receipt names the elision
+    /// (bd-a720be).
     #[test]
-    fn preserves_default_branch_merge_inside_candidate_history() {
+    fn elides_a_default_branch_merge_already_represented_by_the_target() {
         let fixture = fixture();
         git(&fixture.clone, &["checkout", "feature"]);
         git(
@@ -2466,9 +2708,106 @@ mod tests {
             topology
                 .new_commits
                 .iter()
-                .any(|commit| commit.parents.len() == 2)
+                .all(|commit| commit.parents.len() != 2),
+            "the redundant target merge is linearized onto the target"
         );
+        assert_eq!(topology.elided_target_merges.len(), 1);
         assert_eq!(receipt.new_tree_oid, topology.expected_merge_tree_oid);
+    }
+
+    /// Exact shape emitted for Cacophony #2330 by v0.0.60 (bd-a720be):
+    /// a fix rooted on stale main, a merge of then-current main, and a newer
+    /// parent-generation branch selected as the stack target.
+    #[test]
+    fn stacked_main_merge_is_rebuilt_on_target_and_passes_the_next_guard() {
+        let fixture = fixture();
+        git(&fixture.clone, &["checkout", "feature"]);
+        amend_head_dates(&fixture.clone, "2001-01-01T00:00:00Z");
+        git(
+            &fixture.clone,
+            &[
+                "merge",
+                "--no-ff",
+                "main",
+                "-m",
+                "Merge branch 'main' into feature",
+            ],
+        );
+        amend_head_dates(&fixture.clone, "2001-01-01T00:00:00Z");
+        let source_head = CommitOid(git(&fixture.clone, &["rev-parse", "HEAD"]));
+        git(&fixture.clone, &["push", "--force", "origin", "feature"]);
+
+        git(&fixture.clone, &["checkout", "main"]);
+        git(&fixture.clone, &["checkout", "-b", "parent-generation"]);
+        std::fs::write(fixture.clone.join("parent-generation"), "parent\n").unwrap();
+        git(&fixture.clone, &["add", "parent-generation"]);
+        git(&fixture.clone, &["commit", "-m", "pending parent member"]);
+        let parent_head = CommitOid(git(&fixture.clone, &["rev-parse", "HEAD"]));
+        git(
+            &fixture.clone,
+            &["push", "-u", "origin", "parent-generation"],
+        );
+        git(&fixture.clone, &["checkout", "feature"]);
+
+        let mut candidate = open_candidate(
+            2330,
+            "timed-out request latency",
+            branch(&fixture.repository, "feature", &source_head),
+            branch(&fixture.repository, "main", &fixture.new_main),
+        );
+        let target = branch(&fixture.repository, "parent-generation", &parent_head);
+        let workflow_source = branch(&fixture.repository, "main", &fixture.new_main);
+        let prepared = prepare_candidate(
+            &fixture.clone,
+            &fixture.repository,
+            &candidate,
+            remote_range(&candidate),
+            PlannedBase::Remote(target.clone()),
+            &workflow_source,
+            RebaseExecutionBudget::new(TEST_REBASE_BUDGET),
+        )
+        .expect("Caravan's own stack output must pass its ancestry proof");
+
+        assert!(!prepared.plan.already_satisfied);
+        assert!(
+            is_ancestor(
+                &process_runner(&fixture.clone, TEST_REBASE_BUDGET, None),
+                &parent_head,
+                &prepared.plan.new_head_oid
+            )
+            .unwrap()
+        );
+        let topology = prepared.plan.merge_topology.as_ref().unwrap();
+        assert_eq!(topology.elided_target_merges.len(), 1);
+        assert!(
+            topology
+                .new_commits
+                .iter()
+                .all(|commit| commit.parents.len() == 1)
+        );
+        assert!(
+            !git(
+                &fixture.clone,
+                &["show", "-s", "--format=%s", &prepared.plan.new_head_oid.0]
+            )
+            .contains("Merge branch 'main'")
+        );
+        assert_dates_not_before(&fixture.clone, &prepared.plan.new_head_oid, &parent_head);
+
+        apply_prepared(&prepared).expect("publish the exact prepared test generation");
+        candidate.head.oid = prepared.plan.new_head_oid.clone();
+        candidate.base = target.clone();
+        let next = prepare_candidate(
+            &fixture.clone,
+            &fixture.repository,
+            &candidate,
+            remote_range(&candidate),
+            PlannedBase::Remote(target),
+            &workflow_source,
+            RebaseExecutionBudget::new(TEST_REBASE_BUDGET),
+        )
+        .expect("next tick accepts the exact object Cara produced");
+        assert!(next.plan.already_satisfied);
     }
 
     #[test]
@@ -2600,40 +2939,18 @@ mod tests {
         let child_head = CommitOid(git(&fixture.clone, &["rev-parse", "HEAD"]));
         git(&fixture.clone, &["push", "-u", "origin", "child"]);
 
-        let parent = PullRequestSnapshot {
-            merge_state_status: None,
-            number: PrNumber(7),
-            title: "parent".to_owned(),
-            url: "https://example.invalid/7".to_owned(),
-            state: PullRequestState::Open,
-            draft: false,
-            head: branch(&fixture.repository, "feature", &fixture.feature),
-            base: branch(&fixture.repository, "main", &fixture.old_main),
-            cross_repository: false,
-            labels: BTreeSet::new(),
-            auto_merge: AutoMergeState::disabled(),
-            checks: Vec::new(),
-            created_at: None,
-            merged_at: None,
-            updated_at: None,
-        };
-        let child = PullRequestSnapshot {
-            merge_state_status: None,
-            number: PrNumber(8),
-            title: "child".to_owned(),
-            url: "https://example.invalid/8".to_owned(),
-            state: PullRequestState::Open,
-            draft: false,
-            head: branch(&fixture.repository, "child", &child_head),
-            base: branch(&fixture.repository, "feature", &fixture.feature),
-            cross_repository: false,
-            labels: BTreeSet::new(),
-            auto_merge: AutoMergeState::disabled(),
-            checks: Vec::new(),
-            created_at: None,
-            merged_at: None,
-            updated_at: None,
-        };
+        let parent = open_candidate(
+            7,
+            "parent",
+            branch(&fixture.repository, "feature", &fixture.feature),
+            branch(&fixture.repository, "main", &fixture.old_main),
+        );
+        let child = open_candidate(
+            8,
+            "child",
+            branch(&fixture.repository, "child", &child_head),
+            branch(&fixture.repository, "feature", &fixture.feature),
+        );
         let default = branch(&fixture.repository, "main", &fixture.new_main);
         let prepared_parent = prepare_candidate(
             &fixture.clone,
@@ -2668,7 +2985,7 @@ mod tests {
             .expect("nonlinear topology receipt");
         assert_eq!(
             topology.strategy,
-            "git_rebase_merges_no_rebase_cousins_v2_replaced_parent"
+            "git_rebase_merges_rebase_cousins_v3_replaced_parent"
         );
         assert_eq!(
             topology.parent_replacement,
@@ -2677,12 +2994,15 @@ mod tests {
                 new_parent: planned_parent.oid.clone(),
             })
         );
-        let mapped_merge = topology
-            .mapping
+        let old_merge = topology
+            .old_commits
             .iter()
-            .find(|mapping| mapping.old_parents.contains(&fixture.feature))
+            .find(|commit| commit.parents.contains(&fixture.feature))
             .expect("old merge names the provider base");
-        assert!(mapped_merge.new_parents.contains(&planned_parent.oid));
+        assert!(
+            topology.elided_target_merges.contains(&old_merge.oid),
+            "the redundant old-parent merge is replaced by direct planned-parent ancestry"
+        );
         assert_eq!(
             prepared_child.plan.new_tree_oid,
             topology.expected_merge_tree_oid
@@ -2692,17 +3012,15 @@ mod tests {
         verify_prepared(&prepared_child).expect("child global preflight");
         let parent_receipt = apply_prepared_after_write_barrier(&prepared_parent).unwrap();
         let child_receipt = apply_prepared_after_write_barrier(&prepared_child).unwrap();
-        let status = std::process::Command::new("git")
-            .current_dir(&fixture.clone)
-            .args([
-                "merge-base",
-                "--is-ancestor",
-                parent_receipt.new_head_oid.0.as_str(),
-                child_receipt.new_head_oid.0.as_str(),
-            ])
-            .status()
-            .unwrap();
-        assert!(status.success());
+        let runner = process_runner(&fixture.clone, TEST_REBASE_BUDGET, None);
+        assert!(
+            is_ancestor(
+                &runner,
+                &parent_receipt.new_head_oid,
+                &child_receipt.new_head_oid
+            )
+            .unwrap()
+        );
     }
 
     #[test]
@@ -3390,10 +3708,12 @@ mod tests {
         );
     }
 
-    /// Without the explicit authorization the same shape still fails closed, so
-    /// a child is never silently flattened.
+    /// A child that already contains the exact selected target as a merge parent
+    /// is already stacked. Ordinary sync retains that exact object instead of
+    /// rejecting its other parent as cousin history or flattening it. This is
+    /// the migration path for the first v0.0.60 stack (bd-a720be).
     #[test]
-    fn a_merge_preserving_child_is_never_flattened() {
+    fn a_child_with_the_exact_target_as_merge_parent_is_already_stacked() {
         let fixture = fixture();
         let target_head = fixture.new_main.clone();
         git(&fixture.clone, &["checkout", "feature"]);
@@ -3438,7 +3758,7 @@ mod tests {
         };
         let target = branch(&fixture.repository, "main", &target_head);
 
-        let error = prepare_candidate(
+        let prepared = prepare_candidate(
             &fixture.clone,
             &fixture.repository,
             &candidate,
@@ -3446,15 +3766,12 @@ mod tests {
             PlannedBase::Remote(target.clone()),
             &target,
             RebaseExecutionBudget::new(TEST_REBASE_BUDGET),
-        );
-        let Err(error) = error else {
-            panic!("an unauthorized merge-preserving replay must fail closed");
-        };
+        )
+        .expect("the exact target merge parent is already a valid stack edge");
 
-        assert_eq!(
-            mcp_cli::StructuredError::code(&error),
-            "rebase_merge_replay_conflict"
-        );
+        assert!(prepared.plan.already_satisfied);
+        assert_eq!(prepared.plan.new_head_oid, head);
+        assert_eq!(prepared.plan.new_base.branch().oid, target_head);
     }
 
     #[test]

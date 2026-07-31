@@ -595,13 +595,20 @@ are never replayed into the child. An empty effective source patch returns `join
 provider/branch mutation.
 
 It preserves bounded owned two-parent candidate topology with
-`rebase-merges=no-rebase-cousins`, independently proves the exact clean
-`merge-tree` result, retains old/new commit-parent mapping in the plan/receipt,
-and rejects octopus roots, cousin/external parents, topology drift, or tree
-mismatch before any write. When Git changes the replay commit count,
-`rebase_topology_changed` reports source/rebuilt/dropped counts and OIDs, likely
-already-present/empty-patch causes, and a safe source-rebase or reviewed-repair
-next action. Membership rewrites one candidate. After the
+`rebase-merges=rebase-cousins`, so a stacked child is rooted on the selected
+parent generation instead of preserving a stale cousin root. It independently
+proves the exact clean `merge-tree` result and retains old/new commit-parent
+mapping in the plan/receipt. A redundant merge of target history may be elided
+only when every external parent was already target ancestry and the final tree
+still equals that independent proof; the receipt names every elided merge.
+Cara-created commits are also checked before push for parent-monotonic author
+and committer dates, and a reconstructed merge directly involving the selected
+target must name its actual branch. Octopus roots, unowned external parents,
+unsafe topology drift, misleading merge provenance, timestamp reversal, or tree
+mismatch stop before any write. When any other Git replay changes the commit
+count, `rebase_topology_changed` reports source/rebuilt/dropped counts and OIDs,
+likely already-present/empty-patch causes, and a safe source-rebase or
+reviewed-repair next action. Membership rewrites one candidate. After the
 mandatory provider rediscovery, `join`/`rejoin` require the exact live tail from
 the rebase receipt, while `new`/`renew` require the exact current default and no
 inferred candidate membership; a new caravan correctly has no join tail.
