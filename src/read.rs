@@ -1168,7 +1168,17 @@ pub fn resolve_admission_with_generation(
                 priority_label: configured.first().map(|(label, _)| (*label).clone()),
                 priority_rank: configured.first().map(|(_, rank)| rank + 1),
                 created_at,
-                reason: "generation-bound automatic admission skip; sync revalidates exact evidence before retrying".to_owned(),
+                // Do not promise revalidation. That holds only when Cara wrote
+                // the label AND a matching receipt survives. With the label
+                // present and NO receipt, bd-239640 correctly refuses removal,
+                // because an absent receipt is indistinguishable from a
+                // deliberate operator hold, and the candidate is excluded
+                // permanently. Both states reach this line identically, and the
+                // receipt lives in PR comments the status snapshot does not
+                // carry, so this read cannot tell them apart. State what is
+                // known rather than the outcome that is merely likely
+                // (bd-3fc019).
+                reason: "carries the automatic skip label; Cara removes it only where it can prove it wrote it, so a label with no receipt stays skipped until removed by hand".to_owned(),
             });
             continue;
         }
@@ -2616,6 +2626,39 @@ mod tests {
         })
     }
 
+    /// bd-3fc019: the skip reason must not promise an outcome this read cannot
+    /// verify.
+    ///
+    /// A `caravan-join-skipped` label with a matching receipt is revalidated by
+    /// sync. The SAME label with no receipt is refused removal by bd-239640,
+    /// because an absent receipt cannot be told apart from a deliberate operator
+    /// hold, so the candidate is excluded permanently. The receipt lives in PR
+    /// comments the status snapshot does not carry, so both reach this line
+    /// identically. Reported as recoverable, it cost thirty consecutive watch
+    /// cycles of #2245, #2259 and #2314 being called correct while stuck.
+    #[test]
+    fn a_skip_label_does_not_promise_revalidation_this_read_cannot_verify() {
+        let mut candidate = pr(2314, "stuck", "main", false);
+        candidate.labels.insert("caravan-join-skipped".to_owned());
+        let status = status(candidate.clone(), vec![candidate]);
+        let labels = crate::config::CaravanConfig::default().agent_priority_labels;
+        let admission = resolve_admission(&status.analysis, &labels);
+        let skipped = admission
+            .skipped
+            .iter()
+            .find(|entry| entry.pr == PrNumber(2314))
+            .expect("a labelled candidate is reported as skipped");
+        assert!(
+            !skipped.reason.contains("revalidates"),
+            "must not promise revalidation that an absent receipt prevents: {}",
+            skipped.reason
+        );
+        assert!(
+            skipped.reason.contains("prove it wrote it"),
+            "must state the condition Cara actually applies: {}",
+            skipped.reason
+        );
+    }
     #[test]
     fn active_check_reports_whole_caravan_health() {
         let active = vec![pr(1, "one", "main", true), pr(2, "two", "one", true)];
