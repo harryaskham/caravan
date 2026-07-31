@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "auth_modes": {
+    "default": "ambient",
+    "app": "app_installation"
+  },
+  "required_repository_permissions": {
+    "metadata": "read",
+    "contents": "write",
+    "pull_requests": "write",
+    "issues": "write",
+    "checks": "read",
+    "statuses": "read",
+    "actions": "read"
+  },
+  "optional_permission_upgrades": {
+    "actions": {
+      "level": "write",
+      "only_when": "the configured deployment authorizes workflow reruns"
+    },
+    "workflows": {
+      "level": "write",
+      "only_when": "Caravan-managed source branches may modify .github/workflows files"
+    }
+  },
+  "forbidden_permissions": [
+    "administration",
+    "members",
+    "organization_administration",
+    "organization_secrets",
+    "repository_secrets"
+  ],
+  "webhook_wake_events": [
+    "push",
+    "pull_request",
+    "pull_request_review",
+    "check_run",
+    "check_suite",
+    "workflow_run",
+    "status"
+  ],
+  "future_hosted_tenancy_events": [
+    "installation",
+    "installation_repositories"
+  ],
+  "branch_policy": {
+    "managed_source_force_push": "allow_app_only",
+    "default_branch_bypass": "forbidden",
+    "writer_selection": "exactly_one_of_local_or_hosted"
+  },
+  "outstanding_proofs": [
+    "bd-71e444",
+    "remote_compare_and_swap_writer_lease"
+  ]
+}

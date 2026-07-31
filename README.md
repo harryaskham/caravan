@@ -401,6 +401,11 @@ operator can explicitly remove abandoned local state with `repair abort
 
 ## GitHub authentication and API budgets
 
+The reviewed least-privilege App permissions, broker schema, branch rules,
+webhook setup, attribution limits, and single-writer contract are in
+[`docs/github-app.md`](docs/github-app.md); the exact machine-checked baseline is
+[`docs/github-app-policy.json`](docs/github-app-policy.json).
+
 Cara's `gh` subprocesses are authenticated. An explicit `GH_TOKEN` or
 `GITHUB_TOKEN` is used directly; otherwise Cara selects a repository-accessible
 account from `gh auth` and injects its token without printing it. Explicit

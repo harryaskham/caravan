@@ -469,6 +469,9 @@ RECOVERY, LOCKS, AND OBSERVABILITY
   falls back to ambient auth on incomplete/invalid App settings or broker failure. Remote Git operations use that same cached
   principal through an environment-only HTTPS credential helper. SSH, plaintext
   HTTP, local/mismatched remotes, and credential-bearing URLs fail before Git.
+  The least-privilege permission/branch/webhook/single-writer baseline is
+  machine-checked in `docs/github-app-policy.json` and explained in
+  `docs/github-app.md`; live bot attribution remains a separate canary.
 - `cara self-update status|check|run` updates only the exact running first-PATH
   stable user binary (`~/.cargo/bin`, `~/.local/bin`, or an exact explicit
   `CARA_SELF_UPDATE_INSTALL_DIR`). Shadowed, renamed/test, Cargo target, and
