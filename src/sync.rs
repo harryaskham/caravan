@@ -3861,6 +3861,41 @@ fn persist_auto_skip(
             })),
         ));
     }
+    // Prove the candidate is still tracked before writing anything.
+    if !progress.current.contains_key(&receipt.candidate_pr) {
+        return Err(AppError::validation(
+            "auto_admission_candidate_missing",
+            format!(
+                "candidate #{} disappeared before skip",
+                receipt.candidate_pr
+            ),
+        ));
+    }
+    // Receipt BEFORE label. Both writes can fail independently, so the order
+    // decides which partial state is survivable.
+    //
+    // Label-first leaves a skip label with no receipt, and a later tick cannot
+    // distinguish that from a deliberate operator hold, so bd-239640's
+    // fail-closed rule correctly refuses to remove it and the candidate is
+    // excluded permanently — observed on #2245, #2259 and #2314. Receipt-first
+    // leaves at most a receipt with no label: the candidate stays admissible,
+    // the next tick rewrites the same marked comment idempotently, and nothing
+    // needs operator recovery (bd-8b1160).
+    let comment = provider
+        .ensure_marked_comment(
+            repository,
+            &progress.precondition(receipt.candidate_pr),
+            &marker,
+            &body,
+        )
+        .map_err(|error| mutation_error(&error, progress, Some(receipt.candidate_pr)))?;
+    record_marked_comment(
+        progress,
+        comment,
+        receipt.candidate_pr,
+        "posted durable automatic admission skip receipt",
+    );
+    // Re-read the candidate: the receipt write advanced the tracked generation.
     let candidate = progress
         .current
         .get(&receipt.candidate_pr)
@@ -3884,20 +3919,6 @@ fn persist_auto_skip(
             .map_err(|error| mutation_error(&error, progress, Some(receipt.candidate_pr)))?;
         progress.record(labelled, "added generation-bound automatic admission skip");
     }
-    let comment = provider
-        .ensure_marked_comment(
-            repository,
-            &progress.precondition(receipt.candidate_pr),
-            &marker,
-            &body,
-        )
-        .map_err(|error| mutation_error(&error, progress, Some(receipt.candidate_pr)))?;
-    record_marked_comment(
-        progress,
-        comment,
-        receipt.candidate_pr,
-        "posted durable automatic admission skip receipt",
-    );
     Ok(())
 }
 

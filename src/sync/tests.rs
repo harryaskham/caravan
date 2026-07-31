@@ -7149,3 +7149,56 @@ fn a_decision_leaves_the_worktree_alone_by_default_and_records_why() {
         "the receipt names the policy that left the worktree alone: {details}"
     );
 }
+
+/// bd-8b1160: the two skip writes can fail independently, so their ORDER decides
+/// which partial state survives. A skip label with no receipt is indistinguishable
+/// from a deliberate operator hold, so bd-239640 correctly refuses to remove it and
+/// the candidate is excluded permanently — observed live on #2245, #2259 and #2314.
+/// A receipt with no label costs nothing: the candidate stays admissible and the
+/// next tick rewrites the same marked comment idempotently.
+#[test]
+fn the_skip_receipt_is_written_before_the_label_that_depends_on_it() {
+    let mut candidate = pull_request(
+        7,
+        "candidate",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    candidate.labels.clear();
+    let status = status(vec![candidate.clone()], Some(candidate.number), &clean);
+    let provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
+    let mut progress = SyncProgress::new(&status, Vec::new(), u32::MAX);
+    let receipt = AutoJoinSkipReceipt {
+        schema_version: 1,
+        repository: status.repository.clone(),
+        candidate_pr: candidate.number,
+        candidate_head: candidate.head.clone(),
+        candidate_base: candidate.base.clone(),
+        default_branch: status.analysis.fleet.default_branch.clone(),
+        tested_tails: Vec::new(),
+        config_fingerprint: auto_admission_config_fingerprint(&AppContext::default()),
+        heuristic_version: AUTO_ADMISSION_HEURISTIC_VERSION.to_owned(),
+        compatibility_reasons: vec!["default conflict".to_owned()],
+        actor: "cara sync automatic admission".to_owned(),
+        observed_unix_secs: 1,
+        evidence_hash: String::new(),
+    }
+    .finalize_hash();
+
+    persist_auto_skip(&provider, &mut progress, &repository(), &receipt).unwrap();
+
+    let calls = provider.calls.borrow();
+    let comment_at = calls
+        .iter()
+        .position(|kind| *kind == MutationKind::Comment)
+        .expect("the receipt is written");
+    let label_at = calls
+        .iter()
+        .position(|kind| *kind == MutationKind::AddLabel)
+        .expect("the label is written");
+    assert!(
+        comment_at < label_at,
+        "a partial write must never leave an unrecoverable label without its receipt: {calls:?}"
+    );
+}
