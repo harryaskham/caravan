@@ -5285,6 +5285,17 @@ fn first_blocking_completion_problem<'a>(
     force_merge: bool,
 ) -> Option<&'a GraphProblem> {
     status.analysis.fleet.problems.iter().find(|problem| {
+        // Completion is judged against problems that GATE THE FLEET. A
+        // candidate-scoped conflict belongs to a pull request in no caravan, so
+        // it cannot describe a failure to converge and must not abort a tick
+        // that has already rewritten branches. The two admission gates learned
+        // this in bd-226a07; this site and its sibling below did not, so a tick
+        // rebased two generations, reached final rediscovery, found a candidate
+        // that does not merge cleanly into main, and aborted with invalid_graph
+        // (bd-c39de4).
+        if !problem.kind.blocks_fleet() {
+            return false;
+        }
         let Some(number) = force_head_auto_merge_gap(status, problem, force_merge) else {
             return true;
         };
