@@ -24,6 +24,8 @@ const MAX_STDOUT_CAPTURE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_STDERR_CAPTURE_BYTES: usize = 64 * 1024;
 const OUTPUT_LIMIT_EVIDENCE_BYTES: usize = 4 * 1024;
 const GITHUB_AUTH_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const GITHUB_APP_GIT_TOKEN_ENV: &str = "CARA_GITHUB_APP_GIT_TOKEN";
+const GITHUB_APP_GIT_CREDENTIAL_HELPER: &str = "!f() { if test \"$1\" = get; then printf '%s\\n' 'username=x-access-token' \"password=$CARA_GITHUB_APP_GIT_TOKEN\"; fi; }; f";
 
 /// Whether one checkout's `origin` names a GitHub repository at all.
 ///
@@ -35,6 +37,7 @@ static GITHUB_REMOTE_IS_GITHUB: OnceLock<Mutex<HashMap<std::path::PathBuf, bool>
 
 static GITHUB_AUTH_CACHE: OnceLock<Mutex<HashMap<String, Option<GithubAuthSelection>>>> =
     OnceLock::new();
+static GITHUB_APP_PRINCIPALS: OnceLock<Mutex<HashMap<String, (String, u64)>>> = OnceLock::new();
 
 #[derive(Clone)]
 enum GithubAuthSelection {
@@ -58,6 +61,12 @@ impl GithubAppCredential {
     }
 }
 
+#[derive(Clone)]
+struct GithubAppGitAuth {
+    credential: GithubAppCredential,
+    repository: GithubRepository,
+}
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GithubAppCredentialResponse {
@@ -68,11 +77,19 @@ struct GithubAppCredentialResponse {
     expires_unix_secs: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GithubGitTransport {
+    Https,
+    Http,
+    Ssh,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GithubRepository {
     host: String,
     owner: String,
     name: String,
+    git_transport: GithubGitTransport,
 }
 
 impl GithubRepository {
@@ -85,14 +102,24 @@ impl GithubRepository {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 struct CommandIo {
     env: BTreeMap<String, String>,
     stdin: Option<String>,
 }
 
+impl std::fmt::Debug for CommandIo {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CommandIo")
+            .field("env_names", &self.env.keys().collect::<Vec<_>>())
+            .field("stdin", &self.stdin.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
 /// A subprocess request with arguments kept separate from shell parsing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CommandSpec {
     /// Executable name or path.
     pub program: String,
@@ -100,6 +127,24 @@ pub struct CommandSpec {
     pub args: Vec<String>,
     /// Optional I/O additions stay boxed so ordinary command/error values remain small.
     io: Option<Box<CommandIo>>,
+}
+
+impl std::fmt::Debug for CommandSpec {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CommandSpec")
+            .field("program", &self.program)
+            .field(
+                "args",
+                &self
+                    .args
+                    .iter()
+                    .map(|argument| redact_url_userinfo(argument))
+                    .collect::<Vec<_>>(),
+            )
+            .field("io", &self.io)
+            .finish()
+    }
 }
 
 impl CommandSpec {
@@ -157,12 +202,29 @@ impl CommandSpec {
     /// Render a diagnostic-only command line without executing a shell.
     #[must_use]
     pub fn display(&self) -> String {
-        std::iter::once(self.program.as_str())
-            .chain(self.args.iter().map(String::as_str))
-            .map(quote_for_diagnostic)
+        std::iter::once(self.program.clone())
+            .chain(
+                self.args
+                    .iter()
+                    .map(|argument| redact_url_userinfo(argument)),
+            )
+            .map(|value| quote_for_diagnostic(&value))
             .collect::<Vec<_>>()
             .join(" ")
     }
+}
+
+fn redact_url_userinfo(value: &str) -> String {
+    for scheme in ["https://", "http://"] {
+        if let Some(rest) = value.strip_prefix(scheme)
+            && let Some((userinfo, host_and_path)) = rest.split_once('@')
+            && !userinfo.is_empty()
+            && host_and_path.contains('/')
+        {
+            return format!("{scheme}<redacted>@{host_and_path}");
+        }
+    }
+    value.to_owned()
 }
 
 fn quote_for_diagnostic(value: &str) -> String {
@@ -243,9 +305,12 @@ pub enum CommandRunError {
         command: CommandSpec,
         message: String,
     },
-    /// App API identity is configured but direct git transport still lacks the
-    /// same installation credential, so a push must fail before execution.
-    GithubAppGitTransportUnavailable { command: CommandSpec },
+    /// App mode could not bind remote Git transport to the same exact HTTPS
+    /// repository and installation credential as provider API operations.
+    GithubAppGitTransportRefused {
+        command: CommandSpec,
+        message: String,
+    },
     /// The executable could not be started or waited for.
     Spawn {
         /// Requested command.
@@ -305,9 +370,9 @@ impl std::fmt::Display for CommandRunError {
                 "GitHub App authentication refused `{}`: {message}",
                 command.display()
             ),
-            Self::GithubAppGitTransportUnavailable { command } => write!(
+            Self::GithubAppGitTransportRefused { command, message } => write!(
                 formatter,
-                "GitHub App API identity is active, but git transport identity is not configured; refusing `{}` before push",
+                "GitHub App git transport refused `{}`: {message}",
                 command.display()
             ),
             Self::Spawn { command, message } => {
@@ -518,6 +583,35 @@ impl ProcessRunner {
         resolve_github_auth(self.cwd.as_deref(), self.operation_deadline)
     }
 
+    fn inferred_github_app_git_auth(
+        &self,
+        request: &CommandSpec,
+    ) -> Result<Option<GithubAppGitAuth>, String> {
+        if !self.infer_github_auth
+            || github_app_credential_command().is_none()
+            || !is_remote_git_request(request)
+        {
+            return Ok(None);
+        }
+        let cwd = self.cwd.as_deref().unwrap_or_else(|| Path::new("."));
+        let runner = auth_probe_runner(cwd, self.operation_deadline);
+        let origin = discover_github_repository(&runner, cwd);
+        let explicit = explicit_github_repository(request)?;
+        let repository = origin
+            .or(explicit)
+            .ok_or_else(|| "no exact GitHub repository remote is available".to_owned())?;
+        validate_github_app_git_repository(&repository, request)?;
+        validate_github_app_git_configuration(&runner)?;
+        match resolve_github_auth_for_repository(&runner, &repository) {
+            Some(GithubAuthSelection::AppInstallation(credential)) => Ok(Some(GithubAppGitAuth {
+                credential,
+                repository,
+            })),
+            Some(GithubAuthSelection::Refused(message)) => Err(message),
+            _ => Err("App mode did not resolve an installation credential".to_owned()),
+        }
+    }
+
     /// True when this checkout's origin was probed and is not a GitHub remote.
     fn origin_is_not_github(&self) -> bool {
         let Some(cwd) = self.cwd.as_deref() else {
@@ -583,6 +677,26 @@ impl ProcessRunner {
                 None => "gh_default_or_unauthenticated".to_owned(),
             }
         });
+    }
+
+    fn record_github_app_git_transport(&self, auth: Option<&GithubAppGitAuth>) {
+        let Some(auth) = auth else {
+            return;
+        };
+        let mut telemetry = self
+            .github_api_telemetry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        telemetry.authenticated = true;
+        telemetry.auth_source = Some("github_app_installation".to_owned());
+        telemetry.github_app_slug = Some(auth.credential.app_slug.clone());
+        telemetry.github_app_installation_id = Some(auth.credential.installation_id);
+        telemetry.github_app_token_expires_unix_secs = Some(auth.credential.expires_unix_secs);
+        telemetry.github_app_git_transport = Some("https_credential_helper".to_owned());
+        telemetry.github_app_git_repository = Some(format!(
+            "{}/{}",
+            auth.repository.owner, auth.repository.name
+        ));
     }
 
     fn record_github_response(&self, request: &CommandSpec, output: &CommandOutput) {
@@ -664,22 +778,23 @@ fn invalidate_github_app_auth_cache() {
     }
 }
 
-fn resolve_github_auth(
-    cwd: Option<&Path>,
-    operation_deadline: Option<Instant>,
-) -> Option<GithubAuthSelection> {
-    let cwd = cwd?;
+fn auth_probe_runner(cwd: &Path, operation_deadline: Option<Instant>) -> ProcessRunner {
     let runner = ProcessRunner::in_directory(cwd)
         .with_timeout(GITHUB_AUTH_PROBE_TIMEOUT)
         .without_github_auth_inference();
-    let runner = operation_deadline.map_or(runner.clone(), |deadline| {
+    operation_deadline.map_or(runner.clone(), |deadline| {
         runner.with_operation_deadline(deadline)
-    });
+    })
+}
+
+fn discover_github_repository(runner: &ProcessRunner, cwd: &Path) -> Option<GithubRepository> {
     let remote = runner
-        .run(&CommandSpec::new("git").args(["config", "--get", "remote.origin.url"]))
+        .run(&CommandSpec::new("git").args(["config", "--get-all", "remote.origin.url"]))
         .ok()
         .filter(CommandOutput::is_success)?;
-    let parsed = parse_github_remote(remote.stdout.trim());
+    let mut urls = remote.stdout.lines().filter(|url| !url.trim().is_empty());
+    let parsed = urls.next().and_then(parse_github_remote);
+    let parsed = if urls.next().is_none() { parsed } else { None };
     // Record why a probe could not run. Collapsing "this checkout's origin is
     // not GitHub" into an auth verdict sent readers to re-run `gh auth login`,
     // mutating real credential state for a problem that was never about
@@ -689,7 +804,24 @@ fn resolve_github_auth(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(cwd.to_path_buf(), parsed.is_some());
-    let repository = parsed?;
+    parsed
+}
+
+fn resolve_github_auth(
+    cwd: Option<&Path>,
+    operation_deadline: Option<Instant>,
+) -> Option<GithubAuthSelection> {
+    let cwd = cwd?;
+    let runner = auth_probe_runner(cwd, operation_deadline);
+    let repository = discover_github_repository(&runner, cwd)?;
+    resolve_github_auth_for_repository(&runner, &repository)
+}
+
+fn resolve_github_auth_for_repository(
+    runner: &ProcessRunner,
+    repository: &GithubRepository,
+) -> Option<GithubAuthSelection> {
+    let app_mode = github_app_credential_command().is_some();
     let key = repository.cache_key();
     let cache = GITHUB_AUTH_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     // Retain this guard through refresh. Broker/token exchange is infrequent and
@@ -699,12 +831,16 @@ fn resolve_github_auth(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(selection) = cache.get(&key).cloned() {
+        let mode_matches =
+            matches!(selection, Some(GithubAuthSelection::AppInstallation(_))) == app_mode;
         match &selection {
-            Some(GithubAuthSelection::AppInstallation(credential)) if !credential.usable() => {}
-            _ => return selection,
+            Some(GithubAuthSelection::AppInstallation(credential))
+                if mode_matches && !credential.usable() => {}
+            _ if mode_matches => return selection,
+            _ => {}
         }
     }
-    let selection = resolve_github_auth_uncached(&runner, &repository);
+    let selection = resolve_github_auth_uncached(runner, repository);
     if !matches!(selection, Some(GithubAuthSelection::Refused(_))) {
         cache.insert(key, selection.clone());
     }
@@ -820,10 +956,32 @@ fn resolve_github_app_credential(
     {
         return Err("credential broker response names a different installation".to_owned());
     }
+    bind_github_app_principal(repository, &credential)?;
     if !github_token_can_access(runner, repository, &credential.token) {
         return Err("App installation token cannot access the exact repository".to_owned());
     }
     Ok(credential)
+}
+
+fn bind_github_app_principal(
+    repository: &GithubRepository,
+    credential: &GithubAppCredential,
+) -> Result<(), String> {
+    let mut principals = GITHUB_APP_PRINCIPALS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let expected = (credential.app_slug.clone(), credential.installation_id);
+    match principals.get(&repository.cache_key()) {
+        Some(bound) if bound != &expected => {
+            Err("credential refresh changed the bound App installation principal".to_owned())
+        }
+        Some(_) => Ok(()),
+        None => {
+            principals.insert(repository.cache_key(), expected);
+            Ok(())
+        }
+    }
 }
 
 fn validate_github_app_credential(
@@ -933,17 +1091,24 @@ fn github_auth_candidates(repository: &GithubRepository, status_json: Option<&st
 }
 
 fn parse_github_remote(remote: &str) -> Option<GithubRepository> {
-    let (host, path) = if let Some(rest) = remote.strip_prefix("ssh://") {
+    let (host, path, git_transport) = if let Some(rest) = remote.strip_prefix("ssh://") {
         let (authority, path) = rest.split_once('/')?;
-        (authority.rsplit('@').next()?, path)
-    } else if let Some(rest) = remote
-        .strip_prefix("https://")
-        .or_else(|| remote.strip_prefix("http://"))
-    {
-        rest.split_once('/')?
+        (authority.rsplit('@').next()?, path, GithubGitTransport::Ssh)
+    } else if let Some(rest) = remote.strip_prefix("https://") {
+        let (host, path) = rest.split_once('/')?;
+        if host.contains('@') {
+            return None;
+        }
+        (host, path, GithubGitTransport::Https)
+    } else if let Some(rest) = remote.strip_prefix("http://") {
+        let (host, path) = rest.split_once('/')?;
+        if host.contains('@') {
+            return None;
+        }
+        (host, path, GithubGitTransport::Http)
     } else {
         let (authority, path) = remote.split_once(':')?;
-        (authority.rsplit('@').next()?, path)
+        (authority.rsplit('@').next()?, path, GithubGitTransport::Ssh)
     };
     let mut parts = path
         .trim_end_matches('/')
@@ -958,6 +1123,7 @@ fn parse_github_remote(remote: &str) -> Option<GithubRepository> {
         host: host.to_owned(),
         owner: owner.to_owned(),
         name: name.to_owned(),
+        git_transport,
     })
 }
 
@@ -982,20 +1148,121 @@ fn should_refresh_github_app_auth(
                 .contains("bad credentials"))
 }
 
-fn enforce_github_app_git_transport_boundary(
+fn validate_github_app_git_configuration(runner: &ProcessRunner) -> Result<(), String> {
+    let forbidden = runner
+        .run(&CommandSpec::new("git").args([
+            "config",
+            "--get-regexp",
+            r"^(url\..*\.insteadof|remote\..*\.pushurl|http\..*\.sslverify)$",
+        ]))
+        .map_err(|_| "could not inspect Git transport configuration".to_owned())?;
+    match forbidden.code {
+        Some(0 | 1) if forbidden.stdout.trim().is_empty() => Ok(()),
+        Some(0) => Err(
+            "Git URL rewrites, pushurl, and URL-specific TLS overrides are forbidden in App mode"
+                .to_owned(),
+        ),
+        _ => Err("could not inspect Git transport configuration".to_owned()),
+    }
+}
+
+fn explicit_github_repository(request: &CommandSpec) -> Result<Option<GithubRepository>, String> {
+    let mut selected: Option<GithubRepository> = None;
+    for argument in &request.args {
+        if redact_url_userinfo(argument) != *argument {
+            return Err("credential-bearing remote URLs are forbidden in App mode".to_owned());
+        }
+        let Some(repository) = parse_github_remote(argument) else {
+            continue;
+        };
+        if selected.as_ref().is_some_and(|existing| {
+            existing.cache_key() != repository.cache_key()
+                || existing.git_transport != repository.git_transport
+        }) {
+            return Err("command names more than one repository or transport".to_owned());
+        }
+        selected = Some(repository);
+    }
+    Ok(selected)
+}
+
+fn validate_github_app_git_repository(
+    repository: &GithubRepository,
     request: &CommandSpec,
-    app_mode: bool,
-) -> Result<(), CommandRunError> {
-    let is_git_push = Path::new(&request.program)
-        .file_name()
-        .is_some_and(|name| name == "git")
-        && request.args.iter().any(|argument| argument == "push");
-    if app_mode && is_git_push {
-        return Err(CommandRunError::GithubAppGitTransportUnavailable {
-            command: request.clone(),
-        });
+) -> Result<(), String> {
+    if repository.git_transport != GithubGitTransport::Https {
+        return Err(
+            "App transport requires an HTTPS origin; SSH and plaintext HTTP refuse".to_owned(),
+        );
+    }
+    for argument in &request.args {
+        if let Some(explicit) = parse_github_remote(argument)
+            && (explicit.cache_key() != repository.cache_key()
+                || explicit.git_transport != GithubGitTransport::Https)
+        {
+            return Err("command names a different repository or non-HTTPS remote".to_owned());
+        }
     }
     Ok(())
+}
+
+fn is_remote_git_request(request: &CommandSpec) -> bool {
+    Path::new(&request.program)
+        .file_name()
+        .is_some_and(|name| name == "git")
+        && request
+            .args
+            .iter()
+            .any(|argument| matches!(argument.as_str(), "fetch" | "push" | "ls-remote" | "clone"))
+}
+
+fn github_app_git_environment(auth: &GithubAppGitAuth) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (
+            GITHUB_APP_GIT_TOKEN_ENV.to_owned(),
+            auth.credential.token.clone(),
+        ),
+        ("GIT_TERMINAL_PROMPT".to_owned(), "0".to_owned()),
+        ("GCM_INTERACTIVE".to_owned(), "Never".to_owned()),
+        ("GIT_CONFIG_COUNT".to_owned(), "5".to_owned()),
+        (
+            "GIT_CONFIG_KEY_0".to_owned(),
+            "credential.helper".to_owned(),
+        ),
+        ("GIT_CONFIG_VALUE_0".to_owned(), String::new()),
+        (
+            "GIT_CONFIG_KEY_1".to_owned(),
+            "credential.helper".to_owned(),
+        ),
+        (
+            "GIT_CONFIG_VALUE_1".to_owned(),
+            GITHUB_APP_GIT_CREDENTIAL_HELPER.to_owned(),
+        ),
+        (
+            "GIT_CONFIG_KEY_2".to_owned(),
+            "credential.useHttpPath".to_owned(),
+        ),
+        ("GIT_CONFIG_VALUE_2".to_owned(), "true".to_owned()),
+        ("GIT_CONFIG_KEY_3".to_owned(), "core.hooksPath".to_owned()),
+        ("GIT_CONFIG_VALUE_3".to_owned(), "/dev/null".to_owned()),
+        ("GIT_CONFIG_KEY_4".to_owned(), "http.sslVerify".to_owned()),
+        ("GIT_CONFIG_VALUE_4".to_owned(), "true".to_owned()),
+    ])
+}
+
+fn should_refresh_github_app_git_auth(
+    auth: Option<&GithubAppGitAuth>,
+    output: &CommandOutput,
+    retry_allowed: bool,
+) -> bool {
+    if !retry_allowed || auth.is_none() || output.is_success() {
+        return false;
+    }
+    let stderr = output.stderr.to_ascii_lowercase();
+    stderr.contains("authentication failed")
+        || stderr.contains("bad credentials")
+        || stderr.contains("http 401")
+        || stderr.contains("could not read username")
 }
 
 impl CommandRunner for ProcessRunner {
@@ -1004,10 +1271,6 @@ impl CommandRunner for ProcessRunner {
         let is_gh = Path::new(&request.program)
             .file_name()
             .is_some_and(|name| name == "gh");
-        enforce_github_app_git_transport_boundary(
-            request,
-            github_app_credential_command().is_some(),
-        )?;
         if is_gh {
             if let Some(budget) = &self.github_request_budget {
                 budget.reserve(request)?;
@@ -1015,7 +1278,14 @@ impl CommandRunner for ProcessRunner {
         }
         let timeout = self.effective_timeout(request)?;
         let github_auth = self.inferred_github_auth(request);
+        let github_app_git_auth =
+            self.inferred_github_app_git_auth(request)
+                .map_err(|message| CommandRunError::GithubAppGitTransportRefused {
+                    command: request.clone(),
+                    message,
+                })?;
         self.record_github_request(request, github_auth.as_ref());
+        self.record_github_app_git_transport(github_app_git_auth.as_ref());
         if let Some(GithubAuthSelection::Refused(message)) = &github_auth {
             return Err(CommandRunError::GithubAppAuthRefused {
                 command: request.clone(),
@@ -1027,6 +1297,12 @@ impl CommandRunner for ProcessRunner {
             .args(&request.args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some(io) = &request.io {
+            command.envs(&io.env);
+            if io.stdin.is_some() {
+                command.stdin(Stdio::piped());
+            }
+        }
         match &github_auth {
             Some(GithubAuthSelection::Token(token)) => command.env("GH_TOKEN", token),
             Some(GithubAuthSelection::AppInstallation(credential)) => {
@@ -1034,11 +1310,17 @@ impl CommandRunner for ProcessRunner {
             }
             _ => &mut command,
         };
-        if let Some(io) = &request.io {
-            command.envs(&io.env);
-            if io.stdin.is_some() {
-                command.stdin(Stdio::piped());
+        if let Some(auth) = &github_app_git_auth {
+            for name in [
+                "GIT_SSL_NO_VERIFY",
+                "GIT_TRACE",
+                "GIT_TRACE_CURL",
+                "GIT_CURL_VERBOSE",
+                "GIT_CONFIG_PARAMETERS",
+            ] {
+                command.env_remove(name);
             }
+            command.envs(github_app_git_environment(auth));
         }
         if let Some(cwd) = &self.cwd {
             command.current_dir(cwd);
@@ -1153,6 +1435,11 @@ impl CommandRunner for ProcessRunner {
             stderr,
         };
         if should_refresh_github_app_auth(github_auth.as_ref(), &output, self.github_app_auth_retry)
+            || should_refresh_github_app_git_auth(
+                github_app_git_auth.as_ref(),
+                &output,
+                self.github_app_auth_retry,
+            )
         {
             invalidate_github_app_auth_cache();
             let mut retry = self.clone();
@@ -1293,6 +1580,8 @@ fn duration_millis(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn diagnostic_rendering_quotes_shell_metacharacters_without_using_a_shell() {
@@ -1302,23 +1591,14 @@ mod tests {
 
     #[test]
     fn parses_common_github_remote_forms_without_repository_config() {
-        let expected = GithubRepository {
-            host: "github.com".to_owned(),
-            owner: "harryaskham".to_owned(),
-            name: "caravan".to_owned(),
-        };
-        assert_eq!(
-            parse_github_remote("ssh://git@github.com/harryaskham/caravan.git"),
-            Some(expected.clone())
-        );
-        assert_eq!(
-            parse_github_remote("git@github.com:harryaskham/caravan.git"),
-            Some(expected.clone())
-        );
-        assert_eq!(
-            parse_github_remote("https://github.com/harryaskham/caravan.git"),
-            Some(expected)
-        );
+        let ssh = parse_github_remote("ssh://git@github.com/harryaskham/caravan.git").unwrap();
+        let scp = parse_github_remote("git@github.com:harryaskham/caravan.git").unwrap();
+        let https = parse_github_remote("https://github.com/harryaskham/caravan.git").unwrap();
+        assert_eq!(ssh.cache_key(), https.cache_key());
+        assert_eq!(scp.cache_key(), https.cache_key());
+        assert_eq!(ssh.git_transport, GithubGitTransport::Ssh);
+        assert_eq!(scp.git_transport, GithubGitTransport::Ssh);
+        assert_eq!(https.git_transport, GithubGitTransport::Https);
         assert_eq!(parse_github_remote("/tmp/local.git"), None);
     }
 
@@ -1328,6 +1608,7 @@ mod tests {
             host: "github.com".to_owned(),
             owner: "owner".to_owned(),
             name: "repo".to_owned(),
+            git_transport: GithubGitTransport::Https,
         };
         let response = GithubAppCredentialResponse {
             token: "installation-secret".to_owned(),
@@ -1356,11 +1637,37 @@ mod tests {
     }
 
     #[test]
+    fn app_principal_cannot_change_across_token_refresh() {
+        let repository =
+            parse_github_remote("https://github.com/caravan-test/app-principal-refresh-test.git")
+                .unwrap();
+        let first = GithubAppCredential {
+            token: "first-secret".to_owned(),
+            app_slug: "caravan".to_owned(),
+            installation_id: 42,
+            expires_unix_secs: current_unix_secs() + 3_600,
+        };
+        bind_github_app_principal(&repository, &first).unwrap();
+        bind_github_app_principal(&repository, &first).unwrap();
+        let changed = GithubAppCredential {
+            token: "second-secret".to_owned(),
+            app_slug: "other-app".to_owned(),
+            installation_id: 99,
+            expires_unix_secs: current_unix_secs() + 3_600,
+        };
+        let error = bind_github_app_principal(&repository, &changed).unwrap_err();
+        assert!(error.contains("changed the bound App installation principal"));
+        assert!(!error.contains("first-secret"));
+        assert!(!error.contains("second-secret"));
+    }
+
+    #[test]
     fn app_credential_near_expiry_fails_without_exposing_token() {
         let repository = GithubRepository {
             host: "github.com".to_owned(),
             owner: "owner".to_owned(),
             name: "repo".to_owned(),
+            git_transport: GithubGitTransport::Https,
         };
         let response = GithubAppCredentialResponse {
             token: "near-expiry-secret".to_owned(),
@@ -1377,16 +1684,183 @@ mod tests {
     }
 
     #[test]
-    fn app_api_mode_refuses_git_push_before_process_execution() {
+    fn app_git_transport_requires_exact_https_repository() {
         let request = CommandSpec::new("git").args(["push", "origin", "HEAD:refs/heads/x"]);
-        let error = enforce_github_app_git_transport_boundary(&request, true)
-            .expect_err("App API identity cannot silently mix with ambient git push identity");
-        assert!(matches!(
-            error,
-            CommandRunError::GithubAppGitTransportUnavailable { .. }
+        let https = parse_github_remote("https://github.com/owner/repo.git").unwrap();
+        validate_github_app_git_repository(&https, &request).unwrap();
+
+        let ssh = parse_github_remote("git@github.com:owner/repo.git").unwrap();
+        let error = validate_github_app_git_repository(&ssh, &request).unwrap_err();
+        assert!(error.contains("HTTPS origin"));
+
+        let other = CommandSpec::new("git").args([
+            "ls-remote",
+            "https://github.com/other/repo.git",
+            "refs/heads/main",
+        ]);
+        let error = validate_github_app_git_repository(&https, &other).unwrap_err();
+        assert!(error.contains("different repository"));
+        assert!(is_remote_git_request(&request));
+        assert!(!is_remote_git_request(
+            &CommandSpec::new("git").args(["status"])
         ));
-        enforce_github_app_git_transport_boundary(&request, false)
-            .expect("ordinary local gh mode retains git transport behavior");
+    }
+
+    #[test]
+    fn app_git_transport_rejects_url_rewrites_before_credentials() {
+        let root = std::env::temp_dir().join(format!("cara-app-config-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let runner = ProcessRunner::in_directory(&root).without_github_auth_inference();
+        assert!(
+            runner
+                .run(&CommandSpec::new("git").args(["init", "--quiet"]))
+                .unwrap()
+                .is_success()
+        );
+        assert!(
+            runner
+                .run(&CommandSpec::new("git").args([
+                    "config",
+                    "url.https://attacker.invalid/.insteadOf",
+                    "https://github.com/"
+                ]))
+                .unwrap()
+                .is_success()
+        );
+        let error = validate_github_app_git_configuration(&runner).unwrap_err();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(error.contains("URL rewrites"));
+    }
+
+    #[test]
+    fn command_debug_redacts_environment_and_stdin_secrets() {
+        let request = CommandSpec::new("git")
+            .args(["credential", "fill"])
+            .env(GITHUB_APP_GIT_TOKEN_ENV, "debug-secret")
+            .stdin("password=stdin-secret");
+        let debug = format!("{request:?}");
+        assert!(debug.contains(GITHUB_APP_GIT_TOKEN_ENV));
+        assert!(!debug.contains("debug-secret"));
+        assert!(!debug.contains("stdin-secret"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_git_transport_uses_broker_without_argv_secret() {
+        const CHILD: &str = "CARA_APP_GIT_CHILD_FIXTURE";
+        const TOKEN: &str = "broker-git-sentinel-secret";
+        if let Ok(root) = std::env::var(CHILD) {
+            let runner = ProcessRunner::in_directory(&root);
+            let request = CommandSpec::new("git").args(["ls-remote", "origin", "refs/heads/main"]);
+            let output = runner.run(&request).expect("App git command runs");
+            assert!(output.is_success());
+            let telemetry = runner.github_api_telemetry();
+            assert_eq!(telemetry.github_app_installation_id, Some(4242));
+            assert_eq!(
+                telemetry.github_app_git_transport.as_deref(),
+                Some("https_credential_helper")
+            );
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!("cara-app-git-{}", std::process::id()));
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let broker = bin.join("broker");
+        let git = bin.join("git");
+        let gh = bin.join("gh");
+        std::fs::write(
+            &broker,
+            "#!/bin/sh\ntest \"$CARA_GITHUB_APP_REPOSITORY\" = owner/repo || exit 81\ntest \"$CARA_GITHUB_APP_HOST\" = github.com || exit 82\nprintf '{\"token\":\"%s\",\"app_slug\":\"caravan\",\"installation_id\":4242,\"repository\":\"owner/repo\",\"expires_unix_secs\":4102444800}\\n' \"$BROKER_TOKEN\"\n",
+        )
+        .unwrap();
+        std::fs::write(&gh, "#!/bin/sh\ntest \"$GH_TOKEN\" = \"$BROKER_TOKEN\"\n").unwrap();
+        std::fs::write(
+            &git,
+            "#!/bin/sh\nif test \"$1 $2 $3\" = 'config --get-all remote.origin.url'; then echo https://github.com/owner/repo.git; exit 0; fi\nif test \"$1 $2\" = 'config --get-regexp'; then exit 1; fi\nif test \"$1\" = ls-remote; then test \"$CARA_GITHUB_APP_GIT_TOKEN\" = \"$BROKER_TOKEN\" || exit 91; test \"$GIT_CONFIG_COUNT\" = 5 || exit 92; test \"$GIT_TERMINAL_PROMPT\" = 0 || exit 93; case \"$GIT_CONFIG_VALUE_1\" in *\"$BROKER_TOKEN\"*) exit 94;; esac; test \"$GIT_CONFIG_KEY_3\" = core.hooksPath || exit 96; test \"$GIT_CONFIG_VALUE_3\" = /dev/null || exit 97; test \"$GIT_CONFIG_KEY_4\" = http.sslVerify || exit 98; test \"$GIT_CONFIG_VALUE_4\" = true || exit 99; exit 0; fi\nexit 95\n",
+        )
+        .unwrap();
+        for executable in [&broker, &git, &gh] {
+            std::fs::set_permissions(executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "command::tests::app_git_transport_uses_broker_without_argv_secret",
+            ])
+            .env(CHILD, &root)
+            .env("PATH", path)
+            .env("BROKER_TOKEN", TOKEN)
+            .env("CARA_GITHUB_APP_CREDENTIAL_COMMAND", &broker)
+            .output()
+            .unwrap();
+        let evidence = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            output.status.success(),
+            "child failed without secret evidence"
+        );
+        assert!(!evidence.contains(TOKEN));
+    }
+
+    #[test]
+    fn app_git_helper_reads_token_only_from_environment() {
+        let auth = GithubAppGitAuth {
+            credential: GithubAppCredential {
+                token: "helper-sentinel-secret".to_owned(),
+                app_slug: "caravan".to_owned(),
+                installation_id: 42,
+                expires_unix_secs: current_unix_secs() + 3_600,
+            },
+            repository: parse_github_remote("https://github.com/owner/repo.git").unwrap(),
+        };
+        let mut request = CommandSpec::new("git")
+            .args(["credential", "fill"])
+            .stdin("protocol=https\nhost=github.com\npath=owner/repo.git\n\n");
+        for (name, value) in github_app_git_environment(&auth) {
+            request = request.env(name, value);
+        }
+        assert!(!request.display().contains("helper-sentinel-secret"));
+        assert!(!format!("{request:?}").contains("helper-sentinel-secret"));
+        let runner = ProcessRunner::new().without_github_auth_inference();
+        let output = runner.run(&request).expect("credential helper executes");
+        assert!(output.is_success());
+        assert!(output.stdout.contains("username=x-access-token"));
+        assert!(output.stdout.contains("password=helper-sentinel-secret"));
+        runner.record_github_app_git_transport(Some(&auth));
+        let telemetry = runner.github_api_telemetry();
+        assert_eq!(
+            telemetry.github_app_git_transport.as_deref(),
+            Some("https_credential_helper")
+        );
+        assert_eq!(
+            telemetry.github_app_git_repository.as_deref(),
+            Some("owner/repo")
+        );
+        assert!(
+            !serde_json::to_string(&telemetry)
+                .unwrap()
+                .contains("helper-sentinel-secret")
+        );
+    }
+
+    #[test]
+    fn credential_bearing_remote_urls_are_rejected_and_redacted() {
+        let request = CommandSpec::new("git").args([
+            "clone",
+            "https://user:url-sentinel-secret@github.com/owner/repo.git",
+        ]);
+        let error = explicit_github_repository(&request).unwrap_err();
+        assert!(error.contains("credential-bearing remote URLs"));
+        assert!(!request.display().contains("url-sentinel-secret"));
+        assert!(!format!("{request:?}").contains("url-sentinel-secret"));
+        assert!(request.display().contains("<redacted>@github.com"));
     }
 
     #[test]
@@ -1442,6 +1916,34 @@ mod tests {
     }
 
     #[test]
+    fn app_git_auth_failure_refreshes_once() {
+        let auth = GithubAppGitAuth {
+            credential: GithubAppCredential {
+                token: "refresh-git-secret".to_owned(),
+                app_slug: "caravan".to_owned(),
+                installation_id: 42,
+                expires_unix_secs: current_unix_secs() + 3_600,
+            },
+            repository: parse_github_remote("https://github.com/owner/repo.git").unwrap(),
+        };
+        let failed = CommandOutput::failure(
+            128,
+            "fatal: Authentication failed for 'https://github.com/owner/repo.git'",
+        );
+        assert!(should_refresh_github_app_git_auth(
+            Some(&auth),
+            &failed,
+            true
+        ));
+        assert!(!should_refresh_github_app_git_auth(
+            Some(&auth),
+            &failed,
+            false
+        ));
+        assert!(!should_refresh_github_app_git_auth(None, &failed, true));
+    }
+
+    #[test]
     fn refused_app_auth_is_never_reported_as_authenticated() {
         let runner = ProcessRunner::new();
         let request = CommandSpec::new("gh").args(["api", "repos/owner/repo"]);
@@ -1460,6 +1962,7 @@ mod tests {
             host: "github.com".to_owned(),
             owner: "harryaskham".to_owned(),
             name: "private-repo".to_owned(),
+            git_transport: GithubGitTransport::Https,
         };
         let status = serde_json::json!({
             "hosts": {"github.com": [

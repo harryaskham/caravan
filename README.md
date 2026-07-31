@@ -415,14 +415,23 @@ object containing `token`, `app_slug`, `installation_id`, `repository`, and
 `CARA_GITHUB_APP_SLUG`/`CARA_GITHUB_APP_INSTALLATION_ID` must match; expired or
 near-expiry responses fail closed. Valid credentials are process-cached with a
 60-second refresh margin and concurrent refresh is single-flight. Broker stdout
-is parsed but never rendered. Until the separate App git-transport slice lands,
-this mode refuses every `git push` before execution rather than attributing API
-writes to the App and force-pushes to the ambient human.
+is parsed but never rendered.
+
+The same cached installation principal authenticates remote Git operations over
+an exact HTTPS repository. Cara installs a process-local Git credential helper
+through secret environment configuration: the helper program text contains no
+secret and reads the token only from environment; token-bearing scripts, argv,
+remote URLs, and persisted Git config are never created. Existing credential
+helpers and interactive prompting are disabled for that child. SSH, plaintext
+HTTP, non-GitHub/local remotes, explicit repository mismatch, and
+credential-bearing URLs fail before the remote command. One authentication
+failure refreshes and retries under the same deadline; a second failure stops.
+Ambient mode does not install or invoke this helper.
 
 Status, check, sync, loop, JSON, and MCP receipts expose secret-free provider
 telemetry: authenticated source class, total/GraphQL/REST/gh-CLI call counts,
-App slug/installation/expiry when selected, and the latest GraphQL
-cost/remaining/reset evidence. The merge-candidate query
+App slug/installation/expiry plus exact Git transport/repository when selected,
+and the latest GraphQL cost/remaining/reset evidence. The merge-candidate query
 collects `rateLimit` in-band, so observing budget costs no extra request. Set
 `CARA_GITHUB_AUTH_KIND=github_app_installation` beside an installation token to
 make that non-secret identity explicit in receipts.
