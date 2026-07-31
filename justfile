@@ -1,5 +1,40 @@
 set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 
+# Run exactly the validation CI runs, in the pinned development shell.
+#
+# CI's gate is these five commands. Before this recipe existed there was no way
+# to run them as a unit, so every contributor hand-rolled a subset before
+# publishing -- and a subset is what a hand-rolled gate always is. One such gate
+# omitted `--bin cara` and shipped v0.0.59 with a command tree clap could not
+# construct: a global `--repo` collided with the repeatable `--repo` on `web`,
+# so `cara web` did not exist and the tag published with no assets. Any of
+# `cargo test --all`, `cargo run -- help` or `cargo run -- mcp tools` would have
+# caught it; the gate ran none of them (bd-8e2c93).
+validate:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  nix develop --command bash -c '
+    set -euo pipefail
+    cargo fmt --all --check
+    cargo clippy --all-targets -- -D warnings
+    cargo test --all
+    cargo run -- help >/dev/null
+    cargo run -- mcp tools >/dev/null
+  '
+  echo "validate: green on the same block CI runs"
+
+# Inner-loop check. NOT sufficient before publication: use `just validate`.
+validate-fast:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  nix develop --command bash -c '
+    set -euo pipefail
+    cargo fmt --all --check
+    cargo clippy --all-targets -- -D warnings
+    cargo test --lib
+  '
+  echo "validate-fast: green -- run 'just validate' before publishing"
+
 run-web-dev *repos:
   #!/usr/bin/env bash
   set -euo pipefail
