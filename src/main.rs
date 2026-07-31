@@ -2285,6 +2285,11 @@ fn render_status(output: &caravan::read::StatusOutput) -> String {
                         .as_deref()
                         .map_or_else(String::new, |latest| format!(", latest {latest}"))
                 ))
+            } else if history.evidence_may_be_stripped() {
+                warning(format!(
+                    "none in flight now, and history is UNPROVEN rather than empty: {} merged row(s) came back from the label-filtered query carrying no caravan label, so the evidence was removed",
+                    history.unlabelled_merged_rows
+                ))
             } else {
                 dim(
                     "none in flight now, and no merged caravan member within the bounded discovery window",

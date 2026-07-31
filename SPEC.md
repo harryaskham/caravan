@@ -235,7 +235,10 @@ preconditions.
 means no caravan is in flight at this instant. `fleet.history` carries the
 lifetime answer from the same bounded snapshot — `merged_members_observed`,
 `earliest_merged_at`, `latest_merged_at` — so a current-state read can never be
-mistaken for a lifetime claim. Human `cara status` prints "N in flight now" and,
+mistaken for a lifetime claim. `unlabelled_merged_rows` counts merged rows the
+label-filtered query returned whose own records carry no caravan label, which is
+the signature of labels stripped after the fact. A zero count beside a non-zero
+`unlabelled_merged_rows` means the history is UNPROVEN, never proven empty. Human `cara status` prints "N in flight now" and,
 when the list is empty, states explicitly that this is not a lifetime claim.
 - `cara next-candidate` — return the same canonical first ordered admission attempt and complete reasoning without mutation; it explicitly requires subsequent membership preflight and never authorizes leapfrogging a rejected first attempt.
 - `cara show` — print the current PR's whole caravan and highlight its position.

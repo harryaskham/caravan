@@ -721,6 +721,16 @@ pub struct CaravanHistory {
     /// Exact provider timestamp of the most recent observed merged member.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_merged_at: Option<String>,
+    /// Merged rows the label-filtered query returned whose own records carry no
+    /// caravan label.
+    ///
+    /// A non-zero count while `merged_members_observed` is zero means the
+    /// evidence was removed, not that nothing ever merged. Labels were stripped
+    /// from merged pull requests as an urgent workaround, and GitHub's label
+    /// index still listed them, so history silently collapsed from 24 to 0
+    /// (bd-47f0c7).
+    #[serde(default)]
+    pub unlabelled_merged_rows: usize,
 }
 
 impl CaravanHistory {
@@ -729,6 +739,15 @@ impl CaravanHistory {
     #[must_use]
     pub const fn has_formed_before(&self) -> bool {
         self.merged_members_observed > 0
+    }
+
+    /// True when an empty history is unproven rather than proven empty.
+    ///
+    /// Distinguishes "no caravan ever merged" from "the evidence that proved it
+    /// was removed", which are rendered identically by a bare count of zero.
+    #[must_use]
+    pub const fn evidence_may_be_stripped(&self) -> bool {
+        self.merged_members_observed == 0 && self.unlabelled_merged_rows > 0
     }
 }
 

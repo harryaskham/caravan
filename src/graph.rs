@@ -585,10 +585,23 @@ pub fn derive_for_actor(snapshot: &RepositorySnapshot, actor: HeadMergeActor) ->
         .filter_map(|pull_request| pull_request.merged_at.clone())
         .collect::<Vec<_>>();
     merged_timestamps.sort_unstable();
+    // The label-filtered query returned these rows, so GitHub's index still
+    // considers them caravan members while their own records carry no label.
+    // That is the signature of labels stripped after the fact, and without it a
+    // count of zero reads as "no caravan ever merged here" — the precise
+    // misreading `history` exists to prevent (bd-47f0c7).
+    let unlabelled_merged_rows = snapshot
+        .pull_requests
+        .iter()
+        .filter(|pull_request| {
+            pull_request.state == PullRequestState::Merged && !pull_request.has_label("caravan")
+        })
+        .count();
     let history = crate::model::CaravanHistory {
         merged_members_observed: merged_members.len(),
         earliest_merged_at: merged_timestamps.first().cloned(),
         latest_merged_at: merged_timestamps.last().cloned(),
+        unlabelled_merged_rows,
     };
 
     GraphAnalysis {
@@ -1613,6 +1626,30 @@ mod tests {
         assert_eq!(
             history.latest_merged_at.as_deref(),
             Some("2026-07-28T17:27:45Z")
+        );
+    }
+
+    /// bd-47f0c7: labels were stripped from merged pull requests as an urgent
+    /// workaround, GitHub's label index still returned the rows, and history
+    /// collapsed from 24 to 0. A bare zero renders "never merged" and "evidence
+    /// removed" identically, which is the exact misreading history exists to
+    /// prevent.
+    #[test]
+    fn stripped_labels_make_history_unproven_rather_than_empty() {
+        let mut stripped = pull_request(2200, "landed", "main");
+        stripped.state = PullRequestState::Merged;
+        stripped.merged_at = Some("2026-07-30T11:05:54Z".to_owned());
+        stripped.labels.clear();
+
+        let analysis = derive(&snapshot(vec![stripped]));
+        let history = &analysis.fleet.history;
+
+        assert_eq!(history.merged_members_observed, 0);
+        assert_eq!(history.unlabelled_merged_rows, 1);
+        assert!(!history.has_formed_before());
+        assert!(
+            history.evidence_may_be_stripped(),
+            "an unproven history must never render as a proven absence"
         );
     }
 
