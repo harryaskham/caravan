@@ -74,6 +74,7 @@ Initial supported combination:
 
 ```yaml
 stack_type: github
+max_caravan_length: 8 # native Stack batch bound; 2..=100
 rebase_on_join: false
 sync:
   head_merge_actor: caravan
@@ -87,9 +88,11 @@ Rationale:
 
 Future support for physical branches in a native Stack requires a separate reviewed contract; it is not inferred by accepting both settings.
 
+Native mode is a bounded batch, not an indefinitely growing queue. `max_caravan_length` defaults to eight under `stack_type: github` and is strictly constrained to GitHub's two-to-100 entry Stack range. At capacity, deterministic admission creates or grows another Caravan rather than extending the full Stack. Sync does not wait merely for a batch to fill: it may land the maximal contiguous ready prefix at any size, while a fully ready batch of up to eight entries lands through one atomic Stack merge. The exact selected prefix is sealed against admission changes while its operation owns the repository lock.
+
 ### Rolling compatibility
 
-`stack_type` is optional and defaults to `caravan`. Adding it advances `min_cara_version` only in repositories that opt into `github`. Older readers continue reading configs without the field; they reject opted-in configs instead of silently treating a native Stack as an ordinary caravan.
+`stack_type` is optional and defaults to `caravan`. Adding it advances `min_cara_version` only in repositories that opt into `github`. Older readers continue reading configs without the field; they reject opted-in configs instead of silently treating a native Stack as an ordinary caravan. An absent `max_caravan_length` preserves existing unbounded/dynamic-capacity Caravan behavior; the default of eight is applied only after explicit GitHub-backend selection, so existing repositories do not acquire a new admission limit during upgrade.
 
 ## Read model
 
@@ -135,7 +138,8 @@ A successful `join` still performs Cara's ordinary full candidate/target/generat
 Then:
 
 - singleton + new child: create a Stack from `[root, child]`;
-- existing exact Stack: append the child with `/add`;
+- existing exact Stack below `max_caravan_length`: append the child with `/add`;
+- a full Stack is not extended; normal deterministic placement considers another non-full compatible Caravan or creates a new singleton batch;
 - exact retry: no-op when the Stack already contains the same ordered PR/head generation;
 - partial/indeterminate response: rediscover Stack + PR truth before deciding whether to retry.
 
@@ -247,6 +251,7 @@ Each phase leaves `stack_type: caravan` untouched.
 | Stack metadata | labels/base refs | GitHub Stack + Cara labels/base refs |
 | Root merge | existing Cara/provider actor | Cara invokes async Stack merge |
 | Multi-PR merge | serial bounded roots | provider atomic contiguous prefix (direct action) |
+| Admission batch bound | existing dynamic mutation-budget capacity | default 8 (`max_caravan_length`, 2..=100) |
 | Auto-merge | existing historical option | unsupported |
 | Force/admin bypass | audited Cara policy | unsupported initially |
 | Holds | Cara | Cara, before submit |
@@ -258,7 +263,7 @@ Each phase leaves `stack_type: caravan` untouched.
 
 Use disposable same-repository branches and never production Caravan PRs.
 
-1. Create two- and three-entry Stack; verify REST/GraphQL/webhook identity.
+1. Create two-, three-, and eight-entry Stacks; verify REST/GraphQL/webhook identity and that a ninth candidate is routed to another batch.
 2. Repeat create/add after ambiguous response; prove idempotent convergence.
 3. Move a lower head between preflight and async submit; prove all-or-none behavior and determine whether group generation is snapshot-bound.
 4. Move the selected top head; verify `sha` rejects.

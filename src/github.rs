@@ -1,7 +1,8 @@
-//! Read-only GitHub repository and pull-request discovery.
+//! GitHub repository discovery and policy-free provider primitives.
 //!
-//! This module deliberately stops at faithful provider conversion. Graph policy
-//! and every GitHub mutation live in downstream lanes.
+//! This module deliberately stops at faithful provider conversion plus exact,
+//! optimistic mutation adapters. Graph, scheduling, admission, and merge policy
+//! live in downstream lanes.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -3060,11 +3061,13 @@ fn normalize_check_state(provider_state: Option<&str>) -> CheckState {
 }
 
 mod raw;
+mod stack;
 
 // The transport layer is an implementation seam, not a new public surface:
 // re-export exactly what was public before the split so no downstream path
 // changes (bd-fcd5c9).
 pub use raw::*;
+pub use stack::*;
 
 #[cfg(test)]
 mod tests {
