@@ -462,11 +462,13 @@ RECOVERY, LOCKS, AND OBSERVABILITY
   login, and finally probes other successful `gh` accounts. Selection is cached
   only for the process; Cara never runs `gh auth switch`, stores a preferred
   account in project config, or exposes a token in commands/errors/receipts.
-  Opt-in App auth requires `CARA_GITHUB_AUTH_MODE=app_installation`, a
-  `CARA_GITHUB_APP_CREDENTIAL_COMMAND`, expected App slug, and installation ID.
-  A broker path alone never activates. Cara validates exact identity/expiry,
-  single-flights refresh, exposes only secret-free App telemetry, and never
-  falls back to ambient auth on incomplete/invalid App settings or broker failure. Remote Git operations use that same cached
+  Opt-in App auth first requires repository `github_auth` policy with exact
+  slug/installation, then matching `CARA_GITHUB_AUTH_MODE=app_installation`,
+  `CARA_GITHUB_APP_CREDENTIAL_COMMAND`, slug, and installation environment.
+  Missing policy stays ambient; broker environment alone never activates. Cara
+  validates exact identity/expiry, single-flights refresh, exposes only
+  secret-free App telemetry, and never falls back on policy/runtime mismatch or
+  broker failure. Remote Git operations use that same cached
   principal through an environment-only HTTPS credential helper. SSH, plaintext
   HTTP, local/mismatched remotes, and credential-bearing URLs fail before Git.
   The least-privilege permission/branch/webhook/single-writer baseline is
@@ -604,6 +606,7 @@ impl AppContext {
                 (relative, false, CaravanConfig::default())
             }
         };
+        config.validate_github_auth_runtime_environment()?;
         Ok(Self {
             repository_path,
             config_path,

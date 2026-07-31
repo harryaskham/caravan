@@ -935,6 +935,8 @@ repository: owner/name
 force_merge: false
 # Optional backend axis. `caravan` is the stable default.
 stack_type: caravan
+github_auth:
+  mode: ambient
 rebase_on_join: false
 agent_priority_labels:
   - caravan-priority:high

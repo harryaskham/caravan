@@ -7,8 +7,22 @@ machine-readable permission baseline is
 
 ## Modes and credential broker
 
-Ambient mode is the default. A broker path by itself does not activate App
-identity. App mode requires all four non-secret settings:
+Ambient mode is the default, including when `.caravan/config.yaml` is absent.
+App identity must first be authorized by non-secret repository policy:
+
+```yaml
+github_auth:
+  mode: app_installation
+  app_slug: caravan
+  installation_id: 12345
+```
+
+Ambient policy must not declare App identity fields. App policy requires both;
+unknown modes/fields and invalid slugs/IDs fail strict config parsing. Config
+validation remains offline and never needs credentials.
+
+At production startup, repository policy is bound to all four deployment
+settings. A broker path by itself does not activate App identity:
 
 ```sh
 export CARA_GITHUB_AUTH_MODE=app_installation
@@ -16,6 +30,11 @@ export CARA_GITHUB_APP_CREDENTIAL_COMMAND=/absolute/path/to/reviewed-broker
 export CARA_GITHUB_APP_SLUG=caravan
 export CARA_GITHUB_APP_INSTALLATION_ID=12345
 ```
+
+Mode, slug, and installation must exactly match repository policy. This check
+runs for normal CLI/MCP context and every explicit `cara web --repo`; one web
+process therefore cannot silently mix installations. Missing, mismatched, or
+ambient-vs-App runtime selection fails before provider discovery.
 
 The broker is one executable, not a shell command. Cara passes
 `CARA_GITHUB_APP_HOST` and `CARA_GITHUB_APP_REPOSITORY` to it. On stdout it must

@@ -41,6 +41,105 @@ impl std::fmt::Display for StackType {
     }
 }
 
+/// Repository-authorized GitHub credential identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GithubAuthMode {
+    /// Preserve ambient/stored `gh` and ordinary Git credential behavior.
+    #[default]
+    Ambient,
+    /// Require the exact deployment App installation selected below.
+    AppInstallation,
+}
+
+/// Non-secret repository policy for GitHub authentication.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct GithubAuthConfig {
+    pub mode: GithubAuthMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_slug: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installation_id: Option<u64>,
+}
+
+impl GithubAuthConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        match self.mode {
+            GithubAuthMode::Ambient => {
+                if self.app_slug.is_some() || self.installation_id.is_some() {
+                    return Err(ConfigError::Validation(
+                        "github_auth ambient mode must not declare App identity fields".to_owned(),
+                    ));
+                }
+            }
+            GithubAuthMode::AppInstallation => {
+                let slug = self.app_slug.as_deref().unwrap_or_default();
+                if slug.is_empty()
+                    || slug.len() > 100
+                    || !slug
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                {
+                    return Err(ConfigError::Validation(
+                        "github_auth.app_slug must be a 1-100 character ASCII App slug".to_owned(),
+                    ));
+                }
+                if self.installation_id.is_none_or(|id| id == 0) {
+                    return Err(ConfigError::Validation(
+                        "github_auth.installation_id must be a positive integer".to_owned(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_runtime_values(
+        &self,
+        mode: Option<&str>,
+        slug: Option<&str>,
+        installation_id: Option<&str>,
+        broker_command: Option<&str>,
+    ) -> Result<(), ConfigError> {
+        let mode = mode.unwrap_or_default().trim();
+        match self.mode {
+            GithubAuthMode::Ambient if mode.is_empty() || mode == "ambient" => Ok(()),
+            GithubAuthMode::Ambient => Err(ConfigError::Validation(
+                "github_auth policy is ambient but runtime requested App authentication".to_owned(),
+            )),
+            GithubAuthMode::AppInstallation => {
+                if mode != "app_installation" {
+                    return Err(ConfigError::Validation(
+                        "github_auth App policy requires CARA_GITHUB_AUTH_MODE=app_installation"
+                            .to_owned(),
+                    ));
+                }
+                if slug.map(str::trim) != self.app_slug.as_deref() {
+                    return Err(ConfigError::Validation(
+                        "runtime App slug does not match github_auth.app_slug".to_owned(),
+                    ));
+                }
+                let runtime_installation =
+                    installation_id.and_then(|value| value.trim().parse::<u64>().ok());
+                if runtime_installation != self.installation_id {
+                    return Err(ConfigError::Validation(
+                        "runtime installation ID does not match github_auth.installation_id"
+                            .to_owned(),
+                    ));
+                }
+                if broker_command.is_none_or(|command| command.trim().is_empty()) {
+                    return Err(ConfigError::Validation(
+                        "github_auth App policy requires CARA_GITHUB_APP_CREDENTIAL_COMMAND"
+                            .to_owned(),
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Supported config schema version.
 pub const CONFIG_VERSION: u32 = 1;
 /// Version of this Cara reader.
@@ -392,6 +491,8 @@ pub struct CaravanConfig {
     /// the historical Cara-owned provider model and performs no native Stack
     /// API probes or mutations.
     pub stack_type: StackType,
+    /// Non-secret repository authorization for ambient or GitHub App identity.
+    pub github_auth: GithubAuthConfig,
     /// Explicitly authorize lease-protected history rewriting so PR ancestry
     /// physically follows the Caravan chain. Safe default is disabled.
     pub rebase_on_join: bool,
@@ -426,6 +527,7 @@ impl Default for CaravanConfig {
             min_cara_version: CARA_VERSION.to_owned(),
             force_merge: false,
             stack_type: StackType::default(),
+            github_auth: GithubAuthConfig::default(),
             rebase_on_join: false,
             agent_priority_labels: default_agent_priority_labels(),
             command_timeout_secs: default_command_timeout_secs(),
@@ -627,6 +729,7 @@ impl CaravanConfig {
                 "repair.materialization_timeout_secs must be between 1 and {MAX_COMMAND_TIMEOUT_SECS}"
             )));
         }
+        self.github_auth.validate()?;
         if self.stack_type == StackType::Github {
             if self.rebase_on_join {
                 return Err(ConfigError::Validation(
@@ -667,6 +770,22 @@ impl CaravanConfig {
             }
         }
         Ok(())
+    }
+
+    /// Bind deployment auth settings to this repository's non-secret policy.
+    /// Pure config parsing deliberately does not require deployment credentials;
+    /// production context startup calls this before provider discovery.
+    pub fn validate_github_auth_runtime_environment(&self) -> Result<(), ConfigError> {
+        self.github_auth.validate_runtime_values(
+            std::env::var("CARA_GITHUB_AUTH_MODE").ok().as_deref(),
+            std::env::var("CARA_GITHUB_APP_SLUG").ok().as_deref(),
+            std::env::var("CARA_GITHUB_APP_INSTALLATION_ID")
+                .ok()
+                .as_deref(),
+            std::env::var("CARA_GITHUB_APP_CREDENTIAL_COMMAND")
+                .ok()
+                .as_deref(),
+        )
     }
 
     #[must_use]
@@ -1332,6 +1451,97 @@ mod environment_override_tests {
             config.sync.checkout_on_decision, before,
             "no override is set in this test process"
         );
+    }
+}
+
+#[cfg(test)]
+mod github_auth_tests {
+    use super::*;
+
+    #[test]
+    fn policy_defaults_ambient_and_binds_runtime_identity() {
+        let legacy = CaravanConfig::parse("version: 1\n").unwrap();
+        assert_eq!(legacy.github_auth.mode, GithubAuthMode::Ambient);
+        legacy
+            .github_auth
+            .validate_runtime_values(None, None, None, Some("/ignored/broker"))
+            .unwrap();
+        let error = legacy
+            .github_auth
+            .validate_runtime_values(
+                Some("app_installation"),
+                Some("caravan"),
+                Some("42"),
+                Some("/broker"),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("policy is ambient"));
+
+        let app = CaravanConfig::parse(
+            "version: 1\ngithub_auth:\n  mode: app_installation\n  app_slug: caravan\n  installation_id: 42\n",
+        )
+        .unwrap();
+        app.github_auth
+            .validate_runtime_values(
+                Some("app_installation"),
+                Some("caravan"),
+                Some("42"),
+                Some("/secure/broker"),
+            )
+            .unwrap();
+        let mismatch = app
+            .github_auth
+            .validate_runtime_values(
+                Some("app_installation"),
+                Some("other"),
+                Some("42"),
+                Some("/secure/broker"),
+            )
+            .unwrap_err();
+        assert!(mismatch.to_string().contains("slug does not match"));
+    }
+
+    #[test]
+    fn policy_rejects_incomplete_or_ignored_identity() {
+        for yaml in [
+            "version: 1\ngithub_auth:\n  mode: ambient\n  app_slug: caravan\n",
+            "version: 1\ngithub_auth:\n  mode: app_installation\n  installation_id: 42\n",
+            "version: 1\ngithub_auth:\n  mode: app_installation\n  app_slug: caravan\n  installation_id: 0\n",
+            "version: 1\ngithub_auth:\n  mode: app_installation\n  app_slug: 'bad slug'\n  installation_id: 42\n",
+        ] {
+            assert!(CaravanConfig::parse(yaml).is_err(), "accepted {yaml}");
+        }
+        let unknown = CaravanConfig::parse(
+            "version: 1\ngithub_auth:\n  mode: ambient\n  private_key: forbidden\n",
+        )
+        .unwrap_err();
+        assert!(unknown.to_string().contains("unknown field `private_key`"));
+    }
+
+    #[test]
+    fn app_runtime_requires_mode_identity_and_broker() {
+        let policy = GithubAuthConfig {
+            mode: GithubAuthMode::AppInstallation,
+            app_slug: Some("caravan".to_owned()),
+            installation_id: Some(42),
+        };
+        for values in [
+            (None, Some("caravan"), Some("42"), Some("/broker")),
+            (Some("app_installation"), None, Some("42"), Some("/broker")),
+            (
+                Some("app_installation"),
+                Some("caravan"),
+                Some("41"),
+                Some("/broker"),
+            ),
+            (Some("app_installation"), Some("caravan"), Some("42"), None),
+        ] {
+            assert!(
+                policy
+                    .validate_runtime_values(values.0, values.1, values.2, values.3)
+                    .is_err()
+            );
+        }
     }
 }
 
