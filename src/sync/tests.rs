@@ -2370,12 +2370,17 @@ fn force_head_with_auto_merge_off_uses_direct_admin_squash_without_auto_arm() {
 
     assert_eq!(
         *provider.calls.borrow(),
-        vec![MutationKind::Comment, MutationKind::SquashMerge]
+        vec![
+            MutationKind::Comment,
+            MutationKind::SquashMerge,
+            MutationKind::RemoveLabel,
+        ]
     );
     assert_eq!(
         progress.current[&PrNumber(1)].state,
         PullRequestState::Merged
     );
+    assert!(!progress.current[&PrNumber(1)].has_label("caravan-force"));
     assert_eq!(progress.events[0].kind, EventKind::ForceMergeAttempted);
 
     let final_pulls = provider.pulls.borrow().values().cloned().collect();
@@ -2445,7 +2450,11 @@ fn unrelated_disabled_force_head_does_not_block_targeted_force_sync() {
     );
     assert_eq!(
         *provider.calls.borrow(),
-        vec![MutationKind::Comment, MutationKind::SquashMerge]
+        vec![
+            MutationKind::Comment,
+            MutationKind::SquashMerge,
+            MutationKind::RemoveLabel,
+        ]
     );
 
     let final_pulls = provider.pulls.borrow().values().cloned().collect();
@@ -2488,7 +2497,11 @@ fn unrelated_auto_merge_gap_does_not_block_selected_durable_force() {
     );
     assert_eq!(
         *provider.calls.borrow(),
-        vec![MutationKind::Comment, MutationKind::SquashMerge]
+        vec![
+            MutationKind::Comment,
+            MutationKind::SquashMerge,
+            MutationKind::RemoveLabel,
+        ]
     );
 }
 
@@ -2614,6 +2627,7 @@ fn force_merge_permission_denial_preserves_attempt_event() {
         "force_merge_attempted"
     );
     assert!(provider.calls.borrow().is_empty());
+    assert!(provider.pulls.borrow()[&PrNumber(1)].has_label("caravan-force"));
 }
 
 #[test]
@@ -2645,8 +2659,10 @@ fn forced_head_bypasses_queued_expected_in_progress_and_empty_checks() {
                 MutationKind::DisableAutoMerge,
                 MutationKind::Comment,
                 MutationKind::SquashMerge,
+                MutationKind::RemoveLabel,
             ]
         );
+        assert!(!progress.current[&PrNumber(1)].has_label("caravan-force"));
         assert_eq!(
             progress.current[&PrNumber(1)].state,
             PullRequestState::Merged
@@ -2694,7 +2710,11 @@ fn passing_checks_with_durable_force_still_merge_immediately() {
     assert!(progress.ci.is_empty());
     assert_eq!(
         *provider.calls.borrow(),
-        vec![MutationKind::Comment, MutationKind::SquashMerge]
+        vec![
+            MutationKind::Comment,
+            MutationKind::SquashMerge,
+            MutationKind::RemoveLabel,
+        ]
     );
     assert_eq!(
         progress
@@ -2710,6 +2730,40 @@ fn passing_checks_with_durable_force_still_merge_immediately() {
     assert_eq!(
         progress.current[&PrNumber(1)].state,
         PullRequestState::Merged
+    );
+    assert!(!progress.current[&PrNumber(1)].has_label("caravan-force"));
+}
+
+#[test]
+fn force_label_cleanup_failure_reports_completed_merge_and_does_not_promote() {
+    let mut pulls = healthy_chain();
+    pulls[0].auto_merge = AutoMergeState::disabled();
+    pulls[0].labels.insert("caravan-force".to_owned());
+    pulls[0].checks = vec![check("build-test", CheckState::Failure, Some(49))];
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    provider.fail_once(MutationKind::RemoveLabel);
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+
+    let error = execute(&status, &provider, false, false, true)
+        .expect_err("post-merge label cleanup failure is a typed partial mutation");
+
+    assert_eq!(error.code(), "force_intent_consume_failed");
+    let details = error.details().unwrap();
+    assert_eq!(details["merged"], true);
+    assert_eq!(details["mutated"], true);
+    assert_eq!(
+        provider.pulls.borrow()[&PrNumber(1)].state,
+        PullRequestState::Merged
+    );
+    assert!(provider.pulls.borrow()[&PrNumber(1)].has_label("caravan-force"));
+    assert_eq!(provider.pulls.borrow()[&PrNumber(2)].base.name, "one");
+    assert_eq!(
+        *provider.calls.borrow(),
+        vec![
+            MutationKind::Comment,
+            MutationKind::SquashMerge,
+            MutationKind::RemoveLabel,
+        ]
     );
 }
 
@@ -2737,6 +2791,7 @@ fn successful_force_merge_is_one_shot_and_advances_child() {
         progress.current[&PrNumber(1)].state,
         PullRequestState::Merged
     );
+    assert!(!progress.current[&PrNumber(1)].has_label("caravan-force"));
     assert_eq!(progress.current[&PrNumber(2)].state, PullRequestState::Open);
     assert_eq!(progress.current[&PrNumber(2)].base.name, "main");
     assert_eq!(
@@ -2749,6 +2804,7 @@ fn successful_force_merge_is_one_shot_and_advances_child() {
         vec![
             MutationKind::Comment,
             MutationKind::SquashMerge,
+            MutationKind::RemoveLabel,
             MutationKind::SetBase,
         ]
     );

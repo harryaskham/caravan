@@ -4109,7 +4109,10 @@ fn force_merge_head(
     for number in caravan.members.iter().skip(1).copied() {
         progress.ensure_auto_merge_disabled(provider, &status.repository, number)?;
     }
-    progress.ensure_mutation_capacity(1)?;
+    // Reserve both irreversible merge and one-shot intent consumption before
+    // entering the merge. The label stays present until the merge succeeds, so
+    // a failed merge retains durable operator intent (bd-694436).
+    progress.ensure_mutation_capacity(2)?;
     let receipt =
         match provider.admin_squash_merge(&status.repository, &progress.precondition(head)) {
             Ok(receipt) => receipt,
@@ -4125,6 +4128,34 @@ fn force_merge_head(
             Err(error) => return Err(mutation_error(&error, progress, Some(head))),
         };
     progress.record(receipt, "administrator squash-merged forced caravan head");
+    let consumed = provider
+        .remove_label(
+            &status.repository,
+            &progress.precondition(head),
+            "caravan-force",
+        )
+        .map_err(|error| {
+            let source = mutation_error(&error, progress, Some(head));
+            AppError::structured(
+                source.category(),
+                "force_intent_consume_failed",
+                "forced root merged, but its one-shot caravan-force label could not be consumed",
+                Some(json!({
+                    "pr": head,
+                    "merged": true,
+                    "source": source.details(),
+                    "operation_receipt": progress.operation_receipt(),
+                    "provider_receipts": progress.provider_receipts,
+                    "mutated": true,
+                    "resumable": true,
+                    "safe_next_action": "remove only the residual caravan-force label from the already merged PR; do not retry or duplicate the merge",
+                })),
+            )
+        })?;
+    progress.record(
+        consumed,
+        "consumed one-shot force intent after successful merge",
+    );
     progress.events.push(progress.event(
         EventKind::ForceMergeCompleted,
         Some(caravan.id),
