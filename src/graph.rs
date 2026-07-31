@@ -2,7 +2,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -111,6 +112,36 @@ where
     }
 }
 
+type PreparedRevisionKey = (String, String);
+
+/// Process-wide evidence that one exact provider revision was prepared in one
+/// local object database. Provider discovery remains authoritative; this only
+/// avoids refetching an unchanged exact OID during later reads in the same tick.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SharedPreparedRevisionKey {
+    local_repository: PathBuf,
+    remote: String,
+    provider_repository: crate::model::RepositoryId,
+    branch: String,
+    oid: String,
+}
+
+#[derive(Debug, Clone)]
+struct SharedPreparedRevision {
+    inserted: Instant,
+    resolved: crate::model::CommitOid,
+}
+
+static SHARED_PREPARED_REVISIONS: OnceLock<
+    Mutex<BTreeMap<SharedPreparedRevisionKey, SharedPreparedRevision>>,
+> = OnceLock::new();
+const SHARED_PREPARED_REVISION_MAX_AGE: Duration = Duration::from_secs(600);
+const MAX_SHARED_PREPARED_REVISIONS: usize = 4_096;
+
+fn prepared_revision_key(branch: &BranchSnapshot) -> PreparedRevisionKey {
+    (branch.name.clone(), branch.oid.0.clone())
+}
+
 /// Production compatibility checker for one repository and remote.
 #[derive(Debug, Clone)]
 pub struct GitCompatibilityChecker {
@@ -118,18 +149,78 @@ pub struct GitCompatibilityChecker {
     remote: String,
     timeout: Duration,
     operation_deadline: Option<std::time::Instant>,
-    prepared: std::cell::RefCell<BTreeMap<(String, String), crate::model::CommitOid>>,
+    prepared: std::cell::RefCell<BTreeMap<PreparedRevisionKey, crate::model::CommitOid>>,
 }
 
 impl GitCompatibilityChecker {
     #[must_use]
     pub fn new(repository: impl AsRef<Path>, remote: impl Into<String>) -> Self {
+        let repository = repository.as_ref();
         Self {
-            repository: repository.as_ref().to_path_buf(),
+            repository: std::fs::canonicalize(repository)
+                .unwrap_or_else(|_| repository.to_path_buf()),
             remote: remote.into(),
             timeout: crate::command::DEFAULT_COMMAND_TIMEOUT,
             operation_deadline: None,
             prepared: std::cell::RefCell::new(BTreeMap::new()),
+        }
+    }
+
+    fn shared_key(&self, branch: &BranchSnapshot) -> SharedPreparedRevisionKey {
+        SharedPreparedRevisionKey {
+            local_repository: self.repository.clone(),
+            remote: self.remote.clone(),
+            provider_repository: branch.repository.clone(),
+            branch: branch.name.clone(),
+            oid: branch.oid.0.clone(),
+        }
+    }
+
+    fn hydrate_from_shared_cache(&self, branches: &[BranchSnapshot]) {
+        let cache = SHARED_PREPARED_REVISIONS.get_or_init(|| Mutex::new(BTreeMap::new()));
+        let mut shared = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        shared.retain(|_, entry| entry.inserted.elapsed() <= SHARED_PREPARED_REVISION_MAX_AGE);
+        let mut local = self.prepared.borrow_mut();
+        for branch in branches {
+            if let Some(entry) = shared.get(&self.shared_key(branch)) {
+                local.insert(prepared_revision_key(branch), entry.resolved.clone());
+            }
+        }
+    }
+
+    fn publish_to_shared_cache(
+        &self,
+        branches: &[BranchSnapshot],
+        prepared: &BTreeMap<PreparedRevisionKey, crate::model::CommitOid>,
+    ) {
+        let cache = SHARED_PREPARED_REVISIONS.get_or_init(|| Mutex::new(BTreeMap::new()));
+        let mut shared = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        shared.retain(|_, entry| entry.inserted.elapsed() <= SHARED_PREPARED_REVISION_MAX_AGE);
+        for branch in branches {
+            let Some(resolved) = prepared.get(&prepared_revision_key(branch)) else {
+                continue;
+            };
+            let key = self.shared_key(branch);
+            if !shared.contains_key(&key)
+                && shared.len() >= MAX_SHARED_PREPARED_REVISIONS
+                && let Some(oldest) = shared
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.inserted)
+                    .map(|(key, _)| key.clone())
+            {
+                shared.remove(&oldest);
+            }
+            shared.insert(
+                key,
+                SharedPreparedRevision {
+                    inserted: Instant::now(),
+                    resolved: resolved.clone(),
+                },
+            );
         }
     }
 
@@ -150,26 +241,28 @@ impl GitCompatibilityChecker {
 
 impl CompatibilityChecker for GitCompatibilityChecker {
     fn prepare(&self, branches: &[BranchSnapshot]) -> Result<(), AppError> {
-        let runner = crate::command::ProcessRunner::in_directory(&self.repository)
-            .with_timeout(self.timeout)
-            .with_operation_deadline(
-                self.operation_deadline
-                    .unwrap_or_else(|| std::time::Instant::now() + self.timeout),
-            );
+        self.hydrate_from_shared_cache(branches);
         let missing = {
             let cache = self.prepared.borrow();
             branches
                 .iter()
-                .filter(|branch| !cache.contains_key(&(branch.name.clone(), branch.oid.0.clone())))
+                .filter(|branch| !cache.contains_key(&prepared_revision_key(branch)))
                 .cloned()
                 .collect::<Vec<_>>()
         };
         if !missing.is_empty() {
+            let runner = crate::command::ProcessRunner::in_directory(&self.repository)
+                .with_timeout(self.timeout)
+                .with_operation_deadline(
+                    self.operation_deadline
+                        .unwrap_or_else(|| std::time::Instant::now() + self.timeout),
+                );
             let prepared = compatibility::prepare_branch_snapshots_with_runner(
                 &runner,
                 &self.remote,
                 &missing,
             )?;
+            self.publish_to_shared_cache(&missing, &prepared);
             self.prepared.borrow_mut().extend(prepared);
         }
         Ok(())
@@ -180,11 +273,11 @@ impl CompatibilityChecker for GitCompatibilityChecker {
         candidate: &BranchSnapshot,
         target: &BranchSnapshot,
     ) -> Result<CompatibilityReport, AppError> {
-        let key = |branch: &BranchSnapshot| (branch.name.clone(), branch.oid.0.clone());
         let cache = self.prepared.borrow();
-        if let (Some(candidate_oid), Some(target_oid)) =
-            (cache.get(&key(candidate)), cache.get(&key(target)))
-        {
+        if let (Some(candidate_oid), Some(target_oid)) = (
+            cache.get(&prepared_revision_key(candidate)),
+            cache.get(&prepared_revision_key(target)),
+        ) {
             let runner = crate::command::ProcessRunner::in_directory(&self.repository)
                 .with_timeout(self.timeout)
                 .with_operation_deadline(
@@ -218,11 +311,11 @@ impl CompatibilityChecker for GitCompatibilityChecker {
         candidate: &BranchSnapshot,
         target: &BranchSnapshot,
     ) -> Result<Option<CumulativeTreeProof>, AppError> {
-        let key = |branch: &BranchSnapshot| (branch.name.clone(), branch.oid.0.clone());
         let cache = self.prepared.borrow();
-        let (Some(candidate_oid), Some(target_oid)) =
-            (cache.get(&key(candidate)), cache.get(&key(target)))
-        else {
+        let (Some(candidate_oid), Some(target_oid)) = (
+            cache.get(&prepared_revision_key(candidate)),
+            cache.get(&prepared_revision_key(target)),
+        ) else {
             return Ok(None);
         };
         let runner = crate::command::ProcessRunner::in_directory(&self.repository)
@@ -246,11 +339,11 @@ impl CompatibilityChecker for GitCompatibilityChecker {
         candidate: &BranchSnapshot,
         target: &BranchSnapshot,
     ) -> Result<Option<SquashEquivalenceReport>, AppError> {
-        let key = |branch: &BranchSnapshot| (branch.name.clone(), branch.oid.0.clone());
         let cache = self.prepared.borrow();
-        let (Some(candidate_oid), Some(target_oid)) =
-            (cache.get(&key(candidate)), cache.get(&key(target)))
-        else {
+        let (Some(candidate_oid), Some(target_oid)) = (
+            cache.get(&prepared_revision_key(candidate)),
+            cache.get(&prepared_revision_key(target)),
+        ) else {
             return Ok(None);
         };
         let runner = crate::command::ProcessRunner::in_directory(&self.repository)
@@ -1040,6 +1133,127 @@ mod tests {
             conflicting_paths: Vec::new(),
             diagnostic: None,
         })
+    }
+
+    /// bd-750d37: consecutive rediscoveries construct fresh checker instances.
+    /// Exact prepared revisions survive that boundary, but never cross a local
+    /// repository/remote identity and never outlive the bounded preparation TTL.
+    #[test]
+    fn compatibility_preparation_is_shared_by_exact_identity_and_expires() {
+        fn git(repository: &Path, args: &[&str]) -> String {
+            let output = std::process::Command::new("git")
+                .current_dir(repository)
+                .args(args)
+                .output()
+                .expect("fixture git command");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout)
+                .expect("git output is utf-8")
+                .trim()
+                .to_owned()
+        }
+
+        let fixture = tempfile::tempdir().expect("fixture repository");
+        git(
+            fixture.path(),
+            &["init", "--quiet", "--initial-branch=main"],
+        );
+        git(fixture.path(), &["config", "user.name", "Caravan Test"]);
+        git(
+            fixture.path(),
+            &["config", "user.email", "caravan@example.invalid"],
+        );
+        std::fs::write(fixture.path().join("file"), "prepared\n").unwrap();
+        git(fixture.path(), &["add", "file"]);
+        git(fixture.path(), &["commit", "--quiet", "-m", "prepared"]);
+        let oid = git(fixture.path(), &["rev-parse", "HEAD"]);
+        let repository_path = fixture.path().to_string_lossy().into_owned();
+        git(
+            fixture.path(),
+            &["remote", "add", "fixture", &repository_path],
+        );
+        let snapshot = BranchSnapshot {
+            repository: repository(),
+            name: "main".to_owned(),
+            oid: CommitOid(oid),
+        };
+
+        let first = GitCompatibilityChecker::new(fixture.path(), "fixture");
+        first
+            .prepare(std::slice::from_ref(&snapshot))
+            .expect("first instance prepares from the remote");
+        git(fixture.path(), &["remote", "remove", "fixture"]);
+
+        let second = GitCompatibilityChecker::new(fixture.path(), "fixture");
+        second
+            .prepare(std::slice::from_ref(&snapshot))
+            .expect("fresh checker reuses the exact process-wide preparation");
+
+        let wrong_remote = GitCompatibilityChecker::new(fixture.path(), "other");
+        assert!(
+            wrong_remote
+                .prepare(std::slice::from_ref(&snapshot))
+                .is_err(),
+            "the remote is part of cache identity"
+        );
+        let mut wrong_provider = snapshot.clone();
+        wrong_provider.repository.name = "another-repository".to_owned();
+        assert!(
+            GitCompatibilityChecker::new(fixture.path(), "fixture")
+                .prepare(&[wrong_provider])
+                .is_err(),
+            "the provider repository is part of cache identity"
+        );
+        let mut wrong_branch = snapshot.clone();
+        wrong_branch.name = "other-branch".to_owned();
+        assert!(
+            GitCompatibilityChecker::new(fixture.path(), "fixture")
+                .prepare(&[wrong_branch])
+                .is_err(),
+            "the branch is part of cache identity"
+        );
+        let mut wrong_oid = snapshot.clone();
+        wrong_oid.oid = CommitOid("a".repeat(40));
+        assert!(
+            GitCompatibilityChecker::new(fixture.path(), "fixture")
+                .prepare(&[wrong_oid])
+                .is_err(),
+            "the exact OID is part of cache identity"
+        );
+
+        let other_repository = tempfile::tempdir().expect("other repository");
+        git(
+            other_repository.path(),
+            &["init", "--quiet", "--initial-branch=main"],
+        );
+        let wrong_repository = GitCompatibilityChecker::new(other_repository.path(), "fixture");
+        assert!(
+            wrong_repository
+                .prepare(std::slice::from_ref(&snapshot))
+                .is_err(),
+            "the local object database is part of cache identity"
+        );
+
+        let key = first.shared_key(&snapshot);
+        SHARED_PREPARED_REVISIONS
+            .get()
+            .expect("cache initialized")
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&key)
+            .expect("exact cache entry")
+            .inserted = Instant::now()
+            .checked_sub(SHARED_PREPARED_REVISION_MAX_AGE + Duration::from_secs(1))
+            .expect("TTL fits in monotonic clock");
+        let expired = GitCompatibilityChecker::new(fixture.path(), "fixture");
+        assert!(
+            expired.prepare(&[snapshot]).is_err(),
+            "an expired preparation must refetch instead of claiming a stale local fact"
+        );
     }
 
     #[test]

@@ -86,6 +86,8 @@ PR `X` is **mechanically compatible** with target branch `Y` when Git can constr
 
 Mechanical compatibility does not prove semantic correctness. CI, the user, or an external agent owns semantic decisions. Pairwise checks deliberately avoid factorial permutation testing.
 
+Within one long-lived Cara process, exact prepared Git revisions are reusable across the initial, midpoint, and final rediscoveries of a tick. The bounded cache key includes the canonical local repository, remote, provider repository, branch, and exact OID; an entry expires 600 seconds after preparation and the process retains at most 4096 entries. Cache access never refreshes that age. Provider/GitHub rediscovery and pairwise merge-tree analysis still run on every read. An unchanged exact generation may reuse its already-fetched local commit, while any repository, remote, branch, or OID movement misses and performs the ordinary pre/post-advertisement fetch verification. Expiry bounds local object-pruning or garbage-collection assumptions; the cache is an optimization, never provider or mutation authority.
+
 The default branch may move independently. A caravan head that no longer merges cleanly into it is a decision point. A valid repair may change the PR, reshape the caravan, or land an outside-caravan fix on the default branch that restores compatibility without rerunning caravan PR CI.
 
 ### Squash-equivalent stacked history
