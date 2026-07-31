@@ -12,8 +12,10 @@
 //! * [`AdmissionSelection`] — *who chose this candidate*: automatic priority/
 //!   FIFO order, an explicit owner request naming a remote PR, or the owner's
 //!   own checked-out PR.
-//! * [`AdmissionIntent`] — *what the candidate asked for*: form a new caravan
-//!   (`new`) or attach to a resolved live target (`join`).
+//! * [`AdmissionIntent`] — *what the exact receipt evaluates*: form a new
+//!   caravan (`new`) or attach to a resolved live target (`join`). A targetless
+//!   check may recommend the one unambiguous clean target; mutation receipts
+//!   retain the operation the caller explicitly requested.
 //!
 //! Automatic selection is bound by FIFO for both intents, without exception.
 //! Explicit owner selection is resolved *before* FIFO canonical-candidate
@@ -38,7 +40,7 @@ pub const ADMISSION_INTENT_POLICY: &str = "Priority/FIFO order binds automatic a
 /// Maximum base-chain hops walked while deriving candidate dependencies.
 const MAX_DEPENDENCY_DEPTH: usize = 64;
 
-/// Which admission intent the candidate declared before FIFO evaluation.
+/// Which admission intent the exact receipt evaluates before FIFO policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AdmissionIntent {

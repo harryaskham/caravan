@@ -279,7 +279,7 @@ pub(super) fn preflight_eligibility(
         tail_pr: target.caravan.tail().map(|number| number.0),
         head_pr: None,
     });
-    read::check_analysis(&virtual_status, &check_input, checker)
+    read::check_requested_action_analysis(&virtual_status, &check_input, checker)
 }
 
 #[allow(clippy::too_many_arguments)]

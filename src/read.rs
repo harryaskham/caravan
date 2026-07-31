@@ -1578,12 +1578,38 @@ const fn admission_selection(remote: bool) -> crate::admission::AdmissionSelecti
     }
 }
 
-/// Pure/injectable check policy used by live commands and fixture tests.
+/// Pure/injectable recommendation policy used by `cara check` and fixture tests.
+///
+/// With no explicit target, a check may recommend joining the one visible,
+/// unheld caravan when that exact attachment is eligible. Mutation preflights
+/// use [`check_requested_action_analysis`] instead: an explicit `cara new`
+/// must continue to prove `new`, never inherit the check command's recommendation.
 #[allow(clippy::too_many_lines)]
 pub fn check_analysis(
     status: &StatusOutput,
     input: &CheckInput,
     checker: &impl CompatibilityChecker,
+) -> Result<CheckOutput, AppError> {
+    check_analysis_with_recommendation(status, input, checker, true)
+}
+
+/// Prove the action the caller explicitly requested without inferring another
+/// membership operation. This is the mutation-side counterpart to
+/// [`check_analysis`].
+pub(crate) fn check_requested_action_analysis(
+    status: &StatusOutput,
+    input: &CheckInput,
+    checker: &impl CompatibilityChecker,
+) -> Result<CheckOutput, AppError> {
+    check_analysis_with_recommendation(status, input, checker, false)
+}
+
+#[allow(clippy::too_many_lines)]
+fn check_analysis_with_recommendation(
+    status: &StatusOutput,
+    input: &CheckInput,
+    checker: &impl CompatibilityChecker,
+    recommend_implicit_join: bool,
 ) -> Result<CheckOutput, AppError> {
     crate::initialization::require_ready(&status.initialization)?;
     let current_pr = input.pr.map(PrNumber).or(status.current_pr).ok_or_else(|| {
@@ -1680,6 +1706,35 @@ pub fn check_analysis(
         return eligible_or_error(output, remote);
     }
 
+    let explicit_join = input.tail_pr.is_some() || input.head_pr.is_some();
+    // A targetless check is a recommendation request, not an explicit `new`.
+    // Recommend a join only when the downstream targetless `cara join --pr N`
+    // can resolve the same target unambiguously. The targeted recursive pass
+    // disables recommendation, so it evaluates the existing coherent join path
+    // exactly once. An ineligible join is evidence to try `new`, not the final
+    // receipt; every other error still fails closed.
+    if recommend_implicit_join && !explicit_join {
+        if let [target_caravan] = status.analysis.fleet.caravans.as_slice() {
+            let held = status.pauses.iter().any(|pause| {
+                pause.state.is_effective() && pause.record.caravan_head == target_caravan.id
+            });
+            if !held {
+                let tail = target_caravan.tail().expect("caravans are non-empty");
+                let targeted = CheckInput {
+                    pr: input.pr,
+                    tail_pr: Some(tail.0),
+                    head_pr: None,
+                };
+                match check_analysis_with_recommendation(status, &targeted, checker, false) {
+                    Ok(output) if output.eligible => return Ok(output),
+                    Ok(_) => {}
+                    Err(error) if error.code() == "check_failed" => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    }
+
     // Seed from fleet problems, but never inherit another *unadmitted*
     // candidate's incompatibility. That is advisory evidence about a PR which is
     // in no caravan and blocks nothing, so letting it land here made one
@@ -1719,7 +1774,6 @@ pub fn check_analysis(
     // Intent is resolved before FIFO canonical-candidate rejection. An
     // unresolved, missing, or ambiguous join target fails closed here and never
     // reaches the ordering relaxation below.
-    let explicit_join = input.tail_pr.is_some() || input.head_pr.is_some();
     let target_caravan = explicit_join
         .then(|| resolve_target_caravan(status, input))
         .transpose()?;
@@ -2570,6 +2624,156 @@ mod tests {
         assert_eq!(output.mode, CheckMode::ActiveCaravan);
         assert_eq!(output.caravan_id, Some(PrNumber(1)));
         assert!(output.eligible);
+    }
+
+    /// bd-c462db: the targetless surface is the recommendation caco consumes.
+    /// It must return the complete existing join receipt, not merely flip the
+    /// action on a new-caravan receipt.
+    #[test]
+    fn targetless_check_recommends_the_one_clean_visible_caravan() {
+        let candidate = pr(9, "nine", "main", false);
+        let status = status(
+            candidate.clone(),
+            vec![pr(1, "one", "main", true), candidate],
+        );
+
+        for input in [
+            CheckInput::default(),
+            CheckInput {
+                pr: Some(9),
+                ..CheckInput::default()
+            },
+        ] {
+            let output = check_analysis(&status, &input, &clean_checker)
+                .expect("the visible clean tail is recommended");
+
+            assert!(output.eligible, "problems: {:?}", output.problems);
+            assert_eq!(output.next_action, CandidateNextAction::Join);
+            assert_eq!(output.mode, CheckMode::JoinTail);
+            assert_eq!(output.caravan_id, Some(PrNumber(1)));
+            assert_eq!(output.target_pr, Some(PrNumber(1)));
+            let intent = output.admission_intent.expect("typed join intent");
+            assert_eq!(intent.intent, crate::admission::AdmissionIntent::Join);
+            assert_eq!(intent.target_caravan, Some(PrNumber(1)));
+            assert_eq!(intent.target_tail, Some(PrNumber(1)));
+            assert_eq!(output.compatibility.len(), 1);
+            assert_eq!(output.compatibility[0].candidate.name, "nine");
+            assert_eq!(output.compatibility[0].target.name, "one");
+        }
+    }
+
+    /// The recommendation is not mutation intent. `cara new` uses this strict
+    /// path and must keep proving a new caravan even when check would recommend
+    /// the one visible tail.
+    #[test]
+    fn requested_new_preflight_does_not_inherit_the_join_recommendation() {
+        let candidate = pr(9, "nine", "main", false);
+        let status = status(
+            candidate.clone(),
+            vec![pr(1, "one", "main", true), candidate],
+        );
+
+        let output =
+            check_requested_action_analysis(&status, &CheckInput::default(), &clean_checker)
+                .expect("explicit new remains independently admissible");
+
+        assert_eq!(output.next_action, CandidateNextAction::New);
+        assert_eq!(output.mode, CheckMode::NewCaravan);
+        assert_eq!(output.caravan_id, Some(PrNumber(9)));
+        assert_eq!(output.target_pr, None);
+        assert_eq!(
+            output.admission_intent.expect("typed new intent").intent,
+            crate::admission::AdmissionIntent::New
+        );
+    }
+
+    /// An effective hold makes the otherwise unambiguous target unavailable to
+    /// automatic recommendation. Check must preserve the independent new path.
+    #[test]
+    fn targetless_check_never_recommends_a_held_caravan() {
+        let candidate = pr(9, "nine", "main", false);
+        let mut status = status(
+            candidate.clone(),
+            vec![pr(1, "one", "main", true), candidate],
+        );
+        let head = status.analysis.pull_requests[&PrNumber(1)].clone();
+        status.pauses.push(crate::pause::PauseStatus {
+            record: crate::pause::PauseRecord {
+                version: 1,
+                caravan_head: PrNumber(1),
+                members: vec![PrNumber(1)],
+                expected_head: crate::model::PullRequestPrecondition::from(&head),
+                expected_checks: head.checks,
+                actor: "operator".to_owned(),
+                reason: "incident".to_owned(),
+                paused_unix_secs: 1,
+                expires_unix_secs: None,
+                external_reference: None,
+                resume_authorized_by: None,
+            },
+            state: crate::pause::PauseState::Active,
+            auto_merge_suspended: true,
+            retired_state: None,
+            safe_next_action: "resume explicitly".to_owned(),
+        });
+
+        let output = check_analysis(&status, &CheckInput::default(), &clean_checker)
+            .expect("a hold keeps the independent new path available");
+
+        assert!(output.eligible, "problems: {:?}", output.problems);
+        assert_eq!(output.next_action, CandidateNextAction::New);
+        assert_eq!(output.mode, CheckMode::NewCaravan);
+        assert_eq!(output.target_pr, None);
+    }
+
+    /// An incompatible inferred join is not returned as the final answer. The
+    /// ordinary new-caravan evaluation still owns the fallback receipt.
+    #[test]
+    fn rejected_implicit_join_falls_back_to_a_coherent_new_receipt() {
+        let candidate = pr(9, "nine", "main", false);
+        let status = status(
+            candidate.clone(),
+            vec![pr(1, "one", "main", true), candidate],
+        );
+        let checker = |candidate: &crate::model::BranchSnapshot,
+                       target: &crate::model::BranchSnapshot| {
+            let conflict = candidate.name == "nine" && target.name == "one";
+            Ok(CompatibilityReport {
+                candidate: candidate.clone(),
+                target: target.clone(),
+                outcome: if conflict {
+                    CompatibilityOutcome::Conflict
+                } else {
+                    CompatibilityOutcome::Clean
+                },
+                conflicting_paths: if conflict {
+                    vec!["src/lib.rs".to_owned()]
+                } else {
+                    Vec::new()
+                },
+                diagnostic: None,
+            })
+        };
+
+        let output = check_analysis(
+            &status,
+            &CheckInput {
+                pr: Some(9),
+                ..CheckInput::default()
+            },
+            &checker,
+        )
+        .expect("remote rejection remains an inspectable fallback receipt");
+
+        assert!(!output.eligible);
+        assert_eq!(output.next_action, CandidateNextAction::Repair);
+        assert_eq!(output.mode, CheckMode::NewCaravan);
+        assert_eq!(output.caravan_id, Some(PrNumber(9)));
+        assert_eq!(output.target_pr, None);
+        assert_eq!(
+            output.admission_intent.expect("typed new fallback").intent,
+            crate::admission::AdmissionIntent::New
+        );
     }
 
     #[test]
@@ -3812,11 +4016,11 @@ mod tests {
         assert!(intent.blocking_prs.is_empty());
     }
 
-    /// Cacophony PR2215 A/B shape: the same front with a live caravan present.
-    /// Explicit `new` and explicit `join --tail-pr` are both admitted, and both
-    /// leave PR #2113 canonical.
+    /// Cacophony PR2215 A/B shape, updated by bd-c462db: with a live caravan,
+    /// targetless check now recommends the same coherent join as an explicit
+    /// `--tail-pr`; both leave PR #2113 canonical.
     #[test]
-    fn cacophony_pr2215_explicit_new_and_join_match_the_reviewed_ab_shape() {
+    fn cacophony_pr2215_targetless_and_explicit_join_match_the_reviewed_shape() {
         let candidate = pr(2215, "green", "main", false);
         let status = status(
             candidate,
@@ -3834,8 +4038,8 @@ mod tests {
                     tail_pr: None,
                     head_pr: None,
                 },
-                CandidateNextAction::New,
-                CheckMode::NewCaravan,
+                CandidateNextAction::Join,
+                CheckMode::JoinTail,
             ),
             (
                 CheckInput {

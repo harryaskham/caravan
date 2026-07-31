@@ -3742,7 +3742,7 @@ fn check_auto_target(
     input: &CheckInput,
     checker: &impl crate::graph::CompatibilityChecker,
 ) -> Result<crate::read::CheckOutput, AppError> {
-    match crate::read::check_analysis(status, input, checker) {
+    match crate::read::check_requested_action_analysis(status, input, checker) {
         Ok(output) => Ok(output),
         Err(error) if error.code() == "check_failed" => error
             .details()

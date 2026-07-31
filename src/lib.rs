@@ -178,9 +178,12 @@ the exact pinned binary. It performs strict parsing and no repository/provider a
    labels or silently overwrite mismatched metadata. Repair the exact reported
    repository setting, protection, label, permission, or config mismatch.
 3. Inspect `cara next-candidate`. Use `cara check --pr N` to validate the exact
-   remote PR without checkout or mutation. Add `--tail-pr T` (or `--head-pr H`)
-   when proposing a join. Follow the typed `new`, `join`, `repair`, `wait`, or
-   `reject` action from the returned receipt.
+   remote PR without checkout or mutation. A targetless check recommends joining
+   the one visible unheld caravan when that attachment is clean, otherwise it
+   falls back to `new`; zero or multiple caravans retain `new` because a later
+   targetless join would be ambiguous. Add `--tail-pr T` (or `--head-pr H`) for
+   an exact join target. Follow the typed `new`, `join`, `repair`, `wait`, or
+   `reject` action and its coherent target from the returned receipt.
 4. Use `cara new --pr N`, `renew --pr N`, `join --pr N`, or `rejoin --pr N`
    for checkout-free Saloon actions; omit `--pr` only when the checkout resolves
    one unique open PR. Use membership only after that preflight.
@@ -668,6 +671,8 @@ pub struct TargetInput {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Args)]
 pub struct CheckInput {
     /// Exact remote candidate PR. When omitted, use the current checkout's PR.
+    /// Without a target, check may recommend the one unambiguous clean live
+    /// caravan; mutation commands retain their explicitly requested operation.
     #[arg(long, value_name = "PR")]
     #[serde(default)]
     pub pr: Option<u64>,
@@ -971,7 +976,7 @@ pub fn build_router() -> ToolRouter<AppContext> {
     );
     router.add_typed_tool_with_output_schema(
         "check",
-        "Preflight an exact remote candidate with --pr, or the current PR when omitted, without checkout or provider mutation. Optionally test joining --tail-pr or the resolved tail of --head-pr; returns exact facts, a typed admission-intent decision, and a mechanical next action. Explicit join intent is resolved before FIFO rejection and may attach ahead of unrelated unjoined rows; new-caravan intent stays strictly FIFO.",
+        "Preflight an exact remote candidate with --pr, or the current PR when omitted, without checkout or provider mutation. A targetless check recommends the one visible unheld caravan when its exact attachment is eligible, otherwise it falls back to new; zero or multiple caravans retain new because targetless join would be ambiguous. Optionally test an exact --tail-pr or resolved --head-pr. Returns exact facts, a coherent typed admission-intent decision/target, and one mechanical next action without changing explicit new mutation preflight.",
         |context: &AppContext, input: CheckInput| read::check(context, &input),
     );
     router.add_typed_tool_with_output_schema(

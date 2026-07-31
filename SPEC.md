@@ -242,8 +242,8 @@ the signature of labels stripped after the fact. A zero count beside a non-zero
 when the list is empty, states explicitly that this is not a lifetime claim.
 - `cara next-candidate` — return the same canonical first ordered admission attempt and complete reasoning without mutation; it explicitly requires subsequent membership preflight and never authorizes leapfrogging a rejected first attempt.
 - `cara show` — print the current PR's whole caravan and highlight its position.
-- `cara check` — no-update validation. For an active member, check its whole caravan and fleet invariants. Otherwise check whether `new` would succeed.
-- `cara check --pr N` — re-read and preflight exact remote PR `N` without changing checkout, branch, base, labels, or auto-merge. The receipt consumes the canonical provider candidate identity/freshness schema and includes exact head/base repositories and OIDs, draft/labels/auto-merge state, enrollment and canonical-order state, compatibility/conflicting paths, and one mechanical next action: `new`, `join`, `repair`, `wait`, or `reject`. A provider head/ref race fails closed with exact old/new evidence.
+- `cara check` — no-update validation. For an active member, check its whole caravan and fleet invariants. For an unenrolled candidate with no explicit target, first evaluate attachment to the one visible unheld caravan. A clean attachment returns the complete coherent `join` receipt; an ineligible attachment falls back to the ordinary `new` evaluation. Zero or multiple visible caravans retain `new` evaluation because a subsequent targetless `cara join` could not resolve the same target unambiguously. This recommendation policy is check-only: an explicit `cara new` mutation continues to preflight `new`.
+- `cara check --pr N` — re-read and preflight exact remote PR `N` without changing checkout, branch, base, labels, or auto-merge. The receipt consumes the canonical provider candidate identity/freshness schema and includes exact head/base repositories and OIDs, draft/labels/auto-merge state, enrollment and canonical-order state, compatibility/conflicting paths, and one mechanical next action: `new`, `join`, `repair`, `wait`, or `reject`. When targetless check recommends the unique visible caravan, `mode`, `caravan_id`, `target_pr`, compatibility, and typed admission intent all describe that same join; it never flips only `next_action` on a new-caravan receipt. A provider head/ref race fails closed with exact old/new evidence.
 
 Candidate freshness is always measured against a live provider generation, never against the pull request's own recorded base. GitHub keeps serving the base a PR was opened or last synced against, so a default-based candidate is compared to the current default tip; every identity records that `compared_base` generation so a consumer can verify the claim instead of trusting it. A recorded base superseded by the current tip is `stale_base` with an explicit reason, including when the synthetic merge ref is missing or has unexpected topology.
 - `cara check [--pr N] --tail-pr T` — check whether the selected remote/current PR can join after exact tail `T`.
@@ -260,8 +260,10 @@ anyway):
 - **Selection** is *who chose this candidate*: `automatic` priority/FIFO order,
   an `explicit` owner request naming one exact remote PR, or the owner's own
   `checked_out` PR.
-- **Intent** is *what the candidate asked for*: `new` (form a caravan) or `join`
-  (attach to a resolved live target).
+- **Intent** is *what the exact receipt evaluates*: `new` (form a caravan) or
+  `join` (attach to a resolved live target). A targetless `check` may recommend
+  `join` to the one unambiguous visible unheld caravan; mutation preflight keeps
+  the operation the caller actually requested.
 
 Priority-then-FIFO is the contract for *automatic selection*: which unjoined PR
 sync picks next as the new root or the next automatically grown member. It binds
@@ -283,8 +285,9 @@ active caravan member, when it is on the candidate's exact base chain, or when
 its canonical rank cannot be computed (unknown/conflicting priority metadata).
 A candidate that is not itself a current ordered admission attempt — rejected,
 stale-pinned, or carrying a generation-bound skip — gains nothing from declaring
-intent. An unresolved, missing, or ambiguous join target is an error before
-ordering is considered, never a guess. Ordering never substitutes for
+intent. An explicitly named unresolved, missing, or ambiguous join target is an
+error before ordering is considered, never a guess. A targetless recommendation
+uses only one unambiguous visible caravan; otherwise it evaluates `new`. Ordering never substitutes for
 compatibility, dependency, policy, provider-candidate freshness, generation
 integrity, or provider/auth success: those still reject the attach.
 

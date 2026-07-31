@@ -1,4 +1,6 @@
 /target
 /.direnv
 /.caravan/*.local.yaml
+# Runtime session summaries publish through the state surface, never product history.
+/.cacophony/agent/
 .DS_Store

@@ -1478,6 +1478,42 @@ fn new_applies_active_label_and_squash_auto_merge() {
     assert!(output.receipt.changed);
 }
 
+/// bd-c462db: check may recommend the one visible caravan, but an explicit
+/// `cara new` request still owns its declared mutation and preflight.
+#[test]
+fn new_with_one_visible_caravan_does_not_inherit_check_recommendation() {
+    let head = pull_request(1, "one", "main", &[ACTIVE_LABEL]);
+    let candidate = pull_request(2, "two", "main", &[]);
+    let provider = FakeProvider::with_pull_requests(vec![head.clone(), candidate.clone()]);
+
+    let output = execute(
+        status(candidate, vec![head]),
+        &clean,
+        &provider,
+        MembershipRequest {
+            operation: MembershipOperation::New,
+            create_pr: false,
+            tail_pr: None,
+            head_pr: None,
+            reason: None,
+            priority_label: None,
+            agent_priority_labels: Vec::new(),
+        },
+    )
+    .expect("explicit new remains a new caravan");
+
+    assert_eq!(output.caravan_id, PrNumber(2));
+    assert_eq!(output.pull_request.base.name, "main");
+    assert!(output.pull_request.auto_merge.enabled);
+    assert_eq!(
+        output
+            .admission_intent
+            .expect("typed membership intent")
+            .intent,
+        crate::admission::AdmissionIntent::New
+    );
+}
+
 #[test]
 fn explicit_membership_consumes_advisory_auto_admission_skip() {
     let candidate = pull_request(1, "one", "main", &[SKIPPED_LABEL]);
