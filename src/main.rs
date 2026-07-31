@@ -52,7 +52,13 @@ struct Cli {
     /// agent watching one checkout could not read another without changing
     /// directory, and `web` already took `--repo`, so the capability existed and
     /// was reachable from exactly one subcommand (bd-3c0d9e).
-    #[arg(long, global = true, value_name = "PATH")]
+    ///
+    /// Spelled `--repository`, not `--repo`: `web` takes a REPEATABLE, required
+    /// `--repo` for its multi-repository view, and clap rejects a duplicate long
+    /// name at command-tree construction, which made `cara web` unconstructable.
+    /// Renaming the single-repository global is the non-breaking half of that
+    /// collision (bd-99b842).
+    #[arg(long = "repository", global = true, value_name = "PATH")]
     repo: Option<PathBuf>,
 
     #[command(subcommand)]

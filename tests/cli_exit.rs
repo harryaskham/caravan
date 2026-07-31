@@ -250,18 +250,19 @@ fn sync_dry_run_is_discoverable_from_the_mutating_command() {
     );
 }
 
-/// `--repo` must be global, not a `web` privilege.
+/// Targeting a repository must be global, not a `web` privilege.
 ///
 /// Every other command resolved its repository from the invocation directory,
 /// so answering a question about a repository required standing in it. The
 /// general form already existed as `AppContext::load_from_directory` and was
-/// reachable from exactly one subcommand (bd-3c0d9e).
+/// reachable from exactly one subcommand (bd-3c0d9e). Spelled `--repository`
+/// because `web` owns a repeatable `--repo` (bd-99b842).
 #[test]
 fn repo_is_a_global_argument_not_a_web_privilege() {
     for args in [
-        vec!["--repo", "/tmp", "status", "--help"],
-        vec!["--repo", "/tmp", "check", "--help"],
-        vec!["--repo", "/tmp", "log", "--help"],
+        vec!["--repository", "/tmp", "status", "--help"],
+        vec!["--repository", "/tmp", "check", "--help"],
+        vec!["--repository", "/tmp", "log", "--help"],
     ] {
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_cara"))
             .args(&args)
@@ -280,7 +281,40 @@ fn repo_is_a_global_argument_not_a_web_privilege() {
         .output()
         .expect("cara --help runs");
     assert!(
-        String::from_utf8_lossy(&help.stdout).contains("--repo"),
+        String::from_utf8_lossy(&help.stdout).contains("--repository"),
         "the global option must be discoverable from the top-level help"
+    );
+}
+
+/// A global option must not collide with a subcommand's own long name.
+///
+/// `web` declares a REPEATABLE, required `--repo`. Adding a global `--repo`
+/// made clap reject the command tree at construction, so `cara web` could not
+/// be built at all and the release contract job failed. Local `--lib` and
+/// `--test cli_exit` runs were both green because the failing assertions live
+/// in the `--bin cara` test target (bd-99b842).
+#[test]
+fn the_single_repository_global_does_not_collide_with_the_web_multi_repository_flag() {
+    let web = std::process::Command::new(env!("CARGO_BIN_EXE_cara"))
+        .args(["web", "--help"])
+        .output()
+        .expect("cara web --help runs");
+    assert!(
+        web.status.success(),
+        "web must remain constructable: {}",
+        String::from_utf8_lossy(&web.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&web.stdout).contains("--repo "),
+        "web keeps its own repeatable --repo"
+    );
+
+    let top = std::process::Command::new(env!("CARGO_BIN_EXE_cara"))
+        .arg("--help")
+        .output()
+        .expect("cara --help runs");
+    assert!(
+        String::from_utf8_lossy(&top.stdout).contains("--repository"),
+        "the single-repository global is spelled --repository"
     );
 }
