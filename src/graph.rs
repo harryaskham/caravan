@@ -1135,28 +1135,33 @@ mod tests {
         })
     }
 
+    /// Run a git command in a fixture repository.
+    ///
+    /// Hoisted out of the test that used it: as a nested item its body counted
+    /// toward that function's length and pushed it past the 100-line lint, which
+    /// landed on main red under `--all-targets`.
+    fn git(repository: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .current_dir(repository)
+            .args(args)
+            .output()
+            .expect("fixture git command");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("git output is utf-8")
+            .trim()
+            .to_owned()
+    }
+
     /// bd-750d37: consecutive rediscoveries construct fresh checker instances.
     /// Exact prepared revisions survive that boundary, but never cross a local
     /// repository/remote identity and never outlive the bounded preparation TTL.
     #[test]
     fn compatibility_preparation_is_shared_by_exact_identity_and_expires() {
-        fn git(repository: &Path, args: &[&str]) -> String {
-            let output = std::process::Command::new("git")
-                .current_dir(repository)
-                .args(args)
-                .output()
-                .expect("fixture git command");
-            assert!(
-                output.status.success(),
-                "git {args:?} failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            String::from_utf8(output.stdout)
-                .expect("git output is utf-8")
-                .trim()
-                .to_owned()
-        }
-
         let fixture = tempfile::tempdir().expect("fixture repository");
         git(
             fixture.path(),
