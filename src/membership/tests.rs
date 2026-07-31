@@ -398,6 +398,31 @@ fn post_rewrite_budget_is_reserved_before_any_branch_rewrite() {
     assert_eq!(details["mutated"], false);
     assert_eq!(details["pr"], 2079);
 
+    // The reserve is a MULTIPLE of `command_timeout_secs`, so the remedy must not
+    // tell the reader to raise it. An operator read the old advice and proposed
+    // 60 -> 300, which takes the requirement from 240s to 1200s: advice that
+    // steers deeper into the fault it is describing (bd-cef42d).
+    let remedy = details["safe_next_action"]
+        .as_str()
+        .expect("safe_next_action is a string");
+    assert!(
+        remedy.contains("LOWER command_timeout_secs"),
+        "the remedy must name the direction that reduces the reserve: {remedy}"
+    );
+    assert!(
+        !remedy.contains("raise command_timeout_secs"),
+        "raising it increases this very requirement: {remedy}"
+    );
+    assert!(
+        remedy.contains("sync.max_duration_secs"),
+        "the other real lever is the operation deadline: {remedy}"
+    );
+    assert_eq!(
+        details["required_ms"],
+        u64::from(super::POST_REWRITE_COMMAND_RESERVE) * 30_000,
+        "required is exactly the reserve times the per-command timeout"
+    );
+
     // Ample budget proceeds, and an unbounded operation is unaffected.
     let ample = std::time::Instant::now() + std::time::Duration::from_secs(600);
     assert!(super::require_post_rewrite_budget(&context, Some(ample), PrNumber(2079)).is_ok());

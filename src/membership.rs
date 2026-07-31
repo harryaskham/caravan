@@ -880,7 +880,16 @@ fn require_post_rewrite_budget(
             "reserved_commands": POST_REWRITE_COMMAND_RESERVE,
             "mutated": false,
             "resumable": true,
-            "safe_next_action": "rerun the same command with a fresh operation budget, or raise command_timeout_secs / the sync duration bound",
+            // The reserve is a MULTIPLE of `command_timeout_secs`, so raising it
+            // raises the bar it is failing against and never enlarges what
+            // remains. The advice used to say "raise command_timeout_secs",
+            // which steers the reader deeper into the fault: an operator read it
+            // and proposed 60 -> 300, which would have taken the requirement
+            // from 240s to 1200s (bd-cef42d).
+            "required_formula": "command_timeout_secs * POST_REWRITE_COMMAND_RESERVE",
+            "safe_next_action": format!(
+                "rerun with a fresh operation budget, or raise sync.max_duration_secs to enlarge the operation deadline, or LOWER command_timeout_secs: the reserve is {POST_REWRITE_COMMAND_RESERVE}x that value, so raising it increases this requirement rather than meeting it"
+            ),
         })),
     ))
 }
