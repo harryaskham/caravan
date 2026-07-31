@@ -856,6 +856,7 @@ fn validate_topology(
         ));
     }
     let mut seen = std::collections::BTreeSet::new();
+    let mut previous_open_head: Option<&BranchSnapshot> = None;
     for (position, entry) in topology.entries.iter().enumerate() {
         if entry.position != u32::try_from(position).unwrap_or(u32::MAX) {
             return Err(invalid_plan(
@@ -875,22 +876,25 @@ fn validate_topology(
                 "Stack entries must use same-repository base and head branches",
             ));
         }
-        let expected_base = if position == 0 {
-            &topology.base
-        } else {
-            &topology.entries[position - 1].head
-        };
-        let same_base_ref = entry.base.repository == expected_base.repository
-            && entry.base.name == expected_base.name;
-        let exact_live_base = entry.pull_request_state != PullRequestState::Open
-            || entry.base.oid == expected_base.oid;
-        if !same_base_ref || !exact_live_base {
+        if entry.pull_request_state == PullRequestState::Open {
+            // After an atomic prefix merge GitHub retains the merged entries in
+            // the Stack but rebases/retargets the first remaining open PR to
+            // the Stack base. Subsequent open entries continue the live chain.
+            let expected_base = previous_open_head.unwrap_or(&topology.base);
+            if entry.base != *expected_base {
+                return Err(invalid_plan(
+                    "github_stack_base_chain_invalid",
+                    &format!(
+                        "open PR #{} does not target the exact previous open generation",
+                        entry.pr
+                    ),
+                ));
+            }
+            previous_open_head = Some(&entry.head);
+        } else if previous_open_head.is_some() {
             return Err(invalid_plan(
-                "github_stack_base_chain_invalid",
-                &format!(
-                    "PR #{} does not target the expected previous generation",
-                    entry.pr
-                ),
+                "github_stack_state_order_invalid",
+                "closed or merged Stack entries may only precede the open suffix",
             ));
         }
     }
@@ -1135,7 +1139,10 @@ fn unstack_request(repository: &RepositoryId, stack_number: u64) -> GitHubStackR
     }
 }
 
-fn native_stack_read_command(repository: &RepositoryId, stack_number: u64) -> CommandSpec {
+pub(super) fn native_stack_read_command(
+    repository: &RepositoryId,
+    stack_number: u64,
+) -> CommandSpec {
     stack_api_command(
         "GET",
         format!("repos/{}/stacks/{stack_number}", repository.slug()),
@@ -1143,7 +1150,10 @@ fn native_stack_read_command(repository: &RepositoryId, stack_number: u64) -> Co
     )
 }
 
-fn native_stack_base_ref_command(repository: &RepositoryId, branch: &str) -> CommandSpec {
+pub(super) fn native_stack_base_ref_command(
+    repository: &RepositoryId,
+    branch: &str,
+) -> CommandSpec {
     CommandSpec::new("gh").args([
         "api".to_owned(),
         format!(

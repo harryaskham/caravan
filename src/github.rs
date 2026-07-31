@@ -3062,12 +3062,14 @@ fn normalize_check_state(provider_state: Option<&str>) -> CheckState {
 
 mod raw;
 mod stack;
+mod stack_merge;
 
 // The transport layer is an implementation seam, not a new public surface:
 // re-export exactly what was public before the split so no downstream path
 // changes (bd-fcd5c9).
 pub use raw::*;
 pub use stack::*;
+pub use stack_merge::*;
 
 #[cfg(test)]
 mod tests {

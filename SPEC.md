@@ -956,15 +956,27 @@ Unknown config fields are errors. Secrets belong in environment variables, not c
 
 `stack_type` is optional and defaults to `caravan`, which preserves the existing
 label/base-chain/merge behavior and performs no GitHub Stack capability probe.
-`github` is an explicit native-Stack preview. In its first read-only phase it
-requires `rebase_on_join: false` and `sync.head_merge_actor: caravan`; status
-makes one bounded REST Stack inventory read, distinguishes available,
-unavailable, and unknown capability, and verifies provider member order, base
-refs, branch names, and exact head OIDs against Cara's graph. A full 100-Stack
-page is reported as truncated rather than complete. Every provider-mutating
-workflow returns `github_stack_backend_read_only` before provider writes. Later slices may remove
-that blocker only for reviewed Stack operations; an older Cara reader must be
-excluded with `min_cara_version` before a repository opts in.
+`github` is an explicit native-Stack preview. It requires
+`rebase_on_join: false` and `sync.head_merge_actor: caravan`; status makes one
+bounded REST Stack inventory read, distinguishes available, unavailable, and
+unknown capability, and verifies provider member order, base refs, branch
+names, and exact head OIDs against Cara's graph. A full 100-Stack page is
+reported as truncated rather than complete. Every provider-mutating workflow
+returns `github_stack_backend_read_only` before provider writes.
+
+Exact REST create/add/unstack and asynchronous direct-merge planning,
+submission, UUID-polling, and receipt primitives are policy-free internal
+adapters, not executable workflow authority. The 2026-07-31 disposable sandbox
+proved successful full and partial atomic squash, all-or-none failure after an
+ordinary lower fast-forward, top-SHA rejection, and UUID recovery. It also
+proved the current API does not lease the complete group: after 202, a lower
+rewind preserving upper ancestry merged every selected PR at the changed lower
+generation. Cara seals that outcome as `indeterminate`, but post-merge detection
+cannot prevent it. The mutation fence may be removed only after GitHub exposes
+a preventive complete-group generation lease or an equivalent mechanism. An
+older Cara reader must still be excluded with `min_cara_version` before any
+future repository opt-in. Exact evidence is recorded in
+`docs/validation/github-native-stack-sandbox-2026-07-31.md`.
 
 `rebase_on_join` is a strict, explicit history-rewrite opt-in and defaults to
 `false`, preserving the virtual compatibility contract above. Status and check

@@ -544,9 +544,14 @@ nor fetch Git dependencies at build time.
 
 Repository policy and hooks live at `.caravan/config.yaml`. `stack_type` defaults
 to `caravan`, preserving the existing implementation without probing GitHub's
-native Stack API. The explicit `github` value is initially a read-only preview:
+native Stack API. The explicit `github` value remains a read-only preview:
 status reports capability and exact Stack drift, while provider-mutating
-workflows return `github_stack_backend_read_only`. The optional `rebase_on_join: true` mode
+workflows return `github_stack_backend_read_only`. Exact REST create/add/unstack
+and asynchronous merge receipt primitives exist internally, but a disposable
+sandbox proved GitHub leases only the selected top SHA and can merge after a
+lower head changes while preserving ancestry. Executable native merge therefore
+requires a future preventive complete-group lease, not merely post-merge
+detection. The optional `rebase_on_join: true` mode
 physically rebases each owned PR's candidate-only, linear commit range onto its
 exact predecessor under an exact force-with-lease; it is disabled by default and
 never mutates the caller's worktree:
