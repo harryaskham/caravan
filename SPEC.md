@@ -680,7 +680,13 @@ the already-proven merge tree directly onto the exact target instead of
 re-resolving conflicts its author resolved by hand. Children are never
 flattened, because their ancestry must physically follow the chain, and an
 unauthorized merge-preserving replay still fails closed with
-`rebase_merge_replay_conflict`.
+`rebase_merge_replay_conflict`. Root flattening is work only while the exact
+candidate range still contains a merge. Once a prior tick produced a linear
+head with the exact unchanged target as an ancestor, the next plan is
+`already_satisfied` and retains that head OID; the persistent flatten-policy flag
+must never replay identical trees under new timestamps and invalidate its own
+exact-generation CI. Explicit squash reconciliation or descendant unwind remain
+separate rewrite authorities.
 
 Under the historical `github` actor the earlier contract still applies. Required
 root squash auto-merge is scheduler-owned convergent state: the provider drops

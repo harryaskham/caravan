@@ -522,8 +522,14 @@ pub fn prepare_candidate(
     // the independently proven result tree is sufficient to treat the branch as
     // already stacked (bd-a720be).
     let target_is_ancestor = is_ancestor(&runner, &target.oid, &candidate.head.oid)?;
+    // Root flattening is work only while merge commits remain in the candidate
+    // range. Once an earlier tick has produced a linear head directly on this
+    // same target, excluding it from reuse solely because the policy flag stays
+    // enabled regenerates identical trees under new timestamps forever and
+    // continually invalidates exact-generation CI (bd-e500b0).
+    let root_needs_flattening = budget.flatten_squashed_root && has_merges;
     let reuse_existing_head = target_is_ancestor
-        && !budget.flatten_squashed_root
+        && !root_needs_flattening
         && !budget.reconcile_squash_equivalent
         && budget.replay_upstream.is_none();
     let expected_merge_tree = if has_merges {
@@ -3706,6 +3712,28 @@ mod tests {
             ),
             prepared.plan.new_tree_oid.0
         );
+
+        // Publish and rediscover the exact flattened root. A later tick on the
+        // unchanged target must retain this generation; replaying its now-linear
+        // commits solely because root flattening is enabled changes timestamps,
+        // cancels exact-generation CI, and can never reach merge readiness
+        // (bd-e500b0).
+        let first = apply_prepared(&prepared).expect("publish the flattened root");
+        let mut rediscovered = candidate;
+        rediscovered.head.oid = first.new_head_oid.clone();
+        rediscovered.base.oid = target_head.clone();
+        let second = prepare_candidate(
+            &fixture.clone,
+            &fixture.repository,
+            &rediscovered,
+            remote_range(&rediscovered),
+            PlannedBase::Remote(target.clone()),
+            &target,
+            RebaseExecutionBudget::new(TEST_REBASE_BUDGET).flattening_squashed_root(true),
+        )
+        .expect("an already flattened root is idempotent on an unchanged target");
+        assert!(second.plan.already_satisfied);
+        assert_eq!(second.plan.new_head_oid, first.new_head_oid);
     }
 
     /// A child that already contains the exact selected target as a merge parent
