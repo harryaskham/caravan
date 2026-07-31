@@ -970,7 +970,12 @@ zero provider mutation. Linear ranges use the ordinary sequencer. Owned nonlinea
 two-parent merge-preserving strategy: commits reachable only from the candidate
 (after excluding retained old-base and current-target ancestry) are replayed
 with no cousin rebasing, and every old/new parent edge is mapped in the receipt.
-Octopus/root/cousin/external parents are rejected. The rebuilt head tree must
+When a child merge commit names its exact old provider base as one parent and
+that same parent branch has a retained simulated replacement earlier in the
+same globally verified batch, Cara maps only that old parent generation to the
+planned parent and seals the replacement in the topology receipt. This is the
+ordinary cumulative merge shape, not cousin history. Octopus/root parents and
+every unrelated cousin/external parent remain rejected. The rebuilt head tree must
 exactly equal an independently computed clean `merge-tree` for current target +
 old candidate head before any write. Post-rewrite
 provider rediscovery is operation-specific: `join`/`rejoin` require the exact

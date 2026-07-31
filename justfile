@@ -222,9 +222,10 @@ release-backfill-all tag:
 # recipe closes that exact gap and nothing else.
 #
 # It is fail-closed: the commit must be on origin/main, its tree's Cargo.toml
-# version must equal the tag, the tag must not already exist locally or on
-# origin, and the working tree must be clean. It never moves or force-pushes a
-# tag and never edits a file.
+# and Cargo.lock versions must equal the tag, and flake.nix must either declare
+# that literal version or derive `caravanVersion` from Cargo.toml. The tag must
+# not already exist locally or on origin, and the working tree must be clean.
+# It never moves or force-pushes a tag and never edits a file.
 #   just release-tag v0.0.11                # tag exact origin/main
 #   just release-tag v0.0.11 <commit-sha>   # tag one exact landed commit
 release-tag tag commit="origin/main":
@@ -254,7 +255,12 @@ release-tag tag commit="origin/main":
     VERSION="${TAG#v}"
     CARGO_VERSION="$(git show "$COMMIT:Cargo.toml" | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)"
     LOCK_VERSION="$(git show "$COMMIT:Cargo.lock" | awk '/^name = "caravan"$/ { getline; sub(/^version = "/, ""); sub(/"$/, ""); print; exit }')"
-    FLAKE_VERSION="$(git show "$COMMIT:flake.nix" | sed -n 's/^ *version = "\(.*\)";$/\1/p' | head -1)"
+    FLAKE_SOURCE="$(git show "$COMMIT:flake.nix")"
+    if printf '%s\n' "$FLAKE_SOURCE" | grep -Fq 'caravanVersion = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;'; then
+      FLAKE_VERSION="$CARGO_VERSION"
+    else
+      FLAKE_VERSION="$(printf '%s\n' "$FLAKE_SOURCE" | sed -n 's/^ *version = "\(.*\)";$/\1/p' | head -1)"
+    fi
     for pair in "Cargo.toml:$CARGO_VERSION" "Cargo.lock:$LOCK_VERSION" "flake.nix:$FLAKE_VERSION"; do
       file="${pair%%:*}"
       found="${pair#*:}"

@@ -242,6 +242,13 @@ pub struct RebaseTopologyMapping {
     pub new_parents: Vec<CommitOid>,
 }
 
+/// One exact old parent generation replaced by its same-batch planned successor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RebaseTopologyParentReplacement {
+    pub old_parent: CommitOid,
+    pub new_parent: CommitOid,
+}
+
 /// Complete merge-preserving proof retained in plan and apply receipt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct MergePreservingTopology {
@@ -253,6 +260,10 @@ pub struct MergePreservingTopology {
     pub new_commits: Vec<RebaseTopologyCommit>,
     #[serde(default)]
     pub mapping: Vec<RebaseTopologyMapping>,
+    /// Exact provider base replaced by the retained simulated parent in this
+    /// same globally verified batch. Absent for ordinary remote targets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_replacement: Option<RebaseTopologyParentReplacement>,
 }
 
 /// Serializable immutable plan produced once and pushed without recomputation.
@@ -487,8 +498,26 @@ pub fn prepare_candidate(
     }
     let commit_count = old_topology.len();
     let has_merges = old_topology.iter().any(|commit| commit.parents.len() == 2);
+    // A simulated target is the same parent branch rewritten earlier in this
+    // globally verified batch. A nonlinear child can legitimately carry the
+    // exact old provider base as one merge parent; the sequencer must replace
+    // that one boundary with the retained planned parent rather than classify
+    // it as unrelated cousin history (bd-b7568d).
+    let replay_parent_boundary =
+        matches!(&new_base, PlannedBase::Simulated(_)).then(|| range_branch.oid.clone());
+    let replaced_parent_boundary = replay_parent_boundary.as_ref().filter(|old_parent| {
+        old_topology
+            .iter()
+            .any(|commit| commit.parents.contains(old_parent))
+    });
     let expected_merge_tree = if has_merges {
-        validate_merge_preserving_topology(&runner, &old_topology, target, candidate.number)?;
+        validate_merge_preserving_topology(
+            &runner,
+            &old_topology,
+            target,
+            replaced_parent_boundary,
+            candidate.number,
+        )?;
         Some(expected_merge_tree(
             &runner,
             target,
@@ -543,11 +572,15 @@ pub fn prepare_candidate(
             &target.oid,
             &candidate.head.oid,
             has_merges,
-            budget.replay_upstream.as_ref().or_else(|| {
-                reconciliation
-                    .as_ref()
-                    .and_then(SquashEquivalenceReport::authorized_range_base)
-            }),
+            budget
+                .replay_upstream
+                .as_ref()
+                .or_else(|| {
+                    reconciliation
+                        .as_ref()
+                        .and_then(SquashEquivalenceReport::authorized_range_base)
+                })
+                .or(replay_parent_boundary.as_ref()),
         )?
     };
     if !rebase.is_success() {
@@ -605,6 +638,7 @@ pub fn prepare_candidate(
                 &new_head,
                 &new_tree,
                 expected,
+                replaced_parent_boundary,
                 candidate.number,
             )
         })
@@ -729,6 +763,7 @@ fn validate_merge_preserving_topology(
     runner: &impl CommandRunner,
     topology: &[RebaseTopologyCommit],
     target: &BranchSnapshot,
+    replaced_parent_boundary: Option<&CommitOid>,
     pr: PrNumber,
 ) -> Result<(), AppError> {
     let range = topology
@@ -760,6 +795,9 @@ fn validate_merge_preserving_topology(
             .iter()
             .filter(|parent| !range.contains(*parent))
         {
+            if replaced_parent_boundary == Some(parent) {
+                continue;
+            }
             if !is_ancestor(runner, parent, &target.oid)? {
                 return Err(decision(
                     "rebase_cousin_history",
@@ -1029,6 +1067,7 @@ fn build_merge_topology_proof(
     new_head: &CommitOid,
     new_tree: &CommitOid,
     expected_tree: CommitOid,
+    replaced_parent_boundary: Option<&CommitOid>,
     pr: PrNumber,
 ) -> Result<MergePreservingTopology, AppError> {
     if new_tree != &expected_tree {
@@ -1062,7 +1101,15 @@ fn build_merge_topology_proof(
             ));
         }
         for old_parent in &old.parents {
-            if let Some(expected_parent) = oid_mapping.get(old_parent)
+            if replaced_parent_boundary == Some(old_parent) {
+                if !new.parents.contains(target) {
+                    return Err(decision(
+                        "rebase_topology_changed",
+                        "merge-preserving replay did not replace the exact old provider parent with the retained planned parent",
+                        json!({"pr": pr, "old": old, "new": new, "old_parent": old_parent, "expected_parent": target, "resumable": true}),
+                    ));
+                }
+            } else if let Some(expected_parent) = oid_mapping.get(old_parent)
                 && !new.parents.contains(expected_parent)
             {
                 return Err(decision(
@@ -1091,11 +1138,22 @@ fn build_merge_topology_proof(
         });
     }
     Ok(MergePreservingTopology {
-        strategy: "git_rebase_merges_no_rebase_cousins_v1".to_owned(),
+        strategy: if replaced_parent_boundary.is_some() {
+            "git_rebase_merges_no_rebase_cousins_v2_replaced_parent"
+        } else {
+            "git_rebase_merges_no_rebase_cousins_v1"
+        }
+        .to_owned(),
         expected_merge_tree_oid: expected_tree,
         old_commits: old_topology.to_vec(),
         new_commits: new_topology,
         mapping,
+        parent_replacement: replaced_parent_boundary.map(|old_parent| {
+            RebaseTopologyParentReplacement {
+                old_parent: old_parent.clone(),
+                new_parent: target.clone(),
+            }
+        }),
     })
 }
 
@@ -2502,6 +2560,138 @@ mod tests {
         assert!(prepared_child.plan.merge_topology.is_none());
         let parent_receipt = apply_prepared(&prepared_parent).unwrap();
         let child_receipt = apply_prepared(&prepared_child).unwrap();
+        let status = std::process::Command::new("git")
+            .current_dir(&fixture.clone)
+            .args([
+                "merge-base",
+                "--is-ancestor",
+                parent_receipt.new_head_oid.0.as_str(),
+                child_receipt.new_head_oid.0.as_str(),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    /// bd-b7568d live PR2330 shape: the child was authored on an independent
+    /// side and merged the exact old root generation as its second parent.
+    /// Rewriting that root in the same batch must map only that provider base
+    /// to the planned root; it is not unowned cousin history.
+    #[test]
+    fn nonlinear_child_maps_old_provider_parent_to_planned_parent() {
+        let fixture = fixture();
+        git(
+            &fixture.clone,
+            &["checkout", "-b", "child", fixture.old_main.0.as_str()],
+        );
+        std::fs::write(fixture.clone.join("child-side"), "child\n").unwrap();
+        git(&fixture.clone, &["add", "child-side"]);
+        git(&fixture.clone, &["commit", "-m", "child side"]);
+        git(
+            &fixture.clone,
+            &[
+                "merge",
+                "--no-ff",
+                "feature",
+                "-m",
+                "merge exact parent into child",
+            ],
+        );
+        let child_head = CommitOid(git(&fixture.clone, &["rev-parse", "HEAD"]));
+        git(&fixture.clone, &["push", "-u", "origin", "child"]);
+
+        let parent = PullRequestSnapshot {
+            merge_state_status: None,
+            number: PrNumber(7),
+            title: "parent".to_owned(),
+            url: "https://example.invalid/7".to_owned(),
+            state: PullRequestState::Open,
+            draft: false,
+            head: branch(&fixture.repository, "feature", &fixture.feature),
+            base: branch(&fixture.repository, "main", &fixture.old_main),
+            cross_repository: false,
+            labels: BTreeSet::new(),
+            auto_merge: AutoMergeState::disabled(),
+            checks: Vec::new(),
+            created_at: None,
+            merged_at: None,
+            updated_at: None,
+        };
+        let child = PullRequestSnapshot {
+            merge_state_status: None,
+            number: PrNumber(8),
+            title: "child".to_owned(),
+            url: "https://example.invalid/8".to_owned(),
+            state: PullRequestState::Open,
+            draft: false,
+            head: branch(&fixture.repository, "child", &child_head),
+            base: branch(&fixture.repository, "feature", &fixture.feature),
+            cross_repository: false,
+            labels: BTreeSet::new(),
+            auto_merge: AutoMergeState::disabled(),
+            checks: Vec::new(),
+            created_at: None,
+            merged_at: None,
+            updated_at: None,
+        };
+        let default = branch(&fixture.repository, "main", &fixture.new_main);
+        let prepared_parent = prepare_candidate(
+            &fixture.clone,
+            &fixture.repository,
+            &parent,
+            range_base_for_remote_target(&parent, &default),
+            PlannedBase::Remote(default.clone()),
+            &default,
+            RebaseExecutionBudget::new(Duration::from_secs(60)),
+        )
+        .expect("parent plan");
+        let planned_parent = branch(
+            &fixture.repository,
+            "feature",
+            &prepared_parent.plan.new_head_oid,
+        );
+        let prepared_child = prepare_candidate(
+            &fixture.clone,
+            &fixture.repository,
+            &child,
+            range_base_for_rewritten_parent(&child, &parent.head),
+            PlannedBase::Simulated(planned_parent.clone()),
+            &default,
+            RebaseExecutionBudget::new(Duration::from_secs(60)),
+        )
+        .expect("the old exact provider parent maps to its same-batch replacement");
+
+        let topology = prepared_child
+            .plan
+            .merge_topology
+            .as_ref()
+            .expect("nonlinear topology receipt");
+        assert_eq!(
+            topology.strategy,
+            "git_rebase_merges_no_rebase_cousins_v2_replaced_parent"
+        );
+        assert_eq!(
+            topology.parent_replacement,
+            Some(RebaseTopologyParentReplacement {
+                old_parent: fixture.feature.clone(),
+                new_parent: planned_parent.oid.clone(),
+            })
+        );
+        let mapped_merge = topology
+            .mapping
+            .iter()
+            .find(|mapping| mapping.old_parents.contains(&fixture.feature))
+            .expect("old merge names the provider base");
+        assert!(mapped_merge.new_parents.contains(&planned_parent.oid));
+        assert_eq!(
+            prepared_child.plan.new_tree_oid,
+            topology.expected_merge_tree_oid
+        );
+
+        verify_prepared(&prepared_parent).expect("parent global preflight");
+        verify_prepared(&prepared_child).expect("child global preflight");
+        let parent_receipt = apply_prepared_after_write_barrier(&prepared_parent).unwrap();
+        let child_receipt = apply_prepared_after_write_barrier(&prepared_child).unwrap();
         let status = std::process::Command::new("git")
             .current_dir(&fixture.clone)
             .args([
