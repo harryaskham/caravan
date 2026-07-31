@@ -77,7 +77,7 @@ const LEGACY_ACTIVE_DESCRIPTION: &str = "Active member of a Caravan merge chain"
 const DEFAULT_CONFIG: &str = concat!(
     "version: 1\nmin_cara_version: \"",
     env!("CARGO_PKG_VERSION"),
-    "\"\nforce_merge: false\nrebase_on_join: false\nagent_priority_labels:\n  - caravan-priority:high\n  - caravan-priority:normal\n  - caravan-priority:low\ncommand_timeout_secs: 30\nrepair:\n  materialization_timeout_secs: 180\nsync:\n  actions:\n    join_unlabelled_prs: false\n  max_candidates_per_tick: 8\n  max_mutations_per_tick: 64\n  max_github_requests_per_tick: 256\n  max_duration_secs: 120\nloop:\n  interval_secs: 60\njournal:\n  max_bytes: 8388608\n  max_archives: 3\nhooks: {}\n"
+    "\"\nforce_merge: false\nstack_type: caravan\nrebase_on_join: false\nagent_priority_labels:\n  - caravan-priority:high\n  - caravan-priority:normal\n  - caravan-priority:low\ncommand_timeout_secs: 30\nrepair:\n  materialization_timeout_secs: 180\nsync:\n  actions:\n    join_unlabelled_prs: false\n  max_candidates_per_tick: 8\n  max_mutations_per_tick: 64\n  max_github_requests_per_tick: 256\n  max_duration_secs: 120\nloop:\n  interval_secs: 60\njournal:\n  max_bytes: 8388608\n  max_archives: 3\nhooks: {}\n"
 );
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -101,6 +101,15 @@ pub struct LabelReceipt {
     pub state: ResourceState,
 }
 
+/// A typed non-label reason why read-only status is available but provider
+/// mutation is not authorized.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct InitializationMutationBlocker {
+    pub code: String,
+    pub message: String,
+    pub next: String,
+}
+
 /// Read-only label readiness included in `status` and `check` output.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct InitializationStatus {
@@ -111,6 +120,8 @@ pub struct InitializationStatus {
     pub mismatched_labels: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutation_blocker: Option<InitializationMutationBlocker>,
 }
 
 impl Default for InitializationStatus {
@@ -120,6 +131,7 @@ impl Default for InitializationStatus {
             missing_labels: Vec::new(),
             mismatched_labels: Vec::new(),
             next: None,
+            mutation_blocker: None,
         }
     }
 }
@@ -245,12 +257,24 @@ pub fn inspect_labels(
         missing_labels: missing,
         mismatched_labels: mismatched,
         next: (!ready).then(|| "run `cara init`; mismatched labels must be reconciled by an operator before retrying".to_owned()),
+        mutation_blocker: None,
     }
 }
 
 /// Fail a mutating operation before provider mutation when first-use resources
 /// are absent or incompatible.
 pub fn require_ready(status: &InitializationStatus) -> Result<(), AppError> {
+    if let Some(blocker) = &status.mutation_blocker {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            blocker.code.clone(),
+            blocker.message.clone(),
+            Some(json!({
+                "next": blocker.next,
+                "mutation_blocked": true,
+            })),
+        ));
+    }
     if status.ready {
         return Ok(());
     }
@@ -352,6 +376,17 @@ pub fn init_with_provider(
     default_branch: &str,
     provider: &impl InitializationProvider,
 ) -> Result<InitOutput, AppError> {
+    if context.config.stack_type == crate::config::StackType::Github {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "github_stack_backend_read_only",
+            "GitHub native Stack mode is read-only in this rollout phase",
+            Some(json!({
+                "mutation_blocked": true,
+                "next": "keep stack_type: caravan while running `cara init`; opt into github only for read-only status until the reviewed Stack adapter is released",
+            })),
+        ));
+    }
     let config = ensure_config(context)?;
 
     let permission = provider.permission(repository).map_err(provider_error)?;
@@ -1260,5 +1295,39 @@ mod tests {
         );
         assert_eq!(status.mismatched_labels, ["caravan-evicted"]);
         assert!(status.next.unwrap().contains("cara init"));
+    }
+
+    #[test]
+    fn github_stack_preview_blocks_init_before_provider_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = FakeProvider::new(Vec::new());
+        let mut context = context(&directory);
+        context.config.stack_type = crate::config::StackType::Github;
+        context.config.sync.head_merge_actor = Some(crate::model::HeadMergeActor::Caravan);
+
+        let error = init_with_provider(&context, &repository(), "main", &provider)
+            .expect_err("preview initialization must make zero writes");
+
+        assert_eq!(error.code(), "github_stack_backend_read_only");
+        assert!(provider.labels.lock().unwrap().is_empty());
+        assert!(!directory.path().join(".caravan/config.yaml").exists());
+    }
+
+    #[test]
+    fn typed_preview_blocker_wins_over_generic_initialization_refusal() {
+        let status = InitializationStatus {
+            ready: false,
+            mutation_blocker: Some(InitializationMutationBlocker {
+                code: "github_stack_backend_read_only".to_owned(),
+                message: "GitHub Stack mode is read-only".to_owned(),
+                next: "select stack_type: caravan".to_owned(),
+            }),
+            ..InitializationStatus::default()
+        };
+
+        let error = require_ready(&status).expect_err("preview must make zero writes");
+
+        assert_eq!(error.code(), "github_stack_backend_read_only");
+        assert_eq!(error.details().unwrap()["mutation_blocked"], true);
     }
 }

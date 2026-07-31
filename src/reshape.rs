@@ -316,6 +316,7 @@ fn execute(
     reason: Option<String>,
     rewrite: Option<&RewriteContext<'_>>,
 ) -> Result<ReshapeOutput, AppError> {
+    crate::initialization::require_ready(&status.initialization)?;
     let number = selected.or(status.current_pr).ok_or_else(|| {
         AppError::validation(
             "reshape_pr_not_selected",
@@ -724,6 +725,7 @@ fn virtual_status(
         timing: None,
         repository: status.repository.clone(),
         rebase_on_join: status.rebase_on_join.clone(),
+        stack_backend: status.stack_backend.clone(),
         auto_admission: status.auto_admission.clone(),
         default_branch: status.default_branch.clone(),
         current_branch: status.current_branch.clone(),
@@ -1297,6 +1299,7 @@ mod tests {
             timing: None,
             repository: repository(),
             rebase_on_join: crate::read::RebaseOnJoinStatus::default(),
+            stack_backend: crate::read::StackBackendStatus::default(),
             auto_admission: crate::read::AutoAdmissionStatus::default(),
             default_branch: "main".to_owned(),
             current_branch: snapshot.current_branch,

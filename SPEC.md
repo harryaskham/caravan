@@ -930,6 +930,8 @@ version: 1
 # no other input.
 repository: owner/name
 force_merge: false
+# Optional backend axis. `caravan` is the stable default.
+stack_type: caravan
 rebase_on_join: false
 agent_priority_labels:
   - caravan-priority:high
@@ -948,6 +950,18 @@ hooks:
 ```
 
 Unknown config fields are errors. Secrets belong in environment variables, not committed YAML or hook metadata.
+
+`stack_type` is optional and defaults to `caravan`, which preserves the existing
+label/base-chain/merge behavior and performs no GitHub Stack capability probe.
+`github` is an explicit native-Stack preview. In its first read-only phase it
+requires `rebase_on_join: false` and `sync.head_merge_actor: caravan`; status
+makes one bounded REST Stack inventory read, distinguishes available,
+unavailable, and unknown capability, and verifies provider member order, base
+refs, branch names, and exact head OIDs against Cara's graph. A full 100-Stack
+page is reported as truncated rather than complete. Every provider-mutating
+workflow returns `github_stack_backend_read_only` before provider writes. Later slices may remove
+that blocker only for reviewed Stack operations; an older Cara reader must be
+excluded with `min_cara_version` before a repository opts in.
 
 `rebase_on_join` is a strict, explicit history-rewrite opt-in and defaults to
 `false`, preserving the virtual compatibility contract above. Status and check

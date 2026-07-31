@@ -397,6 +397,7 @@ mod tests {
                     timing: None,
                     repository: repository.clone(),
                     rebase_on_join: crate::read::RebaseOnJoinStatus::default(),
+                    stack_backend: crate::read::StackBackendStatus::default(),
                     auto_admission: crate::read::AutoAdmissionStatus::default(),
                     default_branch: "main".to_owned(),
                     current_branch: None,

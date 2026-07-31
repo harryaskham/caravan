@@ -324,6 +324,7 @@ fn status(current: PullRequestSnapshot, others: Vec<PullRequestSnapshot>) -> Sta
         timing: None,
         repository: repository(),
         rebase_on_join: crate::read::RebaseOnJoinStatus::default(),
+        stack_backend: crate::read::StackBackendStatus::default(),
         auto_admission: crate::read::AutoAdmissionStatus::default(),
         default_branch: "main".to_owned(),
         current_branch: snapshot.current_branch,

@@ -517,15 +517,20 @@ nor fetch Git dependencies at build time.
 
 ## Configuration
 
-Repository policy and hooks live at `.caravan/config.yaml`. The optional
-`rebase_on_join: true` mode physically rebases each owned PR's candidate-only,
-linear commit range onto its exact predecessor under an exact force-with-lease;
-it is disabled by default and never mutates the caller's worktree:
+Repository policy and hooks live at `.caravan/config.yaml`. `stack_type` defaults
+to `caravan`, preserving the existing implementation without probing GitHub's
+native Stack API. The explicit `github` value is initially a read-only preview:
+status reports capability and exact Stack drift, while provider-mutating
+workflows return `github_stack_backend_read_only`. The optional `rebase_on_join: true` mode
+physically rebases each owned PR's candidate-only, linear commit range onto its
+exact predecessor under an exact force-with-lease; it is disabled by default and
+never mutates the caller's worktree:
 
 ```yaml
 version: 1
 repository: owner/name  # optional; required only when git remotes cannot name it
 force_merge: false
+stack_type: caravan
 rebase_on_join: false
 command_timeout_secs: 30
 repair:

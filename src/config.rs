@@ -12,6 +12,35 @@ use serde_json::{Value, json};
 use crate::model::{EventKind, HeadMergeActor};
 use crate::root_merge::ExternalAutoMergePolicy;
 
+/// Provider representation and landing backend for one Caravan stack.
+///
+/// `caravan` is the stable default and preserves the existing label/base-chain
+/// implementation. `github` is an explicit preview opt-in; the first rollout
+/// is read-only until the provider mutation adapter is separately accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StackType {
+    #[default]
+    Caravan,
+    Github,
+}
+
+impl StackType {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Caravan => "caravan",
+            Self::Github => "github",
+        }
+    }
+}
+
+impl std::fmt::Display for StackType {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.code())
+    }
+}
+
 /// Supported config schema version.
 pub const CONFIG_VERSION: u32 = 1;
 /// Version of this Cara reader.
@@ -359,6 +388,10 @@ pub struct CaravanConfig {
     #[serde(default = "legacy_min_cara_version")]
     pub min_cara_version: String,
     pub force_merge: bool,
+    /// Stack representation and landing backend. Absent configuration keeps
+    /// the historical Cara-owned provider model and performs no native Stack
+    /// API probes or mutations.
+    pub stack_type: StackType,
     /// Explicitly authorize lease-protected history rewriting so PR ancestry
     /// physically follows the Caravan chain. Safe default is disabled.
     pub rebase_on_join: bool,
@@ -392,6 +425,7 @@ impl Default for CaravanConfig {
             version: config_version(),
             min_cara_version: CARA_VERSION.to_owned(),
             force_merge: false,
+            stack_type: StackType::default(),
             rebase_on_join: false,
             agent_priority_labels: default_agent_priority_labels(),
             command_timeout_secs: default_command_timeout_secs(),
@@ -592,6 +626,18 @@ impl CaravanConfig {
             return Err(ConfigError::Validation(format!(
                 "repair.materialization_timeout_secs must be between 1 and {MAX_COMMAND_TIMEOUT_SECS}"
             )));
+        }
+        if self.stack_type == StackType::Github {
+            if self.rebase_on_join {
+                return Err(ConfigError::Validation(
+                    "stack_type: github currently requires rebase_on_join: false; GitHub Stack preview must not introduce a second physical branch writer".to_owned(),
+                ));
+            }
+            if self.sync.resolved_head_merge_actor() != HeadMergeActor::Caravan {
+                return Err(ConfigError::Validation(
+                    "stack_type: github requires sync.head_merge_actor: caravan; GitHub native Stack entries do not support provider auto-merge".to_owned(),
+                ));
+            }
         }
         if self.sync.actions.join_unlabelled_prs && !self.rebase_on_join {
             return Err(ConfigError::Validation(
@@ -1285,6 +1331,66 @@ mod environment_override_tests {
         assert_eq!(
             config.sync.checkout_on_decision, before,
             "no override is set in this test process"
+        );
+    }
+}
+
+#[cfg(test)]
+mod stack_type_tests {
+    use super::*;
+
+    #[test]
+    fn absent_stack_type_preserves_the_caravan_backend() {
+        let config: CaravanConfig = serde_yaml::from_str(
+            r"
+version: 1
+force_merge: false
+rebase_on_join: false
+command_timeout_secs: 30
+",
+        )
+        .expect("legacy config remains readable");
+
+        assert_eq!(config.stack_type, StackType::Caravan);
+        assert_eq!(CaravanConfig::default().stack_type, StackType::Caravan);
+    }
+
+    #[test]
+    fn github_stack_preview_requires_virtual_caravan_owned_merging() {
+        let config: CaravanConfig = serde_yaml::from_str(
+            r"
+version: 1
+force_merge: false
+stack_type: github
+rebase_on_join: false
+command_timeout_secs: 30
+sync:
+  head_merge_actor: caravan
+",
+        )
+        .expect("explicit GitHub Stack policy parses");
+        config
+            .validate()
+            .expect("the reviewed read-only preview combination is valid");
+
+        let mut physical = config.clone();
+        physical.rebase_on_join = true;
+        assert!(
+            physical
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("requires rebase_on_join: false")
+        );
+
+        let mut delegated = config;
+        delegated.sync.head_merge_actor = Some(HeadMergeActor::Github);
+        assert!(
+            delegated
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("requires sync.head_merge_actor: caravan")
         );
     }
 }

@@ -98,6 +98,317 @@ fn rebase_on_join_status(context: &AppContext) -> RebaseOnJoinStatus {
     }
 }
 
+/// Whether the configured provider exposes native Stack reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StackCapability {
+    NotProbed,
+    Available,
+    Unavailable,
+    Unknown,
+}
+
+impl StackCapability {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::NotProbed => "not_probed",
+            Self::Available => "available",
+            Self::Unavailable => "unavailable",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Whether Cara may mutate through the configured backend in this release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StackMutationSupport {
+    Caravan,
+    ReadOnlyPreview,
+}
+
+impl StackMutationSupport {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Caravan => "caravan",
+            Self::ReadOnlyPreview => "read_only_preview",
+        }
+    }
+}
+
+/// Exact relationship between one provider Stack and Cara's graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StackConsistency {
+    Exact,
+    Drifted,
+    Orphaned,
+    Unknown,
+}
+
+impl StackConsistency {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Drifted => "drifted",
+            Self::Orphaned => "orphaned",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct StackBackendProblem {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct NativeStackStatus {
+    pub stack: crate::github::GitHubStackSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caravan_id: Option<PrNumber>,
+    pub consistency: StackConsistency,
+    #[serde(default)]
+    pub problems: Vec<StackBackendProblem>,
+}
+
+/// Read-only configured backend status. The stable Caravan default never probes
+/// the GitHub Stacks API; explicit GitHub mode reports capability and drift but
+/// remains mutation-blocked until later rollout slices land.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct StackBackendStatus {
+    pub configured: crate::config::StackType,
+    pub capability: StackCapability,
+    pub mutation_support: StackMutationSupport,
+    #[serde(default)]
+    pub native_stacks: Vec<NativeStackStatus>,
+    #[serde(default)]
+    pub provider_stacks_truncated: bool,
+    #[serde(default)]
+    pub missing_caravans: Vec<PrNumber>,
+    #[serde(default)]
+    pub problems: Vec<StackBackendProblem>,
+}
+
+impl Default for StackBackendStatus {
+    fn default() -> Self {
+        Self {
+            configured: crate::config::StackType::Caravan,
+            capability: StackCapability::NotProbed,
+            mutation_support: StackMutationSupport::Caravan,
+            native_stacks: Vec::new(),
+            provider_stacks_truncated: false,
+            missing_caravans: Vec::new(),
+            problems: Vec::new(),
+        }
+    }
+}
+
+trait NativeStackInventoryProvider {
+    fn native_stack_inventory(
+        &self,
+        repository: &RepositoryId,
+    ) -> Result<crate::github::GitHubStackInventory, crate::github::GitHubStackReadError>;
+}
+
+impl<R: crate::command::CommandRunner> NativeStackInventoryProvider
+    for crate::github::GitHubMutationAdapter<R>
+{
+    fn native_stack_inventory(
+        &self,
+        repository: &RepositoryId,
+    ) -> Result<crate::github::GitHubStackInventory, crate::github::GitHubStackReadError> {
+        self.native_stack_inventory(repository)
+    }
+}
+
+fn apply_stack_backend_mutation_policy(
+    configured: crate::config::StackType,
+    initialization: &mut crate::initialization::InitializationStatus,
+) {
+    if configured != crate::config::StackType::Github {
+        return;
+    }
+    initialization.ready = false;
+    initialization.mutation_blocker =
+        Some(crate::initialization::InitializationMutationBlocker {
+            code: "github_stack_backend_read_only".to_owned(),
+            message: "GitHub native Stack mode is read-only in this rollout phase".to_owned(),
+            next: "inspect stack_backend capability and consistency; keep stack_type: caravan for mutations until the reviewed Stack adapter is released".to_owned(),
+        });
+}
+
+fn stack_backend_status(
+    configured: crate::config::StackType,
+    provider: &impl NativeStackInventoryProvider,
+    repository: &RepositoryId,
+    analysis: &GraphAnalysis,
+) -> StackBackendStatus {
+    if configured == crate::config::StackType::Caravan {
+        return StackBackendStatus::default();
+    }
+
+    let inventory = match provider.native_stack_inventory(repository) {
+        Ok(inventory) => inventory,
+        Err(crate::github::GitHubStackReadError::Unavailable { diagnostic }) => {
+            return StackBackendStatus {
+                configured,
+                capability: StackCapability::Unavailable,
+                mutation_support: StackMutationSupport::ReadOnlyPreview,
+                problems: vec![StackBackendProblem {
+                    code: "github_stacks_unavailable".to_owned(),
+                    message: diagnostic,
+                }],
+                ..StackBackendStatus::default()
+            };
+        }
+        Err(error) => {
+            return StackBackendStatus {
+                configured,
+                capability: StackCapability::Unknown,
+                mutation_support: StackMutationSupport::ReadOnlyPreview,
+                problems: vec![StackBackendProblem {
+                    code: "github_stacks_capability_unknown".to_owned(),
+                    message: error.to_string(),
+                }],
+                ..StackBackendStatus::default()
+            };
+        }
+    };
+
+    let mut represented = BTreeSet::new();
+    let mut native_stacks = Vec::with_capacity(inventory.stacks.len());
+    for stack in inventory.stacks {
+        let members = stack
+            .pull_requests
+            .iter()
+            .map(|pull| PrNumber(pull.number))
+            .collect::<Vec<_>>();
+        let caravan = members
+            .first()
+            .and_then(|member| analysis.fleet.containing(*member));
+        let mut problems = Vec::new();
+        let (caravan_id, mut consistency) = if let Some(caravan) = caravan {
+            represented.insert(caravan.id);
+            if caravan.members == members {
+                (Some(caravan.id), StackConsistency::Exact)
+            } else {
+                problems.push(StackBackendProblem {
+                    code: "github_stack_member_order_drift".to_owned(),
+                    message: format!(
+                        "Stack #{} members {:?} do not equal caravan #{} members {:?}",
+                        stack.number, members, caravan.id, caravan.members
+                    ),
+                });
+                (Some(caravan.id), StackConsistency::Drifted)
+            }
+        } else {
+            problems.push(StackBackendProblem {
+                code: "github_stack_orphaned".to_owned(),
+                message: format!(
+                    "Stack #{} does not map to any current Caravan",
+                    stack.number
+                ),
+            });
+            (None, StackConsistency::Orphaned)
+        };
+
+        if stack.base.ref_name != analysis.fleet.default_branch.name {
+            problems.push(StackBackendProblem {
+                code: "github_stack_base_drift".to_owned(),
+                message: format!(
+                    "Stack #{} targets `{}` instead of `{}`",
+                    stack.number, stack.base.ref_name, analysis.fleet.default_branch.name
+                ),
+            });
+            consistency = StackConsistency::Drifted;
+        }
+        for (index, entry) in stack.pull_requests.iter().enumerate() {
+            let number = PrNumber(entry.number);
+            let Some(pull) = analysis.pull_requests.get(&number) else {
+                problems.push(StackBackendProblem {
+                    code: "github_stack_pr_missing".to_owned(),
+                    message: format!(
+                        "Stack #{} PR #{} is absent from Cara discovery",
+                        stack.number, number
+                    ),
+                });
+                consistency = StackConsistency::Drifted;
+                continue;
+            };
+            if pull.head.oid != entry.head.sha || pull.head.name != entry.head.ref_name {
+                problems.push(StackBackendProblem {
+                    code: "github_stack_head_drift".to_owned(),
+                    message: format!(
+                        "Stack #{} PR #{} head generation differs from Cara discovery",
+                        stack.number, number
+                    ),
+                });
+                consistency = StackConsistency::Drifted;
+            }
+            let expected_base = if index == 0 {
+                analysis.fleet.default_branch.name.as_str()
+            } else {
+                stack.pull_requests[index - 1].head.ref_name.as_str()
+            };
+            if pull.base.name != expected_base {
+                problems.push(StackBackendProblem {
+                    code: "github_stack_pr_base_drift".to_owned(),
+                    message: format!(
+                        "Stack #{} PR #{} targets `{}` instead of `{expected_base}`",
+                        stack.number, number, pull.base.name
+                    ),
+                });
+                consistency = StackConsistency::Drifted;
+            }
+        }
+        native_stacks.push(NativeStackStatus {
+            stack,
+            caravan_id,
+            consistency,
+            problems,
+        });
+    }
+
+    let missing_caravans = if inventory.truncated {
+        Vec::new()
+    } else {
+        analysis
+            .fleet
+            .caravans
+            .iter()
+            .filter(|caravan| caravan.members.len() >= 2 && !represented.contains(&caravan.id))
+            .map(|caravan| caravan.id)
+            .collect::<Vec<_>>()
+    };
+    let mut problems = missing_caravans
+        .iter()
+        .map(|caravan| StackBackendProblem {
+            code: "github_stack_absent".to_owned(),
+            message: format!("caravan #{caravan} has no provider-native Stack"),
+        })
+        .collect::<Vec<_>>();
+    if inventory.truncated {
+        problems.push(StackBackendProblem {
+            code: "github_stack_inventory_truncated".to_owned(),
+            message: "GitHub returned a full bounded page; repository-wide Stack absence cannot be proven".to_owned(),
+        });
+    }
+    StackBackendStatus {
+        configured,
+        capability: StackCapability::Available,
+        mutation_support: StackMutationSupport::ReadOnlyPreview,
+        native_stacks,
+        provider_stacks_truncated: inventory.truncated,
+        missing_caravans,
+        problems,
+    }
+}
+
 /// Repository-wide live Caravan status.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct StatusOutput {
@@ -128,6 +439,9 @@ pub struct StatusOutput {
     /// Explicitly reports enabled/disabled physical chain-rebuild policy.
     #[serde(default)]
     pub rebase_on_join: RebaseOnJoinStatus,
+    /// Configured Stack backend, provider capability, and exact read-only drift.
+    #[serde(default)]
+    pub stack_backend: StackBackendStatus,
     /// Exact configured merge-actor policy for caravan roots. Every surface
     /// that arms, refuses, or performs a merge reads this one fact so the
     /// auto-merge invariant, membership, reshape, pause, and sync can never
@@ -807,6 +1121,13 @@ fn status_with_discovery_options(
         }
     });
     apply_generation_graph_problems(&mut analysis, &generation_integrity);
+    let stack_backend = stack_backend_status(
+        context.config.stack_type,
+        &label_provider,
+        &snapshot.repository,
+        &analysis,
+    );
+    apply_stack_backend_mutation_policy(context.config.stack_type, &mut initialization);
     let admission = resolve_admission_with_generation(
         &analysis,
         &context.config.agent_priority_labels,
@@ -845,6 +1166,7 @@ fn status_with_discovery_options(
         timing: None,
         repository: snapshot.repository,
         rebase_on_join: rebase_on_join_status(context),
+        stack_backend,
         auto_admission: AutoAdmissionStatus {
             enabled: context.config.sync.actions.join_unlabelled_prs,
             heuristic_version: crate::sync::AUTO_ADMISSION_HEURISTIC_VERSION.to_owned(),
@@ -2511,6 +2833,33 @@ mod tests {
             })
         }
     }
+
+    struct FixedStackProvider(
+        Result<crate::github::GitHubStackInventory, crate::github::GitHubStackReadError>,
+    );
+
+    impl NativeStackInventoryProvider for FixedStackProvider {
+        fn native_stack_inventory(
+            &self,
+            _repository: &RepositoryId,
+        ) -> Result<crate::github::GitHubStackInventory, crate::github::GitHubStackReadError>
+        {
+            self.0.clone()
+        }
+    }
+
+    struct StackProviderMustNotBeCalled;
+
+    impl NativeStackInventoryProvider for StackProviderMustNotBeCalled {
+        fn native_stack_inventory(
+            &self,
+            _repository: &RepositoryId,
+        ) -> Result<crate::github::GitHubStackInventory, crate::github::GitHubStackReadError>
+        {
+            panic!("the default Caravan backend must not probe GitHub Stacks")
+        }
+    }
+
     use crate::model::{AutoMergeState, BranchSnapshot, CommitOid, PullRequestState};
 
     fn repository() -> RepositoryId {
@@ -2596,6 +2945,7 @@ mod tests {
             timing: None,
             repository: repository(),
             rebase_on_join: RebaseOnJoinStatus::default(),
+            stack_backend: StackBackendStatus::default(),
             auto_admission: AutoAdmissionStatus::default(),
             default_branch: "main".to_owned(),
             current_branch: snapshot.current_branch,
@@ -4478,6 +4828,143 @@ mod tests {
                 .unwrap()
                 .contains_key(&key)
         );
+    }
+
+    #[test]
+    fn caravan_stack_backend_is_default_and_performs_no_capability_probe() {
+        let status = status(pr(9, "nine", "main", false), Vec::new());
+
+        let backend = stack_backend_status(
+            crate::config::StackType::Caravan,
+            &StackProviderMustNotBeCalled,
+            &status.repository,
+            &status.analysis,
+        );
+
+        assert_eq!(backend.configured, crate::config::StackType::Caravan);
+        assert_eq!(backend.capability, StackCapability::NotProbed);
+        assert_eq!(backend.mutation_support, StackMutationSupport::Caravan);
+    }
+
+    #[test]
+    fn github_stack_read_model_binds_exact_member_order_bases_and_heads() {
+        let root = pr(1, "root", "main", true);
+        let child = pr(2, "child", "root", true);
+        let status = status(child.clone(), vec![root.clone(), child.clone()]);
+        let provider = FixedStackProvider(Ok(crate::github::GitHubStackInventory {
+            truncated: false,
+            stacks: vec![crate::github::GitHubStackSnapshot {
+                id: 9001,
+                number: 42,
+                node_id: "S_stack".to_owned(),
+                base: crate::github::GitHubStackBase {
+                    ref_name: "main".to_owned(),
+                },
+                open: true,
+                created_at: "2026-07-31T10:00:00Z".to_owned(),
+                pull_requests: vec![
+                    crate::github::GitHubStackPullRequest {
+                        number: 1,
+                        state: "open".to_owned(),
+                        draft: false,
+                        merged_at: None,
+                        head: crate::github::GitHubStackPullRequestHead {
+                            ref_name: root.head.name.clone(),
+                            sha: root.head.oid.clone(),
+                        },
+                    },
+                    crate::github::GitHubStackPullRequest {
+                        number: 2,
+                        state: "open".to_owned(),
+                        draft: false,
+                        merged_at: None,
+                        head: crate::github::GitHubStackPullRequestHead {
+                            ref_name: child.head.name.clone(),
+                            sha: child.head.oid.clone(),
+                        },
+                    },
+                ],
+            }],
+        }));
+
+        let backend = stack_backend_status(
+            crate::config::StackType::Github,
+            &provider,
+            &status.repository,
+            &status.analysis,
+        );
+
+        assert_eq!(backend.capability, StackCapability::Available);
+        assert_eq!(
+            backend.mutation_support,
+            StackMutationSupport::ReadOnlyPreview
+        );
+        assert_eq!(backend.native_stacks[0].caravan_id, Some(PrNumber(1)));
+        assert_eq!(
+            backend.native_stacks[0].consistency,
+            StackConsistency::Exact
+        );
+        assert!(backend.problems.is_empty());
+    }
+
+    #[test]
+    fn truncated_stack_inventory_never_infers_absent_caravans() {
+        let root = pr(1, "root", "main", true);
+        let child = pr(2, "child", "root", true);
+        let status = status(child.clone(), vec![root, child]);
+        let provider = FixedStackProvider(Ok(crate::github::GitHubStackInventory {
+            stacks: Vec::new(),
+            truncated: true,
+        }));
+
+        let backend = stack_backend_status(
+            crate::config::StackType::Github,
+            &provider,
+            &status.repository,
+            &status.analysis,
+        );
+
+        assert!(backend.missing_caravans.is_empty());
+        assert!(
+            backend
+                .problems
+                .iter()
+                .any(|problem| problem.code == "github_stack_inventory_truncated")
+        );
+    }
+
+    #[test]
+    fn github_stack_preview_blocks_mutation_but_caravan_default_does_not() {
+        let mut stable = crate::initialization::InitializationStatus::default();
+        apply_stack_backend_mutation_policy(crate::config::StackType::Caravan, &mut stable);
+        assert!(stable.ready);
+        assert!(stable.mutation_blocker.is_none());
+
+        let mut preview = crate::initialization::InitializationStatus::default();
+        apply_stack_backend_mutation_policy(crate::config::StackType::Github, &mut preview);
+        assert!(!preview.ready);
+        assert_eq!(
+            preview.mutation_blocker.unwrap().code,
+            "github_stack_backend_read_only"
+        );
+    }
+
+    #[test]
+    fn github_stack_capability_failure_is_typed_without_faking_absence() {
+        let status = status(pr(9, "nine", "main", false), Vec::new());
+        let provider = FixedStackProvider(Err(crate::github::GitHubStackReadError::Unavailable {
+            diagnostic: "Not Found (HTTP 404)".to_owned(),
+        }));
+
+        let backend = stack_backend_status(
+            crate::config::StackType::Github,
+            &provider,
+            &status.repository,
+            &status.analysis,
+        );
+
+        assert_eq!(backend.capability, StackCapability::Unavailable);
+        assert_eq!(backend.problems[0].code, "github_stacks_unavailable");
     }
 
     #[test]

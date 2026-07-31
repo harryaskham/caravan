@@ -2239,6 +2239,49 @@ fn render_status(output: &caravan::read::StatusOutput) -> String {
             .map_or_else(String::new, |next| format!(" — {next}"))
     );
     let _ = writeln!(text, "rebase_on_join={}", output.rebase_on_join.state);
+    let _ = writeln!(
+        text,
+        "stack_backend={} capability={} mutations={} native_stacks={} missing_caravans={} truncated={}",
+        output.stack_backend.configured.code(),
+        output.stack_backend.capability.code(),
+        output.stack_backend.mutation_support.code(),
+        output.stack_backend.native_stacks.len(),
+        output.stack_backend.missing_caravans.len(),
+        output.stack_backend.provider_stacks_truncated,
+    );
+    if let Some(blocker) = &output.initialization.mutation_blocker {
+        let _ = writeln!(
+            text,
+            "  mutation blocker: {} — {} — {}",
+            blocker.code, blocker.message, blocker.next
+        );
+    }
+    for native in &output.stack_backend.native_stacks {
+        let _ = writeln!(
+            text,
+            "  native Stack #{} consistency={} caravan={} entries={}",
+            native.stack.number,
+            native.consistency.code(),
+            native
+                .caravan_id
+                .map_or_else(|| "none".to_owned(), |id| id.to_string()),
+            native.stack.pull_requests.len(),
+        );
+        for problem in &native.problems {
+            let _ = writeln!(
+                text,
+                "    stack problem: {} — {}",
+                problem.code, problem.message
+            );
+        }
+    }
+    for problem in &output.stack_backend.problems {
+        let _ = writeln!(
+            text,
+            "  stack problem: {} — {}",
+            problem.code, problem.message
+        );
+    }
     let rate = output.provider_api.rate_limit.as_ref().map_or_else(
         || "rate=unavailable".to_owned(),
         |rate| {
@@ -3541,6 +3584,7 @@ mod tests {
             timing: None,
             repository: repository.clone(),
             rebase_on_join: caravan::read::RebaseOnJoinStatus::default(),
+            stack_backend: caravan::read::StackBackendStatus::default(),
             auto_admission: caravan::read::AutoAdmissionStatus::default(),
             default_branch: "main".to_owned(),
             current_branch: Some("feature".to_owned()),
@@ -3577,6 +3621,7 @@ mod tests {
         assert!(rendered.contains("CARAVAN  harryaskham/caravan @ main  healthy"));
         assert!(rendered.contains("current: feature (no open PR)"));
         assert!(rendered.contains("rebase_on_join=disabled"));
+        assert!(rendered.contains("stack_backend=caravan capability=not_probed mutations=caravan"));
         assert!(rendered.contains("set `rebase_on_join: true`"));
         assert!(!rendered.contains("\"analysis\""));
     }
