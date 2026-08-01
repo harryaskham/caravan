@@ -10,7 +10,6 @@ use sha2::{Digest, Sha256};
 
 use crate::command::{CommandOutput, CommandRunError, CommandRunner, CommandSpec, ProcessRunner};
 use crate::model::{Caravan, CommitOid, PrNumber, PullRequestSnapshot, RepositoryId};
-use crate::operation_lock::OperationLock;
 use crate::read::{self, StatusOutput};
 use crate::{AppContext, AppError};
 
@@ -82,7 +81,7 @@ pub fn checkout_decision_snapshot(
     pull_request: &PullRequestSnapshot,
     operation_deadline: std::time::Instant,
 ) -> Result<Option<crate::operation_lock::OperationLockRecovery>, AppError> {
-    let mut lock = OperationLock::acquire(&context.repository_path, "sync_decision_checkout")?;
+    let mut lock = context.acquire_writer_operation("sync_decision_checkout")?;
     let lock_recovery = lock.recovered_dead_owner().cloned();
     lock.checkpoint(
         "decision_checkout_in_flight",
@@ -119,7 +118,7 @@ pub fn navigate(
     direction: Direction,
 ) -> Result<NavigationOutput, AppError> {
     let operation = format!("navigate_{scope:?}_{direction:?}").to_ascii_lowercase();
-    let lock = OperationLock::acquire(&context.repository_path, &operation)?;
+    let lock = context.acquire_writer_operation(&operation)?;
     let runner = ProcessRunner::in_directory(&context.repository_path).with_timeout(
         std::time::Duration::from_secs(context.config.command_timeout_secs),
     );

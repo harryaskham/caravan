@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 
 use crate::command::{CommandOutput, CommandRunError, CommandRunner, CommandSpec, ProcessRunner};
 use crate::model::{BranchSnapshot, CommitOid, PrNumber, PullRequestSnapshot, RepositoryId};
+#[cfg(test)]
 use crate::operation_lock::OperationLock;
 use crate::{AppContext, AppError, SyncInput};
 
@@ -414,7 +415,7 @@ pub fn start(
     context: &AppContext,
     input: &RepairStartInput,
 ) -> Result<RepairStartOutput, AppError> {
-    let mut lock = OperationLock::acquire(&context.repository_path, "repair-start")?;
+    let mut lock = context.acquire_writer_operation("repair-start")?;
     lock.checkpoint(
         "repair_discovery_in_flight",
         json!({"pr": input.pr, "target_pr": input.target_pr}),
@@ -925,8 +926,7 @@ pub fn authorize_agent_edits(
             "Caravan config changed after the repair session was prepared",
         ));
     }
-    let mut lock =
-        OperationLock::acquire(&context.repository_path, "repair-authorize-agent-edits")?;
+    let mut lock = context.acquire_writer_operation("repair-authorize-agent-edits")?;
     lock.checkpoint(
         "repair_agent_edit_authorization_preflight",
         repair_lock_receipt(&repair)?,
@@ -1159,7 +1159,7 @@ pub fn grant_paths(
             Some(json!({"repair": repair_status_output(&repair)?})),
         ));
     }
-    let mut lock = OperationLock::acquire(&context.repository_path, "repair-grant")?;
+    let mut lock = context.acquire_writer_operation("repair-grant")?;
     lock.checkpoint(
         "repair_semantic_grant_preflight",
         repair_lock_receipt(&repair)?,
@@ -1425,7 +1425,7 @@ pub fn revoke_grants(
             "Caravan config changed after the repair session was prepared",
         ));
     }
-    let mut lock = OperationLock::acquire(&context.repository_path, "repair-revoke-grant")?;
+    let mut lock = context.acquire_writer_operation("repair-revoke-grant")?;
     lock.checkpoint(
         "repair_semantic_grant_revocation_preflight",
         repair_lock_receipt(&repair)?,
@@ -1754,7 +1754,7 @@ pub fn continue_session(
         return resume_or_return(context, input, &paths, repair, publication);
     }
 
-    let mut lock = OperationLock::acquire(&context.repository_path, "repair-continue")?;
+    let mut lock = context.acquire_writer_operation("repair-continue")?;
     lock.checkpoint(
         "repair_verification_in_flight",
         repair_lock_receipt(&repair)?,
@@ -1945,7 +1945,7 @@ fn resume_or_return(
     repair.phase = RepairPhase::SyncPending;
     repair.updated_unix_ms = unix_ms();
     write_manifest(&paths.manifest, &repair)?;
-    let caller_lock = OperationLock::acquire(&context.repository_path, "repair-sync")?;
+    let caller_lock = context.acquire_writer_operation("repair-sync")?;
     let workspace_context = AppContext {
         repository_path: paths.workspace.clone(),
         config_path: PathBuf::from(&repair.config_path),
@@ -1998,7 +1998,7 @@ pub fn abort(
     let paths = repair_paths_for_session(&context.repository_path, &input.session)?;
     let repair = read_manifest(&paths.manifest)?;
     require_session_match(&repair, &input.session)?;
-    let lock = OperationLock::acquire(&context.repository_path, "repair-abort")?;
+    let lock = context.acquire_writer_operation("repair-abort")?;
     let workspace_removed = paths.session_root.exists();
     if workspace_removed {
         fs::remove_dir_all(&paths.session_root).map_err(|error| {

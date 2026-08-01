@@ -22,7 +22,6 @@ use crate::model::{
     OperationId, OperationReceipt, PrNumber, PullRequestPrecondition, PullRequestSnapshot,
     PullRequestState, RepositoryId,
 };
-use crate::operation_lock::OperationLock;
 use crate::read::{self, CheckOutput, StatusOutput};
 use crate::{AppContext, AppError, CheckInput, CreateInput, JoinInput};
 
@@ -524,7 +523,7 @@ fn execute_live(
     request: &MembershipRequest,
     candidate_pr: Option<u64>,
 ) -> Result<MembershipOutput, AppError> {
-    let _lock = OperationLock::acquire(&context.repository_path, request.operation.name())?;
+    let _lock = context.acquire_writer_operation(request.operation.name())?;
     execute_locked(context, request, candidate_pr, None, None, None, true)
 }
 

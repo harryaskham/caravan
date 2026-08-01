@@ -19,7 +19,6 @@ use crate::model::{
     MutationKind, MutationStep, MutationStepState, OperationId, OperationReceipt, PrNumber,
     PullRequestPrecondition, PullRequestSnapshot, PullRequestState, RepositorySnapshot,
 };
-use crate::operation_lock::OperationLock;
 use crate::read::{self, StatusOutput};
 use crate::{AppContext, AppError, EvictInput, SplitInput};
 
@@ -208,7 +207,7 @@ fn execute_live(
     selected: Option<PrNumber>,
     reason: Option<String>,
 ) -> Result<ReshapeOutput, AppError> {
-    let _lock = OperationLock::acquire(&context.repository_path, operation.name())?;
+    let _lock = context.acquire_writer_operation(operation.name())?;
     let timeout = std::time::Duration::from_secs(context.config.command_timeout_secs);
     let status = read::status(context)?;
     let repository = status.repository.clone();

@@ -37,6 +37,7 @@ pub mod root_merge;
 pub mod squash_equivalence;
 pub mod sync;
 pub mod web;
+pub mod writer_guard;
 
 use clap::Args;
 use feedback_cli::{FeedbackConfig, FeedbackError, ReportStrategy, Reporter};
@@ -479,8 +480,9 @@ RECOVERY, LOCKS, AND OBSERVABILITY
   `docs/remote-writer-lease.md`, but it is not active. Provider/Git writes carry
   explicit intent and a fenced runner refuses missing markers or a lost token
   before child execution. `writer.mode` defaults to `local_only`; reserved
-  `read_only`/`remote_fenced` values fail startup until operations install the
-  fenced runner before their local lock.
+  `read_only`/`remote_fenced` values fail startup. Every production mutation
+  already enters one `WriterOperationGuard` local-lock boundary; activation must
+  extend it to acquire remote first and install the fenced runner.
 - `cara self-update status|check|run` updates only the exact running first-PATH
   stable user binary (`~/.cargo/bin`, `~/.local/bin`, or an exact explicit
   `CARA_SELF_UPDATE_INSTALL_DIR`). Shadowed, renamed/test, Cargo target, and
@@ -620,6 +622,18 @@ impl AppContext {
             config_existed,
             config,
         })
+    }
+
+    /// Acquire the sole production mutation authority boundary.
+    pub fn acquire_writer_operation(
+        &self,
+        operation: &str,
+    ) -> Result<writer_guard::WriterOperationGuard, AppError> {
+        writer_guard::WriterOperationGuard::acquire(
+            &self.repository_path,
+            &self.config.writer,
+            operation,
+        )
     }
 }
 

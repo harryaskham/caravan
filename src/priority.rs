@@ -18,7 +18,6 @@ use crate::model::{
     BranchSnapshot, PrNumber, PullRequestPrecondition, PullRequestSnapshot, PullRequestState,
     RepositoryId,
 };
-use crate::operation_lock::OperationLock;
 use crate::read::StatusOutput;
 use crate::{AppContext, AppError};
 
@@ -208,7 +207,7 @@ fn execute_live(
     if let PriorityOperation::Set(label) = operation {
         validate_requested_label(label, &context.config.agent_priority_labels)?;
     }
-    let lock = OperationLock::acquire(&context.repository_path, "priority_control")?;
+    let lock = context.acquire_writer_operation("priority_control")?;
     let status = crate::read::status_for_remote_candidate(context, PrNumber(pr))?;
     ensure_config_unchanged(context)?;
     let provider = GitHubMutationAdapter::new(

@@ -3,7 +3,7 @@
 use super::{
     AUTO_ADMISSION_HEURISTIC_VERSION, AppContext, AppError, AutoCandidateTarget, Caravan,
     CiDisposition, Duration, ErrorCategory, EventKind, GitHubMutationAdapter, Instant,
-    OperationLock, PullRequestPrecondition, PullRequestSnapshot, PullRequestState, StatusOutput,
+    PullRequestPrecondition, PullRequestSnapshot, PullRequestState, StatusOutput,
     SyncApplyAdmissionPlan, SyncAutoAdmissionPlan, SyncInput, SyncPlanAction, SyncPlanActionState,
     SyncPlanDecision, SyncPlanOutput, SyncPlanPhase, SyncProgress, SyncProvider,
     evaluate_auto_candidate, head_is_conflict_free_with_default, json, merged_predecessor,
@@ -47,7 +47,7 @@ pub(crate) fn rename_mutation_failure_for_plan(error: AppError) -> AppError {
 
 #[allow(clippy::too_many_lines)]
 fn plan_sync_inner(context: &AppContext, input: &SyncInput) -> Result<SyncPlanOutput, AppError> {
-    let _lock = OperationLock::acquire(&context.repository_path, "plan-sync")?;
+    let _lock = context.acquire_writer_operation("plan-sync")?;
     let started = Instant::now();
     let operation_deadline = started + sync_operation_budget(context);
     let github_budget =

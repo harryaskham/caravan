@@ -22,7 +22,6 @@ use crate::model::{
     MutationStepState, OperationId, OperationReceipt, PrNumber, PullRequestPrecondition,
     PullRequestSnapshot, PullRequestState, RepositoryId,
 };
-use crate::operation_lock::OperationLock;
 use crate::read::StatusOutput;
 use crate::{AppContext, AppError};
 
@@ -230,7 +229,7 @@ fn execute_live(
     operation: ForceIntentOperation,
 ) -> Result<ForceIntentOutput, AppError> {
     validate_input(input)?;
-    let _lock = OperationLock::acquire(&context.repository_path, operation.name())?;
+    let _lock = context.acquire_writer_operation(operation.name())?;
     let timeout = Duration::from_secs(context.config.command_timeout_secs);
     let deadline =
         std::time::Instant::now() + Duration::from_secs(context.config.sync.max_duration_secs);

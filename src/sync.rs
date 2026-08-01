@@ -43,6 +43,7 @@ use crate::root_merge::{
     RootMergeAncestry, RootMergeBlock, RootMergeFacts, RootMergeFailureCause, RootMergeGate,
     RootMergeReceipt, RootPromotionFailureCause, RootPromotionReceipt, RootPromotionTrigger,
 };
+use crate::writer_guard::WriterOperationGuard;
 use crate::{AppContext, AppError, CheckInput, SyncInput};
 
 mod budget;
@@ -2343,7 +2344,7 @@ fn sync_without_hooks(
     started: Instant,
     operation_deadline: Instant,
 ) -> Result<SyncOutput, AppError> {
-    let lock = OperationLock::acquire(&context.repository_path, "sync")?;
+    let lock = context.acquire_writer_operation("sync")?;
     let lock_recovery = lock.recovered_dead_owner().cloned();
     sync_with_lock(
         context,
@@ -2362,7 +2363,7 @@ fn sync_with_lock(
     input: &SyncInput,
     started: Instant,
     operation_deadline: Instant,
-    mut lock: OperationLock,
+    mut lock: WriterOperationGuard,
     lock_recovery: Option<OperationLockRecovery>,
 ) -> Result<SyncOutput, AppError> {
     lock.checkpoint(

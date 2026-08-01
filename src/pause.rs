@@ -20,7 +20,6 @@ use crate::model::{
     AutoMergeState, CheckSnapshot, MutationKind, MutationStep, MutationStepState, OperationId,
     OperationReceipt, PrNumber, PullRequestPrecondition, PullRequestState, RepositoryId,
 };
-use crate::operation_lock::OperationLock;
 use crate::read::{self, StatusOutput};
 use crate::{AppContext, AppError, PauseInput, ResumeInput};
 
@@ -130,7 +129,7 @@ pub fn pause(context: &AppContext, input: &PauseInput) -> Result<PauseOutput, Ap
     if let Some(reference) = &input.external_reference {
         validate_text("external reference", reference)?;
     }
-    let _lock = OperationLock::acquire(&context.repository_path, "pause")?;
+    let _lock = context.acquire_writer_operation("pause")?;
     let status = read::status(context)?;
     crate::initialization::require_ready(&status.initialization)?;
     let head = PrNumber(input.head_pr);
@@ -215,7 +214,7 @@ pub fn pause(context: &AppContext, input: &PauseInput) -> Result<PauseOutput, Ap
 
 pub fn resume(context: &AppContext, input: &ResumeInput) -> Result<PauseOutput, AppError> {
     validate_text("actor", &input.actor)?;
-    let _lock = OperationLock::acquire(&context.repository_path, "resume")?;
+    let _lock = context.acquire_writer_operation("resume")?;
     let head = PrNumber(input.head_pr);
     let Some(record) = load_one(&context.repository_path, head)? else {
         return Err(AppError::validation(

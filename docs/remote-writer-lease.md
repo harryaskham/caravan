@@ -96,6 +96,21 @@ keep their write surfaces explicit. This seam is enforceable when wrapped, but
 production operations do not yet construct the wrapper, so non-local writer
 modes remain startup-closed.
 
+## Operation authority boundary
+
+Every production mutation now acquires `WriterOperationGuard` through
+`AppContext::acquire_writer_operation` rather than opening `OperationLock`
+directly. Membership, sync/plan, force/intent, reshape, pause/resume, priority,
+navigation decisions, and every repair lifecycle path share this boundary.
+`local_only` transparently preserves the existing local lock owner,
+checkpoint/recovery, explicit release, and Drop semantics. Source contract tests
+reject a new direct acquisition outside the lock implementation and test-only
+fixtures. Reserved non-local modes still refuse before local lock creation.
+
+This centralization does not acquire a remote lease or propagate a fenced runner
+by itself. The activation slice must extend this guard to acquire remote first,
+then local, and supply the same remote guard to all operation runners.
+
 ## Guard lifecycle
 
 `RemoteLeaseGuard` owns one grant, implements the command mutation-fence seam,

@@ -1889,7 +1889,7 @@ mod tests {
     #[test]
     fn production_remote_git_writes_are_explicitly_marked() {
         let physical = include_str!("physical_rebase.rs")
-            .split("#[cfg(test)]")
+            .split("\n#[cfg(test)]\nmod tests")
             .next()
             .unwrap();
         assert_eq!(physical.matches("\"push\"").count(), 3);
@@ -1897,7 +1897,7 @@ mod tests {
         assert_eq!(physical.matches(".git_write()").count(), 1);
 
         let repair = include_str!("repair.rs")
-            .split("#[cfg(test)]")
+            .split("\n#[cfg(test)]\nmod tests")
             .next()
             .unwrap();
         assert_eq!(repair.matches("\"push\"").count(), 1);
