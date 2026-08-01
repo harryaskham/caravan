@@ -431,6 +431,23 @@ impl Default for LoopConfig {
     }
 }
 
+/// Explicit per-repository native-Stack rollout opt-in.
+///
+/// This is an allowlist, not an enabler. Opting in is *necessary* before any
+/// executable native Stack mutation and remains insufficient on its own: the
+/// reviewed ruleset-locked orchestrator must also be released. Keeping the two
+/// separate means opening the workflow fence later can never silently enable
+/// every repository that merely selected `stack_type: github`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct StackRolloutConfig {
+    /// Explicit reviewed opt-in for this exact repository.
+    pub mutations_opt_in: bool,
+    /// Non-secret reviewer/ticket identity recorded with the opt-in.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reviewed_by: String,
+}
+
 /// Dedicated bounds for network-heavy isolated repair materialization.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
@@ -621,6 +638,9 @@ pub struct CaravanConfig {
     /// bounded atomic merge batch, not an unbounded queue.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_caravan_length: Option<u32>,
+    /// Explicit per-repository native-Stack rollout opt-in.
+    #[serde(default)]
+    pub stack_rollout: StackRolloutConfig,
     /// Non-secret repository authorization for ambient or GitHub App identity.
     pub github_auth: GithubAuthConfig,
     /// Local-only today; remote/read-only modes stay fail-closed until full wiring.
@@ -676,6 +696,7 @@ impl Default for CaravanConfig {
             force_merge: false,
             stack_type: StackType::default(),
             max_caravan_length: None,
+            stack_rollout: StackRolloutConfig::default(),
             github_auth: GithubAuthConfig::default(),
             writer: WriterConfig::default(),
             rebase_on_join: false,
@@ -903,6 +924,7 @@ impl CaravanConfig {
             self.validate_github_backend()?;
         }
         self.validate_batch_bound()?;
+        self.validate_stack_rollout()?;
         if self.sync.actions.join_unlabelled_prs && !self.rebase_on_join {
             return Err(ConfigError::Validation(
                 "sync.actions.join_unlabelled_prs requires rebase_on_join: true".to_owned(),
@@ -929,6 +951,26 @@ impl CaravanConfig {
                     "hooks.{event:?}.timeout_secs must be between 1 and {MAX_HOOK_TIMEOUT_SECS}"
                 )));
             }
+        }
+        Ok(())
+    }
+
+    /// An opt-in is meaningful only for the native backend, and only with a
+    /// recorded reviewer. It never by itself authorizes a mutation.
+    fn validate_stack_rollout(&self) -> Result<(), ConfigError> {
+        if !self.stack_rollout.mutations_opt_in {
+            return Ok(());
+        }
+        if self.stack_type != StackType::Github {
+            return Err(ConfigError::Validation(
+                "stack_rollout.mutations_opt_in requires stack_type: github; the default caravan backend has no native rollout gate".to_owned(),
+            ));
+        }
+        if self.stack_rollout.reviewed_by.trim().is_empty() {
+            return Err(ConfigError::Validation(
+                "stack_rollout.mutations_opt_in requires a non-empty reviewed_by identity"
+                    .to_owned(),
+            ));
         }
         Ok(())
     }

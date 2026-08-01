@@ -1034,6 +1034,17 @@ batch never stalls the queue. Sync never waits for occupancy; it lands the
 maximal contiguous ready prefix, and a fully ready batch lands as one atomic
 native merge. Status reports the effective bound and exact per-caravan
 full-batch evidence.
+
+Native rollout is additionally gated by an explicit per-repository allowlist.
+`stack_rollout.mutations_opt_in` requires `stack_type: github` and a non-empty
+`reviewed_by`, and is necessary but never sufficient: without it status reports
+`github_stack_repository_not_opted_in`, with it the reviewed rollout fence
+`github_stack_backend_read_only` still applies, and an unavailable or unproven
+capability outranks both with `github_stack_capability_unavailable` or
+`github_stack_capability_unknown` so absence is never inferred. Opting into
+`stack_type: github` also requires `min_cara_version` at or above the first
+native-Stack reader release, so an older Cara can never read a provider Stack as
+an ordinary caravan.
 The 2026-07-31 disposable sandbox
 proved successful full and partial atomic squash, all-or-none failure after an
 ordinary lower fast-forward, top-SHA rejection, and UUID recovery. It also

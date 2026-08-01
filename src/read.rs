@@ -227,11 +227,11 @@ impl<R: crate::command::CommandRunner> NativeStackInventoryProvider
 }
 
 fn apply_stack_backend_mutation_policy(
-    configured: crate::config::StackType,
+    config: &crate::config::CaravanConfig,
     backend: &StackBackendStatus,
     initialization: &mut crate::initialization::InitializationStatus,
 ) {
-    if configured != crate::config::StackType::Github {
+    if config.stack_type != crate::config::StackType::Github {
         return;
     }
     initialization.ready = false;
@@ -249,6 +249,19 @@ fn apply_stack_backend_mutation_policy(
             message: "GitHub native Stack capability could not be proven".to_owned(),
             next: "resolve the reported capability diagnostic and re-read status; an unproven capability never authorizes a mutation".to_owned(),
         },
+        // The allowlist is necessary and deliberately not sufficient: an
+        // opted-in repository still waits for the reviewed ruleset-locked
+        // orchestrator, so opening the fence can never enable every repository
+        // that merely selected the native backend.
+        StackCapability::NotProbed | StackCapability::Available
+            if !config.stack_rollout.mutations_opt_in =>
+        {
+            crate::initialization::InitializationMutationBlocker {
+                code: "github_stack_repository_not_opted_in".to_owned(),
+                message: "this repository has not explicitly opted into native GitHub Stack mutations".to_owned(),
+                next: "record a reviewed stack_rollout.mutations_opt_in with reviewed_by before native Stack rollout; opting in alone still does not enable mutations".to_owned(),
+            }
+        }
         StackCapability::NotProbed | StackCapability::Available => {
             crate::initialization::InitializationMutationBlocker {
                 code: "github_stack_backend_read_only".to_owned(),
@@ -1162,11 +1175,7 @@ fn status_with_discovery_options(
         &snapshot.repository,
         &analysis,
     );
-    apply_stack_backend_mutation_policy(
-        context.config.stack_type,
-        &stack_backend,
-        &mut initialization,
-    );
+    apply_stack_backend_mutation_policy(&context.config, &stack_backend, &mut initialization);
     let admission = resolve_admission_with_generation(
         &analysis,
         &context.config.agent_priority_labels,
@@ -5105,29 +5114,38 @@ mod tests {
             capability: StackCapability::Available,
             ..StackBackendStatus::default()
         };
+        let caravan_config = crate::config::CaravanConfig::default();
+        let mut opted_in = caravan_config.clone();
+        opted_in.stack_type = crate::config::StackType::Github;
+        opted_in.stack_rollout.mutations_opt_in = true;
+        opted_in.stack_rollout.reviewed_by = "operator".to_owned();
+        let mut not_opted_in = opted_in.clone();
+        not_opted_in.stack_rollout = crate::config::StackRolloutConfig::default();
+
         let mut stable = crate::initialization::InitializationStatus::default();
-        apply_stack_backend_mutation_policy(
-            crate::config::StackType::Caravan,
-            &available,
-            &mut stable,
-        );
+        apply_stack_backend_mutation_policy(&caravan_config, &available, &mut stable);
         assert!(stable.ready);
         assert!(stable.mutation_blocker.is_none());
 
-        let mut preview = crate::initialization::InitializationStatus::default();
-        apply_stack_backend_mutation_policy(
-            crate::config::StackType::Github,
-            &available,
-            &mut preview,
+        // bd-a79679: the allowlist is necessary, and deliberately insufficient.
+        let mut unlisted = crate::initialization::InitializationStatus::default();
+        apply_stack_backend_mutation_policy(&not_opted_in, &available, &mut unlisted);
+        assert!(!unlisted.ready);
+        assert_eq!(
+            unlisted.mutation_blocker.unwrap().code,
+            "github_stack_repository_not_opted_in"
         );
+
+        let mut preview = crate::initialization::InitializationStatus::default();
+        apply_stack_backend_mutation_policy(&opted_in, &available, &mut preview);
         assert!(!preview.ready);
         assert_eq!(
             preview.mutation_blocker.unwrap().code,
             "github_stack_backend_read_only"
         );
 
-        // bd-a79679: an unproven or unavailable capability is never absence and
-        // never the ordinary rollout fence.
+        // An unproven or unavailable capability is never absence, and outranks
+        // even an explicit repository opt-in.
         for (capability, code) in [
             (
                 StackCapability::Unavailable,
@@ -5140,11 +5158,7 @@ mod tests {
                 ..StackBackendStatus::default()
             };
             let mut blocked = crate::initialization::InitializationStatus::default();
-            apply_stack_backend_mutation_policy(
-                crate::config::StackType::Github,
-                &backend,
-                &mut blocked,
-            );
+            apply_stack_backend_mutation_policy(&opted_in, &backend, &mut blocked);
             assert!(!blocked.ready);
             assert_eq!(blocked.mutation_blocker.unwrap().code, code);
         }

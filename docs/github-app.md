@@ -3,7 +3,9 @@
 Caravan supports a GitHub App identity as an **opt-in deployment mode**. It does
 not replace local execution or ambient/stored `gh` authentication. The
 machine-readable permission baseline is
-[`github-app-policy.json`](github-app-policy.json).
+[`github-app-policy.json`](github-app-policy.json). For the operator click-path
+that produces the App, its installation ID, and a broker, see
+[`github-app-setup.md`](github-app-setup.md).
 
 ## Modes and credential broker
 

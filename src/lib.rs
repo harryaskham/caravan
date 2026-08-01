@@ -266,6 +266,12 @@ GITHUB NATIVE STACKS (EXPLICIT PREVIEW)
   admission deterministically uses another compatible caravan or opens a new
   one, and sync still lands the maximal contiguous ready prefix rather than
   waiting for a batch to fill.
+- `stack_rollout.mutations_opt_in` with a recorded `reviewed_by` is a required
+  per-repository allowlist and is deliberately not sufficient: status reports
+  `github_stack_repository_not_opted_in` without it, and
+  `github_stack_backend_read_only` with it, until the reviewed ruleset-locked
+  orchestrator ships. Unavailable or unproven capability outranks both and is
+  never treated as an absent Stack.
 
 VIRTUAL CHAINS (SAFE DEFAULT)
 With `rebase_on_join: false` or an absent setting, Caravan does not rewrite PR
@@ -2061,6 +2067,11 @@ mod tests {
         assert!(output.instructions.contains("Administration(write)"));
         assert!(output.instructions.contains("provider_atomic: false"));
         assert!(output.instructions.contains("max_caravan_length"));
+        assert!(
+            output
+                .instructions
+                .contains("stack_rollout.mutations_opt_in")
+        );
         assert!(
             output
                 .instructions

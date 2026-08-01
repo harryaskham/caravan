@@ -49,6 +49,7 @@ fn absent_stack_type_keeps_every_default_unchanged() {
     let rendered = serde_yaml::to_string(&legacy).expect("default policy serializes");
     assert!(!rendered.contains("max_caravan_length"), "{rendered}");
     assert!(rendered.contains("stack_type: caravan"), "{rendered}");
+    assert!(!legacy.stack_rollout.mutations_opt_in);
 }
 
 #[test]
@@ -99,6 +100,31 @@ fn native_mode_upgrades_are_all_explicit_and_bounded() {
             "batch bound {invalid} must be refused"
         );
     }
+
+    // The rollout allowlist is explicit, reviewer-attributed, and native-only.
+    assert!(!github.stack_rollout.mutations_opt_in);
+    let mut opted_in = github.clone();
+    opted_in.stack_rollout.mutations_opt_in = true;
+    assert!(
+        opted_in
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("reviewed_by")
+    );
+    opted_in.stack_rollout.reviewed_by = "operator/bd-a79679".to_owned();
+    opted_in.validate().expect("a reviewed opt-in is valid");
+
+    let mut default_backend = opted_in;
+    default_backend.stack_type = StackType::Caravan;
+    assert!(
+        default_backend
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("requires stack_type: github"),
+        "the default backend must never carry a native rollout gate"
+    );
 }
 
 #[test]
