@@ -523,11 +523,22 @@ fn execute_live(
     request: &MembershipRequest,
     candidate_pr: Option<u64>,
 ) -> Result<MembershipOutput, AppError> {
-    let _lock = context.acquire_writer_operation(request.operation.name())?;
-    execute_locked(context, request, candidate_pr, None, None, None, true)
+    let lock = context.acquire_writer_operation(request.operation.name())?;
+    execute_locked(
+        context,
+        request,
+        candidate_pr,
+        None,
+        None,
+        None,
+        true,
+        &lock,
+    )
 }
 
 /// Run one exact sync-owned new/join while the caller retains the repository lock.
+/// The explicit budget/deadline/guard dimensions are separate safety authorities.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn auto_admit_locked(
     context: &AppContext,
     status: StatusOutput,
@@ -536,6 +547,7 @@ pub(crate) fn auto_admit_locked(
     priority_label: Option<String>,
     operation_deadline: std::time::Instant,
     github_budget: &crate::command::GithubRequestBudget,
+    writer_guard: &crate::writer_guard::WriterOperationGuard,
 ) -> Result<MembershipOutput, AppError> {
     let operation = if tail_pr.is_some() {
         MembershipOperation::Join
@@ -561,6 +573,7 @@ pub(crate) fn auto_admit_locked(
         Some(github_budget),
         Some(status),
         false,
+        writer_guard,
     )
 }
 
@@ -1184,6 +1197,10 @@ fn preflight_join_source(
 }
 
 #[allow(clippy::too_many_lines)]
+// Keep independent provider budget, deadline, preloaded facts, hooks, and writer
+// authority visible at this transactional boundary rather than hiding them in a
+// partially initialized options bag.
+#[allow(clippy::too_many_arguments)]
 fn execute_locked(
     context: &AppContext,
     request: &MembershipRequest,
@@ -1192,6 +1209,7 @@ fn execute_locked(
     github_budget: Option<&crate::command::GithubRequestBudget>,
     preloaded_status: Option<StatusOutput>,
     dispatch_hooks: bool,
+    writer_guard: &crate::writer_guard::WriterOperationGuard,
 ) -> Result<MembershipOutput, AppError> {
     if candidate_pr.is_some() && request.create_pr {
         return Err(AppError::validation(
@@ -1251,7 +1269,7 @@ fn execute_locked(
     let provider_runner = github_budget.map_or(provider_runner.clone(), |budget| {
         provider_runner.with_github_request_budget(budget.clone())
     });
-    let mut provider = GitHubMutationAdapter::new(provider_runner);
+    let mut provider = GitHubMutationAdapter::new(writer_guard.runner(provider_runner));
     let repository = status.repository.clone();
     let failure_status = status.clone();
     let default_branch_oid = status.analysis.fleet.default_branch.oid.clone();
@@ -1639,7 +1657,7 @@ fn execute_locked(
             let provider_runner = github_budget.map_or(provider_runner.clone(), |budget| {
                 provider_runner.with_github_request_budget(budget.clone())
             });
-            provider = GitHubMutationAdapter::new(provider_runner);
+            provider = GitHubMutationAdapter::new(writer_guard.runner(provider_runner));
         } else {
             status =
                 read::status_with_deadline_and_budget(context, operation_deadline, github_budget)?;

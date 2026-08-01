@@ -2420,6 +2420,7 @@ fn sync_with_lock(
         .with_timeout(timeout)
         .with_operation_deadline(operation_deadline)
         .with_github_request_budget(github_budget.clone());
+    let runner = lock.runner(runner);
     // A decision can require an exact branch checkout. Prove checkout safety
     // before the first provider mutation so a dirty worktree can never turn a
     // partially-mutated sync into an unrepairable decision receipt.
@@ -2726,6 +2727,7 @@ fn sync_with_lock(
             &mut progress,
             operation_deadline,
             &github_budget,
+            &lock,
         )
         .map_err(|error| {
             attach_auto_admission_progress(&error, context, &progress, &github_budget)
@@ -2963,6 +2965,7 @@ fn run_auto_admission(
     progress: &mut SyncProgress,
     operation_deadline: Instant,
     github_budget: &crate::command::GithubRequestBudget,
+    writer_guard: &WriterOperationGuard,
 ) -> Result<(StatusOutput, AutoAdmissionOutput), AppError> {
     let mut output = AutoAdmissionOutput {
         enabled: true,
@@ -3231,6 +3234,7 @@ fn run_auto_admission(
                 candidate_order.priority_label,
                 operation_deadline,
                 github_budget,
+                writer_guard,
             )?;
             append_membership_progress(progress, &membership);
             admitted_this_iteration = true;

@@ -127,10 +127,11 @@ wrap multiple fully configured `ProcessRunner`s, preserving their auth, budgets,
 deadlines, and telemetry; each marked write revalidates the shared fence while
 reads bypass it. Explicit release drops local ownership before remote.
 
-Production context still refuses `remote_fenced`. Membership/sync, repair, and
-reshape's internal physical-worktree runners are not yet propagated. The
-activation slices must route those remaining provider and Git writers through
-`guard.runner(...)` before opening the mode.
+Production context still refuses `remote_fenced`. Membership and sync provider
+adapters now share their operation guard, including post-rewrite rediscovery and
+auto-admission handoff. Repair and all membership/sync/reshape internal physical
+worktree runners are not yet propagated. The remaining slices must route those
+Git writers through `guard.runner(...)` before opening the mode.
 
 ## Guard lifecycle
 

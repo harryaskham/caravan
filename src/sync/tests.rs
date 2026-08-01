@@ -1702,6 +1702,19 @@ fn a_human_applied_join_skip_is_not_stripped_for_lacking_a_cara_receipt() {
     let status = status(vec![held.clone()], None, &clean);
     let mut context = AppContext::default();
     context.config.sync.actions.join_unlabelled_prs = true;
+    let repository = tempfile::tempdir().unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(repository.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    context.repository_path = repository.path().to_path_buf();
+    let writer_guard = context
+        .acquire_writer_operation("test-auto-admission")
+        .unwrap();
     let mut progress = SyncProgress::new(&status, Vec::new(), u32::MAX);
     let github_budget = crate::command::GithubRequestBudget::new(100);
 
@@ -1712,6 +1725,7 @@ fn a_human_applied_join_skip_is_not_stripped_for_lacking_a_cara_receipt() {
         &mut progress,
         Instant::now() + Duration::from_secs(30),
         &github_budget,
+        &writer_guard,
     )
     .expect("auto admission runs");
 
@@ -1742,6 +1756,19 @@ fn forty_candidate_auto_admission_preserves_nonzero_exact_git_budget() {
     context.config.sync.actions.join_unlabelled_prs = true;
     context.config.command_timeout_secs = 30;
     context.config.sync.max_candidates_per_tick = 40;
+    let repository = tempfile::tempdir().unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(repository.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    context.repository_path = repository.path().to_path_buf();
+    let writer_guard = context
+        .acquire_writer_operation("test-auto-admission")
+        .unwrap();
     let mut progress = SyncProgress::new(&status, Vec::new(), u32::MAX);
     let github_budget = crate::command::GithubRequestBudget::new(100);
 
@@ -1752,6 +1779,7 @@ fn forty_candidate_auto_admission_preserves_nonzero_exact_git_budget() {
         &mut progress,
         Instant::now() + Duration::from_secs(5),
         &github_budget,
+        &writer_guard,
     )
     .unwrap();
 

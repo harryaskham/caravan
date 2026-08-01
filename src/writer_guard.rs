@@ -358,6 +358,25 @@ mod tests {
     }
 
     #[test]
+    fn membership_and_sync_provider_runners_share_the_operation_guard() {
+        let membership = include_str!("membership.rs");
+        let membership = membership
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+        assert_eq!(membership.matches("acquire_writer_operation(").count(), 1);
+        assert_eq!(membership.matches("writer_guard.runner(").count(), 2);
+        assert!(membership.contains("writer_guard: &crate::writer_guard::WriterOperationGuard"));
+
+        let sync = include_str!("sync.rs");
+        let sync = sync.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+        assert_eq!(sync.matches("acquire_writer_operation(").count(), 1);
+        assert_eq!(sync.matches("lock.runner(").count(), 1);
+        assert!(sync.contains("writer_guard: &WriterOperationGuard"));
+        assert!(sync.contains("github_budget,\n                writer_guard,"));
+    }
+
+    #[test]
     fn production_modules_do_not_acquire_operation_lock_directly() {
         for (name, source) in [
             ("force", include_str!("force.rs")),
