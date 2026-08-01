@@ -9,6 +9,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
 use crate::github::{
     GitHubStackEntryGeneration, GitHubStackGeneration, GitHubStackMergeBlocker,
     GitHubStackMergeEntryEvidence,
@@ -145,6 +148,104 @@ fn mechanically_blocked(facts: StackPolicyFacts<'_>, entry: &GitHubStackEntryGen
             && report.target == entry.base
             && report.outcome != CompatibilityOutcome::Clean
     })
+}
+
+/// Which landing path a caravan must use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", tag = "route")]
+pub enum StackLandingRoute {
+    /// The stable default: Cara owns the landing exactly as before.
+    CaravanOwned,
+    /// One exact provider Stack, reached only through the lock-fenced
+    /// transaction in `github::stack_land`.
+    NativeStack { stack_number: u64 },
+}
+
+/// Decide the landing path for one caravan, failing closed on every gate.
+///
+/// The default backend returns immediately without consulting capability,
+/// rollout opt-in, or provider Stack state, so a repository that never selected
+/// `stack_type: github` is unaffected by any of this logic.
+///
+/// This never opens the workflow fence. `initialization::require_ready` still
+/// refuses native mutation ahead of any caller reaching this decision; routing
+/// exists so the remaining rollout step is exactly one reviewed change rather
+/// than new untested wiring.
+pub fn route_landing(
+    config: &crate::config::CaravanConfig,
+    backend: &crate::read::StackBackendStatus,
+    caravan_id: PrNumber,
+) -> Result<StackLandingRoute, crate::AppError> {
+    if config.stack_type != crate::config::StackType::Github {
+        return Ok(StackLandingRoute::CaravanOwned);
+    }
+    if backend.capability != crate::read::StackCapability::Available {
+        return Err(route_refusal(
+            "github_stack_capability_not_proven",
+            format!(
+                "native landing requires a proven Stack capability, observed `{}`",
+                backend.capability.code()
+            ),
+            "an unproven capability is never absence; resolve it or set stack_type: caravan",
+        ));
+    }
+    if !config.stack_rollout.mutations_opt_in {
+        return Err(route_refusal(
+            "github_stack_repository_not_opted_in",
+            "native landing requires an explicit reviewed repository opt-in".to_owned(),
+            "record stack_rollout.mutations_opt_in with reviewed_by; opting in alone still does not enable mutations",
+        ));
+    }
+    if backend.provider_stacks_truncated {
+        return Err(route_refusal(
+            "github_stack_inventory_truncated",
+            "a truncated Stack inventory cannot prove which Stack owns this caravan".to_owned(),
+            "re-read status once the provider returns a complete inventory page",
+        ));
+    }
+
+    let matching = backend
+        .native_stacks
+        .iter()
+        .filter(|native| native.caravan_id == Some(caravan_id))
+        .collect::<Vec<_>>();
+    let [native] = matching.as_slice() else {
+        return Err(route_refusal(
+            "github_stack_caravan_mapping_ambiguous",
+            format!(
+                "caravan #{caravan_id} maps to {} provider Stacks; exactly one is required",
+                matching.len()
+            ),
+            "resolve the provider/Caravan mapping before landing; ambiguity is never resolved by choosing one",
+        ));
+    };
+    if native.consistency != crate::read::StackConsistency::Exact {
+        return Err(route_refusal(
+            "github_stack_generation_drifted",
+            format!(
+                "caravan #{caravan_id} Stack #{} is `{}`, not exact",
+                native.stack.number,
+                native.consistency.code()
+            ),
+            "reconcile the drifted Stack generation before landing",
+        ));
+    }
+    Ok(StackLandingRoute::NativeStack {
+        stack_number: native.stack.number,
+    })
+}
+
+fn route_refusal(code: &str, message: String, next: &str) -> crate::AppError {
+    crate::AppError::structured(
+        mcp_cli::ErrorCategory::Validation,
+        code,
+        message,
+        Some(serde_json::json!({
+            "mutated": false,
+            "retryable": false,
+            "safe_next_action": next,
+        })),
+    )
 }
 
 #[cfg(test)]
@@ -370,5 +471,172 @@ mod tests {
                 .blockers
                 .contains(&GitHubStackMergeBlocker::StackEntryNotOpen)
         );
+    }
+
+    fn backend(
+        capability: crate::read::StackCapability,
+        natives: Vec<crate::read::NativeStackStatus>,
+    ) -> crate::read::StackBackendStatus {
+        crate::read::StackBackendStatus {
+            configured: crate::config::StackType::Github,
+            capability,
+            mutation_support: crate::read::StackMutationSupport::ReadOnlyPreview,
+            native_stacks: natives,
+            provider_stacks_truncated: false,
+            missing_caravans: Vec::new(),
+            problems: Vec::new(),
+        }
+    }
+
+    fn native(
+        caravan_id: Option<PrNumber>,
+        consistency: crate::read::StackConsistency,
+    ) -> crate::read::NativeStackStatus {
+        crate::read::NativeStackStatus {
+            stack: crate::github::GitHubStackSnapshot {
+                id: 1,
+                number: 42,
+                node_id: "S_route".to_owned(),
+                base: crate::github::GitHubStackBase {
+                    ref_name: "main".to_owned(),
+                },
+                open: true,
+                created_at: "2026-08-01T09:00:00Z".to_owned(),
+                pull_requests: Vec::new(),
+            },
+            caravan_id,
+            consistency,
+            problems: Vec::new(),
+        }
+    }
+
+    fn github_config() -> crate::config::CaravanConfig {
+        let mut config = crate::config::CaravanConfig::default();
+        config.stack_type = crate::config::StackType::Github;
+        config.stack_rollout.mutations_opt_in = true;
+        config.stack_rollout.reviewed_by = "operator".to_owned();
+        config
+    }
+
+    #[test]
+    fn the_default_backend_routes_to_caravan_without_consulting_any_gate() {
+        // Deliberately hostile native state: the default path must ignore it.
+        let hostile = backend(
+            crate::read::StackCapability::Unavailable,
+            vec![native(
+                Some(PrNumber(101)),
+                crate::read::StackConsistency::Drifted,
+            )],
+        );
+        let route = route_landing(
+            &crate::config::CaravanConfig::default(),
+            &hostile,
+            PrNumber(101),
+        )
+        .expect("the stable default never fails on native state");
+        assert_eq!(route, StackLandingRoute::CaravanOwned);
+    }
+
+    #[test]
+    fn an_exact_opted_in_available_stack_routes_natively() {
+        let route = route_landing(
+            &github_config(),
+            &backend(
+                crate::read::StackCapability::Available,
+                vec![native(
+                    Some(PrNumber(101)),
+                    crate::read::StackConsistency::Exact,
+                )],
+            ),
+            PrNumber(101),
+        )
+        .expect("an exact opted-in Stack routes natively");
+        assert_eq!(route, StackLandingRoute::NativeStack { stack_number: 42 });
+    }
+
+    #[test]
+    fn every_native_gate_fails_closed_with_its_exact_code() {
+        let exact = vec![native(
+            Some(PrNumber(101)),
+            crate::read::StackConsistency::Exact,
+        )];
+
+        for capability in [
+            crate::read::StackCapability::Unavailable,
+            crate::read::StackCapability::Unknown,
+            crate::read::StackCapability::NotProbed,
+        ] {
+            let error = route_landing(
+                &github_config(),
+                &backend(capability, exact.clone()),
+                PrNumber(101),
+            )
+            .expect_err("an unproven capability can never route natively");
+            assert_eq!(
+                mcp_cli::StructuredError::code(&error),
+                "github_stack_capability_not_proven"
+            );
+        }
+
+        let mut unlisted = github_config();
+        unlisted.stack_rollout = crate::config::StackRolloutConfig::default();
+        let error = route_landing(
+            &unlisted,
+            &backend(crate::read::StackCapability::Available, exact.clone()),
+            PrNumber(101),
+        )
+        .expect_err("a repository without an opt-in can never route natively");
+        assert_eq!(
+            mcp_cli::StructuredError::code(&error),
+            "github_stack_repository_not_opted_in"
+        );
+
+        let mut truncated = backend(crate::read::StackCapability::Available, exact.clone());
+        truncated.provider_stacks_truncated = true;
+        let error = route_landing(&github_config(), &truncated, PrNumber(101))
+            .expect_err("a truncated inventory proves nothing about ownership");
+        assert_eq!(
+            mcp_cli::StructuredError::code(&error),
+            "github_stack_inventory_truncated"
+        );
+
+        for natives in [
+            Vec::new(),
+            vec![
+                native(Some(PrNumber(101)), crate::read::StackConsistency::Exact),
+                native(Some(PrNumber(101)), crate::read::StackConsistency::Exact),
+            ],
+        ] {
+            let error = route_landing(
+                &github_config(),
+                &backend(crate::read::StackCapability::Available, natives),
+                PrNumber(101),
+            )
+            .expect_err("ambiguous or absent mapping is never resolved by choosing one");
+            assert_eq!(
+                mcp_cli::StructuredError::code(&error),
+                "github_stack_caravan_mapping_ambiguous"
+            );
+        }
+
+        for consistency in [
+            crate::read::StackConsistency::Drifted,
+            crate::read::StackConsistency::Orphaned,
+            crate::read::StackConsistency::Unknown,
+        ] {
+            let error = route_landing(
+                &github_config(),
+                &backend(
+                    crate::read::StackCapability::Available,
+                    vec![native(Some(PrNumber(101)), consistency)],
+                ),
+                PrNumber(101),
+            )
+            .expect_err("a non-exact generation can never land");
+            assert_eq!(
+                mcp_cli::StructuredError::code(&error),
+                "github_stack_generation_drifted"
+            );
+        }
     }
 }
