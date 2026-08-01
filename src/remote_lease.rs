@@ -4,7 +4,8 @@
 //! paths do not consume it yet, so non-local writer config remains fail-closed.
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -481,16 +482,26 @@ fn validate_renewed_grant(
 /// Owned lease lifecycle. Drop attempts exact release but never claims success.
 pub struct RemoteLeaseGuard {
     backend: Arc<dyn RemoteWriterLease>,
-    grant: RemoteLeaseGrant,
-    released: bool,
+    grant: Mutex<RemoteLeaseGrant>,
+    ttl_ms: u64,
+    heartbeat_ms: u64,
+    released: AtomicBool,
 }
 
 impl fmt::Debug for RemoteLeaseGuard {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("RemoteLeaseGuard")
-            .field("grant", &self.grant)
-            .field("released", &self.released)
+            .field(
+                "grant",
+                &self
+                    .grant
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
+            .field("ttl_ms", &self.ttl_ms)
+            .field("heartbeat_ms", &self.heartbeat_ms)
+            .field("released", &self.released.load(Ordering::SeqCst))
             .finish_non_exhaustive()
     }
 }
@@ -508,22 +519,29 @@ impl RemoteLeaseGuard {
         }
         Ok(Self {
             backend,
-            grant,
-            released: false,
+            grant: Mutex::new(grant),
+            ttl_ms: request.ttl_ms,
+            heartbeat_ms: request.heartbeat_ms,
+            released: AtomicBool::new(false),
         })
     }
 
     #[must_use]
-    pub fn grant(&self) -> &RemoteLeaseGrant {
-        &self.grant
+    pub fn grant_snapshot(&self) -> RemoteLeaseGrant {
+        self.grant
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     pub fn revalidate(&self, now_unix_ms: u64) -> Result<(), RemoteLeaseError> {
-        let observed = self.backend.inspect(&self.grant.key)?;
+        if self.released.load(Ordering::SeqCst) {
+            return Err(RemoteLeaseError::Lost("lease guard is released".to_owned()));
+        }
+        let grant = self.grant_snapshot();
+        let observed = self.backend.inspect(&grant.key)?;
         match observed {
-            Some(observed)
-                if observed.exact_fence(&self.grant) && observed.live_at(now_unix_ms) =>
-            {
+            Some(observed) if observed.exact_fence(&grant) && observed.live_at(now_unix_ms) => {
                 Ok(())
             }
             _ => Err(RemoteLeaseError::Lost(
@@ -532,29 +550,76 @@ impl RemoteLeaseGuard {
         }
     }
 
-    pub fn renew(
-        &mut self,
-        now_unix_ms: u64,
-        ttl_ms: u64,
-        heartbeat_ms: u64,
-    ) -> Result<(), RemoteLeaseError> {
-        self.grant = self
+    pub fn renew(&self, now_unix_ms: u64) -> Result<(), RemoteLeaseError> {
+        if self.released.load(Ordering::SeqCst) {
+            return Err(RemoteLeaseError::Lost("lease guard is released".to_owned()));
+        }
+        let mut grant = self
+            .grant
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !grant.live_at(now_unix_ms) {
+            return Err(RemoteLeaseError::Lost(
+                "lease expired before heartbeat renewal".to_owned(),
+            ));
+        }
+        let renewed = self
             .backend
-            .renew(&self.grant, now_unix_ms, ttl_ms, heartbeat_ms)?;
+            .renew(&grant, now_unix_ms, self.ttl_ms, self.heartbeat_ms)?;
+        *grant = validate_renewed_grant(&grant, Some(renewed))?;
         Ok(())
     }
 
-    pub fn release(mut self) -> Result<bool, RemoteLeaseError> {
-        let released = self.backend.release(&self.grant)?;
-        self.released = released;
+    pub fn before_write_at(&self, now_unix_ms: u64) -> Result<(), RemoteLeaseError> {
+        if self.released.load(Ordering::SeqCst) {
+            return Err(RemoteLeaseError::Lost("lease guard is released".to_owned()));
+        }
+        // Hold one critical section from due-check through replacement. A
+        // concurrent writer arriving after renewal observes the new heartbeat
+        // and inspects instead of issuing a duplicate renewal.
+        let mut grant = self
+            .grant
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !grant.live_at(now_unix_ms) {
+            return Err(RemoteLeaseError::Lost(
+                "lease expired before write revalidation".to_owned(),
+            ));
+        }
+        if now_unix_ms >= grant.heartbeat_due_unix_ms {
+            let renewed =
+                self.backend
+                    .renew(&grant, now_unix_ms, self.ttl_ms, self.heartbeat_ms)?;
+            *grant = validate_renewed_grant(&grant, Some(renewed))?;
+            return Ok(());
+        }
+        let observed = self.backend.inspect(&grant.key)?;
+        match observed {
+            Some(observed) if observed.exact_fence(&grant) && observed.live_at(now_unix_ms) => {
+                Ok(())
+            }
+            _ => Err(RemoteLeaseError::Lost(
+                "exact live fencing token was not observed".to_owned(),
+            )),
+        }
+    }
+
+    pub fn release(self) -> Result<bool, RemoteLeaseError> {
+        let grant = self.grant_snapshot();
+        let released = self.backend.release(&grant)?;
+        self.released.store(released, Ordering::SeqCst);
         Ok(released)
     }
 }
 
 impl Drop for RemoteLeaseGuard {
     fn drop(&mut self) {
-        if !self.released {
-            let _ = self.backend.release(&self.grant);
+        if !self.released.load(Ordering::SeqCst) {
+            let grant = self
+                .grant
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = self.backend.release(grant);
         }
     }
 }
@@ -567,7 +632,7 @@ impl CommandMutationFence for RemoteLeaseGuard {
             .as_millis()
             .try_into()
             .map_err(|_| "system clock exceeds remote lease range".to_owned())?;
-        self.revalidate(now_unix_ms)
+        self.before_write_at(now_unix_ms)
             .map_err(|error| error.to_string())
     }
 }
@@ -589,6 +654,7 @@ fn validate_identity(name: &str, value: &str) -> Result<(), RemoteLeaseError> {
 mod tests {
     use std::collections::{BTreeMap, VecDeque};
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
     use std::thread;
 
     use super::*;
@@ -623,6 +689,7 @@ mod tests {
     #[derive(Default)]
     struct FakeCas {
         state: Mutex<FakeState>,
+        renewals: AtomicUsize,
     }
 
     #[derive(Default)]
@@ -695,6 +762,7 @@ mod tests {
             ttl_ms: u64,
             heartbeat_ms: u64,
         ) -> Result<RemoteLeaseGrant, RemoteLeaseError> {
+            self.renewals.fetch_add(1, Ordering::SeqCst);
             let mut state = self.state.lock().unwrap();
             let Some(current) = state.grants.get_mut(&grant.key) else {
                 return Err(RemoteLeaseError::Lost("lease is absent".to_owned()));
@@ -936,14 +1004,38 @@ mod tests {
     #[test]
     fn guard_revalidates_renews_and_releases_exact_fence() {
         let backend: Arc<dyn RemoteWriterLease> = Arc::new(FakeCas::default());
-        let mut guard =
+        let guard =
             RemoteLeaseGuard::acquire(Arc::clone(&backend), &request("host-a", "operation", 1_000))
                 .unwrap();
         guard.revalidate(2_000).unwrap();
-        let old_expiry = guard.grant().expires_unix_ms;
-        guard.renew(3_000, 20_000, 4_000).unwrap();
-        assert!(guard.grant().expires_unix_ms > old_expiry);
+        let old_expiry = guard.grant_snapshot().expires_unix_ms;
+        guard.renew(3_000).unwrap();
+        assert!(guard.grant_snapshot().expires_unix_ms > old_expiry);
         assert!(guard.release().unwrap());
+    }
+
+    #[test]
+    fn concurrent_due_writers_single_flight_one_heartbeat_renewal() {
+        let backend = Arc::new(FakeCas::default());
+        let backend_trait: Arc<dyn RemoteWriterLease> = backend.clone();
+        let guard = Arc::new(
+            RemoteLeaseGuard::acquire(backend_trait, &request("host-a", "operation", 1_000))
+                .unwrap(),
+        );
+        guard.before_write_at(2_000).unwrap();
+        assert_eq!(backend.renewals.load(Ordering::SeqCst), 0);
+        let handles = (0..8)
+            .map(|_| {
+                let guard = Arc::clone(&guard);
+                thread::spawn(move || guard.before_write_at(3_000))
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+        assert_eq!(backend.renewals.load(Ordering::SeqCst), 1);
+        assert_eq!(guard.grant_snapshot().heartbeat_due_unix_ms, 5_000);
+        assert_eq!(guard.grant_snapshot().expires_unix_ms, 13_000);
     }
 
     #[test]
@@ -958,7 +1050,7 @@ mod tests {
         let backend_trait: Arc<dyn RemoteWriterLease> = backend.clone();
         let guard =
             RemoteLeaseGuard::acquire(backend_trait, &request("host-a", "operation", now)).unwrap();
-        backend.release(guard.grant()).unwrap();
+        backend.release(&guard.grant_snapshot()).unwrap();
         let inner = ScriptedRunner::with(vec![Ok(CommandOutput::success("unexpected"))]);
         let runner = FencedCommandRunner::new(inner.clone(), guard);
         let write = CommandSpec::new("gh")
@@ -978,10 +1070,10 @@ mod tests {
             RemoteLeaseGuard::acquire(Arc::clone(&backend), &request("host-a", "operation", 1_000))
                 .unwrap();
         assert!(matches!(
-            guard.revalidate(guard.grant().expires_unix_ms),
+            guard.revalidate(guard.grant_snapshot().expires_unix_ms),
             Err(RemoteLeaseError::Lost(_))
         ));
-        let previous = guard.grant().clone();
+        let previous = guard.grant_snapshot();
         let mut regressed = previous.clone();
         regressed.expires_unix_ms = previous.expires_unix_ms;
         assert!(matches!(

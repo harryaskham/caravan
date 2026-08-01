@@ -140,10 +140,14 @@ lease checkpoints/renewal, read-only policy, and final mode opening.
 
 ## Guard lifecycle
 
-`RemoteLeaseGuard` owns one grant, implements the command mutation-fence seam,
-supports authoritative revalidation and exact
-renewal, and attempts exact best-effort release on drop without claiming that
-release succeeded. The remaining operation-integration slice must:
+`RemoteLeaseGuard` owns the latest grant behind synchronized shared state and
+implements the command mutation-fence seam. Before each write it authoritatively
+inspects when heartbeat is not due, or renews under one critical section when
+due. Concurrent writers single-flight that renewal: later writers observe the
+new revision/heartbeat and inspect instead. Renewal requires unchanged exact
+key/owner/operation/fence and strictly advanced expiry. Release and Drop use the
+latest grant, attempt exact best-effort release, and never claim ambiguous
+success. The remaining operation-integration slice must:
 
 1. acquire the remote lease before the local operation lock;
 2. retain the guard and secret-free grant receipt for the whole operation;

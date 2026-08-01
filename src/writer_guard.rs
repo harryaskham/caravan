@@ -106,8 +106,8 @@ impl WriterOperationGuard {
     }
 
     #[must_use]
-    pub fn remote_grant(&self) -> Option<&RemoteLeaseGrant> {
-        self.remote.as_deref().map(RemoteLeaseGuard::grant)
+    pub fn remote_grant(&self) -> Option<RemoteLeaseGrant> {
+        self.remote.as_deref().map(RemoteLeaseGuard::grant_snapshot)
     }
 
     #[must_use]
