@@ -12,6 +12,13 @@ use serde_json::{Value, json};
 use crate::model::{EventKind, HeadMergeActor};
 use crate::root_merge::ExternalAutoMergePolicy;
 
+/// Oldest Cara release able to read a native GitHub Stack policy.
+///
+/// A repository opting into `stack_type: github` must pin at least this reader,
+/// so an older Cara can never silently treat one provider Stack as an ordinary
+/// label/base-chain caravan.
+pub const MIN_GITHUB_STACK_READER_VERSION: &str = "0.0.65";
+
 /// GitHub's documented native Stack size range. A batch bound outside it could
 /// never be represented as one provider Stack.
 pub const GITHUB_STACK_MIN_ENTRIES: u32 = 2;
@@ -943,6 +950,13 @@ impl CaravanConfig {
     /// Explicit native-Stack preview policy: no second physical branch writer
     /// and no provider auto-merge on Stack entries.
     fn validate_github_backend(&self) -> Result<(), ConfigError> {
+        if compare_release_versions(&self.min_cara_version, MIN_GITHUB_STACK_READER_VERSION)?
+            == std::cmp::Ordering::Less
+        {
+            return Err(ConfigError::Validation(format!(
+                "stack_type: github requires min_cara_version >= {MIN_GITHUB_STACK_READER_VERSION}; an older reader would treat a native Stack as an ordinary caravan"
+            )));
+        }
         if self.rebase_on_join {
             return Err(ConfigError::Validation(
                 "stack_type: github currently requires rebase_on_join: false; GitHub Stack preview must not introduce a second physical branch writer".to_owned(),
@@ -1850,6 +1864,7 @@ command_timeout_secs: 30
         let github: CaravanConfig = serde_yaml::from_str(
             r"
 version: 1
+min_cara_version: '0.0.65'
 force_merge: false
 stack_type: github
 rebase_on_join: false
@@ -1887,11 +1902,49 @@ sync:
         }
     }
 
+    /// bd-a79679: opting into the native backend must also pin a reader that
+    /// understands it, so an older Cara can never treat a provider Stack as an
+    /// ordinary label/base-chain caravan.
+    #[test]
+    fn github_backend_requires_a_reader_that_understands_native_stacks() {
+        let policy = r"
+version: 1
+min_cara_version: '0.0.65'
+force_merge: false
+stack_type: github
+rebase_on_join: false
+command_timeout_secs: 30
+sync:
+  head_merge_actor: caravan
+";
+        let pinned: CaravanConfig = serde_yaml::from_str(policy).expect("policy parses");
+        pinned.validate().expect("an adequate reader pin is valid");
+
+        let mut stale = pinned.clone();
+        stale.min_cara_version = "0.0.64".to_owned();
+        assert!(
+            stale
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("requires min_cara_version >="),
+            "an older reader must be excluded before native Stack opt-in"
+        );
+
+        // The default caravan backend never acquires this requirement.
+        let mut default_backend = stale;
+        default_backend.stack_type = StackType::Caravan;
+        default_backend
+            .validate()
+            .expect("the default backend keeps reading legacy reader pins");
+    }
+
     #[test]
     fn github_stack_preview_requires_virtual_caravan_owned_merging() {
         let config: CaravanConfig = serde_yaml::from_str(
             r"
 version: 1
+min_cara_version: '0.0.65'
 force_merge: false
 stack_type: github
 rebase_on_join: false

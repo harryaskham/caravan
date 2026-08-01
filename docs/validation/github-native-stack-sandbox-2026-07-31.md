@@ -122,3 +122,13 @@ The `github_stack_backend_read_only` workflow fence remains closed until the rul
 ## Cleanup
 
 The sandbox is private and archived with description `DISPOSABLE Cara Stack sandbox completed 2026-07-31; delete when delete_repo-scoped operator token is available`. The attempted REST deletion returned HTTP 403 because the active token has `repo` but not `delete_repo`; no broader token was requested or stored. Final deletion is tracked by `bd-7aa0aa` and remains the only cleanup action.
+
+## Corrected testing direction (operator, 2026-08-01)
+
+"Sandbox" here means a hermetic environment for testing, not a disposable
+GitHub repository. Both provider proofs above required real GitHub Stack and
+ruleset behavior, which no local harness can emulate, so they remain the record
+of what GitHub actually does. Routine Caravan validation, however, uses this
+repository's own `.caravan/config.yaml` and dogfoods Cara directly; a dedicated
+`caravan-test` repository may be introduced later. Do not create further
+disposable GitHub repositories for ordinary validation.

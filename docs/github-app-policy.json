@@ -21,10 +21,14 @@
     "workflows": {
       "level": "write",
       "only_when": "Caravan-managed source branches may modify .github/workflows files"
+    },
+    "administration": {
+      "level": "write",
+      "only_when": "a reviewed native GitHub Stack deployment needs the exact-ref Stack merge lock ruleset",
+      "scope": "operation-scoped Stack lock rulesets only; never general repository settings"
     }
   },
   "forbidden_permissions": [
-    "administration",
     "members",
     "organization_administration",
     "organization_secrets",

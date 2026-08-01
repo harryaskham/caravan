@@ -29,13 +29,19 @@ fn github_app_permission_baseline_is_exact_and_least_privilege() {
             "workflows": {
                 "level": "write",
                 "only_when": "Caravan-managed source branches may modify .github/workflows files"
+            },
+            // bd-a79679: conditional native-Stack lock authority, deliberately
+            // scoped so it is never general repository-settings permission.
+            "administration": {
+                "level": "write",
+                "only_when": "a reviewed native GitHub Stack deployment needs the exact-ref Stack merge lock ruleset",
+                "scope": "operation-scoped Stack lock rulesets only; never general repository settings"
             }
         })
     );
     assert_eq!(
         policy["forbidden_permissions"],
         json!([
-            "administration",
             "members",
             "organization_administration",
             "organization_secrets",
@@ -63,6 +69,9 @@ fn github_app_contract_keeps_ambient_default_and_names_unfinished_proofs() {
         "force-with-lease",
         "caravan@localhost.invalid",
         "exactly one",
+        // bd-a79679: the conditional Stack-lock upgrade must stay explicitly
+        // documented as opt-in, never a baseline permission.
+        "Administration: write",
     ] {
         assert!(GUIDE.contains(required), "guide omitted `{required}`");
     }
