@@ -483,7 +483,23 @@ a coalesced status refresh or one configured bounded sync-all action. Webhooks
 are never provider authority: every wake performs fresh discovery and ordinary
 lock/budget/precondition enforcement. Invalid/unknown events mutate nothing;
 periodic polling remains fallback reconciliation. Secrets never enter config,
-status, journal, logs, or receipts.
+status, journal, logs, or receipts. Deliveries route by the configured
+`repository: owner/name` when set, falling back to observed status only for
+repositories that declare none, so a repository whose provider read has not yet
+succeeded is still routable rather than silently webhook-deaf.
+
+`cara web --hosted` is the optional deployment contract for pre-provisioned
+checkouts. It requires a signed webhook secret, one exact installation,
+`--webhook-sync`, no `--read-only`, and for every served repository
+`github_auth.mode: app_installation` pinned to that same installation,
+`writer.mode: remote_fenced`, and an exact slug; mixed installations, ambient
+auth, `local_only`, a missing slug, two worktrees declaring one slug, or missing
+broker/host/writer identity all fail closed at startup. Hosted workers mutate
+only from HMAC-verified deliveries: interactive mutating actions are refused,
+because the same-origin CSRF token is cross-site protection rather than
+authentication, so reachability through an operator proxy is never authority to
+force, merge, or reshape. Non-mutating check/plan actions remain available.
+Hosted mode provisions no clones, manages no tenancy, and performs no failover.
 
 ## 6. Sync algorithm
 
@@ -937,6 +953,10 @@ force_merge: false
 stack_type: caravan
 github_auth:
   mode: ambient
+# Writer authority. `local_only` (default) uses the machine-local operation lock.
+# `read_only` permits config/status/check/log/plan surfaces and refuses every
+# mutation. `remote_fenced` additionally requires an external compare-and-swap
+# lease broker and fences every provider/Git write behind a monotonic token.
 writer:
   mode: local_only
 rebase_on_join: false
