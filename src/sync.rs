@@ -73,6 +73,7 @@ use plan::{plan_auto_admission_with_checker, plan_caravan_convergence};
 
 const MAX_SYNC_OPERATION_SECS: u64 = 3_600;
 const MAX_PARALLEL_REBASE_CHAINS: usize = 2;
+const PARKED_LABEL: &str = "caravan-parked";
 /// Exact remote range/target verification plus one force-with-lease push.
 const PHYSICAL_APPLY_COMMAND_SLOTS_PER_PENDING_MEMBER: u64 = 3;
 /// A member whose exact cumulative ancestry already holds still revalidates
@@ -1385,6 +1386,208 @@ fn sync_operation_budget(context: &AppContext) -> Duration {
     )
 }
 
+#[derive(Default)]
+struct ParkingReconciliation {
+    changed: bool,
+    steps: Vec<MutationStep>,
+    provider_receipts: Vec<GitHubMutationReceipt>,
+    events: Vec<CaravanEvent>,
+}
+
+/// Reconcile explicit terminal-red quarantine before active capacity and
+/// convergence are selected. Default `block` performs no work and preserves
+/// historical behavior exactly.
+// Keep transition ordering (evidence -> label -> auto-merge -> event) visible at
+// one transactional boundary; partially initialized parking helpers are harder
+// to audit than this linear policy.
+#[allow(clippy::too_many_lines)]
+fn reconcile_terminal_red_parking(
+    context: &AppContext,
+    status: &StatusOutput,
+    provider: &impl SyncProvider,
+) -> Result<ParkingReconciliation, AppError> {
+    if context.config.sync.terminal_red.action != crate::config::TerminalRedAction::Park {
+        return Ok(ParkingReconciliation::default());
+    }
+    let mut output = ParkingReconciliation::default();
+    for caravan in &status.analysis.fleet.caravans {
+        let receipt_start = output.provider_receipts.len();
+        let mut failures = Vec::new();
+        for number in &caravan.members {
+            let pull_request = status
+                .analysis
+                .pull_requests
+                .get(number)
+                .expect("caravan member has provider facts");
+            let (current, superseded) =
+                crate::model::latest_checks_per_identity(&pull_request.checks);
+            let terminal = current
+                .iter()
+                .filter(|check| {
+                    matches!(
+                        check.state,
+                        CheckState::Failure
+                            | CheckState::Cancelled
+                            | CheckState::TimedOut
+                            | CheckState::ActionRequired
+                    )
+                })
+                .copied()
+                .collect::<Vec<_>>();
+            if !terminal.is_empty() {
+                failures.push(json!({
+                    "pr": number,
+                    "head": pull_request.head.oid,
+                    "checks": terminal,
+                    "superseded_checks": superseded,
+                    "classification": parking_failure_classification(&current),
+                }));
+            }
+        }
+        let head = status
+            .analysis
+            .pull_requests
+            .get(&caravan.id)
+            .expect("caravan head has provider facts");
+        let should_park = !failures.is_empty();
+        let is_parked = head.has_label(PARKED_LABEL);
+        if should_park == is_parked {
+            // Parked heads must never remain armed even after a partial earlier
+            // transition. This is idempotent and exact-precondition fenced.
+            if is_parked && head.auto_merge.enabled {
+                let receipt = provider
+                    .disable_auto_merge(&status.repository, &PullRequestPrecondition::from(head))
+                    .map_err(|error| parking_mutation_error(&error, caravan, &failures))?;
+                output.changed = true;
+                output.steps.push(MutationStep {
+                    kind: MutationKind::DisableAutoMerge,
+                    state: MutationStepState::Completed,
+                    pr: Some(caravan.id),
+                    summary: "disabled auto-merge on parked caravan head".to_owned(),
+                });
+                output.provider_receipts.push(receipt);
+            }
+            continue;
+        }
+
+        let expected = PullRequestPrecondition::from(head);
+        let receipt = if should_park {
+            provider.add_label(&status.repository, &expected, PARKED_LABEL)
+        } else {
+            provider.remove_label(&status.repository, &expected, PARKED_LABEL)
+        }
+        .map_err(|error| parking_mutation_error(&error, caravan, &failures))?;
+        output.changed = true;
+        output.steps.push(MutationStep {
+            kind: if should_park {
+                MutationKind::AddLabel
+            } else {
+                MutationKind::RemoveLabel
+            },
+            state: MutationStepState::Completed,
+            pr: Some(caravan.id),
+            summary: if should_park {
+                "parked exact terminal-red caravan outside active capacity".to_owned()
+            } else {
+                "reactivated parked caravan after current verdict recovered".to_owned()
+            },
+        });
+        let after = receipt.after.clone();
+        output.provider_receipts.push(receipt);
+        if should_park && after.auto_merge.enabled {
+            let disable = provider
+                .disable_auto_merge(&status.repository, &PullRequestPrecondition::from(&after))
+                .map_err(|error| parking_mutation_error(&error, caravan, &failures))?;
+            output.steps.push(MutationStep {
+                kind: MutationKind::DisableAutoMerge,
+                state: MutationStepState::Completed,
+                pr: Some(caravan.id),
+                summary: "disabled auto-merge on newly parked caravan head".to_owned(),
+            });
+            output.provider_receipts.push(disable);
+        }
+
+        let fingerprint = crate::membership::fnv1a64(
+            &serde_json::to_vec(&json!({
+                "caravan": caravan,
+                "failures": failures,
+                "head": head.head,
+                "policy": "park",
+            }))
+            .expect("parking evidence serializes"),
+        );
+        output.events.push(hooks::event(
+            if should_park {
+                EventKind::CaravanParked
+            } else {
+                EventKind::CaravanUnparked
+            },
+            OperationId::new(),
+            status.repository.clone(),
+            Some(caravan.id),
+            caravan.members.clone(),
+            Some(status.analysis.fleet.clone()),
+            Some(if should_park {
+                "exact current terminal-red verdict parked the caravan".to_owned()
+            } else {
+                "new/nonterminal/green current verdict reactivated the caravan".to_owned()
+            }),
+            BTreeMap::from([
+                ("policy".to_owned(), json!("park")),
+                ("fingerprint".to_owned(), json!(fingerprint)),
+                ("failures".to_owned(), json!(failures)),
+                ("ordering".to_owned(), json!(caravan.members)),
+                (
+                    "provider_receipts".to_owned(),
+                    json!(&output.provider_receipts[receipt_start..]),
+                ),
+            ]),
+        ));
+    }
+    Ok(output)
+}
+
+fn parking_failure_classification(checks: &[&CheckSnapshot]) -> &'static str {
+    if checks
+        .iter()
+        .any(|check| check.state == CheckState::Failure)
+    {
+        "source_or_infrastructure_failure"
+    } else if checks
+        .iter()
+        .any(|check| check.state == CheckState::TimedOut)
+    {
+        "transport_or_timeout"
+    } else if checks
+        .iter()
+        .any(|check| check.state == CheckState::Cancelled)
+    {
+        "cancellation"
+    } else if checks
+        .iter()
+        .any(|check| check.state == CheckState::ActionRequired)
+    {
+        "action_required"
+    } else {
+        "unknown"
+    }
+}
+
+fn parking_mutation_error(
+    error: &MutationError,
+    caravan: &Caravan,
+    failures: &[Value],
+) -> AppError {
+    AppError::structured(
+        ErrorCategory::ExecutionFailure,
+        "terminal_red_parking_failed",
+        format!("terminal-red parking transition failed: {error}"),
+        Some(
+            json!({"caravan": caravan, "failures": failures, "mutated": false, "resumable": true}),
+        ),
+    )
+}
+
 struct PreparedChain {
     caravan: Caravan,
     members: Vec<crate::physical_rebase::PreparedRebase>,
@@ -2577,6 +2780,22 @@ fn sync_with_lock(
         &runner,
     )?;
     let provider = GitHubMutationAdapter::new(runner);
+    let parking = reconcile_terminal_red_parking(context, &status, &provider)?;
+    let parking_mutations = u32::try_from(
+        parking
+            .steps
+            .iter()
+            .filter(|step| step.state == MutationStepState::Completed)
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
+    if parking.changed {
+        status = read::status_with_deadline_and_budget(
+            context,
+            operation_deadline,
+            Some(&github_budget),
+        )?;
+    }
     let convergence_started = Instant::now();
     let mut physical_rebuild = PhysicalRebuildOutcome::default();
     if context.config.rebase_on_join {
@@ -2778,11 +2997,23 @@ fn sync_with_lock(
             .config
             .sync
             .max_mutations_per_tick
-            .saturating_sub(physical_mutations),
+            .saturating_sub(physical_mutations)
+            .saturating_sub(parking_mutations),
         &rewritten_heads,
         RequiredRunsPolicy::from_config(&context.config.sync),
         NativeSyncContext::from_context(context),
     )?;
+    if !parking.steps.is_empty() {
+        let mut steps = parking.steps;
+        steps.append(&mut progress.steps);
+        progress.steps = steps;
+        let mut receipts = parking.provider_receipts;
+        receipts.append(&mut progress.provider_receipts);
+        progress.provider_receipts = receipts;
+        let mut events = parking.events;
+        events.append(&mut progress.events);
+        progress.events = events;
+    }
     progress::emit(
         "provider_convergence",
         format!(
@@ -3796,6 +4027,7 @@ fn current_tail_generations_bounded(
         .fleet
         .caravans
         .iter()
+        .filter(|caravan| !caravan.parked)
         .filter_map(|caravan| {
             let tail_pr = caravan.tail()?;
             let tail = status.analysis.pull_requests.get(&tail_pr)?;
@@ -5269,7 +5501,14 @@ fn head_published_at(
 
 fn select_caravans(status: &StatusOutput, all: bool) -> Result<Vec<Caravan>, AppError> {
     let mut caravans = if all {
-        status.analysis.fleet.caravans.clone()
+        status
+            .analysis
+            .fleet
+            .caravans
+            .iter()
+            .filter(|caravan| !caravan.parked)
+            .cloned()
+            .collect()
     } else {
         let current = status.current_pr.ok_or_else(|| {
             if let Some(predecessor) = read::historical_predecessor(status) {
@@ -5292,21 +5531,43 @@ fn select_caravans(status: &StatusOutput, all: bool) -> Result<Vec<Caravan>, App
                 )
             }
         })?;
-        vec![
-            status
-                .analysis
-                .fleet
-                .containing(current)
-                .cloned()
-                .ok_or_else(|| {
-                    AppError::validation(
-                        "current_pr_not_in_caravan",
-                        format!("PR #{current} is not an active caravan member"),
-                    )
-                })?,
-        ]
+        let caravan = status
+            .analysis
+            .fleet
+            .containing(current)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::validation(
+                    "current_pr_not_in_caravan",
+                    format!("PR #{current} is not an active caravan member"),
+                )
+            })?;
+        if caravan.parked {
+            return Err(AppError::structured(
+                ErrorCategory::Validation,
+                "caravan_parked_red",
+                "the selected caravan is parked outside active convergence until current CI recovers",
+                Some(
+                    json!({"caravan": caravan, "resumable": true, "safe_next_action": "rerun after a new head or latest CI verdict becomes nonterminal/green"}),
+                ),
+            ));
+        }
+        vec![caravan]
     };
-    caravans.sort_by_key(|caravan| caravan.id);
+    // Reactivation keeps the root's immutable FIFO age; it never jumps ahead
+    // because it was unparked recently, and newer green work cannot starve it.
+    caravans.sort_by_key(|caravan| {
+        let created_at = status
+            .analysis
+            .pull_requests
+            .get(&caravan.id)
+            .and_then(|head| head.created_at.clone());
+        (
+            created_at.is_none(),
+            created_at.unwrap_or_default(),
+            caravan.id,
+        )
+    });
     Ok(caravans)
 }
 

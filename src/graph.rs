@@ -618,6 +618,11 @@ pub fn derive_for_actor(snapshot: &RepositorySnapshot, actor: HeadMergeActor) ->
         }
     }
     caravans.sort_by_key(|caravan| caravan.id);
+    for caravan in &mut caravans {
+        caravan.parked = active
+            .get(&caravan.id)
+            .is_some_and(|head| head.has_label("caravan-parked"));
+    }
     for caravan in &caravans {
         for (position, number) in caravan.members.iter().enumerate() {
             let pull_request = active
@@ -627,7 +632,7 @@ pub fn derive_for_actor(snapshot: &RepositorySnapshot, actor: HeadMergeActor) ->
                 && pull_request.auto_merge.merge_method == Some(MergeMethod::Squash);
             // Historical delegation arms exactly the root; caravan-owned
             // merging arms nobody, because there is exactly one merge actor.
-            let root_must_be_armed = actor.github() && position == 0;
+            let root_must_be_armed = actor.github() && position == 0 && !caravan.parked;
             let valid = if root_must_be_armed {
                 native_squash_armed
             } else {

@@ -471,11 +471,33 @@ pub struct SyncActionsConfig {
     pub join_unlabelled_prs: bool,
 }
 
+/// Deterministic engine response to exact current terminal-red CI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalRedAction {
+    /// Preserve historical strict behavior: terminal red blocks this sync tick.
+    #[default]
+    Block,
+    /// Quarantine the complete caravan outside active capacity without changing
+    /// membership topology, allowing independent green candidates to advance.
+    Park,
+}
+
+/// Optional terminal-red queue liveness policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct TerminalRedConfig {
+    pub action: TerminalRedAction,
+}
+
 /// Whole-tick safety bounds for reconciliation and optional automatic admission.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct SyncConfig {
     pub actions: SyncActionsConfig,
+    /// Configurable response to exact latest terminal-red CI. Default `block`
+    /// preserves existing queue behavior; `park` is explicit opt-in.
+    pub terminal_red: TerminalRedConfig,
     /// Leave the working tree checked out on a decision's PR so it can be
     /// repaired in place.
     ///
@@ -575,6 +597,7 @@ impl Default for SyncConfig {
     fn default() -> Self {
         Self {
             actions: SyncActionsConfig::default(),
+            terminal_red: TerminalRedConfig::default(),
             reserve_secs_per_command: default_sync_reserve_secs_per_command(),
             max_candidates_per_tick: default_sync_max_candidates_per_tick(),
             max_mutations_per_tick: default_sync_max_mutations_per_tick(),
@@ -1322,6 +1345,11 @@ mod tests {
         assert_eq!(config.command_timeout_secs, 30);
         assert_eq!(config.repair.materialization_timeout_secs, 180);
         assert!(!config.sync.actions.join_unlabelled_prs);
+        assert_eq!(
+            config.sync.terminal_red.action,
+            TerminalRedAction::Block,
+            "parking is opt-in; upgrades preserve strict blocking"
+        );
         assert_eq!(config.sync.max_candidates_per_tick, 8);
         assert_eq!(config.sync.max_mutations_per_tick, 64);
         assert_eq!(config.sync.max_github_requests_per_tick, 256);
@@ -1343,6 +1371,8 @@ repair:
 sync:
   actions:
     join_unlabelled_prs: true
+  terminal_red:
+    action: park
   max_candidates_per_tick: 5
   max_mutations_per_tick: 40
   max_github_requests_per_tick: 200
@@ -1362,6 +1392,7 @@ hooks:
         assert_eq!(config.command_timeout_secs, 45);
         assert_eq!(config.repair.materialization_timeout_secs, 240);
         assert!(config.sync.actions.join_unlabelled_prs);
+        assert_eq!(config.sync.terminal_red.action, TerminalRedAction::Park);
         assert_eq!(config.sync.max_candidates_per_tick, 5);
         assert_eq!(config.sync.max_mutations_per_tick, 40);
         assert_eq!(config.sync.max_github_requests_per_tick, 200);

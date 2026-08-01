@@ -36,6 +36,7 @@ fn required_label(name: &str, color: &str, description: impl Into<String>) -> Re
 pub fn required_labels(
     priority_labels: &[String],
     include_auto_admission_skip: bool,
+    include_parked: bool,
 ) -> Vec<RequiredLabel> {
     const PRIORITY_COLORS: [&str; 6] = ["B60205", "D93F0B", "FBCA04", "0E8A16", "1D76DB", "5319E7"];
     let mut labels = vec![
@@ -51,6 +52,13 @@ pub fn required_labels(
             "Allow configured force handling for known CI failures",
         ),
     ];
+    if include_parked {
+        labels.push(required_label(
+            "caravan-parked",
+            "8250DF",
+            "Terminal-red Caravan preserved outside active queue capacity",
+        ));
+    }
     if include_auto_admission_skip {
         labels.push(required_label(
             "caravan-join-skipped",
@@ -235,6 +243,7 @@ pub fn inspect_labels(
     labels: &[RepositoryLabel],
     priority_labels: &[String],
     include_auto_admission_skip: bool,
+    include_parked: bool,
 ) -> InitializationStatus {
     let by_name: BTreeMap<_, _> = labels
         .iter()
@@ -242,7 +251,7 @@ pub fn inspect_labels(
         .collect();
     let mut missing = Vec::new();
     let mut mismatched = Vec::new();
-    for required in required_labels(priority_labels, include_auto_admission_skip) {
+    for required in required_labels(priority_labels, include_auto_admission_skip, include_parked) {
         match by_name.get(required.name.as_str()) {
             None => missing.push(required.name.clone()),
             Some(actual) if !label_matches(actual, &required) => {
@@ -435,6 +444,7 @@ pub fn init_with_provider(
     let required = required_labels(
         &context.config.agent_priority_labels,
         context.config.sync.actions.join_unlabelled_prs,
+        context.config.sync.terminal_red.action == crate::config::TerminalRedAction::Park,
     );
     let initial = provider.labels(repository).map_err(provider_error)?;
     reject_mismatches(repository, &initial, &required)?;
@@ -839,6 +849,7 @@ mod tests {
         required_labels(
             &crate::config::CaravanConfig::default().agent_priority_labels,
             false,
+            false,
         )
     }
 
@@ -991,6 +1002,33 @@ mod tests {
                 .iter()
                 .all(|receipt| receipt.state == ResourceState::AlreadyPresent)
         );
+    }
+
+    #[test]
+    fn parked_label_is_required_only_under_the_explicit_park_policy() {
+        let priorities = crate::config::CaravanConfig::default().agent_priority_labels;
+        // Default `block` repositories upgrading to a parking-capable binary must
+        // not be told an unrelated label is missing, or `cara init`/`status`
+        // would report every existing repository as unready.
+        let blocking = required_labels(&priorities, false, false);
+        assert!(
+            !blocking.iter().any(|label| label.name == "caravan-parked"),
+            "default block policy must not require the parking label"
+        );
+        let canonical_blocking = blocking.iter().map(canonical).collect::<Vec<_>>();
+        assert!(inspect_labels(&canonical_blocking, &priorities, false, false).ready);
+
+        let parking = required_labels(&priorities, false, true);
+        let parked = parking
+            .iter()
+            .find(|label| label.name == "caravan-parked")
+            .expect("park policy requires its fixed label");
+        assert_eq!(parked.color, "8250DF");
+        // The same already-canonical repository is unready the moment parking is
+        // enabled, so enabling the policy names the exact missing resource.
+        let status = inspect_labels(&canonical_blocking, &priorities, false, true);
+        assert!(!status.ready);
+        assert_eq!(status.missing_labels, ["caravan-parked"]);
     }
 
     #[test]
@@ -1166,6 +1204,7 @@ mod tests {
                 &labels,
                 &crate::config::CaravanConfig::default().agent_priority_labels,
                 false,
+                false,
             )
             .ready
         );
@@ -1271,7 +1310,7 @@ mod tests {
             },
         ];
         let priorities = crate::config::CaravanConfig::default().agent_priority_labels;
-        let status = inspect_labels(&labels, &priorities, false);
+        let status = inspect_labels(&labels, &priorities, false, false);
         assert!(!status.ready);
         assert_eq!(
             status.missing_labels,

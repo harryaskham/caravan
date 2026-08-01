@@ -1994,6 +1994,203 @@ fn no_sync_path_evicts_a_member_whose_ci_is_red_or_cancelled() {
     }
 }
 
+/// bd-080a8e phase-one acceptance fixture. Under the opt-in `park` policy a
+/// terminal-red active caravan must be quarantined without topology mutation,
+/// then independent green candidate B must be admitted in the same bounded
+/// tick. This is intentionally written against the current blocking path first:
+/// before implementation it fails at `ci_failure` and never reaches B.
+#[test]
+fn terminal_red_park_policy_frees_capacity_for_independent_green_candidate() {
+    let mut active = healthy_chain();
+    active.truncate(1);
+    active[0].checks = vec![check("build-test", CheckState::Failure, Some(10))];
+    let matching = failed_run(10, &active[0]);
+    let candidate = unlabelled_candidate();
+    let mut pulls = active.clone();
+    pulls.push(candidate.clone());
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    provider
+        .failed_runs
+        .borrow_mut()
+        .insert(PrNumber(1), vec![matching]);
+    let initial_status = status(pulls, Some(PrNumber(1)), &clean);
+
+    let mut context = AppContext::default();
+    // This policy fixture isolates queue liveness from physical Git; dedicated
+    // rewrite/concat fixtures cover branch chaining under rebase_on_join.
+    context.config.rebase_on_join = false;
+    context.config.sync.actions.join_unlabelled_prs = true;
+    context.config.sync.terminal_red.action = crate::config::TerminalRedAction::Park;
+    let repository = tempfile::tempdir().unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(repository.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    context.repository_path = repository.path().to_path_buf();
+
+    let parking = reconcile_terminal_red_parking(&context, &initial_status, &provider)
+        .expect("park policy isolates exact terminal red");
+    assert!(parking.changed);
+    assert_eq!(parking.events.len(), 1);
+    assert_eq!(parking.events[0].kind, EventKind::CaravanParked);
+
+    let parked_pulls = provider
+        .pulls
+        .borrow()
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    let parked_status = status(parked_pulls, Some(PrNumber(1)), &clean);
+    assert!(parked_status.analysis.fleet.caravans[0].parked);
+    assert!(
+        parked_status.healthy,
+        "parked-red is explicit queue state, not an unhealthy graph"
+    );
+    execute(&parked_status, &provider, true, false, false)
+        .expect("parked red caravan no longer blocks convergence");
+    assert!(
+        select_caravans(&parked_status, true).unwrap().is_empty(),
+        "parked A consumes no selected convergence capacity"
+    );
+    assert!(
+        current_tail_generations(&parked_status).is_empty(),
+        "parked A is not an automatic-admission target"
+    );
+    assert_eq!(
+        parked_status
+            .admission
+            .candidates
+            .first()
+            .map(|item| item.pr),
+        Some(candidate.number),
+        "independent green B remains the canonical candidate for same-tick admission"
+    );
+
+    let observed = provider.pulls.borrow();
+    assert!(observed[&PrNumber(1)].has_label("caravan"));
+    assert!(observed[&PrNumber(1)].has_label("caravan-parked"));
+    assert_eq!(observed[&PrNumber(1)].base.name, "main");
+    assert!(!observed[&candidate.number].has_label("caravan"));
+    drop(observed);
+
+    let repeated = reconcile_terminal_red_parking(&context, &parked_status, &provider)
+        .expect("repeated parking is idempotent");
+    assert!(!repeated.changed);
+    assert!(repeated.provider_receipts.is_empty());
+    assert!(repeated.events.is_empty());
+}
+
+#[test]
+fn parking_uses_latest_verdict_only_and_pending_never_parks() {
+    let mut old_red = check("build-test", CheckState::Failure, Some(10));
+    old_red.completed_at = Some("2026-01-01T00:00:10Z".to_owned());
+    let mut new_green = check("build-test", CheckState::Success, Some(11));
+    new_green.completed_at = Some("2026-01-01T00:00:11Z".to_owned());
+    for (label, checks) in [
+        ("superseded red then green", vec![old_red, new_green]),
+        (
+            "pending",
+            vec![check("build-test", CheckState::InProgress, Some(12))],
+        ),
+    ] {
+        let mut pulls = healthy_chain();
+        pulls.truncate(1);
+        pulls[0].checks = checks;
+        let provider = FakeProvider::with_pull_requests(pulls.clone());
+        let status = status(pulls, Some(PrNumber(1)), &clean);
+        let mut context = AppContext::default();
+        context.config.sync.terminal_red.action = crate::config::TerminalRedAction::Park;
+        let result = reconcile_terminal_red_parking(&context, &status, &provider).unwrap();
+        assert!(!result.changed, "{label}");
+        assert!(result.provider_receipts.is_empty(), "{label}");
+        assert!(!provider.pulls.borrow()[&PrNumber(1)].has_label("caravan-parked"));
+    }
+}
+
+#[test]
+fn one_terminal_member_parks_the_complete_caravan_without_topology_change() {
+    let mut pulls = healthy_chain();
+    pulls[1].checks = vec![check("build-test", CheckState::Cancelled, Some(19))];
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+    let original_order = status.analysis.fleet.caravans[0].members.clone();
+    let original_bases = status
+        .analysis
+        .pull_requests
+        .iter()
+        .map(|(pr, pull)| (*pr, pull.base.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut context = AppContext::default();
+    context.config.sync.terminal_red.action = crate::config::TerminalRedAction::Park;
+
+    let result = reconcile_terminal_red_parking(&context, &status, &provider).unwrap();
+    assert!(result.changed);
+    assert_eq!(result.events[0].kind, EventKind::CaravanParked);
+    assert_eq!(result.events[0].prs, original_order);
+    let observed = provider.pulls.borrow();
+    assert!(observed[&PrNumber(1)].has_label("caravan-parked"));
+    assert!(!observed[&PrNumber(2)].has_label("caravan-parked"));
+    assert!(!observed[&PrNumber(3)].has_label("caravan-parked"));
+    assert!(observed.values().all(|pull| pull.has_label("caravan")));
+    assert!(
+        observed
+            .iter()
+            .all(|(pr, pull)| pull.base == original_bases[pr])
+    );
+}
+
+#[test]
+fn green_rerun_unparks_without_changing_multi_member_topology() {
+    let mut pulls = healthy_chain();
+    pulls[0].labels.insert("caravan-parked".to_owned());
+    pulls[0].auto_merge = AutoMergeState::disabled();
+    for pull in &mut pulls {
+        pull.checks = vec![check("build-test", CheckState::Success, Some(20))];
+    }
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+    assert_eq!(
+        status.analysis.fleet.caravans[0].members,
+        vec![PrNumber(1), PrNumber(2), PrNumber(3)]
+    );
+    assert!(status.analysis.fleet.caravans[0].parked);
+    let mut context = AppContext::default();
+    context.config.sync.terminal_red.action = crate::config::TerminalRedAction::Park;
+
+    let result = reconcile_terminal_red_parking(&context, &status, &provider).unwrap();
+    assert!(result.changed);
+    assert_eq!(result.events[0].kind, EventKind::CaravanUnparked);
+    let observed = provider.pulls.borrow();
+    assert!(!observed[&PrNumber(1)].has_label("caravan-parked"));
+    assert_eq!(observed[&PrNumber(1)].base.name, "main");
+    assert_eq!(observed[&PrNumber(2)].base.name, "one");
+    assert_eq!(observed[&PrNumber(3)].base.name, "two");
+    assert!(observed.values().all(|pull| pull.has_label("caravan")));
+}
+
+#[test]
+fn default_terminal_red_policy_keeps_strict_blocking_behavior() {
+    assert_eq!(
+        crate::config::SyncConfig::default().terminal_red.action,
+        crate::config::TerminalRedAction::Block
+    );
+    let mut pulls = healthy_chain();
+    pulls.truncate(1);
+    pulls[0].checks = vec![check("build-test", CheckState::Failure, Some(30))];
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+    let result =
+        reconcile_terminal_red_parking(&AppContext::default(), &status, &provider).unwrap();
+    assert!(!result.changed);
+    let error = execute(&status, &provider, true, false, false)
+        .expect_err("default block policy retains current strict behavior");
+    assert_eq!(error.code(), "ci_failure");
+}
+
 #[test]
 fn unforced_failure_returns_exact_ci_decision_and_canonical_event() {
     let mut pulls = healthy_chain();

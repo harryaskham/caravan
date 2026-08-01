@@ -146,6 +146,14 @@ pub(crate) fn plan_from_status(
                 format!("PR #{target_tail} is not a current caravan tail"),
             )
         })?;
+    if source.parked || target.parked {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "concat_caravan_parked",
+            "concat refuses parked caravans until current CI reactivates them",
+            Some(json!({"source": source, "target": target})),
+        ));
+    }
     if source.id == target.id {
         return Err(AppError::structured(
             ErrorCategory::Validation,

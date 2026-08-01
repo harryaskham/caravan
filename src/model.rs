@@ -611,13 +611,21 @@ pub struct MergeCandidateIdentity {
 pub struct Caravan {
     pub id: PrNumber,
     pub members: Vec<PrNumber>,
+    /// Terminal-red caravan preserved intact but excluded from active queue
+    /// capacity under the explicit `sync.terminal_red.action: park` policy.
+    #[serde(default)]
+    pub parked: bool,
 }
 
 impl Caravan {
     #[must_use]
     pub fn new(members: Vec<PrNumber>) -> Option<Self> {
         let id = members.first().copied()?;
-        Some(Self { id, members })
+        Some(Self {
+            id,
+            members,
+            parked: false,
+        })
     }
 
     #[must_use]
@@ -1271,6 +1279,10 @@ pub enum EventKind {
     /// Two complete live caravans were concatenated under one reviewed atomic
     /// physical rewrite and one source-root membership commit.
     CaravansConcatenated,
+    /// Exact current terminal-red caravan moved outside active queue capacity.
+    CaravanParked,
+    /// Parked caravan re-entered active capacity after a new/nonterminal/green verdict.
+    CaravanUnparked,
     CiFailed,
     ForceMergeAttempted,
     ForceMergeCompleted,

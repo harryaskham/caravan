@@ -648,6 +648,8 @@ repair:
 sync:
   actions:
     join_unlabelled_prs: false
+  terminal_red:
+    action: block  # default; opt in to `park` for strict queue liveness
   max_candidates_per_tick: 8
   max_mutations_per_tick: 64
   max_github_requests_per_tick: 256
@@ -665,6 +667,16 @@ hooks:
     timeout_secs: 30
     blocking: false
 ```
+
+`sync.terminal_red.action` configures deterministic latest-verdict liveness.
+`block` is the backward-compatible default: terminal red stops the tick. `park`
+adds `caravan-parked` to the exact caravan head, disables its auto-merge,
+preserves every member/base/head, excludes it from active convergence/tail
+capacity, and allows independent green candidates to advance. Pending/running
+and superseded historical red never park. A new head or current nonterminal/green
+verdict removes the label and re-enters the caravan at its original FIFO age.
+Hooks may repair parked work but are never required for unrelated throughput.
+Run `cara init` after enabling park so the fixed label exists.
 
 `sync.missing_required_runs_grace_secs` is the bounded wait before a required
 context with zero reporting run or check-suite lineage on the exact current head

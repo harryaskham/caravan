@@ -740,6 +740,7 @@ pub fn project_status(context: &AppContext, status: &StatusOutput) -> SyncBudget
         .fleet
         .caravans
         .iter()
+        .filter(|caravan| !caravan.parked)
         .filter(|caravan| {
             !status
                 .pauses

@@ -3311,6 +3311,8 @@ mod tests {
         assert!(INDEX_HTML.contains("id=\"execute-concat\""));
         assert!(APP_JS.contains("plan_concat"));
         assert!(APP_JS.contains("expected_plan_hash"));
+        assert!(APP_JS.contains("Parked red"));
+        assert!(APP_JS.contains("parkedCaravans"));
         assert!(!APP_JS.contains("evict+rejoin"));
         assert!(INDEX_HTML.contains("id=\"show-config\""));
         assert!(INDEX_HTML.contains("id=\"show-evidence\""));

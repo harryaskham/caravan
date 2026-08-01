@@ -2409,14 +2409,24 @@ fn render_status(output: &caravan::read::StatusOutput) -> String {
         output.auto_admission.max_duration_secs,
     );
     let history = &output.analysis.fleet.history;
+    let parked_count = output
+        .analysis
+        .fleet
+        .caravans
+        .iter()
+        .filter(|caravan| caravan.parked)
+        .count();
+    let active_count = output
+        .analysis
+        .fleet
+        .caravans
+        .len()
+        .saturating_sub(parked_count);
     let _ = writeln!(
         text,
         "\n{}  {}",
         heading("CARAVANS"),
-        dim(format!(
-            "{} in flight now",
-            output.analysis.fleet.caravans.len()
-        ))
+        dim(format!("{active_count} active, {parked_count} parked now"))
     );
     // "Now" and "ever" are different questions. An empty live list was read as
     // "no caravan has ever formed" on a repository that had merged 23 members
@@ -2483,10 +2493,15 @@ fn render_status(output: &caravan::read::StatusOutput) -> String {
             })
             .collect::<Vec<_>>()
             .join(&dim("  →  "));
+        let state = if caravan.parked { " parked-red" } else { "" };
         let _ = writeln!(
             text,
             "  {}  {chain}",
-            styled("1;35", format!("van #{}", caravan.id))
+            if caravan.parked {
+                warning(format!("van #{}{state}", caravan.id))
+            } else {
+                styled("1;35", format!("van #{}", caravan.id))
+            }
         );
         if let Some(projection) = output
             .sync_budget

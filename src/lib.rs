@@ -126,6 +126,13 @@ CORE MODEL AND INVARIANTS
   only by exactly one auditable check-suite rerequest against the unchanged
   head. Empty commits, close/reopen loops, force pushes, and broad reruns are
   never implicit workarounds.
+- Terminal-red queue behavior is configurable. `sync.terminal_red.action: block`
+  is the backward-compatible default. Explicit `park` preserves the complete
+  caravan topology under a `caravan-parked` head label, disables head
+  auto-merge, excludes it from active convergence/capacity/tail selection, and
+  allows independent green work to advance. Pending and superseded red never
+  park; new/nonterminal/green current evidence deterministically unparks at the
+  root's original FIFO age. Hooks are optional recovery, never queue liveness.
 - A successful tick names every `head_of_line` stall: the exact blocking PR, its
   one-based queue position, the members waiting behind it, the block class, and
   ordered repair/reshape/evict remedies. A stalled front is an external

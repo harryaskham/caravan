@@ -181,6 +181,8 @@
     }
     const status = repo.status;
     const caravans = status?.analysis?.fleet?.caravans ?? [];
+    const activeCaravans = caravans.filter((caravan) => !caravan.parked);
+    const parkedCaravans = caravans.filter((caravan) => caravan.parked);
     const problems = status?.analysis?.fleet?.problems ?? [];
     const activeMembers = new Set(caravans.flatMap((caravan) => caravan.members));
     const saloon = prValues(status).filter((pr) => openPr(pr) && !activeMembers.has(pr.number));
@@ -195,7 +197,7 @@
         <div><p class="eyebrow">${repo.config_existed ? "Configured repository" : "Default policy"}</p><h2 id="repo-title">${escapeHtml(repoName(repo))}</h2></div>
         <p>Updated ${escapeHtml(updated)} · physical chains ${escapeHtml(mode)} · ${escapeHtml(webhookText)}</p>
       </article>
-      <article class="overview-card"><span class="metric-label">Caravans</span><strong class="metric">${caravans.length}</strong><p>${activeMembers.size} PRs</p></article>
+      <article class="overview-card"><span class="metric-label">Caravans</span><strong class="metric">${activeCaravans.length}</strong><p>${parkedCaravans.length} parked · ${activeMembers.size} PRs</p></article>
       <article class="overview-card"><span class="metric-label">Saloon</span><strong class="metric">${saloon.length}</strong><p>not yet joined</p></article>
       <article class="overview-card"><span class="metric-label">Attention</span><strong class="metric">${problems.length + (repo.error ? 1 : 0)}</strong><p>${state.read_only ? "read only" : "mutable"}</p></article>`;
   }
@@ -261,7 +263,7 @@
         <header class="caravan-header">
           <div class="caravan-title"><h3>Caravan #${caravan.id}</h3><span>${members.length} ${members.length === 1 ? "member" : "members"}</span></div>
           <div class="caravan-tools">
-            <div class="badges">${pause ? badge("Paused", "warn") : head?.auto_merge?.enabled ? badge("Head armed", "good") : badge("Head not armed", "warn")}</div>
+            <div class="badges">${caravan.parked ? badge("Parked red", "bad") : pause ? badge("Paused", "warn") : head?.auto_merge?.enabled ? badge("Head armed", "good") : badge("Head not armed", "warn")}</div>
             <div class="inline-actions">${actionButton("Plan", "plan_sync", { all: true, rerun_failed: false }, "", false)}${actionButton("Sync", "sync", { all: true, rerun_failed: false }, "primary")}${holdAction}</div>
           </div>
         </header>
@@ -484,7 +486,7 @@
   }
 
   function renderConcatControl(repo, actionBusy) {
-    const caravans = repo.status?.analysis?.fleet?.caravans ?? [];
+    const caravans = (repo.status?.analysis?.fleet?.caravans ?? []).filter((caravan) => !caravan.parked);
     ui.concatControl.hidden = caravans.length < 2;
     if (caravans.length < 2) {
       concatPlans.delete(repo.id);

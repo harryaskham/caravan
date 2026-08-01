@@ -555,6 +555,19 @@ Already-correct steps are no-ops. Rerunning after interruption resumes from redi
 
 Sync never invents an agent decision. Every successful bounded tick returns a versioned scheduler projection over the fresh final discovery: exact default branch generation, each selected caravan's root/tail/member head and base generations, observed CI disposition, intentional holds, and one `healthy`, `waiting_ci`, or `held` state. These successful states always carry `wake_class=none`; fresh, empty, expected, queued, or running checks remain `waiting_ci` and do not wake a repair actor.
 
+Terminal-red handling is repository policy. `sync.terminal_red.action: block`
+(default) preserves strict historical behavior. `park` deterministically labels
+the exact caravan head `caravan-parked` after latest-per-check evidence proves a
+current terminal Failure/Cancelled/TimedOut/ActionRequired verdict, disables its
+auto-merge, and excludes the whole preserved caravan from active convergence,
+capacity and admission-tail selection. It never changes member labels, branches
+or bases. Pending/running and superseded red remain active. A new head or latest
+nonterminal/green verdict removes the parked label; re-entry retains the root's
+immutable original FIFO age. Park/unpark events bind exact ordering, member
+heads, current/superseded check evidence, classification, fingerprint and
+provider receipt. Hooks are optional recovery and never a green-queue liveness
+dependency. Phase one parks a complete caravan when any member is terminal red.
+
 Failed ticks carry a scheduler classification alongside their typed error. A provider/head/tail precondition race is `wake_class=retry_tick`: the next tick rediscovers and retries, and no `sync_failed` repair hook is emitted. Mechanical/semantic graph decisions, terminal current-generation CI, proven provider-generation invariant violations, and deterministic unsupported physical range shapes (`rebase_nonlinear_range`, ambiguous/empty ranges, rewritten target history, or invalid owned topology) are non-retryable `wake_class=external_decision`. They emit exactly one canonical `ci_failed` or `sync_failed` repair-wake event even when the same failed tick also completed ordinary topology events. The receipt preserves exact affected PR/caravan, merge OIDs/plans, zero/partial mutation evidence, actionable first-party choices, and a stable decision fingerprint for external deduplication. Local checkout, configuration, permission, or policy work that an external repair agent cannot safely decide is `wake_class=operator_action`. At an incompatible edge or unhandled CI failure, sync stops like an interactive rebase, checks out the affected PR when safe, emits a structured decision point, fires its hook, and exits. A dirty or internally-remoted caller must not trigger raw Git surgery: `repair start` resolves an explicit provider-owned URL, creates an independent workspace below Git's common Caravan state, seeds only content-addressed objects from the current canonical checkout, binds the explicit provider as a separate remote, minimally/bloblessly fetches and checks out exact provider OIDs, and leaves caller HEAD, refs, config, index, and files untouched.
 
 For deterministic repair, conflicts and exact semantic grants remain narrow. For a typed semantic/CI decision, an audited session-level authorization may permit one exact agent to add, modify, rename, or delete ordinary repository content inside the isolated workspace. It never authorizes Git internals, out-of-workspace paths, symlinks/gitlinks, staged secret-like operational files, unstaged/untracked residue, unresolved markers, excess bounded scope/diff, identity drift, or a different actor. Continue fingerprints the complete bounded broad path list, staged objects (including deletions), and binary diff before commit; the publication receipt carries that evidence and requires fresh CI.
@@ -933,6 +946,8 @@ Hook events include:
 - `head_advanced`;
 - `evicted`;
 - `split`;
+- `caravan_parked`;
+- `caravan_unparked`;
 - `ci_failed`;
 - `force_merge_attempted`;
 - `force_merge_completed`;

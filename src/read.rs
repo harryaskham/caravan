@@ -1128,6 +1128,7 @@ fn status_with_discovery_options(
         &labels,
         &context.config.agent_priority_labels,
         context.config.sync.actions.join_unlabelled_prs,
+        context.config.sync.terminal_red.action == crate::config::TerminalRedAction::Park,
     );
     if !context.config_existed {
         initialization.ready = false;
