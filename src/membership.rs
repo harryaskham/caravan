@@ -61,7 +61,12 @@ const CANDIDATE_OPERATION_COMMAND_BUDGET: u32 = POST_REWRITE_COMMAND_RESERVE * 2
 fn candidate_operation_deadline(
     context: &AppContext,
     tick_deadline: std::time::Instant,
+    _binding_read_deadline: std::time::Instant,
 ) -> std::time::Instant {
+    // The binding read's one-command deadline is intentionally an input to this
+    // seam so the dangerous choice is explicit and regression-testable. It has
+    // already bounded its own runner; returning it here recreates bd-10303b's
+    // unsatisfiable 1x window versus the 4x post-rewrite reserve.
     let share = std::time::Duration::from_secs(context.config.command_timeout_secs)
         .saturating_mul(CANDIDATE_OPERATION_COMMAND_BUDGET);
     std::cmp::min(tick_deadline, std::time::Instant::now() + share)
@@ -1251,9 +1256,11 @@ fn execute_locked(
                 github_budget,
             )?
         };
-        // Not `bound.exact_deadline`: that is the binding read's own one-command
-        // window, already applied to its own runner (bd-84f82d).
-        operation_deadline = candidate_operation_deadline(context, operation_deadline);
+        // The binding read's one-command window is already applied to its own
+        // runner. The explicit seam must retain a candidate share of the tick,
+        // not return that read deadline (bd-84f82d, bd-10303b).
+        operation_deadline =
+            candidate_operation_deadline(context, operation_deadline, bound.exact_deadline);
         bound.status
     } else if request.create_pr {
         read::status_for_pr_creation(context, operation_deadline, github_budget)?
@@ -1644,9 +1651,10 @@ fn execute_locked(
                 rediscovery_deadline,
                 github_budget,
             )?;
-            // Same as the binding above: keep a candidate-scoped share of the
-            // tick, never a single command window (bd-84f82d).
-            operation_deadline = candidate_operation_deadline(context, operation_deadline);
+            // Same as the binding above: keep the same candidate-scoped share
+            // of the tick, never the rediscovery read's one-command window.
+            operation_deadline =
+                candidate_operation_deadline(context, operation_deadline, bound.exact_deadline);
             status = bound.status;
             checker = GitCompatibilityChecker::new(&context.repository_path, "origin")
                 .with_timeout(timeout)

@@ -401,7 +401,8 @@ fn a_candidate_share_can_hold_the_reserve_it_will_be_asked_for() {
 
     // A generous tick: the candidate share must leave room for the reserve.
     let tick = std::time::Instant::now() + std::time::Duration::from_secs(3600);
-    let share = super::candidate_operation_deadline(&context, tick);
+    let binding_read = std::time::Instant::now() + timeout;
+    let share = super::candidate_operation_deadline(&context, tick, binding_read);
     assert!(
         share.saturating_duration_since(std::time::Instant::now()) >= reserve,
         "the share must hold the reserve the guard will demand, or the rewrite path is unreachable"
@@ -423,6 +424,121 @@ fn a_candidate_share_can_hold_the_reserve_it_will_be_asked_for() {
         share < tick,
         "the share must remain bounded below the tick deadline"
     );
+}
+
+/// bd-10303b: exercise the complete post-rewrite half of a fresh join under
+/// the same candidate-scoped operation deadline. The arithmetic-only guard test
+/// above would stay green if rediscovery accidentally collapsed the deadline
+/// back to one command or if membership writes no longer consumed the freshly
+/// rediscovered rewritten head.
+#[test]
+fn rewrite_required_join_rediscovery_and_membership_share_one_operation_budget() {
+    let mut context = AppContext::default();
+    context.config.command_timeout_secs = 1;
+    context.config.rebase_on_join = true;
+    context.config.sync.actions.join_unlabelled_prs = true;
+
+    let tail = pull_request(1, "tail", "main", &[ACTIVE_LABEL]);
+    let fresh = pull_request(2, "candidate", "main", &[]);
+    let initial_status = status(fresh.clone(), vec![tail.clone()]);
+    assert_eq!(fresh.base.name, "main");
+    assert_ne!(
+        fresh.base.name, tail.head.name,
+        "the join requires a rewrite"
+    );
+
+    // Candidate binding receives a bounded share of the sync tick. The
+    // post-push rediscovery must retain that exact operation deadline rather
+    // than replacing it with its own one-command read deadline.
+    let tick_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let binding_read_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let operation_deadline =
+        super::candidate_operation_deadline(&context, tick_deadline, binding_read_deadline);
+    assert!(
+        operation_deadline > binding_read_deadline,
+        "the one-command binding deadline must not replace the operation budget"
+    );
+    super::require_post_rewrite_budget(&context, Some(operation_deadline), fresh.number)
+        .expect("fresh rewrite has enough budget before the irreversible push");
+
+    // Model the authoritative provider rediscovery after the force-with-lease
+    // push: the head changed, while membership base/label writes have not run.
+    let mut rediscovered = fresh.clone();
+    rediscovered.head.oid = CommitOid("rewritten-candidate-head".to_owned());
+    let post_rewrite_status = status(rediscovered.clone(), vec![tail.clone()]);
+    let rediscovery_read_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let post_rediscovery_deadline = super::candidate_operation_deadline(
+        &context,
+        operation_deadline,
+        rediscovery_read_deadline,
+    );
+    assert_eq!(
+        post_rediscovery_deadline, operation_deadline,
+        "rediscovery must retain the candidate operation budget"
+    );
+    super::require_post_rewrite_budget(
+        &context,
+        Some(post_rediscovery_deadline),
+        rediscovered.number,
+    )
+    .expect("mandatory membership writes still fit after rediscovery");
+
+    let rebase = crate::physical_rebase::RebaseReceipt {
+        pr: fresh.number,
+        branch: fresh.head.name.clone(),
+        old_head_oid: fresh.head.oid.clone(),
+        new_head_oid: rediscovered.head.oid.clone(),
+        old_base_oid: fresh.base.oid.clone(),
+        new_base_branch: tail.head.name.clone(),
+        new_base_oid: tail.head.oid.clone(),
+        new_tree_oid: CommitOid("rewritten-result-tree".to_owned()),
+        commit_count: 1,
+        merge_topology: None,
+        squash_reconciliation: None,
+        ci_trigger_workflows: vec![".github/workflows/ci.yml".to_owned()],
+        lease: format!(
+            "--force-with-lease=refs/heads/{}:{}",
+            fresh.head.name, fresh.head.oid
+        ),
+        already_satisfied: false,
+        rewrite_reason: crate::physical_rebase::BranchRewriteReason::Unspecified,
+    };
+    let mut provider = FakeProvider::with_pull_requests(vec![tail.clone(), rediscovered]);
+    provider.labels.insert(SKIPPED_LABEL.to_owned());
+    let output = execute_with_rebase_guard(
+        post_rewrite_status,
+        &clean,
+        &provider,
+        MembershipRequest {
+            operation: MembershipOperation::Join,
+            create_pr: false,
+            tail_pr: Some(tail.number.0),
+            head_pr: None,
+            reason: Some("automatic tail re-formation regression".to_owned()),
+            priority_label: None,
+            agent_priority_labels: Vec::new(),
+        },
+        Some(&rebase),
+        true,
+    )
+    .expect("rewritten candidate completes membership in the same operation");
+
+    assert!(std::time::Instant::now() < post_rediscovery_deadline);
+    assert_eq!(output.pull_request.base.name, tail.head.name);
+    assert_eq!(
+        output.pull_request.base.oid,
+        CommitOid(format!("{}-oid", tail.head.name))
+    );
+    assert!(output.pull_request.has_label(ACTIVE_LABEL));
+    assert_eq!(output.pull_request.auto_merge, AutoMergeState::disabled());
+    assert!(output.provider_receipts.iter().any(|receipt| {
+        receipt.kind == MutationKind::SetBase && receipt.after.base.name == tail.head.name
+    }));
+    assert!(output.provider_receipts.iter().any(|receipt| {
+        receipt.kind == MutationKind::AddLabel && receipt.after.has_label(ACTIVE_LABEL)
+    }));
+    assert_eq!(output.pull_request.head.oid, rebase.new_head_oid);
+    assert_eq!(initial_status.current_pr, Some(fresh.number));
 }
 
 /// bd-4e4615: an irreversible branch rewrite must not start without budget for
