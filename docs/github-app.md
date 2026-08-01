@@ -72,16 +72,22 @@ Install the App only on repositories Caravan operates. Start with this baseline:
 | Commit statuses | Read | Read required legacy status contexts. |
 | Actions | Read | Read workflow/check state. |
 
-Two upgrades are conditional, not baseline permissions:
+Three upgrades are conditional, not baseline permissions:
 
 - **Actions: write** only when the deployment explicitly enables workflow reruns.
 - **Workflows: write** only when managed source branches are allowed to change
   `.github/workflows/*`. Without it, such a push must fail rather than broaden
   the installation silently.
+- **Administration: write** only for a reviewed native-Stack deployment whose
+  executable merge path uses Cara's exact-ref no-bypass repository-ruleset
+  lock. It may create/read/delete only the operation-scoped Stack lock ruleset;
+  it is never general repository-settings authority and remains forbidden in
+  the baseline `github-app-policy.json`.
 
-Do not grant Administration, Members, organization administration, repository
-or organization secrets, or blanket default-branch bypass. Permission changes
-require review of `github-app-policy.json` and its contract test.
+Do not grant Members, organization administration, repository or organization
+secrets, or blanket default-branch bypass. Do not grant Administration for
+ordinary Caravan mode or read-only Stack preview. Permission changes require
+review of `github-app-policy.json` and its contract test.
 
 ## Git transport and branch rules
 

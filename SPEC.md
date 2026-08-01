@@ -1005,10 +1005,23 @@ ordinary lower fast-forward, top-SHA rejection, and UUID recovery. It also
 proved the current API does not lease the complete group: after 202, a lower
 rewind preserving upper ancestry merged every selected PR at the changed lower
 generation. Cara seals that outcome as `indeterminate`, but post-merge detection
-cannot prevent it. The mutation fence may be removed only after GitHub exposes
-a preventive complete-group generation lease or an equivalent mechanism. An
-older Cara reader must still be excluded with `min_cara_version` before any
-future repository opt-in. Exact evidence is recorded in
+cannot prevent it. The installed `gh stack` CLI does not contain a merge command
+or hidden stronger lease; web merge uses the same endpoint.
+
+The 2026-08-01 follow-up proved the accepted preventive equivalent. Cara creates
+one active repository ruleset with no bypass actors, exact selected source refs,
+and exactly `update` plus `deletion` restrictions. Exact readback must report
+`current_user_can_bypass: never`; owner SSH pushes and owner-authenticated REST
+force-update/delete were all rejected while direct prefix merge and unselected
+suffix rebase succeeded. The ruleset generation is checkpointed with the async
+UUID, revalidated before each submit/poll, and released only by exact ID and
+generation after terminal proof. Missing/drifted lock is `indeterminate`.
+Repository ruleset mutation requires an explicit Administration(write) upgrade,
+which remains outside the baseline App policy and default Caravan mode. The
+workflow fence may open only after that ruleset-locked orchestrator and policy
+are reviewed; unlocked top-SHA-only merge remains invalid. An older Cara reader
+must still be excluded with `min_cara_version` before repository opt-in. Exact
+evidence is recorded in
 `docs/validation/github-native-stack-sandbox-2026-07-31.md`.
 
 `rebase_on_join` is a strict, explicit history-rewrite opt-in and defaults to

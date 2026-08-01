@@ -234,6 +234,26 @@ the exact pinned binary. It performs strict parsing and no repository/provider a
    network operation is never silent. JSON and MCP callers install no observer
    and keep byte-identical envelopes.
 
+GITHUB NATIVE STACKS (EXPLICIT PREVIEW)
+- `stack_type: caravan` is the stable default and makes no native Stack API
+  calls. `stack_type: github` discovers and compares GitHub's ordered Stack
+  object but ordinary Cara mutations remain fenced until rollout is complete.
+- The installed `gh stack` CLI does not merge Stacks. It creates, links,
+  submits, rebases, and synchronizes branch/PR topology; GitHub's web merge uses
+  the same asynchronous REST endpoint that accepts only the selected top SHA.
+- An unlocked async Stack merge is invalid for Cara: a lower branch can rewind
+  after submission while preserving ancestry, and GitHub may merge the changed
+  generation. Cara's accepted preventive contract is one active repository
+  ruleset with no bypass actors, exact selected refs, and update+deletion
+  restrictions. Acquire it, read it back with `current_user_can_bypass: never`,
+  re-read the whole Stack, keep it through terminal UUID proof, then release
+  only the exact ruleset generation. Lost lock or lower-head drift is
+  `indeterminate`, never permission to retry unlocked.
+- The ruleset path requires explicit GitHub Administration(write), which is not
+  part of the baseline App policy. Do not broaden permissions or remove
+  `github_stack_backend_read_only` until the ruleset-locked orchestrator and
+  repository policy are both enabled by a reviewed Cara release.
+
 VIRTUAL CHAINS (SAFE DEFAULT)
 With `rebase_on_join: false` or an absent setting, Caravan does not rewrite PR
 history. It maintains the chain through PR base refs and proves mechanical
@@ -1999,6 +2019,18 @@ mod tests {
         assert!(output.instructions.contains("caravan-force"));
         assert!(output.instructions.contains("force-intent"));
         assert!(output.instructions.contains("--membership-generation"));
+        assert!(output.instructions.contains("GITHUB NATIVE STACKS"));
+        assert!(
+            output
+                .instructions
+                .contains("`gh stack` CLI does not merge")
+        );
+        assert!(
+            output
+                .instructions
+                .contains("current_user_can_bypass: never")
+        );
+        assert!(output.instructions.contains("Administration(write)"));
         assert!(
             output
                 .instructions

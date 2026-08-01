@@ -193,7 +193,9 @@ A tick may submit only a contiguous prefix beginning at the Stack bottom. It cho
 
 Before submission Cara re-reads the Stack and every selected PR. It binds the top selected `sha` accepted by the API and records every lower exact head even though the current API does not expose per-entry lease fields.
 
-The absence of lower-entry lease parameters was resolved negatively by the 2026-07-31 disposable-repository sandbox. A lower fast-forward that broke ancestry failed all-or-none, but a lower rewind to an ancestor after the provider returned 202 preserved linearity and GitHub merged every selected PR at the changed lower generation. The API therefore does not snapshot or lease the complete group. Cara detects the changed lower head afterward as `indeterminate`, but detection cannot prevent the merge that already occurred. Native merge remains preview-only until GitHub exposes a complete-group generation lease or an equivalent preventive mechanism; see `docs/validation/github-native-stack-sandbox-2026-07-31.md`.
+The absence of lower-entry lease parameters was resolved negatively by the 2026-07-31 disposable-repository sandbox. A lower fast-forward that broke ancestry failed all-or-none, but a lower rewind to an ancestor after the provider returned 202 preserved linearity and GitHub merged every selected PR at the changed lower generation. The merge API therefore does not snapshot or lease the complete group, and post-merge `indeterminate` detection is not prevention.
+
+The 2026-08-01 follow-up proved a preventive equivalent: one active repository ruleset with no bypass actors and exact selected refs, containing `update` and `deletion` restrictions, rejected both repository-owner SSH pushes and owner-authenticated REST ref mutations while direct Stack merge succeeded and GitHub rebased the unselected suffix. Cara must acquire and exactly read back that ruleset, re-read the complete Stack, keep the lock through terminal UUID proof, and release only its exact ruleset generation. This path requires Administration(write), remains explicit, and never changes default Caravan permissions; see `docs/validation/github-native-stack-sandbox-2026-07-31.md`.
 
 ### Async transaction
 
@@ -233,7 +235,7 @@ No mutation is used as a capability probe.
 2. **Stack create/add** — membership adapter with exact idempotent receipts; no merge.
 3. **Async merge preview** — plan and preflight only; expose selected prefix and lower-head lease gap.
 4. **Sandbox direct merge** — completed with a negative lower-lease result; atomic failure, success, partial merge, squash results, remaining-entry rebase, and both fast-forward/rewind lower-head races are recorded in `docs/validation/github-native-stack-sandbox-2026-07-31.md`.
-5. **Opt-in merge** — blocked: an audited repository allowlist is insufficient without a preventive complete-group lease.
+5. **Opt-in merge** — permitted only after the proven exact-ref no-bypass ruleset lock is fully wired, durably checkpointed, and exposed as an explicit Administration(write) opt-in; allowlisting alone is insufficient.
 6. **Reshape rebuild** — unstack/recreate for evict and split.
 7. **Merge-queue adapter** — separate acceptance; `enqueued` is not direct atomic landing proof.
 

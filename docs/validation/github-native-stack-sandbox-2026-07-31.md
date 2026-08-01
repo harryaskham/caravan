@@ -94,13 +94,30 @@ Stack containing PRs `#23 -> #24 -> #25` resolves the central acceptance questio
 
 Therefore `merge-async` does **not** bind the complete selected Stack generation. It binds only the selected top SHA and may merge every selected PR after a lower entry changes, provided the resulting chain remains linear. Cara can detect this afterward and seal `indeterminate`, but postcondition detection cannot prevent the already-completed merge.
 
+## Follow-up preventive ruleset proof — 2026-08-01
+
+The installed `github/gh-stack` v0.0.8 CLI has no `merge` subcommand and its source contains no `merge-async` client. It creates, links, submits, rebases, and synchronizes branch/PR topology; GitHub's web Stack merge uses the same top-SHA-only provider endpoint tested above. There is no hidden CLI complete-group lease.
+
+A follow-up run in the same disposable repository proved a client-side provider-enforced equivalent:
+
+1. One active repository ruleset with no bypass actors targeted exact selected refs `refs/heads/lease-lock-1` and `refs/heads/lease-lock-2` and contained exactly `update` plus `deletion` restrictions.
+2. Exact GET readback reported `current_user_can_bypass: never`.
+3. A repository-owner SSH push to the selected lower ref was rejected with `GH013 / Cannot update this protected ref`.
+4. Owner-authenticated REST force-update and delete attempts both returned HTTP 422 repository-rule violations; the selected head remained exact.
+5. With both selected refs locked, direct async merge of PRs `#27 -> #28` succeeded under UUID `282bd37c-e4e1-435f-b6ec-5109ca9eaf14` at default SHA `07005d1f22831c0f6b6142c85df1be615c9914fe`.
+6. Unselected PR `#29` remained writable to GitHub's Stack service and was correctly rebased/retargeted to the new default, proving a partial prefix does not deadlock provider continuation.
+7. Exact ruleset deletion was followed by 404/absence proof; the previously rejected owner push then succeeded, proving bounded reversible cleanup.
+
+This closes the ordinary-user and repository-owner lower-head race without pretending the top-only merge API changed. The safety boundary is an exact active no-bypass ruleset held from final full-generation read through terminal async proof. Ruleset creation/deletion requires GitHub Administration(write), so this is an explicit native-Stack permission upgrade and never part of default Caravan mode.
+
 ## Acceptance decision
 
 - Atomic all-or-none provider behavior is proven for success, direct failure, selected-top movement, and lower movement that breaks linear ancestry.
 - UUID persistence, pending polling, terminal failure, terminal success, partial-prefix behavior, and exact 409 recovery are proven.
-- Complete-group optimistic concurrency is **not** provided by the current API because a lower rewind preserving linearity can merge at a generation different from Cara's sealed intent.
+- Complete-group optimistic concurrency is **not** provided by the merge API itself because a lower rewind preserving linearity can merge at a generation different from Cara's sealed intent.
+- An active exact-ref no-bypass repository ruleset is a proven preventive equivalent: it blocks SSH and REST owner writes while permitting GitHub to merge the selected prefix and rewrite only the unselected suffix.
 
-The `github_stack_backend_read_only` workflow mutation fence remains closed. The adapter and receipts may land for preview and diagnostics, but native Stack merge must not become an executable repository mode until GitHub exposes a complete-group generation lease or another preventive mechanism—not merely post-merge detection—closes this race.
+The `github_stack_backend_read_only` workflow fence remains closed until the ruleset lock is threaded through executable Stack orchestration and its Administration(write) permission is explicit. It may then open only for the exact ruleset-locked path; an unlocked top-SHA-only merge remains permanently invalid.
 
 ## Cleanup
 

@@ -10,7 +10,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use super::{
-    GitHubMutationAdapter, GitHubStackEntryGeneration, GitHubStackGeneration,
+    GitHubMutationAdapter, GitHubStackBranchLockError, GitHubStackBranchLockGeneration,
+    GitHubStackBranchLockPlan, GitHubStackEntryGeneration, GitHubStackGeneration,
     GitHubStackMutationError, MutationError,
 };
 use crate::command::{CommandOutput, CommandRunner, CommandSpec};
@@ -193,6 +194,18 @@ pub struct GitHubStackAsyncMergePlan {
     pub merge_action: GitHubStackMergeAction,
 }
 
+impl GitHubStackAsyncMergePlan {
+    #[must_use]
+    pub fn branch_lock_plan(&self) -> GitHubStackBranchLockPlan {
+        GitHubStackBranchLockPlan {
+            operation_id: self.operation_id.clone(),
+            actor: self.actor.clone(),
+            stack_number: self.before.number,
+            selected: self.selected.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct GitHubStackMergeRequestIdentity {
     pub method: String,
@@ -333,6 +346,64 @@ impl GitHubStackMergeReceipt {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GitHubStackLockedMergeCheckpoint {
+    pub schema_version: u32,
+    pub repository: RepositoryId,
+    pub merge: GitHubStackMergeCheckpoint,
+    pub branch_lock: GitHubStackBranchLockGeneration,
+    pub evidence_hash: String,
+}
+
+impl GitHubStackLockedMergeCheckpoint {
+    fn seal(mut self) -> Self {
+        self.evidence_hash.clear();
+        let material = serde_json::to_vec(&self).expect("locked Stack merge checkpoint serializes");
+        self.evidence_hash = crate::membership::fnv1a64(&material);
+        self
+    }
+
+    #[must_use]
+    pub fn verify(&self) -> bool {
+        let expected = self.evidence_hash.clone();
+        let mut material = self.clone();
+        material.evidence_hash.clear();
+        serde_json::to_vec(&material)
+            .ok()
+            .is_some_and(|bytes| crate::membership::fnv1a64(&bytes) == expected)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GitHubStackLockedMergeReceipt {
+    pub schema_version: u32,
+    pub merge: GitHubStackMergeReceipt,
+    pub branch_lock: GitHubStackBranchLockGeneration,
+    pub branch_lock_verified: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<GitHubStackLockedMergeCheckpoint>,
+    pub evidence_hash: String,
+}
+
+impl GitHubStackLockedMergeReceipt {
+    fn seal(mut self) -> Self {
+        self.evidence_hash.clear();
+        let material = serde_json::to_vec(&self).expect("locked Stack merge receipt serializes");
+        self.evidence_hash = crate::membership::fnv1a64(&material);
+        self
+    }
+
+    #[must_use]
+    pub fn verify(&self) -> bool {
+        let expected = self.evidence_hash.clone();
+        let mut material = self.clone();
+        material.evidence_hash.clear();
+        serde_json::to_vec(&material)
+            .ok()
+            .is_some_and(|bytes| crate::membership::fnv1a64(&bytes) == expected)
+    }
+}
+
 #[derive(Debug)]
 pub enum GitHubStackMergeError {
     InvalidPlan {
@@ -347,6 +418,7 @@ pub enum GitHubStackMergeError {
         diagnostic: String,
     },
     Stack(GitHubStackMutationError),
+    Lock(GitHubStackBranchLockError),
     Provider(MutationError),
 }
 
@@ -367,6 +439,7 @@ impl std::fmt::Display for GitHubStackMergeError {
                 )
             }
             Self::Stack(error) => error.fmt(formatter),
+            Self::Lock(error) => error.fmt(formatter),
             Self::Provider(error) => error.fmt(formatter),
         }
     }
@@ -377,6 +450,12 @@ impl std::error::Error for GitHubStackMergeError {}
 impl From<GitHubStackMutationError> for GitHubStackMergeError {
     fn from(error: GitHubStackMutationError) -> Self {
         Self::Stack(error)
+    }
+}
+
+impl From<GitHubStackBranchLockError> for GitHubStackMergeError {
+    fn from(error: GitHubStackBranchLockError) -> Self {
+        Self::Lock(error)
     }
 }
 
@@ -398,10 +477,52 @@ struct ProviderAsyncMergeResult {
 }
 
 impl<R: CommandRunner> GitHubMutationAdapter<R> {
-    /// Submit exactly one direct atomic Stack merge. Callers must persist the
-    /// returned checkpoint before polling. If the response loses its UUID this
-    /// returns an indeterminate sealed receipt and deliberately does not retry.
-    pub fn native_stack_merge_submit(
+    /// Submit only while one exact active no-bypass ruleset locks every selected
+    /// source ref. Lock verification is immediately followed by the final full
+    /// Stack generation read and the one documented async PUT.
+    pub fn native_stack_merge_submit_locked(
+        &self,
+        repository: &RepositoryId,
+        plan: &GitHubStackAsyncMergePlan,
+        branch_lock: &GitHubStackBranchLockGeneration,
+    ) -> Result<GitHubStackLockedMergeReceipt, GitHubStackMergeError> {
+        validate_merge_lock(plan, branch_lock)?;
+        let branch_lock = self.native_stack_branch_lock_verify(repository, branch_lock)?;
+        let merge = self.native_stack_merge_submit_unlocked(repository, plan)?;
+        Ok(locked_merge_receipt(repository, merge, branch_lock, true))
+    }
+
+    /// Poll one persisted UUID while revalidating the exact provider lock. If
+    /// the lock disappeared or changed, provider truth is still observed but
+    /// the outcome is forced to `indeterminate`.
+    pub fn native_stack_merge_poll_locked(
+        &self,
+        repository: &RepositoryId,
+        checkpoint: &GitHubStackLockedMergeCheckpoint,
+    ) -> Result<GitHubStackLockedMergeReceipt, GitHubStackMergeError> {
+        validate_locked_checkpoint(repository, checkpoint)?;
+        let lock_result = self.native_stack_branch_lock_verify(repository, &checkpoint.branch_lock);
+        let mut merge = self.native_stack_merge_poll_unlocked(repository, &checkpoint.merge)?;
+        let lock_verified = lock_result.is_ok();
+        if !lock_verified {
+            merge.status = GitHubStackMergeStatus::Indeterminate;
+            let diagnostic = lock_result.expect_err("checked error").to_string();
+            merge.provider_message = Some(match merge.provider_message {
+                Some(message) => format!("{message}; selected branch lock lost: {diagnostic}"),
+                None => format!("selected branch lock lost: {diagnostic}"),
+            });
+            merge = merge.seal();
+        }
+        Ok(locked_merge_receipt(
+            repository,
+            merge,
+            checkpoint.branch_lock.clone(),
+            lock_verified,
+        ))
+    }
+
+    /// Internal transport after the provider-enforced branch lock is proven.
+    fn native_stack_merge_submit_unlocked(
         &self,
         repository: &RepositoryId,
         plan: &GitHubStackAsyncMergePlan,
@@ -517,7 +638,7 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
 
     /// Poll one persisted UUID once. Tick-level cadence and deadline remain
     /// scheduler policy; this primitive never sleeps or loops invisibly.
-    pub fn native_stack_merge_poll(
+    fn native_stack_merge_poll_unlocked(
         &self,
         repository: &RepositoryId,
         checkpoint: &GitHubStackMergeCheckpoint,
@@ -777,6 +898,78 @@ fn stack_merge_receipt(input: StackMergeReceiptInput<'_>) -> GitHubStackMergeRec
         evidence_hash: String::new(),
     }
     .seal()
+}
+
+fn locked_merge_receipt(
+    repository: &RepositoryId,
+    merge: GitHubStackMergeReceipt,
+    branch_lock: GitHubStackBranchLockGeneration,
+    branch_lock_verified: bool,
+) -> GitHubStackLockedMergeReceipt {
+    let checkpoint = merge.checkpoint.as_ref().map(|merge_checkpoint| {
+        GitHubStackLockedMergeCheckpoint {
+            schema_version: STACK_MERGE_SCHEMA_VERSION,
+            repository: repository.clone(),
+            merge: merge_checkpoint.clone(),
+            branch_lock: branch_lock.clone(),
+            evidence_hash: String::new(),
+        }
+        .seal()
+    });
+    GitHubStackLockedMergeReceipt {
+        schema_version: STACK_MERGE_SCHEMA_VERSION,
+        merge,
+        branch_lock,
+        branch_lock_verified,
+        checkpoint,
+        evidence_hash: String::new(),
+    }
+    .seal()
+}
+
+fn validate_merge_lock(
+    plan: &GitHubStackAsyncMergePlan,
+    lock: &GitHubStackBranchLockGeneration,
+) -> Result<(), GitHubStackMergeError> {
+    let expected_prs = plan
+        .selected
+        .iter()
+        .map(|entry| entry.pr)
+        .collect::<Vec<_>>();
+    let mut expected_refs = plan
+        .selected
+        .iter()
+        .map(|entry| format!("refs/heads/{}", entry.head.name))
+        .collect::<Vec<_>>();
+    expected_refs.sort();
+    if lock.repository != plan.before.topology.base.repository
+        || lock.selected_pull_requests != expected_prs
+        || lock.selected_refs != expected_refs
+        || lock.enforcement != "active"
+        || lock.current_user_can_bypass != "never"
+    {
+        return Err(invalid_plan(
+            "github_stack_merge_lock_mismatch",
+            "branch lock does not bind every exact selected Stack source ref",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_locked_checkpoint(
+    repository: &RepositoryId,
+    checkpoint: &GitHubStackLockedMergeCheckpoint,
+) -> Result<(), GitHubStackMergeError> {
+    if checkpoint.schema_version != STACK_MERGE_SCHEMA_VERSION
+        || checkpoint.repository != *repository
+        || !checkpoint.verify()
+    {
+        return Err(GitHubStackMergeError::InvalidCheckpoint {
+            diagnostic: "locked checkpoint schema, repository, or hash is invalid".to_owned(),
+        });
+    }
+    validate_checkpoint(repository, &checkpoint.merge)?;
+    validate_merge_lock(&checkpoint.merge.plan, &checkpoint.branch_lock)
 }
 
 fn classify_observation(
@@ -1300,6 +1493,56 @@ mod tests {
             .unwrap()
     }
 
+    fn branch_lock(plan: &GitHubStackAsyncMergePlan) -> GitHubStackBranchLockGeneration {
+        let mut selected_refs = plan
+            .selected
+            .iter()
+            .map(|entry| format!("refs/heads/{}", entry.head.name))
+            .collect::<Vec<_>>();
+        selected_refs.sort();
+        GitHubStackBranchLockGeneration {
+            id: 77,
+            node_id: "RRS_lock".to_owned(),
+            name: "cara-stack-merge-lock-test".to_owned(),
+            repository: repository(),
+            source: repository().slug(),
+            source_type: "Repository".to_owned(),
+            target: "branch".to_owned(),
+            enforcement: "active".to_owned(),
+            selected_pull_requests: plan.selected.iter().map(|entry| entry.pr).collect(),
+            selected_refs,
+            current_user_can_bypass: "never".to_owned(),
+            created_at: "2026-08-01T10:00:00Z".to_owned(),
+            updated_at: "2026-08-01T10:00:01Z".to_owned(),
+        }
+    }
+
+    fn branch_lock_read_call(
+        lock: &GitHubStackBranchLockGeneration,
+    ) -> (CommandSpec, CommandOutput) {
+        (
+            super::super::stack_lock::read_ruleset_command(&repository(), lock.id),
+            CommandOutput::success(
+                serde_json::json!({
+                    "id": lock.id,
+                    "node_id": lock.node_id,
+                    "name": lock.name,
+                    "target": lock.target,
+                    "source_type": lock.source_type,
+                    "source": lock.source,
+                    "enforcement": lock.enforcement,
+                    "conditions": {"ref_name": {"include": lock.selected_refs, "exclude": []}},
+                    "rules": [{"type":"update"},{"type":"deletion"}],
+                    "bypass_actors": [],
+                    "current_user_can_bypass": lock.current_user_can_bypass,
+                    "created_at": lock.created_at,
+                    "updated_at": lock.updated_at
+                })
+                .to_string(),
+            ),
+        )
+    }
+
     fn checkpoint(plan: GitHubStackAsyncMergePlan) -> GitHubStackMergeCheckpoint {
         let request = merge_request_identity(&repository(), &plan);
         GitHubStackMergeCheckpoint {
@@ -1383,7 +1626,7 @@ mod tests {
         let adapter = GitHubMutationAdapter::new(FakeRunner::new(calls));
 
         let receipt = adapter
-            .native_stack_merge_submit(&repository(), &plan)
+            .native_stack_merge_submit_unlocked(&repository(), &plan)
             .unwrap();
 
         assert_eq!(receipt.status, GitHubStackMergeStatus::Submitted);
@@ -1422,7 +1665,7 @@ mod tests {
         let adapter = GitHubMutationAdapter::new(FakeRunner::new(calls));
 
         let receipt = adapter
-            .native_stack_merge_submit(&repository(), &plan)
+            .native_stack_merge_submit_unlocked(&repository(), &plan)
             .unwrap();
 
         assert_eq!(receipt.status, GitHubStackMergeStatus::Submitted);
@@ -1431,6 +1674,33 @@ mod tests {
             receipt.request.github_request_id.as_deref(),
             Some("REQ-CONFLICT")
         );
+        assert!(receipt.verify());
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn public_submit_requires_and_seals_exact_provider_branch_lock() {
+        let stack = generation();
+        let plan = direct_plan(&stack);
+        let lock = branch_lock(&plan);
+        let mut calls = vec![branch_lock_read_call(&lock)];
+        calls.extend(direct_generation_calls(&stack));
+        calls.push((
+            native_stack_merge_submit_command(&repository(), &plan),
+            CommandOutput::success(
+                "HTTP/2 202 Accepted\n\n{\"uuid\":\"merge-uuid\",\"status\":\"pending\"}",
+            ),
+        ));
+        let adapter = GitHubMutationAdapter::new(FakeRunner::new(calls));
+
+        let receipt = adapter
+            .native_stack_merge_submit_locked(&repository(), &plan, &lock)
+            .unwrap();
+
+        assert!(receipt.branch_lock_verified);
+        assert_eq!(receipt.branch_lock, lock);
+        assert_eq!(receipt.merge.status, GitHubStackMergeStatus::Submitted);
+        assert_eq!(receipt.checkpoint.as_ref().unwrap().branch_lock, lock);
         assert!(receipt.verify());
         adapter.runner.assert_exhausted();
     }
@@ -1460,11 +1730,46 @@ mod tests {
         let adapter = GitHubMutationAdapter::new(runner);
 
         let receipt = adapter
-            .native_stack_merge_poll(&repository(), &checkpoint)
+            .native_stack_merge_poll_unlocked(&repository(), &checkpoint)
             .unwrap();
 
         assert_eq!(receipt.status, GitHubStackMergeStatus::Pending);
         assert_eq!(receipt.checkpoint, Some(checkpoint));
+        assert!(receipt.verify());
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn public_poll_revalidates_lock_before_uuid_read() {
+        let stack = generation();
+        let plan = direct_plan(&stack);
+        let lock = branch_lock(&plan);
+        let merge_checkpoint = checkpoint(plan);
+        let checkpoint = GitHubStackLockedMergeCheckpoint {
+            schema_version: STACK_MERGE_SCHEMA_VERSION,
+            repository: repository(),
+            merge: merge_checkpoint.clone(),
+            branch_lock: lock.clone(),
+            evidence_hash: String::new(),
+        }
+        .seal();
+        let calls = vec![
+            branch_lock_read_call(&lock),
+            (
+                native_stack_merge_poll_command(&repository(), &merge_checkpoint),
+                CommandOutput::success(
+                    "HTTP/2 200 OK\n\n{\"uuid\":\"merge-uuid\",\"status\":\"pending\"}",
+                ),
+            ),
+        ];
+        let adapter = GitHubMutationAdapter::new(FakeRunner::new(calls));
+
+        let receipt = adapter
+            .native_stack_merge_poll_locked(&repository(), &checkpoint)
+            .unwrap();
+
+        assert!(receipt.branch_lock_verified);
+        assert_eq!(receipt.merge.status, GitHubStackMergeStatus::Pending);
         assert!(receipt.verify());
         adapter.runner.assert_exhausted();
     }
@@ -1478,7 +1783,7 @@ mod tests {
         moved.topology.entries[1].base.oid = CommitOid("moved111".to_owned());
         let adapter = GitHubMutationAdapter::new(FakeRunner::new(direct_generation_calls(&moved)));
 
-        let result = adapter.native_stack_merge_submit(&repository(), &plan);
+        let result = adapter.native_stack_merge_submit_unlocked(&repository(), &plan);
 
         assert!(matches!(
             result,
@@ -1515,7 +1820,7 @@ mod tests {
         let adapter = GitHubMutationAdapter::new(FakeRunner::with_results(calls));
 
         let receipt = adapter
-            .native_stack_merge_submit(&repository(), &plan)
+            .native_stack_merge_submit_unlocked(&repository(), &plan)
             .unwrap();
 
         assert_eq!(receipt.status, GitHubStackMergeStatus::Indeterminate);
@@ -1539,7 +1844,7 @@ mod tests {
         let adapter = GitHubMutationAdapter::new(FakeRunner::new(calls));
 
         let receipt = adapter
-            .native_stack_merge_poll(&repository(), &checkpoint)
+            .native_stack_merge_poll_unlocked(&repository(), &checkpoint)
             .unwrap();
 
         assert_eq!(receipt.status, GitHubStackMergeStatus::Failed);
@@ -1563,7 +1868,7 @@ mod tests {
         let adapter = GitHubMutationAdapter::new(FakeRunner::new(calls));
 
         let receipt = adapter
-            .native_stack_merge_poll(&repository(), &checkpoint)
+            .native_stack_merge_poll_unlocked(&repository(), &checkpoint)
             .unwrap();
 
         assert_eq!(receipt.status, GitHubStackMergeStatus::Merged);
@@ -1590,7 +1895,7 @@ mod tests {
         let adapter = GitHubMutationAdapter::new(FakeRunner::new(calls));
 
         let receipt = adapter
-            .native_stack_merge_poll(&repository(), &checkpoint)
+            .native_stack_merge_poll_unlocked(&repository(), &checkpoint)
             .unwrap();
 
         assert_eq!(receipt.status, GitHubStackMergeStatus::Indeterminate);
@@ -1626,7 +1931,7 @@ mod tests {
         let adapter = GitHubMutationAdapter::new(FakeRunner::new(calls));
 
         let receipt = adapter
-            .native_stack_merge_poll(&repository(), &checkpoint)
+            .native_stack_merge_poll_unlocked(&repository(), &checkpoint)
             .unwrap();
 
         assert_eq!(receipt.status, GitHubStackMergeStatus::Merged);
@@ -1656,7 +1961,7 @@ mod tests {
         let adapter = GitHubMutationAdapter::new(FakeRunner::new(calls));
 
         let receipt = adapter
-            .native_stack_merge_poll(&repository(), &checkpoint)
+            .native_stack_merge_poll_unlocked(&repository(), &checkpoint)
             .unwrap();
 
         assert_eq!(receipt.status, GitHubStackMergeStatus::Indeterminate);
@@ -1673,7 +1978,7 @@ mod tests {
         let adapter = GitHubMutationAdapter::new(FakeRunner::new(Vec::new()));
 
         assert!(matches!(
-            adapter.native_stack_merge_poll(&repository(), &checkpoint),
+            adapter.native_stack_merge_poll_unlocked(&repository(), &checkpoint),
             Err(GitHubStackMergeError::InvalidCheckpoint { .. })
         ));
         adapter.runner.assert_exhausted();
