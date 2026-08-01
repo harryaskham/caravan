@@ -57,20 +57,24 @@ stress rounds="10" filter="":
     echo "error: rounds must be a positive integer (got: $rounds)" >&2
     exit 2
   }
+  # Pass the filter through the environment rather than interpolating it into a
+  # shell string, so a filter containing quotes cannot break or inject.
+  export CARA_STRESS_ROUNDS="$rounds"
+  export CARA_STRESS_FILTER="{{filter}}"
   nix develop --command bash -c '
     set -euo pipefail
     # A filter that matches nothing would otherwise run zero tests every round
     # and still report green, which is exactly the vacuous confidence this
     # recipe exists to prevent.
-    selected="$(cargo test --lib {{filter}} -- --list 2>/dev/null | grep -c ": test$" || true)"
+    selected="$(cargo test --lib $CARA_STRESS_FILTER -- --list 2>/dev/null | grep -c ": test$" || true)"
     if [[ "$selected" -eq 0 ]]; then
-      echo "error: filter {{filter}} matched no tests; nothing would be stressed" >&2
+      echo "error: filter ${CARA_STRESS_FILTER:-<none>} matched no tests; nothing would be stressed" >&2
       exit 2
     fi
     echo "stressing $selected test(s)"
-    for round in $(seq 1 '"$rounds"'); do
-      echo "=== stress round $round/'"$rounds"' ==="
-      cargo test --lib {{filter}}
+    for round in $(seq 1 "$CARA_STRESS_ROUNDS"); do
+      echo "=== stress round $round/$CARA_STRESS_ROUNDS ==="
+      cargo test --lib $CARA_STRESS_FILTER
     done
   '
   echo "stress: {{rounds}} green rounds -- probabilistic, not proof of absence"
