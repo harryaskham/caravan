@@ -127,6 +127,16 @@ wrap multiple fully configured `ProcessRunner`s, preserving their auth, budgets,
 deadlines, and telemetry; each marked write revalidates the shared fence while
 reads bypass it. Explicit release drops local ownership before remote.
 
+Every `WriterOperationGuard::checkpoint` automatically binds the latest
+secret-free lease grant to the operation evidence. Remote acquisition writes an
+initial `writer_authority_acquired` checkpoint; derived repair/sync locks write
+`writer_authority_inherited`. Later checkpoints include current key, owner,
+operation ID, fence, heartbeat/expiry, and backend revision. Local-only evidence
+is forwarded unchanged. Existing bounded checkpoint compaction handles large
+operation evidence and preserves `operation_evidence` and
+`remote_writer_lease` navigation keys; broker commands, credentials, and raw
+output are never persisted.
+
 Production context still refuses `remote_fenced`. Membership and sync provider
 adapters share their operation guard, including post-rewrite rediscovery and
 auto-admission handoff. Their physical rebase budgets now retain the same guard

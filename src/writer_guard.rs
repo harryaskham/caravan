@@ -99,10 +99,16 @@ impl WriterOperationGuard {
                 .map_err(|error| remote_lease_error(&error))?,
         );
         let local = OperationLock::acquire(repository, operation)?;
-        Ok(Self {
+        let mut guard = Self {
             local,
             remote: Some(remote),
-        })
+        };
+        guard.checkpoint(
+            "writer_authority_acquired",
+            json!({"operation": operation}),
+            false,
+        )?;
+        Ok(guard)
     }
 
     /// Acquire a second repository-local lock while retaining the same exact
@@ -113,10 +119,18 @@ impl WriterOperationGuard {
         operation: &str,
     ) -> Result<Self, AppError> {
         let local = OperationLock::acquire(repository, operation)?;
-        Ok(Self {
+        let mut derived = Self {
             local,
             remote: self.remote.clone(),
-        })
+        };
+        if derived.remote.is_some() {
+            derived.checkpoint(
+                "writer_authority_inherited",
+                json!({"operation": operation}),
+                false,
+            )?;
+        }
+        Ok(derived)
     }
 
     #[must_use]
@@ -133,6 +147,25 @@ impl WriterOperationGuard {
     #[must_use]
     pub fn runner(&self, runner: ProcessRunner) -> WriterCommandRunner {
         WriterCommandRunner::with_remote_fence(runner, self.remote.clone())
+    }
+
+    /// Persist operation evidence, automatically binding the latest remote
+    /// fencing grant when present. Local-only evidence is forwarded unchanged.
+    pub fn checkpoint(
+        &mut self,
+        phase: impl Into<String>,
+        evidence: serde_json::Value,
+        provider_state_indeterminate: bool,
+    ) -> Result<(), AppError> {
+        let evidence = match self.remote_grant() {
+            Some(grant) => json!({
+                "operation_evidence": evidence,
+                "remote_writer_lease": grant,
+            }),
+            None => evidence,
+        };
+        self.local
+            .checkpoint(phase, evidence, provider_state_indeterminate)
     }
 
     /// Release local ownership before dropping exact remote ownership.
@@ -181,6 +214,7 @@ mod tests {
         grant: Mutex<Option<RemoteLeaseGrant>>,
         acquires: AtomicUsize,
         inspects: AtomicUsize,
+        renewals: AtomicUsize,
         releases: AtomicUsize,
     }
 
@@ -214,12 +248,22 @@ mod tests {
 
         fn renew(
             &self,
-            _grant: &RemoteLeaseGrant,
-            _now_unix_ms: u64,
-            _ttl_ms: u64,
-            _heartbeat_ms: u64,
+            grant: &RemoteLeaseGrant,
+            now_unix_ms: u64,
+            ttl_ms: u64,
+            heartbeat_ms: u64,
         ) -> Result<RemoteLeaseGrant, RemoteLeaseError> {
-            Err(RemoteLeaseError::Execution("not used".to_owned()))
+            self.renewals.fetch_add(1, Ordering::SeqCst);
+            let mut current = self.grant.lock().unwrap();
+            if current.as_ref() != Some(grant) {
+                return Err(RemoteLeaseError::Lost("wrong fence".to_owned()));
+            }
+            let mut renewed = grant.clone();
+            renewed.heartbeat_due_unix_ms = now_unix_ms + heartbeat_ms;
+            renewed.expires_unix_ms = now_unix_ms + ttl_ms;
+            renewed.backend_revision = format!("{}-renewed", grant.backend_revision);
+            *current = Some(renewed.clone());
+            Ok(renewed)
         }
 
         fn release(&self, grant: &RemoteLeaseGrant) -> Result<bool, RemoteLeaseError> {
@@ -267,6 +311,78 @@ mod tests {
             ttl_ms: 60_000,
             heartbeat_ms: 15_000,
         }
+    }
+
+    #[test]
+    fn local_checkpoint_evidence_is_forwarded_without_remote_wrapper() {
+        let repository = init_repository();
+        let mut guard =
+            WriterOperationGuard::acquire(repository.path(), &WriterConfig::default(), "sync")
+                .unwrap();
+        let evidence = json!({"exact": [1, 2, 3], "provider_state": "known"});
+        guard.checkpoint("phase", evidence.clone(), false).unwrap();
+        let status = crate::operation_lock::inspect_lock(
+            repository.path(),
+            crate::operation_lock::DEFAULT_STALE_AFTER,
+        )
+        .unwrap();
+        let checkpoint = status.owner.unwrap().checkpoint.unwrap();
+        assert_eq!(checkpoint.evidence, evidence);
+        assert!(checkpoint.evidence_compaction.is_none());
+    }
+
+    #[test]
+    fn remote_checkpoints_bind_latest_grant_and_keep_compaction_hints() {
+        let repository = init_repository();
+        let backend = Arc::new(RecordingLease::default());
+        let backend_trait: Arc<dyn RemoteWriterLease> = backend.clone();
+        let mut guard = WriterOperationGuard::acquire_remote(
+            repository.path(),
+            "sync",
+            backend_trait,
+            &remote_request(),
+        )
+        .unwrap();
+        let initial = crate::operation_lock::inspect_lock(
+            repository.path(),
+            crate::operation_lock::DEFAULT_STALE_AFTER,
+        )
+        .unwrap()
+        .owner
+        .unwrap()
+        .checkpoint
+        .unwrap();
+        assert_eq!(initial.phase, "writer_authority_acquired");
+        assert_eq!(
+            initial.evidence["remote_writer_lease"]["backend_revision"],
+            "revision-1"
+        );
+
+        let fence = guard.remote_fence().unwrap();
+        let due = fence.grant_snapshot().heartbeat_due_unix_ms;
+        fence.before_write_at(due).unwrap();
+        guard
+            .checkpoint("oversized", json!({"payload": "x".repeat(64 * 1024)}), true)
+            .unwrap();
+        let checkpoint = crate::operation_lock::inspect_lock(
+            repository.path(),
+            crate::operation_lock::DEFAULT_STALE_AFTER,
+        )
+        .unwrap()
+        .owner
+        .unwrap()
+        .checkpoint
+        .unwrap();
+        assert_eq!(backend.renewals.load(Ordering::SeqCst), 1);
+        let compaction = checkpoint.evidence_compaction.unwrap();
+        assert!(compaction.keys.contains(&"operation_evidence".to_owned()));
+        assert!(compaction.keys.contains(&"remote_writer_lease".to_owned()));
+        assert!(
+            fence
+                .grant_snapshot()
+                .backend_revision
+                .ends_with("-renewed")
+        );
     }
 
     #[test]
