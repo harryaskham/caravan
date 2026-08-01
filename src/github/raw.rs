@@ -589,11 +589,17 @@ impl PullRequestJson {
             merge_state_status: self.merge_state_status,
             labels: self.labels.into_iter().map(|label| label.name).collect(),
             auto_merge,
-            checks: self
-                .status_check_rollup
-                .into_iter()
-                .map(CheckJson::into_snapshot)
-                .collect(),
+            checks: {
+                let mut checks = self
+                    .status_check_rollup
+                    .into_iter()
+                    .map(CheckJson::into_snapshot)
+                    .collect::<Vec<_>>();
+                // bd-eff1dc: mark lineage once, here, so every reader shows the
+                // same history without re-deriving supersession per surface.
+                model::mark_superseded_checks(&mut checks);
+                checks
+            },
             created_at: Some(self.created_at),
             merged_at: self.merged_at,
             updated_at: Some(self.updated_at),
@@ -672,6 +678,17 @@ pub(super) struct CheckJson {
     pub(super) workflow_name: Option<String>,
     pub(super) details_url: Option<String>,
     pub(super) target_url: Option<String>,
+    /// bd-eff1dc: run ordering. A rollup keeps every historical run of a
+    /// required check on the same head, so without these an old cancelled run
+    /// is indistinguishable from the current one.
+    #[serde(default)]
+    pub(super) started_at: Option<String>,
+    #[serde(default)]
+    pub(super) completed_at: Option<String>,
+    /// `StatusContext` has no started/completed pair; `createdAt` is its only
+    /// ordering evidence.
+    #[serde(default)]
+    pub(super) created_at: Option<String>,
 }
 
 impl CheckJson {
@@ -680,15 +697,26 @@ impl CheckJson {
             .into_iter()
             .flatten()
             .find(|state| !state.is_empty());
+        let started_at = self
+            .started_at
+            .or(self.created_at)
+            .filter(|stamp| !stamp.is_empty());
         model::CheckSnapshot {
             name: self
                 .name
                 .or(self.context)
-                .or(self.workflow_name)
-                .unwrap_or(self.kind),
+                .or(self.workflow_name.clone())
+                .unwrap_or(self.kind.clone()),
             state: normalize_check_state(provider_state.as_deref()),
             provider_state,
             details_url: self.details_url.or(self.target_url),
+            provider_kind: Some(self.kind).filter(|kind| !kind.is_empty()),
+            workflow_name: self.workflow_name.filter(|name| !name.is_empty()),
+            started_at,
+            completed_at: self.completed_at.filter(|stamp| !stamp.is_empty()),
+            // Set by `mark_superseded_checks` once the whole rollup is known;
+            // a single row cannot know whether a later run exists.
+            superseded: false,
         }
     }
 }
@@ -727,5 +755,157 @@ mod null_label_sequence_tests {
 
         assert!(parsed.labels.is_empty(), "unlabelled, not undiscoverable");
         assert!(parsed.status_check_rollup.is_empty());
+    }
+}
+
+/// bd-eff1dc: provider run ordering must survive normalization, or admission
+/// cannot tell a superseded run from the current one.
+#[cfg(test)]
+mod check_lineage_projection_tests {
+    use super::*;
+
+    #[test]
+    fn a_check_run_keeps_its_identity_and_run_ordering() {
+        let json = r#"{
+            "__typename": "CheckRun",
+            "name": "Public Fast Tests preparation",
+            "context": null,
+            "status": "COMPLETED",
+            "conclusion": "CANCELLED",
+            "state": null,
+            "workflowName": "Public Fast Tests",
+            "detailsUrl": "https://example.test/actions/runs/1/job/2",
+            "targetUrl": null,
+            "startedAt": "2026-08-01T10:26:00Z",
+            "completedAt": "2026-08-01T10:30:00Z"
+        }"#;
+
+        let snapshot = serde_json::from_str::<CheckJson>(json)
+            .expect("a rollup element parses")
+            .into_snapshot();
+
+        assert_eq!(snapshot.provider_kind.as_deref(), Some("CheckRun"));
+        assert_eq!(snapshot.workflow_name.as_deref(), Some("Public Fast Tests"));
+        assert_eq!(snapshot.started_at.as_deref(), Some("2026-08-01T10:26:00Z"));
+        assert_eq!(
+            snapshot.observed_at(),
+            Some("2026-08-01T10:30:00Z"),
+            "a completed run is ordered by its completion"
+        );
+    }
+
+    /// A `StatusContext` has no started/completed pair, so `createdAt` is its
+    /// only ordering evidence. Without this fall-back an external provider's
+    /// reruns would all look simultaneous.
+    #[test]
+    fn a_status_context_orders_by_created_at() {
+        let json = r#"{
+            "__typename": "StatusContext",
+            "name": null,
+            "context": "buildkite/pipeline",
+            "status": null,
+            "conclusion": null,
+            "state": "SUCCESS",
+            "workflowName": null,
+            "detailsUrl": null,
+            "targetUrl": "https://example.test/build/9",
+            "createdAt": "2026-08-01T10:56:00Z"
+        }"#;
+
+        let snapshot = serde_json::from_str::<CheckJson>(json)
+            .expect("a status context parses")
+            .into_snapshot();
+
+        assert_eq!(snapshot.name, "buildkite/pipeline");
+        assert_eq!(snapshot.provider_kind.as_deref(), Some("StatusContext"));
+        assert_eq!(snapshot.observed_at(), Some("2026-08-01T10:56:00Z"));
+    }
+
+    /// The whole point of carrying ordering: a #2339-shaped rollup normalizes
+    /// into one current row per required check, with the earlier runs retained
+    /// and marked rather than deleted.
+    #[test]
+    fn a_pull_request_rollup_marks_its_superseded_runs() {
+        let element = |conclusion: &str, status: &str, started: &str, completed: &str| {
+            format!(
+                r#"{{"__typename":"CheckRun","name":"Public Fast Tests preparation","context":null,"status":"{status}","conclusion":{conclusion},"state":null,"workflowName":"CI","detailsUrl":null,"targetUrl":null,"startedAt":"{started}"{completed}}}"#
+            )
+        };
+        let rollup = format!(
+            "[{},{}]",
+            element(
+                "\"CANCELLED\"",
+                "COMPLETED",
+                "2026-08-01T10:26:00Z",
+                ",\"completedAt\":\"2026-08-01T10:30:00Z\""
+            ),
+            element("null", "IN_PROGRESS", "2026-08-01T10:57:00Z", "")
+        );
+        let json = format!(
+            r#"{{
+                "number": 2339,
+                "title": "two-root incident",
+                "body": "",
+                "state": "OPEN",
+                "isDraft": false,
+                "headRefName": "topic",
+                "headRefOid": "9fb22ff9930d621336ee435f29989639072f5ac5",
+                "isCrossRepository": false,
+                "baseRefName": "main",
+                "baseRefOid": "base",
+                "labels": [],
+                "statusCheckRollup": {rollup},
+                "createdAt": "2026-08-01T10:00:00Z",
+                "mergedAt": null,
+                "url": "https://example.test/pr/2339",
+                "updatedAt": "2026-08-01T11:00:00Z"
+            }}"#
+        );
+
+        let snapshot = serde_json::from_str::<PullRequestJson>(&json)
+            .expect("the live shape parses")
+            .into_snapshot(&RepositoryId {
+                owner: "acme".to_owned(),
+                name: "widgets".to_owned(),
+            })
+            .expect("normalization succeeds");
+
+        assert_eq!(snapshot.checks.len(), 2, "history is retained, not dropped");
+        assert!(
+            snapshot.checks[0].superseded,
+            "the cancelled run has been rerun"
+        );
+        assert!(
+            !snapshot.checks[1].superseded,
+            "the in-progress run is current"
+        );
+
+        let (current, superseded) = model::latest_checks_per_identity(&snapshot.checks);
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].state, model::CheckState::InProgress);
+        assert_eq!(superseded.len(), 1);
+    }
+
+    /// Ordering is optional provider data: older captured fixtures omit it, and
+    /// a row without it must still parse and stay current.
+    #[test]
+    fn a_rollup_element_without_timestamps_still_parses() {
+        let json = r#"{
+            "__typename": "CheckRun",
+            "name": "test",
+            "context": null,
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+            "state": null,
+            "workflowName": "CI",
+            "detailsUrl": null,
+            "targetUrl": null
+        }"#;
+
+        let snapshot = serde_json::from_str::<CheckJson>(json)
+            .expect("timestamps are optional")
+            .into_snapshot();
+
+        assert_eq!(snapshot.observed_at(), None, "no evidence, not 'oldest'");
     }
 }

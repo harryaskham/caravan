@@ -1545,6 +1545,7 @@ mod tests {
                 state: crate::model::CheckState::Success,
                 provider_state: Some("SUCCESS".to_owned()),
                 details_url: Some(format!("https://example.invalid/runs/{index}")),
+                ..crate::model::CheckSnapshot::default()
             })
             .collect();
 

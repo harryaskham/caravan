@@ -141,6 +141,11 @@ pub enum CheckState {
 }
 
 /// One observed status/check result.
+///
+/// A rollup is a LINEAGE, not a set of simultaneous verdicts: retried and
+/// cancelled runs of the same required check stay on the same head forever, so
+/// the snapshot must carry enough identity and ordering to tell a superseded
+/// observation from the current one (bd-eff1dc).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CheckSnapshot {
     pub name: String,
@@ -151,6 +156,166 @@ pub struct CheckSnapshot {
     pub provider_state: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details_url: Option<String>,
+    /// Provider object kind (`CheckRun`, `StatusContext`, ...). Part of check
+    /// identity so a same-named check from a different provider is never
+    /// collapsed into another provider's lineage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_kind: Option<String>,
+    /// Owning workflow, when the provider reports one. Also identity: two
+    /// workflows may legitimately publish the same job name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_name: Option<String>,
+    /// Provider start timestamp (`startedAt`, else `createdAt`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    /// Provider completion timestamp, absent while a run is still going.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+    /// Marked at discovery when a later run of this same required check exists
+    /// on this exact head.
+    ///
+    /// DIAGNOSTIC ONLY. Policy never reads this flag: admission and CI
+    /// disposition recompute supersession from timestamps through
+    /// [`latest_checks_per_identity`], so a hand-built snapshot can never be
+    /// made to look green by setting a boolean. It exists so status and web
+    /// surfaces can show the full lineage while making clear which rows are
+    /// history rather than current verdicts (bd-eff1dc).
+    #[serde(default, skip_serializing_if = "is_not_superseded")]
+    pub superseded: bool,
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if requires a by-reference predicate"
+)]
+fn is_not_superseded(value: &bool) -> bool {
+    !*value
+}
+
+impl Default for CheckSnapshot {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            state: CheckState::Unknown,
+            provider_state: None,
+            details_url: None,
+            provider_kind: None,
+            workflow_name: None,
+            started_at: None,
+            completed_at: None,
+            superseded: false,
+        }
+    }
+}
+
+/// Identity of the required check a run belongs to.
+///
+/// Deliberately excludes state and timestamps: this is the key that groups
+/// successive runs of the SAME check so the latest can win.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CheckIdentity {
+    pub name: String,
+    pub provider_kind: Option<String>,
+    pub workflow_name: Option<String>,
+}
+
+impl CheckSnapshot {
+    /// The required-check identity this observation belongs to.
+    #[must_use]
+    pub fn identity(&self) -> CheckIdentity {
+        CheckIdentity {
+            name: self.name.clone(),
+            provider_kind: self.provider_kind.clone(),
+            workflow_name: self.workflow_name.clone(),
+        }
+    }
+
+    /// Ordering evidence for supersession, newest-last.
+    ///
+    /// `None` means the provider gave no usable ordering for this row. That is
+    /// not "oldest": it means supersession CANNOT be proven, and the caller must
+    /// keep the row current rather than silently discard a verdict.
+    #[must_use]
+    pub fn observed_at(&self) -> Option<&str> {
+        self.completed_at
+            .as_deref()
+            .or(self.started_at.as_deref())
+            .filter(|stamp| !stamp.is_empty())
+    }
+}
+
+/// Reduce a rollup lineage to the latest observation per required check.
+///
+/// Returns `(current, superseded)`, preserving input order within each group.
+///
+/// Supersession is only ever claimed on POSITIVE evidence: a row is dropped
+/// from `current` only when another row of the same identity carries a strictly
+/// later provider timestamp. When a group has no usable timestamps — older
+/// fixtures, providers that omit them, or a genuine tie — every row stays
+/// current, so this reduction can never turn a real failure into silence.
+/// Newest provider timestamp seen for each required-check identity.
+fn newest_observation_per_identity(checks: &[CheckSnapshot]) -> BTreeMap<CheckIdentity, &str> {
+    let mut newest: BTreeMap<CheckIdentity, &str> = BTreeMap::new();
+    for check in checks {
+        let Some(observed) = check.observed_at() else {
+            continue;
+        };
+        newest
+            .entry(check.identity())
+            .and_modify(|best| {
+                if observed > *best {
+                    *best = observed;
+                }
+            })
+            .or_insert(observed);
+    }
+    newest
+}
+
+/// Whether a later run of this same required check exists in `newest`.
+fn is_superseded(check: &CheckSnapshot, newest: &BTreeMap<CheckIdentity, &str>) -> bool {
+    match (newest.get(&check.identity()), check.observed_at()) {
+        (Some(best), Some(observed)) => observed < *best,
+        // No ordering evidence for this row, or none anywhere in its group:
+        // supersession is unproven, so the row remains current.
+        _ => false,
+    }
+}
+
+#[must_use]
+pub fn latest_checks_per_identity(
+    checks: &[CheckSnapshot],
+) -> (Vec<&CheckSnapshot>, Vec<&CheckSnapshot>) {
+    let newest = newest_observation_per_identity(checks);
+    let mut current = Vec::new();
+    let mut superseded = Vec::new();
+    for check in checks {
+        if is_superseded(check, &newest) {
+            superseded.push(check);
+        } else {
+            current.push(check);
+        }
+    }
+    (current, superseded)
+}
+
+/// Mark, in place, every check row that a later run of the same required check
+/// has superseded on this exact head.
+///
+/// Applied once at discovery so every downstream reader — CLI text, JSON, and
+/// the web dashboard — renders the same lineage without each re-deriving the
+/// rule in its own language.
+pub fn mark_superseded_checks(checks: &mut [CheckSnapshot]) {
+    let flags = {
+        let newest = newest_observation_per_identity(checks);
+        checks
+            .iter()
+            .map(|check| is_superseded(check, &newest))
+            .collect::<Vec<_>>()
+    };
+    for (check, superseded) in checks.iter_mut().zip(flags) {
+        check.superseded = superseded;
+    }
 }
 
 /// Canonical PR fact snapshot. Discovery owns provider conversion; graph and
@@ -1260,5 +1425,129 @@ mod tests {
             "\"head_advanced\""
         );
         assert_eq!(EventKind::CiFailed.to_string(), "ci_failed");
+    }
+}
+
+/// bd-eff1dc: a `statusCheckRollup` keeps every historical run of a required
+/// check attached to the same head, so an old red run was being read as a
+/// current verdict and blocked admission permanently.
+#[cfg(test)]
+mod check_lineage_tests {
+    use super::{CheckSnapshot, CheckState, latest_checks_per_identity};
+
+    fn run(name: &str, state: CheckState, started: &str, completed: Option<&str>) -> CheckSnapshot {
+        CheckSnapshot {
+            name: name.to_owned(),
+            state,
+            provider_kind: Some("CheckRun".to_owned()),
+            workflow_name: Some("CI".to_owned()),
+            started_at: Some(started.to_owned()),
+            completed_at: completed.map(str::to_owned),
+            ..CheckSnapshot::default()
+        }
+    }
+
+    fn current_states(checks: &[CheckSnapshot]) -> Vec<CheckState> {
+        latest_checks_per_identity(checks)
+            .0
+            .into_iter()
+            .map(|check| check.state)
+            .collect()
+    }
+
+    #[test]
+    fn a_newer_in_progress_run_supersedes_an_older_failure() {
+        let checks = vec![
+            run("Fast Tests", CheckState::Cancelled, "10:26", Some("10:30")),
+            run("Fast Tests", CheckState::InProgress, "10:57", None),
+        ];
+        assert_eq!(current_states(&checks), vec![CheckState::InProgress]);
+    }
+
+    #[test]
+    fn a_newer_success_supersedes_an_older_failure() {
+        let checks = vec![
+            run("Check & Lint", CheckState::Failure, "10:50", Some("10:52")),
+            run("Check & Lint", CheckState::Success, "10:56", Some("10:58")),
+        ];
+        assert_eq!(current_states(&checks), vec![CheckState::Success]);
+    }
+
+    /// The inverse must NOT be softened: a newer failure over an older success
+    /// is a real verdict.
+    #[test]
+    fn a_newer_failure_is_not_excused_by_an_older_success() {
+        let checks = vec![
+            run("Check & Lint", CheckState::Success, "10:20", Some("10:25")),
+            run("Check & Lint", CheckState::Failure, "10:50", Some("10:52")),
+        ];
+        assert_eq!(current_states(&checks), vec![CheckState::Failure]);
+    }
+
+    /// Reduction is per identity, so a current failure in one context and a
+    /// current pending run in another both survive; precedence between them
+    /// stays with the classifier.
+    #[test]
+    fn distinct_contexts_are_reduced_independently() {
+        let checks = vec![
+            run("A", CheckState::Failure, "10:50", Some("10:52")),
+            run("B", CheckState::InProgress, "10:57", None),
+        ];
+        assert_eq!(
+            current_states(&checks),
+            vec![CheckState::Failure, CheckState::InProgress]
+        );
+    }
+
+    /// Same display name from two different providers is two required checks,
+    /// not two runs of one. Collapsing them would silently drop one provider's
+    /// verdict.
+    #[test]
+    fn same_name_from_distinct_providers_does_not_collapse() {
+        let mut external = run("build", CheckState::Failure, "10:00", Some("10:05"));
+        external.provider_kind = Some("StatusContext".to_owned());
+        external.workflow_name = None;
+        let checks = vec![
+            external,
+            run("build", CheckState::Success, "10:40", Some("10:45")),
+        ];
+        let (current, superseded) = latest_checks_per_identity(&checks);
+        assert_eq!(current.len(), 2, "two identities, two current rows");
+        assert!(superseded.is_empty());
+    }
+
+    /// Supersession requires POSITIVE evidence. Without timestamps nothing can
+    /// be proven stale, so every row stays current and a real failure can never
+    /// be reduced away.
+    #[test]
+    fn rows_without_ordering_evidence_all_stay_current() {
+        let checks = vec![
+            CheckSnapshot {
+                name: "build".to_owned(),
+                state: CheckState::Failure,
+                ..CheckSnapshot::default()
+            },
+            CheckSnapshot {
+                name: "build".to_owned(),
+                state: CheckState::Success,
+                ..CheckSnapshot::default()
+            },
+        ];
+        let (current, superseded) = latest_checks_per_identity(&checks);
+        assert_eq!(current.len(), 2);
+        assert!(superseded.is_empty());
+    }
+
+    /// Superseded rows are retained for diagnostics rather than discarded.
+    #[test]
+    fn superseded_rows_are_returned_for_diagnostics() {
+        let checks = vec![
+            run("Fast Tests", CheckState::Cancelled, "10:26", Some("10:30")),
+            run("Fast Tests", CheckState::Cancelled, "10:51", Some("10:53")),
+            run("Fast Tests", CheckState::InProgress, "10:57", None),
+        ];
+        let (current, superseded) = latest_checks_per_identity(&checks);
+        assert_eq!(current.len(), 1);
+        assert_eq!(superseded.len(), 2, "history is kept, not dropped");
     }
 }

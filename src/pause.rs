@@ -792,6 +792,7 @@ mod tests {
                 state: check,
                 provider_state: None,
                 details_url: None,
+                ..crate::model::CheckSnapshot::default()
             }],
             created_at: None,
             merged_at: None,

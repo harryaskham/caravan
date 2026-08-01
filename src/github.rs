@@ -1572,10 +1572,35 @@ fn changed_precondition_fields_with_checks(
     actual: &PullRequestPrecondition,
 ) -> Vec<String> {
     let mut changed = changed_precondition_fields(expected, actual);
-    if expected.checks != actual.checks {
+    if comparable_checks(expected) != comparable_checks(actual) {
         changed.push("checks".to_owned());
     }
     changed
+}
+
+/// The decision-relevant projection of a check list.
+///
+/// bd-eff1dc added provider run timestamps so admission can tell a superseded
+/// run from the current one. Those timestamps are evidence, not policy, and
+/// they move constantly: a running check gains a `completedAt` seconds later.
+/// Comparing them here would turn ordinary CI progress into a stale-precondition
+/// refusal during exactly the retry storms this lineage work exists to survive.
+/// Everything the old fence compared is still compared.
+fn comparable_checks(
+    precondition: &PullRequestPrecondition,
+) -> Vec<(&str, model::CheckState, Option<&str>, Option<&str>)> {
+    precondition
+        .checks
+        .iter()
+        .map(|check| {
+            (
+                check.name.as_str(),
+                check.state,
+                check.provider_state.as_deref(),
+                check.details_url.as_deref(),
+            )
+        })
+        .collect()
 }
 
 fn trimmed_provider_output(output: &CommandOutput) -> Option<String> {
@@ -3253,6 +3278,7 @@ mod tests {
                 state: model::CheckState::Success,
                 provider_state: Some("SUCCESS".to_owned()),
                 details_url: Some("https://example.test/check".to_owned()),
+                ..crate::model::CheckSnapshot::default()
             }],
             auto_merge: AutoMergeState::squash(),
         }

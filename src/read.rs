@@ -2475,13 +2475,19 @@ fn validate_candidate(pull_request: &PullRequestSnapshot, problems: &mut Vec<Gra
     }
 }
 
-/// Whether any check on this exact head is a hard failure.
+/// Whether any CURRENT check on this exact head is a hard failure.
 ///
 /// Deliberately mirrors the sync-side classification: a missing or empty
 /// conclusion is `Unknown`, and Unknown counts as failure rather than success,
 /// because an absent result is not a passing result.
+///
+/// bd-eff1dc: only the latest observation per required-check identity votes. A
+/// rollup retains every historical run on the same head, so without this a
+/// single old cancelled run blocks admission forever, even while the current
+/// run of that same check is green or still in progress.
 fn has_failing_check(pull_request: &PullRequestSnapshot) -> bool {
-    pull_request.checks.iter().any(|check| {
+    let (current, _superseded) = crate::model::latest_checks_per_identity(&pull_request.checks);
+    current.into_iter().any(|check| {
         matches!(
             check.state,
             crate::model::CheckState::Failure
@@ -2504,9 +2510,9 @@ fn has_failing_check(pull_request: &PullRequestSnapshot) -> bool {
 /// Measured by an operator across three live cases: two of the three failures
 /// were spurious in exactly this way (bd-c04d9b).
 fn has_cancelled_check(pull_request: &PullRequestSnapshot) -> bool {
-    pull_request
-        .checks
-        .iter()
+    let (current, _superseded) = crate::model::latest_checks_per_identity(&pull_request.checks);
+    current
+        .into_iter()
         .any(|check| check.state == crate::model::CheckState::Cancelled)
 }
 
@@ -3610,6 +3616,7 @@ mod tests {
             state: crate::model::CheckState::Failure,
             provider_state: Some("FAILURE".to_owned()),
             details_url: None,
+            ..crate::model::CheckSnapshot::default()
         });
         let green = pr(20, "green", "main", false);
         let status = status(red, vec![green]);
@@ -3632,6 +3639,120 @@ mod tests {
         );
     }
 
+    /// bd-eff1dc live shape (cacophony PR #2339, head
+    /// `9fb22ff9930d621336ee435f29989639072f5ac5`): the same required checks
+    /// appear three times on one head because the workflow was cancelled and
+    /// retried. Cara reported "candidate has a failing required check" and
+    /// refused rejoin while the GitHub UI correctly showed CI in progress.
+    ///
+    /// The rollup is a lineage: only the newest run of each required check is a
+    /// current verdict, so a candidate whose latest runs are green must reach
+    /// the admission front.
+    #[test]
+    fn a_candidate_whose_red_runs_were_superseded_is_admissible() {
+        let run = |name: &str,
+                   state: crate::model::CheckState,
+                   started: &str,
+                   completed: Option<&str>| {
+            crate::model::CheckSnapshot {
+                name: name.to_owned(),
+                state,
+                provider_kind: Some("CheckRun".to_owned()),
+                workflow_name: Some("CI".to_owned()),
+                started_at: Some(started.to_owned()),
+                completed_at: completed.map(str::to_owned),
+                ..crate::model::CheckSnapshot::default()
+            }
+        };
+
+        let mut retried = pr(10, "retried", "main", false);
+        retried.checks = vec![
+            run(
+                "Public Fast Tests preparation",
+                crate::model::CheckState::Cancelled,
+                "10:26",
+                Some("10:30"),
+            ),
+            run(
+                "Public Fast Tests preparation",
+                crate::model::CheckState::Cancelled,
+                "10:51",
+                Some("10:53"),
+            ),
+            run(
+                "Public Fast Tests preparation",
+                crate::model::CheckState::Success,
+                "10:57",
+                Some("11:05"),
+            ),
+            run(
+                "Check & Lint",
+                crate::model::CheckState::Failure,
+                "10:50",
+                Some("10:52"),
+            ),
+            run(
+                "Check & Lint",
+                crate::model::CheckState::Success,
+                "11:02",
+                Some("11:04"),
+            ),
+        ];
+        let later = pr(20, "later", "main", false);
+        let status = status(retried, vec![later]);
+        let labels = crate::config::CaravanConfig::default().agent_priority_labels;
+
+        let admission = resolve_admission(&status.analysis, &labels);
+
+        assert_eq!(
+            admission.next_candidate,
+            Some(PrNumber(10)),
+            "superseded red runs must not hold a green candidate out of the queue: {:?}",
+            admission.skipped
+        );
+        assert!(
+            !admission
+                .skipped
+                .iter()
+                .any(|candidate| candidate.pr == PrNumber(10)),
+            "the candidate must not be skipped for a rerun failure: {:?}",
+            admission.skipped
+        );
+    }
+
+    /// The same reduction must not excuse a CURRENT failure: newest red still
+    /// refuses, even with older green runs above it in the lineage.
+    #[test]
+    fn a_current_failure_after_an_earlier_success_still_refuses() {
+        let run = |state: crate::model::CheckState, started: &str, completed: &str| {
+            crate::model::CheckSnapshot {
+                name: "Check & Lint".to_owned(),
+                state,
+                provider_kind: Some("CheckRun".to_owned()),
+                workflow_name: Some("CI".to_owned()),
+                started_at: Some(started.to_owned()),
+                completed_at: Some(completed.to_owned()),
+                ..crate::model::CheckSnapshot::default()
+            }
+        };
+
+        let mut regressed = pr(10, "regressed", "main", false);
+        regressed.checks = vec![
+            run(crate::model::CheckState::Success, "10:20", "10:25"),
+            run(crate::model::CheckState::Failure, "10:50", "10:52"),
+        ];
+        let mut problems = Vec::new();
+
+        validate_candidate(&regressed, &mut problems);
+
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.message.contains("failing required check")),
+            "a newer failure is a verdict, not history: {problems:?}"
+        );
+    }
+
     /// bd-c04d9b live shape (caravan #2287): five producers CANCELLED under
     /// capacity pressure, two aggregates then concluding FAILURE in seconds
     /// without building anything. An operator measured two of three such cases
@@ -3649,12 +3770,14 @@ mod tests {
             state: crate::model::CheckState::Cancelled,
             provider_state: Some("CANCELLED".to_owned()),
             details_url: None,
+            ..crate::model::CheckSnapshot::default()
         });
         cancelled.checks.push(crate::model::CheckSnapshot {
             name: "Check & Lint".to_owned(),
             state: crate::model::CheckState::Failure,
             provider_state: Some("FAILURE".to_owned()),
             details_url: None,
+            ..crate::model::CheckSnapshot::default()
         });
         let mut problems = Vec::new();
 
@@ -3688,6 +3811,7 @@ mod tests {
             state: crate::model::CheckState::Failure,
             provider_state: Some("FAILURE".to_owned()),
             details_url: None,
+            ..crate::model::CheckSnapshot::default()
         });
         let mut problems = Vec::new();
 
@@ -3712,6 +3836,7 @@ mod tests {
             state: crate::model::CheckState::Failure,
             provider_state: Some("FAILURE".to_owned()),
             details_url: None,
+            ..crate::model::CheckSnapshot::default()
         });
         let mut problems = Vec::new();
 
@@ -3735,6 +3860,7 @@ mod tests {
             state: crate::model::CheckState::InProgress,
             provider_state: None,
             details_url: None,
+            ..crate::model::CheckSnapshot::default()
         });
         let mut problems = Vec::new();
 
@@ -3925,6 +4051,7 @@ mod tests {
             state: crate::model::CheckState::InProgress,
             provider_state: Some("IN_PROGRESS".to_owned()),
             details_url: None,
+            ..crate::model::CheckSnapshot::default()
         });
         fresh.updated_at = Some("2026-01-02T00:00:00Z".to_owned());
         require_fresh_candidate(&discovered, &fresh)

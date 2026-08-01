@@ -4850,7 +4850,13 @@ fn classify_checks(checks: &[CheckSnapshot], forced: bool) -> CiDisposition {
         return CiDisposition::Forced;
     }
 
-    let failed = checks.iter().any(|check| {
+    // bd-eff1dc: a rollup is a lineage, not a set of simultaneous verdicts.
+    // Retried and cancelled runs of the same required check stay attached to the
+    // same head forever, so only the latest observation per identity may drive
+    // disposition. Superseded rows remain available for diagnostics.
+    let (current, _superseded) = crate::model::latest_checks_per_identity(checks);
+
+    let failed = current.iter().any(|check| {
         matches!(
             check.state,
             CheckState::Failure
@@ -4865,12 +4871,14 @@ fn classify_checks(checks: &[CheckSnapshot], forced: bool) -> CiDisposition {
     // the row as merely waiting because a sibling job is still running hides a
     // hard failure for as long as anything else is in flight — long enough to
     // admit known-red work and stack every following PR on top of it
-    // (operator report, cacophony PR 2276).
+    // (operator report, cacophony PR 2276). This still holds under bd-eff1dc:
+    // the precedence is unchanged, it simply applies to CURRENT rows, so a
+    // current failure in one context still beats a current pending sibling.
     if failed {
         return CiDisposition::Failed;
     }
-    let pending = checks.is_empty()
-        || checks.iter().any(|check| {
+    let pending = current.is_empty()
+        || current.iter().any(|check| {
             matches!(
                 check.state,
                 CheckState::Expected | CheckState::Queued | CheckState::InProgress
@@ -7277,7 +7285,11 @@ fn classify_cancellation(
     checks: &[CheckSnapshot],
     diagnostics: &[ClassifiedWorkflowRunFailure],
 ) -> CiCancellationSummary {
-    let cancelled_checks = checks
+    // bd-eff1dc: explain the CURRENT refusal. A superseded cancellation is
+    // lineage, and naming it here would tell the reader to rerun a run that has
+    // already been rerun.
+    let (current, _superseded) = crate::model::latest_checks_per_identity(checks);
+    let cancelled_checks = current
         .iter()
         .filter(|check| check.state == CheckState::Cancelled)
         .map(|check| check.name.clone())
@@ -7294,7 +7306,7 @@ fn classify_cancellation(
         .filter(|diagnostic| stepless(diagnostic))
         .map(|diagnostic| diagnostic.diagnostic.workflow_name.clone())
         .collect::<Vec<_>>();
-    let judged_failure_exists = checks
+    let judged_failure_exists = current
         .iter()
         .any(|check| check.state == CheckState::Failure)
         && diagnostics.iter().any(|diagnostic| !stepless(diagnostic));

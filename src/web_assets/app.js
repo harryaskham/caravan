@@ -120,24 +120,36 @@
     return `<a class="${escapeHtml(className)}" href="${escapeHtml(prUrl(pr))}" target="_blank" rel="noopener noreferrer">${escapeHtml(label)}</a>`;
   }
 
+  // bd-eff1dc: a rollup keeps every historical run of a required check on the
+  // same head. Discovery marks the ones a later run superseded, so summaries
+  // must judge only current rows or a long-finished cancelled run reports the
+  // PR as blocked forever.
+  function currentChecks(checks) {
+    return (checks ?? []).filter((check) => !check.superseded);
+  }
+
   function checkTone(checks) {
-    if (!checks?.length) return ["No checks", "warn"];
-    const states = checks.map((check) => normalized(check.state));
+    const current = currentChecks(checks);
+    if (!current.length) return ["No checks", "warn"];
+    const states = current.map((check) => normalized(check.state));
     if (states.some((item) => ["failure", "error", "cancelled", "timed_out", "unknown"].includes(item))) return ["CI blocked", "bad"];
     if (states.some((item) => ["queued", "pending", "in_progress", "expected"].includes(item))) return ["CI running", "warn"];
     return ["CI green", "good"];
   }
 
   function checkRows(checks, showPassing = false) {
-    const rows = (checks ?? []).filter((check) => showPassing || normalized(check.state) !== "success");
+    // History stays visible, but clearly marked, so a reader can see that the
+    // red row above the green one has already been rerun.
+    const rows = (checks ?? []).filter((check) => showPassing || check.superseded || normalized(check.state) !== "success");
     if (!rows.length) return "";
     return `<div class="check-list">${rows.map((check) => {
       const stateName = normalized(check.state);
-      const tone = stateName === "success" ? "good" : ["queued", "pending", "in_progress", "expected"].includes(stateName) ? "warn" : "bad";
+      const tone = check.superseded ? "" : stateName === "success" ? "good" : ["queued", "pending", "in_progress", "expected"].includes(stateName) ? "warn" : "bad";
       const name = check.details_url
         ? `<a href="${escapeHtml(check.details_url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(check.name)}</a>`
         : `<span>${escapeHtml(check.name)}</span>`;
-      return `<div class="check-row">${name}${badge(check.provider_state || stateName, tone)}</div>`;
+      const label = check.superseded ? `${check.provider_state || stateName} · superseded` : check.provider_state || stateName;
+      return `<div class="check-row${check.superseded ? " superseded" : ""}">${name}${badge(label, tone)}</div>`;
     }).join("")}</div>`;
   }
 
@@ -315,7 +327,7 @@
       return "other";
     }
     if (hasLabel(pr, "caravan-evicted") || hasLabel(pr, "caravan-join-skipped") || admissionFact(status, "skipped", pr)) return "bounty";
-    const checkStates = (pr.checks ?? []).map((check) => normalized(check.state));
+    const checkStates = currentChecks(pr.checks).map((check) => normalized(check.state));
     if (pr.draft || admissionFact(status, "rejected", pr) || checkStates.some((value) => value !== "success")) return "saddling";
     return "other";
   }

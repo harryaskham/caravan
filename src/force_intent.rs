@@ -1264,6 +1264,7 @@ mod tests {
                 state: CheckState::Failure,
                 provider_state: Some("FAILURE".to_owned()),
                 details_url: Some("https://example.invalid/run/1".to_owned()),
+                ..crate::model::CheckSnapshot::default()
             }],
             created_at: None,
             merged_at: None,

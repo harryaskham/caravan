@@ -782,6 +782,7 @@ mod tests {
                 state: CheckState::Failure,
                 provider_state: Some("FAILURE".to_owned()),
                 details_url: None,
+                ..crate::model::CheckSnapshot::default()
             }],
             created_at: None,
             merged_at: None,
@@ -1165,6 +1166,7 @@ mod tests {
                 state: CheckState::InProgress,
                 provider_state: Some("IN_PROGRESS".to_owned()),
                 details_url: None,
+                ..crate::model::CheckSnapshot::default()
             }],
         ] {
             let mut candidate = pull();

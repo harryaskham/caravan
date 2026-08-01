@@ -43,6 +43,7 @@ fn check(name: &str, state: CheckState) -> CheckSnapshot {
         state,
         provider_state: Some(format!("{state:?}").to_uppercase()),
         details_url: None,
+        ..crate::model::CheckSnapshot::default()
     }
 }
 
@@ -420,6 +421,7 @@ fn an_uninterpretable_rollup_state_is_unknown_not_missing() {
             state: CheckState::Unknown,
             provider_state: Some("SOMETHING_NEW".to_owned()),
             details_url: None,
+            ..crate::model::CheckSnapshot::default()
         },
     ];
     let assessment = case.assess();

@@ -678,6 +678,7 @@ fn join_root_check_progress_does_not_stale_mutation_identity() {
         state: crate::model::CheckState::Queued,
         provider_state: Some("QUEUED".to_owned()),
         details_url: None,
+        ..crate::model::CheckSnapshot::default()
     }];
     let candidate = pull_request(2, "two", "main", &[]);
     let status = status(candidate.clone(), vec![root.clone()]);

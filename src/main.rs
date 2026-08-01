@@ -2083,12 +2083,22 @@ fn render_sync(output: &caravan::sync::SyncOutput) -> String {
         );
     }
     for observation in &output.ci {
+        // bd-eff1dc: report current rows against total, so a reader can see that
+        // a long check list is mostly superseded lineage rather than a wall of
+        // current failures.
+        let (current, superseded) = caravan::model::latest_checks_per_identity(&observation.checks);
+        let lineage = if superseded.is_empty() {
+            String::new()
+        } else {
+            format!(", {} superseded", superseded.len())
+        };
         let _ = writeln!(
             text,
-            "  CI #{}: {:?} ({} checks, {} failed runs)",
+            "  CI #{}: {:?} ({} checks{}, {} failed runs)",
             observation.pr,
             observation.disposition,
-            observation.checks.len(),
+            current.len(),
+            lineage,
             observation.failed_runs.len()
         );
     }

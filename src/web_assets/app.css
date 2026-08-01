@@ -155,6 +155,10 @@ button:focus-visible, [role="tab"]:focus-visible, a:focus-visible, summary:focus
 summary { color: var(--sage); font-weight: 700; cursor: pointer; }
 .check-list { display: grid; gap: 4px; margin-top: 7px; }
 .check-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; font-size: .63rem; }
+/* bd-eff1dc: a superseded run is history, not a current verdict. Kept visible
+   so the lineage is auditable, dimmed so it never reads as the live result. */
+.check-row.superseded { opacity: .55; }
+.check-row.superseded a, .check-row.superseded span { text-decoration: line-through; }
 .check-row a, .check-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .split-grid { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 12px; min-height: 0; }

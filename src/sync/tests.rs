@@ -788,6 +788,7 @@ fn check(name: &str, state: CheckState, run_id: Option<u64>) -> CheckSnapshot {
         provider_state: Some(format!("{state:?}").to_uppercase()),
         details_url: run_id
             .map(|id| format!("https://github.com/harryaskham/caravan/actions/runs/{id}/job/1")),
+        ..crate::model::CheckSnapshot::default()
     }
 }
 
@@ -2271,6 +2272,7 @@ fn unknown_provider_state_is_a_non_rerunnable_ci_decision() {
         state: CheckState::Unknown,
         provider_state: Some("FUTURE_PROVIDER_STATE".to_owned()),
         details_url: None,
+        ..crate::model::CheckSnapshot::default()
     }];
     let provider = FakeProvider::with_pull_requests(pulls.clone());
     let status = status(pulls, Some(PrNumber(1)), &clean);
@@ -2961,6 +2963,7 @@ fn sync_lock_checkpoint_stays_bounded_for_large_fleet_receipts() {
                 state: CheckState::Success,
                 provider_state: Some("SUCCESS".to_owned()),
                 details_url: None,
+                ..crate::model::CheckSnapshot::default()
             })
             .collect();
         progress.provider_receipts.push(GitHubMutationReceipt {
@@ -6716,12 +6719,14 @@ fn a_hard_failure_is_not_masked_by_a_still_running_check() {
             state: crate::model::CheckState::Failure,
             provider_state: Some("FAILURE".to_owned()),
             details_url: None,
+            ..crate::model::CheckSnapshot::default()
         },
         CheckSnapshot {
             name: "Rust Fast Tests work".to_owned(),
             state: crate::model::CheckState::InProgress,
             provider_state: None,
             details_url: None,
+            ..crate::model::CheckSnapshot::default()
         },
     ];
 
@@ -6730,6 +6735,150 @@ fn a_hard_failure_is_not_masked_by_a_still_running_check() {
         CiDisposition::Failed,
         "a FAILURE must not be reported as merely waiting because a sibling check is still running"
     );
+}
+
+/// bd-eff1dc: the same rule must not fire on a SUPERSEDED failure. Live on
+/// Cacophony PR #2339, head `9fb22ff9930d621336ee435f29989639072f5ac5`, the
+/// rollup carried three generations of the same required checks on one head:
+/// two cancelled `Public Fast Tests preparation` runs, the aggregate `Check &
+/// Lint` failures downstream of those cancellations, and a current in-progress
+/// run. Cara reported "candidate has a failing required check" and refused
+/// rejoin while the GitHub UI correctly showed CI in progress.
+///
+/// The rollup is a lineage, not a set of simultaneous verdicts, so only the
+/// latest observation per required check may vote.
+#[test]
+fn a_superseded_failure_does_not_outvote_the_current_run() {
+    let rollup = vec![
+        rollup_run(
+            "Public Fast Tests preparation",
+            crate::model::CheckState::Cancelled,
+            "10:26",
+            Some("10:30"),
+        ),
+        rollup_run(
+            "Public Fast Tests preparation",
+            crate::model::CheckState::Cancelled,
+            "10:51",
+            Some("10:53"),
+        ),
+        rollup_run(
+            "Public Fast Tests preparation",
+            crate::model::CheckState::InProgress,
+            "10:57",
+            None,
+        ),
+        rollup_run(
+            "Check & Lint",
+            crate::model::CheckState::Failure,
+            "10:50",
+            Some("10:52"),
+        ),
+        rollup_run(
+            "Check & Lint",
+            crate::model::CheckState::Failure,
+            "10:56",
+            Some("10:58"),
+        ),
+        rollup_run(
+            "Changed surface admission",
+            crate::model::CheckState::Success,
+            "10:25",
+            Some("10:26"),
+        ),
+        rollup_run(
+            "Changed surface admission",
+            crate::model::CheckState::Success,
+            "10:51",
+            Some("10:52"),
+        ),
+        rollup_run(
+            "Changed surface admission",
+            crate::model::CheckState::Success,
+            "10:56",
+            Some("10:57"),
+        ),
+    ];
+
+    // The newest `Check & Lint` is still a real current failure, so this exact
+    // head is correctly Failed rather than silently admitted.
+    assert_eq!(
+        classify_checks(&rollup, false),
+        CiDisposition::Failed,
+        "the LATEST Check & Lint run failed, so the head is genuinely red"
+    );
+
+    // Once the aggregate is rerun green, the two historical cancellations and
+    // the two historical aggregate failures must no longer block: the current
+    // preparation run is in progress, so the disposition is waiting.
+    let mut rerun = rollup;
+    rerun.push(rollup_run(
+        "Check & Lint",
+        crate::model::CheckState::Success,
+        "11:02",
+        Some("11:04"),
+    ));
+    assert_eq!(
+        classify_checks(&rerun, false),
+        CiDisposition::Waiting,
+        "superseded cancelled/failed runs must not outvote the current in-progress run"
+    );
+}
+
+/// bd-eff1dc: a lineage whose latest rows are all green classifies as passing,
+/// which is what makes a #2339-shaped candidate admissible again.
+#[test]
+fn a_head_whose_latest_runs_are_green_becomes_passing() {
+    let rollup = vec![
+        rollup_run(
+            "Public Fast Tests preparation",
+            crate::model::CheckState::Cancelled,
+            "10:26",
+            Some("10:30"),
+        ),
+        rollup_run(
+            "Public Fast Tests preparation",
+            crate::model::CheckState::Success,
+            "10:57",
+            Some("11:05"),
+        ),
+        rollup_run(
+            "Check & Lint",
+            crate::model::CheckState::Failure,
+            "10:50",
+            Some("10:52"),
+        ),
+        rollup_run(
+            "Check & Lint",
+            crate::model::CheckState::Success,
+            "11:02",
+            Some("11:04"),
+        ),
+    ];
+
+    assert_eq!(
+        classify_checks(&rollup, false),
+        CiDisposition::Passing,
+        "every required check's latest run is green"
+    );
+}
+
+/// One rollup row shaped like the provider's, with run ordering.
+fn rollup_run(
+    name: &str,
+    state: crate::model::CheckState,
+    started: &str,
+    completed: Option<&str>,
+) -> CheckSnapshot {
+    CheckSnapshot {
+        name: name.to_owned(),
+        state,
+        provider_kind: Some("CheckRun".to_owned()),
+        workflow_name: Some("CI".to_owned()),
+        started_at: Some(started.to_owned()),
+        completed_at: completed.map(str::to_owned),
+        ..crate::model::CheckSnapshot::default()
+    }
 }
 
 /// An absent conclusion is not a success. GitHub reports a check with no
@@ -6742,6 +6891,7 @@ fn an_absent_conclusion_is_never_treated_as_passing() {
         state: crate::model::CheckState::Unknown,
         provider_state: None,
         details_url: None,
+        ..crate::model::CheckSnapshot::default()
     }];
 
     assert_ne!(
