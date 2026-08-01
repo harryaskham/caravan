@@ -59,6 +59,15 @@ stress rounds="10" filter="":
   }
   nix develop --command bash -c '
     set -euo pipefail
+    # A filter that matches nothing would otherwise run zero tests every round
+    # and still report green, which is exactly the vacuous confidence this
+    # recipe exists to prevent.
+    selected="$(cargo test --lib {{filter}} -- --list 2>/dev/null | grep -c ": test$" || true)"
+    if [[ "$selected" -eq 0 ]]; then
+      echo "error: filter {{filter}} matched no tests; nothing would be stressed" >&2
+      exit 2
+    fi
+    echo "stressing $selected test(s)"
     for round in $(seq 1 '"$rounds"'); do
       echo "=== stress round $round/'"$rounds"' ==="
       cargo test --lib {{filter}}
