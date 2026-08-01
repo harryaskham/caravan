@@ -166,6 +166,15 @@ environment variable name, never a literal.
 Dashboard state reports `hosted` plus each repository's non-secret auth/writer
 policy, so a misconfigured member is visible rather than silently ambient.
 
+Hosted workers mutate **only** from HMAC-verified webhook deliveries. The
+interactive `POST /api/action` endpoint refuses every mutating action with
+`web_hosted_interactive_mutation_refused`; non-mutating check/plan actions stay
+available for observability. This is deliberate: the same-origin `csrf_token` is
+served by `GET /api/state` and is cross-site protection, not authentication, so
+Caravan does not treat reachability through the operator proxy as authority to
+force, merge, or reshape. Operators who want an interactive console should run
+ordinary local `cara web` over a tunnel instead of exposing hosted mode.
+
 Explicitly **not** included: automatic installation onboarding, tenancy
 management, clone/checkout provisioning or garbage collection, and automatic
 failover. Exactly one worker may be the configured writer per repository; a

@@ -434,8 +434,8 @@ impl Dashboard {
     }
 }
 
-/// Serve until SIGINT/SIGTERM sets the foreground stop flag.
-pub fn serve(input: &WebInput) -> Result<(), AppError> {
+/// Validate input, load repositories, and build the serving dashboard.
+fn build_dashboard(input: &WebInput) -> Result<Arc<Dashboard>, AppError> {
     validate_input(input)?;
     let webhook_secret = load_webhook_secret(input)?;
     let webhook_enabled = webhook_secret.is_some();
@@ -446,7 +446,7 @@ pub fn serve(input: &WebInput) -> Result<(), AppError> {
     };
     let repositories = load_repositories(&input.repositories)?;
     validate_hosted_repositories(input, &repositories)?;
-    let dashboard = Arc::new(Dashboard {
+    Ok(Arc::new(Dashboard {
         listen: input.listen,
         poll_seconds,
         read_only: input.read_only,
@@ -464,7 +464,12 @@ pub fn serve(input: &WebInput) -> Result<(), AppError> {
         }),
         stopping: AtomicBool::new(false),
         active_requests: AtomicUsize::new(0),
-    });
+    }))
+}
+
+/// Serve until SIGINT/SIGTERM sets the foreground stop flag.
+pub fn serve(input: &WebInput) -> Result<(), AppError> {
+    let dashboard = build_dashboard(input)?;
     dashboard.refresh_all();
 
     let server = Server::http(input.listen).map_err(|error| {
@@ -499,6 +504,8 @@ pub fn serve(input: &WebInput) -> Result<(), AppError> {
         dashboard.poll_seconds,
         if dashboard.read_only {
             "disabled"
+        } else if dashboard.hosted {
+            "webhook-only"
         } else {
             "enabled"
         }
@@ -614,6 +621,30 @@ fn validate_input(input: &WebInput) -> Result<(), AppError> {
         ));
     }
     Ok(())
+}
+
+/// Decide whether one interactive same-origin action may mutate.
+///
+/// A hosted worker is reached through an operator proxy, so the same-origin
+/// CSRF token is not authentication. Hosted mutations are therefore accepted
+/// only from HMAC-verified webhook deliveries, never from this endpoint.
+fn interactive_mutation_refusal(
+    dashboard: &Dashboard,
+    mutates: bool,
+) -> Option<(&'static str, &'static str)> {
+    if !mutates {
+        return None;
+    }
+    if dashboard.hosted {
+        return Some((
+            "web_hosted_interactive_mutation_refused",
+            "hosted workers mutate only from verified webhook deliveries",
+        ));
+    }
+    if dashboard.read_only {
+        return Some(("web_read_only", "mutation endpoints are disabled"));
+    }
+    None
 }
 
 fn is_loopback(address: IpAddr) -> bool {
@@ -1814,12 +1845,10 @@ fn handle_action(
             return error_response(StatusCode(400), "web_action_invalid", &error.to_string());
         }
     };
-    if dashboard.read_only && action_request.action.mutates() {
-        return error_response(
-            StatusCode(403),
-            "web_read_only",
-            "mutation endpoints are disabled",
-        );
+    if let Some((code, message)) =
+        interactive_mutation_refusal(dashboard, action_request.action.mutates())
+    {
+        return error_response(StatusCode(403), code, message);
     }
     let (actual_sequence, expected_mutation_fingerprint) = action_authority(repository);
     if actual_sequence != action_request.expected_refresh_sequence {
@@ -2448,6 +2477,82 @@ mod tests {
         local.github_webhook_secret_env = None;
         validate_hosted_repositories(&local, &[hosted_entry(ambient)])
             .expect("default local dashboard keeps ambient/local_only behavior");
+    }
+
+    fn test_dashboard(hosted: bool, read_only: bool) -> Dashboard {
+        Dashboard {
+            listen: "127.0.0.1:4774".parse().unwrap(),
+            poll_seconds: 15,
+            read_only,
+            hosted,
+            csrf_token: "token".to_owned(),
+            started_unix_ms: 0,
+            repositories: Vec::new(),
+            webhook_secret: None,
+            webhook_installation_id: None,
+            webhook_sync: hosted,
+            webhook_status: Mutex::new(WebhookStatus::default()),
+            stopping: AtomicBool::new(false),
+            active_requests: AtomicUsize::new(0),
+        }
+    }
+
+    #[test]
+    fn hosted_workers_refuse_interactive_mutations_but_keep_webhook_work() {
+        let hosted = test_dashboard(true, false);
+        for action in [
+            WebAction::Sync(SyncInput::default()),
+            WebAction::Join(JoinInput::default()),
+            WebAction::ForceArm(crate::force::ForceIntentInput {
+                pr: 1,
+                actor: "operator".to_owned(),
+                reason: "test".to_owned(),
+            }),
+        ] {
+            assert!(action.mutates(), "expected a mutating action");
+            assert_eq!(
+                interactive_mutation_refusal(&hosted, action.mutates()),
+                Some((
+                    "web_hosted_interactive_mutation_refused",
+                    "hosted workers mutate only from verified webhook deliveries",
+                ))
+            );
+        }
+        // Observability actions stay available to humans behind the proxy.
+        for action in [
+            WebAction::Check(CheckInput::default()),
+            WebAction::PlanSync(SyncInput::default()),
+        ] {
+            assert!(!action.mutates());
+            assert_eq!(
+                interactive_mutation_refusal(&hosted, action.mutates()),
+                None
+            );
+        }
+
+        // The refusal is interactive-only. The webhook entry point takes no
+        // Dashboard and never consults hosted/read_only, so verified deliveries
+        // still drive work: here it durably defers pending sync rather than
+        // being refused (a bare fixture has no status snapshot yet).
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join(".git")).unwrap();
+        let repositories = load_repositories(&[directory.path().to_path_buf()]).unwrap();
+        assert!(!enqueue_webhook_sync(&repositories[0]));
+        assert!(repositories[0].webhook_sync_pending.load(Ordering::SeqCst));
+
+        // Local and read-only modes keep their exact prior behavior.
+        assert_eq!(
+            interactive_mutation_refusal(&test_dashboard(false, false), true),
+            None
+        );
+        assert_eq!(
+            interactive_mutation_refusal(&test_dashboard(false, true), true),
+            Some(("web_read_only", "mutation endpoints are disabled"))
+        );
+        assert_eq!(
+            interactive_mutation_refusal(&test_dashboard(false, true), false),
+            None
+        );
     }
 
     fn authority_status(head_oid: &str) -> StatusOutput {

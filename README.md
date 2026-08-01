@@ -290,7 +290,9 @@ CARA_GITHUB_WEBHOOK_SECRET=... cara web --repo /srv/a --repo /srv/b \
 requires signed webhooks, one exact installation, `--webhook-sync`, and per-repo
 `app_installation` auth plus `remote_fenced` writer with an exact slug. Ambient
 auth, `local_only`, mixed installations, or `--read-only` fail closed at startup.
-It provisions no clones and performs no failover; see
+Hosted workers mutate only from verified webhook deliveries; interactive
+dashboard mutations are refused, because the same-origin CSRF token is not
+authentication. It provisions no clones and performs no failover; see
 [`docs/github-app.md`](docs/github-app.md). Default `cara web` is unchanged.
 
 Repository inputs are explicit filesystem paths rather than slugs because every
