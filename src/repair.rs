@@ -2007,13 +2007,15 @@ fn resume_or_return(
         config_existed: context.config_existed,
         config: context.config.clone(),
     };
-    match crate::sync::sync(
+    let workspace_lock = caller_lock.derive_for_repository(&paths.workspace, "sync")?;
+    match crate::sync::sync_with_writer_guard(
         &workspace_context,
         &SyncInput {
             all: true,
             rerun_failed: false,
             dry_run: false,
         },
+        workspace_lock,
     ) {
         Ok(sync) => {
             caller_lock.release()?;

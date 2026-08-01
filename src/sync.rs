@@ -1206,10 +1206,26 @@ impl<R: crate::command::CommandRunner> SyncProvider for GitHubMutationAdapter<R>
 
 /// Synchronize the current caravan or every caravan and dispatch its canonical events.
 pub fn sync(context: &AppContext, input: &SyncInput) -> Result<SyncOutput, AppError> {
+    sync_with_optional_writer_guard(context, input, None)
+}
+
+pub(crate) fn sync_with_writer_guard(
+    context: &AppContext,
+    input: &SyncInput,
+    writer_guard: WriterOperationGuard,
+) -> Result<SyncOutput, AppError> {
+    sync_with_optional_writer_guard(context, input, Some(writer_guard))
+}
+
+fn sync_with_optional_writer_guard(
+    context: &AppContext,
+    input: &SyncInput,
+    writer_guard: Option<WriterOperationGuard>,
+) -> Result<SyncOutput, AppError> {
     let started = Instant::now();
     let budget = sync_operation_budget(context);
     let operation_deadline = started + budget;
-    match sync_without_hooks(context, input, started, operation_deadline) {
+    match sync_without_hooks(context, input, started, operation_deadline, writer_guard) {
         Ok(mut output) => {
             output.hook_deliveries = hooks::dispatch_events(context, &output.events)?;
             Ok(output)
@@ -2345,8 +2361,12 @@ fn sync_without_hooks(
     input: &SyncInput,
     started: Instant,
     operation_deadline: Instant,
+    writer_guard: Option<WriterOperationGuard>,
 ) -> Result<SyncOutput, AppError> {
-    let lock = context.acquire_writer_operation("sync")?;
+    let lock = match writer_guard {
+        Some(lock) => lock,
+        None => context.acquire_writer_operation("sync")?,
+    };
     let lock_recovery = lock.recovered_dead_owner().cloned();
     sync_with_lock(
         context,

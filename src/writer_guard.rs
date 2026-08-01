@@ -105,6 +105,20 @@ impl WriterOperationGuard {
         })
     }
 
+    /// Acquire a second repository-local lock while retaining the same exact
+    /// cross-host lease and operation identity. No broker acquire occurs.
+    pub fn derive_for_repository(
+        &self,
+        repository: &Path,
+        operation: &str,
+    ) -> Result<Self, AppError> {
+        let local = OperationLock::acquire(repository, operation)?;
+        Ok(Self {
+            local,
+            remote: self.remote.clone(),
+        })
+    }
+
     #[must_use]
     pub fn remote_grant(&self) -> Option<RemoteLeaseGrant> {
         self.remote.as_deref().map(RemoteLeaseGuard::grant_snapshot)
@@ -326,6 +340,68 @@ mod tests {
     }
 
     #[test]
+    fn derived_repository_guard_shares_one_remote_lease_and_releases_last() {
+        let parent_repository = init_repository();
+        let child_repository = init_repository();
+        let backend = Arc::new(RecordingLease::default());
+        let backend_trait: Arc<dyn RemoteWriterLease> = backend.clone();
+        let parent = WriterOperationGuard::acquire_remote(
+            parent_repository.path(),
+            "repair-sync",
+            backend_trait,
+            &remote_request(),
+        )
+        .unwrap();
+        let child = parent
+            .derive_for_repository(child_repository.path(), "sync")
+            .unwrap();
+        assert_eq!(backend.acquires.load(Ordering::SeqCst), 1);
+        assert_eq!(parent.remote_grant(), child.remote_grant());
+        parent
+            .runner(ProcessRunner::new())
+            .run(&CommandSpec::new("true").provider_write())
+            .unwrap();
+        child
+            .runner(ProcessRunner::new())
+            .run(&CommandSpec::new("true").git_write())
+            .unwrap();
+        assert_eq!(backend.inspects.load(Ordering::SeqCst), 2);
+        child.release().unwrap();
+        assert_eq!(backend.releases.load(Ordering::SeqCst), 0);
+        parent.release().unwrap();
+        assert_eq!(backend.releases.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn failed_child_local_lock_does_not_release_parent_remote_lease() {
+        let parent_repository = init_repository();
+        let child_repository = init_repository();
+        let blocking = OperationLock::acquire(child_repository.path(), "blocking").unwrap();
+        let backend = Arc::new(RecordingLease::default());
+        let backend_trait: Arc<dyn RemoteWriterLease> = backend.clone();
+        let parent = WriterOperationGuard::acquire_remote(
+            parent_repository.path(),
+            "repair-sync",
+            backend_trait,
+            &remote_request(),
+        )
+        .unwrap();
+        assert!(
+            parent
+                .derive_for_repository(child_repository.path(), "sync")
+                .is_err()
+        );
+        assert_eq!(backend.releases.load(Ordering::SeqCst), 0);
+        parent
+            .runner(ProcessRunner::new())
+            .run(&CommandSpec::new("true").provider_write())
+            .unwrap();
+        blocking.release().unwrap();
+        parent.release().unwrap();
+        assert_eq!(backend.releases.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn nonlocal_writer_modes_refuse_before_local_lock_creation() {
         let repository = tempfile::tempdir().unwrap();
         for mode in [WriterMode::ReadOnly, WriterMode::RemoteFenced] {
@@ -384,6 +460,17 @@ mod tests {
         assert_eq!(sync.matches("lock.runner(").count(), 1);
         assert!(sync.contains("writer_guard: &WriterOperationGuard"));
         assert!(sync.contains("github_budget,\n                writer_guard,"));
+    }
+
+    #[test]
+    fn repair_to_sync_derives_local_lock_without_reacquiring_remote() {
+        let repair = include_str!("repair.rs");
+        let repair = repair.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+        assert!(repair.contains("caller_lock.derive_for_repository(&paths.workspace, \"sync\")"));
+        assert!(repair.contains("sync_with_writer_guard("));
+        let sync = include_str!("sync.rs");
+        assert!(sync.contains("pub(crate) fn sync_with_writer_guard("));
+        assert!(sync.contains("Some(lock) => lock"));
     }
 
     #[test]

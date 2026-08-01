@@ -134,9 +134,12 @@ through temporary worktree preparation, barrier verification, and the marked
 force-with-lease push; reshape eviction uses the same path. Lease loss after
 preparation stops before push and preserves the remote head. Repair discovery,
 workspace materialization, semantic grant/revoke, continuation, and the marked
-non-force provider publication push now share their operation guard too. The
-remaining activation work is repair-to-sync inherited-guard handoff, durable
-lease checkpoints/renewal, read-only policy, and final mode opening.
+non-force provider publication push now share their operation guard too. Repair
+sync derives a second workspace-local lock while sharing the parent's exact
+remote guard, so it performs no second broker acquire and releases remote only
+when the last owner drops. The remaining activation work is durable lease
+checkpoints/receipts, read-only policy, complete two-host coverage, and final
+mode opening.
 
 ## Guard lifecycle
 
