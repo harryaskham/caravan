@@ -1,0 +1,6 @@
+Disposable live provider-identity canary for bd-71e444.
+
+This branch and its pull request must never merge. It exists only to prove that
+Caravan's GitHub App installation is the provider actor for an exact
+force-with-lease physical rewrite and API comment. Cleanup deletes this file by
+deleting the disposable branch after closing and evicting the canary PR.
