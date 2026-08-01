@@ -79,11 +79,29 @@ strictly advanced expiry). Release ambiguity succeeds only when inspect proves
 no holder. A replacement fence is loss, not release success. There is no
 unbounded retry.
 
+## Mutation-intent seam
+
+Every production provider or remote-Git command carries an explicit intent:
+`read`, `provider_write`, or `git_write`. Known `gh` write forms (PR/label/run
+mutations, REST write methods, and GraphQL `mutation`) and non-dry-run `git
+push` are also conservatively inferred. `FencedCommandRunner` rejects an
+inferred write with a missing marker before fence or child execution, bypasses
+reads without a lease call, and revalidates exactly once before each marked
+write. It delegates the inner runner's deadlines, request budgets, App
+credentials, and telemetry unchanged.
+
+The GitHub adapter, native Stack/async-merge adapters, physical force-with-lease
+push, and reviewed repair push are marked. Source/constructor contract tests
+keep their write surfaces explicit. This seam is enforceable when wrapped, but
+production operations do not yet construct the wrapper, so non-local writer
+modes remain startup-closed.
+
 ## Guard lifecycle
 
-`RemoteLeaseGuard` owns one grant, supports authoritative revalidation and exact
+`RemoteLeaseGuard` owns one grant, implements the command mutation-fence seam,
+supports authoritative revalidation and exact
 renewal, and attempts exact best-effort release on drop without claiming that
-release succeeded. The future mutation-integration slice must:
+release succeeded. The remaining operation-integration slice must:
 
 1. acquire the remote lease before the local operation lock;
 2. retain the guard and secret-free grant receipt for the whole operation;

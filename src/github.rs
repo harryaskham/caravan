@@ -2602,7 +2602,7 @@ fn create_pull_request_command(
     if input.draft {
         command = command.arg("--draft");
     }
-    command
+    command.provider_write()
 }
 
 fn edit_pull_request_command(
@@ -2611,15 +2611,17 @@ fn edit_pull_request_command(
     flag: &str,
     value: &str,
 ) -> CommandSpec {
-    CommandSpec::new("gh").args([
-        "pr".to_owned(),
-        "edit".to_owned(),
-        number.to_string(),
-        "--repo".to_owned(),
-        repository.slug(),
-        flag.to_owned(),
-        value.to_owned(),
-    ])
+    CommandSpec::new("gh")
+        .args([
+            "pr".to_owned(),
+            "edit".to_owned(),
+            number.to_string(),
+            "--repo".to_owned(),
+            repository.slug(),
+            flag.to_owned(),
+            value.to_owned(),
+        ])
+        .provider_write()
 }
 
 fn auto_merge_command(repository: &RepositoryId, number: PrNumber, disable: bool) -> CommandSpec {
@@ -2635,6 +2637,7 @@ fn auto_merge_command(repository: &RepositoryId, number: PrNumber, disable: bool
     } else {
         command.args(["--auto", "--squash"])
     }
+    .provider_write()
 }
 
 fn force_transaction_ids_command(
@@ -2700,7 +2703,7 @@ fn force_transaction_command(
     if let Some(label_id) = label_id {
         command = command.args(["-f".to_owned(), format!("labelId={label_id}")]);
     }
-    command
+    command.provider_write()
 }
 
 fn open_generation_pr_command(repository: &str, limit: usize) -> CommandSpec {
@@ -2759,14 +2762,16 @@ fn workflow_run_command(repository: &RepositoryId, run_id: u64) -> CommandSpec {
 }
 
 fn rerun_failed_command(repository: &RepositoryId, run_id: u64) -> CommandSpec {
-    CommandSpec::new("gh").args([
-        "run".to_owned(),
-        "rerun".to_owned(),
-        run_id.to_string(),
-        "--repo".to_owned(),
-        repository.slug(),
-        "--failed".to_owned(),
-    ])
+    CommandSpec::new("gh")
+        .args([
+            "run".to_owned(),
+            "rerun".to_owned(),
+            run_id.to_string(),
+            "--repo".to_owned(),
+            repository.slug(),
+            "--failed".to_owned(),
+        ])
+        .provider_write()
 }
 
 fn check_suites_command(repository: &RepositoryId, head_oid: &str) -> CommandSpec {
@@ -2804,15 +2809,17 @@ fn check_suite_command(repository: &RepositoryId, check_suite_id: u64) -> Comman
 }
 
 fn rerequest_check_suite_command(repository: &RepositoryId, check_suite_id: u64) -> CommandSpec {
-    CommandSpec::new("gh").args([
-        "api".to_owned(),
-        "--method".to_owned(),
-        "POST".to_owned(),
-        format!(
-            "repos/{}/check-suites/{check_suite_id}/rerequest",
-            repository.slug()
-        ),
-    ])
+    CommandSpec::new("gh")
+        .args([
+            "api".to_owned(),
+            "--method".to_owned(),
+            "POST".to_owned(),
+            format!(
+                "repos/{}/check-suites/{check_suite_id}/rerequest",
+                repository.slug()
+            ),
+        ])
+        .provider_write()
 }
 
 fn branch_settings_command(repository: &RepositoryId, branch: &str) -> CommandSpec {
@@ -2864,17 +2871,19 @@ fn create_repository_label_command(
     color: &str,
     description: &str,
 ) -> CommandSpec {
-    CommandSpec::new("gh").args([
-        "label".to_owned(),
-        "create".to_owned(),
-        name.to_owned(),
-        "--repo".to_owned(),
-        repository.slug(),
-        "--color".to_owned(),
-        color.to_owned(),
-        "--description".to_owned(),
-        description.to_owned(),
-    ])
+    CommandSpec::new("gh")
+        .args([
+            "label".to_owned(),
+            "create".to_owned(),
+            name.to_owned(),
+            "--repo".to_owned(),
+            repository.slug(),
+            "--color".to_owned(),
+            color.to_owned(),
+            "--description".to_owned(),
+            description.to_owned(),
+        ])
+        .provider_write()
 }
 
 fn issue_comments_command(repository: &RepositoryId, number: PrNumber) -> CommandSpec {
@@ -2894,15 +2903,17 @@ fn comment_pull_request_command(
     number: PrNumber,
     body: &str,
 ) -> CommandSpec {
-    CommandSpec::new("gh").args([
-        "pr".to_owned(),
-        "comment".to_owned(),
-        number.to_string(),
-        "--repo".to_owned(),
-        repository.slug(),
-        "--body".to_owned(),
-        body.to_owned(),
-    ])
+    CommandSpec::new("gh")
+        .args([
+            "pr".to_owned(),
+            "comment".to_owned(),
+            number.to_string(),
+            "--repo".to_owned(),
+            repository.slug(),
+            "--body".to_owned(),
+            body.to_owned(),
+        ])
+        .provider_write()
 }
 
 fn repository_permission_command(repository: &RepositoryId) -> CommandSpec {
@@ -2916,15 +2927,17 @@ fn repository_permission_command(repository: &RepositoryId) -> CommandSpec {
 }
 
 fn admin_squash_merge_command(repository: &RepositoryId, number: PrNumber) -> CommandSpec {
-    CommandSpec::new("gh").args([
-        "pr".to_owned(),
-        "merge".to_owned(),
-        number.to_string(),
-        "--repo".to_owned(),
-        repository.slug(),
-        "--admin".to_owned(),
-        "--squash".to_owned(),
-    ])
+    CommandSpec::new("gh")
+        .args([
+            "pr".to_owned(),
+            "merge".to_owned(),
+            number.to_string(),
+            "--repo".to_owned(),
+            repository.slug(),
+            "--admin".to_owned(),
+            "--squash".to_owned(),
+        ])
+        .provider_write()
 }
 
 fn squash_merge_command(
@@ -2932,16 +2945,18 @@ fn squash_merge_command(
     number: PrNumber,
     head: &CommitOid,
 ) -> CommandSpec {
-    CommandSpec::new("gh").args([
-        "pr".to_owned(),
-        "merge".to_owned(),
-        number.to_string(),
-        "--repo".to_owned(),
-        repository.slug(),
-        "--squash".to_owned(),
-        "--match-head-commit".to_owned(),
-        head.0.clone(),
-    ])
+    CommandSpec::new("gh")
+        .args([
+            "pr".to_owned(),
+            "merge".to_owned(),
+            number.to_string(),
+            "--repo".to_owned(),
+            repository.slug(),
+            "--squash".to_owned(),
+            "--match-head-commit".to_owned(),
+            head.0.clone(),
+        ])
+        .provider_write()
 }
 
 fn merge_commit_command(repository: &RepositoryId, number: PrNumber) -> CommandSpec {
@@ -4969,12 +4984,14 @@ mod tests {
         );
         assert_eq!(
             rerequest_check_suite_command(&repository, 4242),
-            CommandSpec::new("gh").args([
-                "api",
-                "--method",
-                "POST",
-                "repos/acme/widgets/check-suites/4242/rerequest",
-            ])
+            CommandSpec::new("gh")
+                .args([
+                    "api",
+                    "--method",
+                    "POST",
+                    "repos/acme/widgets/check-suites/4242/rerequest",
+                ])
+                .provider_write()
         );
     }
 
@@ -5070,19 +5087,61 @@ mod tests {
     }
 
     #[test]
+    fn every_provider_mutation_builder_is_explicitly_marked() {
+        let repository = repository();
+        let commands = vec![
+            create_pull_request_command(
+                &repository,
+                &CreatePullRequestInput {
+                    head: "feature".to_owned(),
+                    base: "main".to_owned(),
+                    draft: false,
+                },
+            ),
+            edit_pull_request_command(&repository, PrNumber(12), "--add-label", "caravan"),
+            auto_merge_command(&repository, PrNumber(12), false),
+            force_transaction_command("pull-id", Some("label-id"), true, true),
+            rerun_failed_command(&repository, 42),
+            rerequest_check_suite_command(&repository, 42),
+            create_repository_label_command(&repository, "caravan", "ffffff", "managed"),
+            comment_pull_request_command(&repository, PrNumber(12), "receipt"),
+            admin_squash_merge_command(&repository, PrNumber(12)),
+            squash_merge_command(&repository, PrNumber(12), &CommitOid("head".to_owned())),
+        ];
+        for command in commands {
+            assert_eq!(
+                command.intent(),
+                crate::command::CommandIntent::ProviderWrite
+            );
+            assert_eq!(
+                command.inferred_write_intent(),
+                Some(crate::command::CommandIntent::ProviderWrite),
+                "{}",
+                command.display()
+            );
+        }
+        assert_eq!(
+            force_transaction_ids_command(&repository, PrNumber(12), "caravan").intent(),
+            crate::command::CommandIntent::Read
+        );
+    }
+
+    #[test]
     fn mutation_command_builders_keep_user_values_as_separate_arguments() {
         let repository = repository();
         assert_eq!(
             edit_pull_request_command(&repository, PrNumber(12), "--add-label", "caravan queue"),
-            CommandSpec::new("gh").args([
-                "pr",
-                "edit",
-                "12",
-                "--repo",
-                "acme/widgets",
-                "--add-label",
-                "caravan queue",
-            ])
+            CommandSpec::new("gh")
+                .args([
+                    "pr",
+                    "edit",
+                    "12",
+                    "--repo",
+                    "acme/widgets",
+                    "--add-label",
+                    "caravan queue",
+                ])
+                .provider_write()
         );
         assert_eq!(
             edit_pull_request_command(
@@ -5091,50 +5150,58 @@ mod tests {
                 "--remove-label",
                 "caravan-evicted"
             ),
-            CommandSpec::new("gh").args([
-                "pr",
-                "edit",
-                "12",
-                "--repo",
-                "acme/widgets",
-                "--remove-label",
-                "caravan-evicted",
-            ])
+            CommandSpec::new("gh")
+                .args([
+                    "pr",
+                    "edit",
+                    "12",
+                    "--repo",
+                    "acme/widgets",
+                    "--remove-label",
+                    "caravan-evicted",
+                ])
+                .provider_write()
         );
         assert_eq!(
             auto_merge_command(&repository, PrNumber(12), false),
-            CommandSpec::new("gh").args([
-                "pr",
-                "merge",
-                "12",
-                "--repo",
-                "acme/widgets",
-                "--auto",
-                "--squash",
-            ])
+            CommandSpec::new("gh")
+                .args([
+                    "pr",
+                    "merge",
+                    "12",
+                    "--repo",
+                    "acme/widgets",
+                    "--auto",
+                    "--squash",
+                ])
+                .provider_write()
         );
         assert_eq!(
             auto_merge_command(&repository, PrNumber(12), true),
-            CommandSpec::new("gh").args([
-                "pr",
-                "merge",
-                "12",
-                "--repo",
-                "acme/widgets",
-                "--disable-auto",
-            ])
+            CommandSpec::new("gh")
+                .args([
+                    "pr",
+                    "merge",
+                    "12",
+                    "--repo",
+                    "acme/widgets",
+                    "--disable-auto",
+                ])
+                .provider_write()
         );
         assert_eq!(
             admin_squash_merge_command(&repository, PrNumber(12)),
-            CommandSpec::new("gh").args([
-                "pr",
-                "merge",
-                "12",
-                "--repo",
-                "acme/widgets",
-                "--admin",
-                "--squash",
-            ])
+            CommandSpec::new("gh")
+                .args([
+                    "pr",
+                    "merge",
+                    "12",
+                    "--repo",
+                    "acme/widgets",
+                    "--admin",
+                    "--squash",
+                ])
+                .provider_write()
         );
     }
 

@@ -1217,7 +1217,12 @@ fn stack_api_command(method: &str, path: String, include_headers: bool) -> Comma
     if include_headers {
         command = command.arg("--include");
     }
-    command.arg(path)
+    let command = command.arg(path);
+    if method == "GET" {
+        command
+    } else {
+        command.provider_write()
+    }
 }
 
 #[cfg(test)]
@@ -1766,6 +1771,16 @@ mod tests {
             Err(GitHubStackMutationError::Unavailable { .. })
         ));
         adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn stack_write_methods_are_marked_and_get_remains_read_only() {
+        let write = stack_api_command("POST", "repos/o/r/stacks".to_owned(), true);
+        assert_eq!(write.intent(), crate::command::CommandIntent::ProviderWrite);
+        assert_eq!(write.inferred_write_intent(), Some(write.intent()));
+        let read = stack_api_command("GET", "repos/o/r/stacks/1".to_owned(), false);
+        assert_eq!(read.intent(), crate::command::CommandIntent::Read);
+        assert_eq!(read.inferred_write_intent(), None);
     }
 
     #[test]

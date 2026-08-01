@@ -9,7 +9,7 @@ use std::sync::Arc;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::command::{CommandRunner, CommandSpec};
+use crate::command::{CommandIntent, CommandMutationFence, CommandRunner, CommandSpec};
 
 const LEASE_SCHEMA_VERSION: u32 = 1;
 const MAX_PROTOCOL_BYTES: usize = 16 * 1024;
@@ -559,6 +559,19 @@ impl Drop for RemoteLeaseGuard {
     }
 }
 
+impl CommandMutationFence for RemoteLeaseGuard {
+    fn before_write(&self, _intent: CommandIntent) -> Result<(), String> {
+        let now_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| "system clock is before the Unix epoch".to_owned())?
+            .as_millis()
+            .try_into()
+            .map_err(|_| "system clock exceeds remote lease range".to_owned())?;
+        self.revalidate(now_unix_ms)
+            .map_err(|error| error.to_string())
+    }
+}
+
 fn validate_identity(name: &str, value: &str) -> Result<(), RemoteLeaseError> {
     if value.is_empty()
         || value.len() > MAX_IDENTITY_BYTES
@@ -579,7 +592,7 @@ mod tests {
     use std::thread;
 
     use super::*;
-    use crate::command::{CommandOutput, CommandRunError};
+    use crate::command::{CommandOutput, CommandRunError, FencedCommandRunner};
 
     #[derive(Clone, Default)]
     struct ScriptedRunner {
@@ -931,6 +944,31 @@ mod tests {
         guard.renew(3_000, 20_000, 4_000).unwrap();
         assert!(guard.grant().expires_unix_ms > old_expiry);
         assert!(guard.release().unwrap());
+    }
+
+    #[test]
+    fn lost_remote_guard_stops_marked_command_before_inner_runner() {
+        let now: u64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            .try_into()
+            .unwrap();
+        let backend = Arc::new(FakeCas::default());
+        let backend_trait: Arc<dyn RemoteWriterLease> = backend.clone();
+        let guard =
+            RemoteLeaseGuard::acquire(backend_trait, &request("host-a", "operation", now)).unwrap();
+        backend.release(guard.grant()).unwrap();
+        let inner = ScriptedRunner::with(vec![Ok(CommandOutput::success("unexpected"))]);
+        let runner = FencedCommandRunner::new(inner.clone(), guard);
+        let write = CommandSpec::new("gh")
+            .args(["pr", "edit", "1"])
+            .provider_write();
+        assert!(matches!(
+            runner.run(&write),
+            Err(CommandRunError::MutationFenceRefused { .. })
+        ));
+        assert!(inner.requests.lock().unwrap().is_empty());
     }
 
     #[test]

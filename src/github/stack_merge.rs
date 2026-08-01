@@ -950,7 +950,7 @@ fn native_stack_merge_poll_command(
 }
 
 fn stack_merge_api_command(method: &str, path: String) -> CommandSpec {
-    CommandSpec::new("gh").args([
+    let command = CommandSpec::new("gh").args([
         "api".to_owned(),
         "--method".to_owned(),
         method.to_owned(),
@@ -960,7 +960,12 @@ fn stack_merge_api_command(method: &str, path: String) -> CommandSpec {
         STACK_API_VERSION.to_owned(),
         "--include".to_owned(),
         path,
-    ])
+    ]);
+    if method == "GET" {
+        command
+    } else {
+        command.provider_write()
+    }
 }
 
 fn git_ref_command(repository: &RepositoryId, branch: &str) -> CommandSpec {
@@ -1672,6 +1677,16 @@ mod tests {
             Err(GitHubStackMergeError::InvalidCheckpoint { .. })
         ));
         adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn async_stack_put_is_marked_and_poll_get_remains_read_only() {
+        let write = stack_merge_api_command("PUT", "repos/o/r/pulls/1/merge-async".to_owned());
+        assert_eq!(write.intent(), crate::command::CommandIntent::ProviderWrite);
+        assert_eq!(write.inferred_write_intent(), Some(write.intent()));
+        let read = stack_merge_api_command("GET", "repos/o/r/pulls/1/merge-async/u".to_owned());
+        assert_eq!(read.intent(), crate::command::CommandIntent::Read);
+        assert_eq!(read.inferred_write_intent(), None);
     }
 
     #[test]

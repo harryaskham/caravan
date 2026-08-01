@@ -476,9 +476,11 @@ RECOVERY, LOCKS, AND OBSERVABILITY
   machine-checked in `docs/github-app-policy.json` and explained in
   `docs/github-app.md`; live bot attribution remains a separate canary.
 - Cross-host writer fencing has a strict broker/CAS/guard protocol in
-  `docs/remote-writer-lease.md`, but it is not active. `writer.mode` defaults to
-  `local_only`; reserved `read_only`/`remote_fenced` values fail production
-  startup until every mutation seam revalidates the remote fencing token.
+  `docs/remote-writer-lease.md`, but it is not active. Provider/Git writes carry
+  explicit intent and a fenced runner refuses missing markers or a lost token
+  before child execution. `writer.mode` defaults to `local_only`; reserved
+  `read_only`/`remote_fenced` values fail startup until operations install the
+  fenced runner before their local lock.
 - `cara self-update status|check|run` updates only the exact running first-PATH
   stable user binary (`~/.cargo/bin`, `~/.local/bin`, or an exact explicit
   `CARA_SELF_UPDATE_INSTALL_DIR`). Shadowed, renamed/test, Cargo target, and

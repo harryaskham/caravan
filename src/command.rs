@@ -113,6 +113,7 @@ impl GithubRepository {
 struct CommandIo {
     env: BTreeMap<String, String>,
     stdin: Option<String>,
+    intent: CommandIntent,
 }
 
 impl std::fmt::Debug for CommandIo {
@@ -121,7 +122,24 @@ impl std::fmt::Debug for CommandIo {
             .debug_struct("CommandIo")
             .field("env_names", &self.env.keys().collect::<Vec<_>>())
             .field("stdin", &self.stdin.as_ref().map(|_| "<redacted>"))
+            .field("intent", &self.intent)
             .finish()
+    }
+}
+
+/// Whether a subprocess is read-only or can mutate provider/remote state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CommandIntent {
+    #[default]
+    Read,
+    ProviderWrite,
+    GitWrite,
+}
+
+impl CommandIntent {
+    #[must_use]
+    pub const fn is_write(self) -> bool {
+        !matches!(self, Self::Read)
     }
 }
 
@@ -150,6 +168,7 @@ impl std::fmt::Debug for CommandSpec {
                     .collect::<Vec<_>>(),
             )
             .field("io", &self.io)
+            .field("intent", &self.intent())
             .finish()
     }
 }
@@ -191,6 +210,69 @@ impl CommandSpec {
             .env
             .insert(name.into(), value.into());
         self
+    }
+
+    /// Mark one authenticated provider mutation.
+    #[must_use]
+    pub fn provider_write(mut self) -> Self {
+        self.io
+            .get_or_insert_with(|| Box::new(CommandIo::default()))
+            .intent = CommandIntent::ProviderWrite;
+        self
+    }
+
+    /// Mark one remote Git/ref mutation.
+    #[must_use]
+    pub fn git_write(mut self) -> Self {
+        self.io
+            .get_or_insert_with(|| Box::new(CommandIo::default()))
+            .intent = CommandIntent::GitWrite;
+        self
+    }
+
+    #[must_use]
+    pub fn intent(&self) -> CommandIntent {
+        self.io.as_ref().map_or(CommandIntent::Read, |io| io.intent)
+    }
+
+    /// Conservative semantic classifier used by contract tests and the fenced
+    /// wrapper to catch an omitted explicit marker before child execution.
+    #[must_use]
+    pub fn inferred_write_intent(&self) -> Option<CommandIntent> {
+        let program = Path::new(&self.program).file_name()?.to_str()?;
+        if program == "git" {
+            let push = self.args.iter().any(|argument| argument == "push");
+            let dry_run = self.args.iter().any(|argument| argument == "--dry-run");
+            return (push && !dry_run).then_some(CommandIntent::GitWrite);
+        }
+        if program != "gh" {
+            return None;
+        }
+        let first = self.args.first().map(String::as_str);
+        let second = self.args.get(1).map(String::as_str);
+        if matches!(
+            (first, second),
+            (
+                Some("pr"),
+                Some("create" | "edit" | "merge" | "comment" | "close" | "reopen")
+            ) | (Some("label"), Some("create" | "edit" | "delete"))
+                | (Some("run"), Some("rerun" | "cancel" | "delete"))
+                | (Some("repo"), Some("edit"))
+        ) {
+            return Some(CommandIntent::ProviderWrite);
+        }
+        if first != Some("api") {
+            return None;
+        }
+        let explicit_write = self.args.windows(2).any(|pair| {
+            pair[0] == "--method" && matches!(pair[1].as_str(), "POST" | "PATCH" | "PUT" | "DELETE")
+        });
+        let graphql_mutation = self.args.iter().any(|argument| {
+            argument
+                .strip_prefix("query=")
+                .is_some_and(|query| query.trim_start().starts_with("mutation"))
+        });
+        (explicit_write || graphql_mutation).then_some(CommandIntent::ProviderWrite)
     }
 
     /// Provide a UTF-8 stdin payload.
@@ -318,6 +400,13 @@ pub enum CommandRunError {
         command: CommandSpec,
         message: String,
     },
+    /// A marked write lost or could not prove its remote fencing token before
+    /// any subprocess was spawned.
+    MutationFenceRefused {
+        command: CommandSpec,
+        intent: CommandIntent,
+        message: String,
+    },
     /// The executable could not be started or waited for.
     Spawn {
         /// Requested command.
@@ -382,6 +471,15 @@ impl std::fmt::Display for CommandRunError {
                 "GitHub App git transport refused `{}`: {message}",
                 command.display()
             ),
+            Self::MutationFenceRefused {
+                command,
+                intent,
+                message,
+            } => write!(
+                formatter,
+                "remote {intent:?} fence refused `{}` before execution: {message}",
+                command.display()
+            ),
             Self::Spawn { command, message } => {
                 write!(
                     formatter,
@@ -435,6 +533,60 @@ pub trait CommandRunner {
     /// Return secret-free GitHub API telemetry accumulated by this runner.
     fn github_api_telemetry(&self) -> crate::model::GitHubApiTelemetry {
         crate::model::GitHubApiTelemetry::default()
+    }
+}
+
+/// Revalidate one operation-scoped remote fence immediately before a write.
+pub trait CommandMutationFence: Send + Sync {
+    /// Error text must be bounded and secret-free.
+    fn before_write(&self, intent: CommandIntent) -> Result<(), String>;
+}
+
+/// Runner wrapper that makes write intent centrally enforceable without
+/// changing read-command behavior or inner request/telemetry budgets.
+#[derive(Debug, Clone)]
+pub struct FencedCommandRunner<R, F> {
+    inner: R,
+    fence: F,
+}
+
+impl<R, F> FencedCommandRunner<R, F> {
+    #[must_use]
+    pub const fn new(inner: R, fence: F) -> Self {
+        Self { inner, fence }
+    }
+
+    #[must_use]
+    pub const fn inner(&self) -> &R {
+        &self.inner
+    }
+}
+
+impl<R: CommandRunner, F: CommandMutationFence> CommandRunner for FencedCommandRunner<R, F> {
+    fn run(&self, command: &CommandSpec) -> Result<CommandOutput, CommandRunError> {
+        if let Some(inferred) = command.inferred_write_intent()
+            && command.intent() != inferred
+        {
+            return Err(CommandRunError::MutationFenceRefused {
+                command: command.clone(),
+                intent: inferred,
+                message: "write command is missing its explicit mutation-intent marker".to_owned(),
+            });
+        }
+        if command.intent().is_write() {
+            self.fence
+                .before_write(command.intent())
+                .map_err(|message| CommandRunError::MutationFenceRefused {
+                    command: command.clone(),
+                    intent: command.intent(),
+                    message,
+                })?;
+        }
+        self.inner.run(command)
+    }
+
+    fn github_api_telemetry(&self) -> crate::model::GitHubApiTelemetry {
+        self.inner.github_api_telemetry()
     }
 }
 
@@ -1627,6 +1779,130 @@ fn duration_millis(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone, Default)]
+    struct CountingRunner(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl CommandRunner for CountingRunner {
+        fn run(&self, _request: &CommandSpec) -> Result<CommandOutput, CommandRunError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(CommandOutput::success("ok"))
+        }
+    }
+
+    #[derive(Clone)]
+    struct CountingFence {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        allowed: bool,
+    }
+
+    impl CommandMutationFence for CountingFence {
+        fn before_write(&self, _intent: CommandIntent) -> Result<(), String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.allowed {
+                Ok(())
+            } else {
+                Err("exact live fencing token was not observed".to_owned())
+            }
+        }
+    }
+
+    #[test]
+    fn fenced_runner_blocks_marked_writes_before_spawning_inner_child() {
+        let inner = CountingRunner::default();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runner = FencedCommandRunner::new(
+            inner.clone(),
+            CountingFence {
+                calls: Arc::clone(&calls),
+                allowed: false,
+            },
+        );
+        let request = CommandSpec::new("gh")
+            .args(["api", "--method", "POST", "repos/o/r/issues"])
+            .provider_write();
+        let error = runner.run(&request).unwrap_err();
+        assert!(matches!(
+            error,
+            CommandRunError::MutationFenceRefused {
+                intent: CommandIntent::ProviderWrite,
+                ..
+            }
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(inner.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn fenced_runner_rejects_inferred_write_without_explicit_marker() {
+        let inner = CountingRunner::default();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runner = FencedCommandRunner::new(
+            inner.clone(),
+            CountingFence {
+                calls: Arc::clone(&calls),
+                allowed: true,
+            },
+        );
+        for request in [
+            CommandSpec::new("gh").args(["api", "--method", "DELETE", "repos/o/r/ref"]),
+            CommandSpec::new("gh").args(["api", "graphql", "-f", "query=mutation { x }"]),
+            CommandSpec::new("git").args(["push", "origin", "HEAD:refs/heads/x"]),
+        ] {
+            assert!(matches!(
+                runner.run(&request),
+                Err(CommandRunError::MutationFenceRefused { .. })
+            ));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(inner.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn fenced_runner_bypasses_reads_and_revalidates_each_marked_write() {
+        let inner = CountingRunner::default();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runner = FencedCommandRunner::new(
+            inner.clone(),
+            CountingFence {
+                calls: Arc::clone(&calls),
+                allowed: true,
+            },
+        );
+        runner
+            .run(&CommandSpec::new("gh").args(["pr", "view", "1"]))
+            .unwrap();
+        runner
+            .run(&CommandSpec::new("git").args(["push", "origin"]).git_write())
+            .unwrap();
+        runner
+            .run(
+                &CommandSpec::new("gh")
+                    .args(["pr", "edit", "1"])
+                    .provider_write(),
+            )
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(inner.0.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn production_remote_git_writes_are_explicitly_marked() {
+        let physical = include_str!("physical_rebase.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert_eq!(physical.matches("\"push\"").count(), 3);
+        assert_eq!(physical.matches("\"--dry-run\"").count(), 2);
+        assert_eq!(physical.matches(".git_write()").count(), 1);
+
+        let repair = include_str!("repair.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert_eq!(repair.matches("\"push\"").count(), 1);
+        assert_eq!(repair.matches(".git_write()").count(), 1);
+    }
 
     #[test]
     fn diagnostic_rendering_quotes_shell_metacharacters_without_using_a_shell() {

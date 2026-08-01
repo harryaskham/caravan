@@ -1557,12 +1557,14 @@ fn push_prepared(prepared: &PreparedRebase) -> Result<RebaseReceipt, AppError> {
         let destination = format!("HEAD:refs/heads/{}", prepared.plan.branch);
         require_success(
             &runner,
-            CommandSpec::new("git").args([
-                "push",
-                prepared.plan.lease.as_str(),
-                "origin",
-                destination.as_str(),
-            ]),
+            CommandSpec::new("git")
+                .args([
+                    "push",
+                    prepared.plan.lease.as_str(),
+                    "origin",
+                    destination.as_str(),
+                ])
+                .git_write(),
             "rebase_stale_lease",
             "exact force-with-lease push failed; the branch may have moved and was not overwritten",
         )?;

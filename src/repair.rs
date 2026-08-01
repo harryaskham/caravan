@@ -1875,7 +1875,8 @@ pub fn continue_session(
                     repair.provider_git_url.as_str(),
                     destination.as_str(),
                 ])
-                .env("GIT_TERMINAL_PROMPT", "0"),
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .git_write(),
             "repair_non_fast_forward",
             "non-force repair publication failed; the provider branch may have moved",
         )?;
