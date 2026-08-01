@@ -1567,6 +1567,7 @@ fn execute_locked(
             &status.analysis.fleet.default_branch,
             crate::physical_rebase::RebaseExecutionBudget::new(timeout)
                 .with_deadline(operation_deadline)
+                .with_writer_fence(writer_guard.remote_fence())
                 .because(rewrite_reason)
                 // bd-abd929: bd-85b71d applied this reasoning inside sync but never
                 // here: a caravan ROOT is squash-merged by cara, so its history

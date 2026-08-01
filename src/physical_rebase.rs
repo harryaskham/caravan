@@ -6,6 +6,7 @@
 //! an exact force-with-lease push.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -17,7 +18,9 @@ use serde_json::json;
 use crate::AppError;
 use crate::command::{CommandOutput, CommandRunner, CommandSpec, ProcessRunner};
 use crate::model::{BranchSnapshot, CommitOid, PrNumber, PullRequestSnapshot, RepositoryId};
+use crate::remote_lease::RemoteLeaseGuard;
 use crate::squash_equivalence::{self, SquashEquivalenceReport};
+use crate::writer_guard::WriterCommandRunner;
 
 const MAX_MERGE_PRESERVING_COMMITS: usize = 256;
 static WORKTREE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -127,6 +130,8 @@ pub struct RebaseExecutionBudget {
     pub replay_upstream: Option<CommitOid>,
     /// Immutable reason attached to the exact prepared generation.
     pub rewrite_reason: BranchRewriteReason,
+    /// Operation-scoped remote fence retained through preparation and push.
+    pub writer_fence: Option<Arc<RemoteLeaseGuard>>,
 }
 
 impl RebaseExecutionBudget {
@@ -139,6 +144,7 @@ impl RebaseExecutionBudget {
             flatten_squashed_root: false,
             replay_upstream: None,
             rewrite_reason: BranchRewriteReason::Unspecified,
+            writer_fence: None,
         }
     }
 
@@ -191,6 +197,12 @@ impl RebaseExecutionBudget {
     #[must_use]
     pub const fn with_squash_reconciliation(mut self, authorized: bool) -> Self {
         self.reconcile_squash_equivalent = authorized;
+        self
+    }
+
+    #[must_use]
+    pub fn with_writer_fence(mut self, fence: Option<Arc<RemoteLeaseGuard>>) -> Self {
+        self.writer_fence = fence;
         self
     }
 }
@@ -508,6 +520,7 @@ pub fn prepare_candidate(
         repository_path,
         budget.command_timeout,
         budget.operation_deadline,
+        budget.writer_fence.as_ref(),
     );
     fetch_exact(&runner, "origin", &candidate.head)?;
     match &new_base {
@@ -638,11 +651,13 @@ pub fn prepare_candidate(
         &candidate.head.oid,
         budget.worktree_setup_timeout(),
         budget.operation_deadline,
+        budget.writer_fence.clone(),
     )?;
     let worktree_runner = process_runner(
         &worktree.path,
         budget.command_timeout,
         budget.operation_deadline,
+        budget.writer_fence.as_ref(),
     );
     // Reconciliation is opt-in and additionally requires exact proof, so a
     // routine rewrite never silently drops history. A merge-preserving range
@@ -1448,6 +1463,7 @@ pub(crate) fn verify_prepared_before(
         &prepared.worktree.path,
         prepared.worktree.timeout,
         operation_deadline,
+        prepared.worktree.writer_fence.as_ref(),
     );
     let retained_head = rev_parse(&runner, "HEAD")?;
     if retained_head != prepared.plan.new_head_oid {
@@ -1505,6 +1521,7 @@ pub fn apply_prepared(prepared: &PreparedRebase) -> Result<RebaseReceipt, AppErr
         &prepared.worktree.path,
         prepared.worktree.timeout,
         prepared.worktree.operation_deadline,
+        prepared.worktree.writer_fence.as_ref(),
     );
     match &prepared.plan.new_base {
         PlannedBase::Remote(target) | PlannedBase::Simulated(target) => {
@@ -1524,6 +1541,7 @@ pub(crate) fn apply_prepared_after_write_barrier(
         &prepared.worktree.path,
         prepared.worktree.timeout,
         prepared.worktree.operation_deadline,
+        prepared.worktree.writer_fence.as_ref(),
     );
     match &prepared.plan.range_source {
         PlannedRangeBase::RemoteBranch { branch }
@@ -1555,6 +1573,7 @@ fn push_prepared(prepared: &PreparedRebase) -> Result<RebaseReceipt, AppError> {
             &prepared.worktree.path,
             prepared.worktree.timeout,
             prepared.worktree.operation_deadline,
+            prepared.worktree.writer_fence.as_ref(),
         );
         let destination = format!("HEAD:refs/heads/{}", prepared.plan.branch);
         require_success(
@@ -1699,7 +1718,7 @@ pub(crate) fn verify_branch_snapshot_before(
 ) -> Result<(), AppError> {
     validate_branch(&snapshot.name)?;
     validate_oid(&snapshot.oid)?;
-    let runner = process_runner(repository_path, timeout, phase_deadline);
+    let runner = process_runner(repository_path, timeout, phase_deadline, None);
     verify_remote_head(&runner, "origin", &snapshot.name, &snapshot.oid)
 }
 
@@ -1955,11 +1974,13 @@ fn process_runner(
     directory: &Path,
     timeout: Duration,
     operation_deadline: Option<Instant>,
-) -> ProcessRunner {
+    writer_fence: Option<&Arc<RemoteLeaseGuard>>,
+) -> WriterCommandRunner {
     let runner = ProcessRunner::in_directory(directory).with_timeout(timeout);
-    operation_deadline.map_or(runner.clone(), |deadline| {
+    let runner = operation_deadline.map_or(runner.clone(), |deadline| {
         runner.with_operation_deadline(deadline)
-    })
+    });
+    WriterCommandRunner::with_remote_fence(runner, writer_fence.cloned())
 }
 
 struct TemporaryWorktree {
@@ -1967,6 +1988,7 @@ struct TemporaryWorktree {
     path: PathBuf,
     timeout: Duration,
     operation_deadline: Option<Instant>,
+    writer_fence: Option<Arc<RemoteLeaseGuard>>,
 }
 
 impl TemporaryWorktree {
@@ -1975,13 +1997,19 @@ impl TemporaryWorktree {
         head: &CommitOid,
         timeout: Duration,
         operation_deadline: Option<Instant>,
+        writer_fence: Option<Arc<RemoteLeaseGuard>>,
     ) -> Result<Self, AppError> {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
         let path = unique_worktree_path(nonce);
-        let runner = process_runner(repository, timeout, operation_deadline);
+        let runner = process_runner(
+            repository,
+            timeout,
+            operation_deadline,
+            writer_fence.as_ref(),
+        );
         require_success(
             &runner,
             CommandSpec::new("git").args([
@@ -2000,6 +2028,7 @@ impl TemporaryWorktree {
             path,
             timeout,
             operation_deadline,
+            writer_fence,
         })
     }
 }
@@ -2021,9 +2050,13 @@ impl Drop for TemporaryWorktree {
 mod tests {
     use std::collections::BTreeSet;
     use std::process::Command;
+    use std::sync::Mutex;
 
     use super::*;
     use crate::model::{AutoMergeState, PullRequestState};
+    use crate::remote_lease::{
+        RemoteLeaseAcquire, RemoteLeaseError, RemoteLeaseGrant, RemoteLeaseKey, RemoteWriterLease,
+    };
     use mcp_cli::StructuredError;
 
     // Physical-rebase fixtures intentionally exercise several real local Git
@@ -2031,6 +2064,86 @@ mod tests {
     // resilient when the Nix build runs the suite under CPU/I/O contention;
     // timeout policy has separate focused coverage.
     const TEST_REBASE_BUDGET: Duration = Duration::from_secs(60);
+
+    #[derive(Default)]
+    struct RevocableLease(Mutex<Option<RemoteLeaseGrant>>);
+
+    impl RevocableLease {
+        fn revoke(&self) {
+            *self.0.lock().unwrap() = None;
+        }
+    }
+
+    impl RemoteWriterLease for RevocableLease {
+        fn acquire(
+            &self,
+            request: &RemoteLeaseAcquire,
+        ) -> Result<RemoteLeaseGrant, RemoteLeaseError> {
+            let grant = RemoteLeaseGrant {
+                schema_version: 1,
+                key: request.key.clone(),
+                writer_owner: request.writer_owner.clone(),
+                operation_id: request.operation_id.clone(),
+                fencing_token: 1,
+                heartbeat_due_unix_ms: request.now_unix_ms + request.heartbeat_ms,
+                expires_unix_ms: request.now_unix_ms + request.ttl_ms,
+                backend_revision: "revision-1".to_owned(),
+            };
+            *self.0.lock().unwrap() = Some(grant.clone());
+            Ok(grant)
+        }
+
+        fn inspect(
+            &self,
+            _key: &RemoteLeaseKey,
+        ) -> Result<Option<RemoteLeaseGrant>, RemoteLeaseError> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+
+        fn renew(
+            &self,
+            _grant: &RemoteLeaseGrant,
+            _now_unix_ms: u64,
+            _ttl_ms: u64,
+            _heartbeat_ms: u64,
+        ) -> Result<RemoteLeaseGrant, RemoteLeaseError> {
+            Err(RemoteLeaseError::Execution("not used".to_owned()))
+        }
+
+        fn release(&self, _grant: &RemoteLeaseGrant) -> Result<bool, RemoteLeaseError> {
+            self.0.lock().unwrap().take();
+            Ok(true)
+        }
+    }
+
+    fn test_writer_fence() -> (Arc<RevocableLease>, Arc<RemoteLeaseGuard>) {
+        let now_unix_ms: u64 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            .try_into()
+            .unwrap();
+        let backend = Arc::new(RevocableLease::default());
+        let backend_trait: Arc<dyn RemoteWriterLease> = backend.clone();
+        let guard = RemoteLeaseGuard::acquire(
+            backend_trait,
+            &RemoteLeaseAcquire {
+                key: RemoteLeaseKey {
+                    host: "github.com".to_owned(),
+                    owner: "owner".to_owned(),
+                    repository: "repo".to_owned(),
+                    installation_id: Some(42),
+                },
+                writer_owner: "host-a".to_owned(),
+                operation_id: "physical-test".to_owned(),
+                now_unix_ms,
+                ttl_ms: 60_000,
+                heartbeat_ms: 15_000,
+            },
+        )
+        .unwrap();
+        (backend, Arc::new(guard))
+    }
 
     #[test]
     fn identical_clock_values_still_produce_unique_worktree_paths() {
@@ -2250,6 +2363,47 @@ mod tests {
             merged_at: None,
             updated_at: None,
         }
+    }
+
+    #[test]
+    fn lost_operation_fence_after_prepare_stops_before_force_push() {
+        let fixture = fixture();
+        let candidate = open_candidate(
+            42,
+            "fenced candidate",
+            branch(&fixture.repository, "feature", &fixture.feature),
+            branch(&fixture.repository, "main", &fixture.old_main),
+        );
+        let target = branch(&fixture.repository, "main", &fixture.new_main);
+        let (backend, fence) = test_writer_fence();
+        let prepared = prepare_candidate(
+            &fixture.clone,
+            &fixture.repository,
+            &candidate,
+            range_base_for_remote_target(&candidate, &target),
+            PlannedBase::Remote(target.clone()),
+            &target,
+            RebaseExecutionBudget::new(TEST_REBASE_BUDGET).with_writer_fence(Some(fence)),
+        )
+        .expect("preparation uses only read and dry-run commands");
+        backend.revoke();
+
+        let error = apply_prepared(&prepared).unwrap_err();
+        assert_eq!(error.code(), "rebase_command_failed");
+        assert!(
+            error.details().unwrap()["source"]
+                .as_str()
+                .unwrap()
+                .contains("remote GitWrite fence refused")
+        );
+        let remote = git(
+            &fixture.clone,
+            &["ls-remote", "origin", "refs/heads/feature"],
+        );
+        assert_eq!(
+            remote.split_whitespace().next(),
+            Some(fixture.feature.0.as_str())
+        );
     }
 
     /// A stacked candidate whose first member landed as **one** squash commit
@@ -2930,7 +3084,7 @@ mod tests {
         );
         assert!(
             is_ancestor(
-                &process_runner(&fixture.clone, TEST_REBASE_BUDGET, None),
+                &process_runner(&fixture.clone, TEST_REBASE_BUDGET, None, None),
                 &parent_head,
                 &prepared.plan.new_head_oid
             )
@@ -3173,7 +3327,7 @@ mod tests {
         verify_prepared(&prepared_child).expect("child global preflight");
         let parent_receipt = apply_prepared_after_write_barrier(&prepared_parent).unwrap();
         let child_receipt = apply_prepared_after_write_barrier(&prepared_child).unwrap();
-        let runner = process_runner(&fixture.clone, TEST_REBASE_BUDGET, None);
+        let runner = process_runner(&fixture.clone, TEST_REBASE_BUDGET, None, None);
         assert!(
             is_ancestor(
                 &runner,

@@ -222,6 +222,7 @@ fn execute_live(
         repository_path: &context.repository_path,
         timeout,
         enabled: context.config.rebase_on_join,
+        writer_fence: lock.remote_fence(),
     };
     let mut output = match execute(
         status,
@@ -369,6 +370,7 @@ struct RewriteContext<'a> {
     repository_path: &'a std::path::Path,
     timeout: std::time::Duration,
     enabled: bool,
+    writer_fence: Option<std::sync::Arc<crate::remote_lease::RemoteLeaseGuard>>,
 }
 
 #[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
@@ -566,6 +568,7 @@ fn unwind_descendants(
             target,
             default,
             crate::physical_rebase::RebaseExecutionBudget::new(rewrite.timeout)
+                .with_writer_fence(rewrite.writer_fence.clone())
                 .replaying_after(boundary.oid.clone())
                 .because(crate::physical_rebase::BranchRewriteReason::ParentEvicted {
                     parent_pr: evicted,

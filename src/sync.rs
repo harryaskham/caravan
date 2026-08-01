@@ -1485,6 +1485,7 @@ fn prepare_physical_chains(
     all: bool,
     provider: &impl SyncProvider,
     operation_deadline: Instant,
+    writer_guard: &WriterOperationGuard,
 ) -> Result<(Vec<PreparedChain>, SyncProgress, PhysicalApplyAdmission), AppError> {
     let selected = selected_unpaused_caravans(status, all)?;
     let progress = SyncProgress::new(
@@ -1596,6 +1597,7 @@ fn prepare_physical_chains(
                 &status.analysis.fleet.default_branch,
                 crate::physical_rebase::RebaseExecutionBudget::new(timeout)
                     .with_deadline(precommit_deadline)
+                    .with_writer_fence(writer_guard.remote_fence())
                     .because(if index == 0 {
                         crate::physical_rebase::BranchRewriteReason::CurrentDefaultAdvanced
                     } else {
@@ -2443,8 +2445,14 @@ fn sync_with_lock(
             }),
             false,
         )?;
-        let (prepared, progress_state, admission) =
-            prepare_physical_chains(context, &status, input.all, &provider, operation_deadline)?;
+        let (prepared, progress_state, admission) = prepare_physical_chains(
+            context,
+            &status,
+            input.all,
+            &provider,
+            operation_deadline,
+            &lock,
+        )?;
         progress::emit(
             "physical_rebase_planning",
             format!(

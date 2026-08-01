@@ -31,6 +31,16 @@ pub enum WriterCommandRunner {
     Remote(FencedCommandRunner<ProcessRunner, Arc<RemoteLeaseGuard>>),
 }
 
+impl WriterCommandRunner {
+    #[must_use]
+    pub fn with_remote_fence(runner: ProcessRunner, remote: Option<Arc<RemoteLeaseGuard>>) -> Self {
+        match remote {
+            Some(remote) => Self::Remote(FencedCommandRunner::new(runner, remote)),
+            None => Self::Local(runner),
+        }
+    }
+}
+
 impl CommandRunner for WriterCommandRunner {
     fn run(
         &self,
@@ -100,15 +110,15 @@ impl WriterOperationGuard {
         self.remote.as_deref().map(RemoteLeaseGuard::grant)
     }
 
+    #[must_use]
+    pub fn remote_fence(&self) -> Option<Arc<RemoteLeaseGuard>> {
+        self.remote.clone()
+    }
+
     /// Apply this operation's exact remote fence to a fully configured runner.
     #[must_use]
     pub fn runner(&self, runner: ProcessRunner) -> WriterCommandRunner {
-        match &self.remote {
-            Some(remote) => {
-                WriterCommandRunner::Remote(FencedCommandRunner::new(runner, Arc::clone(remote)))
-            }
-            None => WriterCommandRunner::Local(runner),
-        }
+        WriterCommandRunner::with_remote_fence(runner, self.remote.clone())
     }
 
     /// Release local ownership before dropping exact remote ownership.
@@ -374,6 +384,29 @@ mod tests {
         assert_eq!(sync.matches("lock.runner(").count(), 1);
         assert!(sync.contains("writer_guard: &WriterOperationGuard"));
         assert!(sync.contains("github_budget,\n                writer_guard,"));
+    }
+
+    #[test]
+    fn physical_rebase_budgets_retain_the_operation_fence_through_push() {
+        for (name, source) in [
+            ("membership", include_str!("membership.rs")),
+            ("sync", include_str!("sync.rs")),
+            ("reshape", include_str!("reshape.rs")),
+        ] {
+            let production = source.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+            assert!(
+                production.contains("with_writer_fence("),
+                "{name} omitted the operation fence from physical planning"
+            );
+        }
+        let physical = include_str!("physical_rebase.rs")
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+        assert!(physical.contains("writer_fence: Option<Arc<RemoteLeaseGuard>>"));
+        assert!(physical.contains("prepared.worktree.writer_fence.as_ref()"));
+        assert!(physical.contains("CommandSpec::new(\"git\")"));
+        assert!(physical.contains(".git_write()"));
     }
 
     #[test]

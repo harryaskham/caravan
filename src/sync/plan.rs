@@ -47,7 +47,7 @@ pub(crate) fn rename_mutation_failure_for_plan(error: AppError) -> AppError {
 
 #[allow(clippy::too_many_lines)]
 fn plan_sync_inner(context: &AppContext, input: &SyncInput) -> Result<SyncPlanOutput, AppError> {
-    let _lock = context.acquire_writer_operation("plan-sync")?;
+    let lock = context.acquire_writer_operation("plan-sync")?;
     let started = Instant::now();
     let operation_deadline = started + sync_operation_budget(context);
     let github_budget =
@@ -76,7 +76,7 @@ fn plan_sync_inner(context: &AppContext, input: &SyncInput) -> Result<SyncPlanOu
         &context.config_path,
         &runner,
     )?;
-    let provider = GitHubMutationAdapter::new(runner);
+    let provider = GitHubMutationAdapter::new(lock.runner(runner));
     let selected = selected_unpaused_caravans(&status, input.all)?;
     let selected_ids = selected
         .iter()
@@ -86,8 +86,14 @@ fn plan_sync_inner(context: &AppContext, input: &SyncInput) -> Result<SyncPlanOu
         .config
         .rebase_on_join
     {
-        let (prepared, progress, admission) =
-            prepare_physical_chains(context, &status, input.all, &provider, operation_deadline)?;
+        let (prepared, progress, admission) = prepare_physical_chains(
+            context,
+            &status,
+            input.all,
+            &provider,
+            operation_deadline,
+            &lock,
+        )?;
         let plans = prepared
             .iter()
             .flat_map(|chain| chain.members.iter().map(|item| item.plan.clone()))

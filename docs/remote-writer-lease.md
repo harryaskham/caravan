@@ -128,10 +128,12 @@ deadlines, and telemetry; each marked write revalidates the shared fence while
 reads bypass it. Explicit release drops local ownership before remote.
 
 Production context still refuses `remote_fenced`. Membership and sync provider
-adapters now share their operation guard, including post-rewrite rediscovery and
-auto-admission handoff. Repair and all membership/sync/reshape internal physical
-worktree runners are not yet propagated. The remaining slices must route those
-Git writers through `guard.runner(...)` before opening the mode.
+adapters share their operation guard, including post-rewrite rediscovery and
+auto-admission handoff. Their physical rebase budgets now retain the same guard
+through temporary worktree preparation, barrier verification, and the marked
+force-with-lease push; reshape eviction uses the same path. Lease loss after
+preparation stops before push and preserves the remote head. Repair runners and
+publication remain to be propagated before opening the mode.
 
 ## Guard lifecycle
 
