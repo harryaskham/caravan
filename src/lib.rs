@@ -11,6 +11,7 @@ pub mod ci;
 pub mod ci_gate;
 pub mod command;
 pub mod compatibility;
+pub mod concat;
 pub mod force;
 pub mod force_intent;
 pub mod generation;
