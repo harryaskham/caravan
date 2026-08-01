@@ -132,11 +132,41 @@ objects but is neither GitHub App attribution nor a cryptographic signature.
 ## Local and hosted writers
 
 Local and future hosted execution may coexist in the product, but exactly one
-is the configured writer for a repository. The strict, not-yet-active broker
-and guard contract is in [`remote-writer-lease.md`](remote-writer-lease.md). The other may read and plan. The
-current operation lock is machine-local and cannot fence two hosts. Automatic
-failover is therefore unavailable until both writers use a remote
-compare-and-swap lease with repository identity, owner, operation ID, expiry,
-heartbeat, and monotonically fenced token, rechecked before every provider or
-branch write. Lease-service failure must fail closed; takeover must be explicit
-and audited.
+is the configured writer for a repository. The broker and guard contract is in
+[`remote-writer-lease.md`](remote-writer-lease.md), and `writer.mode:
+remote_fenced` activates it. The other may read and plan. The machine-local
+operation lock alone cannot fence two hosts, so cross-host safety requires that
+remote compare-and-swap lease with repository identity, owner, operation ID,
+expiry, heartbeat, and monotonically fenced token, rechecked before every
+provider or branch write. Lease-service failure fails closed; takeover is
+explicit and audited. Automatic failover remains unavailable by design.
+
+## Hosted worker mode (`cara web --hosted`)
+
+`cara web --hosted` runs the existing dashboard/webhook receiver under a strict
+deployment contract over **pre-provisioned** repository checkouts. It adds no
+second receiver: HMAC verification, delivery dedup, per-repository serialized
+action queues, fallback polling, authoritative provider reread, operation
+budgets, and remote lease fencing are the same code paths local mode uses.
+
+Startup refuses unless all of the following hold:
+
+- every `--repo` is an existing Git worktree the operator already provisioned;
+- a signed webhook secret env and the exact `--github-installation-id` are set;
+- `--webhook-sync` is on and `--read-only` is off;
+- each repository sets `github_auth.mode: app_installation` pinned to that same
+  installation, `writer.mode: remote_fenced`, and exact `repository: owner/name`.
+
+Mixed installations, ambient auth, `local_only`, a missing slug, or a missing
+remote-lease broker/host/writer identity all fail closed before serving. The
+listener stays loopback-only; expose it through an operator-owned TLS reverse
+proxy or tunnel, and supply the webhook secret from a secret manager as an
+environment variable name, never a literal.
+
+Dashboard state reports `hosted` plus each repository's non-secret auth/writer
+policy, so a misconfigured member is visible rather than silently ambient.
+
+Explicitly **not** included: automatic installation onboarding, tenancy
+management, clone/checkout provisioning or garbage collection, and automatic
+failover. Exactly one worker may be the configured writer per repository; a
+second host may read and plan. Those remain separate, later work.

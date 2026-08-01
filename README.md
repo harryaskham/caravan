@@ -281,7 +281,17 @@ cara web --repo . --listen 127.0.0.1:4774 --open
 CARA_GITHUB_WEBHOOK_SECRET=... cara web --repo . \
   --github-webhook-secret-env CARA_GITHUB_WEBHOOK_SECRET \
   --github-installation-id 12345 --webhook-sync
+CARA_GITHUB_WEBHOOK_SECRET=... cara web --repo /srv/a --repo /srv/b \
+  --github-webhook-secret-env CARA_GITHUB_WEBHOOK_SECRET \
+  --github-installation-id 12345 --webhook-sync --hosted
 ```
+
+`--hosted` is the optional deployment contract for pre-provisioned checkouts: it
+requires signed webhooks, one exact installation, `--webhook-sync`, and per-repo
+`app_installation` auth plus `remote_fenced` writer with an exact slug. Ambient
+auth, `local_only`, mixed installations, or `--read-only` fail closed at startup.
+It provisions no clones and performs no failover; see
+[`docs/github-app.md`](docs/github-app.md). Default `cara web` is unchanged.
 
 Repository inputs are explicit filesystem paths rather than slugs because every
 read and mutation remains bound to that exact worktree, config, operation lock,

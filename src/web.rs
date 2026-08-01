@@ -61,6 +61,7 @@ type WebhookHmac = Hmac<Sha256>;
 
 /// Start a local dashboard over one or more explicit repository paths.
 #[derive(Debug, Clone, Args)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct WebInput {
     /// Repository/worktree path to manage. Repeat for a multi-repository view.
     #[arg(long = "repo", value_name = "PATH", required = true)]
@@ -93,6 +94,10 @@ pub struct WebInput {
     /// Run one bounded sync-all tick for accepted webhook wakes; otherwise refresh only.
     #[arg(long, requires = "github_webhook_secret_env")]
     pub webhook_sync: bool,
+
+    /// Hosted worker contract over explicit pre-provisioned repositories.
+    #[arg(long, requires = "github_webhook_secret_env")]
+    pub hosted: bool,
 }
 
 /// Secret-free error projection retained beside the most recent snapshot.
@@ -263,6 +268,7 @@ pub struct WebState {
     pub listen: String,
     pub poll_seconds: u64,
     pub read_only: bool,
+    pub hosted: bool,
     pub webhook: WebhookStatus,
     /// Same-origin token required as `X-Cara-CSRF` on POST requests.
     pub csrf_token: String,
@@ -360,6 +366,7 @@ struct Dashboard {
     listen: SocketAddr,
     poll_seconds: u64,
     read_only: bool,
+    hosted: bool,
     csrf_token: String,
     started_unix_ms: u64,
     repositories: Vec<Arc<RepositoryEntry>>,
@@ -388,6 +395,7 @@ impl Dashboard {
             listen: self.listen.to_string(),
             poll_seconds: self.poll_seconds,
             read_only: self.read_only,
+            hosted: self.hosted,
             webhook: self
                 .webhook_status
                 .lock()
@@ -436,13 +444,16 @@ pub fn serve(input: &WebInput) -> Result<(), AppError> {
     } else {
         input.poll_seconds
     };
+    let repositories = load_repositories(&input.repositories)?;
+    validate_hosted_repositories(input, &repositories)?;
     let dashboard = Arc::new(Dashboard {
         listen: input.listen,
         poll_seconds,
         read_only: input.read_only,
+        hosted: input.hosted,
         csrf_token: uuid::Uuid::now_v7().to_string(),
         started_unix_ms: unix_ms(),
-        repositories: load_repositories(&input.repositories)?,
+        repositories,
         webhook_secret,
         webhook_installation_id: input.github_installation_id,
         webhook_sync: input.webhook_sync,
@@ -610,6 +621,76 @@ fn is_loopback(address: IpAddr) -> bool {
         IpAddr::V4(address) => address.is_loopback(),
         IpAddr::V6(address) => address.is_loopback(),
     }
+}
+
+/// Enforce the hosted worker contract over already-loaded repositories.
+/// Ordinary local `cara web` keeps `ambient`/`local_only` behavior untouched.
+fn validate_hosted_repositories(
+    input: &WebInput,
+    repositories: &[Arc<RepositoryEntry>],
+) -> Result<(), AppError> {
+    if !input.hosted {
+        return Ok(());
+    }
+    if !input.webhook_sync {
+        return Err(AppError::validation(
+            "web_hosted_requires_webhook_sync",
+            "--hosted requires --webhook-sync so accepted deliveries perform bounded work",
+        ));
+    }
+    if input.read_only {
+        return Err(AppError::validation(
+            "web_hosted_read_only_conflict",
+            "--hosted cannot be combined with --read-only",
+        ));
+    }
+    let Some(expected_installation) = input.github_installation_id else {
+        return Err(AppError::validation(
+            "web_hosted_installation_required",
+            "--hosted requires the exact --github-installation-id it serves",
+        ));
+    };
+    for repository in repositories {
+        let config = &repository.context.config;
+        let path = &repository.context.repository_path;
+        if config.github_auth.mode != crate::config::GithubAuthMode::AppInstallation {
+            return Err(AppError::structured(
+                ErrorCategory::Validation,
+                "web_hosted_repository_auth_not_app",
+                "--hosted requires github_auth.mode: app_installation for every served repository",
+                Some(json!({"path": path, "github_auth_mode": "ambient"})),
+            ));
+        }
+        if config.github_auth.installation_id != Some(expected_installation) {
+            return Err(AppError::structured(
+                ErrorCategory::Validation,
+                "web_hosted_installation_mismatch",
+                "every hosted repository must pin the exact installation this worker serves",
+                Some(json!({
+                    "path": path,
+                    "expected_installation_id": expected_installation,
+                    "repository_installation_id": config.github_auth.installation_id,
+                })),
+            ));
+        }
+        if config.writer.mode != crate::config::WriterMode::RemoteFenced {
+            return Err(AppError::structured(
+                ErrorCategory::Validation,
+                "web_hosted_writer_not_fenced",
+                "--hosted requires writer.mode: remote_fenced for every served repository",
+                Some(json!({"path": path})),
+            ));
+        }
+        if config.repository.is_none() {
+            return Err(AppError::structured(
+                ErrorCategory::Validation,
+                "web_hosted_repository_slug_required",
+                "--hosted requires exact repository: owner/name for every served repository",
+                Some(json!({"path": path})),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn load_repositories(paths: &[PathBuf]) -> Result<Vec<Arc<RepositoryEntry>>, AppError> {
@@ -2068,6 +2149,7 @@ mod tests {
             github_webhook_secret_env: None,
             github_installation_id: None,
             webhook_sync: false,
+            hosted: false,
         };
         assert_eq!(
             validate_input(&input).unwrap_err().code(),
@@ -2092,6 +2174,7 @@ mod tests {
             github_webhook_secret_env: Some("CARA_TEST_SECRET".to_owned()),
             github_installation_id: None,
             webhook_sync: false,
+            hosted: false,
         };
         assert_eq!(
             validate_input(&input).unwrap_err().code(),
@@ -2189,6 +2272,182 @@ mod tests {
                 .err()
                 .expect("duplicate path fails");
         assert_eq!(error.code(), "web_repository_duplicate");
+    }
+
+    fn hosted_entry(config: CaravanConfig) -> Arc<RepositoryEntry> {
+        let path = PathBuf::from("/tmp/hosted-repo");
+        Arc::new(RepositoryEntry {
+            id: "repo-1".to_owned(),
+            context: AppContext {
+                repository_path: path.clone(),
+                config_path: path.join(DEFAULT_CONFIG_PATH),
+                config_existed: true,
+                config,
+            },
+            snapshot: Mutex::new(WebRepositorySnapshot {
+                id: "repo-1".to_owned(),
+                path: path.display().to_string(),
+                config_path: path.join(DEFAULT_CONFIG_PATH).display().to_string(),
+                config_existed: true,
+                effective_config: serde_json::Value::Null,
+                refreshed_unix_ms: 0,
+                refresh_sequence: 0,
+                refreshing: false,
+                status: None,
+                error: None,
+                candidate_compatibility: Vec::new(),
+                candidate_compatibility_truncated: 0,
+                last_action: None,
+                journal: None,
+                actions: Vec::new(),
+            }),
+            refresh_lock: Mutex::new(()),
+            action_lock: Mutex::new(()),
+            actions: Mutex::new(VecDeque::new()),
+            webhook_deliveries: Mutex::new(VecDeque::new()),
+            webhook_delivery_path: path.join("deliveries.json"),
+            webhook_sync_pending: AtomicBool::new(false),
+        })
+    }
+
+    fn hosted_config(
+        mode: crate::config::GithubAuthMode,
+        installation_id: Option<u64>,
+        writer: crate::config::WriterMode,
+        repository: Option<&str>,
+    ) -> CaravanConfig {
+        let mut config = CaravanConfig::default();
+        config.github_auth.mode = mode;
+        config.github_auth.installation_id = installation_id;
+        if mode == crate::config::GithubAuthMode::AppInstallation {
+            config.github_auth.app_slug = Some("caravan-hosted".to_owned());
+        }
+        config.writer.mode = writer;
+        config.repository = repository.map(str::to_owned);
+        config
+    }
+
+    fn hosted_input(hosted: bool, installation_id: Option<u64>) -> WebInput {
+        WebInput {
+            repositories: vec![PathBuf::from(".")],
+            listen: "127.0.0.1:4774".parse().unwrap(),
+            poll_seconds: 15,
+            read_only: false,
+            open: false,
+            github_webhook_secret_env: Some("CARA_TEST_SECRET".to_owned()),
+            github_installation_id: installation_id,
+            webhook_sync: true,
+            hosted,
+        }
+    }
+
+    #[test]
+    fn hosted_mode_requires_app_identity_fenced_writer_and_one_installation() {
+        let compliant = || {
+            hosted_config(
+                crate::config::GithubAuthMode::AppInstallation,
+                Some(42),
+                crate::config::WriterMode::RemoteFenced,
+                Some("owner/repo"),
+            )
+        };
+        validate_hosted_repositories(
+            &hosted_input(true, Some(42)),
+            &[hosted_entry(compliant()), hosted_entry(compliant())],
+        )
+        .expect("two repositories on one installation are accepted");
+
+        for (config, expected) in [
+            (
+                hosted_config(
+                    crate::config::GithubAuthMode::Ambient,
+                    None,
+                    crate::config::WriterMode::RemoteFenced,
+                    Some("owner/repo"),
+                ),
+                "web_hosted_repository_auth_not_app",
+            ),
+            (
+                hosted_config(
+                    crate::config::GithubAuthMode::AppInstallation,
+                    Some(43),
+                    crate::config::WriterMode::RemoteFenced,
+                    Some("owner/repo"),
+                ),
+                "web_hosted_installation_mismatch",
+            ),
+            (
+                hosted_config(
+                    crate::config::GithubAuthMode::AppInstallation,
+                    Some(42),
+                    crate::config::WriterMode::LocalOnly,
+                    Some("owner/repo"),
+                ),
+                "web_hosted_writer_not_fenced",
+            ),
+            (
+                hosted_config(
+                    crate::config::GithubAuthMode::AppInstallation,
+                    Some(42),
+                    crate::config::WriterMode::RemoteFenced,
+                    None,
+                ),
+                "web_hosted_repository_slug_required",
+            ),
+        ] {
+            let error = validate_hosted_repositories(
+                &hosted_input(true, Some(42)),
+                &[hosted_entry(compliant()), hosted_entry(config)],
+            )
+            .expect_err("non-compliant hosted repository is refused");
+            assert_eq!(error.code(), expected);
+        }
+
+        let mut without_sync = hosted_input(true, Some(42));
+        without_sync.webhook_sync = false;
+        assert_eq!(
+            validate_hosted_repositories(&without_sync, &[hosted_entry(compliant())])
+                .unwrap_err()
+                .code(),
+            "web_hosted_requires_webhook_sync"
+        );
+
+        let mut read_only = hosted_input(true, Some(42));
+        read_only.read_only = true;
+        assert_eq!(
+            validate_hosted_repositories(&read_only, &[hosted_entry(compliant())])
+                .unwrap_err()
+                .code(),
+            "web_hosted_read_only_conflict"
+        );
+
+        assert_eq!(
+            validate_hosted_repositories(&hosted_input(true, None), &[hosted_entry(compliant())])
+                .unwrap_err()
+                .code(),
+            "web_hosted_installation_required"
+        );
+
+        let policy = redacted_config(&compliant()).unwrap();
+        assert_eq!(policy["github_auth"]["mode"], "app_installation");
+        assert_eq!(policy["github_auth"]["installation_id"], 42);
+        assert_eq!(policy["writer"]["mode"], "remote_fenced");
+        assert_eq!(policy["repository"], "owner/repo");
+    }
+
+    #[test]
+    fn local_dashboard_mode_accepts_ambient_local_only_repositories() {
+        let ambient = hosted_config(
+            crate::config::GithubAuthMode::Ambient,
+            None,
+            crate::config::WriterMode::LocalOnly,
+            None,
+        );
+        let mut local = hosted_input(false, None);
+        local.webhook_sync = false;
+        local.github_webhook_secret_env = None;
+        validate_hosted_repositories(&local, &[hosted_entry(ambient)])
+            .expect("default local dashboard keeps ambient/local_only behavior");
     }
 
     fn authority_status(head_oid: &str) -> StatusOutput {
