@@ -97,6 +97,7 @@ pub fn checkout_decision_snapshot(
             context.config.command_timeout_secs,
         ))
         .with_operation_deadline(operation_deadline);
+    let runner = lock.runner(runner);
     ensure_safe_worktree(&context.repository_path, &context.config_path, &runner)?; // The decision already embeds the exact provider snapshot. checkout_exact
     // verifies the remote branch still advertises that OID, avoiding a third
     // full repository discovery during an already-bounded sync decision.
@@ -122,6 +123,7 @@ pub fn navigate(
     let runner = ProcessRunner::in_directory(&context.repository_path).with_timeout(
         std::time::Duration::from_secs(context.config.command_timeout_secs),
     );
+    let runner = lock.runner(runner);
     ensure_safe_worktree(&context.repository_path, &context.config_path, &runner)?;
     let status = read::status(context)?;
     let (from_pr, to_pr) = select_destination(&status, scope, direction)?;

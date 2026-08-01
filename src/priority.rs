@@ -210,10 +210,9 @@ fn execute_live(
     let lock = context.acquire_writer_operation("priority_control")?;
     let status = crate::read::status_for_remote_candidate(context, PrNumber(pr))?;
     ensure_config_unchanged(context)?;
-    let provider = GitHubMutationAdapter::new(
-        ProcessRunner::in_directory(&context.repository_path)
-            .with_timeout(Duration::from_secs(context.config.command_timeout_secs)),
-    );
+    let runner = ProcessRunner::in_directory(&context.repository_path)
+        .with_timeout(Duration::from_secs(context.config.command_timeout_secs));
+    let provider = GitHubMutationAdapter::new(lock.runner(runner));
     let output = execute(
         &status,
         &provider,

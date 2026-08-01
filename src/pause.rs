@@ -129,7 +129,7 @@ pub fn pause(context: &AppContext, input: &PauseInput) -> Result<PauseOutput, Ap
     if let Some(reference) = &input.external_reference {
         validate_text("external reference", reference)?;
     }
-    let _lock = context.acquire_writer_operation("pause")?;
+    let lock = context.acquire_writer_operation("pause")?;
     let status = read::status(context)?;
     crate::initialization::require_ready(&status.initialization)?;
     let head = PrNumber(input.head_pr);
@@ -174,11 +174,10 @@ pub fn pause(context: &AppContext, input: &PauseInput) -> Result<PauseOutput, Ap
         resume_authorized_by: None,
     };
     validate_record_size(&record)?;
-    let provider = GitHubMutationAdapter::new(
-        ProcessRunner::in_directory(&context.repository_path).with_timeout(
-            std::time::Duration::from_secs(context.config.command_timeout_secs),
-        ),
+    let runner = ProcessRunner::in_directory(&context.repository_path).with_timeout(
+        std::time::Duration::from_secs(context.config.command_timeout_secs),
     );
+    let provider = GitHubMutationAdapter::new(lock.runner(runner));
     let mut receipts = Vec::new();
     let mut steps = Vec::new();
     if current.auto_merge.enabled {
@@ -214,7 +213,7 @@ pub fn pause(context: &AppContext, input: &PauseInput) -> Result<PauseOutput, Ap
 
 pub fn resume(context: &AppContext, input: &ResumeInput) -> Result<PauseOutput, AppError> {
     validate_text("actor", &input.actor)?;
-    let _lock = context.acquire_writer_operation("resume")?;
+    let lock = context.acquire_writer_operation("resume")?;
     let head = PrNumber(input.head_pr);
     let Some(record) = load_one(&context.repository_path, head)? else {
         return Err(AppError::validation(
@@ -264,11 +263,10 @@ pub fn resume(context: &AppContext, input: &ResumeInput) -> Result<PauseOutput, 
             &input.actor,
         )?;
     }
-    let provider = GitHubMutationAdapter::new(
-        ProcessRunner::in_directory(&context.repository_path).with_timeout(
-            std::time::Duration::from_secs(context.config.command_timeout_secs),
-        ),
+    let runner = ProcessRunner::in_directory(&context.repository_path).with_timeout(
+        std::time::Duration::from_secs(context.config.command_timeout_secs),
     );
+    let provider = GitHubMutationAdapter::new(lock.runner(runner));
     let mut receipts = Vec::new();
     let mut steps = Vec::new();
     if status.head_merge.actor.caravan() {

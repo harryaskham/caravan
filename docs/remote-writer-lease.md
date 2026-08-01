@@ -104,9 +104,10 @@ credentials, and telemetry unchanged.
 
 The GitHub adapter, native Stack/async-merge adapters, physical force-with-lease
 push, and reviewed repair push are marked. Source/constructor contract tests
-keep their write surfaces explicit. This seam is enforceable when wrapped, but
-production operations do not yet construct the wrapper, so non-local writer
-modes remain startup-closed.
+keep their write surfaces explicit. Force/force-intent, pause/resume, priority,
+reshape provider controls, and navigation now construct their provider/local
+runners through the operation guard; reads bypass and marked writes revalidate
+when a remote guard is eventually active.
 
 ## Operation authority boundary
 
@@ -126,10 +127,10 @@ wrap multiple fully configured `ProcessRunner`s, preserving their auth, budgets,
 deadlines, and telemetry; each marked write revalidates the shared fence while
 reads bypass it. Explicit release drops local ownership before remote.
 
-Production context still refuses `remote_fenced`, and operation code does not
-yet request guard-wrapped runners. The activation slice must propagate
-`guard.runner(...)` through all provider and internal physical-worktree writers
-before opening the mode.
+Production context still refuses `remote_fenced`. Membership/sync, repair, and
+reshape's internal physical-worktree runners are not yet propagated. The
+activation slices must route those remaining provider and Git writers through
+`guard.runner(...)` before opening the mode.
 
 ## Guard lifecycle
 

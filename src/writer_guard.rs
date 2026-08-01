@@ -334,6 +334,30 @@ mod tests {
     }
 
     #[test]
+    fn provider_control_domains_build_one_guarded_runner_per_mutation_boundary() {
+        for (name, source, expected) in [
+            ("force", include_str!("force.rs"), 1),
+            ("force_intent", include_str!("force_intent.rs"), 1),
+            ("pause_resume", include_str!("pause.rs"), 2),
+            ("priority", include_str!("priority.rs"), 1),
+            ("reshape", include_str!("reshape.rs"), 1),
+            ("navigation", include_str!("navigation.rs"), 2),
+        ] {
+            let production = source.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+            assert_eq!(
+                production.matches("acquire_writer_operation(").count(),
+                expected,
+                "{name} operation boundary changed"
+            );
+            assert_eq!(
+                production.matches("lock.runner(").count(),
+                expected,
+                "{name} has an unfenced operation runner"
+            );
+        }
+    }
+
+    #[test]
     fn production_modules_do_not_acquire_operation_lock_directly() {
         for (name, source) in [
             ("force", include_str!("force.rs")),

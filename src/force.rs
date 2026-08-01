@@ -229,7 +229,7 @@ fn execute_live(
     operation: ForceIntentOperation,
 ) -> Result<ForceIntentOutput, AppError> {
     validate_input(input)?;
-    let _lock = context.acquire_writer_operation(operation.name())?;
+    let lock = context.acquire_writer_operation(operation.name())?;
     let timeout = Duration::from_secs(context.config.command_timeout_secs);
     let deadline =
         std::time::Instant::now() + Duration::from_secs(context.config.sync.max_duration_secs);
@@ -239,11 +239,10 @@ fn execute_live(
         deadline,
         None,
     )?;
-    let provider = GitHubMutationAdapter::new(
-        crate::command::ProcessRunner::in_directory(&context.repository_path)
-            .with_timeout(timeout)
-            .with_operation_deadline(bound.exact_deadline),
-    );
+    let runner = crate::command::ProcessRunner::in_directory(&context.repository_path)
+        .with_timeout(timeout)
+        .with_operation_deadline(bound.exact_deadline);
+    let provider = GitHubMutationAdapter::new(lock.runner(runner));
     execute(&bound.status, &provider, context, input, operation)
 }
 

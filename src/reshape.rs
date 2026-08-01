@@ -207,16 +207,16 @@ fn execute_live(
     selected: Option<PrNumber>,
     reason: Option<String>,
 ) -> Result<ReshapeOutput, AppError> {
-    let _lock = context.acquire_writer_operation(operation.name())?;
+    let lock = context.acquire_writer_operation(operation.name())?;
     let timeout = std::time::Duration::from_secs(context.config.command_timeout_secs);
     let status = read::status(context)?;
     let repository = status.repository.clone();
     let failure_status = status.clone();
     let checker =
         GitCompatibilityChecker::new(&context.repository_path, "origin").with_timeout(timeout);
-    let provider = GitHubMutationAdapter::new(
-        crate::command::ProcessRunner::in_directory(&context.repository_path).with_timeout(timeout),
-    );
+    let runner =
+        crate::command::ProcessRunner::in_directory(&context.repository_path).with_timeout(timeout);
+    let provider = GitHubMutationAdapter::new(lock.runner(runner));
     let requested_reason = reason.clone();
     let rewrite = RewriteContext {
         repository_path: &context.repository_path,
