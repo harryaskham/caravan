@@ -1,0 +1,6 @@
+Disposable v0.0.79 telemetry canary for bd-71e444.
+
+Never merge. This branch exists only to prove one released Cara membership
+receipt binds GitHub App API identity to its exact HTTPS credential-helper Git
+transport and force-with-lease provider actor. Cleanup closes the PR and deletes
+the branch.
