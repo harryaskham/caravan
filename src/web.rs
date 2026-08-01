@@ -289,6 +289,8 @@ pub struct WebActionRequest {
 pub enum WebAction {
     Check(CheckInput),
     PlanSync(SyncInput),
+    PlanConcat(crate::concat::ConcatInput),
+    Concat(crate::concat::ConcatExecuteInput),
     Sync(SyncInput),
     Join(JoinInput),
     Rejoin(JoinInput),
@@ -315,6 +317,8 @@ impl WebAction {
         match self {
             Self::Check(_) => "check",
             Self::PlanSync(_) => "plan_sync",
+            Self::PlanConcat(_) => "plan_concat",
+            Self::Concat(_) => "concat",
             Self::Sync(_) => "sync",
             Self::Join(_) => "join",
             Self::Rejoin(_) => "rejoin",
@@ -340,7 +344,7 @@ impl WebAction {
     fn mutates(&self) -> bool {
         !matches!(
             self,
-            Self::Check(_) | Self::PlanSync(_) | Self::RepairStatus(_)
+            Self::Check(_) | Self::PlanSync(_) | Self::PlanConcat(_) | Self::RepairStatus(_)
         )
     }
 }
@@ -2107,6 +2111,8 @@ fn run_action(context: &AppContext, action: WebAction) -> Result<serde_json::Val
     match action {
         WebAction::Check(input) => serialize_action(crate::read::check(context, &input)),
         WebAction::PlanSync(input) => serialize_action(crate::sync::plan_sync(context, &input)),
+        WebAction::PlanConcat(input) => serialize_action(crate::concat::plan(context, &input)),
+        WebAction::Concat(input) => serialize_action(crate::concat::execute(context, &input)),
         WebAction::Sync(input) => serialize_action(crate::sync::sync(context, &input)),
         WebAction::Join(input) => serialize_action(crate::membership::join(context, &input)),
         WebAction::Rejoin(input) => serialize_action(crate::membership::rejoin(context, &input)),
@@ -3301,6 +3307,11 @@ mod tests {
         assert!(!APP_JS.contains("import("));
         assert!(APP_JS.contains("https://github.com/"));
         assert!(INDEX_HTML.contains("id=\"plan-sync\""));
+        assert!(INDEX_HTML.contains("id=\"plan-concat\""));
+        assert!(INDEX_HTML.contains("id=\"execute-concat\""));
+        assert!(APP_JS.contains("plan_concat"));
+        assert!(APP_JS.contains("expected_plan_hash"));
+        assert!(!APP_JS.contains("evict+rejoin"));
         assert!(INDEX_HTML.contains("id=\"show-config\""));
         assert!(INDEX_HTML.contains("id=\"show-evidence\""));
         assert!(!INDEX_HTML.contains("Surveying the trail"));

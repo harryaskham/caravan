@@ -4,6 +4,7 @@
 //! topology receipt. It never sequences eviction and rejoin, never mutates the
 //! provider, and never guesses which root/tail the operator meant.
 
+use clap::Args;
 use mcp_cli::{ErrorCategory, StructuredError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -15,15 +16,19 @@ use crate::read::{self, StatusOutput};
 use crate::{AppContext, AppError};
 
 /// Operator-reviewed intent to append one entire live caravan after another.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Args)]
 pub struct ConcatInput {
     /// Exact head/root of the source caravan to append.
+    #[arg(long)]
     pub source_head_pr: u64,
     /// Exact current tail of the target caravan.
+    #[arg(long)]
     pub target_tail_pr: u64,
     /// Non-secret audited actor identity.
+    #[arg(long)]
     pub actor: String,
     /// Bounded operator rationale.
+    #[arg(long)]
     pub reason: String,
 }
 
@@ -259,10 +264,12 @@ pub(crate) fn plan_from_status(
 }
 
 /// Execution request bound to one reviewed no-write plan.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Args)]
 pub struct ConcatExecuteInput {
     #[serde(flatten)]
+    #[command(flatten)]
     pub intent: ConcatInput,
+    #[arg(long)]
     pub expected_plan_hash: String,
 }
 

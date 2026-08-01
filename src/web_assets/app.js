@@ -6,6 +6,14 @@
     dashboard: document.querySelector("#dashboard"),
     overview: document.querySelector("#repo-overview"),
     caravans: document.querySelector("#caravans"),
+    concatControl: document.querySelector("#concat-control"),
+    concatSource: document.querySelector("#concat-source"),
+    concatTarget: document.querySelector("#concat-target"),
+    concatActor: document.querySelector("#concat-actor"),
+    concatReason: document.querySelector("#concat-reason"),
+    planConcat: document.querySelector("#plan-concat"),
+    executeConcat: document.querySelector("#execute-concat"),
+    concatPlanHash: document.querySelector("#concat-plan-hash"),
     saloon: document.querySelector("#saloon"),
     saloonCount: document.querySelector("#saloon-count"),
     decisions: document.querySelector("#decisions"),
@@ -35,6 +43,7 @@
   let selectedRepo = null;
   let requestInFlight = false;
   let inspectorMode = null;
+  const concatPlans = new Map();
   const sidebarState = {
     repositories: window.localStorage.getItem("caravan.sidebar.repositories") !== "collapsed",
     attention: window.localStorage.getItem("caravan.sidebar.attention") !== "collapsed",
@@ -474,6 +483,30 @@
     if (mode === "config") renderConfig(repo); else renderEvidence(repo);
   }
 
+  function renderConcatControl(repo, actionBusy) {
+    const caravans = repo.status?.analysis?.fleet?.caravans ?? [];
+    ui.concatControl.hidden = caravans.length < 2;
+    if (caravans.length < 2) {
+      concatPlans.delete(repo.id);
+      return;
+    }
+    const sourceValue = ui.concatSource.value;
+    const targetValue = ui.concatTarget.value;
+    ui.concatSource.innerHTML = caravans.map((caravan) => `<option value="${caravan.id}">Caravan #${caravan.id} · ${caravan.members.length} member(s)</option>`).join("");
+    ui.concatTarget.innerHTML = caravans.map((caravan) => {
+      const tail = caravan.members.at(-1);
+      return `<option value="${tail}">Caravan #${caravan.id} tail #${tail}</option>`;
+    }).join("");
+    if ([...ui.concatSource.options].some((option) => option.value === sourceValue)) ui.concatSource.value = sourceValue;
+    if ([...ui.concatTarget.options].some((option) => option.value === targetValue)) ui.concatTarget.value = targetValue;
+    const reviewed = concatPlans.get(repo.id);
+    const currentPlan = reviewed && reviewed.refreshSequence === repo.refresh_sequence ? reviewed.plan : null;
+    if (!currentPlan && reviewed) concatPlans.delete(repo.id);
+    ui.concatPlanHash.textContent = currentPlan ? `Reviewed ${currentPlan.plan_hash}` : "No reviewed plan";
+    ui.planConcat.disabled = actionBusy;
+    ui.executeConcat.disabled = !currentPlan || actionBusy || state.read_only || state.hosted;
+  }
+
   function render() {
     if (!state?.repositories?.length) return;
     if (!selectedRepo || !state.repositories.some((repo) => repo.id === selectedRepo)) selectedRepo = state.repositories[0].id;
@@ -491,6 +524,7 @@
     renderTabs();
     renderOverview(repo);
     renderCaravans(repo);
+    renderConcatControl(repo, actionBusy);
     renderSaloon(repo);
     renderDecisions(repo);
     applySidebarState();
@@ -529,7 +563,7 @@
   async function performAction(action, input, button) {
     const repo = selected();
     if (!repo || (state.read_only && button?.dataset.mutates !== "false")) return;
-    const destructive = ["evict", "split", "pause", "repair_abort", "force_arm", "force_revoke", "priority_set", "priority_clear"].includes(action);
+    const destructive = ["concat", "evict", "split", "pause", "repair_abort", "force_arm", "force_revoke", "priority_set", "priority_clear"].includes(action);
     if (destructive && !window.confirm(`Run ${action.replaceAll("_", " ")} against ${repoName(repo)} using the current exact snapshot?`)) return;
     if (button) button.disabled = true;
     setBusy(true);
@@ -565,6 +599,12 @@
       if (!job) continue;
       openInspector("evidence");
       if (["succeeded", "failed"].includes(job.state)) {
+        if (job.state === "succeeded" && job.action === "plan_concat" && repo.last_action?.result?.plan_hash) {
+          concatPlans.set(repo.id, { plan: repo.last_action.result, refreshSequence: repo.refresh_sequence });
+          render();
+          openInspector("evidence");
+        }
+        if (job.state === "succeeded" && job.action === "concat") concatPlans.delete(repo.id);
         toast(job.state === "succeeded" ? `${job.action.replaceAll("_", " ")} completed` : job.error?.message || `${job.action} failed`);
         return;
       }
@@ -590,8 +630,29 @@
   }
 
   ui.refresh.addEventListener("click", refreshAll);
+  function concatIntent() {
+    return {
+      source_head_pr: Number(ui.concatSource.value),
+      target_tail_pr: Number(ui.concatTarget.value),
+      actor: ui.concatActor.value,
+      reason: ui.concatReason.value,
+    };
+  }
+
+  function invalidateConcatPlan() {
+    if (selectedRepo) concatPlans.delete(selectedRepo);
+    render();
+  }
+
   ui.plan.addEventListener("click", () => performAction("plan_sync", { all: true, rerun_failed: false }, ui.plan));
   ui.sync.addEventListener("click", () => performAction("sync", { all: true, rerun_failed: false }, ui.sync));
+  ui.planConcat.addEventListener("click", () => performAction("plan_concat", concatIntent(), ui.planConcat));
+  ui.executeConcat.addEventListener("click", () => {
+    const reviewed = concatPlans.get(selectedRepo);
+    if (!reviewed) return;
+    performAction("concat", { ...concatIntent(), expected_plan_hash: reviewed.plan.plan_hash }, ui.executeConcat);
+  });
+  [ui.concatSource, ui.concatTarget, ui.concatActor, ui.concatReason].forEach((control) => control.addEventListener("change", invalidateConcatPlan));
   ui.evidence.addEventListener("click", () => openInspector("evidence"));
   ui.config.addEventListener("click", () => openInspector("config"));
   ui.closeInspector.addEventListener("click", () => { inspectorMode = null; ui.inspector.hidden = true; });

@@ -41,6 +41,21 @@
             <div><p class="eyebrow">Active topology</p><h2 id="caravans-title">Active caravans</h2></div>
           </div>
           <div id="caravans" class="caravan-list"></div>
+          <section id="concat-control" class="concat-control" hidden aria-labelledby="concat-title">
+            <div><p class="eyebrow">Atomic recovery</p><h3 id="concat-title">Concatenate caravans</h3></div>
+            <p>Review one exact engine plan before atomically appending a complete source caravan. This never sequences evict and rejoin.</p>
+            <div class="concat-fields">
+              <label>Source head<select id="concat-source"></select></label>
+              <label>Target tail<select id="concat-target"></select></label>
+              <label>Actor<input id="concat-actor" value="cara-web" maxlength="256"></label>
+              <label>Reason<input id="concat-reason" value="Operator atomic caravan recovery" maxlength="512"></label>
+            </div>
+            <div class="inline-actions">
+              <button id="plan-concat" class="button" type="button" data-mutates="false">Review concat plan</button>
+              <button id="execute-concat" class="button button-primary" type="button" disabled>Execute reviewed plan</button>
+              <code id="concat-plan-hash">No reviewed plan</code>
+            </div>
+          </section>
         </section>
 
         <section class="section-block compact saloon-section" aria-labelledby="saloon-title">

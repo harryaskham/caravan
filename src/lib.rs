@@ -401,6 +401,11 @@ RESHAPING AND EXPLICIT INTENT
 - `cara evict --pr N --reason ...` removes a member and reconnects its child only
   after exact compatibility proof. `split` makes the selected PR a new head.
   `renew` and `rejoin` re-evaluate an evicted PR from fresh facts.
+- To recover two complete live caravans, run `cara plan concat` and review the
+  exact old/new ordering, rewrite/rollback scope and plan hash, then execute
+  `cara concat` with that hash. Concat atomically rewrites the complete source
+  chain and commits one membership edge; never approximate it with client-side
+  evict+rejoin sequencing. Exact retry returns the durable original receipt.
 - `cara force --pr N --actor A --reason R` is the supported way to arm durable
   PR-scoped `caravan-force` intent; raw label edits are not an operator contract.
   It requires `force_merge: true`, an open non-draft active member, a clean
@@ -1245,6 +1250,16 @@ pub fn build_router() -> ToolRouter<AppContext> {
         "plan_sync",
         "Build the exact current sync/auto-admission plan through physical conflict and lease dry-run preflight without any provider write. Returns ordered actions, exact preconditions, no-ops, decisions, first admission target, rediscovery barriers, and mutated=false.",
         |context: &AppContext, input: SyncInput| sync::plan_sync(context, &input),
+    );
+    router.add_typed_tool_with_output_schema(
+        "plan_concat",
+        "Build an exact no-write plan to append one complete live caravan after another, including source/target generations, old/new ordering, complete rewrite and rollback scope, and an immutable plan hash.",
+        |context: &AppContext, input: concat::ConcatInput| concat::plan(context, &input),
+    );
+    router.add_typed_tool_with_output_schema(
+        "concat",
+        "Execute one reviewed concat plan atomically: rewrite the complete source chain in one exact multi-ref transaction, commit one source-root membership edge, verify final ordering, and fully roll back on failure. Exact retry returns the durable original receipt.",
+        |context: &AppContext, input: concat::ConcatExecuteInput| concat::execute(context, &input),
     );
     router.add_typed_tool_with_output_schema(
         "repair_start",

@@ -28,6 +28,23 @@ fn cara_in(directory: &std::path::Path, arguments: &[&str]) -> Output {
 }
 
 #[test]
+fn concat_plan_and_execute_are_distinct_receipt_backed_commands() {
+    let plan = cara(&["plan", "concat", "--help"]);
+    assert!(plan.status.success());
+    let plan_help = String::from_utf8_lossy(&plan.stdout);
+    assert!(plan_help.contains("--source-head-pr"));
+    assert!(plan_help.contains("--target-tail-pr"));
+    assert!(!plan_help.contains("--expected-plan-hash"));
+
+    let execute = cara(&["concat", "--help"]);
+    assert!(execute.status.success());
+    let execute_help = String::from_utf8_lossy(&execute.stdout);
+    assert!(execute_help.contains("--source-head-pr"));
+    assert!(execute_help.contains("--target-tail-pr"));
+    assert!(execute_help.contains("--expected-plan-hash"));
+}
+
+#[test]
 fn json_domain_error_keeps_envelope_and_exits_nonzero() {
     let output = cara(&["--json", "evict", "--reason", ""]);
 

@@ -12,8 +12,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use caravan::{
     AGENT_HELP, AppContext, AppError, CheckInput, CreateInput, EvictInput, JoinInput,
     LockRecoverInput, LockStatusInput, LoopInput, PauseInput, ResumeInput, SplitInput, SyncInput,
-    TOOL_NAME, active_updater_config, build_router, feedback_config, feedback_configuration_error,
-    feedback_panic_config,
+    TOOL_NAME, active_updater_config, build_router,
+    concat::{ConcatExecuteInput, ConcatInput},
+    feedback_config, feedback_configuration_error, feedback_panic_config,
     repair::{
         RepairAbortInput, RepairAuthorizeAgentEditsInput, RepairContinueInput, RepairGrantInput,
         RepairRevokeGrantInput, RepairStartInput, RepairStatusInput,
@@ -118,6 +119,8 @@ enum Command {
     /// Preview exact domain operations without provider mutation.
     #[command(subcommand)]
     Plan(PlanCommand),
+    /// Atomically append one complete live caravan after another reviewed plan.
+    Concat(ConcatExecuteInput),
     /// Prepare, inspect, or continue a Cara-owned isolated repair workspace.
     #[command(subcommand)]
     Repair(RepairCommand),
@@ -248,6 +251,8 @@ impl ForceCommand {
 enum PlanCommand {
     /// Plan sync and first auto-admission through the no-write preflight barrier.
     Sync(SyncInput),
+    /// Review exact source/target topology and rewrite scope without mutation.
+    Concat(ConcatInput),
 }
 
 #[derive(Debug, Subcommand)]
@@ -402,6 +407,7 @@ fn run(cli: &Cli) -> Result<(), i32> {
         Command::Resume(input) => run_resume(cli, input),
         Command::Sync(input) => run_sync(cli, input),
         Command::Plan(command) => run_plan(cli, command),
+        Command::Concat(input) => run_concat(cli, input),
         Command::Repair(command) => run_repair(cli, command),
         Command::Evict(input) => run_evict(cli, input),
         Command::Split(input) => run_split(cli, input),
@@ -1159,6 +1165,55 @@ fn run_plan(cli: &Cli, command: &PlanCommand) -> Result<(), i32> {
                 Err(error) => emit_human_error(error),
             }
         }
+        PlanCommand::Concat(input) => {
+            let result = caravan::concat::plan(&context, input);
+            if cli.json {
+                return emit_result(true, result);
+            }
+            match result {
+                Ok(plan) => {
+                    println!(
+                        "concat plan {}: {:?} + {:?} -> {:?}; rewrites={}",
+                        plan.plan_hash,
+                        plan.target_members,
+                        plan.source_members,
+                        plan.new_ordering,
+                        plan.members.len()
+                    );
+                    println!(
+                        "execute: cara concat --source-head-pr {} --target-tail-pr {} --actor {} --reason {:?} --expected-plan-hash {}",
+                        plan.source_caravan,
+                        input.target_tail_pr,
+                        plan.actor,
+                        plan.reason,
+                        plan.plan_hash
+                    );
+                    Ok(())
+                }
+                Err(error) => emit_human_error(error),
+            }
+        }
+    }
+}
+
+fn run_concat(cli: &Cli, input: &ConcatExecuteInput) -> Result<(), i32> {
+    let context = load_context(cli)?;
+    let result = caravan::concat::execute(&context, input);
+    if cli.json {
+        return emit_result(true, result);
+    }
+    match result {
+        Ok(output) => {
+            println!(
+                "concatenated {:?}; plan={} idempotent={} changed={}",
+                output.resulting_ordering,
+                output.plan.plan_hash,
+                output.idempotent,
+                output.receipt.changed
+            );
+            Ok(())
+        }
+        Err(error) => emit_human_error(error),
     }
 }
 

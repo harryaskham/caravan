@@ -416,6 +416,22 @@ members already released and the one that failed, so an interrupted cascade is
 resumable rather than a silently half-dissolved chain. `--cascade` and `--all`
 are mutually exclusive.
 
+`cara plan concat --source-head-pr S --target-tail-pr T --actor A --reason R`
+produces the immutable no-write recovery plan for appending one entire live
+source caravan after a target tail. It binds exact repository, source/target
+caravans, old/new ordering, every source branch/head/base and predecessor,
+complete rewrite and rollback scope, actor/reason, and a stable plan hash.
+`cara concat ... --expected-plan-hash H` rechecks that plan under one writer
+operation, prepares the whole source chain, atomically moves every source ref
+under exact force-with-lease, authoritatively rediscovers each rewritten head,
+and commits one source-root base edit that merges the fleets. It never sequences
+evict and rejoin. Failure before membership atomically restores source heads;
+final verification failure restores the exact membership after-state and then
+all original heads. Ambiguous compensation never claims success. The successful
+event stores plan, physical, membership, operation and ordering receipts, so an
+exact retry returns the original evidence without a provider call. Cycles,
+forks, holds, conflicts, missing topology and stale plan hashes fail closed.
+
 Eviction also unwinds the evicted member out of its descendants (bd-cef612).
 Physical joins rebased each member onto its predecessor, so retargeting alone
 leaves the evicted patch inside every descendant, which would silently
