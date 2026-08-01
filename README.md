@@ -514,6 +514,30 @@ aligned and create the tag:
 ```
 
 An explicit version such as `./scripts/release.sh 0.2.0` is also accepted.
+
+That one-shot path commits, tags, and pushes together. Caravan's reviewed flow
+instead lands the `release: vX.Y.Z` bump through the ordinary agent and
+reintegration lifecycle, so by tagging time the bump is already on `main` and
+`release.sh` refuses with "already current". Use this sequence instead, and
+prefer `just release-tag` over a hand-rolled `git tag`: it re-verifies the
+commit is contained in `origin/main` and that `Cargo.toml`, `Cargo.lock`, and
+`flake.nix` all declare the exact version, refuses an existing local or remote
+tag, and never moves or force-pushes one.
+
+```sh
+./scripts/release.sh 0.0.75 --no-push   # bump Cargo.toml/Cargo.lock/flake.nix
+git tag -d v0.0.75                      # drop the provisional local tag
+just validate                           # green on the versioned commit
+just stress                             # timing-sensitive changes: shake out races
+# land the release commit through the normal reintegration flow, then:
+just release-tag v0.0.75                # fail-closed tag at exact landed main
+```
+
+A tag is immutable once pushed. If its release workflow fails, do not move or
+reuse the tag: fix the cause and supersede it with the next patch version. A
+bare tag with no release object is not returned by the releases API, so
+`self-update` ignores it.
+
 Run `./tests/release_contract.sh target/debug/cara` after building to exercise
 the asset/checksum layout and `cara self-update status` with an isolated home;
 it never stages or installs an update over the developer binary.
