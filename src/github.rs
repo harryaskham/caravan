@@ -3102,6 +3102,7 @@ fn normalize_check_state(provider_state: Option<&str>) -> CheckState {
 
 mod raw;
 mod stack;
+mod stack_land;
 mod stack_lock;
 mod stack_merge;
 mod stack_reshape;
@@ -3111,6 +3112,7 @@ mod stack_reshape;
 // changes (bd-fcd5c9).
 pub use raw::*;
 pub use stack::*;
+pub use stack_land::*;
 pub use stack_lock::*;
 pub use stack_merge::*;
 pub use stack_reshape::*;
