@@ -601,6 +601,12 @@ phased unstack/rebuild transaction whose sealed checkpoints record
 `preflighted`, `unstacked`, `reshape_applied`, `rebuilding`, `rebuilt`, and
 `verified` and always persist `provider_atomic: false`. Retries resume from
 provider truth without repeating a proven unstack or replacement creation.
+`max_caravan_length` bounds one caravan as a merge batch within GitHub's
+2..=100 Stack range. It is absent by default, preserving the existing dynamic
+capacity model, and defaults to 8 only under `stack_type: github`. A full batch
+is never extended: admission uses another compatible caravan or opens a new one,
+while sync still lands the maximal contiguous ready prefix instead of waiting
+for occupancy.
 The optional `rebase_on_join: true` mode
 physically rebases each owned PR's candidate-only, linear commit range onto its
 exact predecessor under an exact force-with-lease; it is disabled by default and

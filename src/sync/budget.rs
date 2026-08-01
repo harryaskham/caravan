@@ -687,6 +687,16 @@ pub(super) fn capacity_gate(
     }
 }
 
+/// Configured hard batch bound, independent of the physical apply reserve.
+///
+/// `None` preserves the historical dynamic-capacity-only model, so the default
+/// `stack_type: caravan` path is unchanged. GitHub mode defaults to eight
+/// because one native Stack is a bounded atomic merge batch.
+#[must_use]
+pub(crate) fn configured_batch_bound(context: &AppContext) -> Option<u64> {
+    context.config.effective_max_caravan_length().map(u64::from)
+}
+
 /// Classify one caravan against an explicit bound.
 ///
 /// Gating a caravan that holds fewer than `MINIMUM_SOUND_CAPACITY` members is a
@@ -701,6 +711,16 @@ pub(super) fn gate_for_bound(
     members: u64,
     bound: u64,
 ) -> CapacityGate {
+    // A configured batch bound is authoritative policy, not derived arithmetic:
+    // reaching it is ordinary fullness at any chain size and can always be
+    // cleared by draining or by using another caravan.
+    if let Some(batch) = configured_batch_bound(context) {
+        if members >= batch {
+            return CapacityGate::AtCapacity {
+                bound: batch.min(bound),
+            };
+        }
+    }
     if members < bound {
         CapacityGate::Open { bound }
     } else if members < MINIMUM_SOUND_CAPACITY {
@@ -780,6 +800,7 @@ fn project(
     deadline: Duration,
 ) -> SyncBudgetStatus {
     let rebase_on_join = context.config.rebase_on_join;
+    let batch_bound = configured_batch_bound(context);
     let capacity = admission_capacity(context, deadline);
     let mut projections = Vec::with_capacity(selected.len());
     for caravan in selected {
@@ -822,11 +843,16 @@ fn project(
         });
     }
     let blocked_candidate = status.admission.next_candidate.filter(|_| {
-        rebase_on_join
+        (rebase_on_join || batch_bound.is_some())
             && !projections.is_empty()
             && projections.iter().all(|projection| projection.at_capacity)
     });
-    let safe_next_action = if !rebase_on_join {
+    let safe_next_action = if let Some(bound) = batch_bound.filter(|_| blocked_candidate.is_some())
+    {
+        format!(
+            "every caravan holds the configured {bound}-member batch bound (max_caravan_length); admission opens another caravan rather than extending a full batch"
+        )
+    } else if !rebase_on_join {
         "physical chain rebuilding is disabled; no apply reserve applies".to_owned()
     } else if let Err(defect) = &capacity {
         format!(
@@ -853,8 +879,12 @@ fn project(
         command_timeout_ms: context.config.command_timeout_secs.saturating_mul(1_000),
         reserve_ms_per_command: reserve_secs_per_command(context).saturating_mul(1_000),
         deadline_command_slots: deadline_command_slots(context, deadline),
-        max_admissible_members: capacity.as_ref().copied().ok(),
-        capacity_defect: capacity.err(),
+        max_admissible_members: match (batch_bound, capacity.as_ref().copied().ok()) {
+            (Some(batch), Some(dynamic)) if rebase_on_join => Some(batch.min(dynamic)),
+            (Some(batch), _) => Some(batch),
+            (None, dynamic) => dynamic,
+        },
+        capacity_defect: capacity.err().filter(|_| rebase_on_join),
         caravans: projections,
         blocked_candidate,
         safe_next_action,

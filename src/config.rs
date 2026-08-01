@@ -12,6 +12,14 @@ use serde_json::{Value, json};
 use crate::model::{EventKind, HeadMergeActor};
 use crate::root_merge::ExternalAutoMergePolicy;
 
+/// GitHub's documented native Stack size range. A batch bound outside it could
+/// never be represented as one provider Stack.
+pub const GITHUB_STACK_MIN_ENTRIES: u32 = 2;
+pub const GITHUB_STACK_MAX_ENTRIES: u32 = 100;
+/// Default native-Stack batch bound. Deliberately applied only after explicit
+/// `stack_type: github` selection.
+pub const DEFAULT_GITHUB_MAX_CARAVAN_LENGTH: u32 = 8;
+
 /// Provider representation and landing backend for one Caravan stack.
 ///
 /// `caravan` is the stable default and preserves the existing label/base-chain
@@ -596,6 +604,16 @@ pub struct CaravanConfig {
     /// the historical Cara-owned provider model and performs no native Stack
     /// API probes or mutations.
     pub stack_type: StackType,
+    /// Maximum members one caravan may hold before deterministic admission must
+    /// open or grow another caravan.
+    ///
+    /// Absent configuration preserves the historical dynamic mutation-budget
+    /// capacity for `stack_type: caravan`, so an existing repository never
+    /// acquires a new admission limit during upgrade. Explicit
+    /// `stack_type: github` defaults to eight because a native Stack is a
+    /// bounded atomic merge batch, not an unbounded queue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_caravan_length: Option<u32>,
     /// Non-secret repository authorization for ambient or GitHub App identity.
     pub github_auth: GithubAuthConfig,
     /// Local-only today; remote/read-only modes stay fail-closed until full wiring.
@@ -627,6 +645,22 @@ pub struct CaravanConfig {
     pub hooks: BTreeMap<EventKind, HookConfig>,
 }
 
+impl CaravanConfig {
+    /// Effective bounded batch size, or `None` when capacity remains the
+    /// historical dynamic mutation-budget model.
+    ///
+    /// The default is applied only for `stack_type: github`, so the absent
+    /// default `caravan` path is behavior-identical to before this contract.
+    #[must_use]
+    pub const fn effective_max_caravan_length(&self) -> Option<u32> {
+        match (self.max_caravan_length, self.stack_type) {
+            (Some(limit), _) => Some(limit),
+            (None, StackType::Github) => Some(DEFAULT_GITHUB_MAX_CARAVAN_LENGTH),
+            (None, StackType::Caravan) => None,
+        }
+    }
+}
+
 impl Default for CaravanConfig {
     fn default() -> Self {
         Self {
@@ -634,6 +668,7 @@ impl Default for CaravanConfig {
             min_cara_version: CARA_VERSION.to_owned(),
             force_merge: false,
             stack_type: StackType::default(),
+            max_caravan_length: None,
             github_auth: GithubAuthConfig::default(),
             writer: WriterConfig::default(),
             rebase_on_join: false,
@@ -858,17 +893,9 @@ impl CaravanConfig {
             }
         }
         if self.stack_type == StackType::Github {
-            if self.rebase_on_join {
-                return Err(ConfigError::Validation(
-                    "stack_type: github currently requires rebase_on_join: false; GitHub Stack preview must not introduce a second physical branch writer".to_owned(),
-                ));
-            }
-            if self.sync.resolved_head_merge_actor() != HeadMergeActor::Caravan {
-                return Err(ConfigError::Validation(
-                    "stack_type: github requires sync.head_merge_actor: caravan; GitHub native Stack entries do not support provider auto-merge".to_owned(),
-                ));
-            }
+            self.validate_github_backend()?;
         }
+        self.validate_batch_bound()?;
         if self.sync.actions.join_unlabelled_prs && !self.rebase_on_join {
             return Err(ConfigError::Validation(
                 "sync.actions.join_unlabelled_prs requires rebase_on_join: true".to_owned(),
@@ -895,6 +922,36 @@ impl CaravanConfig {
                     "hooks.{event:?}.timeout_secs must be between 1 and {MAX_HOOK_TIMEOUT_SECS}"
                 )));
             }
+        }
+        Ok(())
+    }
+
+    /// Refuse a batch bound that could never be one provider Stack.
+    fn validate_batch_bound(&self) -> Result<(), ConfigError> {
+        match self.max_caravan_length {
+            Some(limit)
+                if !(GITHUB_STACK_MIN_ENTRIES..=GITHUB_STACK_MAX_ENTRIES).contains(&limit) =>
+            {
+                Err(ConfigError::Validation(format!(
+                    "max_caravan_length must be between {GITHUB_STACK_MIN_ENTRIES} and {GITHUB_STACK_MAX_ENTRIES}; GitHub Stacks accept no other batch size"
+                )))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Explicit native-Stack preview policy: no second physical branch writer
+    /// and no provider auto-merge on Stack entries.
+    fn validate_github_backend(&self) -> Result<(), ConfigError> {
+        if self.rebase_on_join {
+            return Err(ConfigError::Validation(
+                "stack_type: github currently requires rebase_on_join: false; GitHub Stack preview must not introduce a second physical branch writer".to_owned(),
+            ));
+        }
+        if self.sync.resolved_head_merge_actor() != HeadMergeActor::Caravan {
+            return Err(ConfigError::Validation(
+                "stack_type: github requires sync.head_merge_actor: caravan; GitHub native Stack entries do not support provider auto-merge".to_owned(),
+            ));
         }
         Ok(())
     }
@@ -1770,6 +1827,64 @@ command_timeout_secs: 30
 
         assert_eq!(config.stack_type, StackType::Caravan);
         assert_eq!(CaravanConfig::default().stack_type, StackType::Caravan);
+    }
+
+    /// bd-83d2c9: the batch bound is GitHub's Stack range, and it is defaulted
+    /// only after explicit backend selection so upgrades never acquire a new
+    /// admission limit.
+    #[test]
+    fn max_caravan_length_defaults_only_under_github_and_stays_in_stack_range() {
+        let legacy: CaravanConfig = serde_yaml::from_str(
+            r"
+version: 1
+force_merge: false
+rebase_on_join: false
+command_timeout_secs: 30
+",
+        )
+        .expect("legacy config remains readable");
+        assert_eq!(legacy.max_caravan_length, None);
+        assert_eq!(legacy.effective_max_caravan_length(), None);
+        legacy.validate().expect("legacy policy stays valid");
+
+        let github: CaravanConfig = serde_yaml::from_str(
+            r"
+version: 1
+force_merge: false
+stack_type: github
+rebase_on_join: false
+command_timeout_secs: 30
+sync:
+  head_merge_actor: caravan
+",
+        )
+        .expect("explicit GitHub Stack policy parses");
+        github.validate().expect("default batch bound is valid");
+        assert_eq!(github.max_caravan_length, None);
+        assert_eq!(
+            github.effective_max_caravan_length(),
+            Some(DEFAULT_GITHUB_MAX_CARAVAN_LENGTH)
+        );
+
+        let mut explicit = legacy.clone();
+        explicit.max_caravan_length = Some(3);
+        explicit
+            .validate()
+            .expect("an explicit in-range bound is valid");
+        assert_eq!(explicit.effective_max_caravan_length(), Some(3));
+
+        for invalid in [0, 1, 101] {
+            let mut rejected = legacy.clone();
+            rejected.max_caravan_length = Some(invalid);
+            assert!(
+                rejected
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("max_caravan_length must be between 2 and 100"),
+                "batch bound {invalid} is not representable as one GitHub Stack"
+            );
+        }
     }
 
     #[test]

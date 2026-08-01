@@ -53,7 +53,8 @@ pub mod progress;
 pub use budget::{CapacityDefect, CaravanBudgetProjection, SyncBudgetStatus, project_status};
 use budget::{
     CapacityGate, ChainCost, MemberCost, PhysicalApplyAdmission, PhysicalCommitBudget,
-    admit_physical_prefix, capacity_evidence, capacity_gate, externally_armed_non_roots,
+    admit_physical_prefix, capacity_evidence, capacity_gate, configured_batch_bound,
+    externally_armed_non_roots,
 };
 #[cfg(test)]
 use budget::{
@@ -375,6 +376,11 @@ pub struct AutoAdmissionTailGeneration {
     pub head_oid: crate::model::CommitOid,
     /// Active or expired explicit hold; stale holds do not freeze admission.
     pub held: bool,
+    /// Caravan already holds the configured `max_caravan_length` batch bound,
+    /// so deterministic admission must use another caravan instead of growing
+    /// this one. Always false without a configured bound.
+    #[serde(default)]
+    pub batch_full: bool,
 }
 
 /// Durable generation-bound explanation for one best-effort skip.
@@ -3197,7 +3203,12 @@ fn run_auto_admission(
             break;
         }
         output.candidates_considered += 1;
-        let evaluation = evaluate_auto_candidate(&status, &candidate, &checker)?;
+        let evaluation = evaluate_auto_candidate_bounded(
+            &status,
+            &candidate,
+            &checker,
+            configured_batch_bound(context),
+        )?;
 
         let mut admitted_this_iteration = false;
         if matches!(evaluation.target, AutoCandidateTarget::Skip) {
@@ -3330,11 +3341,33 @@ pub(crate) fn caravan_capacity_refusal(
     candidate_pr: PrNumber,
     target_tail: Option<PrNumber>,
 ) -> Option<CaravanCapacityRefusal> {
+    let deadline = sync_operation_budget(context);
+    // A configured batch bound applies even without physical chain rebuilding:
+    // it bounds one atomic native merge batch, not an apply reserve.
+    if let Some(batch) = configured_batch_bound(context) {
+        let caravan = status.analysis.fleet.containing(target_tail?)?;
+        let members = u64::try_from(caravan.members.len()).unwrap_or(u64::MAX);
+        if members >= batch {
+            return Some(CaravanCapacityRefusal {
+                code: "caravan_batch_capacity_exhausted".to_owned(),
+                candidate_pr,
+                caravan_id: caravan.id,
+                caravan_members: members,
+                max_admissible_members: Some(batch),
+                capacity_defect: None,
+                configured_deadline_ms: duration_millis(deadline),
+                command_timeout_ms: context.config.command_timeout_secs.saturating_mul(1_000),
+                safe_next_action: format!(
+                    "caravan #{} already holds the configured {batch}-member batch bound (max_caravan_length); admit #{candidate_pr} into another compatible caravan or start a new one instead of extending a full batch",
+                    caravan.id,
+                ),
+            });
+        }
+    }
     if !context.config.rebase_on_join {
         return None;
     }
     let caravan = status.analysis.fleet.containing(target_tail?)?;
-    let deadline = sync_operation_budget(context);
     let members = u64::try_from(caravan.members.len()).unwrap_or(u64::MAX);
     let (code, bound, defect, safe_next_action) = match capacity_gate(context, deadline, members) {
         CapacityGate::Open { .. } => return None,
@@ -3376,8 +3409,11 @@ pub(crate) fn caravan_capacity_refusal(
 /// admission bound the configuration cannot make sound.
 pub(crate) fn caravan_capacity_error(refusal: &CaravanCapacityRefusal) -> AppError {
     let defect = refusal.capacity_defect.is_some();
+    let batch = refusal.code == "caravan_batch_capacity_exhausted";
     let message = if defect {
         "the configured sync deadline yields no admissible chain size, so admission cannot be gated honestly and the join fails as a defect"
+    } else if batch {
+        "the target caravan already holds the configured max_caravan_length batch bound"
     } else {
         "the target caravan already holds every member the configured sync deadline can guarantee to drain"
     };
@@ -3386,6 +3422,12 @@ pub(crate) fn caravan_capacity_error(refusal: &CaravanCapacityRefusal) -> AppErr
             "raise sync.max_duration_secs until the reported minimum_deadline_ms fits, so a chain of at least two members is admissible again",
             "lower sync.reserve_secs_per_command to a proven-safe per-command reserve",
             "start an independent caravan; waiting for an existing caravan to drain cannot repair an unsound bound"
+        ])
+    } else if batch {
+        json!([
+            "admit this candidate into another compatible caravan below the configured batch bound",
+            "start an independent caravan; a full batch is never extended",
+            "run `cara sync --all` and let the full batch land before reusing it"
         ])
     } else {
         json!([
@@ -3461,10 +3503,25 @@ struct AutoCandidateEvaluation {
     reasons: Vec<String>,
 }
 
+#[cfg(test)]
 fn evaluate_auto_candidate(
     status: &StatusOutput,
     candidate: &PullRequestSnapshot,
     checker: &impl crate::graph::CompatibilityChecker,
+) -> Result<AutoCandidateEvaluation, AppError> {
+    evaluate_auto_candidate_bounded(status, candidate, checker, None)
+}
+
+/// Deterministic target selection under an optional configured batch bound.
+///
+/// A full batch is never extended. When every visible tail is full, admission
+/// opens another caravan rather than waiting for one to drain, which is what
+/// keeps a bounded native Stack from becoming an unbounded queue.
+fn evaluate_auto_candidate_bounded(
+    status: &StatusOutput,
+    candidate: &PullRequestSnapshot,
+    checker: &impl crate::graph::CompatibilityChecker,
+    batch_bound: Option<u64>,
 ) -> Result<AutoCandidateEvaluation, AppError> {
     let mut virtual_status = status.clone();
     virtual_status.current_pr = Some(candidate.number);
@@ -3475,7 +3532,7 @@ fn evaluate_auto_candidate(
     {
         virtual_candidate.labels.remove(AUTO_ADMISSION_SKIP_LABEL);
     }
-    let tails = current_tail_generations(status);
+    let tails = current_tail_generations_bounded(status, batch_bound);
     if tails.is_empty() {
         let output = check_auto_target(&virtual_status, &CheckInput::default(), checker)?;
         if output.eligible {
@@ -3493,7 +3550,16 @@ fn evaluate_auto_candidate(
     }
 
     let mut reasons = Vec::new();
+    let mut open_tails = 0_usize;
     for tail in &tails {
+        if tail.batch_full {
+            reasons.push(format!(
+                "tail #{}: caravan #{} already holds the configured max_caravan_length batch bound",
+                tail.tail_pr, tail.caravan_id
+            ));
+            continue;
+        }
+        open_tails += 1;
         if tail.held {
             reasons.push(format!(
                 "tail #{}: caravan #{} is intentionally held",
@@ -3522,6 +3588,19 @@ fn evaluate_auto_candidate(
                 .into_iter()
                 .map(|reason| format!("tail #{}: {reason}", tail.tail_pr)),
         );
+    }
+    // Every visible caravan is a full batch: start another one instead of
+    // deferring the candidate behind a batch that must land as a unit.
+    if open_tails == 0 {
+        let output = check_auto_target(&virtual_status, &CheckInput::default(), checker)?;
+        if output.eligible {
+            return Ok(AutoCandidateEvaluation {
+                target: AutoCandidateTarget::New,
+                tested_tails: tails,
+                reasons,
+            });
+        }
+        reasons.extend(check_reasons(&output));
     }
     Ok(AutoCandidateEvaluation {
         target: AutoCandidateTarget::Skip,
@@ -3580,6 +3659,13 @@ fn check_reasons(output: &crate::read::CheckOutput) -> Vec<String> {
 }
 
 fn current_tail_generations(status: &StatusOutput) -> Vec<AutoAdmissionTailGeneration> {
+    current_tail_generations_bounded(status, None)
+}
+
+fn current_tail_generations_bounded(
+    status: &StatusOutput,
+    batch_bound: Option<u64>,
+) -> Vec<AutoAdmissionTailGeneration> {
     status
         .analysis
         .fleet
@@ -3596,6 +3682,9 @@ fn current_tail_generations(status: &StatusOutput) -> Vec<AutoAdmissionTailGener
                 held: status.pauses.iter().any(|pause| {
                     pause.state.is_effective() && pause.record.caravan_head == caravan.id
                 }),
+                batch_full: batch_bound.is_some_and(|bound| {
+                    u64::try_from(caravan.members.len()).unwrap_or(u64::MAX) >= bound
+                }),
             })
         })
         .collect()
@@ -3605,6 +3694,7 @@ fn auto_admission_config_fingerprint(context: &AppContext) -> String {
     let material = serde_json::to_vec(&json!({
         "version": context.config.version,
         "rebase_on_join": context.config.rebase_on_join,
+        "max_caravan_length": context.config.effective_max_caravan_length(),
         "agent_priority_labels": &context.config.agent_priority_labels,
         "sync": &context.config.sync,
     }))

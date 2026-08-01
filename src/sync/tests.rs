@@ -7221,3 +7221,108 @@ fn the_skip_receipt_is_written_before_the_label_that_depends_on_it() {
         "a partial write must never leave an unrecoverable label without its receipt: {calls:?}"
     );
 }
+
+/// bd-83d2c9: GitHub native mode is a bounded merge batch, so a full caravan
+/// is never extended. The absent/default `caravan` path keeps the historical
+/// dynamic-capacity model exactly.
+#[test]
+fn a_configured_batch_bound_refuses_growth_without_changing_the_default_path() {
+    let mut context = cacophony_context();
+    let at = status(linear_chain(8), None, &clean);
+
+    assert!(
+        caravan_capacity_refusal(&context, &at, PrNumber(999), Some(PrNumber(8))).is_none(),
+        "an absent max_caravan_length must preserve the existing dynamic-capacity behavior"
+    );
+
+    context.config.max_caravan_length = Some(8);
+    let refusal = caravan_capacity_refusal(&context, &at, PrNumber(999), Some(PrNumber(8)))
+        .expect("a full batch must refuse further joins");
+    assert_eq!(refusal.code, "caravan_batch_capacity_exhausted");
+    assert_eq!(refusal.max_admissible_members, Some(8));
+    assert!(refusal.capacity_defect.is_none());
+    assert!(refusal.safe_next_action.contains("another"));
+
+    let error = caravan_capacity_error(&refusal);
+    assert_eq!(error.code(), "caravan_batch_capacity_exhausted");
+    let details = error.details().expect("typed refusal evidence");
+    assert_eq!(details["mutated"], false);
+    assert_eq!(details["max_admissible_members"], 8);
+
+    // A brand-new caravan is never refused, and one member below the bound
+    // still accepts growth.
+    assert!(caravan_capacity_refusal(&context, &at, PrNumber(999), None).is_none());
+    let below = status(linear_chain(7), None, &clean);
+    assert!(caravan_capacity_refusal(&context, &below, PrNumber(999), Some(PrNumber(7))).is_none());
+}
+
+/// The bound applies to GitHub mode, where physical chain rebuilding is off and
+/// the dynamic apply reserve therefore never gates admission.
+#[test]
+fn github_mode_defaults_to_eight_and_bounds_admission_without_rebasing() {
+    let mut context = cacophony_context();
+    context.config.rebase_on_join = false;
+    context.config.stack_type = crate::config::StackType::Github;
+    assert_eq!(context.config.effective_max_caravan_length(), Some(8));
+
+    let at = status(linear_chain(8), None, &clean);
+    let refusal = caravan_capacity_refusal(&context, &at, PrNumber(999), Some(PrNumber(8)))
+        .expect("a full native batch must refuse further joins even without rebase_on_join");
+    assert_eq!(refusal.code, "caravan_batch_capacity_exhausted");
+
+    let projection = crate::sync::project_status(&context, &at);
+    assert_eq!(projection.max_admissible_members, Some(8));
+    assert!(projection.capacity_defect.is_none());
+    assert!(projection.caravans[0].at_capacity);
+}
+
+/// A full batch is never extended, and the queue is never stalled behind it:
+/// deterministic admission opens another caravan instead.
+#[test]
+fn a_full_batch_opens_another_caravan_instead_of_waiting() {
+    let mut context = cacophony_context();
+    context.config.max_caravan_length = Some(2);
+    let mut candidate = pull_request(
+        9,
+        "candidate",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    candidate.labels.clear();
+    let mut members = linear_chain(2);
+    members.push(candidate.clone());
+    let fleet = status(members, Some(candidate.number), &clean);
+    assert_eq!(fleet.analysis.fleet.caravans[0].members.len(), 2);
+
+    let unbounded = evaluate_auto_candidate_bounded(&fleet, &candidate, &clean, None)
+        .expect("unbounded preflight");
+    assert_eq!(
+        unbounded.target,
+        AutoCandidateTarget::Join(PrNumber(2)),
+        "without a configured bound the candidate still stacks behind the tail"
+    );
+
+    let bounded = evaluate_auto_candidate_bounded(
+        &fleet,
+        &candidate,
+        &clean,
+        crate::sync::configured_batch_bound(&context),
+    )
+    .expect("bounded preflight");
+    assert_eq!(
+        bounded.target,
+        AutoCandidateTarget::New,
+        "a full batch must not be extended, and the candidate must not stall: {:?}",
+        bounded.reasons
+    );
+    assert!(bounded.tested_tails[0].batch_full);
+    assert!(
+        bounded
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("max_caravan_length")),
+        "the receipt must name the exact bound that redirected admission: {:?}",
+        bounded.reasons
+    );
+}

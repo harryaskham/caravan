@@ -6,8 +6,8 @@ use super::{
     PullRequestPrecondition, PullRequestSnapshot, PullRequestState, StatusOutput,
     SyncApplyAdmissionPlan, SyncAutoAdmissionPlan, SyncInput, SyncPlanAction, SyncPlanActionState,
     SyncPlanDecision, SyncPlanOutput, SyncPlanPhase, SyncProgress, SyncProvider,
-    evaluate_auto_candidate, head_is_conflict_free_with_default, json, merged_predecessor,
-    mutation_error, preflight_repository, prepare_physical_chains, read,
+    configured_batch_bound, evaluate_auto_candidate_bounded, head_is_conflict_free_with_default,
+    json, merged_predecessor, mutation_error, preflight_repository, prepare_physical_chains, read,
     selected_unpaused_caravans, sync_operation_budget, validate_graph,
 };
 
@@ -823,7 +823,12 @@ pub(super) fn plan_auto_admission_with_checker(
         )?;
         return Ok(output);
     }
-    let evaluation = evaluate_auto_candidate(status, candidate, checker)?;
+    let evaluation = evaluate_auto_candidate_bounded(
+        status,
+        candidate,
+        checker,
+        configured_batch_bound(context),
+    )?;
     output.candidate_pr = Some(candidate_pr);
     output.tested_tails.clone_from(&evaluation.tested_tails);
     output.compatibility_reasons.clone_from(&evaluation.reasons);

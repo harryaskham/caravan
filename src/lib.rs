@@ -260,6 +260,12 @@ GITHUB NATIVE STACKS (EXPLICIT PREVIEW)
   `rebuilding`, `rebuilt`, and `verified`, always persist
   `provider_atomic: false`, and resume from provider truth so a proven unstack
   or replacement Stack is never created twice.
+- `max_caravan_length` bounds one caravan as a merge batch (2..=100). It is
+  absent by default, preserving the existing dynamic capacity model, and
+  defaults to 8 only under `stack_type: github`. A full batch is never extended:
+  admission deterministically uses another compatible caravan or opens a new
+  one, and sync still lands the maximal contiguous ready prefix rather than
+  waiting for a batch to fill.
 
 VIRTUAL CHAINS (SAFE DEFAULT)
 With `rebase_on_join: false` or an absent setting, Caravan does not rewrite PR
@@ -2039,6 +2045,7 @@ mod tests {
         );
         assert!(output.instructions.contains("Administration(write)"));
         assert!(output.instructions.contains("provider_atomic: false"));
+        assert!(output.instructions.contains("max_caravan_length"));
         assert!(
             output
                 .instructions

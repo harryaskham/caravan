@@ -1006,6 +1006,18 @@ sealed `preflighted` → `unstacked` → `reshape_applied` → `rebuilding` →
 the exact per-PR base/head/control-label/auto-merge postcondition the existing
 Cara reshape must establish, creates replacement Stacks one at a time with exact
 zero-write retries, and proves singleton chains by exact inventory absence.
+
+`max_caravan_length` bounds one caravan as a merge batch. It accepts only
+GitHub's 2..=100 Stack range, is absent by default so existing repositories keep
+the dynamic mutation-budget capacity model unchanged, and defaults to 8 only
+under explicit `stack_type: github`. Reaching the bound is ordinary fullness,
+never a capacity defect: admission refuses growth with
+`caravan_batch_capacity_exhausted`, deterministically selects another compatible
+caravan, and opens a new one when every visible caravan is full, so a bounded
+batch never stalls the queue. Sync never waits for occupancy; it lands the
+maximal contiguous ready prefix, and a fully ready batch lands as one atomic
+native merge. Status reports the effective bound and exact per-caravan
+full-batch evidence.
 The 2026-07-31 disposable sandbox
 proved successful full and partial atomic squash, all-or-none failure after an
 ordinary lower fast-forward, top-SHA rejection, and UUID recovery. It also
