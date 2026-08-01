@@ -835,7 +835,7 @@ fn validate_add_plan(
     validate_open_entries(&plan.desired, plan.before.topology.entries.len())
 }
 
-fn validate_topology(
+pub(super) fn validate_topology(
     repository: &RepositoryId,
     topology: &GitHubStackTopology,
     minimum_entries: usize,
@@ -901,7 +901,7 @@ fn validate_topology(
     Ok(())
 }
 
-fn validate_open_entries(
+pub(super) fn validate_open_entries(
     topology: &GitHubStackTopology,
     from: usize,
 ) -> Result<(), GitHubStackMutationError> {
@@ -922,7 +922,7 @@ fn validate_open_entries(
     Ok(())
 }
 
-fn validate_operation_identity(
+pub(super) fn validate_operation_identity(
     operation_id: &str,
     actor: &str,
 ) -> Result<(), GitHubStackMutationError> {

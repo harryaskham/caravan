@@ -163,6 +163,18 @@ Therefore `evict`, `split`, and non-tail reshape use a fenced rebuild:
 
 This is not provider-atomic. Interrupted receipts name the completed phase and rerun converges from provider truth. Never claim that native Stacks make eviction or split atomic.
 
+`src/github/stack_reshape.rs` implements exactly those phases as
+`preflighted → unstacked → reshape_applied → rebuilding → rebuilt → verified`.
+The sealed plan binds the exact unqueued generation, the complete replacement
+partition, and the exact per-PR base/head/control-label/auto-merge
+postcondition the existing Cara reshape must establish; `provider_atomic` is a
+persisted `false`. Preflight is zero-write, unstack reuses the CRUD adapter's
+exact absence proof, the existing reshape receipt is bound only after fresh PR
+truth proves every postcondition, replacement Stacks are created one at a time
+with exact already-created retries, and final verification proves each
+multi-member chain exists exactly once with singleton chains proven by exact
+inventory absence.
+
 Tail eviction can use the same rebuild initially. A narrower provider operation may replace it only when GitHub documents one.
 
 ## Sync and landing

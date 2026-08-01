@@ -997,9 +997,16 @@ names, and exact head OIDs against Cara's graph. A full 100-Stack page is
 reported as truncated rather than complete. Every provider-mutating workflow
 returns `github_stack_backend_read_only` before provider writes.
 
-Exact REST create/add/unstack and asynchronous direct-merge planning,
-submission, UUID-polling, and receipt primitives are policy-free internal
-adapters, not executable workflow authority. The 2026-07-31 disposable sandbox
+Exact REST create/add/unstack, asynchronous direct-merge planning, submission,
+UUID-polling, receipt primitives, and the phased evict/split unstack/rebuild
+transaction are policy-free internal adapters, not executable workflow
+authority. GitHub exposes no arbitrary Stack remove or reorder, so reshape is a
+sealed `preflighted` → `unstacked` → `reshape_applied` → `rebuilding` →
+`rebuilt` → `verified` sequence that persists `provider_atomic: false`, binds
+the exact per-PR base/head/control-label/auto-merge postcondition the existing
+Cara reshape must establish, creates replacement Stacks one at a time with exact
+zero-write retries, and proves singleton chains by exact inventory absence.
+The 2026-07-31 disposable sandbox
 proved successful full and partial atomic squash, all-or-none failure after an
 ordinary lower fast-forward, top-SHA rejection, and UUID recovery. It also
 proved the current API does not lease the complete group: after 202, a lower

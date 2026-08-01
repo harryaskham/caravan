@@ -3104,6 +3104,7 @@ mod raw;
 mod stack;
 mod stack_lock;
 mod stack_merge;
+mod stack_reshape;
 
 // The transport layer is an implementation seam, not a new public surface:
 // re-export exactly what was public before the split so no downstream path
@@ -3112,6 +3113,7 @@ pub use raw::*;
 pub use stack::*;
 pub use stack_lock::*;
 pub use stack_merge::*;
+pub use stack_reshape::*;
 
 #[cfg(test)]
 mod tests {

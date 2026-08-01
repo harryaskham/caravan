@@ -254,6 +254,12 @@ GITHUB NATIVE STACKS (EXPLICIT PREVIEW)
   part of the baseline App policy. Do not broaden permissions or remove
   `github_stack_backend_read_only` until the ruleset-locked orchestrator and
   repository policy are both enabled by a reviewed Cara release.
+- GitHub exposes no arbitrary Stack remove or reorder, so evict and split are a
+  resumable unstack/rebuild transaction, never a provider-atomic operation. Its
+  sealed checkpoints record `preflighted`, `unstacked`, `reshape_applied`,
+  `rebuilding`, `rebuilt`, and `verified`, always persist
+  `provider_atomic: false`, and resume from provider truth so a proven unstack
+  or replacement Stack is never created twice.
 
 VIRTUAL CHAINS (SAFE DEFAULT)
 With `rebase_on_join: false` or an absent setting, Caravan does not rewrite PR
@@ -2032,6 +2038,7 @@ mod tests {
                 .contains("current_user_can_bypass: never")
         );
         assert!(output.instructions.contains("Administration(write)"));
+        assert!(output.instructions.contains("provider_atomic: false"));
         assert!(
             output
                 .instructions

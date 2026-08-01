@@ -594,9 +594,14 @@ merge at a changed generation. A follow-up sandbox then proved Cara's preventive
 equivalent: one active no-bypass repository ruleset over every selected source
 ref rejects owner SSH and REST mutations while the selected prefix merges and
 the unselected suffix rebases. The adapter now acquires, verifies, checkpoints,
-and exactly releases that lock, but executable workflow rollout remains fenced
-until the explicit Administration(write) policy and orchestrator land. The
-optional `rebase_on_join: true` mode
+and exactly release that lock, but executable workflow rollout remains fenced
+until the explicit Administration(write) policy and orchestrator land.
+GitHub exposes no arbitrary Stack remove/reorder, so evict and split are a
+phased unstack/rebuild transaction whose sealed checkpoints record
+`preflighted`, `unstacked`, `reshape_applied`, `rebuilding`, `rebuilt`, and
+`verified` and always persist `provider_atomic: false`. Retries resume from
+provider truth without repeating a proven unstack or replacement creation.
+The optional `rebase_on_join: true` mode
 physically rebases each owned PR's candidate-only, linear commit range onto its
 exact predecessor under an exact force-with-lease; it is disabled by default and
 never mutates the caller's worktree:
