@@ -35,6 +35,37 @@ validate-fast:
   '
   echo "validate-fast: green -- run 'just validate' before publishing"
 
+# Shake out timing- and order-dependent test failures before publication.
+#
+# `just validate` runs the suite once, so a race that fails intermittently can
+# pass locally by luck. v0.0.71 was tagged after a green `validate`, then its
+# release workflow failed on the concurrent lease-exclusion test. Tags are
+# immutable, so that version number was burned and superseded by v0.0.72
+# (bd-3c53b5, bd-1ead85).
+#
+# This is a probabilistic shake-out, not a proof of absence. The racy lease fake
+# that burned v0.0.71 failed roughly 6 of 12 runs, so a few rounds would have
+# caught it; a rarer race can still slip through.
+#   just stress                    # 10 rounds of the whole lib suite
+#   just stress 40                 # more rounds
+#   just stress 40 remote_lease    # concentrate on one area
+stress rounds="10" filter="":
+  #!/usr/bin/env bash
+  set -euo pipefail
+  rounds="{{rounds}}"
+  [[ "$rounds" =~ ^[0-9]+$ ]] && (( rounds > 0 )) || {
+    echo "error: rounds must be a positive integer (got: $rounds)" >&2
+    exit 2
+  }
+  nix develop --command bash -c '
+    set -euo pipefail
+    for round in $(seq 1 '"$rounds"'); do
+      echo "=== stress round $round/'"$rounds"' ==="
+      cargo test --lib {{filter}}
+    done
+  '
+  echo "stress: {{rounds}} green rounds -- probabilistic, not proof of absence"
+
 run-web-dev *repos:
   #!/usr/bin/env bash
   set -euo pipefail
