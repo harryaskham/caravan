@@ -501,6 +501,15 @@ authentication, so reachability through an operator proxy is never authority to
 force, merge, or reshape. Non-mutating check/plan actions remain available.
 Hosted mode provisions no clones, manages no tenancy, and performs no failover.
 
+`GET /api/v1/health` is secret-free and monitorable: `ok` means this process is
+serving, while `degraded` is the actionable signal, true when any served
+repository has never refreshed successfully or is currently carrying a refresh
+error. It also reports the hosted/read-only flags, repository counts including
+never-refreshed and erroring, the oldest successful refresh, and webhook
+counters with the last received timestamp, so a worker that is answering but
+idle -- because deliveries stopped or a repository read keeps failing -- is
+distinguishable from a healthy one.
+
 ## 6. Sync algorithm
 
 A sync tick:

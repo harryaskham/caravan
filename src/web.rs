@@ -670,6 +670,62 @@ fn repository_matches_slug(repository: &RepositoryEntry, repository_slug: &str) 
         .is_some_and(|status| status.repository.slug() == repository_slug)
 }
 
+/// Secret-free operational health, derived from current snapshots.
+///
+/// `ok` keeps its existing meaning of "this process is serving", so alerting
+/// that already watches it does not silently change meaning. `degraded` is the
+/// new signal: it is true when any served repository has never refreshed
+/// successfully or is currently carrying a refresh error, both of which leave a
+/// hosted worker apparently healthy while doing no useful work.
+fn health_payload(dashboard: &Dashboard) -> serde_json::Value {
+    let mut never_refreshed = 0_u64;
+    let mut erroring = 0_u64;
+    let mut oldest_refresh_unix_ms: Option<u64> = None;
+    for repository in &dashboard.repositories {
+        let snapshot = repository
+            .snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if snapshot.status.is_none() {
+            never_refreshed += 1;
+        } else {
+            oldest_refresh_unix_ms = Some(
+                oldest_refresh_unix_ms.map_or(snapshot.refreshed_unix_ms, |oldest| {
+                    oldest.min(snapshot.refreshed_unix_ms)
+                }),
+            );
+        }
+        if snapshot.error.is_some() {
+            erroring += 1;
+        }
+    }
+    let webhook = dashboard
+        .webhook_status
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    json!({
+        "ok": true,
+        "degraded": never_refreshed > 0 || erroring > 0,
+        "schema_version": WEB_SCHEMA_VERSION,
+        "hosted": dashboard.hosted,
+        "read_only": dashboard.read_only,
+        "repositories": dashboard.repositories.len(),
+        "repositories_never_refreshed": never_refreshed,
+        "repositories_erroring": erroring,
+        "oldest_refresh_unix_ms": oldest_refresh_unix_ms,
+        "started_unix_ms": dashboard.started_unix_ms,
+        "webhook": {
+            "enabled": webhook.enabled,
+            "sync_enabled": webhook.sync_enabled,
+            "accepted": webhook.accepted,
+            "deduplicated": webhook.deduplicated,
+            "rejected": webhook.rejected,
+            "last_received_unix_ms": webhook.last_received_unix_ms,
+        },
+    })
+}
+
 fn is_loopback(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => address.is_loopback(),
@@ -1496,15 +1552,9 @@ fn handle_request(mut request: Request, dashboard: &Dashboard) {
             static_response(APP_JS, "text/javascript; charset=utf-8")
         }
         (Method::Get, "/api/v1/state") => json_response(StatusCode(200), &dashboard.state()),
-        (Method::Get, "/api/v1/health") => json_response(
-            StatusCode(200),
-            &json!({
-                "ok": true,
-                "schema_version": WEB_SCHEMA_VERSION,
-                "repositories": dashboard.repositories.len(),
-                "started_unix_ms": dashboard.started_unix_ms,
-            }),
-        ),
+        (Method::Get, "/api/v1/health") => {
+            json_response(StatusCode(200), &health_payload(dashboard))
+        }
         (Method::Post, "/api/v1/webhooks/github") => handle_github_webhook(&mut request, dashboard),
         (Method::Post, path) if path.ends_with("/refresh") => {
             handle_refresh(&request, dashboard, path)
@@ -2671,6 +2721,101 @@ mod tests {
                 .code(),
             "web_hosted_repository_slug_duplicate"
         );
+    }
+
+    #[test]
+    fn health_reports_degradation_without_redefining_ok() {
+        let healthy = hosted_entry(hosted_config(
+            crate::config::GithubAuthMode::Ambient,
+            None,
+            crate::config::WriterMode::LocalOnly,
+            Some("owner/healthy"),
+        ));
+        healthy
+            .snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .status = Some(authority_status("cccccccc"));
+        healthy
+            .snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .refreshed_unix_ms = 5_000;
+
+        let mut dashboard = test_dashboard(true, false);
+        dashboard.repositories = vec![Arc::clone(&healthy)];
+        let payload = health_payload(&dashboard);
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["degraded"], false);
+        assert_eq!(payload["hosted"], true);
+        assert_eq!(payload["repositories"], 1);
+        assert_eq!(payload["repositories_never_refreshed"], 0);
+        assert_eq!(payload["repositories_erroring"], 0);
+        assert_eq!(payload["oldest_refresh_unix_ms"], 5_000);
+
+        // A repository that has never refreshed does no useful work while the
+        // process still answers, so it must surface as degraded.
+        let never = hosted_entry(hosted_config(
+            crate::config::GithubAuthMode::Ambient,
+            None,
+            crate::config::WriterMode::LocalOnly,
+            Some("owner/never"),
+        ));
+        dashboard.repositories = vec![Arc::clone(&healthy), Arc::clone(&never)];
+        let payload = health_payload(&dashboard);
+        assert_eq!(payload["ok"], true, "ok keeps meaning 'serving'");
+        assert_eq!(payload["degraded"], true);
+        assert_eq!(payload["repositories_never_refreshed"], 1);
+
+        // A refreshed repository carrying an error is also degraded.
+        let erroring = hosted_entry(hosted_config(
+            crate::config::GithubAuthMode::Ambient,
+            None,
+            crate::config::WriterMode::LocalOnly,
+            Some("owner/erroring"),
+        ));
+        {
+            let mut snapshot = erroring
+                .snapshot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            snapshot.status = Some(authority_status("dddddddd"));
+            snapshot.refreshed_unix_ms = 9_000;
+            snapshot.error = Some(WebError {
+                category: ErrorCategory::ExecutionFailure,
+                code: "provider_unavailable".to_owned(),
+                message: "provider read failed".to_owned(),
+                details: None,
+            });
+        }
+        dashboard.repositories = vec![Arc::clone(&healthy), erroring];
+        let payload = health_payload(&dashboard);
+        assert_eq!(payload["degraded"], true);
+        assert_eq!(payload["repositories_erroring"], 1);
+        assert_eq!(payload["repositories_never_refreshed"], 0);
+
+        // Webhook liveness is reported so silence is detectable.
+        {
+            let mut status = dashboard
+                .webhook_status
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            status.enabled = true;
+            status.sync_enabled = true;
+            status.accepted = 7;
+            status.rejected = 2;
+            status.deduplicated = 3;
+            status.last_received_unix_ms = Some(12_345);
+        }
+        let payload = health_payload(&dashboard);
+        assert_eq!(payload["webhook"]["enabled"], true);
+        assert_eq!(payload["webhook"]["accepted"], 7);
+        assert_eq!(payload["webhook"]["rejected"], 2);
+        assert_eq!(payload["webhook"]["deduplicated"], 3);
+        assert_eq!(payload["webhook"]["last_received_unix_ms"], 12_345);
+        let encoded = serde_json::to_string(&payload).unwrap();
+        assert!(!encoded.contains("secret"));
+        assert!(!encoded.contains("token"));
     }
 
     fn authority_status(head_oid: &str) -> StatusOutput {
