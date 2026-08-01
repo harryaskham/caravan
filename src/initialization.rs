@@ -1330,4 +1330,58 @@ mod tests {
         assert_eq!(error.code(), "github_stack_backend_read_only");
         assert_eq!(error.details().unwrap()["mutation_blocked"], true);
     }
+
+    /// bd-a79679: the native-Stack rollout fence is only as strong as its
+    /// weakest mutating entry point. Every domain that performs provider or
+    /// branch mutations must consult initialization readiness, which is where
+    /// the capability, repository opt-in, and read-only fence blockers live.
+    #[test]
+    fn every_mutating_domain_consults_the_rollout_fence() {
+        for (name, source) in [
+            ("force", include_str!("force.rs")),
+            ("force_intent", include_str!("force_intent.rs")),
+            ("membership", include_str!("membership.rs")),
+            ("pause", include_str!("pause.rs")),
+            ("priority", include_str!("priority.rs")),
+            ("repair", include_str!("repair.rs")),
+            ("reshape", include_str!("reshape.rs")),
+            ("sync", include_str!("sync.rs")),
+            ("sync_plan", include_str!("sync/plan.rs")),
+        ] {
+            let production = source
+                .split("\n#[cfg(test)]\nmod tests")
+                .next()
+                .unwrap_or(source);
+            assert!(
+                production.contains("initialization::require_ready("),
+                "{name} mutates without consulting the initialization mutation blocker"
+            );
+        }
+    }
+
+    /// The fence must be typed and blocking for every native-mode blocker, so
+    /// no caller can mistake a capability failure for ordinary readiness.
+    #[test]
+    fn every_native_stack_blocker_refuses_mutation_with_its_exact_code() {
+        for code in [
+            "github_stack_capability_unavailable",
+            "github_stack_capability_unknown",
+            "github_stack_repository_not_opted_in",
+            "github_stack_backend_read_only",
+        ] {
+            let status = InitializationStatus {
+                ready: false,
+                mutation_blocker: Some(InitializationMutationBlocker {
+                    code: code.to_owned(),
+                    message: "native Stack mutation is fenced".to_owned(),
+                    next: "keep stack_type: caravan for mutations".to_owned(),
+                }),
+                ..InitializationStatus::default()
+            };
+            let error = require_ready(&status).expect_err("a fenced repository cannot mutate");
+            assert_eq!(error.code(), code);
+            let details = error.details().expect("typed fence evidence");
+            assert_eq!(details["mutation_blocked"], true);
+        }
+    }
 }
