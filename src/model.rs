@@ -1266,6 +1266,9 @@ pub enum EventKind {
     HeadAdvanced,
     Evicted,
     Split,
+    /// Two complete live caravans were concatenated under one reviewed atomic
+    /// physical rewrite and one source-root membership commit.
+    CaravansConcatenated,
     CiFailed,
     ForceMergeAttempted,
     ForceMergeCompleted,

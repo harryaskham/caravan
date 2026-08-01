@@ -4,7 +4,7 @@
 //! topology receipt. It never sequences eviction and rejoin, never mutates the
 //! provider, and never guesses which root/tail the operator meant.
 
-use mcp_cli::ErrorCategory;
+use mcp_cli::{ErrorCategory, StructuredError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -258,6 +258,437 @@ pub(crate) fn plan_from_status(
     Ok(plan)
 }
 
+/// Execution request bound to one reviewed no-write plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ConcatExecuteInput {
+    #[serde(flatten)]
+    pub intent: ConcatInput,
+    pub expected_plan_hash: String,
+}
+
+/// Successful atomic concat receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ConcatOutput {
+    /// True when an exact durable journal receipt was returned without writes.
+    pub idempotent: bool,
+    pub plan: ConcatPlan,
+    pub physical: crate::physical_rebase::AtomicRebaseReceipt,
+    pub membership: crate::github::GitHubMutationReceipt,
+    pub resulting_ordering: Vec<PrNumber>,
+    pub receipt: crate::model::OperationReceipt,
+    #[serde(default)]
+    pub events: Vec<crate::model::CaravanEvent>,
+    #[serde(default)]
+    pub hook_deliveries: Vec<crate::hooks::HookDelivery>,
+}
+
+trait ConcatProvider {
+    fn set_base(
+        &self,
+        repository: &RepositoryId,
+        expected: &crate::model::PullRequestPrecondition,
+        base: &str,
+    ) -> Result<crate::github::GitHubMutationReceipt, crate::github::MutationError>;
+}
+
+impl<R: crate::command::CommandRunner> ConcatProvider for crate::github::GitHubMutationAdapter<R> {
+    fn set_base(
+        &self,
+        repository: &RepositoryId,
+        expected: &crate::model::PullRequestPrecondition,
+        base: &str,
+    ) -> Result<crate::github::GitHubMutationReceipt, crate::github::MutationError> {
+        crate::membership::MembershipProvider::set_base(self, repository, expected, base)
+    }
+}
+
+/// Execute one reviewed concat plan under one writer operation.
+#[allow(clippy::too_many_lines)]
+pub fn execute(context: &AppContext, input: &ConcatExecuteInput) -> Result<ConcatOutput, AppError> {
+    // Exact retry is a local durable read: do not acquire a remote writer lease
+    // or touch provider state when the original receipt already exists.
+    if let Some(output) = existing_receipt(context, &input.expected_plan_hash)? {
+        return Ok(output);
+    }
+    let writer = context.acquire_writer_operation("concat")?;
+    let operation_deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(context.config.sync.max_duration_secs);
+    let status = read::status_with_deadline(context, operation_deadline)?;
+    let timeout = std::time::Duration::from_secs(context.config.command_timeout_secs);
+    let checker = GitCompatibilityChecker::new(&context.repository_path, "origin")
+        .with_timeout(timeout)
+        .with_operation_deadline(operation_deadline);
+    let plan = plan_from_status(&status, &input.intent, &checker)?;
+    if input.expected_plan_hash != plan.plan_hash {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "concat_plan_stale",
+            "concat facts changed after the reviewed plan; refusing before mutation",
+            Some(
+                json!({"expected_plan_hash": input.expected_plan_hash, "actual_plan": plan, "mutated": false}),
+            ),
+        ));
+    }
+
+    let source = status
+        .analysis
+        .fleet
+        .caravan(plan.source_caravan)
+        .expect("concat plan source is a live caravan");
+    let target_tail = status
+        .analysis
+        .pull_requests
+        .get(&plan.members[0].target_pr)
+        .expect("concat plan target tail has facts");
+    let mut prepared = Vec::with_capacity(source.members.len());
+    let mut target = crate::physical_rebase::PlannedBase::Remote(target_tail.head.clone());
+    for (index, number) in source.members.iter().enumerate() {
+        let candidate = status
+            .analysis
+            .pull_requests
+            .get(number)
+            .expect("concat plan member has facts");
+        let range = if index == 0 {
+            crate::physical_rebase::range_base_for_remote_target(candidate, &target_tail.head)
+        } else {
+            let parent = status
+                .analysis
+                .pull_requests
+                .get(&source.members[index - 1])
+                .expect("concat source parent has facts");
+            crate::physical_rebase::range_base_for_rewritten_parent(candidate, &parent.head)
+        };
+        let item = crate::physical_rebase::prepare_candidate(
+            &context.repository_path,
+            &status.repository,
+            candidate,
+            range,
+            target,
+            &status.analysis.fleet.default_branch,
+            crate::physical_rebase::RebaseExecutionBudget::new(timeout)
+                .with_deadline(operation_deadline)
+                .with_writer_fence(writer.remote_fence())
+                .because(
+                    crate::physical_rebase::BranchRewriteReason::ParentAdvanced {
+                        parent_pr: plan.members[index].target_pr,
+                    },
+                ),
+        )?;
+        target = crate::physical_rebase::PlannedBase::Simulated(BranchSnapshot {
+            repository: status.repository.clone(),
+            name: candidate.head.name.clone(),
+            oid: item.plan.new_head_oid.clone(),
+        });
+        prepared.push(item);
+    }
+    let prepared_refs = prepared.iter().collect::<Vec<_>>();
+    let physical = crate::physical_rebase::apply_prepared_atomically(&prepared_refs)?;
+
+    let post_rewrite = match read::status_with_deadline(context, operation_deadline) {
+        Ok(status) => status,
+        Err(error) => {
+            return rollback_physical_error(
+                &error,
+                &prepared_refs,
+                &plan,
+                "concat_post_rewrite_rediscovery_failed",
+            );
+        }
+    };
+    for receipt in &physical.receipts {
+        let observed = post_rewrite.analysis.pull_requests.get(&receipt.pr);
+        if observed.is_none_or(|pr| pr.head.oid != receipt.new_head_oid) {
+            return rollback_physical_error(
+                &AppError::validation(
+                    "concat_rewrite_head_stale",
+                    "provider did not expose every exact atomically rewritten head",
+                ),
+                &prepared_refs,
+                &plan,
+                "concat_post_rewrite_rediscovery_failed",
+            );
+        }
+    }
+
+    let runner = crate::command::ProcessRunner::in_directory(&context.repository_path)
+        .with_timeout(timeout)
+        .with_operation_deadline(operation_deadline);
+    let provider = crate::github::GitHubMutationAdapter::new(writer.runner(runner));
+    let source_root = post_rewrite
+        .analysis
+        .pull_requests
+        .get(&plan.source_caravan)
+        .expect("rewritten source root remains open");
+    let expected = crate::model::PullRequestPrecondition::from(source_root);
+    let membership = match commit_source_root(
+        &provider,
+        &status.repository,
+        &expected,
+        &plan.members[0].target_branch,
+    ) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            let source = concat_mutation_error(&error, &plan, false);
+            return rollback_physical_error(
+                &source,
+                &prepared_refs,
+                &plan,
+                "concat_membership_commit_failed",
+            );
+        }
+    };
+
+    let final_status = match read::status_with_deadline(context, operation_deadline) {
+        Ok(status) => status,
+        Err(error) => {
+            return rollback_complete_transaction(
+                &provider,
+                &status.repository,
+                &membership,
+                &prepared_refs,
+                &plan,
+                &error,
+                "concat_final_rediscovery_failed",
+            );
+        }
+    };
+    let Some(concatenated) = final_status
+        .analysis
+        .fleet
+        .caravans
+        .iter()
+        .find(|caravan| caravan.members == plan.new_ordering)
+    else {
+        let source = AppError::structured(
+            ErrorCategory::Validation,
+            "concat_final_topology_unexpected",
+            "provider writes completed but exact concatenated ordering was not observed",
+            Some(json!({"fleet": final_status.analysis.fleet})),
+        );
+        return rollback_complete_transaction(
+            &provider,
+            &status.repository,
+            &membership,
+            &prepared_refs,
+            &plan,
+            &source,
+            "concat_final_topology_rollback",
+        );
+    };
+
+    let operation_id = crate::model::OperationId::new();
+    let receipt = crate::model::OperationReceipt {
+        operation_id: operation_id.clone(),
+        operation: "concat".to_owned(),
+        completed_steps: vec![crate::model::MutationStep {
+            kind: crate::model::MutationKind::SetBase,
+            state: crate::model::MutationStepState::Completed,
+            pr: Some(plan.source_caravan),
+            summary: format!(
+                "concatenated caravan #{} after tail #{}",
+                plan.source_caravan, input.intent.target_tail_pr
+            ),
+        }],
+        changed: true,
+    };
+    let event = crate::hooks::event(
+        crate::model::EventKind::CaravansConcatenated,
+        operation_id,
+        status.repository,
+        Some(concatenated.id),
+        plan.new_ordering.clone(),
+        Some(final_status.analysis.fleet),
+        Some(plan.reason.clone()),
+        std::collections::BTreeMap::from([
+            ("plan".to_owned(), json!(plan)),
+            ("physical".to_owned(), json!(physical)),
+            ("membership".to_owned(), json!(membership)),
+            ("receipt".to_owned(), json!(receipt)),
+            ("resulting_ordering".to_owned(), json!(plan.new_ordering)),
+        ]),
+    );
+    let hook_deliveries = crate::hooks::dispatch_events(context, std::slice::from_ref(&event))?;
+    Ok(ConcatOutput {
+        idempotent: false,
+        resulting_ordering: plan.new_ordering.clone(),
+        plan,
+        physical,
+        membership,
+        receipt,
+        events: vec![event],
+        hook_deliveries,
+    })
+}
+
+fn rollback_complete_transaction(
+    provider: &impl ConcatProvider,
+    repository: &RepositoryId,
+    membership: &crate::github::GitHubMutationReceipt,
+    prepared: &[&crate::physical_rebase::PreparedRebase],
+    plan: &ConcatPlan,
+    source: &AppError,
+    code: &str,
+) -> Result<ConcatOutput, AppError> {
+    let expected = crate::model::PullRequestPrecondition::from(&membership.after);
+    let original_base = plan.members[0].old_base.name.as_str();
+    let membership_rollback = match commit_source_root(
+        provider,
+        repository,
+        &expected,
+        original_base,
+    ) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            return Err(AppError::structured(
+                ErrorCategory::ExecutionFailure,
+                "concat_membership_rollback_indeterminate",
+                "concat could not restore the source-root base after final verification failed",
+                Some(
+                    json!({"plan": plan, "membership": membership, "source": source.details(), "rollback_error": error.to_string(), "mutated": true, "safe_next_action": "inspect the source-root base and every source branch; do not retry until all generations are classified"}),
+                ),
+            ));
+        }
+    };
+    match crate::physical_rebase::rollback_prepared_atomically(prepared) {
+        Ok(physical_rollback) => Err(AppError::structured(
+            source.category(),
+            code,
+            format!(
+                "concat final verification failed and the complete original topology was restored: {source}"
+            ),
+            Some(
+                json!({"plan": plan, "membership": membership, "membership_rollback": membership_rollback, "physical_rollback": physical_rollback, "source": source.details(), "mutated": false, "resumable": true}),
+            ),
+        )),
+        Err(rollback) => Err(AppError::structured(
+            ErrorCategory::ExecutionFailure,
+            "concat_physical_rollback_indeterminate",
+            "source-root base was restored but original source branch heads could not be proven restored",
+            Some(
+                json!({"plan": plan, "membership": membership, "membership_rollback": membership_rollback, "source": source.details(), "rollback": rollback.details(), "mutated": true, "safe_next_action": "inspect every source branch; do not retry membership until all heads equal the plan rollback generations"}),
+            ),
+        )),
+    }
+}
+
+fn commit_source_root(
+    provider: &impl ConcatProvider,
+    repository: &RepositoryId,
+    expected: &crate::model::PullRequestPrecondition,
+    base: &str,
+) -> Result<crate::github::GitHubMutationReceipt, crate::github::MutationError> {
+    provider.set_base(repository, expected, base)
+}
+
+fn existing_receipt(
+    context: &AppContext,
+    plan_hash: &str,
+) -> Result<Option<ConcatOutput>, AppError> {
+    let log = crate::journal::snapshot(
+        context,
+        &crate::journal::LogInput {
+            limit: 100,
+            kind: Some("caravans_concatenated".to_owned()),
+            ..crate::journal::LogInput::default()
+        },
+    )?;
+    for record in log.records.into_iter().rev() {
+        let crate::journal::JournalRecord::Event { event, .. } = record else {
+            continue;
+        };
+        let Some(plan_value) = event.metadata.get("plan") else {
+            continue;
+        };
+        let plan: ConcatPlan = serde_json::from_value(plan_value.clone()).map_err(|error| {
+            AppError::structured(
+                ErrorCategory::ExecutionFailure,
+                "concat_receipt_invalid",
+                "durable concat event contains an unreadable plan",
+                Some(json!({"event_id": event.event_id, "source": error.to_string()})),
+            )
+        })?;
+        if plan.plan_hash != plan_hash {
+            continue;
+        }
+        let physical = receipt_metadata(&event, "physical")?;
+        let membership = receipt_metadata(&event, "membership")?;
+        let receipt = receipt_metadata(&event, "receipt")?;
+        let resulting_ordering = receipt_metadata(&event, "resulting_ordering")?;
+        return Ok(Some(ConcatOutput {
+            idempotent: true,
+            plan,
+            physical,
+            membership,
+            resulting_ordering,
+            receipt,
+            events: vec![event],
+            hook_deliveries: Vec::new(),
+        }));
+    }
+    Ok(None)
+}
+
+fn receipt_metadata<T: serde::de::DeserializeOwned>(
+    event: &crate::model::CaravanEvent,
+    key: &str,
+) -> Result<T, AppError> {
+    let value = event.metadata.get(key).ok_or_else(|| {
+        AppError::structured(
+            ErrorCategory::ExecutionFailure,
+            "concat_receipt_invalid",
+            "durable concat event is missing required receipt evidence",
+            Some(json!({"event_id": event.event_id, "missing": key})),
+        )
+    })?;
+    serde_json::from_value(value.clone()).map_err(|error| {
+        AppError::structured(
+            ErrorCategory::ExecutionFailure,
+            "concat_receipt_invalid",
+            "durable concat event contains unreadable receipt evidence",
+            Some(json!({"event_id": event.event_id, "field": key, "source": error.to_string()})),
+        )
+    })
+}
+
+fn rollback_physical_error(
+    source: &AppError,
+    prepared: &[&crate::physical_rebase::PreparedRebase],
+    plan: &ConcatPlan,
+    code: &str,
+) -> Result<ConcatOutput, AppError> {
+    match crate::physical_rebase::rollback_prepared_atomically(prepared) {
+        Ok(rollback) => Err(AppError::structured(
+            source.category(),
+            code,
+            format!("concat stopped and restored every original source head: {source}"),
+            Some(
+                json!({"plan": plan, "rollback": rollback, "source": source.details(), "mutated": false, "resumable": true}),
+            ),
+        )),
+        Err(rollback) => Err(AppError::structured(
+            ErrorCategory::ExecutionFailure,
+            "concat_rollback_indeterminate",
+            "concat failed after physical rewrite and original source heads could not be proven restored",
+            Some(
+                json!({"plan": plan, "source": source.details(), "rollback": rollback.details(), "mutated": true, "safe_next_action": "inspect every source branch and preserve both error receipts before any retry"}),
+            ),
+        )),
+    }
+}
+
+fn concat_mutation_error(
+    error: &crate::github::MutationError,
+    plan: &ConcatPlan,
+    mutated: bool,
+) -> AppError {
+    AppError::structured(
+        ErrorCategory::ExecutionFailure,
+        "concat_provider_mutation_failed",
+        format!("concat provider membership commit failed: {error}"),
+        Some(json!({"plan": plan, "mutated": mutated})),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,6 +810,38 @@ mod tests {
         }
     }
 
+    struct FakeConcatProvider {
+        current: std::cell::RefCell<PullRequestSnapshot>,
+    }
+
+    impl ConcatProvider for FakeConcatProvider {
+        fn set_base(
+            &self,
+            _repository: &RepositoryId,
+            expected: &crate::model::PullRequestPrecondition,
+            base: &str,
+        ) -> Result<crate::github::GitHubMutationReceipt, crate::github::MutationError> {
+            let mut current = self.current.borrow_mut();
+            let actual = crate::model::PullRequestPrecondition::from(&*current);
+            if !actual.mutation_identity_eq(expected) {
+                return Err(crate::github::MutationError::StalePrecondition {
+                    expected: Box::new(expected.clone()),
+                    actual: Box::new(actual),
+                    changed_fields: vec!["fixture_drift".to_owned()],
+                });
+            }
+            let before = current.clone();
+            current.base.name = base.to_owned();
+            current.base.oid = CommitOid(format!("{base}-oid"));
+            Ok(crate::github::GitHubMutationReceipt {
+                kind: crate::model::MutationKind::SetBase,
+                before: Some(before),
+                after: current.clone(),
+                provider_output: None,
+            })
+        }
+    }
+
     struct Conflicting;
     impl CompatibilityChecker for Conflicting {
         fn check(
@@ -495,6 +958,122 @@ mod tests {
                 code
             );
         }
+    }
+
+    #[test]
+    fn membership_commit_and_rollback_use_exact_after_state_leases() {
+        let source = pr(3, "source-root", "main");
+        let provider = FakeConcatProvider {
+            current: std::cell::RefCell::new(source.clone()),
+        };
+        let expected = crate::model::PullRequestPrecondition::from(&source);
+        let committed = commit_source_root(&provider, &repository(), &expected, "target-tail")
+            .expect("single membership commit");
+        assert_eq!(provider.current.borrow().base.name, "target-tail");
+
+        let rollback_expected = crate::model::PullRequestPrecondition::from(&committed.after);
+        let rolled_back = commit_source_root(&provider, &repository(), &rollback_expected, "main")
+            .expect("exact rollback restores original base");
+        assert_eq!(rolled_back.after.base.name, "main");
+
+        let committed = commit_source_root(
+            &provider,
+            &repository(),
+            &crate::model::PullRequestPrecondition::from(&rolled_back.after),
+            "target-tail",
+        )
+        .unwrap();
+        provider.current.borrow_mut().head.oid = CommitOid("external-drift".to_owned());
+        let error = commit_source_root(
+            &provider,
+            &repository(),
+            &crate::model::PullRequestPrecondition::from(&committed.after),
+            "main",
+        )
+        .expect_err("drift refuses rollback rather than overwriting");
+        assert!(matches!(
+            error,
+            crate::github::MutationError::StalePrecondition { .. }
+        ));
+        assert_eq!(provider.current.borrow().base.name, "target-tail");
+    }
+
+    #[test]
+    fn durable_receipt_makes_exact_retry_no_write_and_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(directory.path())
+            .status()
+            .unwrap();
+        let context = AppContext {
+            repository_path: directory.path().to_path_buf(),
+            ..AppContext::default()
+        };
+        let status = status();
+        let plan = plan_from_status(
+            &status,
+            &ConcatInput {
+                source_head_pr: 3,
+                target_tail_pr: 2,
+                actor: "operator".to_owned(),
+                reason: "recover".to_owned(),
+            },
+            &Clean,
+        )
+        .unwrap();
+        let source = status.analysis.pull_requests[&PrNumber(3)].clone();
+        let mut after = source.clone();
+        after.base = status.analysis.pull_requests[&PrNumber(2)].head.clone();
+        let membership = crate::github::GitHubMutationReceipt {
+            kind: crate::model::MutationKind::SetBase,
+            before: Some(source),
+            after,
+            provider_output: None,
+        };
+        let physical = crate::physical_rebase::AtomicRebaseReceipt {
+            atomic: true,
+            receipts: Vec::new(),
+            old_heads: plan.rollback_heads.clone(),
+            new_heads: plan.rollback_heads.clone(),
+            recovered_ambiguous_success: false,
+        };
+        let receipt = crate::model::OperationReceipt {
+            operation_id: crate::model::OperationId::new(),
+            operation: "concat".to_owned(),
+            completed_steps: Vec::new(),
+            changed: true,
+        };
+        let event = crate::hooks::event(
+            crate::model::EventKind::CaravansConcatenated,
+            receipt.operation_id.clone(),
+            repository(),
+            Some(PrNumber(1)),
+            plan.new_ordering.clone(),
+            Some(status.analysis.fleet),
+            Some(plan.reason.clone()),
+            std::collections::BTreeMap::from([
+                ("plan".to_owned(), json!(plan)),
+                ("physical".to_owned(), json!(physical)),
+                ("membership".to_owned(), json!(membership)),
+                ("receipt".to_owned(), json!(receipt)),
+                (
+                    "resulting_ordering".to_owned(),
+                    json!([PrNumber(1), PrNumber(2), PrNumber(3), PrNumber(4)]),
+                ),
+            ]),
+        );
+        crate::journal::append_event(&context, &event).unwrap();
+
+        let retry = existing_receipt(&context, &plan.plan_hash)
+            .unwrap()
+            .expect("exact durable receipt");
+        assert!(retry.idempotent);
+        assert_eq!(retry.plan, plan);
+        assert_eq!(retry.physical, physical);
+        assert_eq!(retry.membership, membership);
+        assert_eq!(retry.receipt, receipt);
+        assert_eq!(retry.events, vec![event]);
     }
 
     #[test]
