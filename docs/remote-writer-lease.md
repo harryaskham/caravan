@@ -1,21 +1,25 @@
-# Remote writer lease protocol (preview, not active)
+# Remote writer lease protocol and writer modes
 
 Caravan's existing `.git/caravan/operation.lock` excludes mutating processes on
 one machine. It cannot fence local and hosted workers on different machines.
 This document defines the remote compare-and-swap contract required before a
 hosted writer may be enabled.
 
-**No non-local writer mode is active yet.** Repository config defaults to:
+Repository config remains backward-compatible and defaults to:
 
 ```yaml
 writer:
   mode: local_only
 ```
 
-`read_only` and `remote_fenced` are reserved schema values. Offline config
-validation can review them, but production context startup refuses both until
-every mutation entry point consumes and revalidates a remote fence. Remote
-policy may set bounded timing only in that mode:
+`read_only` permits read/config/status/check/log/plan/web-refresh surfaces and
+refuses every mutation at `WriterOperationGuard` before provider or local write.
+Its plan runner also carries a deny-write fence, so a future accidental marked
+command fails before spawn.
+
+`remote_fenced` permits reads without lease acquisition and requires every
+mutation to acquire the remote lease before the local lock. Remote policy may
+set bounded timing only in that mode:
 
 ```yaml
 writer:
@@ -28,8 +32,9 @@ TTL is 10-3600 seconds; heartbeat is positive and strictly smaller. Deployment
 must also provide `CARA_REMOTE_LEASE_COMMAND`, exact
 `CARA_REMOTE_LEASE_HOST`, and bounded `CARA_REMOTE_WRITER_OWNER`. Exact
 owner/repository comes from required `config.repository`; App installation is
-included when App policy selects one. A broker path or config value cannot activate
-hosted writes by itself.
+included when App policy selects one. `sync.checkout_on_decision` must remain
+false so an error path cannot attempt a second lease while inherited repair
+ownership is live. A broker path alone never activates hosted writes.
 
 ## Lease identity and ordering
 
@@ -137,9 +142,9 @@ operation evidence and preserves `operation_evidence` and
 `remote_writer_lease` navigation keys; broker commands, credentials, and raw
 output are never persisted.
 
-Production context still refuses `remote_fenced`. Membership and sync provider
-adapters share their operation guard, including post-rewrite rediscovery and
-auto-admission handoff. Their physical rebase budgets now retain the same guard
+Production context validates and opens `remote_fenced` only with the exact
+policy/environment above. Membership and sync provider adapters share their
+operation guard, including post-rewrite rediscovery and auto-admission handoff. Their physical rebase budgets now retain the same guard
 through temporary worktree preparation, barrier verification, and the marked
 force-with-lease push; reshape eviction uses the same path. Lease loss after
 preparation stops before push and preserves the remote head. Repair discovery,
@@ -147,9 +152,8 @@ workspace materialization, semantic grant/revoke, continuation, and the marked
 non-force provider publication push now share their operation guard too. Repair
 sync derives a second workspace-local lock while sharing the parent's exact
 remote guard, so it performs no second broker acquire and releases remote only
-when the last owner drops. The remaining activation work is durable lease
-checkpoints/receipts, read-only policy, complete two-host coverage, and final
-mode opening.
+when the last owner drops. Checkpoints automatically bind the latest grant and
+existing compaction limits remain authoritative.
 
 ## Guard lifecycle
 
@@ -160,14 +164,10 @@ due. Concurrent writers single-flight that renewal: later writers observe the
 new revision/heartbeat and inspect instead. Renewal requires unchanged exact
 key/owner/operation/fence and strictly advanced expiry. Release and Drop use the
 latest grant, attempt exact best-effort release, and never claim ambiguous
-success. The remaining operation-integration slice must:
+success. Existing provider preconditions, request/mutation budgets, operation
+deadlines, result-tree checks, and force-with-lease OIDs remain additional
+mandatory gates.
 
-1. acquire the remote lease before the local operation lock;
-2. retain the guard and secret-free grant receipt for the whole operation;
-3. revalidate/renew immediately before every GitHub or Git write;
-4. stop before write on expiry, mismatch, timeout, malformed response, or
-   indeterminate backend state;
-5. preserve all existing provider preconditions and force-with-lease OIDs.
-
-Until that integration lands, `writer.mode: local_only` plus exactly one
-configured deployment writer remains the only supported topology.
+This enables a remote-fenced Cara core, not a hosted service. Deployments still
+configure exactly one scheduler/worker topology per repository; automatic
+failover and hosted queue/tenancy lifecycle remain separate work.

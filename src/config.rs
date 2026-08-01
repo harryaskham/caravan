@@ -206,23 +206,42 @@ impl WriterConfig {
         remote_lease_command: Option<&str>,
     ) -> Result<(), ConfigError> {
         match self.mode {
-            WriterMode::LocalOnly => Ok(()),
-            WriterMode::ReadOnly => Err(ConfigError::Validation(
-                "writer.mode read_only is reserved until mutation entry points enforce it"
-                    .to_owned(),
-            )),
+            WriterMode::LocalOnly | WriterMode::ReadOnly => Ok(()),
             WriterMode::RemoteFenced => {
                 if remote_lease_command.is_none_or(|command| command.trim().is_empty()) {
                     return Err(ConfigError::Validation(
                         "writer.mode remote_fenced requires CARA_REMOTE_LEASE_COMMAND".to_owned(),
                     ));
                 }
-                Err(ConfigError::Validation(
-                    "writer.mode remote_fenced is reserved until every mutation revalidates its fencing token"
-                        .to_owned(),
-                ))
+                Ok(())
             }
         }
+    }
+
+    fn validate_remote_identity_values(
+        &self,
+        host: Option<&str>,
+        writer_owner: Option<&str>,
+    ) -> Result<(), ConfigError> {
+        if self.mode != WriterMode::RemoteFenced {
+            return Ok(());
+        }
+        for (name, value) in [
+            ("CARA_REMOTE_LEASE_HOST", host),
+            ("CARA_REMOTE_WRITER_OWNER", writer_owner),
+        ] {
+            if value.is_none_or(|value| {
+                value.trim().is_empty()
+                    || value.trim() != value
+                    || value.len() > 256
+                    || value.chars().any(char::is_control)
+            }) {
+                return Err(ConfigError::Validation(format!(
+                    "writer.mode remote_fenced requires bounded {name}"
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -820,6 +839,24 @@ impl CaravanConfig {
         }
         self.github_auth.validate()?;
         self.writer.validate()?;
+        if self.writer.mode == WriterMode::RemoteFenced {
+            let valid_repository = self.repository.as_deref().is_some_and(|slug| {
+                slug.split_once('/').is_some_and(|(owner, repository)| {
+                    !owner.is_empty() && !repository.is_empty() && !repository.contains('/')
+                })
+            });
+            if !valid_repository {
+                return Err(ConfigError::Validation(
+                    "writer.mode remote_fenced requires exact repository: owner/name".to_owned(),
+                ));
+            }
+            if self.sync.checkout_on_decision {
+                return Err(ConfigError::Validation(
+                    "writer.mode remote_fenced requires sync.checkout_on_decision: false"
+                        .to_owned(),
+                ));
+            }
+        }
         if self.stack_type == StackType::Github {
             if self.rebase_on_join {
                 return Err(ConfigError::Validation(
@@ -878,6 +915,10 @@ impl CaravanConfig {
         )?;
         self.writer.validate_runtime_with_command(
             std::env::var("CARA_REMOTE_LEASE_COMMAND").ok().as_deref(),
+        )?;
+        self.writer.validate_remote_identity_values(
+            std::env::var("CARA_REMOTE_LEASE_HOST").ok().as_deref(),
+            std::env::var("CARA_REMOTE_WRITER_OWNER").ok().as_deref(),
         )
     }
 
@@ -1643,7 +1684,7 @@ mod writer_mode_tests {
     use super::*;
 
     #[test]
-    fn writer_defaults_local_and_nonlocal_modes_remain_startup_closed() {
+    fn writer_modes_open_only_with_their_required_runtime_contract() {
         let legacy = CaravanConfig::parse("version: 1\n").unwrap();
         assert_eq!(legacy.writer.mode, WriterMode::LocalOnly);
         legacy
@@ -1652,16 +1693,15 @@ mod writer_mode_tests {
             .unwrap();
 
         let read_only = CaravanConfig::parse("version: 1\nwriter:\n  mode: read_only\n").unwrap();
-        assert!(
-            read_only
-                .writer
-                .validate_runtime_with_command(None)
-                .unwrap_err()
-                .to_string()
-                .contains("reserved")
-        );
+        read_only
+            .writer
+            .validate_runtime_with_command(None)
+            .unwrap();
 
-        let remote = CaravanConfig::parse("version: 1\nwriter:\n  mode: remote_fenced\n").unwrap();
+        let remote = CaravanConfig::parse(
+            "version: 1\nrepository: owner/repo\nwriter:\n  mode: remote_fenced\n",
+        )
+        .unwrap();
         assert!(
             remote
                 .writer
@@ -1670,28 +1710,42 @@ mod writer_mode_tests {
                 .to_string()
                 .contains("requires CARA_REMOTE_LEASE_COMMAND")
         );
+        remote
+            .writer
+            .validate_runtime_with_command(Some("/secure/lease-broker"))
+            .unwrap();
         assert!(
             remote
                 .writer
-                .validate_runtime_with_command(Some("/secure/lease-broker"))
-                .unwrap_err()
-                .to_string()
-                .contains("every mutation revalidates")
+                .validate_remote_identity_values(None, Some("worker-a"))
+                .is_err()
         );
+        assert!(
+            remote
+                .writer
+                .validate_remote_identity_values(Some("github.com"), None)
+                .is_err()
+        );
+        remote
+            .writer
+            .validate_remote_identity_values(Some("github.com"), Some("worker-a"))
+            .unwrap();
     }
 
     #[test]
     fn remote_lease_timing_is_bounded_and_ignored_modes_cannot_customize_it() {
         let remote = CaravanConfig::parse(
-            "version: 1\nwriter:\n  mode: remote_fenced\n  lease_ttl_secs: 120\n  heartbeat_secs: 30\n",
+            "version: 1\nrepository: owner/repo\nwriter:\n  mode: remote_fenced\n  lease_ttl_secs: 120\n  heartbeat_secs: 30\n",
         )
         .unwrap();
         assert_eq!(remote.writer.lease_ttl_secs, 120);
         assert_eq!(remote.writer.heartbeat_secs, 30);
         for yaml in [
-            "version: 1\nwriter:\n  mode: remote_fenced\n  lease_ttl_secs: 9\n  heartbeat_secs: 1\n",
-            "version: 1\nwriter:\n  mode: remote_fenced\n  lease_ttl_secs: 60\n  heartbeat_secs: 60\n",
+            "version: 1\nrepository: owner/repo\nwriter:\n  mode: remote_fenced\n  lease_ttl_secs: 9\n  heartbeat_secs: 1\n",
+            "version: 1\nrepository: owner/repo\nwriter:\n  mode: remote_fenced\n  lease_ttl_secs: 60\n  heartbeat_secs: 60\n",
             "version: 1\nwriter:\n  mode: local_only\n  lease_ttl_secs: 120\n",
+            "version: 1\nwriter:\n  mode: remote_fenced\n",
+            "version: 1\nrepository: owner/repo\nwriter:\n  mode: remote_fenced\nsync:\n  checkout_on_decision: true\n",
         ] {
             assert!(CaravanConfig::parse(yaml).is_err(), "accepted {yaml}");
         }

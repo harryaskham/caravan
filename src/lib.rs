@@ -476,14 +476,14 @@ RECOVERY, LOCKS, AND OBSERVABILITY
   The least-privilege permission/branch/webhook/single-writer baseline is
   machine-checked in `docs/github-app-policy.json` and explained in
   `docs/github-app.md`; live bot attribution remains a separate canary.
-- Cross-host writer fencing has a strict broker/CAS/guard protocol in
-  `docs/remote-writer-lease.md`, but it is not active. Provider/Git writes carry
-  explicit intent and a fenced runner refuses missing markers or a lost token
-  before child execution. `writer.mode` defaults to `local_only`; reserved
-  `read_only`/`remote_fenced` values fail startup. Every production mutation
-  enters `WriterOperationGuard`, which models remote-before-local acquisition
-  and one shared fenced-runner factory. Activation must propagate that runner
-  through every operation and internal physical worktree before opening modes.
+- Cross-host writer fencing follows `docs/remote-writer-lease.md`. Provider/Git
+  writes carry explicit intent and refuse missing markers or a lost token before
+  child execution. `writer.mode` defaults to `local_only`; `read_only` permits
+  read/plan surfaces but denies marked/local mutations; `remote_fenced` requires
+  exact repository, broker/host/writer identity, bounded timing, and remote-first
+  acquisition. Every write revalidates or single-flight renews; checkpoints bind
+  the latest secret-free fence. This enables the core, not a hosted service or
+  automatic failover.
 - `cara self-update status|check|run` updates only the exact running first-PATH
   stable user binary (`~/.cargo/bin`, `~/.local/bin`, or an exact explicit
   `CARA_SELF_UPDATE_INSTALL_DIR`). Shadowed, renamed/test, Cargo target, and
@@ -623,6 +623,15 @@ impl AppContext {
             config_existed,
             config,
         })
+    }
+
+    /// Serialize one contractually read-only planning operation without remote
+    /// writer acquisition. Marked writes remain impossible in this path.
+    pub fn acquire_planning_operation(
+        &self,
+        operation: &str,
+    ) -> Result<writer_guard::WriterOperationGuard, AppError> {
+        writer_guard::WriterOperationGuard::acquire_planning(&self.repository_path, operation)
     }
 
     /// Acquire the sole production mutation authority boundary.

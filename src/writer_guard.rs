@@ -23,17 +23,31 @@ use crate::remote_lease::{
 pub struct WriterOperationGuard {
     local: OperationLock,
     remote: Option<Arc<RemoteLeaseGuard>>,
+    read_only: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DenyMutationFence;
+
+impl crate::command::CommandMutationFence for DenyMutationFence {
+    fn before_write(&self, _intent: crate::command::CommandIntent) -> Result<(), String> {
+        Err("read-only planning authority forbids mutation".to_owned())
+    }
 }
 
 #[derive(Debug, Clone)]
-pub enum WriterCommandRunner {
+pub(crate) enum WriterCommandRunner {
     Local(ProcessRunner),
+    ReadOnly(FencedCommandRunner<ProcessRunner, DenyMutationFence>),
     Remote(FencedCommandRunner<ProcessRunner, Arc<RemoteLeaseGuard>>),
 }
 
 impl WriterCommandRunner {
     #[must_use]
-    pub fn with_remote_fence(runner: ProcessRunner, remote: Option<Arc<RemoteLeaseGuard>>) -> Self {
+    pub(crate) fn with_remote_fence(
+        runner: ProcessRunner,
+        remote: Option<Arc<RemoteLeaseGuard>>,
+    ) -> Self {
         match remote {
             Some(remote) => Self::Remote(FencedCommandRunner::new(runner, remote)),
             None => Self::Local(runner),
@@ -48,6 +62,7 @@ impl CommandRunner for WriterCommandRunner {
     ) -> Result<crate::command::CommandOutput, crate::command::CommandRunError> {
         match self {
             Self::Local(runner) => runner.run(command),
+            Self::ReadOnly(runner) => runner.run(command),
             Self::Remote(runner) => runner.run(command),
         }
     }
@@ -55,6 +70,7 @@ impl CommandRunner for WriterCommandRunner {
     fn github_api_telemetry(&self) -> crate::model::GitHubApiTelemetry {
         match self {
             Self::Local(runner) => runner.github_api_telemetry(),
+            Self::ReadOnly(runner) => runner.github_api_telemetry(),
             Self::Remote(runner) => runner.github_api_telemetry(),
         }
     }
@@ -70,6 +86,7 @@ impl WriterOperationGuard {
             WriterMode::LocalOnly => Ok(Self {
                 local: OperationLock::acquire(repository, operation)?,
                 remote: None,
+                read_only: false,
             }),
             WriterMode::ReadOnly => Err(AppError::structured(
                 ErrorCategory::Validation,
@@ -84,6 +101,16 @@ impl WriterOperationGuard {
                 Some(json!({"operation": operation, "writer_mode": "remote_fenced"})),
             )),
         }
+    }
+
+    /// Serialize a guaranteed read-only planning operation locally without
+    /// acquiring or requiring a remote writer lease.
+    pub fn acquire_planning(repository: &Path, operation: &str) -> Result<Self, AppError> {
+        Ok(Self {
+            local: OperationLock::acquire(repository, operation)?,
+            remote: None,
+            read_only: true,
+        })
     }
 
     /// Acquire remote ownership before the existing local lock. If local
@@ -102,6 +129,7 @@ impl WriterOperationGuard {
         let mut guard = Self {
             local,
             remote: Some(remote),
+            read_only: false,
         };
         guard.checkpoint(
             "writer_authority_acquired",
@@ -122,6 +150,7 @@ impl WriterOperationGuard {
         let mut derived = Self {
             local,
             remote: self.remote.clone(),
+            read_only: self.read_only,
         };
         if derived.remote.is_some() {
             derived.checkpoint(
@@ -145,8 +174,12 @@ impl WriterOperationGuard {
 
     /// Apply this operation's exact remote fence to a fully configured runner.
     #[must_use]
-    pub fn runner(&self, runner: ProcessRunner) -> WriterCommandRunner {
-        WriterCommandRunner::with_remote_fence(runner, self.remote.clone())
+    pub(crate) fn runner(&self, runner: ProcessRunner) -> WriterCommandRunner {
+        if self.read_only {
+            WriterCommandRunner::ReadOnly(FencedCommandRunner::new(runner, DenyMutationFence))
+        } else {
+            WriterCommandRunner::with_remote_fence(runner, self.remote.clone())
+        }
     }
 
     /// Persist operation evidence, automatically binding the latest remote
@@ -170,7 +203,11 @@ impl WriterOperationGuard {
 
     /// Release local ownership before dropping exact remote ownership.
     pub fn release(self) -> Result<(), AppError> {
-        let Self { local, remote } = self;
+        let Self {
+            local,
+            remote,
+            read_only: _,
+        } = self;
         local.release()?;
         drop(remote);
         Ok(())
@@ -383,6 +420,37 @@ mod tests {
                 .backend_revision
                 .ends_with("-renewed")
         );
+    }
+
+    #[test]
+    fn read_only_planning_allows_reads_and_refuses_marked_writes() {
+        let repository = init_repository();
+        let mut config = crate::config::CaravanConfig::default();
+        config.writer.mode = WriterMode::ReadOnly;
+        let context = crate::AppContext {
+            repository_path: repository.path().to_path_buf(),
+            config,
+            ..crate::AppContext::default()
+        };
+        for operation in [
+            "membership",
+            "sync",
+            "force",
+            "pause",
+            "priority",
+            "reshape",
+            "navigation",
+            "repair",
+        ] {
+            assert!(context.acquire_writer_operation(operation).is_err());
+        }
+        let planning = context.acquire_planning_operation("plan-sync").unwrap();
+        let runner = planning.runner(ProcessRunner::new());
+        runner.run(&CommandSpec::new("true")).unwrap();
+        assert!(matches!(
+            runner.run(&CommandSpec::new("true").provider_write()),
+            Err(CommandRunError::MutationFenceRefused { .. })
+        ));
     }
 
     #[test]

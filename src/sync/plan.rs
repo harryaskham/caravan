@@ -47,7 +47,7 @@ pub(crate) fn rename_mutation_failure_for_plan(error: AppError) -> AppError {
 
 #[allow(clippy::too_many_lines)]
 fn plan_sync_inner(context: &AppContext, input: &SyncInput) -> Result<SyncPlanOutput, AppError> {
-    let lock = context.acquire_writer_operation("plan-sync")?;
+    let lock = context.acquire_planning_operation("plan-sync")?;
     let started = Instant::now();
     let operation_deadline = started + sync_operation_budget(context);
     let github_budget =

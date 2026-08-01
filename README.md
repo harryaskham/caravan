@@ -568,7 +568,7 @@ stack_type: caravan
 github_auth:
   mode: ambient
 writer:
-  mode: local_only  # non-local modes remain startup-closed pending full fencing
+  mode: local_only  # or read_only / remote_fenced; see remote-writer-lease.md
 rebase_on_join: false
 command_timeout_secs: 30
 repair:
