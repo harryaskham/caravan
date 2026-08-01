@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use mcp_cli::ErrorCategory;
+use mcp_cli::{ErrorCategory, StructuredError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -1514,6 +1514,290 @@ pub(crate) fn verify_prepared_before(
     Ok(())
 }
 
+/// Receipt for one all-or-nothing multi-branch rewrite.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AtomicRebaseReceipt {
+    pub atomic: bool,
+    pub receipts: Vec<RebaseReceipt>,
+    pub old_heads: Vec<BranchSnapshot>,
+    pub new_heads: Vec<BranchSnapshot>,
+    /// True when the push response was ambiguous but exact remote inspection
+    /// proved every planned head committed.
+    pub recovered_ambiguous_success: bool,
+}
+
+/// Receipt proving one atomic rollback restored every original branch head.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AtomicRollbackReceipt {
+    pub atomic: bool,
+    pub restored_heads: Vec<BranchSnapshot>,
+    pub replaced_heads: Vec<BranchSnapshot>,
+}
+
+/// Apply several retained plans in one exact atomic remote transaction.
+///
+/// Every plan is fully verified before the sole write. Git's `--atomic`
+/// capability is the commit boundary: either every branch moves under its own
+/// force-with-lease or none does. This is the physical substrate for concat;
+/// provider membership is committed only after this returns.
+pub fn apply_prepared_atomically(
+    prepared: &[&PreparedRebase],
+) -> Result<AtomicRebaseReceipt, AppError> {
+    if prepared.is_empty() {
+        return Err(AppError::validation(
+            "atomic_rebase_empty",
+            "atomic rewrite requires at least one prepared branch",
+        ));
+    }
+    let repository = &prepared[0].worktree.repository;
+    let mut branches = std::collections::BTreeSet::new();
+    for item in prepared {
+        if &item.worktree.repository != repository {
+            return Err(AppError::validation(
+                "atomic_rebase_repository_mismatch",
+                "every atomic rewrite plan must belong to one repository",
+            ));
+        }
+        if !branches.insert(item.plan.branch.as_str()) {
+            return Err(AppError::validation(
+                "atomic_rebase_duplicate_branch",
+                "atomic rewrite plan names one branch more than once",
+            ));
+        }
+        verify_prepared(item)?;
+    }
+
+    let old_heads = prepared
+        .iter()
+        .map(|item| planned_branch(item, &item.plan.old_head_oid))
+        .collect::<Vec<_>>();
+    let new_heads = prepared
+        .iter()
+        .map(|item| planned_branch(item, &item.plan.new_head_oid))
+        .collect::<Vec<_>>();
+    let changed = prepared
+        .iter()
+        .copied()
+        .filter(|item| !item.plan.already_satisfied)
+        .collect::<Vec<_>>();
+    let receipts = prepared
+        .iter()
+        .map(|item| receipt_from_plan(&item.plan))
+        .collect::<Vec<_>>();
+    if changed.is_empty() {
+        return Ok(AtomicRebaseReceipt {
+            atomic: true,
+            receipts,
+            old_heads,
+            new_heads,
+            recovered_ambiguous_success: false,
+        });
+    }
+
+    let runner = process_runner(
+        &changed[0].worktree.path,
+        changed[0].worktree.timeout,
+        changed[0].worktree.operation_deadline,
+        changed[0].worktree.writer_fence.as_ref(),
+    );
+    let mut args = vec!["push".to_owned(), "--atomic".to_owned()];
+    args.extend(changed.iter().map(|item| item.plan.lease.clone()));
+    args.push("origin".to_owned());
+    args.extend(changed.iter().map(|item| {
+        format!(
+            "{}:refs/heads/{}",
+            item.plan.new_head_oid.0, item.plan.branch
+        )
+    }));
+    let push = require_success(
+        &runner,
+        CommandSpec::new("git").args(args).git_write(),
+        "atomic_rebase_push_failed",
+        "atomic exact-lease push failed; no partial success is assumed",
+    );
+    let recovered_ambiguous_success = if let Err(error) = push {
+        match classify_atomic_remote_state(&runner, &old_heads, &new_heads) {
+            Ok(AtomicRemoteState::AllNew) => true,
+            Ok(AtomicRemoteState::AllOld) => {
+                return Err(decision(
+                    "atomic_rebase_refused",
+                    "atomic push was refused and every branch retained its original head",
+                    json!({"old_heads": old_heads, "new_heads": new_heads, "source": error.details()}),
+                ));
+            }
+            Ok(AtomicRemoteState::Mixed) | Err(_) => {
+                return Err(decision(
+                    "atomic_rebase_indeterminate",
+                    "atomic push outcome could not be proven all-old or all-new",
+                    json!({"old_heads": old_heads, "new_heads": new_heads, "source": error.details(), "safe_next_action": "inspect every named remote branch; do not retry or mutate membership until all heads are classified"}),
+                ));
+            }
+        }
+    } else {
+        false
+    };
+    Ok(AtomicRebaseReceipt {
+        atomic: true,
+        receipts,
+        old_heads,
+        new_heads,
+        recovered_ambiguous_success,
+    })
+}
+
+/// Restore an applied atomic rewrite under exact new-head leases.
+pub fn rollback_prepared_atomically(
+    prepared: &[&PreparedRebase],
+) -> Result<AtomicRollbackReceipt, AppError> {
+    if prepared.is_empty() {
+        return Err(AppError::validation(
+            "atomic_rebase_empty",
+            "atomic rollback requires at least one prepared branch",
+        ));
+    }
+    let changed = prepared
+        .iter()
+        .copied()
+        .filter(|item| !item.plan.already_satisfied)
+        .collect::<Vec<_>>();
+    let restored_heads = prepared
+        .iter()
+        .map(|item| planned_branch(item, &item.plan.old_head_oid))
+        .collect::<Vec<_>>();
+    let replaced_heads = prepared
+        .iter()
+        .map(|item| planned_branch(item, &item.plan.new_head_oid))
+        .collect::<Vec<_>>();
+    if changed.is_empty() {
+        return Ok(AtomicRollbackReceipt {
+            atomic: true,
+            restored_heads,
+            replaced_heads,
+        });
+    }
+    let runner = process_runner(
+        &changed[0].worktree.path,
+        changed[0].worktree.timeout,
+        changed[0].worktree.operation_deadline,
+        changed[0].worktree.writer_fence.as_ref(),
+    );
+    let mut args = vec!["push".to_owned(), "--atomic".to_owned()];
+    args.extend(changed.iter().map(|item| {
+        format!(
+            "--force-with-lease=refs/heads/{}:{}",
+            item.plan.branch, item.plan.new_head_oid.0
+        )
+    }));
+    args.push("origin".to_owned());
+    args.extend(changed.iter().map(|item| {
+        format!(
+            "{}:refs/heads/{}",
+            item.plan.old_head_oid.0, item.plan.branch
+        )
+    }));
+    if let Err(error) = require_success(
+        &runner,
+        CommandSpec::new("git").args(args).git_write(),
+        "atomic_rebase_rollback_failed",
+        "atomic rollback push failed; original branch heads are not claimed restored",
+    ) {
+        return match classify_atomic_remote_state(&runner, &restored_heads, &replaced_heads) {
+            Ok(AtomicRemoteState::AllOld) => Ok(AtomicRollbackReceipt {
+                atomic: true,
+                restored_heads,
+                replaced_heads,
+            }),
+            _ => Err(decision(
+                "atomic_rebase_rollback_indeterminate",
+                "atomic rollback could not prove every original branch head restored",
+                json!({"restored_heads": restored_heads, "replaced_heads": replaced_heads, "source": error.details(), "safe_next_action": "inspect every named remote branch and preserve the receipt before any retry"}),
+            )),
+        };
+    }
+    Ok(AtomicRollbackReceipt {
+        atomic: true,
+        restored_heads,
+        replaced_heads,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AtomicRemoteState {
+    AllOld,
+    AllNew,
+    Mixed,
+}
+
+fn planned_branch(prepared: &PreparedRebase, oid: &CommitOid) -> BranchSnapshot {
+    BranchSnapshot {
+        repository: prepared.plan.new_base.branch().repository.clone(),
+        name: prepared.plan.branch.clone(),
+        oid: oid.clone(),
+    }
+}
+
+fn classify_atomic_remote_state(
+    runner: &impl CommandRunner,
+    old_heads: &[BranchSnapshot],
+    new_heads: &[BranchSnapshot],
+) -> Result<AtomicRemoteState, AppError> {
+    let mut old = true;
+    let mut new = true;
+    for (old_head, new_head) in old_heads.iter().zip(new_heads) {
+        let actual = remote_head_oid(runner, "origin", &old_head.name)?;
+        old &= actual == old_head.oid;
+        new &= actual == new_head.oid;
+    }
+    Ok(if old {
+        AtomicRemoteState::AllOld
+    } else if new {
+        AtomicRemoteState::AllNew
+    } else {
+        AtomicRemoteState::Mixed
+    })
+}
+
+fn remote_head_oid(
+    runner: &impl CommandRunner,
+    remote: &str,
+    branch: &str,
+) -> Result<CommitOid, AppError> {
+    let reference = format!("refs/heads/{branch}");
+    let advertised = require_success(
+        runner,
+        CommandSpec::new("git").args(["ls-remote", "--refs", remote, reference.as_str()]),
+        "rebase_remote_head_unavailable",
+        "could not verify the exact remote branch head",
+    )?;
+    let actual = advertised
+        .stdout
+        .split_whitespace()
+        .next()
+        .unwrap_or_default();
+    validate_oid(&CommitOid(actual.to_owned()))?;
+    Ok(CommitOid(actual.to_owned()))
+}
+
+fn receipt_from_plan(plan: &RebasePlan) -> RebaseReceipt {
+    RebaseReceipt {
+        pr: plan.pr,
+        branch: plan.branch.clone(),
+        old_head_oid: plan.old_head_oid.clone(),
+        new_head_oid: plan.new_head_oid.clone(),
+        old_base_oid: plan.old_base_oid.clone(),
+        new_base_branch: plan.new_base.branch().name.clone(),
+        new_base_oid: plan.new_base.branch().oid.clone(),
+        new_tree_oid: plan.new_tree_oid.clone(),
+        commit_count: plan.commit_count,
+        merge_topology: plan.merge_topology.clone(),
+        squash_reconciliation: plan.squash_reconciliation.clone(),
+        ci_trigger_workflows: plan.ci_trigger_workflows.clone(),
+        lease: plan.lease.clone(),
+        already_satisfied: plan.already_satisfied,
+        rewrite_reason: plan.rewrite_reason.clone(),
+    }
+}
+
 /// Push the exact retained planned object under its original old-head lease.
 pub fn apply_prepared(prepared: &PreparedRebase) -> Result<RebaseReceipt, AppError> {
     verify_prepared(prepared)?;
@@ -2273,6 +2557,7 @@ mod tests {
 
     struct Fixture {
         _root: tempfile::TempDir,
+        bare: PathBuf,
         clone: PathBuf,
         repository: RepositoryId,
         old_main: CommitOid,
@@ -2321,6 +2606,7 @@ mod tests {
 
         Fixture {
             _root: root,
+            bare,
             clone,
             repository: RepositoryId {
                 owner: "owner".to_owned(),
@@ -2363,6 +2649,105 @@ mod tests {
             merged_at: None,
             updated_at: None,
         }
+    }
+
+    fn prepared_atomic_pair() -> (Fixture, PreparedRebase, PreparedRebase, CommitOid) {
+        let fixture = fixture();
+        git(&fixture.clone, &["checkout", "-b", "child"]);
+        std::fs::write(fixture.clone.join("child"), "child\n").unwrap();
+        git(&fixture.clone, &["add", "child"]);
+        git(&fixture.clone, &["commit", "-m", "child"]);
+        let child_head = CommitOid(git(&fixture.clone, &["rev-parse", "HEAD"]));
+        git(&fixture.clone, &["push", "-u", "origin", "child"]);
+
+        let parent = open_candidate(
+            1,
+            "parent",
+            branch(&fixture.repository, "feature", &fixture.feature),
+            branch(&fixture.repository, "main", &fixture.old_main),
+        );
+        let child = open_candidate(
+            2,
+            "child",
+            branch(&fixture.repository, "child", &child_head),
+            branch(&fixture.repository, "feature", &fixture.feature),
+        );
+        let default = branch(&fixture.repository, "main", &fixture.new_main);
+        let prepared_parent = prepare_candidate(
+            &fixture.clone,
+            &fixture.repository,
+            &parent,
+            range_base_for_remote_target(&parent, &default),
+            PlannedBase::Remote(default.clone()),
+            &default,
+            RebaseExecutionBudget::new(TEST_REBASE_BUDGET),
+        )
+        .expect("prepare atomic parent");
+        let simulated_parent = branch(
+            &fixture.repository,
+            "feature",
+            &prepared_parent.plan.new_head_oid,
+        );
+        let prepared_child = prepare_candidate(
+            &fixture.clone,
+            &fixture.repository,
+            &child,
+            range_base_for_rewritten_parent(&child, &parent.head),
+            PlannedBase::Simulated(simulated_parent),
+            &default,
+            RebaseExecutionBudget::new(TEST_REBASE_BUDGET),
+        )
+        .expect("prepare atomic child");
+        (fixture, prepared_parent, prepared_child, child_head)
+    }
+
+    fn remote_branch(fixture: &Fixture, branch: &str) -> String {
+        git(
+            &fixture.clone,
+            &["ls-remote", "origin", &format!("refs/heads/{branch}")],
+        )
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned()
+    }
+
+    #[test]
+    fn atomic_multi_ref_apply_and_rollback_move_every_branch_together() {
+        let (fixture, parent, child, child_head) = prepared_atomic_pair();
+        let receipt = apply_prepared_atomically(&[&parent, &child]).unwrap();
+        assert!(receipt.atomic);
+        assert_eq!(receipt.receipts.len(), 2);
+        assert_eq!(
+            remote_branch(&fixture, "feature"),
+            parent.plan.new_head_oid.0
+        );
+        assert_eq!(remote_branch(&fixture, "child"), child.plan.new_head_oid.0);
+
+        let rollback = rollback_prepared_atomically(&[&parent, &child]).unwrap();
+        assert!(rollback.atomic);
+        assert_eq!(remote_branch(&fixture, "feature"), fixture.feature.0);
+        assert_eq!(remote_branch(&fixture, "child"), child_head.0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_multi_ref_server_rejection_moves_no_planned_branch() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (fixture, parent, child, child_head) = prepared_atomic_pair();
+        let hook = fixture.bare.join("hooks/pre-receive");
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\nwhile read old new ref; do\n  [ \"$ref\" = refs/heads/child ] && exit 1\ndone\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error = apply_prepared_atomically(&[&parent, &child]).unwrap_err();
+        assert_eq!(error.code(), "atomic_rebase_refused");
+        assert_eq!(remote_branch(&fixture, "feature"), fixture.feature.0);
+        assert_eq!(remote_branch(&fixture, "child"), child_head.0);
     }
 
     #[test]

@@ -1898,9 +1898,11 @@ mod tests {
             .split("\n#[cfg(test)]\nmod tests")
             .next()
             .unwrap();
-        assert_eq!(physical.matches("\"push\"").count(), 3);
+        // One ordinary push, two no-write dry-run preflights, and the atomic
+        // concat apply/rollback pushes. Every real write must carry GitWrite.
+        assert_eq!(physical.matches("\"push\"").count(), 5);
         assert_eq!(physical.matches("\"--dry-run\"").count(), 2);
-        assert_eq!(physical.matches(".git_write()").count(), 1);
+        assert_eq!(physical.matches(".git_write()").count(), 3);
 
         let repair = include_str!("repair.rs")
             .split("\n#[cfg(test)]\nmod tests")
