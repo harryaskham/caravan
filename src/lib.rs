@@ -238,10 +238,12 @@ the exact pinned binary. It performs strict parsing and no repository/provider a
    network operation is never silent. JSON and MCP callers install no observer
    and keep byte-identical envelopes.
 
-GITHUB NATIVE STACKS (EXPLICIT PREVIEW)
+GITHUB NATIVE STACKS (EXPLICIT OPT-IN)
 - `stack_type: caravan` is the stable default and makes no native Stack API
-  calls. `stack_type: github` discovers and compares GitHub's ordered Stack
-  object but ordinary Cara mutations remain fenced until rollout is complete.
+  calls. `stack_type: github` plus a reviewed `stack_rollout.mutations_opt_in`
+  enables exact Stack membership, reshape, and lock-fenced landing; capability,
+  mapping, generation, hold, compatibility, CI, and force gates still fail
+  closed before provider mutation.
 - The installed `gh stack` CLI does not merge Stacks. It creates, links,
   submits, rebases, and synchronizes branch/PR topology; GitHub's web merge uses
   the same asynchronous REST endpoint that accepts only the selected top SHA.
@@ -254,9 +256,8 @@ GITHUB NATIVE STACKS (EXPLICIT PREVIEW)
   only the exact ruleset generation. Lost lock or lower-head drift is
   `indeterminate`, never permission to retry unlocked.
 - The ruleset path requires explicit GitHub Administration(write), which is not
-  part of the baseline App policy. Do not broaden permissions or remove
-  `github_stack_backend_read_only` until the ruleset-locked orchestrator and
-  repository policy are both enabled by a reviewed Cara release.
+  part of the baseline App policy. Grant it only to a reviewed native-Stack
+  deployment; ordinary Caravan mode never needs it.
 - GitHub exposes no arbitrary Stack remove or reorder, so evict and split are a
   resumable unstack/rebuild transaction, never a provider-atomic operation. Its
   sealed checkpoints record `preflighted`, `unstacked`, `reshape_applied`,
@@ -269,12 +270,10 @@ GITHUB NATIVE STACKS (EXPLICIT PREVIEW)
   admission deterministically uses another compatible caravan or opens a new
   one, and sync still lands the maximal contiguous ready prefix rather than
   waiting for a batch to fill.
-- `stack_rollout.mutations_opt_in` with a recorded `reviewed_by` is a required
-  per-repository allowlist and is deliberately not sufficient: status reports
-  `github_stack_repository_not_opted_in` without it, and
-  `github_stack_backend_read_only` with it, until the reviewed ruleset-locked
-  orchestrator ships. Unavailable or unproven capability outranks both and is
-  never treated as an absent Stack.
+- `stack_rollout.mutations_opt_in` with a recorded `reviewed_by` is the required
+  per-repository allowlist. Without it status reports
+  `github_stack_repository_not_opted_in`; unavailable or unproven capability
+  outranks the opt-in and is never treated as an absent Stack.
 
 VIRTUAL CHAINS (SAFE DEFAULT)
 With `rebase_on_join: false` or an absent setting, Caravan does not rewrite PR

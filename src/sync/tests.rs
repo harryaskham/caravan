@@ -57,6 +57,9 @@ struct FakeProvider {
     rerequestable_suites: RefCell<BTreeMap<u64, String>>,
     /// Check-suite rerequests observed, in order.
     rerequests: RefCell<Vec<(PrNumber, u64)>>,
+    /// Optional exact native Stack generation for sync integration tests.
+    native_stack: RefCell<Option<crate::github::GitHubStackGeneration>>,
+    native_stack_reads: RefCell<u32>,
 }
 
 impl FakeProvider {
@@ -93,6 +96,8 @@ impl FakeProvider {
             lineage_reads: RefCell::new(Vec::new()),
             rerequestable_suites: RefCell::new(BTreeMap::new()),
             rerequests: RefCell::new(Vec::new()),
+            native_stack: RefCell::new(None),
+            native_stack_reads: RefCell::new(0),
         }
     }
 
@@ -207,6 +212,15 @@ impl FakeProvider {
 }
 
 impl SyncProvider for FakeProvider {
+    fn native_stack_generation_for_sync(
+        &self,
+        _repository: &RepositoryId,
+        _stack_number: u64,
+    ) -> Result<Option<crate::github::GitHubStackGeneration>, AppError> {
+        *self.native_stack_reads.borrow_mut() += 1;
+        Ok(self.native_stack.borrow().clone())
+    }
+
     fn verify_pull_request(
         &self,
         _repository: &RepositoryId,
@@ -7324,5 +7338,94 @@ fn a_full_batch_opens_another_caravan_instead_of_waiting() {
             .any(|reason| reason.contains("max_caravan_length")),
         "the receipt must name the exact bound that redirected admission: {:?}",
         bounded.reasons
+    );
+}
+
+/// bd-3eae33: the executable sync seam reads one exact mapped Stack and feeds
+/// it through Cara readiness. A non-ready bottom entry waits without acquiring
+/// a ruleset or writing a durable landing checkpoint.
+#[test]
+fn native_sync_waits_before_lock_when_the_ready_prefix_is_empty() {
+    let pulls = linear_chain(2);
+    let status = status(pulls.clone(), None, &clean);
+    let caravan = status.analysis.fleet.caravans[0].clone();
+    let base = status.analysis.fleet.default_branch.clone();
+    let root = status.analysis.pull_requests.get(&PrNumber(1)).unwrap();
+    let child = status.analysis.pull_requests.get(&PrNumber(2)).unwrap();
+    let generation = crate::github::GitHubStackGeneration {
+        id: 1,
+        number: 42,
+        node_id: "S_sync".to_owned(),
+        open: true,
+        created_at: "2026-08-01T09:00:00Z".to_owned(),
+        topology: crate::github::GitHubStackTopology {
+            base,
+            entries: vec![
+                crate::github::GitHubStackEntryGeneration {
+                    position: 0,
+                    pr: root.number,
+                    stack_state: "open".to_owned(),
+                    pull_request_state: root.state,
+                    draft: root.draft,
+                    merged_at: None,
+                    base: root.base.clone(),
+                    head: root.head.clone(),
+                },
+                crate::github::GitHubStackEntryGeneration {
+                    position: 1,
+                    pr: child.number,
+                    stack_state: "open".to_owned(),
+                    pull_request_state: child.state,
+                    draft: child.draft,
+                    merged_at: None,
+                    base: child.base.clone(),
+                    head: child.head.clone(),
+                },
+            ],
+        },
+    };
+    let provider = FakeProvider::with_pull_requests(pulls);
+    *provider.native_stack.borrow_mut() = Some(generation);
+
+    let directory = tempfile::tempdir().unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(directory.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut config = crate::config::CaravanConfig::default();
+    config.stack_type = crate::config::StackType::Github;
+    config.stack_rollout.mutations_opt_in = true;
+    config.stack_rollout.reviewed_by = "operator".to_owned();
+    let native = NativeSyncContext {
+        config,
+        repository_path: directory.path().to_path_buf(),
+    };
+    let mut progress = SyncProgress::new(&status, vec![caravan.id], 64);
+    // No passing CI observations: the policy bridge must stop at the bottom.
+    progress
+        .drain_native_stack(&provider, &status, &caravan, 42, &native)
+        .expect("an empty ready prefix is an ordinary wait");
+
+    assert_eq!(*provider.native_stack_reads.borrow(), 1);
+    assert!(progress.native_stack_land.is_empty());
+    assert!(
+        progress
+            .steps
+            .iter()
+            .all(|step| step.kind != MutationKind::NativeStackLand),
+        "no ruleset/submit/release write is allowed before a ready prefix"
+    );
+    assert!(
+        crate::stack_checkpoint::load::<crate::github::GitHubStackLandCheckpoint>(
+            directory.path(),
+            "land-42",
+        )
+        .unwrap()
+        .is_none(),
+        "waiting creates no durable landing intent"
     );
 }

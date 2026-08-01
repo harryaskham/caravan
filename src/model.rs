@@ -1182,6 +1182,8 @@ pub enum MutationKind {
     /// to recover required contexts that never started a run.
     RequestCheckSuite,
     SquashMerge,
+    /// One phase of the exact lock-fenced native Stack landing transaction.
+    NativeStackLand,
     Checkout,
 }
 

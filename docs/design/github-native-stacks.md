@@ -243,12 +243,12 @@ No mutation is used as a capability probe.
 
 ### Phases
 
-1. **Schema and read-only status** — optional enum, default preservation, capability and Stack discovery, drift diagnostics.
-2. **Stack create/add** — membership adapter with exact idempotent receipts; no merge.
-3. **Async merge preview** — plan and preflight only; expose selected prefix and lower-head lease gap.
-4. **Sandbox direct merge** — completed with a negative lower-lease result; atomic failure, success, partial merge, squash results, remaining-entry rebase, and both fast-forward/rewind lower-head races are recorded in `docs/validation/github-native-stack-sandbox-2026-07-31.md`.
-5. **Opt-in merge** — permitted only after the proven exact-ref no-bypass ruleset lock is fully wired, durably checkpointed, and exposed as an explicit Administration(write) opt-in; allowlisting alone is insufficient.
-6. **Reshape rebuild** — unstack/recreate for evict and split.
+1. **Schema and status** — optional enum, default preservation, capability and Stack discovery, drift diagnostics.
+2. **Stack create/add** — membership workflow converges exact idempotent singleton/create/add receipts.
+3. **Async merge** — policy bridge selects a maximal ready prefix; exact-ref no-bypass ruleset lock is durably checkpointed through terminal proof and release.
+4. **Provider proof** — completed with a negative native lower-lease result and a positive ruleset-lock result; atomic failure, success, partial merge, squash results, remaining-entry rebase, and both fast-forward/rewind lower-head races are recorded in `docs/validation/github-native-stack-sandbox-2026-07-31.md`.
+5. **Opt-in merge** — executable only with proven capability, exact mapping/generation, reviewed repository opt-in, and explicit Administration(write) authority for the operation-scoped ruleset.
+6. **Reshape rebuild** — evict/split run the durable preflight/unstack/Cara reshape/rebuild/verify transaction.
 7. **Merge-queue adapter** — separate acceptance; `enqueued` is not direct atomic landing proof.
 
 Each phase leaves `stack_type: caravan` untouched.

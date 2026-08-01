@@ -376,6 +376,7 @@ mod tests {
                 root_auto_merge: Vec::new(),
                 root_promotion: Vec::new(),
                 root_merge: Vec::new(),
+                native_stack_land: Vec::new(),
                 required_runs: Vec::new(),
                 rebase_plans: Vec::new(),
                 rebase_receipts: Vec::new(),

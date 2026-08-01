@@ -376,17 +376,6 @@ pub fn init_with_provider(
     default_branch: &str,
     provider: &impl InitializationProvider,
 ) -> Result<InitOutput, AppError> {
-    if context.config.stack_type == crate::config::StackType::Github {
-        return Err(AppError::structured(
-            ErrorCategory::Validation,
-            "github_stack_backend_read_only",
-            "GitHub native Stack mode is read-only in this rollout phase",
-            Some(json!({
-                "mutation_blocked": true,
-                "next": "keep stack_type: caravan while running `cara init`; opt into github only for read-only status until the reviewed Stack adapter is released",
-            })),
-        ));
-    }
     let config = ensure_config(context)?;
 
     let permission = provider.permission(repository).map_err(provider_error)?;
@@ -1298,43 +1287,27 @@ mod tests {
     }
 
     #[test]
-    fn github_stack_preview_blocks_init_before_provider_mutation() {
-        let directory = tempfile::tempdir().unwrap();
-        let provider = FakeProvider::new(Vec::new());
-        let mut context = context(&directory);
-        context.config.stack_type = crate::config::StackType::Github;
-        context.config.sync.head_merge_actor = Some(crate::model::HeadMergeActor::Caravan);
-
-        let error = init_with_provider(&context, &repository(), "main", &provider)
-            .expect_err("preview initialization must make zero writes");
-
-        assert_eq!(error.code(), "github_stack_backend_read_only");
-        assert!(provider.labels.lock().unwrap().is_empty());
-        assert!(!directory.path().join(".caravan/config.yaml").exists());
-    }
-
-    #[test]
-    fn typed_preview_blocker_wins_over_generic_initialization_refusal() {
+    fn typed_native_blocker_wins_over_generic_initialization_refusal() {
         let status = InitializationStatus {
             ready: false,
             mutation_blocker: Some(InitializationMutationBlocker {
-                code: "github_stack_backend_read_only".to_owned(),
-                message: "GitHub Stack mode is read-only".to_owned(),
+                code: "github_stack_capability_unknown".to_owned(),
+                message: "GitHub Stack capability is unknown".to_owned(),
                 next: "select stack_type: caravan".to_owned(),
             }),
             ..InitializationStatus::default()
         };
 
-        let error = require_ready(&status).expect_err("preview must make zero writes");
+        let error = require_ready(&status).expect_err("blocked native mode must make zero writes");
 
-        assert_eq!(error.code(), "github_stack_backend_read_only");
+        assert_eq!(error.code(), "github_stack_capability_unknown");
         assert_eq!(error.details().unwrap()["mutation_blocked"], true);
     }
 
     /// bd-a79679: the native-Stack rollout fence is only as strong as its
     /// weakest mutating entry point. Every domain that performs provider or
     /// branch mutations must consult initialization readiness, which is where
-    /// the capability, repository opt-in, and read-only fence blockers live.
+    /// the capability and repository opt-in blockers live.
     #[test]
     fn every_mutating_domain_consults_the_rollout_fence() {
         for (name, source) in [
@@ -1367,7 +1340,6 @@ mod tests {
             "github_stack_capability_unavailable",
             "github_stack_capability_unknown",
             "github_stack_repository_not_opted_in",
-            "github_stack_backend_read_only",
         ] {
             let status = InitializationStatus {
                 ready: false,

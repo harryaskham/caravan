@@ -183,7 +183,20 @@ export CARA_GITHUB_APP_INSTALLATION_ID=12345
 ```
 
 Mode, slug, and installation must match repository policy exactly, or Cara
-refuses before any provider read.
+refuses before any provider read. A repository using native GitHub Stacks also
+needs its reviewed rollout declaration; selecting the backend alone is never
+enough:
+
+```yaml
+min_cara_version: "0.0.65"
+stack_type: github
+stack_rollout:
+  mutations_opt_in: true
+  reviewed_by: "operator/change-ticket"
+rebase_on_join: false
+sync:
+  head_merge_actor: caravan
+```
 
 ## 7. Verify
 

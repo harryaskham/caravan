@@ -117,7 +117,7 @@ This closes the ordinary-user and repository-owner lower-head race without prete
 - Complete-group optimistic concurrency is **not** provided by the merge API itself because a lower rewind preserving linearity can merge at a generation different from Cara's sealed intent.
 - An active exact-ref no-bypass repository ruleset is a proven preventive equivalent: it blocks SSH and REST owner writes while permitting GitHub to merge the selected prefix and rewrite only the unselected suffix.
 
-The `github_stack_backend_read_only` workflow fence remains closed until the ruleset lock is threaded through executable Stack orchestration and its Administration(write) permission is explicit. It may then open only for the exact ruleset-locked path; an unlocked top-SHA-only merge remains permanently invalid.
+The executable path is now restricted to the exact ruleset-locked orchestrator and requires the explicit, conditional Administration(write) permission plus a reviewed per-repository opt-in. An unlocked top-SHA-only merge remains permanently invalid.
 
 ## Cleanup
 

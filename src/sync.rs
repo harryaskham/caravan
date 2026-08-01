@@ -786,6 +786,10 @@ pub struct SyncOutput {
     /// landed content actually reached the default branch.
     #[serde(default)]
     pub root_merge: Vec<RootMergeReceipt>,
+    /// Durable native Stack landing transactions completed or still pending in
+    /// this tick. Absent on the stable Caravan backend.
+    #[serde(default)]
+    pub native_stack_land: Vec<crate::github::GitHubStackLandCheckpoint>,
     /// Durable per-member proof that every required context has reporting run
     /// lineage on the exact current head, or the typed reason it does not.
     #[serde(default)]
@@ -823,6 +827,63 @@ pub struct SyncOutput {
 
 /// Provider facts and primitives required by sync policy.
 pub trait SyncProvider {
+    /// Exact native Stack generation. Default refuses so test/provider doubles
+    /// and the stable Caravan path gain no accidental native authority.
+    fn native_stack_generation_for_sync(
+        &self,
+        _repository: &RepositoryId,
+        _stack_number: u64,
+    ) -> Result<Option<crate::github::GitHubStackGeneration>, AppError> {
+        Err(AppError::validation(
+            "github_stack_sync_provider_unavailable",
+            "this sync provider does not implement native Stack reads",
+        ))
+    }
+
+    fn native_stack_land_lock_for_sync(
+        &self,
+        _repository: &RepositoryId,
+        _checkpoint: &crate::github::GitHubStackLandCheckpoint,
+    ) -> Result<crate::github::GitHubStackLandCheckpoint, AppError> {
+        Err(AppError::validation(
+            "github_stack_sync_provider_unavailable",
+            "this sync provider does not implement native Stack lock acquisition",
+        ))
+    }
+
+    fn native_stack_land_submit_for_sync(
+        &self,
+        _repository: &RepositoryId,
+        _checkpoint: &crate::github::GitHubStackLandCheckpoint,
+    ) -> Result<crate::github::GitHubStackLandCheckpoint, AppError> {
+        Err(AppError::validation(
+            "github_stack_sync_provider_unavailable",
+            "this sync provider does not implement native Stack submission",
+        ))
+    }
+
+    fn native_stack_land_poll_for_sync(
+        &self,
+        _repository: &RepositoryId,
+        _checkpoint: &crate::github::GitHubStackLandCheckpoint,
+    ) -> Result<crate::github::GitHubStackLandCheckpoint, AppError> {
+        Err(AppError::validation(
+            "github_stack_sync_provider_unavailable",
+            "this sync provider does not implement native Stack polling",
+        ))
+    }
+
+    fn native_stack_land_release_for_sync(
+        &self,
+        _repository: &RepositoryId,
+        _checkpoint: &crate::github::GitHubStackLandCheckpoint,
+    ) -> Result<crate::github::GitHubStackLandCheckpoint, AppError> {
+        Err(AppError::validation(
+            "github_stack_sync_provider_unavailable",
+            "this sync provider does not implement native Stack lock release",
+        ))
+    }
+
     fn verify_pull_request(
         &self,
         repository: &RepositoryId,
@@ -995,7 +1056,64 @@ pub trait SyncProvider {
     ) -> Result<GitHubMutationReceipt, MutationError>;
 }
 
+fn native_sync_error(error: impl std::fmt::Display) -> AppError {
+    AppError::structured(
+        ErrorCategory::ExecutionFailure,
+        "github_stack_sync_incomplete",
+        error.to_string(),
+        Some(json!({
+            "resumable": true,
+            "safe_next_action": "rerun the same sync; the persisted native Stack checkpoint resumes without repeating a proven lock, submission, merge, or release",
+        })),
+    )
+}
+
 impl<R: crate::command::CommandRunner> SyncProvider for GitHubMutationAdapter<R> {
+    fn native_stack_generation_for_sync(
+        &self,
+        repository: &RepositoryId,
+        stack_number: u64,
+    ) -> Result<Option<crate::github::GitHubStackGeneration>, AppError> {
+        self.native_stack_generation(repository, stack_number)
+            .map_err(native_sync_error)
+    }
+
+    fn native_stack_land_lock_for_sync(
+        &self,
+        repository: &RepositoryId,
+        checkpoint: &crate::github::GitHubStackLandCheckpoint,
+    ) -> Result<crate::github::GitHubStackLandCheckpoint, AppError> {
+        self.native_stack_land_lock(repository, checkpoint)
+            .map_err(native_sync_error)
+    }
+
+    fn native_stack_land_submit_for_sync(
+        &self,
+        repository: &RepositoryId,
+        checkpoint: &crate::github::GitHubStackLandCheckpoint,
+    ) -> Result<crate::github::GitHubStackLandCheckpoint, AppError> {
+        self.native_stack_land_submit(repository, checkpoint)
+            .map_err(native_sync_error)
+    }
+
+    fn native_stack_land_poll_for_sync(
+        &self,
+        repository: &RepositoryId,
+        checkpoint: &crate::github::GitHubStackLandCheckpoint,
+    ) -> Result<crate::github::GitHubStackLandCheckpoint, AppError> {
+        self.native_stack_land_poll(repository, checkpoint)
+            .map_err(native_sync_error)
+    }
+
+    fn native_stack_land_release_for_sync(
+        &self,
+        repository: &RepositoryId,
+        checkpoint: &crate::github::GitHubStackLandCheckpoint,
+    ) -> Result<crate::github::GitHubStackLandCheckpoint, AppError> {
+        self.native_stack_land_release(repository, checkpoint)
+            .map_err(native_sync_error)
+    }
+
     fn verify_pull_request(
         &self,
         repository: &RepositoryId,
@@ -2348,6 +2466,7 @@ fn bounded_prefix_output(
         root_auto_merge: Vec::new(),
         root_promotion: progress.root_promotion,
         root_merge: progress.root_merge,
+        native_stack_land: progress.native_stack_land,
         required_runs: progress.required_runs,
         rebase_plans: progress.rebase_plans,
         rebase_receipts: progress.rebase_receipts,
@@ -2649,7 +2768,7 @@ fn sync_with_lock(
         .filter(|receipt| !receipt.already_satisfied)
         .map(|receipt| (receipt.pr, receipt.new_head_oid.clone()))
         .collect::<BTreeMap<_, _>>();
-    let mut progress = execute_bounded(
+    let mut progress = execute_bounded_with_native(
         &status,
         &provider,
         input.all,
@@ -2662,6 +2781,7 @@ fn sync_with_lock(
             .saturating_sub(physical_mutations),
         &rewritten_heads,
         RequiredRunsPolicy::from_config(&context.config.sync),
+        NativeSyncContext::from_context(context),
     )?;
     progress::emit(
         "provider_convergence",
@@ -2783,7 +2903,7 @@ fn sync_with_lock(
         // convergence pass owns CI observation and rolling-head invariants for
         // newly admitted members under the same lock and deadline.
         if !auto_admission.joins.is_empty() {
-            let post_admission = execute_bounded(
+            let post_admission = execute_bounded_with_native(
                 &final_status,
                 &provider,
                 true,
@@ -2796,6 +2916,7 @@ fn sync_with_lock(
                     .saturating_sub(completed_mutation_count(&progress)),
                 &rewritten_heads,
                 RequiredRunsPolicy::from_config(&context.config.sync),
+                NativeSyncContext::from_context(context),
             )
             .map_err(|error| {
                 attach_auto_admission_progress(&error, context, &progress, &github_budget)
@@ -2867,6 +2988,7 @@ fn sync_with_lock(
         root_auto_merge: progress.root_auto_merge,
         root_promotion: progress.root_promotion,
         root_merge: progress.root_merge,
+        native_stack_land: progress.native_stack_land,
         required_runs: progress.required_runs,
         rebase_plans: progress.rebase_plans,
         rebase_receipts: progress.rebase_receipts,
@@ -2959,6 +3081,9 @@ fn merge_sync_progress(target: &mut SyncProgress, mut source: SyncProgress) {
     for (branch, read) in std::mem::take(&mut source.required_contexts) {
         target.required_contexts.entry(branch).or_insert(read);
     }
+    target
+        .native_stack_land
+        .append(&mut source.native_stack_land);
     target.rebase_plans.append(&mut source.rebase_plans);
     target.rebase_receipts.append(&mut source.rebase_receipts);
     target.paused_caravans.append(&mut source.paused_caravans);
@@ -3884,7 +4009,7 @@ fn execute(
     rerun_failed: bool,
     force_merge: bool,
 ) -> Result<SyncProgress, AppError> {
-    execute_bounded(
+    execute_bounded_with_native(
         status,
         provider,
         all,
@@ -3893,6 +4018,7 @@ fn execute(
         u32::MAX,
         &BTreeMap::new(),
         RequiredRunsPolicy::default(),
+        None,
     )
 }
 
@@ -3902,7 +4028,7 @@ fn execute_with_required_runs(
     provider: &impl SyncProvider,
     required_runs: RequiredRunsPolicy,
 ) -> Result<SyncProgress, AppError> {
-    execute_bounded(
+    execute_bounded_with_native(
         status,
         provider,
         false,
@@ -3911,9 +4037,11 @@ fn execute_with_required_runs(
         u32::MAX,
         &BTreeMap::new(),
         required_runs,
+        None,
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn execute_bounded(
     status: &StatusOutput,
@@ -3924,6 +4052,31 @@ fn execute_bounded(
     mutation_limit: u32,
     rewritten_heads: &BTreeMap<PrNumber, crate::model::CommitOid>,
     required_runs: RequiredRunsPolicy,
+) -> Result<SyncProgress, AppError> {
+    execute_bounded_with_native(
+        status,
+        provider,
+        all,
+        rerun_failed,
+        force_merge,
+        mutation_limit,
+        rewritten_heads,
+        required_runs,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_bounded_with_native(
+    status: &StatusOutput,
+    provider: &impl SyncProvider,
+    all: bool,
+    rerun_failed: bool,
+    force_merge: bool,
+    mutation_limit: u32,
+    rewritten_heads: &BTreeMap<PrNumber, crate::model::CommitOid>,
+    required_runs: RequiredRunsPolicy,
+    native_stack: Option<NativeSyncContext>,
 ) -> Result<SyncProgress, AppError> {
     let mut caravans = select_caravans(status, all)?;
     let paused_caravans = status
@@ -3944,6 +4097,7 @@ fn execute_bounded(
     });
     let synchronized_caravans = caravans.iter().map(|caravan| caravan.id).collect();
     let mut progress = SyncProgress::new(status, synchronized_caravans, mutation_limit);
+    progress.native_stack = native_stack;
     progress.required_runs_grace_secs = required_runs.grace_secs;
     progress.required_runs_retrigger_enabled = required_runs.retrigger;
     progress.paused_caravans = paused_caravans;
@@ -4060,6 +4214,22 @@ fn reconcile_caravan(
             }
             ci_failure = Some(observation);
             break;
+        }
+    }
+
+    if let Some(native) = progress.native_stack.clone() {
+        match crate::stack_policy::route_landing(&native.config, &status.stack_backend, caravan.id)?
+        {
+            crate::stack_policy::StackLandingRoute::CaravanOwned => {}
+            crate::stack_policy::StackLandingRoute::NativeStack { stack_number } => {
+                return progress.drain_native_stack(
+                    provider,
+                    status,
+                    caravan,
+                    stack_number,
+                    &native,
+                );
+            }
         }
     }
 
@@ -4535,6 +4705,15 @@ fn sync_checkpoint_evidence(progress: &SyncProgress) -> Value {
         "rebase_plans": checkpoint_rebase_plans(&progress.rebase_plans),
         "rebase_receipts": checkpoint_rebase_receipts(&progress.rebase_receipts),
         "provider_receipts": checkpoint_provider_receipts(&progress.provider_receipts),
+        "native_stack_land": bounded_checkpoint_sequence(
+            progress.native_stack_land.iter().map(|checkpoint| json!({
+                "repository": checkpoint.repository,
+                "stack_number": checkpoint.plan.before.number,
+                "phase": checkpoint.phase,
+                "terminal_status": checkpoint.terminal_status,
+                "evidence_hash": checkpoint.evidence_hash,
+            })).collect()
+        ),
         "events": checkpoint_events(&progress.events),
         "recovery": "rediscover provider state and replay the same idempotent sync; hashes bind complete omitted evidence",
     })
@@ -5554,6 +5733,21 @@ fn decision_error(decision: &DecisionPoint, progress: &SyncProgress) -> AppError
     )
 }
 
+#[derive(Debug, Clone)]
+struct NativeSyncContext {
+    config: crate::config::CaravanConfig,
+    repository_path: std::path::PathBuf,
+}
+
+impl NativeSyncContext {
+    fn from_context(context: &AppContext) -> Option<Self> {
+        (context.config.stack_type == crate::config::StackType::Github).then(|| Self {
+            config: context.config.clone(),
+            repository_path: context.repository_path.clone(),
+        })
+    }
+}
+
 #[derive(Debug)]
 struct SyncProgress {
     operation_id: OperationId,
@@ -5567,12 +5761,16 @@ struct SyncProgress {
     root_promotion: Vec<RootPromotionReceipt>,
     /// Durable proof of each caravan-owned squash merge and where it landed.
     root_merge: Vec<RootMergeReceipt>,
+    native_stack_land: Vec<crate::github::GitHubStackLandCheckpoint>,
     /// Configured merge actor for this tick.
     head_merge_actor: HeadMergeActor,
     /// Reviewed policy for a foreign provider auto-merge request.
     external_auto_merge_policy: ExternalAutoMergePolicy,
     /// Bounded caravan-owned merges allowed in this tick.
     max_root_merges: u32,
+    /// Present only for explicit native Stack mode. The stable path never
+    /// evaluates native routing or checkpoint storage.
+    native_stack: Option<NativeSyncContext>,
     /// Durable per-member required-run coverage proof for the exact head.
     required_runs: Vec<RequiredRunsReceipt>,
     /// Deduplicated, bounded visible problems for stalled required coverage.
@@ -5609,11 +5807,13 @@ impl SyncProgress {
             root_auto_merge: Vec::new(),
             root_promotion: Vec::new(),
             root_merge: Vec::new(),
+            native_stack_land: Vec::new(),
             // Exactly one fact decides who merges: the configured policy
             // projected onto status. Every surface reads the same value.
             head_merge_actor: status.head_merge.actor,
             external_auto_merge_policy: status.head_merge.external_auto_merge_policy,
             max_root_merges: status.head_merge.max_root_merges_per_tick.max(1),
+            native_stack: None,
             required_runs: Vec::new(),
             missing_required_runs: Vec::new(),
             required_contexts: BTreeMap::new(),
@@ -6344,6 +6544,210 @@ impl SyncProgress {
             true,
         );
         Ok(())
+    }
+
+    /// Land the maximal contiguous ready native Stack prefix under one
+    /// complete-group ruleset lock. Every phase is persisted before the next
+    /// provider write, so another tick resumes rather than resubmits.
+    #[allow(clippy::too_many_lines)]
+    fn drain_native_stack(
+        &mut self,
+        provider: &impl SyncProvider,
+        status: &StatusOutput,
+        caravan: &Caravan,
+        stack_number: u64,
+        native: &NativeSyncContext,
+    ) -> Result<(), AppError> {
+        let repository = &status.repository;
+        let key = format!("land-{stack_number}");
+        let mut checkpoint = if let Some(checkpoint) = crate::stack_checkpoint::load::<
+            crate::github::GitHubStackLandCheckpoint,
+        >(&native.repository_path, &key)?
+        {
+            if !checkpoint.verify()
+                || checkpoint.repository != *repository
+                || checkpoint.plan.before.number != stack_number
+            {
+                return Err(AppError::validation(
+                    "github_stack_land_checkpoint_stale",
+                    "persisted Stack landing checkpoint does not match this repository/Stack",
+                ));
+            }
+            checkpoint
+        } else {
+            let stack = provider
+                .native_stack_generation_for_sync(repository, stack_number)?
+                .ok_or_else(|| {
+                    AppError::validation(
+                        "github_stack_sync_stack_missing",
+                        "mapped native Stack disappeared before landing",
+                    )
+                })?;
+            let held = crate::stack_policy::held_caravan_members(status);
+            let facts = crate::stack_policy::StackPolicyFacts {
+                pull_requests: &self.current,
+                compatibility: &status.analysis.compatibility,
+                held_members: &held,
+            };
+            let evidence = crate::stack_policy::stack_merge_evidence(facts, &stack, &|pr| {
+                let checks = self
+                    .ci
+                    .iter()
+                    .rev()
+                    .find(|observation| observation.pr == pr)
+                    .is_some_and(|observation| observation.disposition == CiDisposition::Passing);
+                let required = self
+                    .required_runs
+                    .iter()
+                    .rev()
+                    .find(|receipt| receipt.pr == pr)
+                    .is_none_or(|receipt| {
+                        matches!(
+                            receipt.assessment.status,
+                            crate::required_runs::RequiredRunsStatus::Satisfied
+                                | crate::required_runs::RequiredRunsStatus::NotRequired
+                        )
+                    });
+                if checks && required {
+                    crate::stack_policy::StackEntryCi::Ready
+                } else {
+                    crate::stack_policy::StackEntryCi::NotReady
+                }
+            });
+            let prefix = crate::github::plan_github_stack_ready_prefix(&stack, &evidence)
+                .map_err(native_sync_error)?;
+            if prefix.selected.is_empty() {
+                let detail = prefix.first_blocked.map(|blocked| {
+                    format!(
+                        "native Stack prefix waits at PR #{}: {:?}",
+                        blocked.pr, blocked.blockers
+                    )
+                });
+                self.record_merge_wait(
+                    caravan.head().expect("caravan has a head"),
+                    RootMergeBlock::ChecksNotPassing,
+                    detail,
+                );
+                return Ok(());
+            }
+            let plan = prefix
+                .direct_squash_plan(
+                    format!("{}:stack:{stack_number}", self.operation_id),
+                    native.config.stack_rollout.reviewed_by.clone(),
+                )
+                .map_err(native_sync_error)?;
+            let checkpoint =
+                GitHubMutationAdapter::<crate::command::ProcessRunner>::native_stack_land_begin(
+                    repository, &plan,
+                );
+            // Durable before lock acquisition, the first provider write.
+            crate::stack_checkpoint::write(&native.repository_path, &key, &checkpoint)?;
+            checkpoint
+        };
+
+        self.ensure_mutation_capacity(3)?;
+        let mut submission_marked_now = false;
+        // At most one poll that leaves the phase unchanged per tick. Lock,
+        // submission, terminal proof, and release may all progress immediately;
+        // a genuinely pending UUID keeps its lock and resumes next tick.
+        for _ in 0..5 {
+            let before_phase = checkpoint.phase;
+            checkpoint = match checkpoint.phase {
+                crate::github::GitHubStackLandPhase::Planned => {
+                    provider.native_stack_land_lock_for_sync(repository, &checkpoint)?
+                }
+                crate::github::GitHubStackLandPhase::Locked => {
+                    submission_marked_now = true;
+                    GitHubMutationAdapter::<crate::command::ProcessRunner>::native_stack_land_mark_submitting(
+                        repository,
+                        &checkpoint,
+                    )
+                    .map_err(native_sync_error)?
+                }
+                crate::github::GitHubStackLandPhase::Submitting if submission_marked_now => {
+                    provider.native_stack_land_submit_for_sync(repository, &checkpoint)?
+                }
+                crate::github::GitHubStackLandPhase::Submitting => {
+                    // A previous process may have submitted after persisting the
+                    // marker but before persisting its UUID. Never blind-retry.
+                    GitHubMutationAdapter::<crate::command::ProcessRunner>::native_stack_land_abandon_uncertain_submission(
+                        repository,
+                        &checkpoint,
+                    )
+                    .map_err(native_sync_error)?
+                }
+                crate::github::GitHubStackLandPhase::Submitted => {
+                    provider.native_stack_land_poll_for_sync(repository, &checkpoint)?
+                }
+                crate::github::GitHubStackLandPhase::Terminal => {
+                    provider.native_stack_land_release_for_sync(repository, &checkpoint)?
+                }
+                crate::github::GitHubStackLandPhase::Released => break,
+            };
+            crate::stack_checkpoint::write(&native.repository_path, &key, &checkpoint)?;
+            if checkpoint.phase == before_phase {
+                break;
+            }
+            if matches!(
+                checkpoint.phase,
+                crate::github::GitHubStackLandPhase::Locked
+                    | crate::github::GitHubStackLandPhase::Submitted
+                    | crate::github::GitHubStackLandPhase::Released
+            ) {
+                self.steps.push(MutationStep {
+                    kind: MutationKind::NativeStackLand,
+                    state: MutationStepState::Completed,
+                    pr: caravan.head(),
+                    summary: format!(
+                        "native Stack #{stack_number} landing advanced from {before_phase:?} to {:?}",
+                        checkpoint.phase
+                    ),
+                });
+            }
+        }
+
+        if checkpoint.phase != crate::github::GitHubStackLandPhase::Released {
+            self.native_stack_land.push(checkpoint);
+            return Ok(());
+        }
+        crate::stack_checkpoint::remove(&native.repository_path, &key)?;
+        let status = checkpoint.terminal_status;
+        self.native_stack_land.push(checkpoint.clone());
+        match status {
+            Some(crate::github::GitHubStackMergeStatus::Merged) => {
+                for entry in &checkpoint.plan.selected {
+                    self.steps.push(MutationStep {
+                        kind: MutationKind::SquashMerge,
+                        state: MutationStepState::Completed,
+                        pr: Some(entry.pr),
+                        summary: format!(
+                            "native Stack #{stack_number} atomically merged the selected ready prefix under exact-ref lock"
+                        ),
+                    });
+                }
+                Ok(())
+            }
+            Some(crate::github::GitHubStackMergeStatus::Failed) => Err(AppError::structured(
+                ErrorCategory::ExecutionFailure,
+                "github_stack_merge_failed",
+                "GitHub reported terminal native Stack merge failure",
+                Some(json!({"checkpoint": checkpoint, "resumable": false})),
+            )),
+            Some(crate::github::GitHubStackMergeStatus::Indeterminate) => {
+                Err(AppError::structured(
+                    ErrorCategory::ExecutionFailure,
+                    "github_stack_merge_indeterminate",
+                    "native Stack merge ended indeterminate; exact receipts require operator inspection",
+                    Some(json!({"checkpoint": checkpoint, "resumable": false})),
+                ))
+            }
+            other => Err(AppError::structured(
+                ErrorCategory::ExecutionFailure,
+                "github_stack_terminal_status_invalid",
+                "released native Stack transaction lacks terminal provider proof",
+                Some(json!({"status": other, "checkpoint": checkpoint})),
+            )),
+        }
     }
 
     /// Merge every promoted, proven-green root this tick may land.

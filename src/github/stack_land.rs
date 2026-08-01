@@ -6,9 +6,8 @@
 //! that the complete-group ruleset lock is released exactly once, only after
 //! terminal provider proof, and never while an outcome is still unresolved.
 //!
-//! Nothing here opens the workflow fence. `github_stack_backend_read_only` (and
-//! the repository opt-in and capability gates ahead of it) still decide whether
-//! a caller may reach this transaction at all.
+//! Repository opt-in, capability, exact mapping, and policy gates decide
+//! whether a caller may reach this transaction at all.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -34,6 +33,9 @@ const SCHEMA_VERSION: u32 = 1;
 pub enum GitHubStackLandPhase {
     Planned,
     Locked,
+    /// Durable pre-submit marker. If a process dies in this phase, submission
+    /// may have happened and is never blindly retried without a UUID.
+    Submitting,
     Submitted,
     Terminal,
     Released,
@@ -91,6 +93,7 @@ impl GitHubStackLandCheckpoint {
         match self.phase {
             GitHubStackLandPhase::Planned | GitHubStackLandPhase::Released => None,
             GitHubStackLandPhase::Locked
+            | GitHubStackLandPhase::Submitting
             | GitHubStackLandPhase::Submitted
             | GitHubStackLandPhase::Terminal => self.branch_lock.as_ref(),
         }
@@ -186,6 +189,46 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
         Ok(next.seal())
     }
 
+    /// Persistable marker written immediately before merge submission.
+    pub fn native_stack_land_mark_submitting(
+        repository: &RepositoryId,
+        checkpoint: &GitHubStackLandCheckpoint,
+    ) -> Result<GitHubStackLandCheckpoint, GitHubStackLandError> {
+        validate(repository, checkpoint)?;
+        if checkpoint.phase >= GitHubStackLandPhase::Submitting {
+            return Ok(checkpoint.clone());
+        }
+        if checkpoint.phase != GitHubStackLandPhase::Locked {
+            return Err(GitHubStackLandError::OutOfOrder {
+                expected: "an acquired complete-group lock".to_owned(),
+                actual: checkpoint.phase,
+            });
+        }
+        let mut next = checkpoint.clone();
+        next.phase = GitHubStackLandPhase::Submitting;
+        Ok(next.seal())
+    }
+
+    /// Seal a crash/restart in the pre-submit marker as indeterminate. The
+    /// caller cannot know whether GitHub accepted a request before the process
+    /// died, and must release the lock without a blind second submission.
+    pub fn native_stack_land_abandon_uncertain_submission(
+        repository: &RepositoryId,
+        checkpoint: &GitHubStackLandCheckpoint,
+    ) -> Result<GitHubStackLandCheckpoint, GitHubStackLandError> {
+        validate(repository, checkpoint)?;
+        if checkpoint.phase != GitHubStackLandPhase::Submitting {
+            return Err(GitHubStackLandError::OutOfOrder {
+                expected: "a durable pre-submit marker with no UUID".to_owned(),
+                actual: checkpoint.phase,
+            });
+        }
+        let mut next = checkpoint.clone();
+        next.phase = GitHubStackLandPhase::Terminal;
+        next.terminal_status = Some(GitHubStackMergeStatus::Indeterminate);
+        Ok(next.seal())
+    }
+
     /// Submit the merge under the verified lock.
     pub fn native_stack_land_submit(
         &self,
@@ -197,7 +240,7 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
             return Ok(checkpoint.clone());
         }
         let lock = match checkpoint.phase {
-            GitHubStackLandPhase::Locked => checkpoint
+            GitHubStackLandPhase::Submitting => checkpoint
                 .branch_lock
                 .as_ref()
                 .expect("a locked checkpoint carries its exact lock"),
@@ -316,7 +359,7 @@ fn phase_shape(checkpoint: &GitHubStackLandCheckpoint) -> Result<(), ()> {
                 && checkpoint.terminal_status.is_none()
                 && checkpoint.lock_release.is_none()
         }
-        GitHubStackLandPhase::Locked => {
+        GitHubStackLandPhase::Locked | GitHubStackLandPhase::Submitting => {
             checkpoint.branch_lock.is_some()
                 && checkpoint.merge.is_none()
                 && checkpoint.terminal_status.is_none()
@@ -550,6 +593,36 @@ mod tests {
             );
             assert!(terminal.verify());
         }
+    }
+
+    #[test]
+    fn a_crash_after_the_submit_marker_is_indeterminate_never_blindly_retried() {
+        let mut locked = begin();
+        locked.phase = GitHubStackLandPhase::Locked;
+        locked.branch_lock = Some(lock());
+        locked = locked.seal();
+
+        let submitting = GitHubMutationAdapter::<NeverRuns>::native_stack_land_mark_submitting(
+            &repository(),
+            &locked,
+        )
+        .unwrap();
+        assert_eq!(submitting.phase, GitHubStackLandPhase::Submitting);
+        assert!(submitting.verify());
+
+        let recovered =
+            GitHubMutationAdapter::<NeverRuns>::native_stack_land_abandon_uncertain_submission(
+                &repository(),
+                &submitting,
+            )
+            .unwrap();
+        assert_eq!(recovered.phase, GitHubStackLandPhase::Terminal);
+        assert_eq!(
+            recovered.terminal_status,
+            Some(GitHubStackMergeStatus::Indeterminate)
+        );
+        assert!(recovered.outstanding_lock().is_some());
+        assert!(recovered.verify());
     }
 
     #[test]

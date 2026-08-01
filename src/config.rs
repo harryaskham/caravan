@@ -30,8 +30,8 @@ pub const DEFAULT_GITHUB_MAX_CARAVAN_LENGTH: u32 = 8;
 /// Provider representation and landing backend for one Caravan stack.
 ///
 /// `caravan` is the stable default and preserves the existing label/base-chain
-/// implementation. `github` is an explicit preview opt-in; the first rollout
-/// is read-only until the provider mutation adapter is separately accepted.
+/// implementation. `github` is an explicit backend whose mutations require a
+/// reviewed per-repository rollout opt-in and proven provider capability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum StackType {
@@ -433,11 +433,10 @@ impl Default for LoopConfig {
 
 /// Explicit per-repository native-Stack rollout opt-in.
 ///
-/// This is an allowlist, not an enabler. Opting in is *necessary* before any
-/// executable native Stack mutation and remains insufficient on its own: the
-/// reviewed ruleset-locked orchestrator must also be released. Keeping the two
-/// separate means opening the workflow fence later can never silently enable
-/// every repository that merely selected `stack_type: github`.
+/// This allowlist enables the reviewed ruleset-locked workflow only when the
+/// provider capability and every operation-specific mapping/generation/policy
+/// gate are also proven. Selecting `stack_type: github` alone can never silently
+/// enable every repository.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct StackRolloutConfig {
@@ -925,7 +924,10 @@ impl CaravanConfig {
         }
         self.validate_batch_bound()?;
         self.validate_stack_rollout()?;
-        if self.sync.actions.join_unlabelled_prs && !self.rebase_on_join {
+        if self.sync.actions.join_unlabelled_prs
+            && !self.rebase_on_join
+            && self.stack_type != StackType::Github
+        {
             return Err(ConfigError::Validation(
                 "sync.actions.join_unlabelled_prs requires rebase_on_join: true".to_owned(),
             ));
@@ -989,7 +991,7 @@ impl CaravanConfig {
         }
     }
 
-    /// Explicit native-Stack preview policy: no second physical branch writer
+    /// Explicit native-Stack policy: no second physical branch writer
     /// and no provider auto-merge on Stack entries.
     fn validate_github_backend(&self) -> Result<(), ConfigError> {
         if compare_release_versions(&self.min_cara_version, MIN_GITHUB_STACK_READER_VERSION)?
@@ -1001,7 +1003,7 @@ impl CaravanConfig {
         }
         if self.rebase_on_join {
             return Err(ConfigError::Validation(
-                "stack_type: github currently requires rebase_on_join: false; GitHub Stack preview must not introduce a second physical branch writer".to_owned(),
+                "stack_type: github requires rebase_on_join: false; GitHub Stack mode must not introduce a second physical branch writer".to_owned(),
             ));
         }
         if self.sync.resolved_head_merge_actor() != HeadMergeActor::Caravan {
@@ -1982,7 +1984,7 @@ sync:
     }
 
     #[test]
-    fn github_stack_preview_requires_virtual_caravan_owned_merging() {
+    fn github_stack_backend_requires_virtual_caravan_owned_merging() {
         let config: CaravanConfig = serde_yaml::from_str(
             r"
 version: 1
@@ -1998,7 +2000,13 @@ sync:
         .expect("explicit GitHub Stack policy parses");
         config
             .validate()
-            .expect("the reviewed read-only preview combination is valid");
+            .expect("the reviewed native Stack combination is valid");
+
+        let mut automatic = config.clone();
+        automatic.sync.actions.join_unlabelled_prs = true;
+        automatic
+            .validate()
+            .expect("native virtual joins need no physical rebase writer");
 
         let mut physical = config.clone();
         physical.rebase_on_join = true;

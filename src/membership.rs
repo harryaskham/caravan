@@ -1226,7 +1226,11 @@ fn execute_locked(
             "--pr selects an existing provider PR and cannot be combined with --create-pr",
         ));
     }
-    if candidate_pr.is_some() && request.operation.is_join() && !context.config.rebase_on_join {
+    if candidate_pr.is_some()
+        && request.operation.is_join()
+        && !context.config.rebase_on_join
+        && context.config.stack_type == crate::config::StackType::Caravan
+    {
         return Err(AppError::structured(
             ErrorCategory::Validation,
             "atomic_join_requires_rebase_on_join",

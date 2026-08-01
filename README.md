@@ -588,18 +588,20 @@ nor fetch Git dependencies at build time.
 
 Repository policy and hooks live at `.caravan/config.yaml`. `stack_type` defaults
 to `caravan`, preserving the existing implementation without probing GitHub's
-native Stack API. The explicit `github` value remains a read-only preview:
-status reports capability and exact Stack drift, while provider-mutating
-workflows return `github_stack_backend_read_only`. Exact REST create/add/unstack
-and asynchronous merge receipt primitives exist internally. The installed
+native Stack API. The explicit `github` value plus a reviewed
+`stack_rollout.mutations_opt_in` enables exact Stack membership, reshape, and
+lock-fenced landing. Capability, complete inventory, unique mapping, exact
+generation, holds, compatibility, CI, and unsupported force intent all fail
+closed before provider mutation. The installed
 `gh stack` CLI does not merge Stacks; GitHub's web merge uses the top-SHA-only
 async REST endpoint. A disposable sandbox proved an unlocked lower rewind can
 merge at a changed generation. A follow-up sandbox then proved Cara's preventive
 equivalent: one active no-bypass repository ruleset over every selected source
 ref rejects owner SSH and REST mutations while the selected prefix merges and
 the unselected suffix rebases. The adapter now acquires, verifies, checkpoints,
-and exactly release that lock, but executable workflow rollout remains fenced
-until the explicit Administration(write) policy and orchestrator land.
+and exactly releases that lock. The ruleset path requires the explicit,
+conditional Administration(write) App permission documented below; default
+Caravan mode never needs it.
 GitHub exposes no arbitrary Stack remove/reorder, so evict and split are a
 phased unstack/rebuild transaction whose sealed checkpoints record
 `preflighted`, `unstacked`, `reshape_applied`, `rebuilding`, `rebuilt`, and
@@ -610,7 +612,21 @@ provider truth without repeating a proven unstack or replacement creation.
 capacity model, and defaults to 8 only under `stack_type: github`. A full batch
 is never extended: admission uses another compatible caravan or opens a new one,
 while sync still lands the maximal contiguous ready prefix instead of waiting
-for occupancy.
+for occupancy. Native mode is enabled per repository only with a reviewed
+allowlist:
+
+```yaml
+min_cara_version: "0.0.65"
+stack_type: github
+max_caravan_length: 8
+stack_rollout:
+  mutations_opt_in: true
+  reviewed_by: "operator/change-ticket"
+sync:
+  head_merge_actor: caravan
+rebase_on_join: false
+```
+
 The optional `rebase_on_join: true` mode
 physically rebases each owned PR's candidate-only, linear commit range onto its
 exact predecessor under an exact force-with-lease; it is disabled by default and

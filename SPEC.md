@@ -1005,18 +1005,20 @@ Unknown config fields are errors. Secrets belong in environment variables, not c
 
 `stack_type` is optional and defaults to `caravan`, which preserves the existing
 label/base-chain/merge behavior and performs no GitHub Stack capability probe.
-`github` is an explicit native-Stack preview. It requires
-`rebase_on_join: false` and `sync.head_merge_actor: caravan`; status makes one
-bounded REST Stack inventory read, distinguishes available, unavailable, and
-unknown capability, and verifies provider member order, base refs, branch
-names, and exact head OIDs against Cara's graph. A full 100-Stack page is
-reported as truncated rather than complete. Every provider-mutating workflow
-returns `github_stack_backend_read_only` before provider writes.
+`github` is an explicit native-Stack backend. It requires
+`rebase_on_join: false`, `sync.head_merge_actor: caravan`, and a reviewed
+`stack_rollout.mutations_opt_in`; status makes one bounded REST Stack inventory
+read, distinguishes available, unavailable, and unknown capability, and
+verifies provider member order, base refs, branch names, and exact head OIDs
+against Cara's graph. A full 100-Stack page is reported as truncated rather than
+complete. Missing opt-in, unavailable capability, truncated inventory,
+ambiguous mapping, generation drift, holds, compatibility failures, incomplete
+CI, and unsupported force intent all fail closed before provider mutation.
 
 Exact REST create/add/unstack, asynchronous direct-merge planning, submission,
 UUID-polling, receipt primitives, and the phased evict/split unstack/rebuild
-transaction are policy-free internal adapters, not executable workflow
-authority. GitHub exposes no arbitrary Stack remove or reorder, so reshape is a
+transaction remain policy-free adapters composed by membership, reshape, and
+sync. GitHub exposes no arbitrary Stack remove or reorder, so reshape is a
 sealed `preflighted` → `unstacked` → `reshape_applied` → `rebuilding` →
 `rebuilt` → `verified` sequence that persists `provider_atomic: false`, binds
 the exact per-PR base/head/control-label/auto-merge postcondition the existing
@@ -1037,11 +1039,10 @@ full-batch evidence.
 
 Native rollout is additionally gated by an explicit per-repository allowlist.
 `stack_rollout.mutations_opt_in` requires `stack_type: github` and a non-empty
-`reviewed_by`, and is necessary but never sufficient: without it status reports
-`github_stack_repository_not_opted_in`, with it the reviewed rollout fence
-`github_stack_backend_read_only` still applies, and an unavailable or unproven
-capability outranks both with `github_stack_capability_unavailable` or
-`github_stack_capability_unknown` so absence is never inferred. Opting into
+`reviewed_by`. Without it status reports
+`github_stack_repository_not_opted_in`; an unavailable or unproven capability
+outranks the opt-in with `github_stack_capability_unavailable` or
+`github_stack_capability_unknown`, so absence is never inferred. Opting into
 `stack_type: github` also requires `min_cara_version` at or above the first
 native-Stack reader release, so an older Cara can never read a provider Stack as
 an ordinary caravan.
@@ -1063,9 +1064,9 @@ suffix rebase succeeded. The ruleset generation is checkpointed with the async
 UUID, revalidated before each submit/poll, and released only by exact ID and
 generation after terminal proof. Missing/drifted lock is `indeterminate`.
 Repository ruleset mutation requires an explicit Administration(write) upgrade,
-which remains outside the baseline App policy and default Caravan mode. The
-workflow fence may open only after that ruleset-locked orchestrator and policy
-are reviewed; unlocked top-SHA-only merge remains invalid. An older Cara reader
+which remains outside the baseline App policy and default Caravan mode. Native
+landing is executable only through the ruleset-locked orchestrator; unlocked
+top-SHA-only merge remains invalid. An older Cara reader
 must still be excluded with `min_cara_version` before repository opt-in. Exact
 evidence is recorded in
 `docs/validation/github-native-stack-sandbox-2026-07-31.md`.
