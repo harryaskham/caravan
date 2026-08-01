@@ -403,7 +403,9 @@ operator can explicitly remove abandoned local state with `repair abort
 
 The reviewed least-privilege App permissions, broker schema, branch rules,
 webhook setup, attribution limits, and single-writer contract are in
-[`docs/github-app.md`](docs/github-app.md); the exact machine-checked baseline is
+[`docs/github-app.md`](docs/github-app.md). The not-yet-active cross-host CAS
+protocol is documented in
+[`docs/remote-writer-lease.md`](docs/remote-writer-lease.md); the exact machine-checked baseline is
 [`docs/github-app-policy.json`](docs/github-app-policy.json).
 
 Cara's `gh` subprocesses are authenticated. An explicit `GH_TOKEN` or
@@ -565,6 +567,8 @@ force_merge: false
 stack_type: caravan
 github_auth:
   mode: ambient
+writer:
+  mode: local_only  # non-local modes remain startup-closed pending full fencing
 rebase_on_join: false
 command_timeout_secs: 30
 repair:

@@ -937,6 +937,8 @@ force_merge: false
 stack_type: caravan
 github_auth:
   mode: ambient
+writer:
+  mode: local_only
 rebase_on_join: false
 agent_priority_labels:
   - caravan-priority:high

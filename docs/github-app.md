@@ -132,7 +132,8 @@ objects but is neither GitHub App attribution nor a cryptographic signature.
 ## Local and hosted writers
 
 Local and future hosted execution may coexist in the product, but exactly one
-is the configured writer for a repository. The other may read and plan. The
+is the configured writer for a repository. The strict, not-yet-active broker
+and guard contract is in [`remote-writer-lease.md`](remote-writer-lease.md). The other may read and plan. The
 current operation lock is machine-local and cannot fence two hosts. Automatic
 failover is therefore unavailable until both writers use a remote
 compare-and-swap lease with repository identity, owner, operation ID, expiry,

@@ -659,16 +659,14 @@ fn load_repositories(paths: &[PathBuf]) -> Result<Vec<Arc<RepositoryEntry>>, App
             } else {
                 CaravanConfig::default()
             };
-            config
-                .validate_github_auth_runtime_environment()
-                .map_err(|error| {
-                    AppError::structured(
-                        ErrorCategory::Validation,
-                        "web_repository_auth_policy_mismatch",
-                        error.to_string(),
-                        Some(json!({"config_path": &config_path})),
-                    )
-                })?;
+            config.validate_runtime_environment().map_err(|error| {
+                AppError::structured(
+                    ErrorCategory::Validation,
+                    "web_repository_auth_policy_mismatch",
+                    error.to_string(),
+                    Some(json!({"config_path": &config_path})),
+                )
+            })?;
             let context = AppContext {
                 repository_path: canonical.clone(),
                 config_path: config_path.clone(),

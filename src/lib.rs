@@ -28,6 +28,7 @@ pub mod pause;
 pub mod physical_rebase;
 pub mod priority;
 pub mod read;
+pub mod remote_lease;
 pub mod repair;
 pub mod required_runs;
 pub mod reshape;
@@ -474,6 +475,10 @@ RECOVERY, LOCKS, AND OBSERVABILITY
   The least-privilege permission/branch/webhook/single-writer baseline is
   machine-checked in `docs/github-app-policy.json` and explained in
   `docs/github-app.md`; live bot attribution remains a separate canary.
+- Cross-host writer fencing has a strict broker/CAS/guard protocol in
+  `docs/remote-writer-lease.md`, but it is not active. `writer.mode` defaults to
+  `local_only`; reserved `read_only`/`remote_fenced` values fail production
+  startup until every mutation seam revalidates the remote fencing token.
 - `cara self-update status|check|run` updates only the exact running first-PATH
   stable user binary (`~/.cargo/bin`, `~/.local/bin`, or an exact explicit
   `CARA_SELF_UPDATE_INSTALL_DIR`). Shadowed, renamed/test, Cargo target, and
@@ -606,7 +611,7 @@ impl AppContext {
                 (relative, false, CaravanConfig::default())
             }
         };
-        config.validate_github_auth_runtime_environment()?;
+        config.validate_runtime_environment()?;
         Ok(Self {
             repository_path,
             config_path,

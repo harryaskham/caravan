@@ -140,6 +140,49 @@ impl GithubAuthConfig {
     }
 }
 
+/// Cross-host writer policy. Only `local_only` is executable until the remote
+/// fence is threaded through every mutation seam.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WriterMode {
+    #[default]
+    LocalOnly,
+    ReadOnly,
+    RemoteFenced,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct WriterConfig {
+    pub mode: WriterMode,
+}
+
+impl WriterConfig {
+    fn validate_runtime_with_command(
+        &self,
+        remote_lease_command: Option<&str>,
+    ) -> Result<(), ConfigError> {
+        match self.mode {
+            WriterMode::LocalOnly => Ok(()),
+            WriterMode::ReadOnly => Err(ConfigError::Validation(
+                "writer.mode read_only is reserved until mutation entry points enforce it"
+                    .to_owned(),
+            )),
+            WriterMode::RemoteFenced => {
+                if remote_lease_command.is_none_or(|command| command.trim().is_empty()) {
+                    return Err(ConfigError::Validation(
+                        "writer.mode remote_fenced requires CARA_REMOTE_LEASE_COMMAND".to_owned(),
+                    ));
+                }
+                Err(ConfigError::Validation(
+                    "writer.mode remote_fenced is reserved until every mutation revalidates its fencing token"
+                        .to_owned(),
+                ))
+            }
+        }
+    }
+}
+
 /// Supported config schema version.
 pub const CONFIG_VERSION: u32 = 1;
 /// Version of this Cara reader.
@@ -493,6 +536,8 @@ pub struct CaravanConfig {
     pub stack_type: StackType,
     /// Non-secret repository authorization for ambient or GitHub App identity.
     pub github_auth: GithubAuthConfig,
+    /// Local-only today; remote/read-only modes stay fail-closed until full wiring.
+    pub writer: WriterConfig,
     /// Explicitly authorize lease-protected history rewriting so PR ancestry
     /// physically follows the Caravan chain. Safe default is disabled.
     pub rebase_on_join: bool,
@@ -528,6 +573,7 @@ impl Default for CaravanConfig {
             force_merge: false,
             stack_type: StackType::default(),
             github_auth: GithubAuthConfig::default(),
+            writer: WriterConfig::default(),
             rebase_on_join: false,
             agent_priority_labels: default_agent_priority_labels(),
             command_timeout_secs: default_command_timeout_secs(),
@@ -775,7 +821,7 @@ impl CaravanConfig {
     /// Bind deployment auth settings to this repository's non-secret policy.
     /// Pure config parsing deliberately does not require deployment credentials;
     /// production context startup calls this before provider discovery.
-    pub fn validate_github_auth_runtime_environment(&self) -> Result<(), ConfigError> {
+    pub fn validate_runtime_environment(&self) -> Result<(), ConfigError> {
         self.github_auth.validate_runtime_values(
             std::env::var("CARA_GITHUB_AUTH_MODE").ok().as_deref(),
             std::env::var("CARA_GITHUB_APP_SLUG").ok().as_deref(),
@@ -785,6 +831,9 @@ impl CaravanConfig {
             std::env::var("CARA_GITHUB_APP_CREDENTIAL_COMMAND")
                 .ok()
                 .as_deref(),
+        )?;
+        self.writer.validate_runtime_with_command(
+            std::env::var("CARA_REMOTE_LEASE_COMMAND").ok().as_deref(),
         )
     }
 
@@ -1542,6 +1591,49 @@ mod github_auth_tests {
                     .is_err()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod writer_mode_tests {
+    use super::*;
+
+    #[test]
+    fn writer_defaults_local_and_nonlocal_modes_remain_startup_closed() {
+        let legacy = CaravanConfig::parse("version: 1\n").unwrap();
+        assert_eq!(legacy.writer.mode, WriterMode::LocalOnly);
+        legacy
+            .writer
+            .validate_runtime_with_command(Some("/ignored/broker"))
+            .unwrap();
+
+        let read_only = CaravanConfig::parse("version: 1\nwriter:\n  mode: read_only\n").unwrap();
+        assert!(
+            read_only
+                .writer
+                .validate_runtime_with_command(None)
+                .unwrap_err()
+                .to_string()
+                .contains("reserved")
+        );
+
+        let remote = CaravanConfig::parse("version: 1\nwriter:\n  mode: remote_fenced\n").unwrap();
+        assert!(
+            remote
+                .writer
+                .validate_runtime_with_command(None)
+                .unwrap_err()
+                .to_string()
+                .contains("requires CARA_REMOTE_LEASE_COMMAND")
+        );
+        assert!(
+            remote
+                .writer
+                .validate_runtime_with_command(Some("/secure/lease-broker"))
+                .unwrap_err()
+                .to_string()
+                .contains("every mutation revalidates")
+        );
     }
 }
 
