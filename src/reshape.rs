@@ -60,6 +60,10 @@ pub struct ReshapeOutput {
     pub receipt: OperationReceipt,
     #[serde(default)]
     pub provider_receipts: Vec<GitHubMutationReceipt>,
+    /// Complete native Stack unstack/rebuild checkpoint. Absent on the stable
+    /// `stack_type: caravan` path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_stack_checkpoint: Option<crate::github::GitHubStackReshapeCheckpoint>,
     #[serde(default)]
     pub affected_prs: Vec<PrNumber>,
     /// Fleet expected after every recorded provider step completes.
@@ -224,6 +228,14 @@ fn execute_live(
         enabled: context.config.rebase_on_join,
         writer_fence: lock.remote_fence(),
     };
+    let native = if context.config.stack_type == crate::config::StackType::Github {
+        let prepared = prepare_reshape(&status, &checker, &provider, operation, selected)?;
+        Some(native_reshape_unstack(
+            context, &provider, &status, &prepared, operation,
+        )?)
+    } else {
+        None
+    };
     let mut output = match execute(
         status,
         &checker,
@@ -248,6 +260,15 @@ fn execute_live(
         Err(error) => return Err(error),
     };
     post_rewrite_comments(&provider, &repository, &mut output)?;
+    if let Some(checkpoint) = native {
+        output.native_stack_checkpoint = Some(native_reshape_complete(
+            context,
+            &provider,
+            &repository,
+            checkpoint,
+            &output,
+        )?);
+    }
     let kind = match operation {
         ReshapeOperation::Evict => EventKind::Evicted,
         ReshapeOperation::Split => EventKind::Split,
@@ -373,16 +394,20 @@ struct RewriteContext<'a> {
     writer_fence: Option<std::sync::Arc<crate::remote_lease::RemoteLeaseGuard>>,
 }
 
-#[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
-fn execute(
-    status: StatusOutput,
+#[derive(Debug, Clone)]
+struct PreparedReshape {
+    number: PrNumber,
+    virtual_status: StatusOutput,
+    plan: ReshapePlan,
+}
+
+fn prepare_reshape(
+    status: &StatusOutput,
     checker: &impl CompatibilityChecker,
     provider: &impl MembershipProvider,
     operation: ReshapeOperation,
     selected: Option<PrNumber>,
-    reason: Option<String>,
-    rewrite: Option<&RewriteContext<'_>>,
-) -> Result<ReshapeOutput, AppError> {
+) -> Result<PreparedReshape, AppError> {
     crate::initialization::require_ready(&status.initialization)?;
     let number = selected.or(status.current_pr).ok_or_else(|| {
         AppError::validation(
@@ -402,15 +427,36 @@ fn execute(
             format!("PR #{number} is not open"),
         ));
     }
-
     let (virtual_status, plan) = match operation {
-        ReshapeOperation::Evict => plan_eviction(&status, &target)?,
-        ReshapeOperation::Split => plan_split(&status, &target)?,
+        ReshapeOperation::Evict => plan_eviction(status, &target)?,
+        ReshapeOperation::Split => plan_split(status, &target)?,
     };
-    preflight_result(&status, &virtual_status, checker)?;
+    preflight_result(status, &virtual_status, checker)?;
     if plan.creates_head {
-        preflight_new_head(provider, &status)?;
+        preflight_new_head(provider, status)?;
     }
+    Ok(PreparedReshape {
+        number,
+        virtual_status,
+        plan,
+    })
+}
+
+#[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
+fn execute(
+    status: StatusOutput,
+    checker: &impl CompatibilityChecker,
+    provider: &impl MembershipProvider,
+    operation: ReshapeOperation,
+    selected: Option<PrNumber>,
+    reason: Option<String>,
+    rewrite: Option<&RewriteContext<'_>>,
+) -> Result<ReshapeOutput, AppError> {
+    let PreparedReshape {
+        number,
+        virtual_status,
+        plan,
+    } = prepare_reshape(&status, checker, provider, operation, selected)?;
 
     let mut state = ReshapeState::new(operation, status.analysis.pull_requests.clone());
     match operation {
@@ -509,11 +555,275 @@ fn execute(
         reason,
         receipt: state.receipt(),
         provider_receipts: state.provider_receipts,
+        native_stack_checkpoint: None,
         affected_prs: plan.affected_prs,
         resulting_fleet: virtual_status.analysis.fleet,
         events: Vec::new(),
         hook_deliveries: Vec::new(),
     })
+}
+
+#[allow(clippy::too_many_lines)]
+fn native_reshape_unstack<R: crate::command::CommandRunner>(
+    context: &AppContext,
+    provider: &GitHubMutationAdapter<R>,
+    status: &StatusOutput,
+    prepared: &PreparedReshape,
+    operation: ReshapeOperation,
+) -> Result<crate::github::GitHubStackReshapeCheckpoint, AppError> {
+    let key = native_reshape_key(operation, prepared.number);
+    if let Some(checkpoint) = crate::stack_checkpoint::load::<
+        crate::github::GitHubStackReshapeCheckpoint,
+    >(&context.repository_path, &key)?
+    {
+        let expected_operation = match operation {
+            ReshapeOperation::Evict => crate::github::GitHubStackReshapeOperation::Evict,
+            ReshapeOperation::Split => crate::github::GitHubStackReshapeOperation::Split,
+        };
+        if !checkpoint.verify()
+            || checkpoint.repository != status.repository
+            || checkpoint.plan.selected_pr != prepared.number
+            || checkpoint.plan.operation != expected_operation
+        {
+            return Err(AppError::validation(
+                "github_stack_reshape_checkpoint_stale",
+                "persisted native reshape checkpoint does not match this repository/selection",
+            ));
+        }
+        let checkpoint = if checkpoint.phase == crate::github::GitHubStackReshapePhase::Preflighted
+        {
+            provider
+                .native_stack_reshape_unstack(&status.repository, &checkpoint)
+                .map_err(|error| native_reshape_error(&error, Some(&checkpoint)))?
+        } else {
+            checkpoint
+        };
+        crate::stack_checkpoint::write(&context.repository_path, &key, &checkpoint)?;
+        return Ok(checkpoint);
+    }
+    let caravan = status
+        .analysis
+        .fleet
+        .containing(prepared.number)
+        .ok_or_else(|| {
+            AppError::validation(
+                "github_stack_reshape_caravan_missing",
+                "selected reshape member has no exact pre-reshape caravan",
+            )
+        })?;
+    let matching = status
+        .stack_backend
+        .native_stacks
+        .iter()
+        .filter(|native| native.caravan_id == Some(caravan.id))
+        .collect::<Vec<_>>();
+    let [native] = matching.as_slice() else {
+        return Err(AppError::validation(
+            "github_stack_reshape_mapping_ambiguous",
+            "native reshape requires exactly one provider Stack mapped to the selected caravan",
+        ));
+    };
+    if native.consistency != crate::read::StackConsistency::Exact {
+        return Err(AppError::validation(
+            "github_stack_reshape_generation_drifted",
+            "native reshape requires an exact provider Stack generation",
+        ));
+    }
+    let before = provider
+        .native_stack_generation(&status.repository, native.stack.number)
+        .map_err(|error| native_reshape_error(&error, None))?
+        .ok_or_else(|| {
+            AppError::validation(
+                "github_stack_reshape_stack_missing",
+                "mapped provider Stack disappeared before reshape preflight",
+            )
+        })?;
+    let original = before
+        .topology
+        .entries
+        .iter()
+        .map(|entry| entry.pr)
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut replacements = prepared
+        .virtual_status
+        .analysis
+        .fleet
+        .caravans
+        .iter()
+        .filter(|candidate| {
+            candidate
+                .members
+                .iter()
+                .any(|member| original.contains(member))
+        })
+        .map(|candidate| {
+            let members = candidate
+                .members
+                .iter()
+                .filter(|member| original.contains(member))
+                .map(|member| {
+                    prepared
+                        .virtual_status
+                        .analysis
+                        .pull_requests
+                        .get(member)
+                        .ok_or_else(|| {
+                            AppError::validation(
+                                "github_stack_reshape_replacement_missing",
+                                format!("replacement PR #{member} facts are missing"),
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            native_replacement_topology(
+                &prepared.virtual_status.analysis.fleet.default_branch,
+                &members,
+            )
+        })
+        .collect::<Result<Vec<_>, AppError>>()?;
+    // Preserve original member order between replacement chains. Split creates
+    // two chains; eviction creates at most one.
+    replacements.sort_by_key(|topology| {
+        topology
+            .entries
+            .first()
+            .and_then(|entry| {
+                before
+                    .topology
+                    .entries
+                    .iter()
+                    .position(|original| original.pr == entry.pr)
+            })
+            .unwrap_or(usize::MAX)
+    });
+    let operation = match operation {
+        ReshapeOperation::Evict => crate::github::GitHubStackReshapeOperation::Evict,
+        ReshapeOperation::Split => crate::github::GitHubStackReshapeOperation::Split,
+    };
+    let plan = crate::github::GitHubStackReshapePlan::new(
+        status.repository.clone(),
+        format!("{}:native-stack", crate::model::OperationId::new()),
+        context.config.stack_rollout.reviewed_by.clone(),
+        operation,
+        prepared.number,
+        before,
+        replacements,
+    )
+    .map_err(|error| native_reshape_error(&error, None))?;
+    let checkpoint = provider
+        .native_stack_reshape_preflight(&status.repository, &plan)
+        .map_err(|error| native_reshape_error(&error, None))?;
+    // Durable before the first provider write: a crash after unstack resumes
+    // from exact absence instead of requiring the vanished Stack to preflight.
+    crate::stack_checkpoint::write(&context.repository_path, &key, &checkpoint)?;
+    let checkpoint = provider
+        .native_stack_reshape_unstack(&status.repository, &checkpoint)
+        .map_err(|error| native_reshape_error(&error, Some(&checkpoint)))?;
+    crate::stack_checkpoint::write(&context.repository_path, &key, &checkpoint)?;
+    Ok(checkpoint)
+}
+
+fn native_reshape_complete<R: crate::command::CommandRunner>(
+    context: &AppContext,
+    provider: &GitHubMutationAdapter<R>,
+    repository: &crate::model::RepositoryId,
+    checkpoint: crate::github::GitHubStackReshapeCheckpoint,
+    output: &ReshapeOutput,
+) -> Result<crate::github::GitHubStackReshapeCheckpoint, AppError> {
+    let key = native_reshape_key(output.operation, output.pr);
+    let mut checkpoint =
+        if checkpoint.phase < crate::github::GitHubStackReshapePhase::ReshapeApplied {
+            let applied = provider
+                .native_stack_reshape_record_existing(repository, &checkpoint, &output.receipt)
+                .map_err(|error| native_reshape_error(&error, Some(&checkpoint)))?;
+            crate::stack_checkpoint::write(&context.repository_path, &key, &applied)?;
+            applied
+        } else {
+            // A previous process already proved and persisted this phase. Ordinary
+            // Cara reshape reruns idempotently, but its new operation receipt does
+            // not replace the authority already sealed into the checkpoint.
+            checkpoint
+        };
+    loop {
+        match checkpoint.phase {
+            crate::github::GitHubStackReshapePhase::ReshapeApplied
+            | crate::github::GitHubStackReshapePhase::Rebuilding => {
+                checkpoint = provider
+                    .native_stack_reshape_rebuild_next(repository, &checkpoint)
+                    .map_err(|error| native_reshape_error(&error, Some(&checkpoint)))?;
+                crate::stack_checkpoint::write(&context.repository_path, &key, &checkpoint)?;
+            }
+            crate::github::GitHubStackReshapePhase::Rebuilt => break,
+            crate::github::GitHubStackReshapePhase::Verified => {
+                crate::stack_checkpoint::remove(&context.repository_path, &key)?;
+                return Ok(checkpoint);
+            }
+            _ => {
+                return Err(AppError::validation(
+                    "github_stack_reshape_phase_invalid",
+                    "native reshape did not reach a rebuildable phase",
+                ));
+            }
+        }
+    }
+    let verified = provider
+        .native_stack_reshape_verify_final(repository, &checkpoint)
+        .map_err(|error| native_reshape_error(&error, Some(&checkpoint)))?;
+    crate::stack_checkpoint::write(&context.repository_path, &key, &verified)?;
+    crate::stack_checkpoint::remove(&context.repository_path, &key)?;
+    Ok(verified)
+}
+
+fn native_reshape_key(operation: ReshapeOperation, selected: PrNumber) -> String {
+    format!("reshape-{}-{}", operation.name(), selected.0)
+}
+
+fn native_replacement_topology(
+    base: &BranchSnapshot,
+    members: &[&PullRequestSnapshot],
+) -> Result<crate::github::GitHubStackTopology, AppError> {
+    let entries = members
+        .iter()
+        .enumerate()
+        .map(|(position, member)| {
+            Ok(crate::github::GitHubStackEntryGeneration {
+                position: u32::try_from(position).map_err(|_| {
+                    AppError::validation(
+                        "github_stack_reshape_too_large",
+                        "replacement Stack position exceeds u32",
+                    )
+                })?,
+                pr: member.number,
+                stack_state: "open".to_owned(),
+                pull_request_state: member.state,
+                draft: member.draft,
+                merged_at: member.merged_at.clone(),
+                base: member.base.clone(),
+                head: member.head.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, AppError>>()?;
+    Ok(crate::github::GitHubStackTopology {
+        base: base.clone(),
+        entries,
+    })
+}
+
+fn native_reshape_error(
+    error: &impl std::fmt::Display,
+    checkpoint: Option<&crate::github::GitHubStackReshapeCheckpoint>,
+) -> AppError {
+    AppError::structured(
+        ErrorCategory::ExecutionFailure,
+        "github_stack_reshape_incomplete",
+        format!("native Stack reshape is incomplete: {error}"),
+        Some(json!({
+            "mutated": checkpoint.is_some(),
+            "resumable": true,
+            "checkpoint": checkpoint,
+            "safe_next_action": "rerun the same evict/split command; every phase converges from exact provider truth and never repeats a proven unstack or replacement creation",
+        })),
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -731,7 +1041,7 @@ fn plan_split(
         } else {
             target.base == status.analysis.fleet.default_branch
         };
-    if already_head {
+    if already_head && status.stack_backend.configured != crate::config::StackType::Github {
         return Err(AppError::validation(
             "split_pr_is_head",
             format!("PR #{} is already a caravan head", target.number),

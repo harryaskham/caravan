@@ -36,6 +36,7 @@ pub mod reshape;
 pub mod root_auto_merge;
 pub mod root_merge;
 pub mod squash_equivalence;
+mod stack_checkpoint;
 pub mod stack_membership;
 pub mod stack_policy;
 pub mod sync;
