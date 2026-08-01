@@ -647,6 +647,29 @@ fn interactive_mutation_refusal(
     None
 }
 
+/// Match one delivery to the repository the deployment declares.
+///
+/// The configured `repository: owner/name` is authoritative when set, so
+/// routing does not depend on a successful provider status read: a repository
+/// whose first read failed would otherwise match nothing and have its
+/// deliveries rejected until a fallback poll healed it. Repositories with no
+/// configured slug still match on observed status exactly as before.
+fn repository_matches_slug(repository: &RepositoryEntry, repository_slug: &str) -> bool {
+    if repository_slug.is_empty() {
+        return false;
+    }
+    if let Some(configured) = repository.context.config.repository.as_deref() {
+        return configured == repository_slug;
+    }
+    repository
+        .snapshot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .status
+        .as_ref()
+        .is_some_and(|status| status.repository.slug() == repository_slug)
+}
+
 fn is_loopback(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => address.is_loopback(),
@@ -681,6 +704,8 @@ fn validate_hosted_repositories(
             "--hosted requires the exact --github-installation-id it serves",
         ));
     };
+    let mut configured_slugs: std::collections::BTreeMap<&str, &Path> =
+        std::collections::BTreeMap::new();
     for repository in repositories {
         let config = &repository.context.config;
         let path = &repository.context.repository_path;
@@ -718,6 +743,19 @@ fn validate_hosted_repositories(
                 "web_hosted_repository_slug_required",
                 "--hosted requires exact repository: owner/name for every served repository",
                 Some(json!({"path": path})),
+            ));
+        }
+        // Deliveries route by configured slug, so two worktrees declaring the
+        // same owner/name would make routing non-deterministic. Canonical path
+        // deduplication cannot catch this because the paths differ.
+        if let Some(slug) = config.repository.as_deref()
+            && let Some(existing) = configured_slugs.insert(slug, path)
+        {
+            return Err(AppError::structured(
+                ErrorCategory::Validation,
+                "web_hosted_repository_slug_duplicate",
+                "--hosted requires one served worktree per repository slug",
+                Some(json!({"repository": slug, "paths": [existing, path]})),
             ));
         }
     }
@@ -1564,15 +1602,11 @@ fn handle_github_webhook(
         .and_then(|value| value.get("full_name"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
-    let Some(repository) = dashboard.repositories.iter().find(|repository| {
-        repository
-            .snapshot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .status
-            .as_ref()
-            .is_some_and(|status| status.repository.slug() == repository_slug)
-    }) else {
+    let Some(repository) = dashboard
+        .repositories
+        .iter()
+        .find(|repository| repository_matches_slug(repository, repository_slug))
+    else {
         record_webhook_rejection(dashboard);
         return error_response(
             StatusCode(404),
@@ -2304,7 +2338,16 @@ mod tests {
     }
 
     fn hosted_entry(config: CaravanConfig) -> Arc<RepositoryEntry> {
-        let path = PathBuf::from("/tmp/hosted-repo");
+        // Derive the path from the declared slug so distinct repositories are
+        // distinct worktrees, matching real deployments.
+        let path = PathBuf::from(format!(
+            "/tmp/hosted-{}",
+            config
+                .repository
+                .as_deref()
+                .unwrap_or("unslugged")
+                .replace('/', "-")
+        ));
         Arc::new(RepositoryEntry {
             id: "repo-1".to_owned(),
             context: AppContext {
@@ -2380,11 +2423,17 @@ mod tests {
                 Some("owner/repo"),
             )
         };
+        let second = hosted_config(
+            crate::config::GithubAuthMode::AppInstallation,
+            Some(42),
+            crate::config::WriterMode::RemoteFenced,
+            Some("owner/second"),
+        );
         validate_hosted_repositories(
             &hosted_input(true, Some(42)),
-            &[hosted_entry(compliant()), hosted_entry(compliant())],
+            &[hosted_entry(compliant()), hosted_entry(second)],
         )
-        .expect("two repositories on one installation are accepted");
+        .expect("two distinct repositories on one installation are accepted");
 
         for (config, expected) in [
             (
@@ -2392,7 +2441,7 @@ mod tests {
                     crate::config::GithubAuthMode::Ambient,
                     None,
                     crate::config::WriterMode::RemoteFenced,
-                    Some("owner/repo"),
+                    Some("owner/ambient"),
                 ),
                 "web_hosted_repository_auth_not_app",
             ),
@@ -2401,7 +2450,7 @@ mod tests {
                     crate::config::GithubAuthMode::AppInstallation,
                     Some(43),
                     crate::config::WriterMode::RemoteFenced,
-                    Some("owner/repo"),
+                    Some("owner/mismatch"),
                 ),
                 "web_hosted_installation_mismatch",
             ),
@@ -2410,7 +2459,7 @@ mod tests {
                     crate::config::GithubAuthMode::AppInstallation,
                     Some(42),
                     crate::config::WriterMode::LocalOnly,
-                    Some("owner/repo"),
+                    Some("owner/localonly"),
                 ),
                 "web_hosted_writer_not_fenced",
             ),
@@ -2552,6 +2601,75 @@ mod tests {
         assert_eq!(
             interactive_mutation_refusal(&test_dashboard(false, true), false),
             None
+        );
+    }
+
+    #[test]
+    fn deliveries_route_by_configured_identity_before_observed_status() {
+        let configured = hosted_entry(hosted_config(
+            crate::config::GithubAuthMode::Ambient,
+            None,
+            crate::config::WriterMode::LocalOnly,
+            Some("owner/repo"),
+        ));
+        // No successful status read yet: the pre-fix observed-status match
+        // rejected this repository's deliveries with 404 until a poll healed it.
+        assert!(
+            configured
+                .snapshot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .status
+                .is_none()
+        );
+        assert!(repository_matches_slug(&configured, "owner/repo"));
+        assert!(!repository_matches_slug(&configured, "owner/other"));
+        assert!(!repository_matches_slug(&configured, ""));
+
+        // Configured identity is authoritative over a stale observation.
+        {
+            let mut snapshot = configured
+                .snapshot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            snapshot.status = Some(authority_status("aaaaaaaa"));
+        }
+        assert!(repository_matches_slug(&configured, "owner/repo"));
+        assert!(!repository_matches_slug(&configured, "owner/renamed"));
+
+        // With no configured slug, observed status still routes as before.
+        let observed = hosted_entry(hosted_config(
+            crate::config::GithubAuthMode::Ambient,
+            None,
+            crate::config::WriterMode::LocalOnly,
+            None,
+        ));
+        assert!(!repository_matches_slug(&observed, "owner/repo"));
+        {
+            let mut snapshot = observed
+                .snapshot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            snapshot.status = Some(authority_status("bbbbbbbb"));
+        }
+        assert!(repository_matches_slug(&observed, "owner/repo"));
+    }
+
+    #[test]
+    fn hosted_startup_refuses_two_worktrees_declaring_one_slug() {
+        let entry = || {
+            hosted_entry(hosted_config(
+                crate::config::GithubAuthMode::AppInstallation,
+                Some(42),
+                crate::config::WriterMode::RemoteFenced,
+                Some("owner/repo"),
+            ))
+        };
+        assert_eq!(
+            validate_hosted_repositories(&hosted_input(true, Some(42)), &[entry(), entry()])
+                .unwrap_err()
+                .code(),
+            "web_hosted_repository_slug_duplicate"
         );
     }
 
