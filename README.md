@@ -415,8 +415,8 @@ operator can explicitly remove abandoned local state with `repair abort
 
 The reviewed least-privilege App permissions, broker schema, branch rules,
 webhook setup, attribution limits, and single-writer contract are in
-[`docs/github-app.md`](docs/github-app.md). The not-yet-active cross-host CAS
-protocol is documented in
+[`docs/github-app.md`](docs/github-app.md). The cross-host CAS lease protocol,
+activated by `writer.mode: remote_fenced`, is documented in
 [`docs/remote-writer-lease.md`](docs/remote-writer-lease.md); the exact machine-checked baseline is
 [`docs/github-app-policy.json`](docs/github-app-policy.json).
 

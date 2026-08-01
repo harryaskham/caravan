@@ -405,7 +405,12 @@ BUILT-IN WEB OPERATIONS
 - The default listener is loopback-only. Status snapshots refresh on a bounded
   cadence and show active caravan trails, exact PR generations and CI, open
   unqueued/rejected PRs with reasons, decisions, pauses, and scheduler health.
-- Use `--read-only` to disable mutation endpoints. Accepted actions bind the
+- Use `--read-only` to disable mutation endpoints. `--hosted` is the optional
+  deployment contract for pre-provisioned checkouts: it requires signed
+  webhooks, one exact installation, `--webhook-sync`, and per-repository
+  `app_installation` auth plus `remote_fenced` writer with an exact slug, and it
+  refuses interactive mutations so a hosted worker acts only on HMAC-verified
+  deliveries. Accepted actions bind the
   reviewed refresh sequence and a deterministic mutation-authority fingerprint.
   Poll/webhook refreshes coalesce behind active jobs; identical provider/config
   facts tolerate sequence-only drift, while changed fingerprints fail before
