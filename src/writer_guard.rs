@@ -387,6 +387,18 @@ mod tests {
     }
 
     #[test]
+    fn repair_publication_and_workspace_runners_share_operation_guard() {
+        let repair = include_str!("repair.rs");
+        let repair = repair.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+        assert_eq!(repair.matches("acquire_writer_operation(").count(), 7);
+        assert_eq!(repair.matches("lock.runner(").count(), 4);
+        assert!(repair.contains("start_exact_with_writer_guard("));
+        assert!(repair.contains("Some(&lock)"));
+        assert!(repair.contains("repair_writer_runner("));
+        assert_eq!(repair.matches(".git_write()").count(), 1);
+    }
+
+    #[test]
     fn physical_rebase_budgets_retain_the_operation_fence_through_push() {
         for (name, source) in [
             ("membership", include_str!("membership.rs")),

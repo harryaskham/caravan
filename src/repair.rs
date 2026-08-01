@@ -454,13 +454,14 @@ pub fn start(
         None => status.analysis.fleet.default_branch.clone(),
     };
     let provider_git_url = provider_git_url(context, &status.repository)?;
-    let output = start_exact(
+    let output = start_exact_with_writer_guard(
         context,
         &status.repository,
         &candidate,
         &target,
         input.target_pr.map(PrNumber),
         &provider_git_url,
+        Some(&lock),
     )?;
     lock.checkpoint(
         "repair_workspace_ready",
@@ -471,7 +472,7 @@ pub fn start(
     Ok(output)
 }
 
-#[allow(clippy::too_many_lines)]
+#[cfg(test)]
 fn start_exact(
     context: &AppContext,
     repository: &RepositoryId,
@@ -479,6 +480,27 @@ fn start_exact(
     target: &BranchSnapshot,
     target_pr: Option<PrNumber>,
     provider_git_url: &str,
+) -> Result<RepairStartOutput, AppError> {
+    start_exact_with_writer_guard(
+        context,
+        repository,
+        candidate,
+        target,
+        target_pr,
+        provider_git_url,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn start_exact_with_writer_guard(
+    context: &AppContext,
+    repository: &RepositoryId,
+    candidate: &PullRequestSnapshot,
+    target: &BranchSnapshot,
+    target_pr: Option<PrNumber>,
+    provider_git_url: &str,
+    writer_guard: Option<&crate::writer_guard::WriterOperationGuard>,
 ) -> Result<RepairStartOutput, AppError> {
     require_owned_repair(repository, candidate, target)?;
     let paths = repair_paths(&context.repository_path, candidate.number)?;
@@ -543,6 +565,7 @@ fn start_exact(
                     resumed,
                     true,
                     reuse_workspace,
+                    writer_guard,
                 );
             }
             validate_workspace(&paths, &existing)?;
@@ -611,7 +634,25 @@ fn start_exact(
         published_head: None,
     };
     write_manifest(&paths.manifest, &repair)?;
-    materialize_repair(&paths, candidate, target, repair, false, false)
+    materialize_repair(
+        &paths,
+        candidate,
+        target,
+        repair,
+        false,
+        false,
+        writer_guard,
+    )
+}
+
+fn repair_writer_runner(
+    writer_guard: Option<&crate::writer_guard::WriterOperationGuard>,
+    runner: ProcessRunner,
+) -> crate::writer_guard::WriterCommandRunner {
+    crate::writer_guard::WriterCommandRunner::with_remote_fence(
+        runner,
+        writer_guard.and_then(crate::writer_guard::WriterOperationGuard::remote_fence),
+    )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -622,9 +663,13 @@ fn materialize_repair(
     mut repair: RepairSession,
     resumed: bool,
     reuse_workspace: bool,
+    writer_guard: Option<&crate::writer_guard::WriterOperationGuard>,
 ) -> Result<RepairStartOutput, AppError> {
     let timeout = Duration::from_secs(repair.materialization_timeout_secs);
-    let root_runner = ProcessRunner::in_directory(&paths.session_root).with_timeout(timeout);
+    let root_runner = repair_writer_runner(
+        writer_guard,
+        ProcessRunner::in_directory(&paths.session_root).with_timeout(timeout),
+    );
     let workspace = paths.workspace.to_string_lossy().into_owned();
     let provider_git_url = repair.provider_git_url.clone();
     verify_object_cache_identity(&repair)?;
@@ -656,7 +701,10 @@ fn materialize_repair(
                 Ok(())
             },
         )?;
-        let workspace_runner = ProcessRunner::in_directory(&paths.workspace).with_timeout(timeout);
+        let workspace_runner = repair_writer_runner(
+            writer_guard,
+            ProcessRunner::in_directory(&paths.workspace).with_timeout(timeout),
+        );
         run_materialization_phase(
             &mut repair,
             paths,
@@ -679,7 +727,10 @@ fn materialize_repair(
         )?;
     }
 
-    let workspace_runner = ProcessRunner::in_directory(&paths.workspace).with_timeout(timeout);
+    let workspace_runner = repair_writer_runner(
+        writer_guard,
+        ProcessRunner::in_directory(&paths.workspace).with_timeout(timeout),
+    );
     run_materialization_phase(
         &mut repair,
         paths,
@@ -932,8 +983,10 @@ pub fn authorize_agent_edits(
         repair_lock_receipt(&repair)?,
         false,
     )?;
-    let runner = ProcessRunner::in_directory(&paths.workspace)
-        .with_timeout(Duration::from_secs(context.config.command_timeout_secs));
+    let runner = lock.runner(
+        ProcessRunner::in_directory(&paths.workspace)
+            .with_timeout(Duration::from_secs(context.config.command_timeout_secs)),
+    );
     verify_remote_head(&runner, &repair.provider_git_url, &repair.head)?;
     verify_remote_head(&runner, &repair.provider_git_url, &repair.target)?;
     let now = unix_ms();
@@ -1166,7 +1219,7 @@ pub fn grant_paths(
         false,
     )?;
     let timeout = Duration::from_secs(context.config.command_timeout_secs);
-    let runner = ProcessRunner::in_directory(&paths.workspace).with_timeout(timeout);
+    let runner = lock.runner(ProcessRunner::in_directory(&paths.workspace).with_timeout(timeout));
     verify_remote_head(&runner, &repair.provider_git_url, &repair.head)?;
     verify_remote_head(&runner, &repair.provider_git_url, &repair.target)?;
     let unmerged = require_success(
@@ -1431,8 +1484,10 @@ pub fn revoke_grants(
         repair_lock_receipt(&repair)?,
         false,
     )?;
-    let runner = ProcessRunner::in_directory(&paths.workspace)
-        .with_timeout(Duration::from_secs(context.config.command_timeout_secs));
+    let runner = lock.runner(
+        ProcessRunner::in_directory(&paths.workspace)
+            .with_timeout(Duration::from_secs(context.config.command_timeout_secs)),
+    );
     verify_remote_head(&runner, &repair.provider_git_url, &repair.head)?;
     verify_remote_head(&runner, &repair.provider_git_url, &repair.target)?;
     let unique = input.paths.iter().cloned().collect::<BTreeSet<_>>();
@@ -1761,7 +1816,7 @@ pub fn continue_session(
         false,
     )?;
     let timeout = Duration::from_secs(context.config.command_timeout_secs);
-    let runner = ProcessRunner::in_directory(&paths.workspace).with_timeout(timeout);
+    let runner = lock.runner(ProcessRunner::in_directory(&paths.workspace).with_timeout(timeout));
     let expected_parents = vec![repair.head.oid.clone(), repair.target.oid.clone()];
 
     let (new_head, parents) = match repair.state {
