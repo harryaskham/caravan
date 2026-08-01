@@ -14,9 +14,21 @@ writer:
 
 `read_only` and `remote_fenced` are reserved schema values. Offline config
 validation can review them, but production context startup refuses both until
-every mutation entry point consumes and revalidates a remote fence.
-`remote_fenced` also requires an environment-only
-`CARA_REMOTE_LEASE_COMMAND`. A broker path or config value cannot activate
+every mutation entry point consumes and revalidates a remote fence. Remote
+policy may set bounded timing only in that mode:
+
+```yaml
+writer:
+  mode: remote_fenced
+  lease_ttl_secs: 60
+  heartbeat_secs: 15
+```
+
+TTL is 10-3600 seconds; heartbeat is positive and strictly smaller. Deployment
+must also provide `CARA_REMOTE_LEASE_COMMAND`, exact
+`CARA_REMOTE_LEASE_HOST`, and bounded `CARA_REMOTE_WRITER_OWNER`. Exact
+owner/repository comes from required `config.repository`; App installation is
+included when App policy selects one. A broker path or config value cannot activate
 hosted writes by itself.
 
 ## Lease identity and ordering
@@ -107,9 +119,17 @@ checkpoint/recovery, explicit release, and Drop semantics. Source contract tests
 reject a new direct acquisition outside the lock implementation and test-only
 fixtures. Reserved non-local modes still refuse before local lock creation.
 
-This centralization does not acquire a remote lease or propagate a fenced runner
-by itself. The activation slice must extend this guard to acquire remote first,
-then local, and supply the same remote guard to all operation runners.
+The boundary now models remote-first acquisition: it constructs one unique
+operation ID, acquires `RemoteLeaseGuard`, then acquires the local lock. Local
+acquisition failure drops and exact-releases remote ownership. One guard can
+wrap multiple fully configured `ProcessRunner`s, preserving their auth, budgets,
+deadlines, and telemetry; each marked write revalidates the shared fence while
+reads bypass it. Explicit release drops local ownership before remote.
+
+Production context still refuses `remote_fenced`, and operation code does not
+yet request guard-wrapped runners. The activation slice must propagate
+`guard.runner(...)` through all provider and internal physical-worktree writers
+before opening the mode.
 
 ## Guard lifecycle
 

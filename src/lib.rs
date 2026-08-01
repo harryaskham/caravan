@@ -47,7 +47,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::command::CommandRunner;
-use crate::config::{CaravanConfig, ConfigError};
+use crate::config::{CaravanConfig, ConfigError, WriterMode};
 
 pub mod config;
 pub mod config_provenance;
@@ -481,8 +481,9 @@ RECOVERY, LOCKS, AND OBSERVABILITY
   explicit intent and a fenced runner refuses missing markers or a lost token
   before child execution. `writer.mode` defaults to `local_only`; reserved
   `read_only`/`remote_fenced` values fail startup. Every production mutation
-  already enters one `WriterOperationGuard` local-lock boundary; activation must
-  extend it to acquire remote first and install the fenced runner.
+  enters `WriterOperationGuard`, which models remote-before-local acquisition
+  and one shared fenced-runner factory. Activation must propagate that runner
+  through every operation and internal physical worktree before opening modes.
 - `cara self-update status|check|run` updates only the exact running first-PATH
   stable user binary (`~/.cargo/bin`, `~/.local/bin`, or an exact explicit
   `CARA_SELF_UPDATE_INSTALL_DIR`). Shadowed, renamed/test, Cargo target, and
@@ -629,12 +630,83 @@ impl AppContext {
         &self,
         operation: &str,
     ) -> Result<writer_guard::WriterOperationGuard, AppError> {
-        writer_guard::WriterOperationGuard::acquire(
-            &self.repository_path,
-            &self.config.writer,
-            operation,
-        )
+        match self.config.writer.mode {
+            WriterMode::RemoteFenced => acquire_remote_writer_operation(self, operation),
+            WriterMode::LocalOnly | WriterMode::ReadOnly => {
+                writer_guard::WriterOperationGuard::acquire(
+                    &self.repository_path,
+                    &self.config.writer,
+                    operation,
+                )
+            }
+        }
     }
+}
+
+fn acquire_remote_writer_operation(
+    context: &AppContext,
+    operation: &str,
+) -> Result<writer_guard::WriterOperationGuard, AppError> {
+    let required = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                AppError::validation(
+                    "remote_writer_environment_incomplete",
+                    format!("writer.mode remote_fenced requires {name}"),
+                )
+            })
+    };
+    let slug = context.config.repository.as_deref().ok_or_else(|| {
+        AppError::validation(
+            "remote_writer_repository_required",
+            "writer.mode remote_fenced requires exact config.repository owner/name",
+        )
+    })?;
+    let (owner, repository) = slug
+        .split_once('/')
+        .filter(|(owner, repository)| {
+            !owner.is_empty() && !repository.is_empty() && !repository.contains('/')
+        })
+        .ok_or_else(|| {
+            AppError::validation(
+                "remote_writer_repository_invalid",
+                "config.repository must be exact owner/name for remote fencing",
+            )
+        })?;
+    let now_unix_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| AppError::validation("remote_writer_clock_invalid", error.to_string()))?
+        .as_millis()
+        .try_into()
+        .map_err(|_| AppError::validation("remote_writer_clock_invalid", "clock overflow"))?;
+    let request = remote_lease::RemoteLeaseAcquire {
+        key: remote_lease::RemoteLeaseKey {
+            host: required("CARA_REMOTE_LEASE_HOST")?,
+            owner: owner.to_owned(),
+            repository: repository.to_owned(),
+            installation_id: context.config.github_auth.installation_id,
+        },
+        writer_owner: required("CARA_REMOTE_WRITER_OWNER")?,
+        operation_id: format!("{operation}-{}", uuid::Uuid::now_v7()),
+        now_unix_ms,
+        ttl_ms: context.config.writer.lease_ttl_secs.saturating_mul(1_000),
+        heartbeat_ms: context.config.writer.heartbeat_secs.saturating_mul(1_000),
+    };
+    let runner = command::ProcessRunner::in_directory(&context.repository_path)
+        .with_timeout(Duration::from_secs(context.config.command_timeout_secs));
+    let broker =
+        remote_lease::CommandRemoteWriterLease::new(runner, required("CARA_REMOTE_LEASE_COMMAND")?)
+            .map_err(|error| {
+                AppError::validation("remote_writer_broker_invalid", error.to_string())
+            })?;
+    writer_guard::WriterOperationGuard::acquire_remote(
+        &context.repository_path,
+        operation,
+        std::sync::Arc::new(broker),
+        &request,
+    )
 }
 
 fn resolve_repository_root(directory: &Path) -> Result<PathBuf, ConfigError> {

@@ -542,6 +542,12 @@ pub trait CommandMutationFence: Send + Sync {
     fn before_write(&self, intent: CommandIntent) -> Result<(), String>;
 }
 
+impl<T: CommandMutationFence + ?Sized> CommandMutationFence for Arc<T> {
+    fn before_write(&self, intent: CommandIntent) -> Result<(), String> {
+        (**self).before_write(intent)
+    }
+}
+
 /// Runner wrapper that makes write intent centrally enforceable without
 /// changing read-command behavior or inner request/telemetry budgets.
 #[derive(Debug, Clone)]

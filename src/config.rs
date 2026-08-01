@@ -151,13 +151,56 @@ pub enum WriterMode {
     RemoteFenced,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+fn default_writer_lease_ttl_secs() -> u64 {
+    60
+}
+
+fn default_writer_heartbeat_secs() -> u64 {
+    15
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct WriterConfig {
     pub mode: WriterMode,
+    #[serde(default = "default_writer_lease_ttl_secs")]
+    pub lease_ttl_secs: u64,
+    #[serde(default = "default_writer_heartbeat_secs")]
+    pub heartbeat_secs: u64,
+}
+
+impl Default for WriterConfig {
+    fn default() -> Self {
+        Self {
+            mode: WriterMode::LocalOnly,
+            lease_ttl_secs: default_writer_lease_ttl_secs(),
+            heartbeat_secs: default_writer_heartbeat_secs(),
+        }
+    }
 }
 
 impl WriterConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if !(10..=3_600).contains(&self.lease_ttl_secs)
+            || self.heartbeat_secs == 0
+            || self.heartbeat_secs >= self.lease_ttl_secs
+        {
+            return Err(ConfigError::Validation(
+                "writer lease_ttl_secs must be 10-3600 and heartbeat_secs must be smaller and positive"
+                    .to_owned(),
+            ));
+        }
+        if self.mode != WriterMode::RemoteFenced
+            && (self.lease_ttl_secs != default_writer_lease_ttl_secs()
+                || self.heartbeat_secs != default_writer_heartbeat_secs())
+        {
+            return Err(ConfigError::Validation(
+                "writer lease timing may only be customized in remote_fenced mode".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     fn validate_runtime_with_command(
         &self,
         remote_lease_command: Option<&str>,
@@ -776,6 +819,7 @@ impl CaravanConfig {
             )));
         }
         self.github_auth.validate()?;
+        self.writer.validate()?;
         if self.stack_type == StackType::Github {
             if self.rebase_on_join {
                 return Err(ConfigError::Validation(
@@ -1634,6 +1678,23 @@ mod writer_mode_tests {
                 .to_string()
                 .contains("every mutation revalidates")
         );
+    }
+
+    #[test]
+    fn remote_lease_timing_is_bounded_and_ignored_modes_cannot_customize_it() {
+        let remote = CaravanConfig::parse(
+            "version: 1\nwriter:\n  mode: remote_fenced\n  lease_ttl_secs: 120\n  heartbeat_secs: 30\n",
+        )
+        .unwrap();
+        assert_eq!(remote.writer.lease_ttl_secs, 120);
+        assert_eq!(remote.writer.heartbeat_secs, 30);
+        for yaml in [
+            "version: 1\nwriter:\n  mode: remote_fenced\n  lease_ttl_secs: 9\n  heartbeat_secs: 1\n",
+            "version: 1\nwriter:\n  mode: remote_fenced\n  lease_ttl_secs: 60\n  heartbeat_secs: 60\n",
+            "version: 1\nwriter:\n  mode: local_only\n  lease_ttl_secs: 120\n",
+        ] {
+            assert!(CaravanConfig::parse(yaml).is_err(), "accepted {yaml}");
+        }
     }
 }
 
