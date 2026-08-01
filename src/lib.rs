@@ -36,6 +36,7 @@ pub mod reshape;
 pub mod root_auto_merge;
 pub mod root_merge;
 pub mod squash_equivalence;
+pub mod stack_policy;
 pub mod sync;
 pub mod web;
 pub mod writer_guard;
