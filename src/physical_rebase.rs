@@ -6,6 +6,7 @@
 //! an exact force-with-lease push.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mcp_cli::ErrorCategory;
@@ -19,6 +20,7 @@ use crate::model::{BranchSnapshot, CommitOid, PrNumber, PullRequestSnapshot, Rep
 use crate::squash_equivalence::{self, SquashEquivalenceReport};
 
 const MAX_MERGE_PRESERVING_COMMITS: usize = 256;
+static WORKTREE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Shared child and whole-operation limits for one prepared generation.
 /// Smallest timeout allowed for creating an isolated worktree.
@@ -1941,6 +1943,14 @@ fn decision(code: &'static str, message: &'static str, details: serde_json::Valu
     AppError::structured(ErrorCategory::Validation, code, message, Some(details))
 }
 
+fn unique_worktree_path(nonce: u128) -> PathBuf {
+    let sequence = WORKTREE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "caravan-rebase-{}-{nonce}-{sequence}",
+        std::process::id()
+    ))
+}
+
 fn process_runner(
     directory: &Path,
     timeout: Duration,
@@ -1970,8 +1980,7 @@ impl TemporaryWorktree {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("caravan-rebase-{}-{nonce}", std::process::id()));
+        let path = unique_worktree_path(nonce);
         let runner = process_runner(repository, timeout, operation_deadline);
         require_success(
             &runner,
@@ -2022,6 +2031,14 @@ mod tests {
     // resilient when the Nix build runs the suite under CPU/I/O contention;
     // timeout policy has separate focused coverage.
     const TEST_REBASE_BUDGET: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn identical_clock_values_still_produce_unique_worktree_paths() {
+        let paths = (0..256)
+            .map(|_| unique_worktree_path(1_785_546_450_726_853_000))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(paths.len(), 256);
+    }
 
     fn git(directory: &Path, arguments: &[&str]) -> String {
         let output = Command::new("git")
