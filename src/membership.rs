@@ -196,6 +196,10 @@ pub struct MembershipOutput {
     /// Exact provider before/after facts for every completed remote mutation.
     #[serde(default)]
     pub provider_receipts: Vec<GitHubMutationReceipt>,
+    /// Native Stack representation established after ordinary Cara membership.
+    /// Absent on the stable `stack_type: caravan` path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_stack_receipt: Option<crate::stack_membership::NativeMembershipReceipt>,
     /// Stable exact-admission receipt for new/renew/join/rejoin. Root admissions
     /// encode the default branch as predecessor `pr=0` (bd-d15ba3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1779,6 +1783,20 @@ fn execute_locked(
         output.join_receipt = Some(join_receipt);
     }
     output.rebase_receipt = rebase_receipt;
+    if context.config.stack_type == crate::config::StackType::Github {
+        let native_facts =
+            crate::stack_membership::NativeMembershipFacts::from_status(&failure_status);
+        let native_plan = crate::stack_membership::plan_native_membership(
+            &native_facts,
+            &output,
+            &context.config.stack_rollout.reviewed_by,
+        )
+        .map_err(|error| native_membership_error(&error, &output))?;
+        let native_receipt = provider
+            .converge_native_membership(&native_plan)
+            .map_err(|error| native_membership_error(&error, &output))?;
+        output.native_stack_receipt = Some(native_receipt);
+    }
     let event = hooks::event(
         kind,
         output.receipt.operation_id.clone(),
@@ -2218,6 +2236,7 @@ fn execute_with_rebase_guard(
         receipt,
         rebase_receipt: None,
         provider_receipts: state.provider_receipts,
+        native_stack_receipt: None,
         join_receipt: None,
         pull_request,
         caravan_id,
@@ -2232,6 +2251,26 @@ fn execute_with_rebase_guard(
 struct JoinTarget {
     caravan: Caravan,
     tail: PullRequestSnapshot,
+}
+
+fn native_membership_error(
+    error: &crate::stack_membership::NativeMembershipError,
+    output: &MembershipOutput,
+) -> AppError {
+    AppError::structured(
+        ErrorCategory::ExecutionFailure,
+        "github_stack_membership_incomplete",
+        format!(
+            "ordinary Cara membership completed but native Stack convergence is incomplete: {error}"
+        ),
+        Some(json!({
+            "mutated": output.receipt.changed,
+            "resumable": true,
+            "ordinary_membership_receipt": output.receipt,
+            "provider_receipts": output.provider_receipts,
+            "safe_next_action": "rerun the same membership command; ordinary Cara mutations are idempotent and native Stack create/add converges from exact provider truth",
+        })),
+    )
 }
 
 fn comment_error(error: &MutationError, state: &ExecutionState) -> AppError {
