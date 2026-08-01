@@ -699,8 +699,14 @@ mod tests {
     }
 
     impl FakeCas {
-        fn replacement(&self, request: &RemoteLeaseAcquire) -> RemoteLeaseGrant {
-            let mut state = self.state.lock().unwrap();
+        /// Insert the replacement grant while the caller still holds the lock.
+        /// A real CAS backend performs the liveness check and the write in one
+        /// atomic step, so the fake must not split them across critical
+        /// sections or two racing hosts can both win.
+        fn replacement_locked(
+            state: &mut FakeState,
+            request: &RemoteLeaseAcquire,
+        ) -> RemoteLeaseGrant {
             let next = state
                 .last_fence
                 .get(&request.key)
@@ -729,10 +735,10 @@ mod tests {
             request: &RemoteLeaseAcquire,
         ) -> Result<RemoteLeaseGrant, RemoteLeaseError> {
             request.validate()?;
-            if let Some(existing) = self
-                .state
-                .lock()
-                .unwrap()
+            // One critical section: check liveness and install the replacement
+            // atomically, exactly as a real compare-and-swap backend does.
+            let mut state = self.state.lock().unwrap();
+            if let Some(existing) = state
                 .grants
                 .get(&request.key)
                 .cloned()
@@ -745,7 +751,7 @@ mod tests {
                     expires_unix_ms: existing.expires_unix_ms,
                 });
             }
-            Ok(self.replacement(request))
+            Ok(Self::replacement_locked(&mut state, request))
         }
 
         fn inspect(
@@ -988,17 +994,35 @@ mod tests {
 
     #[test]
     fn two_concurrent_hosts_never_both_acquire() {
-        let backend = Arc::new(FakeCas::default());
-        let handles = ["host-a", "host-b"].map(|owner| {
-            let backend = Arc::clone(&backend);
-            thread::spawn(move || backend.acquire(&request(owner, owner, 1_000)).is_ok())
-        });
-        let successes = handles
-            .into_iter()
-            .map(|handle| handle.join().unwrap())
-            .filter(|success| *success)
-            .count();
-        assert_eq!(successes, 1);
+        // Repeated contended rounds with several hosts against a fresh backend.
+        // A check-then-act backend wins twice within a few rounds, so this
+        // fails reliably on a racy fake instead of passing by timing luck.
+        for round in 0..64 {
+            let backend = Arc::new(FakeCas::default());
+            let barrier = Arc::new(std::sync::Barrier::new(4));
+            let handles: Vec<_> = ["host-a", "host-b", "host-c", "host-d"]
+                .into_iter()
+                .map(|owner| {
+                    let backend = Arc::clone(&backend);
+                    let barrier = Arc::clone(&barrier);
+                    thread::spawn(move || {
+                        barrier.wait();
+                        backend.acquire(&request(owner, owner, 1_000))
+                    })
+                })
+                .collect();
+            let grants: Vec<_> = handles
+                .into_iter()
+                .filter_map(|handle| handle.join().unwrap().ok())
+                .collect();
+            assert_eq!(
+                grants.len(),
+                1,
+                "round {round} admitted {} concurrent writers",
+                grants.len()
+            );
+            assert_eq!(grants[0].fencing_token, 1);
+        }
     }
 
     #[test]
