@@ -47,6 +47,9 @@ impl ReshapeOperation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ReshapeOutput {
     pub operation: ReshapeOperation,
+    /// Secret-free authenticated API/Git telemetry accumulated by this reshape.
+    #[serde(default)]
+    pub provider_api: crate::model::GitHubApiTelemetry,
     pub pr: PrNumber,
     /// Members that were physically rebased onto the evicted PR and therefore
     /// still carry its commits after retargeting (bd-cef612).
@@ -220,6 +223,7 @@ fn execute_live(
         GitCompatibilityChecker::new(&context.repository_path, "origin").with_timeout(timeout);
     let runner =
         crate::command::ProcessRunner::in_directory(&context.repository_path).with_timeout(timeout);
+    let provider_telemetry_runner = runner.clone();
     let provider = GitHubMutationAdapter::new(lock.runner(runner));
     let requested_reason = reason.clone();
     let rewrite = RewriteContext {
@@ -269,6 +273,10 @@ fn execute_live(
             &output,
         )?);
     }
+    output
+        .provider_api
+        .merge(provider_telemetry_runner.github_api_telemetry());
+
     let kind = match operation {
         ReshapeOperation::Evict => EventKind::Evicted,
         ReshapeOperation::Split => EventKind::Split,
@@ -549,6 +557,7 @@ fn execute(
     };
     Ok(ReshapeOutput {
         operation,
+        provider_api: status.provider_api.clone(),
         descendants_inheriting_evicted_patch,
         descendant_rewrites,
         pr: number,

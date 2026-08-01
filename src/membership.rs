@@ -190,6 +190,10 @@ pub struct JoinReceipt {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct MembershipOutput {
     pub receipt: OperationReceipt,
+    /// Secret-free authenticated API and Git transport telemetry accumulated by
+    /// every runner in this complete membership operation.
+    #[serde(default)]
+    pub provider_api: crate::model::GitHubApiTelemetry,
     /// Exact old/new OIDs for the optional physical ancestry rewrite.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rebase_receipt: Option<crate::physical_rebase::RebaseReceipt>,
@@ -1284,7 +1288,12 @@ fn execute_locked(
     let provider_runner = github_budget.map_or(provider_runner.clone(), |budget| {
         provider_runner.with_github_request_budget(budget.clone())
     });
+    // Keep one clone of the shared telemetry sink before the provider runner is
+    // wrapped/moved. Every mutation performed by `provider` updates this same
+    // Arc-backed snapshot (bd-298a9a).
+    let provider_telemetry_runner = provider_runner.clone();
     let mut provider = GitHubMutationAdapter::new(writer_guard.runner(provider_runner));
+    let mut physical_provider_api = crate::model::GitHubApiTelemetry::default();
     let repository = status.repository.clone();
     let failure_status = status.clone();
     let default_branch_oid = status.analysis.fleet.default_branch.oid.clone();
@@ -1648,7 +1657,9 @@ fn execute_locked(
         // Starting the push with almost no budget left produced a live
         // github_mutation_timeout *after* the remote branch had already moved.
         require_post_rewrite_budget(context, Some(operation_deadline), candidate.number)?;
-        let receipt = crate::physical_rebase::apply_prepared(&prepared)?;
+        let applied = crate::physical_rebase::apply_prepared_with_telemetry(&prepared)?;
+        physical_provider_api.merge(applied.provider_api);
+        let receipt = applied.receipt;
         // GitHub is authoritative after a push. Never apply base/label changes
         // against the stale pre-rewrite PR snapshot.
         if let Some(candidate) = candidate_pr {
@@ -1755,6 +1766,20 @@ fn execute_locked(
             .append(&mut output.provider_receipts);
         output.provider_receipts = created.provider_receipts;
     }
+    // `execute_with_rebase_guard` carries the final discovery telemetry. Merge
+    // the initial read when a rewrite caused rediscovery, then the mutation
+    // adapter and the exact physical Git runner. This is the first point at
+    // which the complete operation is known (bd-298a9a).
+    if rebase_receipt.is_some() {
+        output
+            .provider_api
+            .merge(failure_status.provider_api.clone());
+    }
+    output
+        .provider_api
+        .merge(provider_telemetry_runner.github_api_telemetry());
+    output.provider_api.merge(physical_provider_api);
+
     let kind = if request.operation.is_join() {
         EventKind::PrJoined
     } else {
@@ -2238,6 +2263,7 @@ fn execute_with_rebase_guard(
     };
     Ok(MembershipOutput {
         receipt,
+        provider_api: status.provider_api.clone(),
         rebase_receipt: None,
         provider_receipts: state.provider_receipts,
         native_stack_receipt: None,

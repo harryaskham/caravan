@@ -1798,8 +1798,24 @@ fn receipt_from_plan(plan: &RebasePlan) -> RebaseReceipt {
     }
 }
 
+/// One exact branch-rewrite receipt plus the secret-free App/API/Git transport
+/// telemetry accumulated by the runner which verified and pushed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebaseApplyResult {
+    pub receipt: RebaseReceipt,
+    pub provider_api: crate::model::GitHubApiTelemetry,
+}
+
 /// Push the exact retained planned object under its original old-head lease.
 pub fn apply_prepared(prepared: &PreparedRebase) -> Result<RebaseReceipt, AppError> {
+    Ok(apply_prepared_with_telemetry(prepared)?.receipt)
+}
+
+/// The same exact apply path, retaining the runner's secret-free telemetry for
+/// the enclosing membership receipt (bd-298a9a).
+pub fn apply_prepared_with_telemetry(
+    prepared: &PreparedRebase,
+) -> Result<RebaseApplyResult, AppError> {
     verify_prepared(prepared)?;
     let runner = process_runner(
         &prepared.worktree.path,
@@ -1812,7 +1828,11 @@ pub fn apply_prepared(prepared: &PreparedRebase) -> Result<RebaseReceipt, AppErr
             verify_remote_head(&runner, "origin", &target.name, &target.oid)?;
         }
     }
-    push_prepared(prepared)
+    let receipt = push_prepared_with_runner(prepared, &runner)?;
+    Ok(RebaseApplyResult {
+        receipt,
+        provider_api: runner.github_api_telemetry(),
+    })
 }
 
 /// Apply after sync's global write barrier. Revalidate source/range/target
@@ -1848,20 +1868,17 @@ pub(crate) fn apply_prepared_after_write_barrier(
             verify_remote_head(&runner, "origin", &target.name, &target.oid)?;
         }
     }
-    push_prepared(prepared)
+    push_prepared_with_runner(prepared, &runner)
 }
 
-fn push_prepared(prepared: &PreparedRebase) -> Result<RebaseReceipt, AppError> {
+fn push_prepared_with_runner(
+    prepared: &PreparedRebase,
+    runner: &impl CommandRunner,
+) -> Result<RebaseReceipt, AppError> {
     if !prepared.plan.already_satisfied {
-        let runner = process_runner(
-            &prepared.worktree.path,
-            prepared.worktree.timeout,
-            prepared.worktree.operation_deadline,
-            prepared.worktree.writer_fence.as_ref(),
-        );
         let destination = format!("HEAD:refs/heads/{}", prepared.plan.branch);
         require_success(
-            &runner,
+            runner,
             CommandSpec::new("git")
                 .args([
                     "push",

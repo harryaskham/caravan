@@ -2234,8 +2234,28 @@ fn render_membership(output: &caravan::membership::MembershipOutput) -> String {
     for step in &output.receipt.completed_steps {
         let _ = writeln!(text, "  {:?} {:?}: {}", step.kind, step.state, step.summary);
     }
+    append_provider_identity(&mut text, &output.provider_api);
     append_hook_deliveries(&mut text, &output.hook_deliveries);
     text
+}
+
+fn append_provider_identity(text: &mut String, telemetry: &caravan::model::GitHubApiTelemetry) {
+    let Some(source) = telemetry.auth_source.as_deref() else {
+        return;
+    };
+    let app = telemetry.github_app_slug.as_deref().unwrap_or("-");
+    let installation = telemetry
+        .github_app_installation_id
+        .map_or_else(|| "-".to_owned(), |id| id.to_string());
+    let transport = telemetry.github_app_git_transport.as_deref().unwrap_or("-");
+    let repository = telemetry
+        .github_app_git_repository
+        .as_deref()
+        .unwrap_or("-");
+    let _ = writeln!(
+        text,
+        "  provider: {source} app={app} installation={installation} git={transport} repository={repository}"
+    );
 }
 
 fn append_hook_deliveries(text: &mut String, deliveries: &[caravan::hooks::HookDelivery]) {
@@ -2834,6 +2854,7 @@ fn run_evict(cli: &Cli, input: &EvictInput) -> Result<(), i32> {
                 );
             }
             let mut hooks = String::new();
+            append_provider_identity(&mut hooks, &output.provider_api);
             append_hook_deliveries(&mut hooks, &output.hook_deliveries);
             print!("{hooks}");
             Ok(())
@@ -2857,6 +2878,7 @@ fn run_split(cli: &Cli, input: &SplitInput) -> Result<(), i32> {
                 output.receipt.changed
             );
             let mut hooks = String::new();
+            append_provider_identity(&mut hooks, &output.provider_api);
             append_hook_deliveries(&mut hooks, &output.hook_deliveries);
             print!("{hooks}");
             Ok(())

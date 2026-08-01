@@ -386,6 +386,7 @@ mod tests {
                 completed_steps: Vec::new(),
                 changed: true,
             },
+            provider_api: crate::model::GitHubApiTelemetry::default(),
             rebase_receipt: None,
             provider_receipts: Vec::new(),
             native_stack_receipt: None,

@@ -2366,3 +2366,65 @@ fn same_bead_generation_from_unrelated_agent_does_not_block_membership() {
     assert!(output.pull_request.has_label(ACTIVE_LABEL));
     assert!(output.pull_request.auto_merge.enabled);
 }
+
+/// bd-298a9a: the live App canary proved the physical push actor on GitHub, but
+/// `new --json` discarded the runner telemetry which named that same principal
+/// and transport. The output schema must retain the secret-free identity while
+/// remaining incapable of carrying the token.
+#[test]
+fn membership_output_serializes_app_api_and_git_transport_identity_without_secrets() {
+    let output = MembershipOutput {
+        receipt: OperationReceipt {
+            operation_id: OperationId("app-canary".to_owned()),
+            operation: "new".to_owned(),
+            completed_steps: Vec::new(),
+            changed: true,
+        },
+        provider_api: crate::model::GitHubApiTelemetry {
+            authenticated: true,
+            auth_source: Some("github_app_installation".to_owned()),
+            github_app_slug: Some("caravan-agentic-merge-queue".to_owned()),
+            github_app_installation_id: Some(150_598_516),
+            github_app_token_expires_unix_secs: Some(1_895_000_000),
+            github_app_git_transport: Some("https_credential_helper".to_owned()),
+            github_app_git_repository: Some("harryaskham/caravan".to_owned()),
+            ..crate::model::GitHubApiTelemetry::default()
+        },
+        rebase_receipt: None,
+        provider_receipts: Vec::new(),
+        native_stack_receipt: None,
+        join_receipt: None,
+        pull_request: pull_request(15, "canary", "main", &[ACTIVE_LABEL]),
+        caravan_id: PrNumber(15),
+        coexisting_caravans: Vec::new(),
+        admission_intent: None,
+        events: Vec::new(),
+        hook_deliveries: Vec::new(),
+    };
+
+    let json = serde_json::to_value(&output).unwrap();
+    assert_eq!(
+        json["provider_api"]["auth_source"],
+        "github_app_installation"
+    );
+    assert_eq!(
+        json["provider_api"]["github_app_slug"],
+        "caravan-agentic-merge-queue"
+    );
+    assert_eq!(
+        json["provider_api"]["github_app_installation_id"],
+        150_598_516
+    );
+    assert_eq!(
+        json["provider_api"]["github_app_git_transport"],
+        "https_credential_helper"
+    );
+    assert_eq!(
+        json["provider_api"]["github_app_git_repository"],
+        "harryaskham/caravan"
+    );
+    let rendered = json.to_string();
+    assert!(!rendered.contains("ghs_secret_sentinel"));
+    assert!(!rendered.contains("PRIVATE KEY"));
+    assert!(!rendered.contains("token\""));
+}
