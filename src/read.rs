@@ -3762,6 +3762,80 @@ mod tests {
         );
     }
 
+    /// bd-d376b9 live #2358 shape. The old workflow generation is terminal,
+    /// while its replacement has started but has not materialized every
+    /// downstream job yet. GitHub supplies year-0001 as the unfinished
+    /// completion timestamp. This is pending-for-admission, not red: joining
+    /// rewrites the head and starts CI again anyway.
+    #[test]
+    fn a_candidate_with_a_newer_running_workflow_generation_is_admissible() {
+        let run = |name: &str,
+                   run_id: u64,
+                   state: crate::model::CheckState,
+                   started: &str,
+                   completed: &str| {
+            crate::model::CheckSnapshot {
+                name: name.to_owned(),
+                state,
+                provider_kind: Some("CheckRun".to_owned()),
+                workflow_name: Some("CI".to_owned()),
+                details_url: Some(format!(
+                    "https://github.com/acme/widgets/actions/runs/{run_id}/job/1"
+                )),
+                started_at: Some(started.to_owned()),
+                completed_at: Some(completed.to_owned()),
+                ..crate::model::CheckSnapshot::default()
+            }
+        };
+
+        let mut pending = pr(10, "pending-rerun", "main", false);
+        pending.checks = vec![
+            run(
+                "Check & Lint",
+                100,
+                crate::model::CheckState::Failure,
+                "2026-08-02T09:49:14Z",
+                "2026-08-02T09:49:19Z",
+            ),
+            run(
+                "Public Fast Tests preparation",
+                100,
+                crate::model::CheckState::Cancelled,
+                "2026-08-02T09:49:02Z",
+                "2026-08-02T09:49:02Z",
+            ),
+            run(
+                "Changed surface admission",
+                200,
+                crate::model::CheckState::Success,
+                "2026-08-02T09:49:50Z",
+                "2026-08-02T09:50:28Z",
+            ),
+            run(
+                "Public Fast Tests preparation",
+                200,
+                crate::model::CheckState::InProgress,
+                "2026-08-02T09:50:30Z",
+                "0001-01-01T00:00:00Z",
+            ),
+        ];
+        let later = pr(20, "later", "main", false);
+        let status = status(pending, vec![later]);
+        let labels = crate::config::CaravanConfig::default().agent_priority_labels;
+
+        let admission = resolve_admission(&status.analysis, &labels);
+
+        assert_eq!(admission.next_candidate, Some(PrNumber(10)));
+        assert!(
+            !admission
+                .skipped
+                .iter()
+                .any(|candidate| candidate.pr == PrNumber(10)),
+            "pending replacement CI must stay eligible: {:?}",
+            admission.skipped
+        );
+    }
+
     /// The same reduction must not excuse a CURRENT failure: newest red still
     /// refuses, even with older green runs above it in the lineage.
     #[test]

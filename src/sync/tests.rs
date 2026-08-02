@@ -7036,6 +7036,54 @@ fn a_superseded_failure_does_not_outvote_the_current_run() {
     );
 }
 
+/// bd-d376b9 live #2358 shape: a newer workflow generation is running on the
+/// exact same head. Its not-yet-materialized downstream jobs do not leave old
+/// run failures decisive, and GitHub's year-0001 unfinished-completion sentinel
+/// cannot make the running row older than its real `started_at`.
+#[test]
+fn a_newer_running_workflow_generation_classifies_as_waiting() {
+    let workflow_run = |name: &str,
+                        run_id: u64,
+                        state: crate::model::CheckState,
+                        started: &str,
+                        completed: &str| {
+        let mut check = rollup_run(name, state, started, Some(completed));
+        check.details_url = Some(format!(
+            "https://github.com/acme/widgets/actions/runs/{run_id}/job/1"
+        ));
+        check
+    };
+    let rollup = vec![
+        workflow_run(
+            "Check & Lint",
+            100,
+            crate::model::CheckState::Failure,
+            "2026-08-02T09:49:14Z",
+            "2026-08-02T09:49:19Z",
+        ),
+        workflow_run(
+            "Changed surface admission",
+            200,
+            crate::model::CheckState::Success,
+            "2026-08-02T09:49:50Z",
+            "2026-08-02T09:50:28Z",
+        ),
+        workflow_run(
+            "Public Fast Tests preparation",
+            200,
+            crate::model::CheckState::InProgress,
+            "2026-08-02T09:50:30Z",
+            "0001-01-01T00:00:00Z",
+        ),
+    ];
+
+    assert_eq!(
+        classify_checks(&rollup, false),
+        CiDisposition::Waiting,
+        "newer running CI is pending-for-admission, not terminal red"
+    );
+}
+
 /// bd-eff1dc: a lineage whose latest rows are all green classifies as passing,
 /// which is what makes a #2339-shaped candidate admissible again.
 #[test]

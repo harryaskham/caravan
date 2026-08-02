@@ -171,8 +171,8 @@ pub struct CheckSnapshot {
     /// Provider completion timestamp, absent while a run is still going.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<String>,
-    /// Marked at discovery when a later run of this same required check exists
-    /// on this exact head.
+    /// Marked at discovery when a later run of this required check, or a newer
+    /// generation of its owning workflow, exists on this exact head.
     ///
     /// DIAGNOSTIC ONLY. Policy never reads this flag: admission and CI
     /// disposition recompute supersession from timestamps through
@@ -237,22 +237,61 @@ impl CheckSnapshot {
     /// keep the row current rather than silently discard a verdict.
     #[must_use]
     pub fn observed_at(&self) -> Option<&str> {
-        self.completed_at
-            .as_deref()
-            .or(self.started_at.as_deref())
-            .filter(|stamp| !stamp.is_empty())
+        let valid = |stamp: &&str| {
+            !stamp.is_empty()
+                // GitHub emits this zero-value sentinel for an unfinished
+                // check instead of omitting `completedAt`. It is absence, not
+                // evidence that the running check predates every real run.
+                && !stamp.starts_with("0001-01-01T")
+        };
+        let started = self.started_at.as_deref().filter(valid);
+        let completed = self.completed_at.as_deref().filter(valid);
+        match (started, completed) {
+            (Some(left), Some(right)) => Some(if right > left { right } else { left }),
+            (Some(stamp), None) | (None, Some(stamp)) => Some(stamp),
+            (None, None) => None,
+        }
+    }
+
+    /// GitHub Actions workflow-run generation carried by a check details URL.
+    ///
+    /// A newer run of the same named workflow on the exact PR head supersedes
+    /// the complete older generation, including downstream jobs that the new
+    /// run has not materialized yet. Without this, old terminal jobs remain
+    /// decisive during workflow startup and pending work is misreported red.
+    fn workflow_generation(&self) -> Option<(WorkflowIdentity, u64)> {
+        let workflow_name = self.workflow_name.clone()?;
+        let url = self.details_url.as_deref()?;
+        let suffix = url.split_once("/actions/runs/")?.1;
+        let run_id = suffix.split('/').next()?.parse().ok()?;
+        Some((
+            WorkflowIdentity {
+                provider_kind: self.provider_kind.clone(),
+                workflow_name,
+            },
+            run_id,
+        ))
     }
 }
 
-/// Reduce a rollup lineage to the latest observation per required check.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct WorkflowIdentity {
+    provider_kind: Option<String>,
+    workflow_name: String,
+}
+
+/// Reduce a rollup lineage to current check/workflow observations.
 ///
 /// Returns `(current, superseded)`, preserving input order within each group.
 ///
-/// Supersession is only ever claimed on POSITIVE evidence: a row is dropped
-/// from `current` only when another row of the same identity carries a strictly
-/// later provider timestamp. When a group has no usable timestamps — older
-/// fixtures, providers that omit them, or a genuine tie — every row stays
-/// current, so this reduction can never turn a real failure into silence.
+/// Supersession is only ever claimed on POSITIVE evidence: either another row
+/// of the same check identity has a strictly later valid provider timestamp, or
+/// a check details URL proves a newer GitHub Actions run of the same named
+/// workflow exists on this exact head. The second rule retires unmatched
+/// downstream failures during a replacement workflow's startup window. When
+/// neither kind of evidence exists — older fixtures, provider rows without
+/// usable timestamps/URLs, or a genuine tie — every row stays current, so this
+/// reduction can never turn a real failure into silence.
 /// Newest provider timestamp seen for each required-check identity.
 fn newest_observation_per_identity(checks: &[CheckSnapshot]) -> BTreeMap<CheckIdentity, &str> {
     let mut newest: BTreeMap<CheckIdentity, &str> = BTreeMap::new();
@@ -272,14 +311,42 @@ fn newest_observation_per_identity(checks: &[CheckSnapshot]) -> BTreeMap<CheckId
     newest
 }
 
-/// Whether a later run of this same required check exists in `newest`.
-fn is_superseded(check: &CheckSnapshot, newest: &BTreeMap<CheckIdentity, &str>) -> bool {
-    match (newest.get(&check.identity()), check.observed_at()) {
+fn newest_workflow_generation(checks: &[CheckSnapshot]) -> BTreeMap<WorkflowIdentity, u64> {
+    let mut newest: BTreeMap<WorkflowIdentity, u64> = BTreeMap::new();
+    for check in checks {
+        let Some((identity, run_id)) = check.workflow_generation() else {
+            continue;
+        };
+        newest
+            .entry(identity)
+            .and_modify(|best| *best = (*best).max(run_id))
+            .or_insert(run_id);
+    }
+    newest
+}
+
+/// Whether positive identity or workflow-generation evidence proves this row
+/// historical. Absent/ambiguous evidence always stays current and fail-closed.
+fn is_superseded(
+    check: &CheckSnapshot,
+    newest: &BTreeMap<CheckIdentity, &str>,
+    newest_workflow: &BTreeMap<WorkflowIdentity, u64>,
+) -> bool {
+    let newer_same_check = match (newest.get(&check.identity()), check.observed_at()) {
         (Some(best), Some(observed)) => observed < *best,
         // No ordering evidence for this row, or none anywhere in its group:
         // supersession is unproven, so the row remains current.
         _ => false,
-    }
+    };
+    let newer_workflow_generation = check
+        .workflow_generation()
+        .and_then(|(identity, run_id)| {
+            newest_workflow
+                .get(&identity)
+                .map(|newest_run_id| run_id < *newest_run_id)
+        })
+        .unwrap_or(false);
+    newer_same_check || newer_workflow_generation
 }
 
 #[must_use]
@@ -287,10 +354,11 @@ pub fn latest_checks_per_identity(
     checks: &[CheckSnapshot],
 ) -> (Vec<&CheckSnapshot>, Vec<&CheckSnapshot>) {
     let newest = newest_observation_per_identity(checks);
+    let newest_workflow = newest_workflow_generation(checks);
     let mut current = Vec::new();
     let mut superseded = Vec::new();
     for check in checks {
-        if is_superseded(check, &newest) {
+        if is_superseded(check, &newest, &newest_workflow) {
             superseded.push(check);
         } else {
             current.push(check);
@@ -299,8 +367,8 @@ pub fn latest_checks_per_identity(
     (current, superseded)
 }
 
-/// Mark, in place, every check row that a later run of the same required check
-/// has superseded on this exact head.
+/// Mark, in place, every check row superseded by a later check observation or
+/// newer owning-workflow generation on this exact head.
 ///
 /// Applied once at discovery so every downstream reader — CLI text, JSON, and
 /// the web dashboard — renders the same lineage without each re-deriving the
@@ -308,9 +376,10 @@ pub fn latest_checks_per_identity(
 pub fn mark_superseded_checks(checks: &mut [CheckSnapshot]) {
     let flags = {
         let newest = newest_observation_per_identity(checks);
+        let newest_workflow = newest_workflow_generation(checks);
         checks
             .iter()
-            .map(|check| is_superseded(check, &newest))
+            .map(|check| is_superseded(check, &newest, &newest_workflow))
             .collect::<Vec<_>>()
     };
     for (check, superseded) in checks.iter_mut().zip(flags) {
@@ -1450,7 +1519,7 @@ mod tests {
 /// current verdict and blocked admission permanently.
 #[cfg(test)]
 mod check_lineage_tests {
-    use super::{CheckSnapshot, CheckState, latest_checks_per_identity};
+    use super::{CheckSnapshot, CheckState, latest_checks_per_identity, mark_superseded_checks};
 
     fn run(name: &str, state: CheckState, started: &str, completed: Option<&str>) -> CheckSnapshot {
         CheckSnapshot {
@@ -1470,6 +1539,149 @@ mod check_lineage_tests {
             .into_iter()
             .map(|check| check.state)
             .collect()
+    }
+
+    fn workflow_run(
+        name: &str,
+        workflow: &str,
+        run_id: u64,
+        state: CheckState,
+        started: &str,
+        completed: Option<&str>,
+    ) -> CheckSnapshot {
+        let mut check = run(name, state, started, completed);
+        check.workflow_name = Some(workflow.to_owned());
+        check.details_url = Some(format!(
+            "https://github.com/acme/widgets/actions/runs/{run_id}/job/1"
+        ));
+        check
+    }
+
+    /// Live #2358 shape: GitHub serializes an unfinished check's missing
+    /// completion as its year-0001 sentinel. That value is syntactically
+    /// non-empty but is not ordering evidence; the real later `started_at`
+    /// makes this rerun current.
+    #[test]
+    fn year_one_completion_does_not_make_a_new_running_check_historical() {
+        let checks = vec![
+            workflow_run(
+                "Public Fast Tests preparation",
+                "CI",
+                200,
+                CheckState::Cancelled,
+                "2026-08-02T09:49:02Z",
+                Some("2026-08-02T09:49:02Z"),
+            ),
+            workflow_run(
+                "Public Fast Tests preparation",
+                "CI",
+                200,
+                CheckState::InProgress,
+                "2026-08-02T09:50:30Z",
+                Some("0001-01-01T00:00:00Z"),
+            ),
+        ];
+        assert_eq!(current_states(&checks), vec![CheckState::InProgress]);
+    }
+
+    /// A new workflow generation is positive evidence that downstream terminal
+    /// rows from the older generation are history, even before the new run has
+    /// materialized every matching downstream job identity. Waiting for those
+    /// rows before admission is pointless: joining rewrites the head and starts
+    /// CI again anyway.
+    #[test]
+    fn newer_running_workflow_supersedes_unmatched_old_downstream_failure() {
+        let mut checks = vec![
+            workflow_run(
+                "Check & Lint",
+                "CI",
+                100,
+                CheckState::Failure,
+                "2026-08-02T09:49:14Z",
+                Some("2026-08-02T09:49:19Z"),
+            ),
+            workflow_run(
+                "Changed surface admission",
+                "CI",
+                200,
+                CheckState::Success,
+                "2026-08-02T09:49:50Z",
+                Some("2026-08-02T09:50:28Z"),
+            ),
+            workflow_run(
+                "Public Fast Tests preparation",
+                "CI",
+                200,
+                CheckState::InProgress,
+                "2026-08-02T09:50:30Z",
+                Some("0001-01-01T00:00:00Z"),
+            ),
+        ];
+        assert_eq!(
+            current_states(&checks),
+            vec![CheckState::Success, CheckState::InProgress]
+        );
+        mark_superseded_checks(&mut checks);
+        assert_eq!(
+            checks
+                .iter()
+                .map(|check| check.superseded)
+                .collect::<Vec<_>>(),
+            vec![true, false, false],
+            "status/web flags must match the rows policy ignores"
+        );
+    }
+
+    #[test]
+    fn newer_run_in_one_workflow_does_not_hide_another_workflows_failure() {
+        let checks = vec![
+            workflow_run(
+                "android-validation",
+                "Android companion",
+                150,
+                CheckState::Failure,
+                "2026-08-02T09:49:11Z",
+                Some("2026-08-02T09:49:40Z"),
+            ),
+            workflow_run(
+                "Public Fast Tests preparation",
+                "CI",
+                200,
+                CheckState::InProgress,
+                "2026-08-02T09:50:30Z",
+                Some("0001-01-01T00:00:00Z"),
+            ),
+        ];
+        assert_eq!(
+            current_states(&checks),
+            vec![CheckState::Failure, CheckState::InProgress]
+        );
+    }
+
+    #[test]
+    fn same_workflow_run_failure_still_beats_its_pending_sibling() {
+        let checks = vec![
+            workflow_run(
+                "Check & Lint",
+                "CI",
+                200,
+                CheckState::Failure,
+                "2026-08-02T09:50:00Z",
+                Some("2026-08-02T09:50:05Z"),
+            ),
+            workflow_run(
+                "Public Fast Tests preparation",
+                "CI",
+                200,
+                CheckState::InProgress,
+                "2026-08-02T09:50:30Z",
+                Some("0001-01-01T00:00:00Z"),
+            ),
+        ];
+        assert_eq!(
+            current_states(&checks),
+            vec![CheckState::Failure, CheckState::InProgress]
+        );
     }
 
     #[test]
