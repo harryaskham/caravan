@@ -5,6 +5,10 @@
 //! retryable leaves it stuck forever while the cron cheerfully reruns. Both
 //! directions are cheap to get wrong and invisible until production, so the
 //! example hook is exercised here against a fake `caco`.
+//!
+//! This entire target is guarded by Cargo feature
+//! `environmental-hook-acceptance`. It executes shell/process integration and
+//! therefore belongs to scheduled/manual CI, not an ordinary Nix install.
 
 use std::fs;
 use std::io::Write;

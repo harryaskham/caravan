@@ -965,7 +965,24 @@ for `external_decision`, and filing the bead then notifying a human for
 deduplicates on `decision_fingerprint` rather than the per-emission event id, so
 a caravan stuck for an hour dispatches one agent instead of one per cron tick.
 Its behaviour is pinned by `tests/hook_example.rs` against a fake `caco`, not by
-this prose.
+this prose. That target is an environmental acceptance, not an install gate: it
+is guarded by Cargo feature `environmental-hook-acceptance` and MUST NOT run in
+ordinary Cargo/Nix package checks, installations, pull-request CI, or release
+contract builds. The scheduled/manual `Environmental hook acceptance` workflow
+MUST run the complete target with its assertions unchanged and MUST NOT have a
+`push` or `pull_request` trigger.
+
+The environmental lane MUST always execute the assertions. Success emits no
+feedback. Before reporting a failure, the lane MUST preflight an enabled webhook
+strategy and MUST stay visibly failed rather than silently fall back to stderr.
+A reportable failure emits exactly one bounded event per run with
+the two exact assertion names, architecture, environment, source revision,
+failure phase, exit status, output digest, and credential-redacted output tail.
+The event carries a stable fingerprint over acceptance version, architecture,
+environment, and phase; identical reruns therefore present the same receiver
+idempotency identity. Receiver-side fingerprint-to-canonical-bead collapse is a
+shared Cacophony ingress contract (`bd-52cf42`), not permission for Caravan to
+weaken assertions or add a second local dedupe store.
 
 A hook is a configured shell command. It receives one versioned metadata JSON object on stdin and non-secret context such as `CARA_EVENT`, repository, and PR numbers in environment variables. Hook metadata contains operation/event IDs suitable for external deduplication.
 Before hook delivery, every canonical secret-free event is durably appended with

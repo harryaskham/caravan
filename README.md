@@ -132,12 +132,36 @@ cargo run -- mcp tools
 cargo run -- mcp stdio
 cargo run -- self-update status
 cargo run -- feedback status
+# Explicit only: runs the process/load-sensitive hook contract.
+cargo test --features environmental-hook-acceptance --test hook_example
 ```
 
 The default development shell pins `actionlint` and `shellcheck`; the same
 `scripts/check-workflows.sh` command is a Nix flake check. Custom self-hosted
 runner labels live in `.github/actionlint.yaml`, so workflow validation needs no
 ad hoc nixpkgs fetch or machine-global linter installation.
+
+`tests/hook_example.rs` is deliberately guarded by the
+`environmental-hook-acceptance` feature. Ordinary `cargo test`, Nix package
+checks/installations, pull-request CI, and release contract builds retain every
+deterministic unit/build/schema/version gate but do not build or execute that
+shell/process integration target. `.github/workflows/hook-acceptance.yml` is the
+only hosted owner: it runs daily or by `workflow_dispatch`, never on
+`push`/`pull_request`, and executes all assertions in the target unchanged.
+
+The environmental lane requires the repository secrets
+`CARAVAN_FEEDBACK_WEBHOOK_URL` and `CARAVAN_FEEDBACK_WEBHOOK_TOKEN`.
+`scripts/run-hook-acceptance.sh` always runs the assertions; on failure it
+refuses a silent stderr fallback and requires an authenticated webhook before
+emitting exactly one bounded, credential-redacted feedback event.
+The event names both load-bearing tests, architecture, runner environment,
+source revision, failure phase, output digest, and a bounded output tail. Its
+stable `caravan-hook-acceptance-v1:...` fingerprint lets an identical rerun
+refresh one receiver-side record; canonical webhook fingerprint idempotency is
+owned by Cacophony `bd-52cf42`, not by a Caravan-local dedupe workaround. A
+passing run emits no feedback event. Manual runs may set `force_failure=true`
+to exercise the same visible failure/reporting path without weakening either
+test assertion.
 
 Domain surface:
 

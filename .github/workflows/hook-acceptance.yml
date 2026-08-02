@@ -1,0 +1,52 @@
+name: Environmental hook acceptance
+
+# Deliberately not a push/pull_request workflow: these process-, load-, and
+# environment-dependent checks must stay visible without blocking ordinary Nix
+# installs or required pull-request CI.
+on:
+  schedule:
+    - cron: "37 4 * * *"
+  workflow_dispatch:
+    inputs:
+      force_failure:
+        description: Exercise the feedback-webhook failure and dedupe path
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: caravan-environmental-hook-acceptance
+  cancel-in-progress: false
+
+jobs:
+  hook-acceptance:
+    name: hook process and dispatch acceptance
+    runs-on: [self-hosted, nix, x86_64-linux]
+    timeout-minutes: 20
+    env:
+      FEEDBACK_WEBHOOK_URL: ${{ secrets.CARAVAN_FEEDBACK_WEBHOOK_URL }}
+      FEEDBACK_WEBHOOK_TOKEN_ENV: CARAVAN_FEEDBACK_WEBHOOK_TOKEN
+      CARAVAN_FEEDBACK_WEBHOOK_TOKEN: ${{ secrets.CARAVAN_FEEDBACK_WEBHOOK_TOKEN }}
+      FEEDBACK_COMPONENT: hook-acceptance
+      FEEDBACK_PROJECT: caravan
+      CARA_HOOK_ACCEPTANCE_ENVIRONMENT_CLASS: self-hosted:nix:x86_64-linux
+      CARA_HOOK_ACCEPTANCE_FORCE_FAILURE: ${{ github.event_name == 'workflow_dispatch' && inputs.force_failure || false }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use anonymous HTTPS for public ecosystem crates
+        shell: bash
+        run: |
+          git config --global --unset-all url."ssh://git@github.com/".insteadOf 2>/dev/null || true
+
+      - name: Run environmental hook acceptance and report bounded failures
+        shell: bash
+        run: |
+          nix develop --command bash -c '
+            set -euo pipefail
+            cargo build --bin cara
+            CARA_BIN=target/debug/cara ./scripts/run-hook-acceptance.sh
+          '

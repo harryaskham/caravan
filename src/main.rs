@@ -316,6 +316,9 @@ struct FeedbackArgs {
     /// Optional severity.
     #[arg(long, value_enum)]
     severity: Option<SeverityArg>,
+    /// Stable receiver-side dedupe key. Never put credentials in this value.
+    #[arg(long)]
+    fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -3004,23 +3007,31 @@ fn run_self_update(json: bool, command: &SelfUpdateCommand) -> Result<(), i32> {
     }
 }
 
+fn feedback_event(args: &FeedbackArgs) -> FeedbackEvent {
+    let mut event = FeedbackEvent::new(
+        args.kind.into(),
+        args.component
+            .clone()
+            .unwrap_or_else(|| TOOL_NAME.to_owned()),
+        args.summary.clone(),
+    );
+    if let Some(detail) = &args.detail {
+        event = event.with_detail(detail.clone());
+    }
+    if let Some(severity) = args.severity {
+        event = event.with_severity(severity.into());
+    }
+    if let Some(fingerprint) = &args.fingerprint {
+        event = event.with_fingerprint(fingerprint.clone());
+    }
+    event
+}
+
 fn run_feedback(json: bool, command: &FeedbackCommand) -> Result<(), i32> {
     match command {
         FeedbackCommand::Status => emit_result::<_, AppError>(json, Ok(caravan::feedback_status())),
         FeedbackCommand::Report(args) => {
-            let mut event = FeedbackEvent::new(
-                args.kind.into(),
-                args.component
-                    .clone()
-                    .unwrap_or_else(|| TOOL_NAME.to_owned()),
-                args.summary.clone(),
-            );
-            if let Some(detail) = &args.detail {
-                event = event.with_detail(detail.clone());
-            }
-            if let Some(severity) = args.severity {
-                event = event.with_severity(severity.into());
-            }
+            let event = feedback_event(args);
             let config = feedback_config();
             if let Some(error) = feedback_configuration_error(&config) {
                 return emit_result::<feedback_cli::ReportReceipt, _>(json, Err(error));
@@ -3248,6 +3259,25 @@ where
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn feedback_report_preserves_the_receiver_dedupe_fingerprint() {
+        let event = feedback_event(&FeedbackArgs {
+            kind: FeedbackKindArg::Error,
+            component: Some("hook-acceptance".to_owned()),
+            summary: "environmental hook acceptance failed".to_owned(),
+            detail: Some("bounded evidence".to_owned()),
+            severity: Some(SeverityArg::Error),
+            fingerprint: Some("caravan-hook-acceptance-v1:x86_64:runner".to_owned()),
+        });
+
+        assert_eq!(
+            event.fingerprint.as_deref(),
+            Some("caravan-hook-acceptance-v1:x86_64:runner")
+        );
+        assert_eq!(event.component, "hook-acceptance");
+        assert_eq!(event.detail.as_deref(), Some("bounded evidence"));
+    }
 
     /// A repository-wide problem row names the exact PRs that carry it, so a
     /// single foreign candidate's defect is not read as a defect in every

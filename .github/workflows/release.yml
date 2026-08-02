@@ -80,7 +80,9 @@ jobs:
       - name: Use anonymous HTTPS for public source inputs
         shell: bash
         run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
-      - name: Run the full suite in the pinned development shell
+      - name: Run the deterministic release suite in the pinned development shell
+        # The process/load-sensitive hook target is feature-gated and owned by
+        # the scheduled/manual environmental acceptance workflow.
         shell: bash
         run: nix develop --command cargo test --all
       - name: Exercise asset and self-update status contracts offline

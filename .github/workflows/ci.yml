@@ -39,6 +39,8 @@ jobs:
             set -euo pipefail
             cargo fmt --all --check
             cargo clippy --all-targets -- -D warnings
+            # tests/hook_example.rs requires environmental-hook-acceptance and
+            # is owned by the schedule/manual lane, not blocking PR CI.
             cargo test --all
             cargo run -- help
             cargo run -- mcp tools >/dev/null

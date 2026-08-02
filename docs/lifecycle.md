@@ -184,7 +184,13 @@ fingerprint is stable while the same decision remains unresolved, so a caravan
 stuck for an hour produces one bead rather than one per cron tick.
 
 `examples/hooks/caco-bead-dispatch.sh` implements exactly this, and
-`tests/hook_example.rs` pins the behaviour.
+`tests/hook_example.rs` pins the behaviour. Because that target exercises real
+shell/process boundaries, Cargo feature `environmental-hook-acceptance` keeps it
+out of ordinary Nix installs and blocking pull-request/release checks. The
+scheduled/manual `Environmental hook acceptance` workflow runs the assertions
+unchanged and reports one bounded failure event through the configured feedback
+webhook. Identical runs carry the same stable fingerprint; shared receiver-side
+collapse is tracked by Cacophony `bd-52cf42`.
 
 ---
 

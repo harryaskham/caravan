@@ -9,6 +9,12 @@ repository = "https://github.com/harryaskham/caravan"
 readme = "README.md"
 publish = false
 
+[features]
+default = []
+# These acceptances execute shell/process integrations and therefore belong to
+# the scheduled/manual environmental lane, never an ordinary package build.
+environmental-hook-acceptance = []
+
 [lib]
 name = "caravan"
 path = "src/lib.rs"
@@ -16,6 +22,11 @@ path = "src/lib.rs"
 [[bin]]
 name = "cara"
 path = "src/main.rs"
+
+[[test]]
+name = "hook_example"
+path = "tests/hook_example.rs"
+required-features = ["environmental-hook-acceptance"]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }

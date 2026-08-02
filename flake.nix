@@ -130,8 +130,9 @@
 
               cargoLock.lockFile = "${caravanSrc}/Cargo.lock";
               # Cross/static toolchains cannot run the host-linked test binaries
-              # here; the native package above keeps `doCheck = true` and the
-              # release lane still runs the complete suite before publishing.
+              # here. The native package keeps the deterministic default suite;
+              # scheduled/manual CI separately owns the feature-gated
+              # environmental hook acceptance target.
               doCheck = false;
 
               nativeBuildInputs = [ pkgs.pkg-config ];
