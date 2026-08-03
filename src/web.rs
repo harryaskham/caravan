@@ -3327,7 +3327,10 @@ mod tests {
         assert!(!INDEX_HTML.contains("Caravan Control"));
         assert!(!INDEX_HTML.contains("Waiting at the rail"));
         assert!(INDEX_HTML.contains("id=\"repository-sidebar\""));
+        assert!(INDEX_HTML.contains("id=\"evidence-sidebar\""));
+        assert!(INDEX_HTML.contains("id=\"evidence-content\""));
         assert!(INDEX_HTML.contains("id=\"attention-sidebar\""));
+        assert!(INDEX_HTML.contains("class=\"dashboard-scroll\""));
         assert!(INDEX_HTML.contains("id=\"saloon\""));
         for label in [
             "Ready",
@@ -3360,6 +3363,17 @@ mod tests {
         assert!(APP_CSS.contains(".dashboard.no-caravans .caravan-list .empty-state"));
         assert!(APP_CSS.contains(".repo-rail { grid-column: 1;"));
         assert!(APP_CSS.contains(".content { grid-column: 2;"));
-        assert!(APP_CSS.contains(".attention-rail { grid-column: 3;"));
+        assert!(APP_CSS.contains(".evidence-rail { grid-column: 3;"));
+        assert!(APP_CSS.contains(".attention-rail { grid-column: 4;"));
+        assert!(APP_CSS.contains(".dashboard-scroll {"));
+        assert!(APP_CSS.contains("overflow-y: auto"));
+        assert!(APP_CSS.contains(".caravan { min-height: 220px;"));
+        assert!(APP_CSS.contains(".saloon-groups { display: grid; align-content: start; gap: 7px; min-height: 0; overflow: visible;"));
+        assert!(APP_JS.contains("toggleSidebar(\"evidence\")"));
+        assert!(!APP_JS.contains("openInspector(\"evidence\")"));
+        assert!(APP_JS.contains("problem?.kind === \"dissolved_member\""));
+        assert!(APP_JS.contains("data-dismiss-decision"));
+        assert!(APP_JS.contains("data-restore-decisions"));
+        assert!(APP_JS.contains("Only historical dissolved-member notices can be dismissed"));
     }
 }

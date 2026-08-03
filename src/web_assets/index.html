@@ -19,7 +19,7 @@
       <span id="connection" class="connection" role="status">Connecting</span>
       <button id="plan-sync" class="button" type="button" data-mutates="false" hidden>Plan sync</button>
       <button id="sync-all" class="button button-primary" type="button" hidden>Sync all</button>
-      <button id="show-evidence" class="button" type="button" hidden>Evidence</button>
+      <button id="show-evidence" class="sidebar-toggle" type="button" aria-controls="evidence-sidebar" aria-expanded="false" hidden>Evidence</button>
       <button id="show-config" class="button" type="button" hidden>Config</button>
       <button id="refresh-all" class="button" type="button">Refresh</button>
       <button id="toggle-attention" class="sidebar-toggle" type="button" aria-controls="attention-sidebar" aria-expanded="true" title="Toggle attention">Attention <span id="attention-count" class="sidebar-count">0</span></button>
@@ -36,6 +36,7 @@
       <div id="dashboard" class="dashboard" hidden>
         <section id="repo-overview" class="overview-grid" aria-labelledby="repo-title"></section>
 
+        <div class="dashboard-scroll" tabindex="0" aria-label="Active topology and Saloon">
         <section class="section-block caravan-section" aria-labelledby="caravans-title">
           <div class="section-heading">
             <div><p class="eyebrow">Active topology</p><h2 id="caravans-title">Active caravans</h2></div>
@@ -62,8 +63,14 @@
           <div class="section-heading"><div><p class="eyebrow">Not yet joined</p><h2 id="saloon-title">Saloon</h2></div><span id="saloon-count" class="section-count">0 PRs</span></div>
           <div id="saloon" class="saloon-groups"></div>
         </section>
+        </div>
       </div>
     </section>
+
+    <aside id="evidence-sidebar" class="evidence-rail side-panel" aria-labelledby="evidence-title" hidden>
+      <div class="rail-heading"><div><p class="eyebrow">Evidence</p><h2 id="evidence-title">Operational evidence</h2></div><button class="panel-close" type="button" data-close-sidebar="evidence" aria-label="Collapse operational evidence">›</button></div>
+      <div id="evidence-content" class="evidence-content"></div>
+    </aside>
 
     <aside id="attention-sidebar" class="attention-rail side-panel" aria-labelledby="decisions-title">
       <div class="rail-heading"><div><p class="eyebrow">Attention</p><h2 id="decisions-title">Decisions &amp; blockers</h2></div><button class="panel-close" type="button" data-close-sidebar="attention" aria-label="Collapse decisions and blockers">›</button></div>

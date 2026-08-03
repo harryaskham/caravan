@@ -20,6 +20,8 @@
     attentionCount: document.querySelector("#attention-count"),
     workspace: document.querySelector("#workspace"),
     repositorySidebar: document.querySelector("#repository-sidebar"),
+    evidenceSidebar: document.querySelector("#evidence-sidebar"),
+    evidenceContent: document.querySelector("#evidence-content"),
     attentionSidebar: document.querySelector("#attention-sidebar"),
     toggleRepositories: document.querySelector("#toggle-repositories"),
     toggleAttention: document.querySelector("#toggle-attention"),
@@ -46,10 +48,12 @@
   const concatPlans = new Map();
   const sidebarState = {
     repositories: window.localStorage.getItem("caravan.sidebar.repositories") !== "collapsed",
+    evidence: window.localStorage.getItem("caravan.sidebar.evidence") === "expanded",
     attention: window.localStorage.getItem("caravan.sidebar.attention") !== "collapsed",
   };
   if (window.matchMedia("(max-width: 900px)").matches) {
     if (!window.localStorage.getItem("caravan.sidebar.repositories")) sidebarState.repositories = false;
+    if (!window.localStorage.getItem("caravan.sidebar.evidence")) sidebarState.evidence = false;
     if (!window.localStorage.getItem("caravan.sidebar.attention")) sidebarState.attention = false;
   }
   const SALOON_ORDER = ["ready", "conflicting", "saddling", "other", "bounty"];
@@ -75,25 +79,59 @@
   const openPr = (pr) => String(pr?.state ?? "").toLowerCase() === "open";
   const normalized = (value) => String(value ?? "unknown").toLowerCase();
   const selected = () => state?.repositories?.find((item) => item.id === selectedRepo) ?? null;
+  // Backend GraphProblemKind::is_historical is deliberately exhaustive; today
+  // dissolved_member is its sole true variant. Keep this UI allowlist narrow so
+  // a future/live blocker cannot become dismissible by accident.
+  const isDismissibleProblem = (problem) => problem?.kind === "dissolved_member";
+  const decisionDismissKey = (repositoryId) => `caravan.decisions.dismissed.${repositoryId}`;
+  const decisionFingerprint = (problem) => encodeURIComponent(JSON.stringify([
+    problem?.kind ?? "unknown",
+    [...(problem?.prs ?? [])].sort((left, right) => left - right),
+    problem?.message ?? "",
+  ]));
+
+  function dismissedDecisionIds(repositoryId) {
+    try {
+      const values = JSON.parse(window.localStorage.getItem(decisionDismissKey(repositoryId)) || "[]");
+      return new Set(Array.isArray(values) ? values.filter((value) => typeof value === "string") : []);
+    } catch {
+      return new Set();
+    }
+  }
+
+  function storeDismissedDecisionIds(repositoryId, values) {
+    window.localStorage.setItem(decisionDismissKey(repositoryId), JSON.stringify([...values]));
+  }
+
+  function visibleDecisionProblems(repo) {
+    const dismissed = dismissedDecisionIds(repo.id);
+    return (repo.status?.analysis?.fleet?.problems ?? []).filter((problem) => (
+      !isDismissibleProblem(problem) || !dismissed.has(decisionFingerprint(problem))
+    ));
+  }
 
   function applySidebarState() {
     ui.workspace.classList.toggle("repositories-collapsed", !sidebarState.repositories);
+    ui.workspace.classList.toggle("evidence-collapsed", !sidebarState.evidence);
     ui.workspace.classList.toggle("attention-collapsed", !sidebarState.attention);
     ui.repositorySidebar.hidden = !sidebarState.repositories;
+    ui.evidenceSidebar.hidden = !sidebarState.evidence;
     ui.attentionSidebar.hidden = !sidebarState.attention;
     ui.toggleRepositories.setAttribute("aria-expanded", String(sidebarState.repositories));
+    ui.evidence.setAttribute("aria-expanded", String(sidebarState.evidence));
     ui.toggleAttention.setAttribute("aria-expanded", String(sidebarState.attention));
   }
 
   function toggleSidebar(name, force) {
     sidebarState[name] = force ?? !sidebarState[name];
-    if (sidebarState[name] && window.matchMedia("(max-width: 900px)").matches) {
-      const other = name === "repositories" ? "attention" : "repositories";
-      sidebarState[other] = false;
-      window.localStorage.setItem(`caravan.sidebar.${other}`, "collapsed");
-    }
     window.localStorage.setItem(`caravan.sidebar.${name}`, sidebarState[name] ? "expanded" : "collapsed");
     applySidebarState();
+  }
+
+  function openEvidence() {
+    toggleSidebar("evidence", true);
+    const repo = selected();
+    if (repo) renderEvidence(repo);
   }
 
   function empty(message) {
@@ -183,7 +221,7 @@
     const caravans = status?.analysis?.fleet?.caravans ?? [];
     const activeCaravans = caravans.filter((caravan) => !caravan.parked);
     const parkedCaravans = caravans.filter((caravan) => caravan.parked);
-    const problems = status?.analysis?.fleet?.problems ?? [];
+    const problems = visibleDecisionProblems(repo);
     const activeMembers = new Set(caravans.flatMap((caravan) => caravan.members));
     const saloon = prValues(status).filter((pr) => openPr(pr) && !activeMembers.has(pr.number));
     const updated = repo.refreshed_unix_ms ? new Date(repo.refreshed_unix_ms).toLocaleTimeString() : "Never";
@@ -404,25 +442,32 @@
   }
 
   function renderDecisions(repo) {
-    const status = repo.status;
+    const dismissed = dismissedDecisionIds(repo.id);
+    const allProblems = repo.status?.analysis?.fleet?.problems ?? [];
+    const dismissedCount = allProblems.filter((problem) => (
+      isDismissibleProblem(problem) && dismissed.has(decisionFingerprint(problem))
+    )).length;
     const items = [];
-    if (repo.error) items.push({ title: repo.error.code, message: repo.error.message, details: repo.error.details, tone: "bad" });
-    (status?.analysis?.fleet?.problems ?? []).forEach((problem) => items.push({
+    if (repo.error) items.push({ title: repo.error.code, message: repo.error.message, details: repo.error.details, tone: "bad", dismissible: false });
+    visibleDecisionProblems(repo).forEach((problem) => items.push({
       title: String(problem.kind || "problem").replaceAll("_", " "),
       message: `${problem.message}${problem.prs?.length ? ` · PRs ${problem.prs.map((item) => `#${item}`).join(", ")}` : ""}`,
       details: problem,
-      tone: problem.kind === "unknown" ? "warn" : "bad",
+      tone: problem.kind === "unknown" ? "warn" : problem.kind === "dissolved_member" ? "info" : "bad",
+      dismissible: isDismissibleProblem(problem),
+      fingerprint: decisionFingerprint(problem),
     }));
     ui.attentionCount.textContent = String(items.length);
+    const restore = dismissedCount ? `<button class="mini-action" type="button" data-restore-decisions>Restore dismissed (${dismissedCount})</button>` : "";
     if (!items.length) {
-      ui.decisions.innerHTML = empty("No unresolved decisions");
+      ui.decisions.innerHTML = `${restore}${empty("No unresolved decisions")}`;
       return;
     }
-    ui.decisions.innerHTML = items.map((item) => `<article class="decision-card">
-      <div class="pr-kicker">${badge(item.tone === "bad" ? "Decision" : "Review", item.tone)}</div>
+    ui.decisions.innerHTML = `${restore}${items.map((item) => `<article class="decision-card">
+      <div class="pr-kicker">${badge(item.tone === "bad" ? "Decision" : item.dismissible ? "History" : "Review", item.tone)}${item.dismissible ? `<button class="mini-action" type="button" data-dismiss-decision="${item.fingerprint}">Dismiss</button>` : ""}</div>
       <h3>${escapeHtml(item.title)}</h3><p>${escapeHtml(item.message)}</p>
       ${item.details ? `<details><summary>Exact details</summary><pre>${escapeHtml(JSON.stringify(item.details, null, 2))}</pre></details>` : ""}
-    </article>`).join("");
+    </article>`).join("")}`;
   }
 
   function diagnosticRows(result) {
@@ -465,7 +510,7 @@
       ${!events.length && !deliveries.length && !journal.length ? empty("No durable Cara journal records yet") : ""}
       <details class="hook-config"><summary>${Object.keys(hooks).length} configured hook policies</summary><pre>${escapeHtml(JSON.stringify(hooks, null, 2))}</pre></details>
     </section>`);
-    ui.inspectorContent.innerHTML = sections.join("");
+    ui.evidenceContent.innerHTML = sections.join("");
   }
 
   function renderConfig(repo) {
@@ -475,14 +520,14 @@
     </section>`;
   }
 
-  function openInspector(mode) {
+  function openInspector() {
     const repo = selected();
     if (!repo) return;
-    inspectorMode = mode;
+    inspectorMode = "config";
     ui.inspector.hidden = false;
     ui.inspectorKicker.textContent = repoName(repo);
-    ui.inspectorTitle.textContent = mode === "config" ? "Effective configuration" : "Operational evidence";
-    if (mode === "config") renderConfig(repo); else renderEvidence(repo);
+    ui.inspectorTitle.textContent = "Effective configuration";
+    renderConfig(repo);
   }
 
   function renderConcatControl(repo, actionBusy) {
@@ -528,9 +573,10 @@
     renderCaravans(repo);
     renderConcatControl(repo, actionBusy);
     renderSaloon(repo);
+    renderEvidence(repo);
     renderDecisions(repo);
     applySidebarState();
-    if (inspectorMode) openInspector(inspectorMode);
+    if (inspectorMode) openInspector();
   }
 
   function toast(message) {
@@ -579,13 +625,13 @@
       if (!payload.ok) throw new Error(payload.error?.message || `${action} was not accepted`);
       repo.actions = [...(repo.actions ?? []), payload.job];
       render();
-      openInspector("evidence");
+      openEvidence();
       toast(`${action.replaceAll("_", " ")} started`);
       await pollAction(repo.id, payload.action_id);
     } catch (error) {
       toast(error.message);
       await fetchState({ quiet: true });
-      openInspector("evidence");
+      openEvidence();
     } finally {
       if (button) button.disabled = state.read_only && button.dataset.mutates !== "false";
       setBusy(false);
@@ -599,12 +645,12 @@
       const repo = state?.repositories?.find((item) => item.id === repositoryId);
       const job = repo?.actions?.find((item) => item.id === actionId);
       if (!job) continue;
-      openInspector("evidence");
+      openEvidence();
       if (["succeeded", "failed"].includes(job.state)) {
         if (job.state === "succeeded" && job.action === "plan_concat" && repo.last_action?.result?.plan_hash) {
           concatPlans.set(repo.id, { plan: repo.last_action.result, refreshSequence: repo.refresh_sequence });
           render();
-          openInspector("evidence");
+          openEvidence();
         }
         if (job.state === "succeeded" && job.action === "concat") concatPlans.delete(repo.id);
         toast(job.state === "succeeded" ? `${job.action.replaceAll("_", " ")} completed` : job.error?.message || `${job.action} failed`);
@@ -655,8 +701,8 @@
     performAction("concat", { ...concatIntent(), expected_plan_hash: reviewed.plan.plan_hash }, ui.executeConcat);
   });
   [ui.concatSource, ui.concatTarget, ui.concatActor, ui.concatReason].forEach((control) => control.addEventListener("change", invalidateConcatPlan));
-  ui.evidence.addEventListener("click", () => openInspector("evidence"));
-  ui.config.addEventListener("click", () => openInspector("config"));
+  ui.evidence.addEventListener("click", () => toggleSidebar("evidence"));
+  ui.config.addEventListener("click", openInspector);
   ui.closeInspector.addEventListener("click", () => { inspectorMode = null; ui.inspector.hidden = true; });
   ui.toggleRepositories.addEventListener("click", () => toggleSidebar("repositories"));
   ui.toggleAttention.addEventListener("click", () => toggleSidebar("attention"));
@@ -669,6 +715,31 @@
     if (!button) return;
     selectedRepo = button.dataset.repo;
     render();
+  });
+  ui.decisions.addEventListener("click", (event) => {
+    const repo = selected();
+    if (!repo) return;
+    const dismiss = event.target.closest("[data-dismiss-decision]");
+    if (dismiss) {
+      const problem = (repo.status?.analysis?.fleet?.problems ?? []).find((candidate) => (
+        decisionFingerprint(candidate) === dismiss.dataset.dismissDecision
+      ));
+      if (!problem || !isDismissibleProblem(problem)) {
+        toast("Only historical dissolved-member notices can be dismissed");
+        return;
+      }
+      const values = dismissedDecisionIds(repo.id);
+      values.add(dismiss.dataset.dismissDecision);
+      storeDismissedDecisionIds(repo.id, values);
+      renderOverview(repo);
+      renderDecisions(repo);
+      return;
+    }
+    if (event.target.closest("[data-restore-decisions]")) {
+      storeDismissedDecisionIds(repo.id, new Set());
+      renderOverview(repo);
+      renderDecisions(repo);
+    }
   });
   ui.saloon.addEventListener("toggle", (event) => {
     const group = event.target.closest?.("[data-saloon-group]");
