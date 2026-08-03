@@ -1,8 +1,9 @@
 //! Live read-only command implementations: status, show, and check.
 
 use std::collections::{BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mcp_cli::{ErrorCategory, StructuredError};
 use schemars::JsonSchema;
@@ -525,6 +526,33 @@ pub struct StatusOutput {
     pub admission: AdmissionStatus,
 }
 
+/// Typed evidence that read-only status retained a last-good snapshot after its
+/// current provider pass exhausted the dedicated read budget.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct StatusPartial {
+    pub schema_version: u32,
+    pub code: String,
+    pub exhausted_phase: String,
+    pub cursor: String,
+    pub elapsed_ms: u64,
+    pub deadline_ms: u64,
+    pub remaining_ms: u64,
+    pub last_good_age_ms: u64,
+    #[serde(default)]
+    pub attempt_provider_api: crate::model::GitHubApiTelemetry,
+    pub safe_next_action: String,
+}
+
+/// CLI-facing status receipt. Flattening preserves the stable complete-status
+/// shape consumed by Cacophony while adding one explicit partial marker.
+#[derive(Debug, Clone, Serialize)]
+pub struct StatusReadReceipt {
+    #[serde(flatten)]
+    pub output: StatusOutput,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_partial: Option<StatusPartial>,
+}
+
 /// Timing evidence for one complete read-only status operation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct StatusTiming {
@@ -975,6 +1003,189 @@ fn local_commit_relation(
 pub fn status(context: &AppContext) -> Result<StatusOutput, AppError> {
     let budget = std::time::Duration::from_secs(context.config.command_timeout_secs);
     status_with_deadline(context, std::time::Instant::now() + budget)
+}
+
+const STATUS_READ_BUDGET: Duration = Duration::from_secs(35);
+const STATUS_COMPLETION_RESERVE: Duration = Duration::from_secs(2);
+const STATUS_LAST_GOOD_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+const STATUS_LAST_GOOD_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const STATUS_LAST_GOOD_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedStatus {
+    schema_version: u32,
+    recorded_unix_ms: u64,
+    config_fingerprint: String,
+    output: StatusOutput,
+}
+
+fn unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+fn git_common_dir(repository: &Path) -> Option<PathBuf> {
+    let output = std::process::Command::new("git")
+        .current_dir(repository)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8(output.stdout).ok()?;
+    let path = path.trim();
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+fn status_last_good_path(context: &AppContext) -> Option<PathBuf> {
+    Some(
+        git_common_dir(&context.repository_path)?
+            .join("cara")
+            .join("status-last-good-v1.json"),
+    )
+}
+
+fn persist_last_good_at(path: &Path, context: &AppContext, output: &StatusOutput) {
+    let persisted = PersistedStatus {
+        schema_version: STATUS_LAST_GOOD_SCHEMA_VERSION,
+        recorded_unix_ms: unix_millis(),
+        config_fingerprint: status_cache_key(context),
+        output: output.clone(),
+    };
+    let Ok(bytes) = serde_json::to_vec(&persisted) else {
+        return;
+    };
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > STATUS_LAST_GOOD_MAX_BYTES {
+        return;
+    }
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    if std::fs::write(&temporary, bytes).is_ok() && std::fs::rename(&temporary, path).is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+}
+
+fn persist_last_good(context: &AppContext, output: &StatusOutput) {
+    if let Some(path) = status_last_good_path(context) {
+        persist_last_good_at(&path, context, output);
+    }
+}
+
+fn load_last_good_at(path: &Path, context: &AppContext) -> Option<PersistedStatus> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if metadata.len() > STATUS_LAST_GOOD_MAX_BYTES {
+        return None;
+    }
+    let persisted: PersistedStatus = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    if persisted.schema_version != STATUS_LAST_GOOD_SCHEMA_VERSION
+        || persisted.config_fingerprint != status_cache_key(context)
+    {
+        return None;
+    }
+    let age_ms = unix_millis().saturating_sub(persisted.recorded_unix_ms);
+    (age_ms <= u64::try_from(STATUS_LAST_GOOD_MAX_AGE.as_millis()).unwrap_or(u64::MAX))
+        .then_some(persisted)
+}
+
+fn load_last_good(context: &AppContext) -> Option<PersistedStatus> {
+    load_last_good_at(&status_last_good_path(context)?, context)
+}
+
+fn partial_phase(error: &AppError) -> String {
+    error
+        .details()
+        .and_then(|details| {
+            details
+                .get("phase")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "provider_enumeration".to_owned())
+}
+
+fn partial_provider_api(error: &AppError) -> crate::model::GitHubApiTelemetry {
+    error
+        .details()
+        .and_then(|details| details.get("provider_api").cloned())
+        .and_then(|telemetry| serde_json::from_value(telemetry).ok())
+        .unwrap_or_default()
+}
+
+fn recover_partial_status(
+    error: &AppError,
+    started: Instant,
+    deadline: Duration,
+    persisted: PersistedStatus,
+) -> StatusReadReceipt {
+    let now_ms = unix_millis();
+    let age_ms = now_ms.saturating_sub(persisted.recorded_unix_ms);
+    let elapsed = started.elapsed();
+    let mut output = persisted.output;
+    output.healthy = false;
+    StatusReadReceipt {
+        output,
+        status_partial: Some(StatusPartial {
+            schema_version: 1,
+            code: "status_partial".to_owned(),
+            exhausted_phase: partial_phase(error),
+            cursor: format!("last_good_complete_status:{}", persisted.recorded_unix_ms),
+            elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            deadline_ms: u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
+            remaining_ms: u64::try_from(deadline.saturating_sub(elapsed).as_millis())
+                .unwrap_or(u64::MAX),
+            last_good_age_ms: age_ms,
+            attempt_provider_api: partial_provider_api(error),
+            safe_next_action: "retry the read-only status pass after provider latency recovers; sync mutation and post-rewrite reserves were not used or weakened".to_owned(),
+        }),
+    }
+}
+
+/// Run the human/CLI status surface under its own short read budget.
+///
+/// This path never borrows the sync mutation deadline or post-rewrite reserve.
+/// A timeout returns the config-matched, bounded last-good snapshot as an
+/// explicitly degraded `status_partial` receipt, so Cacophony's canonical Cara
+/// adapter remains useful instead of becoming wholly unavailable.
+pub fn status_resilient(context: &AppContext) -> Result<StatusReadReceipt, AppError> {
+    let started = Instant::now();
+    let budget = STATUS_READ_BUDGET;
+    let provider_budget = budget.saturating_sub(STATUS_COMPLETION_RESERVE);
+    match status_with_deadline(context, started + provider_budget) {
+        Ok(output) => {
+            persist_last_good(context, &output);
+            Ok(StatusReadReceipt {
+                output,
+                status_partial: None,
+            })
+        }
+        Err(error) if error.category() == ErrorCategory::Timeout => load_last_good(context)
+            .map(|persisted| recover_partial_status(&error, started, budget, persisted))
+            .ok_or_else(|| {
+                AppError::structured(
+                    ErrorCategory::Timeout,
+                    "status_partial_unavailable",
+                    "read-only status exhausted its dedicated provider budget before any last-good snapshot was available",
+                    Some(json!({
+                        "phase": partial_phase(&error),
+                        "elapsed_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        "deadline_ms": u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
+                        "provider_api": partial_provider_api(&error),
+                        "status_partial": false,
+                        "safe_next_action": "retry read-only status after provider latency recovers; do not change sync mutation reserves or add another loop",
+                    })),
+                )
+            }),
+        Err(error) => Err(error),
+    }
 }
 
 /// Run status under a caller-supplied absolute deadline. This narrow seam lets
@@ -3601,6 +3812,151 @@ mod tests {
         assert_eq!(details["phase"], "compatibility_prepare");
         assert_eq!(details["elapsed_ms"], 875);
         assert_eq!(details["deadline_ms"], 1_000);
+    }
+
+    #[test]
+    fn resilient_status_budget_is_read_only_and_not_the_sync_mutation_window() {
+        let mut context = crate::AppContext::default();
+        context.config.command_timeout_secs = 3_600;
+        context.config.sync.max_duration_secs = 3_600;
+
+        assert_eq!(STATUS_READ_BUDGET, std::time::Duration::from_secs(35));
+        assert_eq!(STATUS_COMPLETION_RESERVE, std::time::Duration::from_secs(2));
+        assert_ne!(
+            STATUS_READ_BUDGET,
+            std::time::Duration::from_secs(context.config.sync.max_duration_secs),
+            "read-only status must never borrow the sync mutation deadline"
+        );
+    }
+
+    #[test]
+    fn slow_provider_over_eight_candidates_returns_caco_compatible_status_partial() {
+        let active = (1..=12)
+            .map(|number| pr(number, &format!("branch-{number}"), "main", true))
+            .collect::<Vec<_>>();
+        let current = active[8].clone();
+        let complete = status(current, active);
+        assert!(
+            complete.analysis.pull_requests.len() > 8,
+            "the last-good fixture must retain a provider set beyond the automatic candidate limit"
+        );
+        let recorded = unix_millis().saturating_sub(1_250);
+        let persisted = PersistedStatus {
+            schema_version: STATUS_LAST_GOOD_SCHEMA_VERSION,
+            recorded_unix_ms: recorded,
+            config_fingerprint: "fixture".to_owned(),
+            output: complete,
+        };
+        let provider_api = crate::model::GitHubApiTelemetry {
+            calls: 17,
+            graphql_calls: 9,
+            rest_calls: 8,
+            ..crate::model::GitHubApiTelemetry::default()
+        };
+        let error = AppError::structured(
+            ErrorCategory::Timeout,
+            "github_discovery_timeout",
+            "slow provider enumeration exhausted the dedicated read budget",
+            Some(json!({
+                "phase": "open_pull_requests_and_checks",
+                "provider_api": provider_api,
+            })),
+        );
+
+        let receipt = recover_partial_status(
+            &error,
+            std::time::Instant::now(),
+            STATUS_READ_BUDGET,
+            persisted,
+        );
+        let partial = receipt
+            .status_partial
+            .as_ref()
+            .expect("typed partial receipt");
+        assert!(!receipt.output.healthy);
+        assert_eq!(partial.code, "status_partial");
+        assert_eq!(partial.exhausted_phase, "open_pull_requests_and_checks");
+        assert!(partial.cursor.starts_with("last_good_complete_status:"));
+        assert!(partial.last_good_age_ms >= 1_250);
+        assert_eq!(partial.attempt_provider_api.calls, 17);
+        assert_eq!(partial.deadline_ms, 35_000);
+        let expected_repository = receipt.output.repository.clone();
+        let adapter_payload = serde_json::to_value(&receipt).expect("status receipt serializes");
+        assert_eq!(adapter_payload["healthy"], false);
+        assert_eq!(
+            adapter_payload["repository"]["owner"],
+            expected_repository.owner
+        );
+        assert_eq!(
+            adapter_payload["repository"]["name"],
+            expected_repository.name
+        );
+        assert_eq!(adapter_payload["status_partial"]["code"], "status_partial");
+        assert_eq!(
+            adapter_payload["status_partial"]["attempt_provider_api"]["calls"],
+            17
+        );
+        let canonical_adapter_envelope = json!({
+            "status": "success",
+            "data": adapter_payload,
+        });
+        assert_eq!(
+            canonical_adapter_envelope["data"]["repository"]["owner"],
+            expected_repository.owner
+        );
+        assert_eq!(canonical_adapter_envelope["data"]["healthy"], false);
+        assert_eq!(
+            canonical_adapter_envelope["data"]["status_partial"]["code"],
+            "status_partial"
+        );
+        assert!(
+            !partial
+                .safe_next_action
+                .contains("raise sync.max_duration_secs"),
+            "read-only recovery must not prescribe an already-maxed mutation deadline"
+        );
+    }
+
+    #[test]
+    fn partial_unavailable_guidance_never_touches_sync_mutation_bounds() {
+        let error = AppError::structured(
+            ErrorCategory::Timeout,
+            "status_partial_unavailable",
+            "read-only status exhausted its dedicated provider budget before any last-good snapshot was available",
+            Some(json!({
+                "phase": "merge_candidate_identity",
+                "status_partial": false,
+                "safe_next_action": "retry read-only status after provider latency recovers; do not change sync mutation reserves or add another loop",
+            })),
+        );
+        let details = error.details().expect("typed details");
+        let action = details["safe_next_action"].as_str().expect("action");
+        assert!(!action.contains("raise sync.max_duration_secs"));
+        assert!(!action.contains("lower sync.max_candidates_per_tick"));
+        assert!(action.contains("read-only status"));
+    }
+
+    #[test]
+    fn persisted_last_good_is_config_fenced_and_size_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        let context = crate::AppContext {
+            repository_path: directory.path().to_path_buf(),
+            config_path: directory.path().join(".caravan/config.yaml"),
+            config_existed: true,
+            config: crate::config::CaravanConfig::default(),
+        };
+        let path = directory.path().join("status.json");
+        let output = status(pr(9, "nine", "main", false), Vec::new());
+        persist_last_good_at(&path, &context, &output);
+        let loaded = load_last_good_at(&path, &context).expect("matching config loads");
+        assert_eq!(loaded.output.repository, output.repository);
+
+        let mut changed = context.clone();
+        changed.config.command_timeout_secs += 1;
+        assert!(
+            load_last_good_at(&path, &changed).is_none(),
+            "a policy change invalidates stale status sections"
+        );
     }
 
     #[test]

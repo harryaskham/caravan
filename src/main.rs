@@ -622,13 +622,23 @@ fn run_config(cli: &Cli, command: &ConfigCommand) -> Result<(), i32> {
 
 fn run_status(cli: &Cli) -> Result<(), i32> {
     let context = load_context(cli)?;
-    let result = caravan::read::status(&context);
+    let result = caravan::read::status_resilient(&context);
     if cli.json {
         return emit_result(true, result);
     }
     match result {
-        Ok(output) => {
-            print!("{}", render_status(&output));
+        Ok(receipt) => {
+            print!("{}", render_status(&receipt.output));
+            if let Some(partial) = receipt.status_partial {
+                eprintln!(
+                    "status partial: phase={} cursor={} elapsed={}ms remaining={}ms; {}",
+                    partial.exhausted_phase,
+                    partial.cursor,
+                    partial.elapsed_ms,
+                    partial.remaining_ms,
+                    partial.safe_next_action,
+                );
+            }
             Ok(())
         }
         Err(error) => emit_human_error(error),
