@@ -571,7 +571,9 @@ the exact caravan head `caravan-parked` after latest-per-check evidence proves a
 current terminal Failure/Cancelled/TimedOut/ActionRequired verdict, disables its
 auto-merge, and excludes the whole preserved caravan from active convergence,
 capacity and admission-tail selection. It never changes member labels, branches
-or bases. Pending/running and superseded red remain active. A new head or latest
+or bases. Pending/running and superseded red remain active; a newer Actions run
+on the exact head supersedes terminal rows from its older workflow generation
+even before matching downstream job names materialize. A new head or latest
 nonterminal/green verdict removes the parked label; re-entry retains the root's
 immutable original FIFO age. Park/unpark events bind exact ordering, member
 heads, current/superseded check evidence, classification, fingerprint and

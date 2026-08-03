@@ -2111,6 +2111,71 @@ fn parking_uses_latest_verdict_only_and_pending_never_parks() {
     }
 }
 
+/// bd-e4955a: GitHub records a cancelled-prerequisite aggregate as FAILURE,
+/// but a newer run of the same workflow on the exact head owns the verdict.
+/// Parking consumes the shared lineage reducer, so the older generation is
+/// historical even before the replacement run materializes matching job names.
+#[test]
+fn cancelled_prerequisite_generation_never_parks_and_unparks_automatically() {
+    let workflow_run =
+        |name: &str, run_id: u64, state: CheckState, started: &str, completed: &str| {
+            let mut check = check(name, state, Some(run_id));
+            check.provider_kind = Some("CheckRun".to_owned());
+            check.workflow_name = Some("CI".to_owned());
+            check.started_at = Some(started.to_owned());
+            check.completed_at = Some(completed.to_owned());
+            check
+        };
+    let checks = vec![
+        workflow_run(
+            "Check & Lint",
+            100,
+            CheckState::Failure,
+            "2026-08-02T18:49:14Z",
+            "2026-08-02T18:49:19Z",
+        ),
+        workflow_run(
+            "Changed surface admission",
+            200,
+            CheckState::Success,
+            "2026-08-02T18:49:50Z",
+            "2026-08-02T18:50:28Z",
+        ),
+        workflow_run(
+            "Public Fast Tests preparation",
+            200,
+            CheckState::InProgress,
+            "2026-08-02T18:50:30Z",
+            "0001-01-01T00:00:00Z",
+        ),
+    ];
+    let mut context = AppContext::default();
+    context.config.sync.terminal_red.action = crate::config::TerminalRedAction::Park;
+
+    let mut pulls = healthy_chain();
+    pulls.truncate(1);
+    pulls[0].checks.clone_from(&checks);
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    let unparked_status = status(pulls, Some(PrNumber(1)), &clean);
+    let unchanged = reconcile_terminal_red_parking(&context, &unparked_status, &provider)
+        .expect("newer exact-head workflow is pending, not terminal red");
+    assert!(!unchanged.changed);
+    assert!(!provider.pulls.borrow()[&PrNumber(1)].has_label("caravan-parked"));
+
+    let mut parked = healthy_chain();
+    parked.truncate(1);
+    parked[0].checks = checks;
+    parked[0].labels.insert("caravan-parked".to_owned());
+    parked[0].auto_merge = AutoMergeState::disabled();
+    let provider = FakeProvider::with_pull_requests(parked.clone());
+    let parked_status = status(parked, Some(PrNumber(1)), &clean);
+    let recovered = reconcile_terminal_red_parking(&context, &parked_status, &provider)
+        .expect("newer exact-head workflow automatically removes stale parking");
+    assert!(recovered.changed);
+    assert_eq!(recovered.events[0].kind, EventKind::CaravanUnparked);
+    assert!(!provider.pulls.borrow()[&PrNumber(1)].has_label("caravan-parked"));
+}
+
 #[test]
 fn one_terminal_member_parks_the_complete_caravan_without_topology_change() {
     let mut pulls = healthy_chain();
