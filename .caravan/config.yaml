@@ -1,4 +1,7 @@
 version: 1
+# Rolling system runtime sentinel: wrapper compatibility is source/config
+# checked, while upgrades do not require a pin edit.
+min_cara_version: "0.0.0"
 # This repository dogfoods every mutating Cara policy. Force remains one-shot,
 # exact-generation operator intent and never bypasses textual conflicts.
 force_merge: true

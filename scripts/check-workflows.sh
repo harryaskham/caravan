@@ -18,3 +18,4 @@ command -v shellcheck >/dev/null || {
 actionlint -config-file .github/actionlint.yaml .github/workflows/*.yml
 shellcheck scripts/*.sh tests/*.sh examples/hooks/*.sh
 bash tests/hook_acceptance_contract.sh
+bash tests/cara_runtime_contract.sh

@@ -61,6 +61,13 @@ PR generation and atomically asks Cara to append it. The author then moves on;
 Cacophony routes CI or Cara failures back to the recorded owner and closes the
 bead only after the PR actually merges.
 
+Same-repository consumers execute Caravan's checkout-owned runtime prefix,
+`scripts/cara-runtime.sh --source system --`, never a sibling Cacophony script.
+The wrapper's rolling minimum-version sentinel, bounded typed failures,
+resolution fingerprint, consumer metadata, validation, and rollback contract
+are documented in [`cara-runtime.md`](cara-runtime.md). Activating that consumer
+remains a separate Cacophony configuration/rollout change.
+
 For an operator-selected PR, explicit membership is authoritative after exact
 mechanical checks:
 
