@@ -993,7 +993,14 @@ pub(crate) fn status_with_deadline_and_budget(
     operation_deadline: std::time::Instant,
     github_budget: Option<&crate::command::GithubRequestBudget>,
 ) -> Result<StatusOutput, AppError> {
-    status_with_discovery_options(context, operation_deadline, github_budget, false, true)
+    status_with_discovery_options(
+        context,
+        operation_deadline,
+        github_budget,
+        false,
+        true,
+        None,
+    )
 }
 
 /// Status for a fleet-level read that must not depend on the local checkout.
@@ -1008,7 +1015,14 @@ pub(crate) fn fleet_status(
     operation_deadline: std::time::Instant,
     github_budget: Option<&crate::command::GithubRequestBudget>,
 ) -> Result<StatusOutput, AppError> {
-    status_with_discovery_options(context, operation_deadline, github_budget, false, false)
+    status_with_discovery_options(
+        context,
+        operation_deadline,
+        github_budget,
+        false,
+        false,
+        None,
+    )
 }
 
 /// Explicit PR-creation discovery permits one safe, advanced, unlabelled
@@ -1019,7 +1033,67 @@ pub(crate) fn status_for_pr_creation(
     operation_deadline: std::time::Instant,
     github_budget: Option<&crate::command::GithubRequestBudget>,
 ) -> Result<StatusOutput, AppError> {
-    status_with_discovery_options(context, operation_deadline, github_budget, true, true)
+    status_with_discovery_options(context, operation_deadline, github_budget, true, true, None)
+}
+
+#[derive(Debug, Clone)]
+struct ExpectedCandidateHead {
+    pr: PrNumber,
+    branch: String,
+    oid: crate::model::CommitOid,
+}
+
+fn bind_expected_candidate_head(
+    snapshot: &mut crate::model::RepositorySnapshot,
+    expected: &ExpectedCandidateHead,
+) -> Result<(), AppError> {
+    let candidate = snapshot
+        .pull_requests
+        .iter_mut()
+        .find(|candidate| candidate.number == expected.pr)
+        .ok_or_else(|| {
+            AppError::structured(
+                ErrorCategory::TargetNotFound,
+                "rebase_rediscovery_failed",
+                "rewritten PR was absent from post-push provider discovery",
+                Some(json!({
+                    "pr": expected.pr,
+                    "expected_branch": expected.branch,
+                    "expected_head_oid": expected.oid,
+                    "resumable": true,
+                })),
+            )
+        })?;
+    if candidate.head.name != expected.branch {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "rebase_rediscovery_stale",
+            "rewritten PR no longer names the exact branch that Cara pushed",
+            Some(json!({
+                "pr": expected.pr,
+                "expected_branch": expected.branch,
+                "observed_branch": candidate.head.name,
+                "expected_head_oid": expected.oid,
+                "resumable": true,
+            })),
+        ));
+    }
+
+    // The complete open-PR list can briefly retain the pre-push head after the
+    // exact ref API and Git advertisement already expose Cara's successful
+    // lease push. Bind every downstream analysis to that proven generation;
+    // compatibility preparation verifies the remote ref again, and mutation
+    // preconditions refetch it once more before any membership write.
+    candidate.head.oid.clone_from(&expected.oid);
+    for fact in snapshot
+        .generation_facts
+        .iter_mut()
+        .filter(|fact| fact.pr == expected.pr)
+    {
+        fact.provider_head.clone_from(&expected.oid);
+    }
+    snapshot.current_pr = Some(expected.pr);
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1029,6 +1103,7 @@ fn status_with_discovery_options(
     github_budget: Option<&crate::command::GithubRequestBudget>,
     allow_unlabelled_historical_pr_creation: bool,
     require_current_pr_resolution: bool,
+    expected_candidate_head: Option<&ExpectedCandidateHead>,
 ) -> Result<StatusOutput, AppError> {
     // Sharing one absolute deadline prevents a large repository from
     // multiplying its budget by provider and compatibility subprocess count.
@@ -1049,7 +1124,7 @@ fn status_with_discovery_options(
             ..crate::github::DiscoveryOptions::default()
         },
     );
-    let snapshot = discovery.discover().map_err(|error| {
+    let mut snapshot = discovery.discover().map_err(|error| {
         let mapped =
             if let DiscoveryError::Runner(CommandRunError::Timeout { command, .. }) = &error {
                 discovery_timeout_error(
@@ -1066,6 +1141,40 @@ fn status_with_discovery_options(
             };
         attach_provider_api(&mapped, &provider_runner.github_api_telemetry())
     })?;
+    if let Some(expected) = expected_candidate_head {
+        let provider = crate::github::GitHubMutationAdapter::new(provider_runner.clone());
+        provider
+            .verify_branch_head(&snapshot.repository, &expected.branch, &expected.oid)
+            .map_err(|error| match error {
+                crate::github::MutationError::BranchHeadMismatch {
+                    branch,
+                    expected: expected_oid,
+                    actual,
+                } => AppError::structured(
+                    ErrorCategory::Validation,
+                    "rebase_rediscovery_stale",
+                    "provider branch moved after Cara's exact physical push",
+                    Some(json!({
+                        "pr": expected.pr,
+                        "branch": branch,
+                        "expected_oid": expected_oid,
+                        "observed_oid": actual,
+                        "resumable": true,
+                    })),
+                ),
+                error => AppError::structured(
+                    ErrorCategory::ExecutionFailure,
+                    "rebase_rediscovery_refetch_failed",
+                    "could not verify the exact post-push provider branch generation",
+                    Some(json!({
+                        "pr": expected.pr,
+                        "error": error.to_string(),
+                        "resumable": true,
+                    })),
+                ),
+            })?;
+        bind_expected_candidate_head(&mut snapshot, expected)?;
+    }
     let discovery_elapsed = started.elapsed();
     let checker = GitCompatibilityChecker::new(&context.repository_path, "origin")
         .with_timeout(child_timeout)
@@ -1795,6 +1904,42 @@ fn duration_millis(duration: std::time::Duration) -> u64 {
 pub(crate) struct BoundRemoteCandidateStatus {
     pub status: StatusOutput,
     pub exact_deadline: std::time::Instant,
+}
+
+/// Rediscover after one successful physical branch push while binding the
+/// candidate to the exact new generation from the lease receipt.
+///
+/// GitHub's complete open-PR list can briefly report the previous head even
+/// after the exact ref endpoint and Git advertisement expose the pushed head.
+/// This path verifies the branch ref against `expected_oid`, replaces only that
+/// candidate generation before compatibility analysis, and leaves every later
+/// compatibility/provider precondition to reverify the same new head.
+pub(crate) fn status_after_branch_rewrite_with_deadline(
+    context: &AppContext,
+    number: PrNumber,
+    branch: &str,
+    expected_oid: &crate::model::CommitOid,
+    discovery_deadline: std::time::Instant,
+    github_budget: Option<&crate::command::GithubRequestBudget>,
+) -> Result<BoundRemoteCandidateStatus, AppError> {
+    let exact_budget = std::time::Duration::from_secs(context.config.command_timeout_secs);
+    let expected = ExpectedCandidateHead {
+        pr: number,
+        branch: branch.to_owned(),
+        oid: expected_oid.clone(),
+    };
+    let status = status_with_discovery_options(
+        context,
+        discovery_deadline,
+        github_budget,
+        false,
+        true,
+        Some(&expected),
+    )?;
+    Ok(BoundRemoteCandidateStatus {
+        status,
+        exact_deadline: std::time::Instant::now() + exact_budget,
+    })
 }
 
 /// Discover the fleet and bind one exact remote candidate without checkout mutation.
@@ -5088,6 +5233,55 @@ mod tests {
                 .unwrap()
                 .contains_key(&key)
         );
+    }
+
+    /// bd-59f6d2: the complete open-PR provider list may briefly retain the
+    /// old candidate head after Cara's exact lease push. Post-rewrite status
+    /// binds both graph and generation analysis to the verified new head before
+    /// compatibility, including the `--create-pr` path whose original selector
+    /// was absent.
+    #[test]
+    fn post_rewrite_binding_replaces_the_created_prs_stale_provider_head() {
+        let candidate = pr(9, "candidate", "main", false);
+        let old_head = candidate.head.oid.clone();
+        let expected = crate::model::CommitOid("rewritten-candidate-head".to_owned());
+        let mut snapshot = crate::model::RepositorySnapshot {
+            repository: repository(),
+            default_branch: branch("main"),
+            merge_candidates: Vec::new(),
+            merge_candidates_truncated: 0,
+            previous_default_oid: None,
+            default_branch_movements: Vec::new(),
+            current_branch: Some(candidate.head.name.clone()),
+            current_pr: Some(candidate.number),
+            pull_requests: vec![candidate.clone()],
+            generation_facts: vec![crate::model::PullRequestGenerationFact {
+                pr: candidate.number,
+                provider_head: old_head.clone(),
+                created_at: None,
+                provenance: None,
+                metadata_error: None,
+                supersedes: BTreeSet::new(),
+            }],
+            observed_at: None,
+        };
+
+        bind_expected_candidate_head(
+            &mut snapshot,
+            &ExpectedCandidateHead {
+                pr: candidate.number,
+                branch: candidate.head.name.clone(),
+                oid: expected.clone(),
+            },
+        )
+        .expect("exact post-push generation replaces only the stale head fact");
+
+        assert_ne!(old_head, expected);
+        assert_eq!(snapshot.current_pr, Some(candidate.number));
+        assert_eq!(snapshot.pull_requests[0].head.oid, expected);
+        assert_eq!(snapshot.generation_facts[0].provider_head, expected);
+        assert_eq!(snapshot.pull_requests[0].base, candidate.base);
+        assert_eq!(snapshot.pull_requests[0].labels, candidate.labels);
     }
 
     #[test]

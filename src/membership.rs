@@ -1661,35 +1661,36 @@ fn execute_locked(
         physical_provider_api.merge(applied.provider_api);
         let receipt = applied.receipt;
         // GitHub is authoritative after a push. Never apply base/label changes
-        // against the stale pre-rewrite PR snapshot.
-        if let Some(candidate) = candidate_pr {
-            let rediscovery_deadline = std::time::Instant::now() + timeout;
-            let bound = read::status_for_remote_candidate_with_deadline(
-                context,
-                PrNumber(candidate),
-                rediscovery_deadline,
-                github_budget,
-            )?;
-            // Same as the binding above: keep the same candidate-scoped share
-            // of the tick, never the rediscovery read's one-command window.
-            operation_deadline =
-                candidate_operation_deadline(context, operation_deadline, bound.exact_deadline);
-            status = bound.status;
-            checker = GitCompatibilityChecker::new(&context.repository_path, "origin")
-                .with_timeout(timeout)
-                .with_operation_deadline(operation_deadline);
-            let provider_runner =
-                crate::command::ProcessRunner::in_directory(&context.repository_path)
-                    .with_timeout(timeout)
-                    .with_operation_deadline(operation_deadline);
-            let provider_runner = github_budget.map_or(provider_runner.clone(), |budget| {
-                provider_runner.with_github_request_budget(budget.clone())
-            });
-            provider = GitHubMutationAdapter::new(writer_guard.runner(provider_runner));
-        } else {
-            status =
-                read::status_with_deadline_and_budget(context, operation_deadline, github_budget)?;
-        }
+        // against the stale pre-rewrite PR snapshot. Invalidate the polling
+        // cache explicitly, then bind *every* continuation — including
+        // `new --create-pr`, whose original candidate selector was None — to
+        // the exact new head from the lease receipt before compatibility runs.
+        read::invalidate_status_cache(context);
+        let rediscovery_deadline = std::time::Instant::now() + timeout;
+        let bound = read::status_after_branch_rewrite_with_deadline(
+            context,
+            number,
+            &receipt.branch,
+            &receipt.new_head_oid,
+            rediscovery_deadline,
+            github_budget,
+        )
+        .map_err(|error| attach_rebase_receipt(error, Some(&receipt)))?;
+        // Same as the initial binding: keep the candidate-scoped operation
+        // share, never the rediscovery read's one-command window.
+        operation_deadline =
+            candidate_operation_deadline(context, operation_deadline, bound.exact_deadline);
+        status = bound.status;
+        checker = GitCompatibilityChecker::new(&context.repository_path, "origin")
+            .with_timeout(timeout)
+            .with_operation_deadline(operation_deadline);
+        let provider_runner = crate::command::ProcessRunner::in_directory(&context.repository_path)
+            .with_timeout(timeout)
+            .with_operation_deadline(operation_deadline);
+        let provider_runner = github_budget.map_or(provider_runner.clone(), |budget| {
+            provider_runner.with_github_request_budget(budget.clone())
+        });
+        provider = GitHubMutationAdapter::new(writer_guard.runner(provider_runner));
         let observed = status.analysis.pull_requests.get(&number).ok_or_else(|| {
             AppError::structured(
                 ErrorCategory::ExecutionFailure,

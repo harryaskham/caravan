@@ -384,6 +384,16 @@ Priority control is a separate audited scheduling mutation, not admission author
 
 With `rebase_on_join: true`, every successful `new`/`renew`/`join`/`rejoin` emits the same exact `join_receipt` admission contract. Root operations encode the authoritative default branch as predecessor with sentinel PR number `0`; branch/OID, physical rebase, ancestry, membership, force-intent, config, provider receipts, and deterministic receipt hash remain mandatory. A root success without that complete receipt is `atomic_membership_receipt_incomplete`, never a partial success (bd-d15ba3).
 
+After an exact physical branch push, every membership continuation — including
+`--create-pr`, whose original remote-candidate selector is absent — invalidates
+pre-push polling state and binds graph/generation analysis to the receipt's
+`new_head_oid`. The exact GitHub ref is verified before that binding,
+compatibility preparation verifies the same advertisement again, and provider
+mutation preconditions refetch it before any base/label write. A lagging complete
+open-PR snapshot therefore cannot misclassify Cara's own push as
+`stale_remote_revision`; a genuine move away from the new head still fails
+closed with the rebase receipt and resumable evidence (bd-59f6d2).
+
 Every successful mutation of `caravan`, `caravan-evicted`, `caravan-force`, `caravan-join-skipped`, or a configured priority label is completed by a durable PR comment. The comment records operation, before/after labels, actor and reason source, exact compatibility and clean-squash evidence where applicable, and explicit configured label/rank or canonical FIFO basis. A deterministic `caravan-control-label-audit` HTML marker fingerprints operation, PR/head, and the before→after control-label transition; GitHub-visible latest-transition evidence deduplicates partial retries without conflating a later transition on the same head. Comment failure after labels changed returns `github_comment_failed` with completed receipts and a resumable rerun instruction; it is never reported as full success.
 
 ### Navigation
