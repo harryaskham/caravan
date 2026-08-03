@@ -543,14 +543,25 @@ aligned and create the tag:
 
 An explicit version such as `./scripts/release.sh 0.2.0` is also accepted.
 
-That one-shot path commits, tags, and pushes together. Caravan's reviewed flow
-instead lands the `release: vX.Y.Z` bump through the ordinary agent and
-reintegration lifecycle, so by tagging time the bump is already on `main` and
-`release.sh` refuses with "already current". Use this sequence instead, and
-prefer `just release-tag` over a hand-rolled `git tag`: it re-verifies the
-commit is contained in `origin/main` and that `Cargo.toml`, `Cargo.lock`, and
-`flake.nix` all declare the exact version, refuses an existing local or remote
-tag, and never moves or force-pushes one.
+That one-shot path commits, tags, and pushes together. It deliberately ignores
+the checkout's `origin`: managed Cacophony worktrees point `origin` at a local
+daemon mirror. `scripts/release-remote.sh` resolves the canonical GitHub
+repository from `CARA_RELEASE_REPO` (or Cargo.toml's package repository), uses
+`CARA_RELEASE_REMOTE` only when it names the same github.com repository, and
+defaults to its explicit GitHub SSH URL. Publication requires a clean local
+`main` exactly equal to canonical GitHub main, atomically pushes main plus the
+new tag there, then re-reads both remote refs before claiming the workflow will
+run.
+
+Caravan's reviewed flow instead lands the `release: vX.Y.Z` bump through the
+ordinary agent and reintegration lifecycle, so by tagging time the bump is
+already on `main` and `release.sh` refuses with "already current". Use this
+sequence instead, and prefer `just release-tag` over a hand-rolled `git tag`:
+it fetches canonical GitHub main (never daemon-mirror `origin`), verifies the
+commit is contained there and that `Cargo.toml`, `Cargo.lock`, and `flake.nix`
+all declare the exact version, refuses an existing local or true-GitHub tag,
+and verifies the peeled remote tag after push. It never moves or force-pushes a
+tag.
 
 ```sh
 ./scripts/release.sh 0.0.75 --no-push   # bump Cargo.toml/Cargo.lock/flake.nix

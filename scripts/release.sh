@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Bump Caravan's version, commit it, create vX.Y.Z, and optionally push both.
-# The tag triggers .github/workflows/release.yml.
+# Bump Caravan's version, commit it, create vX.Y.Z, and optionally push both
+# atomically to canonical GitHub. The checkout's origin may be a daemon mirror
+# and is never publication authority. The verified tag triggers release.yml.
 
 set -euo pipefail
 
@@ -66,22 +67,47 @@ fi
   echo "working tree is dirty; commit or clean it before releasing" >&2
   exit 1
 }
+
+RELEASE_REPO="$(./scripts/release-remote.sh repo)"
+RELEASE_REMOTE="$(./scripts/release-remote.sh url)"
+branch="$(git branch --show-current)"
+[ -n "$branch" ] || {
+  echo "cannot release from detached HEAD" >&2
+  exit 1
+}
+if [ "$do_push" -eq 1 ]; then
+  [ "$branch" = "main" ] || {
+    echo "refusing to publish from branch '$branch'; release.sh pushes canonical GitHub main only" >&2
+    exit 1
+  }
+  CANONICAL_MAIN_REF="refs/remotes/cara-release/main"
+  git fetch "$RELEASE_REMOTE" "+refs/heads/main:$CANONICAL_MAIN_REF" --quiet
+  local_head="$(git rev-parse HEAD)"
+  canonical_head="$(git rev-parse "$CANONICAL_MAIN_REF")"
+  [ "$local_head" = "$canonical_head" ] || {
+    echo "local main is not exact canonical GitHub main" >&2
+    echo "  local:     $local_head" >&2
+    echo "  canonical: $canonical_head" >&2
+    exit 1
+  }
+fi
+
 if git rev-parse --quiet --verify "refs/tags/$tag" >/dev/null; then
   echo "tag already exists locally: $tag" >&2
   exit 1
 fi
 set +e
-git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1
+git ls-remote --exit-code --tags "$RELEASE_REMOTE" "refs/tags/$tag" >/dev/null 2>&1
 remote_tag_status=$?
 set -e
 case "$remote_tag_status" in
   0)
-    echo "tag already exists on origin: $tag" >&2
+    echo "tag already exists on canonical GitHub: $tag" >&2
     exit 1
     ;;
   2) ;;
   *)
-    echo "could not verify whether $tag exists on origin" >&2
+    echo "could not verify whether $tag exists on canonical GitHub" >&2
     exit 1
     ;;
 esac
@@ -148,13 +174,23 @@ git tag -a "$tag" -m "$tag"
 echo "==> committed and tagged $tag"
 
 if [ "$do_push" -eq 1 ]; then
-  branch="$(git branch --show-current)"
-  [ -n "$branch" ] || {
-    echo "cannot push a release from detached HEAD" >&2
+  release_commit="$(git rev-parse HEAD)"
+  git push --atomic "$RELEASE_REMOTE" \
+    "HEAD:refs/heads/main" \
+    "refs/tags/$tag:refs/tags/$tag"
+
+  remote_main="$(git ls-remote --heads "$RELEASE_REMOTE" refs/heads/main | awk 'NR == 1 { print $1 }')"
+  remote_tag_commit="$(git ls-remote --tags "$RELEASE_REMOTE" "refs/tags/$tag^{}" | awk 'NR == 1 { print $1 }')"
+  [ "$remote_main" = "$release_commit" ] || {
+    echo "canonical GitHub main verification failed: expected $release_commit, found ${remote_main:-missing}" >&2
     exit 1
   }
-  git push --atomic origin "$branch" "refs/tags/$tag"
-  echo "==> pushed $branch and $tag; release workflow will publish cara assets"
+  [ "$remote_tag_commit" = "$release_commit" ] || {
+    echo "canonical GitHub tag verification failed: expected $release_commit, found ${remote_tag_commit:-missing}" >&2
+    exit 1
+  }
+  echo "==> verified main and $tag at $release_commit on canonical GitHub $RELEASE_REPO"
+  echo "==> release workflow will publish cara assets for verified tag $tag"
 else
-  echo "==> --no-push: inspect the commit, then push branch and $tag atomically"
+  echo "==> --no-push: inspect the commit; after landing it, delete the provisional local tag and use scripts/release-tag.sh"
 fi

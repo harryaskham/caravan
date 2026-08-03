@@ -265,71 +265,14 @@ release-backfill-all tag:
 # already exists on main and `release.sh` refuses ("already current"). This
 # recipe closes that exact gap and nothing else.
 #
-# It is fail-closed: the commit must be on origin/main, its tree's Cargo.toml
-# and Cargo.lock versions must equal the tag, and flake.nix must either declare
-# that literal version or derive `caravanVersion` from Cargo.toml. The tag must
-# not already exist locally or on origin, and the working tree must be clean.
-# It never moves or force-pushes a tag and never edits a file.
-#   just release-tag v0.0.11                # tag exact origin/main
+# It is fail-closed: the commit must be on canonical GitHub main, its tree's
+# Cargo.toml and Cargo.lock versions must equal the tag, and flake.nix must
+# either declare that literal version or derive `caravanVersion` from
+# Cargo.toml. The tag must not already exist locally or on true GitHub, and the
+# working tree must be clean. The checkout's `origin` is deliberately ignored:
+# managed worktrees point it at the daemon mirror. It never moves or
+# force-pushes a tag and never edits a file.
+#   just release-tag v0.0.11                # tag exact canonical GitHub main
 #   just release-tag v0.0.11 <commit-sha>   # tag one exact landed commit
-release-tag tag commit="origin/main":
-    #!/usr/bin/env bash
-    set -euo pipefail
-
-    TAG="{{ tag }}"
-    REF="{{ commit }}"
-
-    [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
-      echo "error: tag must be vX.Y.Z (got: $TAG)" >&2
-      exit 2
-    }
-    [ -z "$(git status --porcelain)" ] || {
-      echo "error: working tree is dirty; clean it before tagging" >&2
-      exit 1
-    }
-
-    git fetch origin main --tags --quiet
-    COMMIT="$(git rev-parse --verify "$REF^{commit}")"
-
-    git merge-base --is-ancestor "$COMMIT" origin/main || {
-      echo "error: $COMMIT is not contained in origin/main; tags are cut from landed main only" >&2
-      exit 1
-    }
-
-    VERSION="${TAG#v}"
-    CARGO_VERSION="$(git show "$COMMIT:Cargo.toml" | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)"
-    LOCK_VERSION="$(git show "$COMMIT:Cargo.lock" | awk '/^name = "caravan"$/ { getline; sub(/^version = "/, ""); sub(/"$/, ""); print; exit }')"
-    FLAKE_SOURCE="$(git show "$COMMIT:flake.nix")"
-    if printf '%s\n' "$FLAKE_SOURCE" | grep -Fq 'caravanVersion = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;'; then
-      FLAKE_VERSION="$CARGO_VERSION"
-    else
-      FLAKE_VERSION="$(printf '%s\n' "$FLAKE_SOURCE" | sed -n 's/^ *version = "\(.*\)";$/\1/p' | head -1)"
-    fi
-    for pair in "Cargo.toml:$CARGO_VERSION" "Cargo.lock:$LOCK_VERSION" "flake.nix:$FLAKE_VERSION"; do
-      file="${pair%%:*}"
-      found="${pair#*:}"
-      [ "$found" = "$VERSION" ] || {
-        echo "error: $file at $COMMIT declares version '$found', not '$VERSION'" >&2
-        exit 1
-      }
-    done
-
-    if git rev-parse --quiet --verify "refs/tags/$TAG" >/dev/null; then
-      echo "error: tag already exists locally: $TAG" >&2
-      exit 1
-    fi
-    set +e
-    git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1
-    remote_tag_status=$?
-    set -e
-    case "$remote_tag_status" in
-      0) echo "error: tag already exists on origin: $TAG" >&2; exit 1 ;;
-      2) ;;
-      *) echo "error: could not verify whether $TAG exists on origin" >&2; exit 1 ;;
-    esac
-
-    echo "==> tagging $TAG at $COMMIT (version $VERSION verified in Cargo.toml, Cargo.lock, flake.nix)"
-    git tag -a "$TAG" -m "$TAG" "$COMMIT"
-    git push origin "refs/tags/$TAG"
-    echo "==> pushed $TAG; release.yml will publish cara assets for that tag"
-    echo "    next: just release-pin-rows $TAG \"reviewed release binary\""
+release-tag tag commit="canonical/main":
+    ./scripts/release-tag.sh "{{ tag }}" "{{ commit }}"

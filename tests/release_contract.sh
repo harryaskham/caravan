@@ -33,26 +33,91 @@ trap 'rm -rf "$workspace"' EXIT
 # Exercise the mutating helper only in an isolated throwaway repository.
 IFS=. read -r major minor patch <<<"$version"
 next_version="$major.$minor.$((patch + 1))"
-git init --quiet --bare "$workspace/origin.git"
+git init --quiet --bare "$workspace/mirror.git"
+git init --quiet --bare "$workspace/canonical.git"
 mkdir -p "$workspace/release-repo/scripts"
 cp Cargo.toml Cargo.lock flake.nix "$workspace/release-repo/"
-cp scripts/release.sh "$workspace/release-repo/scripts/"
+cp scripts/release.sh scripts/release-remote.sh scripts/release-tag.sh "$workspace/release-repo/scripts/"
 git -C "$workspace/release-repo" init --quiet --initial-branch=main
 git -C "$workspace/release-repo" config user.name "Caravan Release Test"
 git -C "$workspace/release-repo" config user.email "caravan-release@example.invalid"
 git -C "$workspace/release-repo" add .
 git -C "$workspace/release-repo" commit --quiet --message initial
-git -C "$workspace/release-repo" remote add origin "$workspace/origin.git"
+git -C "$workspace/release-repo" remote add origin "$workspace/mirror.git"
 git -C "$workspace/release-repo" push --quiet --set-upstream origin main
+git -C "$workspace/release-repo" push --quiet "$workspace/canonical.git" main
 (
   cd "$workspace/release-repo"
-  ./scripts/release.sh "$next_version" --no-push >/dev/null
+  if CARA_RELEASE_REMOTE="$workspace/canonical.git" ./scripts/release-remote.sh url >/dev/null 2>&1; then
+    echo "release remote resolver accepted a local path without the explicit fixture guard" >&2
+    exit 1
+  fi
+  CARA_RELEASE_REPO=harryaskham/caravan \
+    CARA_RELEASE_REMOTE="$workspace/canonical.git" \
+    CARA_RELEASE_REMOTE_ALLOW_LOCAL_FIXTURE=1 \
+    ./scripts/release.sh "$next_version" --no-push >/dev/null
   git rev-parse --verify "refs/tags/v$next_version^{commit}" >/dev/null
   [ -z "$(git status --porcelain)" ]
   grep -q "version = \"$next_version\"" Cargo.toml
   grep -q "version = \"$next_version\"" Cargo.lock
   # flake.nix must remain untouched by the bump: it has no literal to update.
   ! grep -q 'version = "[0-9]' flake.nix
+)
+
+# A managed checkout's origin can be a daemon mirror. Publication must update
+# only the separately configured canonical GitHub fixture and must verify both
+# remote main and the peeled annotated tag before claiming success.
+git init --quiet --bare "$workspace/push-mirror.git"
+git init --quiet --bare "$workspace/push-canonical.git"
+cp -R "$workspace/release-repo" "$workspace/push-repo"
+(
+  cd "$workspace/push-repo"
+  git tag -d "v$next_version" >/dev/null
+  git reset --hard HEAD^ >/dev/null
+  git remote set-url origin "$workspace/push-mirror.git"
+  git push --quiet --set-upstream origin main
+  git push --quiet "$workspace/push-canonical.git" main
+  initial="$(git rev-parse HEAD)"
+  output="$(
+    CARA_RELEASE_REPO=harryaskham/caravan \
+      CARA_RELEASE_REMOTE="$workspace/push-canonical.git" \
+      CARA_RELEASE_REMOTE_ALLOW_LOCAL_FIXTURE=1 \
+      ./scripts/release.sh "$next_version"
+  )"
+  release_commit="$(git rev-parse HEAD)"
+  [ "$(git --git-dir="$workspace/push-mirror.git" rev-parse refs/heads/main)" = "$initial" ]
+  if git --git-dir="$workspace/push-mirror.git" rev-parse --verify "refs/tags/v$next_version" >/dev/null 2>&1; then
+    echo "release.sh leaked the release tag into daemon-mirror origin" >&2
+    exit 1
+  fi
+  [ "$(git --git-dir="$workspace/push-canonical.git" rev-parse refs/heads/main)" = "$release_commit" ]
+  [ "$(git --git-dir="$workspace/push-canonical.git" rev-parse "refs/tags/v$next_version^{}")" = "$release_commit" ]
+  grep -q "verified main and v$next_version" <<<"$output"
+)
+
+# The reviewed post-landing tag-only path obeys the same remote boundary.
+git init --quiet --bare "$workspace/tag-mirror.git"
+git init --quiet --bare "$workspace/tag-canonical.git"
+cp -R "$workspace/release-repo" "$workspace/tag-repo"
+(
+  cd "$workspace/tag-repo"
+  git tag -d "v$next_version" >/dev/null
+  git remote set-url origin "$workspace/tag-mirror.git"
+  git push --quiet --set-upstream origin main
+  git push --quiet "$workspace/tag-canonical.git" main
+  commit="$(git rev-parse HEAD)"
+  output="$(
+    CARA_RELEASE_REPO=harryaskham/caravan \
+      CARA_RELEASE_REMOTE="$workspace/tag-canonical.git" \
+      CARA_RELEASE_REMOTE_ALLOW_LOCAL_FIXTURE=1 \
+      ./scripts/release-tag.sh "v$next_version"
+  )"
+  if git --git-dir="$workspace/tag-mirror.git" rev-parse --verify "refs/tags/v$next_version" >/dev/null 2>&1; then
+    echo "release-tag leaked the release tag into daemon-mirror origin" >&2
+    exit 1
+  fi
+  [ "$(git --git-dir="$workspace/tag-canonical.git" rev-parse "refs/tags/v$next_version^{}")" = "$commit" ]
+  grep -q "verified v$next_version" <<<"$output"
 )
 
 mkdir -p "$workspace/bin" "$workspace/dist"
