@@ -1,6 +1,6 @@
 [package]
 name = "caravan"
-version = "0.0.83"
+version = "0.0.84"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
