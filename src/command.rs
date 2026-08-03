@@ -822,8 +822,11 @@ impl ProcessRunner {
             telemetry.gh_cli_calls = telemetry.gh_cli_calls.saturating_add(1);
         }
         let explicit = request.has_env("GH_TOKEN") || request.has_env("GITHUB_TOKEN");
-        telemetry.authenticated = explicit
-            || auth.is_some_and(|selection| !matches!(selection, GithubAuthSelection::Refused(_)));
+        telemetry.authenticated = Some(
+            explicit
+                || auth
+                    .is_some_and(|selection| !matches!(selection, GithubAuthSelection::Refused(_))),
+        );
         telemetry.auth_source = Some(if explicit {
             "explicit_command_token".to_owned()
         } else {
@@ -861,7 +864,7 @@ impl ProcessRunner {
             .github_api_telemetry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        telemetry.authenticated = true;
+        telemetry.authenticated = Some(true);
         telemetry.auth_source = Some("github_app_installation".to_owned());
         telemetry.github_app_slug = Some(auth.credential.app_slug.clone());
         telemetry.github_app_installation_id = Some(auth.credential.installation_id);
@@ -2352,7 +2355,7 @@ mod tests {
             Some(&GithubAuthSelection::Refused("broker failed".to_owned())),
         );
         let telemetry = runner.github_api_telemetry();
-        assert!(!telemetry.authenticated);
+        assert_eq!(telemetry.authenticated, Some(false));
         assert_eq!(telemetry.auth_source.as_deref(), Some("github_app_refused"));
     }
 
@@ -2405,7 +2408,7 @@ mod tests {
             },
         );
         let telemetry = runner.github_api_telemetry();
-        assert!(telemetry.authenticated);
+        assert_eq!(telemetry.authenticated, Some(true));
         assert_eq!(telemetry.auth_source.as_deref(), Some("ambient_token"));
         assert_eq!(telemetry.calls, 1);
         assert_eq!(telemetry.graphql_calls, 1);

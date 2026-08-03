@@ -234,19 +234,29 @@ preconditions.
 - `cara status` — repository overview: current PR, all caravans, the canonical priority-then-FIFO admission list with per-PR reasons, invalid graph fragments, and pending decision points.
 
 The CLI status read owns a dedicated 35-second wall-clock budget with a
-2-second completion reserve; it never borrows `sync.max_duration_secs`, mutation
-capacity, or post-rewrite reserve. Each provider child remains bounded by
-`command_timeout_secs`. A complete status atomically records a config-fenced,
-size-bounded, secret-free last-good snapshot under Git common metadata. If a
-later provider pass exhausts its read budget, status still exits successfully
-with that snapshot marked `healthy: false` plus a typed `status_partial` receipt
-naming the exhausted phase, last-good cursor/age, elapsed/deadline/remaining
-milliseconds, attempt provider request counts, and a read-only retry action. A
-policy change or snapshot older than 24 hours invalidates the fallback. With no
-valid last-good snapshot, the typed `status_partial_unavailable` refusal names
-the phase and never recommends raising an already-maxed sync mutation deadline.
-Mutating sync/admission paths continue using their existing independent budgets
-and cannot consume partial status (bd-4fe538).
+2-second serialization reserve and an additional bounded post-compatibility
+reserve; it never borrows `sync.max_duration_secs`, mutation capacity, or
+post-rewrite reserve. Each provider child remains bounded by
+`command_timeout_secs`. Status performs a minimal provider identity/inventory
+read before local compatibility, then yields compatibility before that reserve
+is consumed. A complete status atomically records a config-fenced, size-bounded,
+secret-free last-good snapshot under Git common metadata. If compatibility
+cannot finish, status still exits successfully — including on the first-ever
+call — with current provider/structural evidence marked `healthy: false` and a
+typed `status_partial` naming every deferred or intentionally skipped proof,
+candidate/caravan/branch counts, planned/completed analysis counts, phase
+timings, completion reserve, provider request counts, explicit unknown fields,
+and `evidence_source: current_bounded_evidence`. A later provider timeout may
+instead use a valid historical snapshot with
+`evidence_source: historical_last_good`, its cursor and age. A policy change or
+snapshot older than 24 hours invalidates that historical fallback. With neither
+current bounded evidence nor a valid last-good snapshot, the typed
+`status_partial_unavailable` refusal names the phase and never recommends
+raising an already-maxed sync mutation deadline. Zero provider calls leave the
+authentication verdict unassessed rather than serializing
+`authenticated: false`. Mutating sync/admission paths continue using their
+existing independent budgets, require complete compatibility, and cannot
+consume partial status (bd-4fe538, bd-cdbef8).
 
 `status.analysis.fleet.caravans` answers **now**, never **ever**: an empty list
 means no caravan is in flight at this instant. `fleet.history` carries the

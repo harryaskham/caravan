@@ -1141,8 +1141,8 @@ pub fn build_router() -> ToolRouter<AppContext> {
     );
     router.add_typed_tool_with_output_schema(
         "status",
-        "Discover the current repository, current PR, every caravan, invalid graph fragments, and unresolved decision points. Read-only.",
-        |context: &AppContext, _input: EmptyInput| read::status(context),
+        "Discover the current repository, current PR, every caravan, invalid graph fragments, and unresolved decision points. Read-only. Slow compatibility yields a successful typed partial from current bounded evidence; mutation-capable tools never consume it.",
+        |context: &AppContext, _input: EmptyInput| read::status_resilient(context),
     );
     router.add_typed_tool_with_output_schema(
         "queue",

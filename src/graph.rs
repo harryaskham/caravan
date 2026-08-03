@@ -42,6 +42,41 @@ pub struct GraphAnalysis {
     pub squash_reconciliations: Vec<SquashEquivalenceReport>,
 }
 
+/// Bounded evidence about status-only compatibility work.
+///
+/// Mutating operations continue to require the complete graph analysis. The
+/// read-only status surface may stop at its dedicated analysis deadline and
+/// return the current provider/structural snapshot with every unevaluated
+/// mechanical proof named explicitly.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CompatibilityAnalysisProgress {
+    pub complete: bool,
+    pub revision_preparation_complete: bool,
+    /// Provider PR rows in the current bounded snapshot.
+    pub candidate_count: usize,
+    /// Unenrolled rows which may participate in automatic admission.
+    pub unqueued_candidate_count: usize,
+    pub caravan_count: usize,
+    pub branch_count: usize,
+    pub planned_analyses: usize,
+    pub completed_analyses: usize,
+    #[serde(default)]
+    pub deferred_analyses: Vec<String>,
+    #[serde(default)]
+    pub deferred_analyses_truncated: usize,
+    #[serde(default)]
+    pub skipped_analyses: Vec<String>,
+    #[serde(default)]
+    pub skipped_analyses_truncated: usize,
+}
+
+/// One graph plus the exact completeness of its mechanical analysis.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundedGraphAnalysis {
+    pub analysis: GraphAnalysis,
+    pub progress: CompatibilityAnalysisProgress,
+}
+
 impl GraphAnalysis {
     #[must_use]
     pub fn healthy(&self) -> bool {
@@ -726,30 +761,113 @@ pub fn analyze(
     analyze_for_actor(snapshot, checker, HeadMergeActor::default())
 }
 
-/// Derive and mechanically validate current chain/fleet invariants for one
-/// configured head merge actor.
-#[allow(clippy::too_many_lines)]
-pub fn analyze_for_actor(
-    snapshot: &RepositorySnapshot,
-    checker: &impl CompatibilityChecker,
-    actor: HeadMergeActor,
-) -> Result<GraphAnalysis, AppError> {
-    let mut analysis = derive_for_actor(snapshot, actor);
-    let caravans = analysis.fleet.caravans.clone();
-    let mut branches = vec![snapshot.default_branch.clone()];
-    branches.extend(caravans.iter().flat_map(|caravan| {
-        caravan.members.iter().filter_map(|number| {
-            analysis
-                .pull_requests
-                .get(number)
-                .map(|pull_request| pull_request.head.clone())
-        })
-    }));
-    branches.sort_by(|left, right| (&left.name, &left.oid.0).cmp(&(&right.name, &right.oid.0)));
-    branches.dedup_by(|left, right| left.name == right.name && left.oid == right.oid);
-    checker.prepare(&branches)?;
+#[derive(Debug, Clone)]
+enum CompatibilityAnalysisTask {
+    Fleet {
+        description: String,
+        candidate: BranchSnapshot,
+        target: BranchSnapshot,
+        prs: Vec<PrNumber>,
+        message: &'static str,
+    },
+    CumulativeTree {
+        description: String,
+        candidate: BranchSnapshot,
+        target: BranchSnapshot,
+    },
+    AdmissionCandidate {
+        description: String,
+        candidate: BranchSnapshot,
+        target: BranchSnapshot,
+        pr: PrNumber,
+    },
+}
 
-    for caravan in &caravans {
+impl CompatibilityAnalysisTask {
+    fn description(&self) -> &str {
+        match self {
+            Self::Fleet { description, .. }
+            | Self::CumulativeTree { description, .. }
+            | Self::AdmissionCandidate { description, .. } => description,
+        }
+    }
+
+    fn execute(
+        &self,
+        analysis: &mut GraphAnalysis,
+        checker: &impl CompatibilityChecker,
+    ) -> Result<(), AppError> {
+        match self {
+            Self::Fleet {
+                candidate,
+                target,
+                prs,
+                message,
+                ..
+            } => {
+                let report = checker.check(candidate, target)?;
+                record_compatibility(analysis, checker, report, prs.clone(), message)
+            }
+            Self::CumulativeTree {
+                candidate, target, ..
+            } => {
+                if let Some(proof) = checker.cumulative_tree(candidate, target)? {
+                    analysis.cumulative_trees.push(proof);
+                }
+                Ok(())
+            }
+            Self::AdmissionCandidate {
+                candidate,
+                target,
+                pr,
+                ..
+            } => {
+                let report = checker.check(candidate, target)?;
+                record_candidate_compatibility(
+                    analysis,
+                    report,
+                    *pr,
+                    "leading admission candidate does not merge cleanly into the current default branch",
+                );
+                Ok(())
+            }
+        }
+    }
+}
+
+const MAX_ANALYSIS_PROGRESS_SAMPLES: usize = 64;
+
+fn push_progress_sample(samples: &mut Vec<String>, truncated: &mut usize, sample: String) {
+    if samples.len() < MAX_ANALYSIS_PROGRESS_SAMPLES {
+        samples.push(sample);
+    } else {
+        *truncated = truncated.saturating_add(1);
+    }
+}
+
+fn defer_tasks(progress: &mut CompatibilityAnalysisProgress, tasks: &[CompatibilityAnalysisTask]) {
+    for task in tasks {
+        push_progress_sample(
+            &mut progress.deferred_analyses,
+            &mut progress.deferred_analyses_truncated,
+            task.description().to_owned(),
+        );
+    }
+}
+
+fn analysis_timed_out(error: &AppError) -> bool {
+    mcp_cli::StructuredError::category(error) == mcp_cli::ErrorCategory::Timeout
+}
+
+#[allow(clippy::too_many_lines)]
+fn compatibility_tasks(
+    snapshot: &RepositorySnapshot,
+    analysis: &GraphAnalysis,
+    progress: &mut CompatibilityAnalysisProgress,
+) -> Vec<CompatibilityAnalysisTask> {
+    let caravans = &analysis.fleet.caravans;
+    let mut tasks = Vec::new();
+    for caravan in caravans {
         let Some(head_number) = caravan.head() else {
             continue;
         };
@@ -759,20 +877,20 @@ pub fn analyze_for_actor(
             .expect("derived head")
             .head
             .clone();
-        let report = checker.check(&head_branch, &snapshot.default_branch)?;
-        record_compatibility(
-            &mut analysis,
-            checker,
-            report,
-            vec![head_number],
-            "caravan head does not merge cleanly into the current default branch",
-        )?;
+        tasks.push(CompatibilityAnalysisTask::Fleet {
+            description: format!("head_to_default:pr#{head_number}"),
+            candidate: head_branch.clone(),
+            target: snapshot.default_branch.clone(),
+            prs: vec![head_number],
+            message: "caravan head does not merge cleanly into the current default branch",
+        });
         // The caravan-owned merge lands the root's *already-validated* tree or
-        // nothing at all, so the proof is collected with the same exact
-        // revisions the compatibility report used.
-        if let Some(proof) = checker.cumulative_tree(&head_branch, &snapshot.default_branch)? {
-            analysis.cumulative_trees.push(proof);
-        }
+        // nothing at all, so the proof is collected with the same revisions.
+        tasks.push(CompatibilityAnalysisTask::CumulativeTree {
+            description: format!("cumulative_tree:pr#{head_number}"),
+            candidate: head_branch,
+            target: snapshot.default_branch.clone(),
+        });
         for pair in caravan.members.windows(2) {
             let parent_branch = analysis
                 .pull_requests
@@ -786,14 +904,13 @@ pub fn analyze_for_actor(
                 .expect("derived child")
                 .head
                 .clone();
-            let report = checker.check(&child_branch, &parent_branch)?;
-            record_compatibility(
-                &mut analysis,
-                checker,
-                report,
-                vec![pair[0], pair[1]],
-                "adjacent caravan PRs are not mechanically compatible",
-            )?;
+            tasks.push(CompatibilityAnalysisTask::Fleet {
+                description: format!("adjacent:pr#{}->pr#{}", pair[1], pair[0]),
+                candidate: child_branch,
+                target: parent_branch,
+                prs: vec![pair[0], pair[1]],
+                message: "adjacent caravan PRs are not mechanically compatible",
+            });
         }
     }
 
@@ -817,63 +934,152 @@ pub fn analyze_for_actor(
                 .expect("derived tail")
                 .head
                 .clone();
-            let report = checker.check(&head_branch, &tail_branch)?;
-            record_compatibility(
-                &mut analysis,
-                checker,
-                report,
-                vec![head_number, tail_number],
-                "one caravan head cannot be attached after another caravan tail",
-            )?;
+            tasks.push(CompatibilityAnalysisTask::Fleet {
+                description: format!("cross_caravan:pr#{head_number}->pr#{tail_number}"),
+                candidate: head_branch,
+                target: tail_branch,
+                prs: vec![head_number, tail_number],
+                message: "one caravan head cannot be attached after another caravan tail",
+            });
         }
     }
 
-    // bd-e9fcd7: a candidate Cara has itself proven mechanically unrepairable
-    // must not hold the admission front. Only a bounded number of leading
-    // unqueued candidates are checked, so this never turns status into a
-    // whole-fleet merge sweep, and a conflicting one is recorded as an ordinary
-    // compatibility problem that admission already excludes without wedging
-    // later candidates.
-    for number in analysis
-        .fleet
-        .unqueued
-        .iter()
-        .copied()
-        .filter(|number| {
-            // An explicitly skipped candidate is not competing for the front of
-            // the queue, so re-proving it every tick spends provider budget to
-            // re-report a decision the operator already made. Reporting it here
-            // is also what made `caravan-join-skipped` look inert: admission had
-            // correctly excluded the PR, while this loop kept naming it.
-            analysis
-                .pull_requests
-                .get(number)
-                .is_none_or(|candidate| !candidate.has_label("caravan-join-skipped"))
-        })
-        .take(LEADING_CANDIDATE_COMPATIBILITY_BOUND)
-        .collect::<Vec<_>>()
-    {
+    // Only the first bounded non-skipped candidates compete for the front.
+    // Everything intentionally omitted is named rather than looking completed.
+    let mut selected = 0_usize;
+    for number in analysis.fleet.unqueued.iter().copied() {
         let Some(candidate) = analysis.pull_requests.get(&number) else {
             continue;
         };
-        if candidate.cross_repository || candidate.draft {
+        let skipped_reason = if candidate.has_label("caravan-join-skipped") {
+            Some("generation_bound_skip")
+        } else if selected >= LEADING_CANDIDATE_COMPATIBILITY_BOUND {
+            Some("leading_candidate_bound")
+        } else {
+            selected = selected.saturating_add(1);
+            if candidate.cross_repository {
+                Some("cross_repository")
+            } else if candidate.draft {
+                Some("draft")
+            } else {
+                None
+            }
+        };
+        if let Some(reason) = skipped_reason {
+            push_progress_sample(
+                &mut progress.skipped_analyses,
+                &mut progress.skipped_analyses_truncated,
+                format!("candidate_to_default:pr#{number}:{reason}"),
+            );
             continue;
         }
-        let candidate_branch = candidate.head.clone();
-        let report = checker.check(&candidate_branch, &snapshot.default_branch)?;
-        // A candidate that has not been admitted blocks nothing. Recording this
-        // as an ordinary `Incompatible` problem made sync abort the entire tick
-        // with `head_conflict`, because that kind means "a caravan member does
-        // not merge" and is a fleet-level decision point.
-        record_candidate_compatibility(
-            &mut analysis,
-            report,
-            number,
-            "leading admission candidate does not merge cleanly into the current default branch",
-        );
+        tasks.push(CompatibilityAnalysisTask::AdmissionCandidate {
+            description: format!("candidate_to_default:pr#{number}"),
+            candidate: candidate.head.clone(),
+            target: snapshot.default_branch.clone(),
+            pr: number,
+        });
     }
+    tasks
+}
 
-    Ok(analysis)
+fn analyze_for_actor_internal(
+    snapshot: &RepositorySnapshot,
+    checker: &impl CompatibilityChecker,
+    actor: HeadMergeActor,
+    analysis_deadline: Option<Instant>,
+) -> Result<BoundedGraphAnalysis, AppError> {
+    let mut analysis = derive_for_actor(snapshot, actor);
+    let caravans = analysis.fleet.caravans.clone();
+    let mut branches = vec![snapshot.default_branch.clone()];
+    branches.extend(caravans.iter().flat_map(|caravan| {
+        caravan.members.iter().filter_map(|number| {
+            analysis
+                .pull_requests
+                .get(number)
+                .map(|pull_request| pull_request.head.clone())
+        })
+    }));
+    branches.sort_by(|left, right| (&left.name, &left.oid.0).cmp(&(&right.name, &right.oid.0)));
+    branches.dedup_by(|left, right| left.name == right.name && left.oid == right.oid);
+
+    let mut progress = CompatibilityAnalysisProgress {
+        candidate_count: snapshot.pull_requests.len(),
+        unqueued_candidate_count: analysis.fleet.unqueued.len(),
+        caravan_count: caravans.len(),
+        branch_count: branches.len(),
+        ..CompatibilityAnalysisProgress::default()
+    };
+    let tasks = compatibility_tasks(snapshot, &analysis, &mut progress);
+    progress.planned_analyses = tasks.len();
+
+    if analysis_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        defer_tasks(&mut progress, &tasks);
+        return Ok(BoundedGraphAnalysis { analysis, progress });
+    }
+    if let Err(error) = checker.prepare(&branches) {
+        if analysis_deadline.is_some() && analysis_timed_out(&error) {
+            defer_tasks(&mut progress, &tasks);
+            return Ok(BoundedGraphAnalysis { analysis, progress });
+        }
+        return Err(error);
+    }
+    progress.revision_preparation_complete = true;
+
+    for (index, task) in tasks.iter().enumerate() {
+        if analysis_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            defer_tasks(&mut progress, &tasks[index..]);
+            return Ok(BoundedGraphAnalysis { analysis, progress });
+        }
+        if let Err(error) = task.execute(&mut analysis, checker) {
+            if analysis_deadline.is_some() && analysis_timed_out(&error) {
+                defer_tasks(&mut progress, &tasks[index..]);
+                return Ok(BoundedGraphAnalysis { analysis, progress });
+            }
+            return Err(error);
+        }
+        progress.completed_analyses = progress.completed_analyses.saturating_add(1);
+    }
+    progress.complete = true;
+    Ok(BoundedGraphAnalysis { analysis, progress })
+}
+
+/// Derive and mechanically validate current chain/fleet invariants for one
+/// configured head merge actor. Every proof is mandatory on mutation-capable
+/// and exact-preflight paths.
+pub fn analyze_for_actor(
+    snapshot: &RepositorySnapshot,
+    checker: &impl CompatibilityChecker,
+    actor: HeadMergeActor,
+) -> Result<GraphAnalysis, AppError> {
+    Ok(analyze_for_actor_with_progress(snapshot, checker, actor)?.analysis)
+}
+
+/// Complete compatibility analysis plus diagnostic work counts.
+///
+/// Unlike the bounded status variant, a timeout remains an error. Exact
+/// preflight and mutation-capable callers therefore retain all-or-nothing
+/// compatibility semantics.
+pub fn analyze_for_actor_with_progress(
+    snapshot: &RepositorySnapshot,
+    checker: &impl CompatibilityChecker,
+    actor: HeadMergeActor,
+) -> Result<BoundedGraphAnalysis, AppError> {
+    analyze_for_actor_internal(snapshot, checker, actor, None)
+}
+
+/// Status-only compatibility analysis which yields at an absolute deadline.
+///
+/// The returned graph contains current provider and structural evidence plus
+/// every proof completed before the deadline. Deferred proof names make the
+/// receipt explicitly partial; callers must never consume it for mutation.
+pub fn analyze_for_actor_bounded(
+    snapshot: &RepositorySnapshot,
+    checker: &impl CompatibilityChecker,
+    actor: HeadMergeActor,
+    analysis_deadline: Instant,
+) -> Result<BoundedGraphAnalysis, AppError> {
+    analyze_for_actor_internal(snapshot, checker, actor, Some(analysis_deadline))
 }
 
 /// How many leading unqueued candidates are proven against the default branch.

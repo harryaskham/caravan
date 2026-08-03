@@ -2381,7 +2381,7 @@ fn membership_output_serializes_app_api_and_git_transport_identity_without_secre
             changed: true,
         },
         provider_api: crate::model::GitHubApiTelemetry {
-            authenticated: true,
+            authenticated: Some(true),
             auth_source: Some("github_app_installation".to_owned()),
             github_app_slug: Some("caravan-agentic-merge-queue".to_owned()),
             github_app_installation_id: Some(150_598_516),

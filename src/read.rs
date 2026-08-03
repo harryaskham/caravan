@@ -12,8 +12,11 @@ use serde_json::json;
 
 use crate::command::CommandRunError;
 use crate::github::{DiscoveryError, GitHubDiscovery};
+#[cfg(test)]
+use crate::graph::analyze_for_actor;
 use crate::graph::{
-    CompatibilityChecker, GitCompatibilityChecker, GraphAnalysis, analyze_for_actor,
+    CompatibilityChecker, GitCompatibilityChecker, GraphAnalysis, analyze_for_actor_bounded,
+    analyze_for_actor_with_progress,
 };
 use crate::model::{
     Caravan, CompatibilityOutcome, CompatibilityReport, GraphProblem, GraphProblemKind, PrNumber,
@@ -526,8 +529,20 @@ pub struct StatusOutput {
     pub admission: AdmissionStatus,
 }
 
-/// Typed evidence that read-only status retained a last-good snapshot after its
-/// current provider pass exhausted the dedicated read budget.
+/// Which bounded evidence backs a degraded read-only status receipt.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusPartialEvidenceSource {
+    /// A previous complete config-matched snapshot survived a later timeout.
+    #[default]
+    HistoricalLastGood,
+    /// This invocation completed provider discovery and bounded local analysis.
+    CurrentBoundedEvidence,
+}
+
+/// Typed evidence that read-only status yielded before its dedicated budget was
+/// consumed. The evidence source distinguishes a historical fallback from a
+/// first-ever status assembled from current provider and structural facts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct StatusPartial {
     pub schema_version: u32,
@@ -537,15 +552,22 @@ pub struct StatusPartial {
     pub elapsed_ms: u64,
     pub deadline_ms: u64,
     pub remaining_ms: u64,
-    pub last_good_age_ms: u64,
+    #[serde(default)]
+    pub evidence_source: StatusPartialEvidenceSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_good_age_ms: Option<u64>,
+    #[serde(default)]
+    pub unknown_fields: Vec<String>,
     #[serde(default)]
     pub attempt_provider_api: crate::model::GitHubApiTelemetry,
+    /// Status partials are evidence only and never carry provider mutation.
+    pub mutated: bool,
     pub safe_next_action: String,
 }
 
-/// CLI-facing status receipt. Flattening preserves the stable complete-status
-/// shape consumed by Cacophony while adding one explicit partial marker.
-#[derive(Debug, Clone, Serialize)]
+/// CLI/MCP-facing status receipt. Flattening preserves the stable complete-
+/// status shape consumed by Cacophony while adding one explicit partial marker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct StatusReadReceipt {
     #[serde(flatten)]
     pub output: StatusOutput,
@@ -553,11 +575,19 @@ pub struct StatusReadReceipt {
     pub status_partial: Option<StatusPartial>,
 }
 
-/// Timing evidence for one complete read-only status operation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+/// Timing and bounded-analysis evidence for one read-only status operation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct StatusTiming {
     pub deadline_ms: u64,
     pub total_ms: u64,
+    /// Time deliberately withheld from compatibility work so final projection
+    /// and serialization cannot overrun the public status deadline.
+    #[serde(default)]
+    pub completion_reserve_ms: u64,
+    #[serde(default)]
+    pub compatibility_budget_ms: u64,
+    #[serde(default)]
+    pub compatibility_analysis: crate::graph::CompatibilityAnalysisProgress,
     pub phases_ms: std::collections::BTreeMap<String, u64>,
 }
 
@@ -1007,6 +1037,10 @@ pub fn status(context: &AppContext) -> Result<StatusOutput, AppError> {
 
 const STATUS_READ_BUDGET: Duration = Duration::from_secs(35);
 const STATUS_COMPLETION_RESERVE: Duration = Duration::from_secs(2);
+/// Compatibility is local but can be quadratic in caravan count. Keep a second
+/// in-operation reserve for provider-backed stack projection and final status
+/// assembly instead of letting the final merge-tree consume the whole window.
+const STATUS_POST_ANALYSIS_RESERVE: Duration = Duration::from_secs(8);
 const STATUS_LAST_GOOD_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const STATUS_LAST_GOOD_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const STATUS_LAST_GOOD_SCHEMA_VERSION: u32 = 1;
@@ -1142,9 +1176,84 @@ fn recover_partial_status(
             deadline_ms: u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
             remaining_ms: u64::try_from(deadline.saturating_sub(elapsed).as_millis())
                 .unwrap_or(u64::MAX),
-            last_good_age_ms: age_ms,
+            evidence_source: StatusPartialEvidenceSource::HistoricalLastGood,
+            last_good_age_ms: Some(age_ms),
+            unknown_fields: vec![format!("current_attempt.{}", partial_phase(error))],
             attempt_provider_api: partial_provider_api(error),
+            mutated: false,
             safe_next_action: "retry the read-only status pass after provider latency recovers; sync mutation and post-rewrite reserves were not used or weakened".to_owned(),
+        }),
+    }
+}
+
+fn recover_current_partial_status(
+    mut output: StatusOutput,
+    started: Instant,
+    deadline: Duration,
+) -> StatusReadReceipt {
+    let elapsed = started.elapsed();
+    output.healthy = false;
+    let progress = output
+        .timing
+        .as_ref()
+        .map(|timing| &timing.compatibility_analysis);
+    let mut unknown_fields = progress.map_or_else(Vec::new, |progress| {
+        let mut unknown = progress
+            .deferred_analyses
+            .iter()
+            .map(|analysis| format!("analysis.deferred.{analysis}"))
+            .collect::<Vec<_>>();
+        unknown.extend(
+            progress
+                .skipped_analyses
+                .iter()
+                .map(|analysis| format!("analysis.skipped.{analysis}")),
+        );
+        if !progress.revision_preparation_complete {
+            unknown.push("analysis.revision_preparation".to_owned());
+        }
+        unknown
+    });
+    if let Some(progress) = progress {
+        if progress.deferred_analyses_truncated > 0 {
+            unknown_fields.push(format!(
+                "analysis.deferred_additional:{}",
+                progress.deferred_analyses_truncated
+            ));
+        }
+        if progress.skipped_analyses_truncated > 0 {
+            unknown_fields.push(format!(
+                "analysis.skipped_additional:{}",
+                progress.skipped_analyses_truncated
+            ));
+        }
+    }
+    if unknown_fields.is_empty() {
+        unknown_fields.push("analysis.compatibility_unknown".to_owned());
+    }
+    let cursor = format!(
+        "current_bounded_evidence:{}:{}",
+        output.repository.slug(),
+        unix_millis()
+    );
+    let attempt_provider_api = output.provider_api.clone();
+    StatusReadReceipt {
+        output,
+        status_partial: Some(StatusPartial {
+            schema_version: 2,
+            code: "status_partial".to_owned(),
+            exhausted_phase: "compatibility_analysis".to_owned(),
+            cursor,
+            elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            deadline_ms: u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
+            remaining_ms: u64::try_from(deadline.saturating_sub(elapsed).as_millis())
+                .unwrap_or(u64::MAX),
+            evidence_source: StatusPartialEvidenceSource::CurrentBoundedEvidence,
+            last_good_age_ms: None,
+            unknown_fields,
+            attempt_provider_api,
+            mutated: false,
+            safe_next_action: "retry the read-only status pass to complete deferred compatibility proofs; current provider evidence is degraded only and sync mutation and post-rewrite reserves were not used or weakened".to_owned(),
         }),
     }
 }
@@ -1152,14 +1261,21 @@ fn recover_partial_status(
 /// Run the human/CLI status surface under its own short read budget.
 ///
 /// This path never borrows the sync mutation deadline or post-rewrite reserve.
-/// A timeout returns the config-matched, bounded last-good snapshot as an
-/// explicitly degraded `status_partial` receipt, so Cacophony's canonical Cara
-/// adapter remains useful instead of becoming wholly unavailable.
+/// Slow local compatibility yields a useful current-evidence partial even on a
+/// first-ever call. Other timeouts retain the config-matched last-good fallback.
 pub fn status_resilient(context: &AppContext) -> Result<StatusReadReceipt, AppError> {
     let started = Instant::now();
     let budget = STATUS_READ_BUDGET;
-    let provider_budget = budget.saturating_sub(STATUS_COMPLETION_RESERVE);
-    match status_with_deadline(context, started + provider_budget) {
+    let operation_budget = budget.saturating_sub(STATUS_COMPLETION_RESERVE);
+    match status_with_resilient_deadline(context, started + operation_budget) {
+        Ok(output)
+            if output
+                .timing
+                .as_ref()
+                .is_some_and(|timing| !timing.compatibility_analysis.complete) =>
+        {
+            Ok(recover_current_partial_status(output, started, budget))
+        }
         Ok(output) => {
             persist_last_good(context, &output);
             Ok(StatusReadReceipt {
@@ -1198,6 +1314,13 @@ pub(crate) fn status_with_deadline(
     status_with_deadline_and_budget(context, operation_deadline, None)
 }
 
+fn status_with_resilient_deadline(
+    context: &AppContext,
+    operation_deadline: std::time::Instant,
+) -> Result<StatusOutput, AppError> {
+    status_with_discovery_options(context, operation_deadline, None, false, true, None, true)
+}
+
 /// Status with one shared exact authenticated GitHub request budget.
 pub(crate) fn status_with_deadline_and_budget(
     context: &AppContext,
@@ -1211,6 +1334,7 @@ pub(crate) fn status_with_deadline_and_budget(
         false,
         true,
         None,
+        false,
     )
 }
 
@@ -1233,6 +1357,7 @@ pub(crate) fn fleet_status(
         false,
         false,
         None,
+        false,
     )
 }
 
@@ -1244,7 +1369,15 @@ pub(crate) fn status_for_pr_creation(
     operation_deadline: std::time::Instant,
     github_budget: Option<&crate::command::GithubRequestBudget>,
 ) -> Result<StatusOutput, AppError> {
-    status_with_discovery_options(context, operation_deadline, github_budget, true, true, None)
+    status_with_discovery_options(
+        context,
+        operation_deadline,
+        github_budget,
+        true,
+        true,
+        None,
+        false,
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -1315,6 +1448,7 @@ fn status_with_discovery_options(
     allow_unlabelled_historical_pr_creation: bool,
     require_current_pr_resolution: bool,
     expected_candidate_head: Option<&ExpectedCandidateHead>,
+    bounded_compatibility: bool,
 ) -> Result<StatusOutput, AppError> {
     // Sharing one absolute deadline prevents a large repository from
     // multiplying its budget by provider and compatibility subprocess count.
@@ -1387,17 +1521,74 @@ fn status_with_discovery_options(
         bind_expected_candidate_head(&mut snapshot, expected)?;
     }
     let discovery_elapsed = started.elapsed();
+
+    // Resolve a minimal provider-backed label/identity read before local
+    // compatibility. A large merge graph must never spend the whole first-
+    // status budget before Cara has made any provider/auth attempt.
+    let label_provider = crate::github::GitHubMutationAdapter::new(provider_runner.clone());
+    let (labels, label_cache_hit) = repository_labels_cached(&label_provider, &snapshot.repository)
+        .map_err(|error| {
+            let mapped = if let crate::github::MutationError::Provider(provider) = &error
+                && matches!(
+                    provider,
+                    DiscoveryError::Runner(CommandRunError::Timeout { .. })
+                ) {
+                discovery_timeout_error(
+                    provider,
+                    "repository_label_inventory",
+                    started.elapsed().saturating_sub(discovery_elapsed),
+                    started.elapsed(),
+                    operation_budget,
+                )
+            } else {
+                AppError::structured(
+                    mcp_cli::ErrorCategory::ExecutionFailure,
+                    "repository_initialization_inventory_failed",
+                    error.to_string(),
+                    Some(json!({"next": "repair GitHub read access and rerun `cara status`"})),
+                )
+            };
+            attach_provider_api(&mapped, &provider_runner.github_api_telemetry())
+        })?;
+    let label_inventory_elapsed = started.elapsed();
+    let mut initialization = crate::initialization::inspect_labels(
+        &labels,
+        &context.config.agent_priority_labels,
+        context.config.sync.actions.join_unlabelled_prs,
+        context.config.sync.terminal_red.action == crate::config::TerminalRedAction::Park,
+    );
+    if !context.config_existed {
+        initialization.ready = false;
+        initialization.next = Some("run `cara init` to atomically create .caravan/config.yaml and verify repository readiness".to_owned());
+    }
+    let compatibility_deadline = if bounded_compatibility {
+        operation_deadline
+            .checked_sub(STATUS_POST_ANALYSIS_RESERVE)
+            .unwrap_or(started)
+            .max(started)
+    } else {
+        operation_deadline
+    };
     let checker = GitCompatibilityChecker::new(&context.repository_path, "origin")
         .with_timeout(child_timeout)
-        .with_operation_deadline(operation_deadline);
+        .with_operation_deadline(compatibility_deadline);
     // The auto-merge invariant is gated on the configured merge actor so a
     // repository that deliberately disabled native auto-merge never reports a
     // permanently unsatisfiable problem.
-    let mut analysis = analyze_for_actor(
-        &snapshot,
-        &checker,
-        context.config.sync.resolved_head_merge_actor(),
-    )
+    let analyzed = if bounded_compatibility {
+        analyze_for_actor_bounded(
+            &snapshot,
+            &checker,
+            context.config.sync.resolved_head_merge_actor(),
+            compatibility_deadline,
+        )
+    } else {
+        analyze_for_actor_with_progress(
+            &snapshot,
+            &checker,
+            context.config.sync.resolved_head_merge_actor(),
+        )
+    }
     .map_err(|error| {
         if mcp_cli::StructuredError::category(&error) == ErrorCategory::Timeout {
             AppError::structured(
@@ -1418,42 +1609,14 @@ fn status_with_discovery_options(
             error
         }
     })?;
+    let mut analysis = analyzed.analysis;
+    let compatibility_progress = analyzed.progress;
+    let compatibility_complete = compatibility_progress.complete;
     let analysis_elapsed = started.elapsed();
-    let label_provider = crate::github::GitHubMutationAdapter::new(provider_runner.clone());
-    let (labels, label_cache_hit) = repository_labels_cached(&label_provider, &snapshot.repository)
-        .map_err(|error| {
-            let mapped = if let crate::github::MutationError::Provider(provider) = &error
-                && matches!(
-                    provider,
-                    DiscoveryError::Runner(CommandRunError::Timeout { .. })
-                ) {
-                discovery_timeout_error(
-                    provider,
-                    "repository_label_inventory",
-                    started.elapsed().saturating_sub(analysis_elapsed),
-                    started.elapsed(),
-                    operation_budget,
-                )
-            } else {
-                AppError::structured(
-                    mcp_cli::ErrorCategory::ExecutionFailure,
-                    "repository_initialization_inventory_failed",
-                    error.to_string(),
-                    Some(json!({"next": "repair GitHub read access and rerun `cara status`"})),
-                )
-            };
-            attach_provider_api(&mapped, &provider_runner.github_api_telemetry())
-        })?;
-    let mut initialization = crate::initialization::inspect_labels(
-        &labels,
-        &context.config.agent_priority_labels,
-        context.config.sync.actions.join_unlabelled_prs,
-        context.config.sync.terminal_red.action == crate::config::TerminalRedAction::Park,
-    );
-    if !context.config_existed {
-        initialization.ready = false;
-        initialization.next = Some("run `cara init` to atomically create .caravan/config.yaml and verify repository readiness".to_owned());
-    }
+
+    // Compatibility preparation fetches exact objects used by the preferred
+    // local ancestry proof. Keep generation analysis after that fetch while the
+    // earlier label read still guarantees a provider attempt before local work.
     let mut generation_facts = snapshot.generation_facts.clone();
     for pr in crate::generation::duplicate_stream_prs(&generation_facts)
         .into_iter()
@@ -1493,6 +1656,7 @@ fn status_with_discovery_options(
             },
         }
     });
+    let provider_identity_elapsed = started.elapsed();
     apply_generation_graph_problems(&mut analysis, &generation_integrity);
     let mut stack_backend = stack_backend_status(
         context.config.stack_type,
@@ -1512,7 +1676,7 @@ fn status_with_discovery_options(
         &context.config.agent_priority_labels,
         generation_integrity,
     );
-    let labels_elapsed = started.elapsed();
+    let projection_elapsed = started.elapsed();
     let mut provider_api = provider_runner.github_api_telemetry();
     if label_cache_hit {
         provider_api.cache_hits = provider_api.cache_hits.saturating_add(1);
@@ -1566,10 +1730,13 @@ fn status_with_discovery_options(
     };
     crate::pause::apply_to_status(&context.repository_path, &mut output)?;
     output.sync_budget = crate::sync::project_status(context, &output);
-    output.healthy = output.analysis.healthy() && output.initialization.ready;
+    output.healthy =
+        compatibility_complete && output.analysis.healthy() && output.initialization.ready;
 
     let total = started.elapsed();
-    if std::time::Instant::now() >= operation_deadline {
+    if (!bounded_compatibility || compatibility_complete)
+        && std::time::Instant::now() >= operation_deadline
+    {
         return Err(AppError::structured(
             ErrorCategory::Timeout,
             "github_discovery_timeout",
@@ -1586,22 +1753,46 @@ fn status_with_discovery_options(
     }
     let millis =
         |duration: std::time::Duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+    let post_analysis_reserve = if bounded_compatibility {
+        STATUS_POST_ANALYSIS_RESERVE
+    } else {
+        Duration::ZERO
+    };
     output.timing = Some(StatusTiming {
         deadline_ms: millis(operation_budget),
         total_ms: millis(total),
+        completion_reserve_ms: millis(if bounded_compatibility {
+            STATUS_COMPLETION_RESERVE.saturating_add(STATUS_POST_ANALYSIS_RESERVE)
+        } else {
+            Duration::ZERO
+        }),
+        compatibility_budget_ms: millis(
+            operation_budget
+                .saturating_sub(label_inventory_elapsed)
+                .saturating_sub(post_analysis_reserve),
+        ),
+        compatibility_analysis: compatibility_progress,
         phases_ms: std::collections::BTreeMap::from([
             ("github_discovery".to_owned(), millis(discovery_elapsed)),
             (
-                "compatibility_analysis".to_owned(),
-                millis(analysis_elapsed.saturating_sub(discovery_elapsed)),
+                "repository_label_inventory".to_owned(),
+                millis(label_inventory_elapsed.saturating_sub(discovery_elapsed)),
             ),
             (
-                "repository_label_inventory".to_owned(),
-                millis(labels_elapsed.saturating_sub(analysis_elapsed)),
+                "compatibility_analysis".to_owned(),
+                millis(analysis_elapsed.saturating_sub(label_inventory_elapsed)),
+            ),
+            (
+                "provider_identity".to_owned(),
+                millis(provider_identity_elapsed.saturating_sub(analysis_elapsed)),
+            ),
+            (
+                "stack_and_admission_projection".to_owned(),
+                millis(projection_elapsed.saturating_sub(provider_identity_elapsed)),
             ),
             (
                 "paused_caravan_projection".to_owned(),
-                millis(total.saturating_sub(labels_elapsed)),
+                millis(total.saturating_sub(projection_elapsed)),
             ),
         ]),
     });
@@ -2146,6 +2337,7 @@ pub(crate) fn status_after_branch_rewrite_with_deadline(
         false,
         true,
         Some(&expected),
+        false,
     )?;
     Ok(BoundRemoteCandidateStatus {
         status,
@@ -2252,11 +2444,7 @@ pub(crate) fn bind_remote_candidate_from_status(
         .provider_api
         .merge(provider_runner.github_api_telemetry());
     let exact_elapsed = exact_started.elapsed();
-    let timing = status.timing.get_or_insert_with(|| StatusTiming {
-        deadline_ms: 0,
-        total_ms: 0,
-        phases_ms: std::collections::BTreeMap::new(),
-    });
+    let timing = status.timing.get_or_insert_with(StatusTiming::default);
     timing.deadline_ms = timing
         .deadline_ms
         .saturating_add(duration_millis(exact_budget));
@@ -3328,16 +3516,19 @@ mod tests {
     }
 
     #[allow(clippy::needless_pass_by_value)]
-    fn status(current: PullRequestSnapshot, active: Vec<PullRequestSnapshot>) -> StatusOutput {
+    fn snapshot(
+        current: PullRequestSnapshot,
+        active: Vec<PullRequestSnapshot>,
+    ) -> crate::model::RepositorySnapshot {
         let current_number = current.number;
-        let mut pull_requests = active.clone();
+        let mut pull_requests = active;
         if !pull_requests
             .iter()
             .any(|pull_request| pull_request.number == current_number)
         {
             pull_requests.push(current);
         }
-        let snapshot = crate::model::RepositorySnapshot {
+        crate::model::RepositorySnapshot {
             merge_candidates: Vec::new(),
             merge_candidates_truncated: 0,
             previous_default_oid: None,
@@ -3349,7 +3540,12 @@ mod tests {
             pull_requests,
             generation_facts: Vec::new(),
             observed_at: None,
-        };
+        }
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn status(current: PullRequestSnapshot, active: Vec<PullRequestSnapshot>) -> StatusOutput {
+        let snapshot = snapshot(current, active);
         let checker = clean_checker;
         let analysis =
             analyze_for_actor(&snapshot, &checker, crate::model::HeadMergeActor::default())
@@ -3395,6 +3591,30 @@ mod tests {
             conflicting_paths: Vec::new(),
             diagnostic: None,
         })
+    }
+
+    struct TimeoutAfterChecks {
+        calls: AtomicUsize,
+        completed_before_timeout: usize,
+    }
+
+    impl CompatibilityChecker for TimeoutAfterChecks {
+        fn check(
+            &self,
+            candidate: &crate::model::BranchSnapshot,
+            target: &crate::model::BranchSnapshot,
+        ) -> Result<CompatibilityReport, AppError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call >= self.completed_before_timeout {
+                return Err(AppError::structured(
+                    ErrorCategory::Timeout,
+                    "compatibility_fixture_timeout",
+                    "fixture compatibility analysis reached its bounded deadline",
+                    Some(json!({"mutated": false})),
+                ));
+            }
+            clean_checker(candidate, target)
+        }
     }
 
     /// bd-3fc019: the skip reason must not promise an outcome this read cannot
@@ -3822,11 +4042,130 @@ mod tests {
 
         assert_eq!(STATUS_READ_BUDGET, std::time::Duration::from_secs(35));
         assert_eq!(STATUS_COMPLETION_RESERVE, std::time::Duration::from_secs(2));
+        assert_eq!(
+            STATUS_POST_ANALYSIS_RESERVE,
+            std::time::Duration::from_secs(8)
+        );
         assert_ne!(
             STATUS_READ_BUDGET,
             std::time::Duration::from_secs(context.config.sync.max_duration_secs),
             "read-only status must never borrow the sync mutation deadline"
         );
+    }
+
+    #[test]
+    fn first_status_over_eight_candidates_yields_current_evidence_then_can_complete() {
+        let active = (1..=12)
+            .map(|number| pr(number, &format!("branch-{number}"), "main", true))
+            .collect::<Vec<_>>();
+        let mut provider_rows = active.clone();
+        provider_rows.extend(
+            (101..=110).map(|number| pr(number, &format!("candidate-{number}"), "main", false)),
+        );
+        let repository_snapshot = snapshot(active[8].clone(), provider_rows.clone());
+        let checker = TimeoutAfterChecks {
+            calls: AtomicUsize::new(0),
+            completed_before_timeout: 3,
+        };
+        let bounded = analyze_for_actor_bounded(
+            &repository_snapshot,
+            &checker,
+            crate::model::HeadMergeActor::default(),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .expect("a local timeout yields bounded current evidence");
+        assert!(!bounded.progress.complete);
+        assert_eq!(bounded.progress.candidate_count, 22);
+        assert_eq!(bounded.progress.unqueued_candidate_count, 10);
+        assert!(bounded.progress.planned_analyses > 8);
+        assert!(bounded.progress.completed_analyses >= 3);
+        assert!(
+            bounded.progress.completed_analyses < bounded.progress.planned_analyses,
+            "the slow fixture must defer part of the graph"
+        );
+        assert!(!bounded.progress.deferred_analyses.is_empty());
+        assert!(!bounded.progress.skipped_analyses.is_empty());
+
+        let mut output = status(active[8].clone(), provider_rows);
+        output.analysis = bounded.analysis;
+        output.healthy = false;
+        output.provider_api = crate::model::GitHubApiTelemetry::default();
+        output.timing = Some(StatusTiming {
+            deadline_ms: 33_000,
+            total_ms: 30_000,
+            completion_reserve_ms: 10_000,
+            compatibility_budget_ms: 25_000,
+            compatibility_analysis: bounded.progress,
+            phases_ms: std::collections::BTreeMap::from([
+                ("github_discovery".to_owned(), 1_000),
+                ("provider_identity".to_owned(), 1_000),
+                ("compatibility_analysis".to_owned(), 28_000),
+            ]),
+        });
+
+        let receipt = recover_current_partial_status(output, Instant::now(), STATUS_READ_BUDGET);
+        let partial = receipt.status_partial.as_ref().expect("typed partial");
+        assert!(!receipt.output.healthy);
+        assert_eq!(partial.code, "status_partial");
+        assert_eq!(
+            partial.evidence_source,
+            StatusPartialEvidenceSource::CurrentBoundedEvidence
+        );
+        assert!(partial.cursor.starts_with("current_bounded_evidence:"));
+        assert_eq!(partial.last_good_age_ms, None);
+        assert!(!partial.unknown_fields.is_empty());
+        assert_eq!(partial.attempt_provider_api.calls, 0);
+        assert_eq!(partial.attempt_provider_api.authenticated, None);
+        assert!(!partial.mutated);
+        assert_eq!(
+            receipt
+                .output
+                .timing
+                .as_ref()
+                .expect("timing")
+                .completion_reserve_ms,
+            10_000
+        );
+        assert!(partial.elapsed_ms < 35_000);
+
+        // The Caco adapter consumes a successful-but-unhealthy envelope as a
+        // degraded canonical engine, not an unavailable command failure.
+        let adapter_payload = serde_json::to_value(&receipt).expect("serializes");
+        let canonical_adapter_envelope = json!({
+            "status": "success",
+            "data": adapter_payload,
+        });
+        assert_eq!(canonical_adapter_envelope["status"], "success");
+        assert_eq!(canonical_adapter_envelope["data"]["healthy"], false);
+        assert_eq!(
+            canonical_adapter_envelope["data"]["status_partial"]["evidence_source"],
+            "current_bounded_evidence"
+        );
+        assert!(canonical_adapter_envelope["data"]["provider_api"]["authenticated"].is_null());
+
+        let strict_error = analyze_for_actor_with_progress(
+            &repository_snapshot,
+            &TimeoutAfterChecks {
+                calls: AtomicUsize::new(0),
+                completed_before_timeout: 0,
+            },
+            crate::model::HeadMergeActor::default(),
+        )
+        .expect_err("exact/mutating callers must never consume bounded partial analysis");
+        assert_eq!(strict_error.category(), ErrorCategory::Timeout);
+
+        let later = analyze_for_actor_with_progress(
+            &repository_snapshot,
+            &clean_checker,
+            crate::model::HeadMergeActor::default(),
+        )
+        .expect("a later pass can produce the full snapshot");
+        assert!(later.progress.complete);
+        assert_eq!(
+            later.progress.completed_analyses,
+            later.progress.planned_analyses
+        );
+        assert!(later.progress.deferred_analyses.is_empty());
     }
 
     #[test]
@@ -3877,7 +4216,7 @@ mod tests {
         assert_eq!(partial.code, "status_partial");
         assert_eq!(partial.exhausted_phase, "open_pull_requests_and_checks");
         assert!(partial.cursor.starts_with("last_good_complete_status:"));
-        assert!(partial.last_good_age_ms >= 1_250);
+        assert!(partial.last_good_age_ms.is_some_and(|age| age >= 1_250));
         assert_eq!(partial.attempt_provider_api.calls, 17);
         assert_eq!(partial.deadline_ms, 35_000);
         let expected_repository = receipt.output.repository.clone();

@@ -469,7 +469,12 @@ pub struct GitHubRateLimits {
 /// Secret-free authenticated GitHub command telemetry for one operation.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct GitHubApiTelemetry {
-    pub authenticated: bool,
+    /// Provider authentication verdict, when at least one provider/Git
+    /// transport call actually reached authentication. `None` means the
+    /// operation made no such call and must never be diagnosed as an auth
+    /// failure merely because local analysis spent its budget first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authenticated: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -496,7 +501,9 @@ pub struct GitHubApiTelemetry {
 impl GitHubApiTelemetry {
     /// Merge telemetry from another runner used by the same bounded operation.
     pub fn merge(&mut self, other: Self) {
-        self.authenticated |= other.authenticated;
+        if let Some(other_authenticated) = other.authenticated {
+            self.authenticated = Some(self.authenticated.unwrap_or(false) || other_authenticated);
+        }
         if other.auth_source.is_some() {
             self.auth_source = other.auth_source;
         }

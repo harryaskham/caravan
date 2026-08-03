@@ -891,15 +891,22 @@ label, comment, and auto-merge mutation identity, so queued→running progress
 does not invalidate an otherwise exact sync/join retry. CI diagnostics and
 rerun operations retain strict check/run/head identity.
 
-Status propagates one absolute deadline through discovery,
-compatibility, and label inventory; every child receives only the remaining
-budget. Timeouts terminate and reap the child process group and return stable
-`github_discovery_timeout` evidence with the exact phase, operation
-`elapsed_ms`/`deadline_ms`, retryability, bounded output, and a mutation-free
-safe next action. Successful JSON status includes `timing` with total and
-per-phase milliseconds (`github_discovery`, `compatibility_analysis`, and
-`repository_label_inventory`) so repository-size regressions are visible
-without an outer shell timeout.
+Status propagates one absolute deadline through discovery, label inventory,
+compatibility, and provider identity; every child receives only the remaining
+budget. The 35-second read-only surface reserves 2 seconds for serialization and
+8 seconds after compatibility for provider-backed/final projection. It performs
+the minimal provider inventory before local graph work. Compatibility therefore
+yields with a successful, unhealthy `status_partial` built from current bounded
+evidence — even when no historical snapshot exists — rather than consuming the
+whole deadline before a provider call. The receipt exposes candidate/caravan/
+branch counts, planned/completed proofs, bounded skipped/deferred proof names,
+phase timings, completion reserve, provider calls, explicit unknown fields, and
+whether evidence is `current_bounded_evidence` or `historical_last_good`. Zero
+provider calls omit the authentication verdict instead of diagnosing
+`authenticated: false`. Other timeouts terminate and reap the child process
+group and return stable `github_discovery_timeout` evidence with the exact
+phase, operation `elapsed_ms`/`deadline_ms`, retryability, bounded output, and a
+mutation-free safe next action.
 
 Discovery performs one bounded all-open PR query containing current check
 rollups, derives the current PR and caravan-labelled members from that snapshot,
