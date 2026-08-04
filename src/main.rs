@@ -682,38 +682,37 @@ fn linux_process_rows() -> Vec<LinuxProcessRow> {
         .collect()
 }
 
+#[cfg(target_os = "linux")]
 fn process_rows(id_field: &str) -> Vec<(u32, u32)> {
-    #[cfg(target_os = "linux")]
-    {
-        return linux_process_rows()
-            .into_iter()
-            .filter_map(|row| match id_field {
-                "ppid" => Some((row.pid, row.ppid)),
-                "sid" => Some((row.pid, row.session)),
-                _ => None,
-            })
-            .collect();
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let columns = format!("pid=,{id_field}=");
-        let Ok(output) = ProcessCommand::new("ps")
-            .args(["-eo", columns.as_str()])
-            .output()
-        else {
-            return Vec::new();
-        };
-        String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter_map(|line| {
-                let mut fields = line.split_whitespace();
-                Some((
-                    fields.next()?.parse::<u32>().ok()?,
-                    fields.next()?.parse::<u32>().ok()?,
-                ))
-            })
-            .collect()
-    }
+    linux_process_rows()
+        .into_iter()
+        .filter_map(|row| match id_field {
+            "ppid" => Some((row.pid, row.ppid)),
+            "sid" => Some((row.pid, row.session)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_rows(id_field: &str) -> Vec<(u32, u32)> {
+    let columns = format!("pid=,{id_field}=");
+    let Ok(output) = ProcessCommand::new("ps")
+        .args(["-eo", columns.as_str()])
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            Some((
+                fields.next()?.parse::<u32>().ok()?,
+                fields.next()?.parse::<u32>().ok()?,
+            ))
+        })
+        .collect()
 }
 
 fn descendant_pids(root: u32) -> Vec<u32> {
