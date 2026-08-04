@@ -6,15 +6,44 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Display};
 
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 /// A GitHub pull-request number.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
 #[serde(transparent)]
 pub struct PrNumber(pub u64);
+
+impl<'de> Deserialize<'de> for PrNumber {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = PrNumber;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a pull-request number or its JSON object-key string")
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(PrNumber(value))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                value
+                    .parse::<u64>()
+                    .map(PrNumber)
+                    .map_err(|_| E::invalid_value(serde::de::Unexpected::Str(value), &self))
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
 
 impl Display for PrNumber {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1414,6 +1443,19 @@ pub struct CaravanEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pr_number_round_trips_as_json_object_key() {
+        let map = BTreeMap::from([(PrNumber(42), "fixture")]);
+        let encoded = serde_json::to_string(&map).expect("serialize PR-keyed map");
+        assert_eq!(encoded, r#"{"42":"fixture"}"#);
+        let decoded: BTreeMap<PrNumber, String> =
+            serde_json::from_str(&encoded).expect("deserialize PR-keyed map");
+        assert_eq!(
+            decoded,
+            BTreeMap::from([(PrNumber(42), "fixture".to_owned())])
+        );
+    }
 
     fn repository() -> RepositoryId {
         RepositoryId {

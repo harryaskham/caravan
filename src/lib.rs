@@ -576,6 +576,17 @@ impl AppError {
         }
     }
 
+    /// Construct an execution failure with optional structured evidence.
+    #[must_use]
+    pub fn execution(code: &str, message: impl Into<String>, details: Option<Value>) -> Self {
+        Self {
+            category: ErrorCategory::ExecutionFailure,
+            code: code.to_owned(),
+            message: message.into(),
+            details,
+        }
+    }
+
     /// Construct a validation error.
     #[must_use]
     pub fn validation(code: &str, message: impl Into<String>) -> Self {

@@ -567,7 +567,7 @@ pub struct StatusPartial {
 
 /// CLI/MCP-facing status receipt. Flattening preserves the stable complete-
 /// status shape consumed by Cacophony while adding one explicit partial marker.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct StatusReadReceipt {
     #[serde(flatten)]
     pub output: StatusOutput,
@@ -1037,6 +1037,9 @@ pub fn status(context: &AppContext) -> Result<StatusOutput, AppError> {
 
 const STATUS_READ_BUDGET: Duration = Duration::from_secs(35);
 const STATUS_COMPLETION_RESERVE: Duration = Duration::from_secs(2);
+/// Outer CLI subprocess bound. This is independent of the executor's own
+/// deadline and leaves Cacophony's 60-second adapter time to collect JSON.
+pub const STATUS_COMMAND_WATCHDOG: Duration = Duration::from_secs(45);
 /// Compatibility is local but can be quadratic in caravan count. Keep a second
 /// in-operation reserve for provider-backed stack projection and final status
 /// assembly instead of letting the final merge-tree consume the whole window.
@@ -1051,6 +1054,13 @@ struct PersistedStatus {
     recorded_unix_ms: u64,
     config_fingerprint: String,
     output: StatusOutput,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StatusWatchdogCheckpoint {
+    schema_version: u32,
+    config_fingerprint: String,
+    receipt: StatusReadReceipt,
 }
 
 fn unix_millis() -> u64 {
@@ -1112,6 +1122,40 @@ fn persist_last_good(context: &AppContext, output: &StatusOutput) {
     if let Some(path) = status_last_good_path(context) {
         persist_last_good_at(&path, context, output);
     }
+}
+
+fn write_watchdog_checkpoint(path: &Path, context: &AppContext, receipt: &StatusReadReceipt) {
+    let checkpoint = StatusWatchdogCheckpoint {
+        schema_version: 1,
+        config_fingerprint: status_cache_key(context),
+        receipt: receipt.clone(),
+    };
+    let Ok(bytes) = serde_json::to_vec(&checkpoint) else {
+        return;
+    };
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > STATUS_LAST_GOOD_MAX_BYTES {
+        return;
+    }
+    if let Some(parent) = path.parent()
+        && std::fs::create_dir_all(parent).is_err()
+    {
+        return;
+    }
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    if std::fs::write(&temporary, bytes).is_ok() && std::fs::rename(&temporary, path).is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+}
+
+fn load_watchdog_checkpoint(path: &Path, context: &AppContext) -> Option<StatusReadReceipt> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if metadata.len() > STATUS_LAST_GOOD_MAX_BYTES {
+        return None;
+    }
+    let checkpoint: StatusWatchdogCheckpoint =
+        serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    (checkpoint.schema_version == 1 && checkpoint.config_fingerprint == status_cache_key(context))
+        .then_some(checkpoint.receipt)
 }
 
 fn load_last_good_at(path: &Path, context: &AppContext) -> Option<PersistedStatus> {
@@ -1182,6 +1226,107 @@ fn recover_partial_status(
             attempt_provider_api: partial_provider_api(error),
             mutated: false,
             safe_next_action: "retry the read-only status pass after provider latency recovers; sync mutation and post-rewrite reserves were not used or weakened".to_owned(),
+        }),
+    }
+}
+
+fn current_checkpoint_status(
+    context: &AppContext,
+    snapshot: &crate::model::RepositorySnapshot,
+    initialization: &crate::initialization::InitializationStatus,
+    provider_api: &crate::model::GitHubApiTelemetry,
+    started: Instant,
+    deadline: Duration,
+) -> StatusReadReceipt {
+    let analysis =
+        crate::graph::derive_for_actor(snapshot, context.config.sync.resolved_head_merge_actor());
+    let admission = resolve_admission(&analysis, &context.config.agent_priority_labels);
+    let stack_backend = StackBackendStatus {
+        configured: context.config.stack_type,
+        ..StackBackendStatus::default()
+    };
+    let elapsed = started.elapsed();
+    let output = StatusOutput {
+        runtime: RuntimeProvenance::detect(),
+        config_provenance: Some(crate::config_provenance::resolve(
+            &context.repository_path,
+            &context.config_path,
+            context.config_path.is_absolute(),
+        )),
+        provider_api: provider_api.clone(),
+        merge_candidates: snapshot.merge_candidates.clone(),
+        merge_candidates_truncated: snapshot.merge_candidates_truncated,
+        previous_default_oid: snapshot.previous_default_oid.clone(),
+        default_branch_movements: snapshot.default_branch_movements.clone(),
+        timing: Some(StatusTiming {
+            deadline_ms: u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
+            total_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            completion_reserve_ms: u64::try_from(
+                STATUS_COMPLETION_RESERVE
+                    .saturating_add(STATUS_POST_ANALYSIS_RESERVE)
+                    .as_millis(),
+            )
+            .unwrap_or(u64::MAX),
+            compatibility_budget_ms: 0,
+            compatibility_analysis: crate::graph::CompatibilityAnalysisProgress {
+                candidate_count: snapshot.pull_requests.len(),
+                unqueued_candidate_count: analysis.fleet.unqueued.len(),
+                caravan_count: analysis.fleet.caravans.len(),
+                ..crate::graph::CompatibilityAnalysisProgress::default()
+            },
+            phases_ms: std::collections::BTreeMap::from([(
+                "provider_discovery_checkpoint".to_owned(),
+                u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            )]),
+        }),
+        repository: snapshot.repository.clone(),
+        rebase_on_join: rebase_on_join_status(context),
+        stack_backend,
+        head_merge: HeadMergeStatus::from_config(&context.config.sync),
+        auto_admission: AutoAdmissionStatus {
+            enabled: context.config.sync.actions.join_unlabelled_prs,
+            heuristic_version: crate::sync::AUTO_ADMISSION_HEURISTIC_VERSION.to_owned(),
+            max_candidates_per_tick: context.config.sync.max_candidates_per_tick,
+            max_mutations_per_tick: context.config.sync.max_mutations_per_tick,
+            max_github_requests_per_tick: context.config.sync.max_github_requests_per_tick,
+            max_duration_secs: context.config.sync.max_duration_secs,
+        },
+        sync_budget: crate::sync::SyncBudgetStatus::default(),
+        default_branch: snapshot.default_branch.name.clone(),
+        current_branch: snapshot.current_branch.clone(),
+        current_pr: snapshot.current_pr,
+        healthy: false,
+        initialization: initialization.clone(),
+        analysis,
+        pauses: Vec::new(),
+        admission,
+    };
+    StatusReadReceipt {
+        output,
+        status_partial: Some(StatusPartial {
+            schema_version: 2,
+            code: "status_partial".to_owned(),
+            exhausted_phase: "command_boundary_watchdog".to_owned(),
+            cursor: format!(
+                "provider_discovery_checkpoint:{}:{}",
+                snapshot.repository.slug(),
+                unix_millis()
+            ),
+            elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            deadline_ms: u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
+            remaining_ms: u64::try_from(deadline.saturating_sub(elapsed).as_millis())
+                .unwrap_or(u64::MAX),
+            evidence_source: StatusPartialEvidenceSource::CurrentBoundedEvidence,
+            last_good_age_ms: None,
+            unknown_fields: vec![
+                "analysis.compatibility".to_owned(),
+                "analysis.generation_integrity".to_owned(),
+                "stack_backend.provider_projection".to_owned(),
+                "pauses".to_owned(),
+            ],
+            attempt_provider_api: provider_api.clone(),
+            mutated: false,
+            safe_next_action: "retry read-only status to complete local compatibility analysis; current provider/structural evidence is retained and no sync mutation reserve was used".to_owned(),
         }),
     }
 }
@@ -1302,6 +1447,62 @@ pub fn status_resilient(context: &AppContext) -> Result<StatusReadReceipt, AppEr
             }),
         Err(error) => Err(error),
     }
+}
+
+/// Recover a typed status envelope after the outer CLI watchdog proves the
+/// in-process executor itself failed to return.
+pub fn status_watchdog_fallback(
+    context: &AppContext,
+    checkpoint_path: &Path,
+    elapsed: Duration,
+) -> Result<StatusReadReceipt, AppError> {
+    if let Some(mut receipt) = load_watchdog_checkpoint(checkpoint_path, context) {
+        receipt.output.healthy = false;
+        if let Some(partial) = receipt.status_partial.as_mut() {
+            "command_boundary_watchdog".clone_into(&mut partial.exhausted_phase);
+            partial.elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+            partial.deadline_ms =
+                u64::try_from(STATUS_COMMAND_WATCHDOG.as_millis()).unwrap_or(u64::MAX);
+            partial.remaining_ms = 0;
+            "retry read-only status after the wedged compatibility executor is diagnosed; provider/structural checkpoint evidence was retained and no sync mutation reserve was used"
+                .clone_into(&mut partial.safe_next_action);
+        }
+        return Ok(receipt);
+    }
+
+    let error = AppError::structured(
+        ErrorCategory::Timeout,
+        "status_command_watchdog_timeout",
+        "the read-only status executor did not return before its command-boundary watchdog",
+        Some(json!({
+            "phase": "command_boundary_watchdog",
+            "elapsed_ms": u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            "deadline_ms": u64::try_from(STATUS_COMMAND_WATCHDOG.as_millis()).unwrap_or(u64::MAX),
+            "status_partial": false,
+        })),
+    );
+    if let Some(persisted) = load_last_good(context) {
+        return Ok(recover_partial_status(
+            &error,
+            Instant::now()
+                .checked_sub(elapsed)
+                .unwrap_or_else(Instant::now),
+            STATUS_COMMAND_WATCHDOG,
+            persisted,
+        ));
+    }
+    Err(AppError::structured(
+        ErrorCategory::Timeout,
+        "status_partial_unavailable",
+        "the read-only status executor exceeded its outer watchdog before provider/structural checkpoint evidence was available",
+        Some(json!({
+            "phase": "command_boundary_watchdog",
+            "elapsed_ms": u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            "deadline_ms": u64::try_from(STATUS_COMMAND_WATCHDOG.as_millis()).unwrap_or(u64::MAX),
+            "status_partial": false,
+            "safe_next_action": "diagnose the wedged status executor; do not change sync mutation reserves, candidate capacity, or loop cadence",
+        })),
+    ))
 }
 
 /// Run status under a caller-supplied absolute deadline. This narrow seam lets
@@ -1560,6 +1761,20 @@ fn status_with_discovery_options(
     if !context.config_existed {
         initialization.ready = false;
         initialization.next = Some("run `cara init` to atomically create .caravan/config.yaml and verify repository readiness".to_owned());
+    }
+    if bounded_compatibility
+        && let Ok(path) = std::env::var("CARA_STATUS_WATCHDOG_CHECKPOINT")
+        && !path.trim().is_empty()
+    {
+        let receipt = current_checkpoint_status(
+            context,
+            &snapshot,
+            &initialization,
+            &provider_runner.github_api_telemetry(),
+            started,
+            operation_budget,
+        );
+        write_watchdog_checkpoint(Path::new(&path), context, &receipt);
     }
     let compatibility_deadline = if bounded_compatibility {
         operation_deadline
@@ -4273,6 +4488,59 @@ mod tests {
         assert!(!action.contains("raise sync.max_duration_secs"));
         assert!(!action.contains("lower sync.max_candidates_per_tick"));
         assert!(action.contains("read-only status"));
+    }
+
+    #[test]
+    fn command_boundary_watchdog_returns_current_provider_checkpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let context = crate::AppContext {
+            repository_path: directory.path().to_path_buf(),
+            config_path: directory.path().join(".caravan/config.yaml"),
+            config_existed: true,
+            config: crate::config::CaravanConfig::default(),
+        };
+        let path = directory.path().join("watchdog.json");
+        let output = status(pr(9, "nine", "main", false), Vec::new());
+        let receipt = StatusReadReceipt {
+            output,
+            status_partial: Some(StatusPartial {
+                schema_version: 2,
+                code: "status_partial".to_owned(),
+                exhausted_phase: "compatibility_analysis".to_owned(),
+                cursor: "provider_discovery_checkpoint:fixture".to_owned(),
+                elapsed_ms: 10,
+                deadline_ms: 35_000,
+                remaining_ms: 34_990,
+                evidence_source: StatusPartialEvidenceSource::CurrentBoundedEvidence,
+                last_good_age_ms: None,
+                unknown_fields: vec!["analysis.compatibility".to_owned()],
+                attempt_provider_api: crate::model::GitHubApiTelemetry {
+                    authenticated: Some(true),
+                    calls: 11,
+                    ..crate::model::GitHubApiTelemetry::default()
+                },
+                mutated: false,
+                safe_next_action: "complete compatibility".to_owned(),
+            }),
+        };
+        write_watchdog_checkpoint(&path, &context, &receipt);
+        assert!(path.exists(), "checkpoint must be written");
+        let raw_checkpoint = std::fs::read(&path).expect("checkpoint bytes");
+        let _: StatusWatchdogCheckpoint =
+            serde_json::from_slice(&raw_checkpoint).expect("checkpoint shape");
+
+        let recovered =
+            status_watchdog_fallback(&context, &path, std::time::Duration::from_secs(45))
+                .expect("outer watchdog retains current checkpoint evidence");
+        let partial = recovered.status_partial.expect("partial");
+        assert!(!recovered.output.healthy);
+        assert_eq!(partial.exhausted_phase, "command_boundary_watchdog");
+        assert_eq!(partial.elapsed_ms, 45_000);
+        assert_eq!(partial.deadline_ms, 45_000);
+        assert_eq!(partial.remaining_ms, 0);
+        assert_eq!(partial.attempt_provider_api.calls, 11);
+        assert!(!partial.mutated);
+        assert_eq!(recovered.output.repository, receipt.output.repository);
     }
 
     #[test]

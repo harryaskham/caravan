@@ -13,6 +13,7 @@ use caravan::{
     AGENT_HELP, AppContext, AppError, CheckInput, CreateInput, EvictInput, JoinInput,
     LockRecoverInput, LockStatusInput, LoopInput, PauseInput, ResumeInput, SplitInput, SyncInput,
     TOOL_NAME, active_updater_config, build_router,
+    command::{CommandRunError, CommandRunner, CommandSpec, ProcessRunner},
     concat::{ConcatExecuteInput, ConcatInput},
     feedback_config, feedback_configuration_error, feedback_panic_config,
     repair::{
@@ -620,10 +621,11 @@ fn run_config(cli: &Cli, command: &ConfigCommand) -> Result<(), i32> {
     }
 }
 
-fn run_status(cli: &Cli) -> Result<(), i32> {
-    let context = load_context(cli)?;
-    let result = caravan::read::status_resilient(&context);
-    if cli.json {
+fn emit_status_result(
+    json: bool,
+    result: Result<caravan::read::StatusReadReceipt, AppError>,
+) -> Result<(), i32> {
+    if json {
         return emit_result(true, result);
     }
     match result {
@@ -642,6 +644,85 @@ fn run_status(cli: &Cli) -> Result<(), i32> {
             Ok(())
         }
         Err(error) => emit_human_error(error),
+    }
+}
+
+fn run_status(cli: &Cli) -> Result<(), i32> {
+    let context = load_context(cli)?;
+    if std::env::var_os("CARA_STATUS_WATCHDOG_WORKER").is_some() {
+        return emit_status_result(cli.json, caravan::read::status_resilient(&context));
+    }
+
+    let checkpoint = std::env::temp_dir().join(format!(
+        "cara-status-watchdog-{}-{}.json",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_millis())
+    ));
+    let executable = std::env::current_exe().map_err(|error| {
+        eprintln!("cara: could not resolve status watchdog executable: {error}");
+        1
+    })?;
+    let request = CommandSpec::new(executable.display().to_string())
+        .args([
+            "--json".to_owned(),
+            "--config".to_owned(),
+            context.config_path.display().to_string(),
+            "status".to_owned(),
+        ])
+        .env("CARA_STATUS_WATCHDOG_WORKER", "1")
+        .env(
+            "CARA_STATUS_WATCHDOG_CHECKPOINT",
+            checkpoint.display().to_string(),
+        );
+    let started = std::time::Instant::now();
+    let result = ProcessRunner::in_directory(&context.repository_path)
+        .with_timeout(caravan::read::STATUS_COMMAND_WATCHDOG)
+        .run(&request);
+    match result {
+        Ok(output) => {
+            let _ = std::fs::remove_file(&checkpoint);
+            if !output.is_success() {
+                print!("{}", output.stdout);
+                eprint!("{}", output.stderr);
+                return Err(output.code.unwrap_or(1));
+            }
+            if cli.json {
+                print!("{}", output.stdout);
+                eprint!("{}", output.stderr);
+                return Ok(());
+            }
+            let receipt = serde_json::from_str::<serde_json::Value>(&output.stdout)
+                .ok()
+                .and_then(|envelope| envelope.get("data").cloned())
+                .and_then(|data| serde_json::from_value(data).ok())
+                .ok_or_else(|| {
+                    eprintln!("cara: bounded status worker returned an invalid success envelope");
+                    1
+                })?;
+            emit_status_result(false, Ok(receipt))
+        }
+        Err(CommandRunError::Timeout { .. }) => {
+            let fallback =
+                caravan::read::status_watchdog_fallback(&context, &checkpoint, started.elapsed());
+            let _ = std::fs::remove_file(&checkpoint);
+            emit_status_result(cli.json, fallback)
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&checkpoint);
+            emit_status_result(
+                cli.json,
+                Err(AppError::execution(
+                    "status_watchdog_failed",
+                    "could not execute the bounded read-only status worker",
+                    Some(serde_json::json!({
+                        "error": error.to_string(),
+                        "mutated": false,
+                    })),
+                )),
+            )
+        }
     }
 }
 
