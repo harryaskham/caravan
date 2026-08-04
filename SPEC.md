@@ -253,12 +253,14 @@ snapshot older than 24 hours invalidates that historical fallback. The CLI
 also owns a 40-second outer subprocess watchdog independent of the analysis
 executor. After provider discovery and label inventory, the worker atomically
 checkpoints current repository/caravan/candidate structure plus request counts.
-Worker output is redirected to parent-owned bounded files rather than pipes. If
-the executor itself wedges instead of yielding, the parent recursively signals
-and reaps descendant process groups plus the worker, then returns the checkpoint
-as `status_partial` with phase `command_boundary_watchdog`. This stays inside
-Cacophony's 60-second collection window and cannot block on output EOF retained
-by a descendant. With neither current bounded
+Worker output is redirected to parent-owned bounded files rather than pipes and,
+on Unix, the worker creates a dedicated session before launching providers. If
+the executor itself wedges, the parent keeps the original PID/group inventory
+across TERM and KILL, includes remaining session members even after reparenting,
+and polls reaping only within a hard local bound before returning the checkpoint
+as `status_partial` with phase `command_boundary_watchdog`. Final envelope
+emission is outside any unbounded process wait, stays inside Cacophony's
+60-second collection window, and cannot block on descendant EOF. With neither current bounded
 evidence nor a valid last-good snapshot, the typed
 `status_partial_unavailable` refusal names the phase and never recommends
 raising an already-maxed sync mutation deadline. Zero provider calls leave the

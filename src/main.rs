@@ -647,14 +647,15 @@ fn emit_status_result(
     }
 }
 
-fn descendant_pids(root: u32) -> Vec<u32> {
+fn process_rows(id_field: &str) -> Vec<(u32, u32)> {
+    let columns = format!("pid=,{id_field}=");
     let Ok(output) = ProcessCommand::new("ps")
-        .args(["-eo", "pid=,ppid="])
+        .args(["-eo", columns.as_str()])
         .output()
     else {
         return Vec::new();
     };
-    let rows = String::from_utf8_lossy(&output.stdout)
+    String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(|line| {
             let mut fields = line.split_whitespace();
@@ -663,7 +664,11 @@ fn descendant_pids(root: u32) -> Vec<u32> {
                 fields.next()?.parse::<u32>().ok()?,
             ))
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+fn descendant_pids(root: u32) -> Vec<u32> {
+    let rows = process_rows("ppid");
     let mut frontier = vec![root];
     let mut descendants = Vec::new();
     while let Some(parent) = frontier.pop() {
@@ -677,40 +682,77 @@ fn descendant_pids(root: u32) -> Vec<u32> {
     descendants
 }
 
+fn session_pids(session: u32) -> Vec<u32> {
+    process_rows("sid")
+        .into_iter()
+        .filter_map(|(pid, sid)| (sid == session && pid != std::process::id()).then_some(pid))
+        .collect()
+}
+
 #[cfg(unix)]
-fn signal_status_process(pid: u32, signal: &str) {
-    let _ = ProcessCommand::new("kill")
-        .args([signal, "--", &format!("-{pid}")])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    let _ = ProcessCommand::new("kill")
-        .args([signal, &pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+fn signal_status_process(pid: u32, signal: rustix::process::Signal) {
+    let Ok(raw_pid) = i32::try_from(pid) else {
+        return;
+    };
+    let Some(pid) = rustix::process::Pid::from_raw(raw_pid) else {
+        return;
+    };
+    // A nested ProcessRunner gives each provider command its own process group.
+    // Signal both identities: some descendants are group leaders, others are not.
+    let _ = rustix::process::kill_process_group(pid, signal);
+    let _ = rustix::process::kill_process(pid, signal);
 }
 
 fn terminate_status_tree(child: &mut Child) {
     #[cfg(unix)]
     {
+        use rustix::process::Signal;
+
         let root = child.id();
-        let mut pids = descendant_pids(root);
-        pids.reverse();
-        for pid in &pids {
-            signal_status_process(*pid, "-TERM");
+        let mut original_descendants = descendant_pids(root);
+        for pid in session_pids(root) {
+            if pid != root && !original_descendants.contains(&pid) {
+                original_descendants.push(pid);
+            }
         }
-        signal_status_process(root, "-TERM");
+        original_descendants.reverse();
+        for pid in &original_descendants {
+            signal_status_process(*pid, Signal::TERM);
+        }
+        signal_status_process(root, Signal::TERM);
         std::thread::sleep(Duration::from_millis(500));
-        let mut remaining = descendant_pids(root);
-        remaining.reverse();
-        for pid in &remaining {
-            signal_status_process(*pid, "-KILL");
+
+        // TERM can kill an intermediate worker and reparent a TERM-resistant
+        // provider before the KILL inventory. Preserve every original identity
+        // so the reparented process and its independent group still receive KILL.
+        let mut kill_targets = original_descendants;
+        for pid in descendant_pids(root)
+            .into_iter()
+            .chain(session_pids(root))
+            .rev()
+        {
+            if pid != root && !kill_targets.contains(&pid) {
+                kill_targets.push(pid);
+            }
         }
-        signal_status_process(root, "-KILL");
+        for pid in &kill_targets {
+            signal_status_process(*pid, Signal::KILL);
+        }
+        signal_status_process(root, Signal::KILL);
     }
     let _ = child.kill();
-    let _ = child.wait();
+
+    // Envelope emission must not live behind an unbounded wait(2). A process in
+    // an uninterruptible kernel wait can ignore even SIGKILL until that wait
+    // resolves; poll reaping briefly, then let process exit/reparenting own it.
+    let reap_deadline = std::time::Instant::now() + Duration::from_millis(250);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => break,
+            Ok(None) if std::time::Instant::now() >= reap_deadline => break,
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
 }
 
 fn bounded_status_file(path: &Path) -> String {
@@ -726,10 +768,13 @@ fn bounded_status_file(path: &Path) -> String {
 // envelope rendering visible at one command-boundary safety transaction.
 #[allow(clippy::too_many_lines)]
 fn run_status(cli: &Cli) -> Result<(), i32> {
-    let context = load_context(cli)?;
     if std::env::var_os("CARA_STATUS_WATCHDOG_WORKER").is_some() {
+        #[cfg(unix)]
+        let _ = rustix::process::setsid();
+        let context = load_context(cli)?;
         return emit_status_result(cli.json, caravan::read::status_resilient(&context));
     }
+    let context = load_context(cli)?;
 
     let checkpoint = std::env::temp_dir().join(format!(
         "cara-status-watchdog-{}-{}.json",
@@ -763,14 +808,10 @@ fn run_status(cli: &Cli) -> Result<(), i32> {
             checkpoint.display().to_string(),
         )
         // Files, not pipes: an escaped descendant cannot keep the parent
-        // blocked waiting for EOF after the worker has been reaped.
+        // blocked waiting for EOF after the worker has been reaped. The worker
+        // creates a dedicated session before provider commands are launched.
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file));
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
     let mut child = command.spawn().map_err(|error| {
         eprintln!("cara: could not start bounded status worker: {error}");
         1
@@ -3465,43 +3506,54 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn status_watchdog_reaps_descendants_without_waiting_for_output_eof() {
-        use std::os::unix::process::CommandExt;
-
         let directory = tempfile::tempdir().expect("temporary directory");
         let ready = directory.path().join("descendant-ready");
         let stdout = std::fs::File::create(directory.path().join("stdout")).unwrap();
         let stderr = std::fs::File::create(directory.path().join("stderr")).unwrap();
-        // The descendant itself writes its exact PID and inherited process group
-        // only after installing TERM resistance. The fixture parent merely waits,
-        // so readiness proves the process we later assert was actually running.
-        let fixture = r#"import os, signal, sys, time
+        // Reproduce the real shape: a worker owns a session and waits on a
+        // provider in its own process group. The provider ignores TERM, retains
+        // inherited descriptors, and handshakes its exact identities.
+        let provider_fixture = r#"import os, signal, sys, time
+os.setpgid(0, 0)
 signal.signal(signal.SIGTERM, signal.SIG_IGN)
 with open(sys.argv[1], "w") as ready:
-    ready.write(f"{os.getpid()} {os.getpgrp()}\n")
+    ready.write(f"{os.getpid()} {os.getpgrp()} {os.getsid(0)} {sys.argv[2]}\n")
     ready.flush()
     os.fsync(ready.fileno())
 while True:
     time.sleep(1)
 "#;
-        let mut command = ProcessCommand::new("sh");
+        let worker_fixture = r#"import os, subprocess, sys
+os.setsid()
+provider = subprocess.Popen(
+    [sys.executable, "-c", os.environ["CARA_WATCHDOG_PROVIDER"], sys.argv[1], str(os.getpid())],
+    close_fds=False,
+)
+provider.wait()
+"#;
+        let ready_argument = ready.to_string_lossy().into_owned();
+        let mut command = ProcessCommand::new("python3");
         command
-            .args([
-                "-c",
-                "python3 -c \"$CARA_WATCHDOG_FIXTURE\" \"$CARA_WATCHDOG_READY\" & wait",
-            ])
-            .env("CARA_WATCHDOG_FIXTURE", fixture)
+            .args(["-c", worker_fixture, ready_argument.as_str()])
+            .env("CARA_WATCHDOG_PROVIDER", provider_fixture)
             .env("CARA_WATCHDOG_READY", &ready)
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
-        command.process_group(0);
         let mut child = command.spawn().expect("spawn watchdog fixture");
         let ready_deadline = std::time::Instant::now() + Duration::from_secs(2);
-        let (descendant_pid, descendant_group) = loop {
+        let (descendant_pid, descendant_group, descendant_session, worker_pid) = loop {
             if let Ok(contents) = std::fs::read_to_string(&ready) {
                 let mut fields = contents.split_whitespace();
-                if let (Some(pid), Some(group)) = (fields.next(), fields.next()) {
-                    if let (Ok(pid), Ok(group)) = (pid.parse::<u32>(), group.parse::<u32>()) {
-                        break (pid, group);
+                if let (Some(pid), Some(group), Some(session), Some(worker)) =
+                    (fields.next(), fields.next(), fields.next(), fields.next())
+                {
+                    if let (Ok(pid), Ok(group), Ok(session), Ok(worker)) = (
+                        pid.parse::<u32>(),
+                        group.parse::<u32>(),
+                        session.parse::<u32>(),
+                        worker.parse::<u32>(),
+                    ) {
+                        break (pid, group, session, worker);
                     }
                 }
             }
@@ -3511,8 +3563,10 @@ while True:
             );
             std::thread::sleep(Duration::from_millis(10));
         };
+        assert_eq!(worker_pid, child.id());
         assert_ne!(descendant_pid, child.id());
-        assert_eq!(descendant_group, child.id());
+        assert_eq!(descendant_group, descendant_pid);
+        assert_eq!(descendant_session, child.id());
         let process_is_alive = |pid: u32| {
             ProcessCommand::new("kill")
                 .args(["-0", &pid.to_string()])
@@ -3527,7 +3581,11 @@ while True:
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(
             !process_is_alive(descendant_pid),
-            "descendant {descendant_pid} in group {descendant_group} survived the watchdog reap"
+            "descendant {descendant_pid} in independent group {descendant_group} and session {descendant_session} survived the watchdog reap"
+        );
+        assert!(
+            session_pids(descendant_session).is_empty(),
+            "watchdog session {descendant_session} retained a process after envelope-safe cleanup"
         );
     }
 

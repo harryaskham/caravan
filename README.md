@@ -906,10 +906,14 @@ provider calls omit the authentication verdict instead of diagnosing
 `authenticated: false`. A separate 40-second CLI watchdog launches status in a
 subprocess and atomically checkpoints provider/structural evidence before
 compatibility. Worker stdout/stderr go to parent-owned bounded files, never
-pipes whose EOF an orphan can retain. If the executor itself wedges, the parent
-recursively terminates descendant process groups, reaps the worker, and returns
-the checkpoint with phase `command_boundary_watchdog`, still inside Cacophony's
-60-second adapter window. Other timeouts terminate and reap
+pipes whose EOF an orphan can retain. On Unix the worker also owns a dedicated
+session, so provider groups remain identifiable after an intermediate worker
+exits and reparents them. If the executor wedges, the parent preserves the
+original PID/group inventory through TERM and KILL, adds any remaining session
+members, and performs only a bounded reap poll before returning the checkpoint
+with phase `command_boundary_watchdog`, still inside Cacophony's 60-second
+adapter window. Envelope emission is never behind an unbounded `wait`. Other
+timeouts terminate and reap
 the child process group and return stable `github_discovery_timeout` evidence
 with the exact phase, operation `elapsed_ms`/`deadline_ms`, retryability, bounded
 output, and a mutation-free safe next action.
