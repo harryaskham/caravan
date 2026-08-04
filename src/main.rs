@@ -3468,10 +3468,16 @@ mod tests {
         use std::os::unix::process::CommandExt;
 
         let directory = tempfile::tempdir().expect("temporary directory");
-        let marker = directory.path().join("escaped-marker");
+        let ready = directory.path().join("descendant-ready");
         let stdout = std::fs::File::create(directory.path().join("stdout")).unwrap();
         let stderr = std::fs::File::create(directory.path().join("stderr")).unwrap();
-        let script = format!("(trap '' TERM; sleep 2; : > '{}') & wait", marker.display());
+        // The descendant itself creates the synchronization marker only after
+        // it exists and has installed TERM resistance. This is causal readiness,
+        // not a scheduler-timing sleep.
+        let script = format!(
+            "(trap '' TERM; : > '{}'; while :; do sleep 1; done) & wait",
+            ready.display()
+        );
         let mut command = ProcessCommand::new("sh");
         command
             .args(["-c", script.as_str()])
@@ -3479,16 +3485,28 @@ mod tests {
             .stderr(Stdio::from(stderr));
         command.process_group(0);
         let mut child = command.spawn().expect("spawn watchdog fixture");
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(!descendant_pids(child.id()).is_empty());
+        let ready_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !ready.exists() && std::time::Instant::now() < ready_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            ready.exists(),
+            "descendant never signalled causal readiness"
+        );
+        let descendants = descendant_pids(child.id());
+        assert!(!descendants.is_empty());
         let started = std::time::Instant::now();
         terminate_status_tree(&mut child);
         assert!(started.elapsed() < Duration::from_secs(2));
-        std::thread::sleep(Duration::from_secs(2));
-        assert!(
-            !marker.exists(),
-            "a descendant survived the watchdog and retained its output lifetime"
-        );
+        for pid in descendants {
+            let alive = ProcessCommand::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            assert!(!alive, "descendant {pid} survived the watchdog reap");
+        }
     }
 
     #[test]
