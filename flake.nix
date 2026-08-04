@@ -95,7 +95,11 @@
           doCheck = true;
 
           nativeBuildInputs = [ pkgs.pkg-config ];
-          nativeCheckInputs = [ pkgs.gitMinimal ];
+          nativeCheckInputs = [
+            pkgs.gitMinimal
+            pkgs.python3
+          ]
+          ++ lib.optionals pkgs.stdenv.isDarwin [ pkgs.unixtools.ps ];
           buildInputs = darwinLibs;
 
           meta = {
