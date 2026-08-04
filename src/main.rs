@@ -725,48 +725,65 @@ impl StatusProcessIdentity {
         }
     }
 
-    fn has_pidfd(&self) -> bool {
+    fn pidfd_receipt(&self) -> PidfdAcquisition {
         #[cfg(target_os = "linux")]
         {
-            self.pidfd.is_some()
+            if self.pidfd.is_some() {
+                PidfdAcquisition::Acquired
+            } else {
+                PidfdAcquisition::Unavailable
+            }
         }
         #[cfg(not(target_os = "linux"))]
         {
             let _ = self;
-            false
+            PidfdAcquisition::Unsupported
         }
     }
 
-    fn signal(&self, signal: rustix::process::Signal) -> bool {
+    fn signal(&self, signal: rustix::process::Signal) -> SignalOutcome {
         #[cfg(target_os = "linux")]
         if let Some(pidfd) = &self.pidfd {
             // pidfd binds the signal to this exact process generation, so a
             // rapidly reused numeric PID cannot receive a stale watchdog KILL.
-            if rustix::process::pidfd_send_signal(pidfd, signal).is_ok() {
-                return true;
+            match rustix::process::pidfd_send_signal(pidfd, signal) {
+                Ok(()) => return SignalOutcome::PidfdSent,
+                Err(rustix::io::Errno::SRCH) => return SignalOutcome::AlreadyExited,
+                Err(_) => {}
             }
         }
         let Ok(raw_pid) = i32::try_from(self.pid) else {
-            return false;
+            return SignalOutcome::InvalidIdentity;
         };
         let Some(pid) = rustix::process::Pid::from_raw(raw_pid) else {
-            return false;
+            return SignalOutcome::InvalidIdentity;
         };
-        let group = rustix::process::kill_process_group(pid, signal).is_ok();
-        rustix::process::kill_process(pid, signal).is_ok() || group
+        let group = rustix::process::kill_process_group(pid, signal);
+        let process = rustix::process::kill_process(pid, signal);
+        if group.is_ok() || process.is_ok() {
+            SignalOutcome::NumericSent
+        } else if matches!(group, Err(rustix::io::Errno::SRCH))
+            && matches!(process, Err(rustix::io::Errno::SRCH))
+        {
+            SignalOutcome::AlreadyExited
+        } else {
+            SignalOutcome::Failed
+        }
     }
 
-    fn reap_if_child(&self) -> bool {
+    fn reap_if_child(&self) -> ReapOutcome {
         let Ok(raw_pid) = i32::try_from(self.pid) else {
-            return false;
+            return ReapOutcome::InvalidIdentity;
         };
         let Some(pid) = rustix::process::Pid::from_raw(raw_pid) else {
-            return false;
+            return ReapOutcome::InvalidIdentity;
         };
-        matches!(
-            rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::NOHANG),
-            Ok(Some(_))
-        )
+        match rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::NOHANG) {
+            Ok(Some(_)) => ReapOutcome::Reaped,
+            Ok(None) => ReapOutcome::StillRunning,
+            Err(rustix::io::Errno::CHILD) => ReapOutcome::NotAChild,
+            Err(_) => ReapOutcome::Failed,
+        }
     }
 
     fn same_generation_alive(&self) -> bool {
@@ -782,14 +799,42 @@ impl StatusProcessIdentity {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)] // Linux-only variants remain part of the cross-platform cleanup receipt.
+enum PidfdAcquisition {
+    Acquired,
+    Unavailable,
+    Unsupported,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)] // PidfdSent is constructed only by the Linux cleanup path.
+enum SignalOutcome {
+    NotAttempted,
+    PidfdSent,
+    NumericSent,
+    AlreadyExited,
+    InvalidIdentity,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReapOutcome {
+    NotAttempted,
+    Reaped,
+    StillRunning,
+    NotAChild,
+    InvalidIdentity,
+    Failed,
+}
+
 #[derive(Debug)]
-#[allow(clippy::struct_excessive_bools)] // A bounded audit receipt records orthogonal syscall outcomes.
 struct StatusCleanupTargetReceipt {
     pid: u32,
-    pidfd_acquired: bool,
-    term_sent: bool,
-    kill_sent: bool,
-    reaped: bool,
+    pidfd: PidfdAcquisition,
+    term: SignalOutcome,
+    kill: SignalOutcome,
+    reap: ReapOutcome,
     survived: bool,
 }
 
@@ -808,12 +853,8 @@ impl StatusCleanupReceipt {
             .filter(|target| target.survived)
             .map(|target| {
                 format!(
-                    "pid={} pidfd={} term={} kill={} reaped={}",
-                    target.pid,
-                    target.pidfd_acquired,
-                    target.term_sent,
-                    target.kill_sent,
-                    target.reaped
+                    "pid={} pidfd={:?} term={:?} kill={:?} reap={:?}",
+                    target.pid, target.pidfd, target.term, target.kill, target.reap
                 )
             })
             .collect::<Vec<_>>();
@@ -848,6 +889,42 @@ fn capture_status_identities(root: u32) -> Vec<StatusProcessIdentity> {
         .collect()
 }
 
+#[cfg(unix)]
+fn merge_status_identities(
+    root: u32,
+    identities: &mut Vec<StatusProcessIdentity>,
+    receipts: &mut Vec<StatusCleanupTargetReceipt>,
+) {
+    for identity in capture_status_identities(root) {
+        if identities
+            .iter()
+            .any(|existing| existing.pid == identity.pid)
+        {
+            continue;
+        }
+        receipts.push(StatusCleanupTargetReceipt {
+            pid: identity.pid,
+            pidfd: identity.pidfd_receipt(),
+            term: SignalOutcome::NotAttempted,
+            kill: SignalOutcome::NotAttempted,
+            reap: ReapOutcome::NotAttempted,
+            survived: false,
+        });
+        identities.push(identity);
+    }
+}
+
+fn merge_reap_outcome(existing: ReapOutcome, next: ReapOutcome) -> ReapOutcome {
+    if existing == ReapOutcome::Reaped {
+        existing
+    } else {
+        next
+    }
+}
+
+// Keep the bounded TERM/KILL/adoption/reap phases and their typed receipts in
+// one auditable transaction; splitting them would obscure phase ordering.
+#[allow(clippy::too_many_lines)]
 fn terminate_status_tree(child: &mut Child) -> StatusCleanupReceipt {
     #[cfg(target_os = "linux")]
     let subreaper_enabled = rustix::process::child_subreaper().ok().flatten().is_some();
@@ -855,51 +932,58 @@ fn terminate_status_tree(child: &mut Child) -> StatusCleanupReceipt {
     let subreaper_enabled = false;
 
     #[cfg(unix)]
-    let (identities, mut receipts, root_identity) = {
-        use rustix::process::Signal;
+    let root = child.id();
+    #[cfg(unix)]
+    let root_identity = StatusProcessIdentity::capture(root);
+    #[cfg(unix)]
+    let mut identities = Vec::new();
+    #[cfg(unix)]
+    let mut receipts = Vec::new();
 
-        let root = child.id();
-        let root_identity = StatusProcessIdentity::capture(root);
-        let identities = capture_status_identities(root);
-        let mut receipts = identities
-            .iter()
-            .map(|identity| StatusCleanupTargetReceipt {
-                pid: identity.pid,
-                pidfd_acquired: identity.has_pidfd(),
-                term_sent: false,
-                kill_sent: false,
-                reaped: false,
-                survived: false,
-            })
-            .collect::<Vec<_>>();
-        for (identity, receipt) in identities.iter().zip(&mut receipts) {
-            receipt.term_sent = identity.signal(Signal::TERM);
+    // A provider can appear between any two process snapshots. Re-scan during
+    // the complete TERM phase and give every observed identity its own receipt.
+    let term_deadline = std::time::Instant::now() + Duration::from_millis(250);
+    loop {
+        #[cfg(unix)]
+        {
+            merge_status_identities(root, &mut identities, &mut receipts);
+            for (identity, receipt) in identities.iter().zip(&mut receipts) {
+                if receipt.term == SignalOutcome::NotAttempted {
+                    receipt.term = identity.signal(rustix::process::Signal::TERM);
+                }
+                receipt.reap = merge_reap_outcome(receipt.reap, identity.reap_if_child());
+            }
         }
-        (identities, receipts, root_identity)
-    };
+        if std::time::Instant::now() >= term_deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
     // Keep the worker alive while descendants receive KILL. Its own wait path
     // can reap providers before any orphan adoption is needed.
-    std::thread::sleep(Duration::from_millis(250));
-    #[cfg(unix)]
-    for (identity, receipt) in identities.iter().zip(&mut receipts) {
-        receipt.kill_sent = identity.signal(rustix::process::Signal::KILL);
-    }
-
     let descendant_deadline = std::time::Instant::now() + Duration::from_millis(400);
     loop {
-        let _ = child.try_wait();
         #[cfg(unix)]
-        for (identity, receipt) in identities.iter().zip(&mut receipts) {
-            receipt.reaped |= identity.reap_if_child();
+        {
+            merge_status_identities(root, &mut identities, &mut receipts);
+            for (identity, receipt) in identities.iter().zip(&mut receipts) {
+                if receipt.kill == SignalOutcome::NotAttempted {
+                    receipt.kill = identity.signal(rustix::process::Signal::KILL);
+                }
+                receipt.reap = merge_reap_outcome(receipt.reap, identity.reap_if_child());
+            }
         }
+        let _ = child.try_wait();
         #[cfg(unix)]
         let any_alive = identities
             .iter()
             .any(StatusProcessIdentity::same_generation_alive);
         #[cfg(not(unix))]
         let any_alive = false;
-        if !any_alive || std::time::Instant::now() >= descendant_deadline {
+        if (!identities.is_empty() && !any_alive)
+            || std::time::Instant::now() >= descendant_deadline
+        {
             break;
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -928,16 +1012,22 @@ fn terminate_status_tree(child: &mut Child) -> StatusCleanupReceipt {
         let _ = child.kill();
     }
 
-    // Reap only exact recorded children under a final hard bound; envelope
-    // emission remains independent of any process that cannot leave kernel wait.
+    // Final scans cover providers adopted only when the worker exited. Every
+    // new identity receives a typed KILL/reap receipt before survivor checking.
     let final_deadline = std::time::Instant::now() + Duration::from_millis(250);
     loop {
         if matches!(child.try_wait(), Ok(Some(_))) {
             root_reaped = true;
         }
         #[cfg(unix)]
-        for (identity, receipt) in identities.iter().zip(&mut receipts) {
-            receipt.reaped |= identity.reap_if_child();
+        {
+            merge_status_identities(root, &mut identities, &mut receipts);
+            for (identity, receipt) in identities.iter().zip(&mut receipts) {
+                if receipt.kill == SignalOutcome::NotAttempted {
+                    receipt.kill = identity.signal(rustix::process::Signal::KILL);
+                }
+                receipt.reap = merge_reap_outcome(receipt.reap, identity.reap_if_child());
+            }
         }
         if std::time::Instant::now() >= final_deadline {
             break;
@@ -946,7 +1036,7 @@ fn terminate_status_tree(child: &mut Child) -> StatusCleanupReceipt {
     }
     #[cfg(unix)]
     for (identity, receipt) in identities.iter().zip(&mut receipts) {
-        receipt.reaped |= identity.reap_if_child();
+        receipt.reap = merge_reap_outcome(receipt.reap, identity.reap_if_child());
         receipt.survived = identity.same_generation_alive();
     }
 
@@ -3792,13 +3882,19 @@ provider.wait()
         let provider_receipt = cleanup
             .targets
             .iter()
-            .find(|target| target.pid == descendant_pid)
-            .expect("provider cleanup receipt");
-        #[cfg(target_os = "linux")]
-        assert!(provider_receipt.pidfd_acquired);
-        assert!(provider_receipt.term_sent);
-        assert!(provider_receipt.kill_sent);
-        assert!(!provider_receipt.survived, "{cleanup:?}");
+            .find(|target| target.pid == descendant_pid);
+        assert!(
+            provider_receipt.is_some(),
+            "missing provider receipt: {cleanup:?}"
+        );
+        if let Some(provider_receipt) = provider_receipt {
+            #[cfg(target_os = "linux")]
+            assert_eq!(provider_receipt.pidfd, PidfdAcquisition::Acquired);
+            assert_ne!(provider_receipt.term, SignalOutcome::NotAttempted);
+            assert_ne!(provider_receipt.kill, SignalOutcome::NotAttempted);
+            assert_ne!(provider_receipt.reap, ReapOutcome::NotAttempted);
+            assert!(!provider_receipt.survived, "{cleanup:?}");
+        }
         assert!(
             !process_is_alive(descendant_pid),
             "descendant {descendant_pid} in independent group {descendant_group} and session {descendant_session} survived the watchdog reap"
