@@ -72,6 +72,11 @@ pub use plan::plan_sync;
 use plan::{plan_auto_admission_with_checker, plan_caravan_convergence};
 
 const MAX_SYNC_OPERATION_SECS: u64 = 3_600;
+/// Production automation kills a sync tick after five minutes. Keep Cara's
+/// internal mutation/read deadline inside that parent by a fixed evidence and
+/// serialization margin; a configured larger planning horizon remains visible
+/// to capacity projections but never governs one live `sync` process.
+const MAX_SYNC_EXECUTION_SECS: u64 = 285;
 const MAX_PARALLEL_REBASE_CHAINS: usize = 2;
 const PARKED_LABEL: &str = "caravan-parked";
 /// Exact remote range/target verification plus one force-with-lease push.
@@ -1348,7 +1353,7 @@ fn sync_with_optional_writer_guard(
     writer_guard: Option<WriterOperationGuard>,
 ) -> Result<SyncOutput, AppError> {
     let started = Instant::now();
-    let budget = sync_operation_budget(context);
+    let budget = sync_execution_budget(context);
     let operation_deadline = started + budget;
     match sync_without_hooks(context, input, started, operation_deadline, writer_guard) {
         Ok(mut output) => {
@@ -1384,6 +1389,10 @@ fn sync_operation_budget(context: &AppContext) -> Duration {
             .max_duration_secs
             .min(MAX_SYNC_OPERATION_SECS),
     )
+}
+
+fn sync_execution_budget(context: &AppContext) -> Duration {
+    sync_operation_budget(context).min(Duration::from_secs(MAX_SYNC_EXECUTION_SECS))
 }
 
 #[derive(Default)]
@@ -2684,6 +2693,86 @@ fn bounded_prefix_output(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn root_first_output(
+    context: &AppContext,
+    input: &SyncInput,
+    started: Instant,
+    operation_deadline: Instant,
+    initial_status_elapsed: Duration,
+    root_elapsed: Duration,
+    progress: SyncProgress,
+    status: StatusOutput,
+    lock_recovery: Option<OperationLockRecovery>,
+    lock: &mut WriterOperationGuard,
+) -> Result<SyncOutput, AppError> {
+    lock.checkpoint(
+        "root_first_merge_complete",
+        json!({
+            "root_merge": &progress.root_merge,
+            "provider_state": sync_checkpoint_evidence(&progress),
+            "continuation": "ordinary fleet analysis deferred to the next bounded tick",
+        }),
+        false,
+    )?;
+    lock.checkpoint("completed", sync_checkpoint_evidence(&progress), false)?;
+    let mut scheduler_status = successful_scheduler_status(
+        &status,
+        &progress.ci,
+        &progress.paused_caravans,
+        context.config.rebase_on_join,
+        &progress.required_runs,
+        &progress.missing_required_runs,
+    );
+    scheduler_status.disposition = SchedulerDisposition::RetryTick;
+    scheduler_status.wake_class = SchedulerWakeClass::RetryTick;
+    scheduler_status.reason = format!(
+        "landed {} exact green Cara-owned root(s) before whole-fleet analysis; rerun the next bounded tick from the durable provider cursor",
+        progress.root_merge.len()
+    );
+    let receipt = progress.operation_receipt();
+    Ok(SyncOutput {
+        tick: SyncTickReceipt {
+            schema_version: 1,
+            verb: "sync".to_owned(),
+            caravans: status.analysis.fleet.caravans.len(),
+            unqueued: status.analysis.fleet.unqueued.len(),
+            synchronized: progress.synchronized_caravans.len(),
+            joins: 0,
+            changed: receipt.changed,
+        },
+        receipt,
+        auto_admission: AutoAdmissionOutput::disabled(context, input.all),
+        scheduler_status,
+        timing: Some(SyncTiming {
+            deadline_ms: duration_millis(operation_deadline.saturating_duration_since(started)),
+            total_ms: duration_millis(started.elapsed()),
+            initial_status_ms: duration_millis(initial_status_elapsed),
+            provider_convergence_ms: duration_millis(root_elapsed),
+            final_status_ms: 0,
+        }),
+        lock_recovery,
+        provider_receipts: progress.provider_receipts,
+        root_auto_merge: progress.root_auto_merge,
+        root_promotion: progress.root_promotion,
+        root_merge: progress.root_merge,
+        native_stack_land: progress.native_stack_land,
+        required_runs: progress.required_runs,
+        rebase_plans: progress.rebase_plans,
+        rebase_receipts: progress.rebase_receipts,
+        historical_predecessor: read::historical_predecessor(&status),
+        synchronized_caravans: progress.synchronized_caravans,
+        paused_caravans: progress.paused_caravans,
+        head_advancements: progress.head_advancements,
+        ci: progress.ci,
+        events: progress.events,
+        hook_deliveries: Vec::new(),
+        // This is intentionally the bounded pre-merge snapshot. Root receipts
+        // are authoritative; whole-fleet rediscovery belongs to the next tick.
+        status,
+    })
+}
+
 fn sync_without_hooks(
     context: &AppContext,
     input: &SyncInput,
@@ -2780,6 +2869,43 @@ fn sync_with_lock(
         &runner,
     )?;
     let provider = GitHubMutationAdapter::new(runner);
+
+    // Root landing is the first provider-owned convergence action. A large
+    // unrelated inventory may consume later planning/analysis, but cannot make
+    // an already-admitted exact-green root miss the parent scheduler window.
+    let root_first_started = Instant::now();
+    progress::emit(
+        "root_first",
+        "evaluating one exact green Cara-owned root before fleet planning",
+    );
+    if let Some(progress) = execute_root_first(
+        &status,
+        &provider,
+        input.all,
+        context.config.sync.max_mutations_per_tick,
+        RequiredRunsPolicy::from_config(&context.config.sync),
+    )? {
+        progress::emit(
+            "root_first",
+            format!(
+                "landed {} root(s); deferring unrelated analysis to the next tick",
+                progress.root_merge.len()
+            ),
+        );
+        return root_first_output(
+            context,
+            input,
+            started,
+            operation_deadline,
+            initial_status_elapsed,
+            root_first_started.elapsed(),
+            progress,
+            status,
+            lock_recovery,
+            &mut lock,
+        );
+    }
+
     let parking = reconcile_terminal_red_parking(context, &status, &provider)?;
     let parking_mutations = u32::try_from(
         parking
@@ -4296,6 +4422,78 @@ fn execute_bounded(
         required_runs,
         None,
     )
+}
+
+fn root_first_eligible(status: &StatusOutput, caravan: &Caravan) -> bool {
+    let Some(root) = caravan.head() else {
+        return false;
+    };
+    let Some(observed) = status.analysis.pull_requests.get(&root) else {
+        return false;
+    };
+    observed.state == PullRequestState::Open
+        && !observed.draft
+        && observed.base.name == status.default_branch
+        && !observed.auto_merge.enabled
+        && classify_checks(&observed.checks, observed.has_label("caravan-force"))
+            == CiDisposition::Passing
+        && status.analysis.cumulative_trees.iter().any(|proof| {
+            proof.candidate == observed.head
+                && proof.target == status.analysis.fleet.default_branch
+                && proof.identical
+        })
+}
+
+/// Land at most one already-admitted exact-green Cara-owned root before any
+/// physical planning or whole-member CI analysis. A successful landing returns
+/// immediately; the next tick resumes from GitHub's durable cursor.
+fn execute_root_first(
+    status: &StatusOutput,
+    provider: &impl SyncProvider,
+    all: bool,
+    mutation_limit: u32,
+    required_runs: RequiredRunsPolicy,
+) -> Result<Option<SyncProgress>, AppError> {
+    if !status.head_merge.actor.caravan() {
+        return Ok(None);
+    }
+    let mut caravans = select_caravans(status, all)?;
+    caravans.retain(|caravan| {
+        !caravan.parked
+            && !status
+                .pauses
+                .iter()
+                .any(|pause| pause.state.is_effective() && pause.record.caravan_head == caravan.id)
+            && root_first_eligible(status, caravan)
+    });
+    if caravans.is_empty() {
+        return Ok(None);
+    }
+
+    let mut progress = SyncProgress::new(
+        status,
+        caravans.iter().map(|caravan| caravan.id).collect(),
+        mutation_limit,
+    );
+    progress.required_runs_grace_secs = required_runs.grace_secs;
+    // Root-first is a merge-priority pass, never a recovery/mutation pass for
+    // absent CI. Missing lineage remains visible on the ordinary continuation.
+    progress.required_runs_retrigger_enabled = false;
+    preflight_repository(provider, status, &progress)?;
+
+    for caravan in &caravans {
+        let root = caravan.head().expect("eligible caravan has a root");
+        progress.promote_root(provider, status, caravan.id, root, None, false)?;
+        progress.ensure_no_foreign_auto_merge(provider, &status.repository, caravan.id, root)?;
+        let observation = progress.observe_ci(provider, &status.repository, root)?;
+        progress.ci.push(observation);
+        let assessment = progress.observe_required_runs(provider, &status.repository, root)?;
+        progress.push_required_runs(caravan.id, assessment, None);
+        if progress.merge_root(provider, status, caravan.id, root, &caravan.members, None)? {
+            return Ok(Some(progress));
+        }
+    }
+    Ok(None)
 }
 
 #[allow(clippy::too_many_arguments)]

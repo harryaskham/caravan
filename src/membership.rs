@@ -2234,6 +2234,7 @@ fn execute_with_rebase_guard(
         &eligibility,
         state.current.as_ref().expect("current PR"),
         admission_priority_basis,
+        status.head_merge.actor,
     );
     state.ensure_control_label_comment(provider, &status.repository, &audit)?;
 

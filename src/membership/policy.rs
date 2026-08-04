@@ -383,6 +383,7 @@ pub(super) fn membership_audit(
     eligibility: &CheckOutput,
     after: &PullRequestSnapshot,
     admission_priority_basis: String,
+    head_merge_actor: crate::model::HeadMergeActor,
 ) -> ControlLabelAudit {
     let (reason, source) = request.reason.as_ref().map_or_else(
         || {
@@ -445,8 +446,11 @@ pub(super) fn membership_audit(
         compatibility_evidence: compatibility,
         clean_squash_evidence: if request.operation.is_join() {
             "compatibility check was clean; non-head auto-merge is disabled".to_owned()
+        } else if head_merge_actor.caravan() {
+            "compatibility check was clean; Cara owns direct squash and provider autoMergeRequest remains disabled on the root".to_owned()
         } else {
-            "compatibility check was clean; squash auto-merge is enabled on the head".to_owned()
+            "compatibility check was clean; GitHub squash auto-merge is enabled on the head"
+                .to_owned()
         },
         admission_priority_basis,
     }

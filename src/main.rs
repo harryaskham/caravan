@@ -959,6 +959,24 @@ fn merge_status_identities(
     }
 }
 
+#[cfg(unix)]
+fn refresh_status_identities(
+    root: u32,
+    identities: &mut Vec<StatusProcessIdentity>,
+    receipts: &mut Vec<StatusCleanupTargetReceipt>,
+) {
+    #[cfg(target_os = "linux")]
+    merge_status_identities(root, identities, receipts);
+    #[cfg(not(target_os = "linux"))]
+    if identities.is_empty() {
+        // Linux has cheap direct /proc scans and needs dynamic subreaper
+        // adoption. Other Unix platforms use an external ps snapshot; once the
+        // causally-ready provider is registered, repeated scans only add
+        // scheduler latency and do not strengthen its durable identity.
+        merge_status_identities(root, identities, receipts);
+    }
+}
+
 fn merge_reap_outcome(existing: ReapOutcome, next: ReapOutcome) -> ReapOutcome {
     if existing == ReapOutcome::Reaped {
         existing
@@ -991,7 +1009,7 @@ fn terminate_status_tree(child: &mut Child) -> StatusCleanupReceipt {
     loop {
         #[cfg(unix)]
         {
-            merge_status_identities(root, &mut identities, &mut receipts);
+            refresh_status_identities(root, &mut identities, &mut receipts);
             for (identity, receipt) in identities.iter().zip(&mut receipts) {
                 if receipt.term == SignalOutcome::NotAttempted {
                     receipt.term = identity.signal(rustix::process::Signal::TERM);
@@ -1011,7 +1029,7 @@ fn terminate_status_tree(child: &mut Child) -> StatusCleanupReceipt {
     loop {
         #[cfg(unix)]
         {
-            merge_status_identities(root, &mut identities, &mut receipts);
+            refresh_status_identities(root, &mut identities, &mut receipts);
             for (identity, receipt) in identities.iter().zip(&mut receipts) {
                 if receipt.kill == SignalOutcome::NotAttempted {
                     receipt.kill = identity.signal(rustix::process::Signal::KILL);
@@ -1066,7 +1084,7 @@ fn terminate_status_tree(child: &mut Child) -> StatusCleanupReceipt {
         }
         #[cfg(unix)]
         {
-            merge_status_identities(root, &mut identities, &mut receipts);
+            refresh_status_identities(root, &mut identities, &mut receipts);
             for (identity, receipt) in identities.iter().zip(&mut receipts) {
                 if receipt.kill == SignalOutcome::NotAttempted {
                     receipt.kill = identity.signal(rustix::process::Signal::KILL);
@@ -3884,7 +3902,10 @@ provider.wait()
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
         let mut child = command.spawn().expect("spawn watchdog fixture");
-        let ready_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        // This is a causal file handshake, not a readiness sleep. Full-suite
+        // process pressure can delay Python startup; the bound only prevents a
+        // broken fixture from waiting forever and is separate from reap timing.
+        let ready_deadline = std::time::Instant::now() + Duration::from_secs(10);
         let (descendant_pid, descendant_group, descendant_session, worker_pid) = loop {
             if let Ok(contents) = std::fs::read_to_string(&ready) {
                 let mut fields = contents.split_whitespace();
@@ -3902,8 +3923,12 @@ provider.wait()
                 }
             }
             assert!(
+                !matches!(child.try_wait(), Ok(Some(_))),
+                "fixture worker exited before the PID/process-group handshake"
+            );
+            assert!(
                 std::time::Instant::now() < ready_deadline,
-                "descendant never completed the PID/process-group handshake"
+                "descendant never completed the PID/process-group handshake within the bounded startup allowance"
             );
             std::thread::sleep(Duration::from_millis(10));
         };

@@ -578,23 +578,24 @@ distinguishable from a healthy one.
 A sync tick:
 
 1. Acquire the local repository operation lock.
-2. Discover and validate the fresh GitHub graph.
-3. Reconcile merged heads: promote the child to the exact default branch in one fenced transaction. No history rewrite is required.
-4. Walk head → tail.
-5. Ensure the head merges cleanly into current default.
-6. Ensure every child merges cleanly into its declared predecessor.
-7. Inspect CI/check state for each PR.
-8. Enforce exactly one merge actor: under `head_merge_actor: caravan` no member carries native auto-merge and Cara performs the bounded squash merges itself; under `github` exactly the root is armed.
-9. Recheck cross-caravan head/tail compatibility.
-10. Emit events/hooks for observed transitions.
-11. When `sync --all` auto-admission is enabled, rediscover and greedily admit
+2. Discover and validate the fresh GitHub graph under an internal live-process deadline capped at 285 seconds, leaving the five-minute parent scheduler time to collect typed output and events even when `sync.max_duration_secs` is a larger planning horizon.
+3. Before parking, physical planning, or whole-member CI analysis, evaluate already-admitted exact-green roots under `head_merge_actor: caravan`. Land at most one proven root and return a typed `retry_tick` receipt immediately; unrelated inventory and the tail continue on the next GitHub-cursor tick.
+4. Reconcile merged heads: promote the child to the exact default branch in one fenced transaction. No history rewrite is required.
+5. Walk head → tail.
+6. Ensure the head merges cleanly into current default.
+7. Ensure every child merges cleanly into its declared predecessor.
+8. Inspect CI/check state for each PR.
+9. Enforce exactly one merge actor: under `head_merge_actor: caravan` no member carries native auto-merge and Cara performs the bounded squash merges itself; under `github` exactly the root is armed. Admission audit text names Cara direct squash in the former mode and never claims a GitHub `autoMergeRequest` was armed.
+10. Recheck cross-caravan head/tail compatibility.
+11. Emit events/hooks for observed transitions.
+12. When `sync --all` auto-admission is enabled, rediscover and greedily admit
     canonical unlabelled candidates only after steps 1–10 converge. Empty fleets
     form a head; non-empty fleets use the first compatible deterministic tail.
     Incompatible exact generations receive a durable skip and later candidates
     may be considered. Before beginning another candidate, preserve a bounded
     nonzero exact-Git reserve; exhaustion returns continuation without starting
     a doomed final fetch.
-12. Re-run normal convergence for admitted members and return exact joins,
+13. Re-run normal convergence for admitted members and return exact joins,
     skips, remaining candidates, safety-budget usage, continuation, and the
     stable health snapshot or first decision point.
 

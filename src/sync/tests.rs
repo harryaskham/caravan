@@ -3511,10 +3511,16 @@ fn sync_lock_checkpoint_stays_bounded_for_large_fleet_receipts() {
 fn whole_sync_budget_uses_the_explicit_validated_wall_clock_bound() {
     let mut context = AppContext::default();
     assert_eq!(sync_operation_budget(&context), Duration::from_secs(120));
+    assert_eq!(sync_execution_budget(&context), Duration::from_secs(120));
     context.config.sync.max_duration_secs = 10;
     assert_eq!(sync_operation_budget(&context), Duration::from_secs(10));
+    assert_eq!(sync_execution_budget(&context), Duration::from_secs(10));
     context.config.sync.max_duration_secs = 3_600;
     assert_eq!(sync_operation_budget(&context), Duration::from_secs(3_600));
+    assert_eq!(
+        sync_execution_budget(&context),
+        Duration::from_secs(MAX_SYNC_EXECUTION_SECS)
+    );
 }
 
 #[test]
@@ -6490,6 +6496,69 @@ fn caravan_member(number: u64, head: &str, base: &str) -> PullRequestSnapshot {
     );
     pull_request.checks = vec![check("build-test", CheckState::Success, None)];
     pull_request
+}
+
+#[test]
+fn root_first_lands_green_root_with_large_unrelated_inventory() {
+    let mut pulls = vec![caravan_member(1, "one", "main")];
+    for number in 100..300 {
+        let mut unrelated = pull_request(
+            number,
+            &format!("unrelated-{number}"),
+            "main",
+            PullRequestState::Open,
+            AutoMergeState::disabled(),
+        );
+        unrelated.labels.clear();
+        unrelated.checks = vec![check("build-test", CheckState::InProgress, None)];
+        pulls.push(unrelated);
+    }
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    let status = caravan_status(pulls, Some(PrNumber(1)), true);
+
+    let progress = execute_root_first(
+        &status,
+        &provider,
+        true,
+        u32::MAX,
+        RequiredRunsPolicy::default(),
+    )
+    .expect("root-first evaluation succeeds")
+    .expect("green root lands before unrelated rows");
+
+    assert_eq!(progress.root_merge.len(), 1);
+    assert_eq!(progress.root_merge[0].pr, PrNumber(1));
+    assert_eq!(progress.ci.len(), 1, "unrelated inventory is not analyzed");
+}
+
+#[test]
+fn root_first_lands_one_green_root_before_tail_analysis() {
+    let pulls = vec![
+        caravan_member(1, "one", "main"),
+        caravan_member(2, "two", "one"),
+    ];
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    let status = caravan_status(pulls, Some(PrNumber(1)), true);
+
+    let progress = execute_root_first(
+        &status,
+        &provider,
+        false,
+        u32::MAX,
+        RequiredRunsPolicy::default(),
+    )
+    .expect("root-first evaluation succeeds")
+    .expect("one exact-green root lands");
+
+    assert_eq!(progress.root_merge.len(), 1);
+    assert_eq!(progress.root_merge[0].pr, PrNumber(1));
+    assert_eq!(progress.ci.len(), 1, "tail CI is deferred to the next tick");
+    assert_eq!(progress.ci[0].pr, PrNumber(1));
+    assert_eq!(
+        provider.pulls.borrow()[&PrNumber(2)].state,
+        PullRequestState::Open,
+        "root-first lands at most one root"
+    );
 }
 
 #[test]

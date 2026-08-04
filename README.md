@@ -736,8 +736,14 @@ to an agent. Hooks stay `blocking: false` so a delivery failure can never roll
 back completed provider work.
 
 When enabling cumulative mode, set `sync.max_duration_secs` high enough for
-physical planning plus the typed apply reserve; this repository uses
-900 seconds. `cara status` reports the required and retained reserve, the
+physical planning plus the typed apply reserve. Capacity projections retain
+that configured horizon, while one live `sync` process uses an internal maximum
+of 285 seconds so a five-minute parent scheduler can always collect typed
+progress/error evidence rather than killing the shell first. Before physical
+planning or whole-member CI analysis, a Cara-owned tick evaluates already-
+admitted exact-green roots and lands at most one; successful root landing
+returns `retry_tick` immediately and defers unrelated inventory to the next
+GitHub-cursor tick. `cara status` reports the required and retained reserve, the
 processable prefix, the deferred members, the maximum admissible chain size,
 and a safe next action for every caravan before any refusal, and
 `cara plan sync --all` reports the exact prefix a tick would admit without
