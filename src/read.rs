@@ -4030,6 +4030,7 @@ mod tests {
                 expires_unix_secs: None,
                 external_reference: None,
                 resume_authorized_by: None,
+                recovery: None,
             },
             state: crate::pause::PauseState::Active,
             auto_merge_suspended: true,

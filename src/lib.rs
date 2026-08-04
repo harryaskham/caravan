@@ -455,6 +455,17 @@ RESHAPING AND EXPLICIT INTENT
   disables only the exact head auto-merge and preserves topology. Expiry is a
   warning, never implicit resume. Only `cara resume` may revalidate exact facts,
   record authorization, and restore policy. A stale hold fails closed.
+- When an external owner must retarget and replace one reviewed head while an
+  existing pause remains the fence, use `cara --json pause-recovery
+  prepare|checkpoint-base|checkpoint-head|finalize|rollback` or the exact MCP
+  tools `pause_recovery_prepare`, `pause_recovery_checkpoint_base`,
+  `pause_recovery_checkpoint_head`, `pause_recovery_finalize`, and
+  `pause_recovery_rollback`. Repeat the complete schema-version-1 owner,
+  pause/topology, old/desired base+head, reason, and idempotency identity at every
+  phase. Cara never performs those provider writes (`provider_mutated=false`):
+  it independently rediscovers each checkpoint, keeps sync fenced through drift,
+  and releases only after exact virtual-merge/check finalization or old-state
+  rollback. Ordinary `resume` refuses while this authority exists.
 
 BUILT-IN WEB OPERATIONS
 - `cara web --repo PATH [--repo PATH ...]` serves a responsive dashboard from
@@ -1271,6 +1282,41 @@ pub fn build_router() -> ToolRouter<AppContext> {
         "resume",
         "Explicitly resume a paused caravan only after exact head, base, labels, checks, state, and topology revalidation; stale facts fail closed.",
         |context: &AppContext, input: ResumeInput| pause::resume(context, &input),
+    );
+    router.add_typed_tool_with_output_schema(
+        "pause_recovery_prepare",
+        "Bind or replay one exact external owner generation on an active pause before any provider base/head mutation; provider_mutated is always false.",
+        |context: &AppContext, input: pause::PauseRecoveryInput| {
+            pause::pause_recovery(context, pause::PauseRecoveryPhase::Prepare, &input)
+        },
+    );
+    router.add_typed_tool_with_output_schema(
+        "pause_recovery_checkpoint_base",
+        "Independently rediscover and checkpoint the exact desired provider base with the old head while the pause fence remains active.",
+        |context: &AppContext, input: pause::PauseRecoveryInput| {
+            pause::pause_recovery(context, pause::PauseRecoveryPhase::CheckpointBase, &input)
+        },
+    );
+    router.add_typed_tool_with_output_schema(
+        "pause_recovery_checkpoint_head",
+        "Independently rediscover and checkpoint the exact reviewed one-commit replacement head/tree after the base checkpoint; the fence remains active.",
+        |context: &AppContext, input: pause::PauseRecoveryInput| {
+            pause::pause_recovery(context, pause::PauseRecoveryPhase::CheckpointHead, &input)
+        },
+    );
+    router.add_typed_tool_with_output_schema(
+        "pause_recovery_finalize",
+        "Verify exact final base/head, one-commit tree, virtual merge parents/tree, complete check attribution, and topology before crash-safe pause release.",
+        |context: &AppContext, input: pause::PauseRecoveryInput| {
+            pause::pause_recovery(context, pause::PauseRecoveryPhase::Finalize, &input)
+        },
+    );
+    router.add_typed_tool_with_output_schema(
+        "pause_recovery_rollback",
+        "Release only after independent rediscovery proves reverse-lease restoration to the exact old base/head/topology; provider_mutated is always false.",
+        |context: &AppContext, input: pause::PauseRecoveryInput| {
+            pause::pause_recovery(context, pause::PauseRecoveryPhase::Rollback, &input)
+        },
     );
     router.add_typed_tool_with_output_schema(
         "sync",
@@ -2141,6 +2187,11 @@ mod tests {
             "force_intent_preview",
             "force_intent_apply",
             "force_intent_revoke",
+            "pause_recovery_prepare",
+            "pause_recovery_checkpoint_base",
+            "pause_recovery_checkpoint_head",
+            "pause_recovery_finalize",
+            "pause_recovery_rollback",
             "next",
             "prev",
             "plan_sync",

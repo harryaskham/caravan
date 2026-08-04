@@ -675,6 +675,16 @@ pub struct SyntheticMergeCandidate {
     pub parents: Vec<CommitOid>,
 }
 
+/// Exact immutable Git commit identity independently read from the provider.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GitCommitIdentity {
+    pub oid: CommitOid,
+    pub tree_oid: CommitOid,
+    /// Provider order is preserved.
+    #[serde(default)]
+    pub parents: Vec<CommitOid>,
+}
+
 /// Provider-native auto-merge ownership, including the actor omitted by the
 /// older graph-only auto-merge projection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

@@ -304,6 +304,11 @@ pub enum WebAction {
     Evict(EvictInput),
     Pause(PauseInput),
     Resume(ResumeInput),
+    PauseRecoveryPrepare(crate::pause::PauseRecoveryInput),
+    PauseRecoveryCheckpointBase(crate::pause::PauseRecoveryInput),
+    PauseRecoveryCheckpointHead(crate::pause::PauseRecoveryInput),
+    PauseRecoveryFinalize(crate::pause::PauseRecoveryInput),
+    PauseRecoveryRollback(crate::pause::PauseRecoveryInput),
     RepairStart(RepairStartInput),
     RepairContinue(RepairContinueInput),
     RepairStatus(RepairStatusInput),
@@ -332,6 +337,11 @@ impl WebAction {
             Self::Evict(_) => "evict",
             Self::Pause(_) => "pause",
             Self::Resume(_) => "resume",
+            Self::PauseRecoveryPrepare(_) => "pause_recovery_prepare",
+            Self::PauseRecoveryCheckpointBase(_) => "pause_recovery_checkpoint_base",
+            Self::PauseRecoveryCheckpointHead(_) => "pause_recovery_checkpoint_head",
+            Self::PauseRecoveryFinalize(_) => "pause_recovery_finalize",
+            Self::PauseRecoveryRollback(_) => "pause_recovery_rollback",
             Self::RepairStart(_) => "repair_start",
             Self::RepairContinue(_) => "repair_continue",
             Self::RepairStatus(_) => "repair_status",
@@ -2128,6 +2138,35 @@ fn run_action(context: &AppContext, action: WebAction) -> Result<serde_json::Val
         WebAction::Evict(input) => serialize_action(crate::reshape::evict(context, &input)),
         WebAction::Pause(input) => serialize_action(crate::pause::pause(context, &input)),
         WebAction::Resume(input) => serialize_action(crate::pause::resume(context, &input)),
+        WebAction::PauseRecoveryPrepare(input) => serialize_action(crate::pause::pause_recovery(
+            context,
+            crate::pause::PauseRecoveryPhase::Prepare,
+            &input,
+        )),
+        WebAction::PauseRecoveryCheckpointBase(input) => {
+            serialize_action(crate::pause::pause_recovery(
+                context,
+                crate::pause::PauseRecoveryPhase::CheckpointBase,
+                &input,
+            ))
+        }
+        WebAction::PauseRecoveryCheckpointHead(input) => {
+            serialize_action(crate::pause::pause_recovery(
+                context,
+                crate::pause::PauseRecoveryPhase::CheckpointHead,
+                &input,
+            ))
+        }
+        WebAction::PauseRecoveryFinalize(input) => serialize_action(crate::pause::pause_recovery(
+            context,
+            crate::pause::PauseRecoveryPhase::Finalize,
+            &input,
+        )),
+        WebAction::PauseRecoveryRollback(input) => serialize_action(crate::pause::pause_recovery(
+            context,
+            crate::pause::PauseRecoveryPhase::Rollback,
+            &input,
+        )),
         WebAction::RepairStart(input) => serialize_action(crate::repair::start(context, &input)),
         WebAction::RepairContinue(input) => {
             serialize_action(crate::repair::continue_session(context, &input))

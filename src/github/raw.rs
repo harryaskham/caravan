@@ -285,12 +285,18 @@ impl From<HeadWorkflowRunJson> for crate::required_runs::WorkflowRunLineage {
 
 #[derive(Debug, Deserialize)]
 pub(super) struct CommitDetailJson {
+    #[serde(default)]
+    pub(super) sha: String,
     pub(super) commit: CommitMetadataJson,
+    #[serde(default)]
+    pub(super) parents: Vec<GitObjectJson>,
 }
 
 #[derive(Debug, Deserialize)]
 pub(super) struct CommitMetadataJson {
     pub(super) committer: CommitActorJson,
+    #[serde(default)]
+    pub(super) tree: Option<GitObjectJson>,
 }
 
 #[derive(Debug, Deserialize)]

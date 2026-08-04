@@ -112,6 +112,9 @@ enum Command {
     Pause(PauseInput),
     /// Explicitly revalidate and resume one paused caravan.
     Resume(ResumeInput),
+    /// Exact-owner checkpoint/finalize/rollback for an already-paused caravan.
+    #[command(subcommand)]
+    PauseRecovery(Box<PauseRecoveryCommand>),
     /// Idempotently synchronize one or all caravans until a decision point.
     ///
     /// Pass `--dry-run` to preview the exact tick without any provider
@@ -210,6 +213,42 @@ struct ForceCommand {
 enum ForceSubcommand {
     /// Revoke current durable PR-scoped force intent.
     Revoke(caravan::force::ForceIntentInput),
+}
+
+#[derive(Debug, Subcommand)]
+enum PauseRecoveryCommand {
+    /// Bind one exact external owner generation before provider mutation.
+    Prepare(caravan::pause::PauseRecoveryInput),
+    /// Verify and checkpoint the exact desired base with the old head.
+    CheckpointBase(caravan::pause::PauseRecoveryInput),
+    /// Verify and checkpoint the exact replacement one-commit head and tree.
+    CheckpointHead(caravan::pause::PauseRecoveryInput),
+    /// Verify virtual merge/check attribution, advance evidence, and release.
+    Finalize(caravan::pause::PauseRecoveryInput),
+    /// Verify reverse-lease restoration to the exact old state and release.
+    Rollback(caravan::pause::PauseRecoveryInput),
+}
+
+impl PauseRecoveryCommand {
+    const fn phase(&self) -> caravan::pause::PauseRecoveryPhase {
+        match self {
+            Self::Prepare(_) => caravan::pause::PauseRecoveryPhase::Prepare,
+            Self::CheckpointBase(_) => caravan::pause::PauseRecoveryPhase::CheckpointBase,
+            Self::CheckpointHead(_) => caravan::pause::PauseRecoveryPhase::CheckpointHead,
+            Self::Finalize(_) => caravan::pause::PauseRecoveryPhase::Finalize,
+            Self::Rollback(_) => caravan::pause::PauseRecoveryPhase::Rollback,
+        }
+    }
+
+    const fn input(&self) -> &caravan::pause::PauseRecoveryInput {
+        match self {
+            Self::Prepare(input)
+            | Self::CheckpointBase(input)
+            | Self::CheckpointHead(input)
+            | Self::Finalize(input)
+            | Self::Rollback(input) => input,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -409,6 +448,7 @@ fn run(cli: &Cli) -> Result<(), i32> {
         Command::ForceIntent(command) => run_reviewed_force_intent(cli, command),
         Command::Pause(input) => run_pause(cli, input),
         Command::Resume(input) => run_resume(cli, input),
+        Command::PauseRecovery(command) => run_pause_recovery(cli, command),
         Command::Sync(input) => run_sync(cli, input),
         Command::Plan(command) => run_plan(cli, command),
         Command::Concat(input) => run_concat(cli, input),
@@ -1708,6 +1748,24 @@ fn run_resume(cli: &Cli, input: &ResumeInput) -> Result<(), i32> {
                     "already resumed"
                 },
                 output.next
+            );
+            Ok(())
+        }
+        Err(error) => emit_human_error(error),
+    }
+}
+
+fn run_pause_recovery(cli: &Cli, command: &PauseRecoveryCommand) -> Result<(), i32> {
+    let context = load_context(cli)?;
+    let result = caravan::pause::pause_recovery(&context, command.phase(), command.input());
+    if cli.json {
+        return emit_result(true, result);
+    }
+    match result {
+        Ok(output) => {
+            println!(
+                "pause-recovery {:?}: {:?}, fence {:?} — {}",
+                output.phase, output.status, output.fence_state, output.next_action
             );
             Ok(())
         }

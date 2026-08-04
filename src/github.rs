@@ -770,6 +770,41 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
         Ok(CommitOid(reference.object.sha))
     }
 
+    /// Exact immutable commit/tree/parent identity from provider Git storage.
+    pub fn commit_identity(
+        &self,
+        repository: &RepositoryId,
+        expected_oid: &CommitOid,
+    ) -> Result<model::GitCommitIdentity, MutationError> {
+        let detail: CommitDetailJson =
+            self.json(commit_command(repository, expected_oid.0.as_str()))?;
+        let actual_oid = if detail.sha.is_empty() {
+            expected_oid.clone()
+        } else {
+            CommitOid(detail.sha)
+        };
+        if actual_oid != *expected_oid {
+            return Err(MutationError::MissingProviderResource {
+                resource: format!("commit identity {expected_oid} resolved as {actual_oid}"),
+            });
+        }
+        let tree = detail
+            .commit
+            .tree
+            .ok_or_else(|| MutationError::MissingProviderResource {
+                resource: format!("commit {expected_oid} tree identity"),
+            })?;
+        Ok(model::GitCommitIdentity {
+            oid: actual_oid,
+            tree_oid: CommitOid(tree.sha),
+            parents: detail
+                .parents
+                .into_iter()
+                .map(|parent| CommitOid(parent.sha))
+                .collect(),
+        })
+    }
+
     /// Exact provider merge commit for one merged pull request, when exposed.
     pub fn merge_commit_oid(
         &self,

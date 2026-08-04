@@ -991,8 +991,36 @@ the status warning: no background loop can resume a hold. Resume is an explicit
 audited action and fails closed if the head, base, labels, topology, compatibility,
 or safe terminal check state no longer matches. When provider truth shows the exact
 recorded head merged or closed, the hold is retired: it stays as history, never as an
-active card, and never as an auto-merge repair request. See `SPEC.md` for recovery and
-retry semantics.
+active card, and never as an auto-merge repair request.
+
+An audited external owner that must change one paused PR's base and reviewed
+one-commit head uses the separate versioned phase machine:
+
+```sh
+cara pause-recovery prepare --help
+# Repeat the exact v1 identity on each call:
+cara --json pause-recovery prepare          ...
+cara --json pause-recovery checkpoint-base  ...
+cara --json pause-recovery checkpoint-head  ...
+cara --json pause-recovery finalize         ...
+# Or, only after reverse-lease restoration to the exact old state:
+cara --json pause-recovery rollback         ...
+```
+
+Every phase repeats the exact operation/idempotency/actor/owner generation,
+repository slug (`--repository-slug`, distinct from global checkout path
+`--repository`), pause and Caravan identity, target, old and desired base/head,
+replacement tree, and reason. Finalize additionally requires virtual-merge
+parents/tree and the replacement head's exact `CheckRun`/`StatusContext` counts.
+Cara performs no provider mutation in this surface; `provider_mutated` is always
+false. It independently rediscovers each checkpoint, keeps `recovering` and
+`recovery_drift` pauses effective against concurrent sync, blocks ordinary
+`resume`, and releases only after verified finalize or exact old-state rollback.
+Exact terminal retries return the original durable receipt. The five matching
+MCP tools are `pause_recovery_prepare`, `pause_recovery_checkpoint_base`,
+`pause_recovery_checkpoint_head`, `pause_recovery_finalize`, and
+`pause_recovery_rollback`; results are flat fields under the standard JSON/MCP
+`data` envelope. See `SPEC.md` for the complete contract.
 
 ```sh
 cara loop --once --json     # one bounded sync --all tick for agents/schedulers

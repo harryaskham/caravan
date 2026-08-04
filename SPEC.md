@@ -512,6 +512,7 @@ Splitting retargets the selected non-head to the default branch, making it a new
 - `cara repair abort --session ID --confirm` — after explicit review, remove only the local persisted workspace/session; provider state is never changed.
 - `cara pause --head-pr N --actor A --reason R` — place an explicit incident or maintenance hold on one exact caravan and disable only its head auto-merge.
 - `cara resume --head-pr N --actor A` — explicitly revalidate and release that hold.
+- `cara --json pause-recovery prepare|checkpoint-base|checkpoint-head|finalize|rollback ...` — bind one exact external owner generation to an already-active pause; checkpoint independently rediscovered external base/head writes; then release only after exact final virtual-merge/check attestation or exact old-state rollback. This surface never mutates the provider.
 - `cara loop` — repeatedly run `sync --all` at the configured interval. A failed tick is bounded evidence, not a stop condition: canonical events are dispatched to configured hooks and the loop keeps ticking so retryable provider races, moved default branches, and unresolved external decisions converge without an operator restart. Only an explicit stop signal ends it, and the summary reports total, failed, and consecutive-failure counts plus bounded recent-failure receipts. `loop --once` remains a single bounded tick and still returns its typed error.
 - `cara loop --manual [--shell COMMAND]` — CLI-only human controller. At an exact `external_decision`, persist private bounded decision JSON, release the operation lock, inherit the controlling TTY in a safe affected/repair workspace, and run `$SHELL -i` or the explicit command. Zero exit triggers fresh rediscovery and another exact tick; nonzero stops with evidence. Refuse JSON/MCP/non-TTY use.
 
@@ -524,6 +525,47 @@ A pause stores bounded, non-secret evidence below Git's shared common metadata d
 Status classifies a matching hold as `active` or `expired` and suspends only the exact missing-head-auto-merge problem. Expiry is an alert, never authority to resume. Cycles, branching, closure, changed heads/bases/labels, incompatible links, and non-head auto-merge remain graph failures; stale hold evidence is reported and fails closed. Provider truth outranks every durable local record: once the exact recorded head is merged or closed, the hold becomes `retired` historical evidence that can never be resumed, never suspends an invariant, never presents as an active caravan, and never requests auto-merge repair on an unmergeable pull request. A checkpoint is recovery evidence, not mutation authority, so oversized checkpoint evidence after a completed provider merge is persisted as a bounded digest with counts, keys, and an exact original hash rather than failing the operation. `sync --all` emits a no-op skip receipt for held caravans and continues independent caravans. A targeted sync returns the same bounded no-op continuation.
 
 Resume is operator/agent initiated only. Before enabling squash auto-merge it revalidates the exact head, base, labels, open state, membership topology, compatibility, and safe terminal checks. An authorization marker makes interrupted resume retries idempotent without treating an external re-enable as valid. Every pause/resume authorization is appended to a secret-free local audit record. No loop, expiry timer, status call, or sync call may remove a hold or enable its head.
+
+Exact-owner paused-generation recovery is a separate authority; ordinary resume
+must refuse while it exists. Its version-1 input repeats on every phase:
+`operation_id`, external reference, idempotency key, actor, owner project/agent/
+generation, repository, Caravan ID and ordered members, pause ID/generation,
+target PR, exact old base ref/OID and head OID, desired base ref/OID and
+replacement head OID/tree, and reason. CLI uses `--repository-slug owner/name`
+because global `--repository PATH` selects the checkout; JSON/MCP retain the
+`repository` property. Finalize additionally supplies virtual-merge parents/tree
+and non-null check attribution `{head_oid, check_run_count,
+status_context_count}`. Every provider check row must be independently
+classified as exactly `CheckRun` or `StatusContext`; unknown attribution fails
+closed.
+
+`prepare` verifies the active pause's actor/external reference/head/members and
+the target's exact old provider state before binding the external owner.
+Idempotent prepare is also status discovery: it returns the already durable
+checkpoint and active fence without a provider write. `checkpoint-base` accepts
+only desired base plus old head. `checkpoint-head` requires the base checkpoint,
+desired base/head, the supplied head tree, and exactly one parent equal to the
+desired base OID. All transitional or drifted states remain effective pauses, so
+concurrent sync cannot select the Caravan; drift never converts the record into
+permission.
+
+`finalize` requires the head checkpoint and independently rediscovers the exact
+open target, unchanged ordered Caravan membership, replacement commit/tree/
+parent, fresh synthetic merge ref with parents `[desired_base_oid,
+desired_head_oid]`, virtual tree, and complete attributed check counts. Only
+then does Cara advance the pause's expected head/topology evidence, persist a
+terminal receipt, and release the pause. `rollback` releases only after provider
+state and topology exactly equal the original old state. Receipt publication
+precedes release, so a crash remains fenced; a timeout after receipt publication
+is reconciled by exact idempotent replay. Same-key foreign bindings conflict.
+All responses are flat under standard envelope `data`, include repeated owner/
+topology identity plus `phase`, `status`, `provider_mutated=false`,
+`operation_changed`, `receipt_id`, `next_action`, canonical `fence_state` and
+`rollback_state`, and include virtual merge/check fields after finalization.
+The standard MCP names are `pause_recovery_prepare`,
+`pause_recovery_checkpoint_base`, `pause_recovery_checkpoint_head`,
+`pause_recovery_finalize`, and `pause_recovery_rollback`; the typed web action
+API exposes the same five operations. No provisional aliases exist.
 
 ### Ecosystem surfaces
 

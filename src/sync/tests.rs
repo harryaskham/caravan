@@ -4157,6 +4157,7 @@ fn sync_all_skips_paused_caravan_and_progresses_independent_caravan() {
         expires_unix_secs: None,
         external_reference: Some("INC-1".to_owned()),
         resume_authorized_by: None,
+        recovery: None,
     };
     status.pauses.push(crate::pause::PauseStatus {
         record,
@@ -4184,6 +4185,52 @@ fn sync_all_skips_paused_caravan_and_progresses_independent_caravan() {
             .iter()
             .any(|step| step.summary.contains("intentionally paused"))
     );
+}
+
+#[test]
+fn concurrent_sync_keeps_recovering_and_drifted_caravans_fenced() {
+    let mut pulls = healthy_chain();
+    pulls[2].base = branch("main");
+    let mut status = status(pulls, Some(PrNumber(1)), &clean);
+    let head = status.analysis.pull_requests[&PrNumber(1)].clone();
+    let pause = crate::pause::PauseStatus {
+        record: crate::pause::PauseRecord {
+            version: 1,
+            caravan_head: PrNumber(1),
+            members: vec![PrNumber(1), PrNumber(2)],
+            expected_head: PullRequestPrecondition::from(&head),
+            expected_checks: head.checks,
+            actor: "oncall".to_owned(),
+            reason: "exact-owner recovery".to_owned(),
+            paused_unix_secs: 1,
+            expires_unix_secs: None,
+            external_reference: Some("INC-1".to_owned()),
+            resume_authorized_by: None,
+            recovery: None,
+        },
+        state: crate::pause::PauseState::Recovering,
+        auto_merge_suspended: true,
+        retired_state: None,
+        safe_next_action: "checkpoint only".to_owned(),
+    };
+
+    for state in [
+        crate::pause::PauseState::Recovering,
+        crate::pause::PauseState::RecoveryDrift,
+    ] {
+        let mut held = pause.clone();
+        held.state = state;
+        status.pauses = vec![held];
+        let selected = selected_unpaused_caravans(&status, true).unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|caravan| caravan.id)
+                .collect::<Vec<_>>(),
+            vec![PrNumber(3)],
+            "{state:?} must exclude the exact paused caravan before provider execution"
+        );
+    }
 }
 
 #[test]
