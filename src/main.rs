@@ -3471,42 +3471,64 @@ mod tests {
         let ready = directory.path().join("descendant-ready");
         let stdout = std::fs::File::create(directory.path().join("stdout")).unwrap();
         let stderr = std::fs::File::create(directory.path().join("stderr")).unwrap();
-        // The descendant itself creates the synchronization marker only after
-        // it exists and has installed TERM resistance. This is causal readiness,
-        // not a scheduler-timing sleep.
-        let script = format!(
-            "(trap '' TERM; : > '{}'; while :; do sleep 1; done) & wait",
-            ready.display()
-        );
+        // The descendant itself writes its exact PID and inherited process group
+        // only after installing TERM resistance. The fixture parent merely waits,
+        // so readiness proves the process we later assert was actually running.
+        let fixture = r#"import os, signal, sys, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+with open(sys.argv[1], "w") as ready:
+    ready.write(f"{os.getpid()} {os.getpgrp()}\n")
+    ready.flush()
+    os.fsync(ready.fileno())
+while True:
+    time.sleep(1)
+"#;
         let mut command = ProcessCommand::new("sh");
         command
-            .args(["-c", script.as_str()])
+            .args([
+                "-c",
+                "python3 -c \"$CARA_WATCHDOG_FIXTURE\" \"$CARA_WATCHDOG_READY\" & wait",
+            ])
+            .env("CARA_WATCHDOG_FIXTURE", fixture)
+            .env("CARA_WATCHDOG_READY", &ready)
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
         command.process_group(0);
         let mut child = command.spawn().expect("spawn watchdog fixture");
         let ready_deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while !ready.exists() && std::time::Instant::now() < ready_deadline {
+        let (descendant_pid, descendant_group) = loop {
+            if let Ok(contents) = std::fs::read_to_string(&ready) {
+                let mut fields = contents.split_whitespace();
+                if let (Some(pid), Some(group)) = (fields.next(), fields.next()) {
+                    if let (Ok(pid), Ok(group)) = (pid.parse::<u32>(), group.parse::<u32>()) {
+                        break (pid, group);
+                    }
+                }
+            }
+            assert!(
+                std::time::Instant::now() < ready_deadline,
+                "descendant never completed the PID/process-group handshake"
+            );
             std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            ready.exists(),
-            "descendant never signalled causal readiness"
-        );
-        let descendants = descendant_pids(child.id());
-        assert!(!descendants.is_empty());
-        let started = std::time::Instant::now();
-        terminate_status_tree(&mut child);
-        assert!(started.elapsed() < Duration::from_secs(2));
-        for pid in descendants {
-            let alive = ProcessCommand::new("kill")
+        };
+        assert_ne!(descendant_pid, child.id());
+        assert_eq!(descendant_group, child.id());
+        let process_is_alive = |pid: u32| {
+            ProcessCommand::new("kill")
                 .args(["-0", &pid.to_string()])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()
-                .is_ok_and(|status| status.success());
-            assert!(!alive, "descendant {pid} survived the watchdog reap");
-        }
+                .is_ok_and(|status| status.success())
+        };
+        assert!(process_is_alive(descendant_pid));
+        let started = std::time::Instant::now();
+        terminate_status_tree(&mut child);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            !process_is_alive(descendant_pid),
+            "descendant {descendant_pid} in group {descendant_group} survived the watchdog reap"
+        );
     }
 
     #[test]
