@@ -736,12 +736,13 @@ to an agent. Hooks stay `blocking: false` so a delivery failure can never roll
 back completed provider work.
 
 When enabling cumulative mode, set `sync.max_duration_secs` high enough for
-physical planning plus the typed apply reserve. Capacity projections retain
-that configured horizon, while one live `sync` process uses an internal maximum
-of 285 seconds so a five-minute parent scheduler can always collect typed
-progress/error evidence rather than killing the shell first. Before physical
-planning or whole-member CI analysis, a Cara-owned tick evaluates already-
-admitted exact-green roots and lands at most one; successful root landing
+physical planning plus the typed apply reserve. The validated repository value
+is the one deadline for discovery, root-first evaluation, planning, mutation,
+reconciliation, serialization, and hooks; there is no hidden deployment-specific
+binary ceiling. Configured hook timeouts may shorten their child lifetime but
+can never extend the remaining sync deadline. Before physical planning or
+whole-member CI analysis, a Cara-owned tick evaluates already-admitted exact-
+green roots and lands at most one; successful root landing
 returns `retry_tick` immediately and defers unrelated inventory to the next
 GitHub-cursor tick. `cara status` reports the required and retained reserve, the
 processable prefix, the deferred members, the maximum admissible chain size,

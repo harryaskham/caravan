@@ -72,11 +72,6 @@ pub use plan::plan_sync;
 use plan::{plan_auto_admission_with_checker, plan_caravan_convergence};
 
 const MAX_SYNC_OPERATION_SECS: u64 = 3_600;
-/// Production automation kills a sync tick after five minutes. Keep Cara's
-/// internal mutation/read deadline inside that parent by a fixed evidence and
-/// serialization margin; a configured larger planning horizon remains visible
-/// to capacity projections but never governs one live `sync` process.
-const MAX_SYNC_EXECUTION_SECS: u64 = 285;
 const MAX_PARALLEL_REBASE_CHAINS: usize = 2;
 const PARKED_LABEL: &str = "caravan-parked";
 /// Exact remote range/target verification plus one force-with-lease push.
@@ -1353,11 +1348,12 @@ fn sync_with_optional_writer_guard(
     writer_guard: Option<WriterOperationGuard>,
 ) -> Result<SyncOutput, AppError> {
     let started = Instant::now();
-    let budget = sync_execution_budget(context);
+    let budget = sync_operation_budget(context);
     let operation_deadline = started + budget;
     match sync_without_hooks(context, input, started, operation_deadline, writer_guard) {
         Ok(mut output) => {
-            output.hook_deliveries = hooks::dispatch_events(context, &output.events)?;
+            output.hook_deliveries =
+                hooks::dispatch_events_before(context, &output.events, operation_deadline)?;
             Ok(output)
         }
         Err(error) => {
@@ -1375,7 +1371,7 @@ fn sync_with_optional_writer_guard(
                     events.push(event);
                 }
             }
-            let deliveries = hooks::dispatch_events(context, &events)?;
+            let deliveries = hooks::dispatch_events_before(context, &events, operation_deadline)?;
             Err(hooks::attach_deliveries(error, &deliveries))
         }
     }
@@ -1389,10 +1385,6 @@ fn sync_operation_budget(context: &AppContext) -> Duration {
             .max_duration_secs
             .min(MAX_SYNC_OPERATION_SECS),
     )
-}
-
-fn sync_execution_budget(context: &AppContext) -> Duration {
-    sync_operation_budget(context).min(Duration::from_secs(MAX_SYNC_EXECUTION_SECS))
 }
 
 #[derive(Default)]

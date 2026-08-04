@@ -578,7 +578,7 @@ distinguishable from a healthy one.
 A sync tick:
 
 1. Acquire the local repository operation lock.
-2. Discover and validate the fresh GitHub graph under an internal live-process deadline capped at 285 seconds, leaving the five-minute parent scheduler time to collect typed output and events even when `sync.max_duration_secs` is a larger planning horizon.
+2. Discover and validate the fresh GitHub graph under the repository's typed, validated `sync.max_duration_secs`. That same deadline governs root-first evaluation, planning, mutation, reconciliation, event serialization, and hook children; hook-specific timeouts may shorten but never extend it.
 3. Before parking, physical planning, or whole-member CI analysis, evaluate already-admitted exact-green roots under `head_merge_actor: caravan`. Land at most one proven root and return a typed `retry_tick` receipt immediately; unrelated inventory and the tail continue on the next GitHub-cursor tick.
 4. Reconcile merged heads: promote the child to the exact default branch in one fenced transaction. No history rewrite is required.
 5. Walk head → tail.

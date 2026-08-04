@@ -3511,16 +3511,24 @@ fn sync_lock_checkpoint_stays_bounded_for_large_fleet_receipts() {
 fn whole_sync_budget_uses_the_explicit_validated_wall_clock_bound() {
     let mut context = AppContext::default();
     assert_eq!(sync_operation_budget(&context), Duration::from_secs(120));
-    assert_eq!(sync_execution_budget(&context), Duration::from_secs(120));
     context.config.sync.max_duration_secs = 10;
     assert_eq!(sync_operation_budget(&context), Duration::from_secs(10));
-    assert_eq!(sync_execution_budget(&context), Duration::from_secs(10));
     context.config.sync.max_duration_secs = 3_600;
     assert_eq!(sync_operation_budget(&context), Duration::from_secs(3_600));
-    assert_eq!(
-        sync_execution_budget(&context),
-        Duration::from_secs(MAX_SYNC_EXECUTION_SECS)
-    );
+    context.config.sync.max_duration_secs = 480;
+    assert_eq!(sync_operation_budget(&context), Duration::from_secs(480));
+}
+
+#[test]
+fn production_deadline_ordering_keeps_tick_inside_parent_and_schedule() {
+    let mut context = AppContext::default();
+    context.config.sync.max_duration_secs = 480;
+    let parent_timeout = Duration::from_secs(540);
+    let schedule_interval = Duration::from_secs(600);
+
+    assert_eq!(sync_operation_budget(&context), Duration::from_secs(480));
+    assert!(sync_operation_budget(&context) < parent_timeout);
+    assert!(parent_timeout < schedule_interval);
 }
 
 #[test]

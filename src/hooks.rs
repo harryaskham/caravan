@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mcp_cli::{ErrorCategory, StructuredError};
 use schemars::JsonSchema;
@@ -226,6 +226,22 @@ pub fn dispatch_events(
     context: &AppContext,
     events: &[CaravanEvent],
 ) -> Result<Vec<HookDelivery>, AppError> {
+    dispatch_events_with_deadline(context, events, None)
+}
+
+pub(crate) fn dispatch_events_before(
+    context: &AppContext,
+    events: &[CaravanEvent],
+    operation_deadline: Instant,
+) -> Result<Vec<HookDelivery>, AppError> {
+    dispatch_events_with_deadline(context, events, Some(operation_deadline))
+}
+
+fn dispatch_events_with_deadline(
+    context: &AppContext,
+    events: &[CaravanEvent],
+    operation_deadline: Option<Instant>,
+) -> Result<Vec<HookDelivery>, AppError> {
     let mut deliveries = Vec::new();
     let mut journaled = BTreeSet::new();
     for event in events {
@@ -235,7 +251,7 @@ pub fn dispatch_events(
         let Some(hook) = context.config.hook(event.kind) else {
             continue;
         };
-        let delivery = dispatch_event(&context.repository_path, hook, event)?;
+        let delivery = dispatch_event(&context.repository_path, hook, event, operation_deadline)?;
         crate::journal::append_delivery(context, event, &delivery)?;
         let failed = delivery.state != HookDeliveryState::Succeeded;
         deliveries.push(delivery.clone());
@@ -250,6 +266,7 @@ fn dispatch_event(
     repository: &Path,
     hook: &HookConfig,
     event: &CaravanEvent,
+    operation_deadline: Option<Instant>,
 ) -> Result<HookDelivery, AppError> {
     validate_event(event)?;
     let payload = serde_json::to_string(event).map_err(|error| {
@@ -294,8 +311,11 @@ fn dispatch_event(
                 .join(","),
         )
         .stdin(format!("{payload}\n"));
-    let runner = ProcessRunner::in_directory(repository)
+    let mut runner = ProcessRunner::in_directory(repository)
         .with_timeout(Duration::from_secs(hook.timeout_secs));
+    if let Some(deadline) = operation_deadline {
+        runner = runner.with_operation_deadline(deadline);
+    }
     let result = runner.run(&request);
     let delivery = match result {
         Ok(output) if output.is_success() => HookDelivery::succeeded(event, hook, &output),
@@ -559,6 +579,30 @@ mod tests {
             fs::read_to_string(context_path).unwrap(),
             "sync_failed|harryaskham/caravan|7|7,8"
         );
+    }
+
+    #[test]
+    fn operation_deadline_caps_hook_timeout() {
+        let repository = tempfile::tempdir().unwrap();
+        let context = context(
+            repository.path(),
+            HookConfig {
+                command: "sleep 5".to_owned(),
+                timeout_secs: 5,
+                blocking: false,
+            },
+        );
+        let started = Instant::now();
+
+        let deliveries = dispatch_events_before(
+            &context,
+            &[event(EventKind::SyncFailed)],
+            started + Duration::from_millis(100),
+        )
+        .unwrap();
+
+        assert_eq!(deliveries[0].state, HookDeliveryState::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]
