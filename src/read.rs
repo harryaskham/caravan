@@ -1039,7 +1039,7 @@ const STATUS_READ_BUDGET: Duration = Duration::from_secs(35);
 const STATUS_COMPLETION_RESERVE: Duration = Duration::from_secs(2);
 /// Outer CLI subprocess bound. This is independent of the executor's own
 /// deadline and leaves Cacophony's 60-second adapter time to collect JSON.
-pub const STATUS_COMMAND_WATCHDOG: Duration = Duration::from_secs(45);
+pub const STATUS_COMMAND_WATCHDOG: Duration = Duration::from_secs(40);
 /// Compatibility is local but can be quadratic in caravan count. Keep a second
 /// in-operation reserve for provider-backed stack projection and final status
 /// assembly instead of letting the final merge-tree consume the whole window.
@@ -4608,7 +4608,7 @@ mod tests {
         assert!(!recovered.output.healthy);
         assert_eq!(partial.exhausted_phase, "command_boundary_watchdog");
         assert_eq!(partial.elapsed_ms, 45_000);
-        assert_eq!(partial.deadline_ms, 45_000);
+        assert_eq!(partial.deadline_ms, 40_000);
         assert_eq!(partial.remaining_ms, 0);
         assert_eq!(partial.attempt_provider_api.calls, 11);
         assert!(!partial.mutated);

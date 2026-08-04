@@ -5,6 +5,7 @@ use std::fs;
 use std::io;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -13,7 +14,6 @@ use caravan::{
     AGENT_HELP, AppContext, AppError, CheckInput, CreateInput, EvictInput, JoinInput,
     LockRecoverInput, LockStatusInput, LoopInput, PauseInput, ResumeInput, SplitInput, SyncInput,
     TOOL_NAME, active_updater_config, build_router,
-    command::{CommandRunError, CommandRunner, CommandSpec, ProcessRunner},
     concat::{ConcatExecuteInput, ConcatInput},
     feedback_config, feedback_configuration_error, feedback_panic_config,
     repair::{
@@ -647,6 +647,84 @@ fn emit_status_result(
     }
 }
 
+fn descendant_pids(root: u32) -> Vec<u32> {
+    let Ok(output) = ProcessCommand::new("ps")
+        .args(["-eo", "pid=,ppid="])
+        .output()
+    else {
+        return Vec::new();
+    };
+    let rows = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            Some((
+                fields.next()?.parse::<u32>().ok()?,
+                fields.next()?.parse::<u32>().ok()?,
+            ))
+        })
+        .collect::<Vec<_>>();
+    let mut frontier = vec![root];
+    let mut descendants = Vec::new();
+    while let Some(parent) = frontier.pop() {
+        for (pid, ppid) in &rows {
+            if *ppid == parent && !descendants.contains(pid) {
+                descendants.push(*pid);
+                frontier.push(*pid);
+            }
+        }
+    }
+    descendants
+}
+
+#[cfg(unix)]
+fn signal_status_process(pid: u32, signal: &str) {
+    let _ = ProcessCommand::new("kill")
+        .args([signal, "--", &format!("-{pid}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = ProcessCommand::new("kill")
+        .args([signal, &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+fn terminate_status_tree(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let root = child.id();
+        let mut pids = descendant_pids(root);
+        pids.reverse();
+        for pid in &pids {
+            signal_status_process(*pid, "-TERM");
+        }
+        signal_status_process(root, "-TERM");
+        std::thread::sleep(Duration::from_millis(500));
+        let mut remaining = descendant_pids(root);
+        remaining.reverse();
+        for pid in &remaining {
+            signal_status_process(*pid, "-KILL");
+        }
+        signal_status_process(root, "-KILL");
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn bounded_status_file(path: &Path) -> String {
+    const LIMIT: u64 = 8 * 1024 * 1024;
+    if std::fs::metadata(path).is_ok_and(|metadata| metadata.len() <= LIMIT) {
+        std::fs::read_to_string(path).unwrap_or_default()
+    } else {
+        String::new()
+    }
+}
+
+// Keep spawn, file-backed capture, process-tree reap, checkpoint fallback, and
+// envelope rendering visible at one command-boundary safety transaction.
+#[allow(clippy::too_many_lines)]
 fn run_status(cli: &Cli) -> Result<(), i32> {
     let context = load_context(cli)?;
     if std::env::var_os("CARA_STATUS_WATCHDOG_WORKER").is_some() {
@@ -660,70 +738,103 @@ fn run_status(cli: &Cli) -> Result<(), i32> {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_millis())
     ));
+    let stdout_path = checkpoint.with_extension("stdout");
+    let stderr_path = checkpoint.with_extension("stderr");
     let executable = std::env::current_exe().map_err(|error| {
         eprintln!("cara: could not resolve status watchdog executable: {error}");
         1
     })?;
-    let request = CommandSpec::new(executable.display().to_string())
-        .args([
-            "--json".to_owned(),
-            "--config".to_owned(),
-            context.config_path.display().to_string(),
-            "status".to_owned(),
-        ])
+    let stdout_file = std::fs::File::create(&stdout_path).map_err(|error| {
+        eprintln!("cara: could not create bounded status stdout: {error}");
+        1
+    })?;
+    let stderr_file = std::fs::File::create(&stderr_path).map_err(|error| {
+        eprintln!("cara: could not create bounded status stderr: {error}");
+        1
+    })?;
+    let config_argument = context.config_path.display().to_string();
+    let mut command = ProcessCommand::new(executable);
+    command
+        .current_dir(&context.repository_path)
+        .args(["--json", "--config", config_argument.as_str(), "status"])
         .env("CARA_STATUS_WATCHDOG_WORKER", "1")
         .env(
             "CARA_STATUS_WATCHDOG_CHECKPOINT",
             checkpoint.display().to_string(),
-        );
-    let started = std::time::Instant::now();
-    let result = ProcessRunner::in_directory(&context.repository_path)
-        .with_timeout(caravan::read::STATUS_COMMAND_WATCHDOG)
-        .run(&request);
-    match result {
-        Ok(output) => {
-            let _ = std::fs::remove_file(&checkpoint);
-            if !output.is_success() {
-                print!("{}", output.stdout);
-                eprint!("{}", output.stderr);
-                return Err(output.code.unwrap_or(1));
-            }
-            if cli.json {
-                print!("{}", output.stdout);
-                eprint!("{}", output.stderr);
-                return Ok(());
-            }
-            let receipt = serde_json::from_str::<serde_json::Value>(&output.stdout)
-                .ok()
-                .and_then(|envelope| envelope.get("data").cloned())
-                .and_then(|data| serde_json::from_value(data).ok())
-                .ok_or_else(|| {
-                    eprintln!("cara: bounded status worker returned an invalid success envelope");
-                    1
-                })?;
-            emit_status_result(false, Ok(receipt))
-        }
-        Err(CommandRunError::Timeout { .. }) => {
-            let fallback =
-                caravan::read::status_watchdog_fallback(&context, &checkpoint, started.elapsed());
-            let _ = std::fs::remove_file(&checkpoint);
-            emit_status_result(cli.json, fallback)
-        }
-        Err(error) => {
-            let _ = std::fs::remove_file(&checkpoint);
-            emit_status_result(
-                cli.json,
-                Err(AppError::execution(
-                    "status_watchdog_failed",
-                    "could not execute the bounded read-only status worker",
-                    Some(serde_json::json!({
-                        "error": error.to_string(),
-                        "mutated": false,
-                    })),
-                )),
-            )
-        }
+        )
+        // Files, not pipes: an escaped descendant cannot keep the parent
+        // blocked waiting for EOF after the worker has been reaped.
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
     }
+    let mut child = command.spawn().map_err(|error| {
+        eprintln!("cara: could not start bounded status worker: {error}");
+        1
+    })?;
+    let started = std::time::Instant::now();
+    let deadline = started + caravan::read::STATUS_COMMAND_WATCHDOG;
+    let (status, timed_out) = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break (Some(status), false),
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                terminate_status_tree(&mut child);
+                break (None, true);
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(error) => {
+                terminate_status_tree(&mut child);
+                let _ = std::fs::remove_file(&checkpoint);
+                let _ = std::fs::remove_file(&stdout_path);
+                let _ = std::fs::remove_file(&stderr_path);
+                return emit_status_result(
+                    cli.json,
+                    Err(AppError::execution(
+                        "status_watchdog_failed",
+                        "could not collect the bounded read-only status worker",
+                        Some(serde_json::json!({
+                            "error": error.to_string(),
+                            "mutated": false,
+                        })),
+                    )),
+                );
+            }
+        }
+    };
+    let stdout = bounded_status_file(&stdout_path);
+    let stderr = bounded_status_file(&stderr_path);
+    let _ = std::fs::remove_file(&stdout_path);
+    let _ = std::fs::remove_file(&stderr_path);
+    if timed_out {
+        let fallback =
+            caravan::read::status_watchdog_fallback(&context, &checkpoint, started.elapsed());
+        let _ = std::fs::remove_file(&checkpoint);
+        return emit_status_result(cli.json, fallback);
+    }
+    let _ = std::fs::remove_file(&checkpoint);
+    let status = status.expect("non-timeout worker has an exit status");
+    if !status.success() {
+        print!("{stdout}");
+        eprint!("{stderr}");
+        return Err(status.code().unwrap_or(1));
+    }
+    if cli.json {
+        print!("{stdout}");
+        eprint!("{stderr}");
+        return Ok(());
+    }
+    let receipt = serde_json::from_str::<serde_json::Value>(&stdout)
+        .ok()
+        .and_then(|envelope| envelope.get("data").cloned())
+        .and_then(|data| serde_json::from_value(data).ok())
+        .ok_or_else(|| {
+            eprintln!("cara: bounded status worker returned an invalid success envelope");
+            1
+        })?;
+    emit_status_result(false, Ok(receipt))
 }
 
 fn run_queue(cli: &Cli, input: &caravan::NextInput) -> Result<(), i32> {
@@ -3350,6 +3461,35 @@ where
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[cfg(unix)]
+    #[test]
+    fn status_watchdog_reaps_descendants_without_waiting_for_output_eof() {
+        use std::os::unix::process::CommandExt;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let marker = directory.path().join("escaped-marker");
+        let stdout = std::fs::File::create(directory.path().join("stdout")).unwrap();
+        let stderr = std::fs::File::create(directory.path().join("stderr")).unwrap();
+        let script = format!("(trap '' TERM; sleep 2; : > '{}') & wait", marker.display());
+        let mut command = ProcessCommand::new("sh");
+        command
+            .args(["-c", script.as_str()])
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr));
+        command.process_group(0);
+        let mut child = command.spawn().expect("spawn watchdog fixture");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!descendant_pids(child.id()).is_empty());
+        let started = std::time::Instant::now();
+        terminate_status_tree(&mut child);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        std::thread::sleep(Duration::from_secs(2));
+        assert!(
+            !marker.exists(),
+            "a descendant survived the watchdog and retained its output lifetime"
+        );
+    }
 
     #[test]
     fn feedback_report_preserves_the_receiver_dedupe_fingerprint() {

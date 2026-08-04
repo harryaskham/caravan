@@ -250,13 +250,15 @@ and `evidence_source: current_bounded_evidence`. A later provider timeout may
 instead use a valid historical snapshot with
 `evidence_source: historical_last_good`, its cursor and age. A policy change or
 snapshot older than 24 hours invalidates that historical fallback. The CLI
-also owns a 45-second outer subprocess watchdog independent of the analysis
+also owns a 40-second outer subprocess watchdog independent of the analysis
 executor. After provider discovery and label inventory, the worker atomically
-checkpoints current repository/caravan/candidate structure plus request counts;
-if the executor itself wedges instead of yielding, the parent kills its process
-group and returns that checkpoint as `status_partial` with phase
-`command_boundary_watchdog`. This stays inside Cacophony's 60-second collection
-window and cannot strand Git/provider descendants. With neither current bounded
+checkpoints current repository/caravan/candidate structure plus request counts.
+Worker output is redirected to parent-owned bounded files rather than pipes. If
+the executor itself wedges instead of yielding, the parent recursively signals
+and reaps descendant process groups plus the worker, then returns the checkpoint
+as `status_partial` with phase `command_boundary_watchdog`. This stays inside
+Cacophony's 60-second collection window and cannot block on output EOF retained
+by a descendant. With neither current bounded
 evidence nor a valid last-good snapshot, the typed
 `status_partial_unavailable` refusal names the phase and never recommends
 raising an already-maxed sync mutation deadline. Zero provider calls leave the

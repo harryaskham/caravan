@@ -903,11 +903,13 @@ branch counts, planned/completed proofs, bounded skipped/deferred proof names,
 phase timings, completion reserve, provider calls, explicit unknown fields, and
 whether evidence is `current_bounded_evidence` or `historical_last_good`. Zero
 provider calls omit the authentication verdict instead of diagnosing
-`authenticated: false`. A separate 45-second CLI watchdog launches status in a
+`authenticated: false`. A separate 40-second CLI watchdog launches status in a
 subprocess and atomically checkpoints provider/structural evidence before
-compatibility. If the executor itself wedges, the parent kills the process
-group and returns that checkpoint with phase `command_boundary_watchdog`, still
-inside Cacophony's 60-second adapter window. Other timeouts terminate and reap
+compatibility. Worker stdout/stderr go to parent-owned bounded files, never
+pipes whose EOF an orphan can retain. If the executor itself wedges, the parent
+recursively terminates descendant process groups, reaps the worker, and returns
+the checkpoint with phase `command_boundary_watchdog`, still inside Cacophony's
+60-second adapter window. Other timeouts terminate and reap
 the child process group and return stable `github_discovery_timeout` evidence
 with the exact phase, operation `elapsed_ms`/`deadline_ms`, retryability, bounded
 output, and a mutation-free safe next action.
