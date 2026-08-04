@@ -130,9 +130,13 @@ CORE MODEL AND INVARIANTS
   is the backward-compatible default. Explicit `park` preserves the complete
   caravan topology under a `caravan-parked` head label, disables head
   auto-merge, excludes it from active convergence/capacity/tail selection, and
-  allows independent green work to advance. Pending and superseded red never
-  park; new/nonterminal/green current evidence deterministically unparks at the
-  root's original FIFO age. Hooks are optional recovery, never queue liveness.
+  allows independent green work to advance. Its exact problems remain visible
+  for scheduler repair routing, but problems wholly owned by parked caravans do
+  not contaminate active-fleet health, candidate preflight, or cross-caravan
+  compatibility. Explicitly targeting a parked caravan names its head and the
+  responsible repair actor. Pending and superseded red never park;
+  new/nonterminal/green current evidence deterministically unparks at the root's
+  original FIFO age. Hooks are optional recovery, never queue liveness.
 - A successful tick names every `head_of_line` stall: the exact blocking PR, its
   one-based queue position, the members waiting behind it, the block class, and
   ordered repair/reshape/evict remedies. A stalled front is an external
@@ -192,9 +196,10 @@ the exact pinned binary. It performs strict parsing and no repository/provider a
    repository setting, protection, label, permission, or config mismatch.
 3. Inspect `cara next-candidate`. Use `cara check --pr N` to validate the exact
    remote PR without checkout or mutation. A targetless check recommends joining
-   the one visible unheld caravan when that attachment is clean, otherwise it
-   falls back to `new`; zero or multiple caravans retain `new` because a later
-   targetless join would be ambiguous. Add `--tail-pr T` (or `--head-pr H`) for
+   the one visible unheld, unparked caravan when that attachment is clean,
+   otherwise it falls back to `new`; zero or multiple active caravans retain
+   `new` because a later targetless join would be ambiguous. Add `--tail-pr T`
+   (or `--head-pr H`) for
    an exact join target. Follow the typed `new`, `join`, `repair`, `wait`, or
    `reject` action and its coherent target from the returned receipt.
 4. Use `cara new --pr N`, `renew --pr N`, `join --pr N`, or `rejoin --pr N`

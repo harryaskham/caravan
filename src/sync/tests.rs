@@ -2084,6 +2084,229 @@ fn terminal_red_park_policy_frees_capacity_for_independent_green_candidate() {
     assert!(repeated.events.is_empty());
 }
 
+/// bd-bb3a4d recurrence fixture from cacophony #2384/#2385 and clean
+/// candidate #2415. Parking correctly removed the red caravan from sync
+/// capacity, but `check` still imported its mechanical problems and tested it
+/// as the candidate's only join/new compatibility target. The clean candidate
+/// therefore returned `next_action=repair` even though the exact repair work
+/// belonged to the parked root.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn parked_repair_is_routed_without_poisoning_independent_admission() {
+    let mut parked_root = pull_request(
+        2384,
+        "parked-root",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    parked_root.labels.insert("caravan-parked".to_owned());
+    parked_root.checks = vec![check("Check & Lint", CheckState::Failure, Some(10))];
+    let parked_child = pull_request(
+        2385,
+        "parked-child",
+        "parked-root",
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    let mut candidate = pull_request(
+        2415,
+        "clean-candidate",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    candidate.labels.clear();
+    candidate.checks = vec![check(
+        "Rust Check & Lint work",
+        CheckState::InProgress,
+        Some(20),
+    )];
+
+    // The parked topology is genuinely stuck, including against current main.
+    // The candidate itself is clean against main; any comparison involving the
+    // parked topology conflicts so this test fails if a single candidate path
+    // still treats the quarantined caravan as active.
+    let selective = |candidate: &BranchSnapshot,
+                     target: &BranchSnapshot|
+     -> Result<CompatibilityReport, AppError> {
+        let conflict = candidate.name.starts_with("parked") || target.name.starts_with("parked");
+        Ok(CompatibilityReport {
+            candidate: candidate.clone(),
+            target: target.clone(),
+            outcome: if conflict {
+                CompatibilityOutcome::Conflict
+            } else {
+                CompatibilityOutcome::Clean
+            },
+            conflicting_paths: if conflict {
+                vec!["src/stuck.rs".to_owned()]
+            } else {
+                Vec::new()
+            },
+            diagnostic: None,
+        })
+    };
+    let fleet = status(
+        vec![parked_root.clone(), parked_child.clone(), candidate.clone()],
+        Some(candidate.number),
+        &selective,
+    );
+
+    assert!(fleet.analysis.fleet.caravans[0].parked);
+    assert!(
+        fleet.analysis.fleet.problems.iter().any(|problem| {
+            problem.kind == GraphProblemKind::Incompatible
+                && problem.prs.contains(&parked_root.number)
+        }),
+        "the stuck root's exact repair evidence remains visible"
+    );
+    assert!(
+        fleet.healthy,
+        "a quarantined repair must not mark the active fleet unhealthy"
+    );
+    assert_eq!(fleet.admission.next_candidate, Some(candidate.number));
+
+    let check = read::check_analysis(
+        &fleet,
+        &CheckInput {
+            pr: Some(candidate.number.0),
+            tail_pr: None,
+            head_pr: None,
+        },
+        &selective,
+    )
+    .expect("the clean independent candidate has an inspectable receipt");
+    assert!(check.eligible, "problems: {:?}", check.problems);
+    assert_eq!(check.next_action, crate::read::CandidateNextAction::New);
+    assert!(check.problems.is_empty());
+
+    let automatic = evaluate_auto_candidate(&fleet, &candidate, &selective)
+        .expect("automatic election evaluates only active targets");
+    assert_eq!(automatic.target, AutoCandidateTarget::New);
+
+    // After #2415 forms an independent active root, the parked topology must
+    // also stay out of active cross-caravan analysis. A later clean candidate
+    // joins that active root rather than inheriting #2384's conflict.
+    let mut admitted = candidate.clone();
+    admitted.labels.insert("caravan".to_owned());
+    admitted.auto_merge = AutoMergeState::squash();
+    let mut follower = pull_request(
+        2416,
+        "clean-follower",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    follower.labels.clear();
+    let post_admission = status(
+        vec![
+            parked_root.clone(),
+            parked_child,
+            admitted,
+            follower.clone(),
+        ],
+        Some(follower.number),
+        &selective,
+    );
+    assert!(
+        post_admission.healthy,
+        "parked-to-active cross compatibility is outside the active graph"
+    );
+    let active_check = read::check_analysis(
+        &post_admission,
+        &CheckInput {
+            pr: Some(candidate.number.0),
+            tail_pr: None,
+            head_pr: None,
+        },
+        &selective,
+    )
+    .expect("the independent active root is not assigned the parked repair");
+    assert!(
+        active_check.eligible,
+        "problems: {:?}",
+        active_check.problems
+    );
+    assert_eq!(
+        active_check.next_action,
+        crate::read::CandidateNextAction::Wait
+    );
+    assert!(active_check.problems.is_empty());
+
+    let follow_up = read::check_analysis(
+        &post_admission,
+        &CheckInput {
+            pr: Some(follower.number.0),
+            tail_pr: None,
+            head_pr: None,
+        },
+        &selective,
+    )
+    .expect("the next candidate targets the active root only");
+    assert!(follow_up.eligible, "problems: {:?}", follow_up.problems);
+    assert_eq!(
+        follow_up.next_action,
+        crate::read::CandidateNextAction::Join
+    );
+    assert_eq!(follow_up.target_pr, Some(candidate.number));
+
+    let parked_target = read::check_analysis(
+        &fleet,
+        &CheckInput {
+            pr: Some(candidate.number.0),
+            tail_pr: None,
+            head_pr: Some(parked_root.number.0),
+        },
+        &selective,
+    )
+    .expect_err("explicit admission into a parked repair must fail clearly");
+    assert_eq!(parked_target.code(), "caravan_target_parked");
+    let details = parked_target
+        .details()
+        .expect("typed parked target evidence");
+    assert_eq!(details["head_pr"], parked_root.number.0);
+    assert_eq!(
+        details["responsible_actor"],
+        "the parked head owner or a dispatched repair agent"
+    );
+
+    // Admission advances independently while scheduler evidence keeps the
+    // exact repair route on the stuck canonical head, never on #2415.
+    let scheduler = successful_scheduler_status(
+        &fleet,
+        &[CiObservation {
+            pr: parked_root.number,
+            disposition: CiDisposition::Failed,
+            checks: parked_root.checks.clone(),
+            failed_runs: Vec::new(),
+            failure_diagnostics: Vec::new(),
+            rerunnable_run_ids: Vec::new(),
+            cancellation: CiCancellationSummary::default(),
+        }],
+        &[],
+        false,
+        &[],
+        &[],
+    );
+    assert_eq!(
+        scheduler.disposition,
+        SchedulerDisposition::ExternalDecision
+    );
+    assert_eq!(scheduler.head_of_line[0].blocking_pr, parked_root.number);
+    assert!(
+        scheduler.head_of_line[0]
+            .remedies
+            .iter()
+            .any(|remedy| remedy.contains("repair"))
+    );
+    assert!(
+        !scheduler.head_of_line[0]
+            .blocked_prs
+            .contains(&candidate.number)
+    );
+}
+
 #[test]
 fn parking_uses_latest_verdict_only_and_pending_never_parks() {
     let mut old_red = check("build-test", CheckState::Failure, Some(10));

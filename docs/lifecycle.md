@@ -51,6 +51,7 @@ statement about one exact set of objects, never a permanent verdict about a PR.
 | Mechanically conflicts with the default branch | **skipped, queue advances** | an agent or human, out of band |
 | A required check has **failed** | **skipped, queue advances** | the PR's owner |
 | A required check is still **running** | admitted; the tick then waits | nobody — automatic |
+| An existing Caravan is `caravan-parked` | exact head is repair-routed; independent admission advances | parked head owner or dispatched repair agent |
 | Owner rejected it via `cara check --pr N` | **stays canonical, blocks** | the owner |
 | Behind the default branch but compatible | admitted; Cara rebases it | nobody — automatic |
 | Your checkout is on a merged/historical branch | irrelevant to selection | nobody — automatic |
@@ -62,7 +63,13 @@ whole queue behind it starves every clean candidate. An owner rejection *is* a
 decision, and silently leapfrogging it would discard that decision.
 
 A skipped candidate appears in `admission.skipped` with the exact reason, so
-"skipped" is never indistinguishable from "forgotten".
+"skipped" is never indistinguishable from "forgotten". A parked Caravan is the
+same separation at fleet scope: its topology and problems remain visible for
+scheduler repair routing, while problems wholly owned by parked Caravans do not
+make the active fleet unhealthy or turn a clean candidate's `next_action` into
+`repair`. Parked Caravans are neither implicit nor explicit join targets;
+explicit selection returns `caravan_target_parked` naming the head, transition,
+and responsible actor. Problems touching an unparked Caravan still block.
 
 ### 1.4 Red bars admission; pending does not; the forge verdict is not consulted
 

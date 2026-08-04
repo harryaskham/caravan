@@ -2802,7 +2802,21 @@ fn check_analysis_with_recommendation(
                 format!("PR #{current_pr} is already in caravan #{}", caravan.id),
             ));
         }
-        let mut active_problems = status.analysis.fleet.problems.clone();
+        // Active-member checks inspect the active fleet, not quarantined parked
+        // caravans. A check on the parked member itself still includes its own
+        // exact problems, while an unrelated active caravan is not assigned the
+        // parked head's repair work.
+        let mut active_problems = status
+            .analysis
+            .fleet
+            .problems
+            .iter()
+            .filter(|problem| {
+                status.analysis.problem_blocks_active_fleet(problem)
+                    || problem.prs.contains(&current_pr)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         if input.tail_pr.is_some() || input.head_pr.is_some() {
             active_problems.push(GraphProblem {
                 kind: GraphProblemKind::Unknown,
@@ -2864,7 +2878,14 @@ fn check_analysis_with_recommendation(
     // exactly once. An ineligible join is evidence to try `new`, not the final
     // receipt; every other error still fails closed.
     if recommend_implicit_join && !explicit_join {
-        if let [target_caravan] = status.analysis.fleet.caravans.as_slice() {
+        let active_caravans = status
+            .analysis
+            .fleet
+            .caravans
+            .iter()
+            .filter(|caravan| !caravan.parked)
+            .collect::<Vec<_>>();
+        if let [target_caravan] = active_caravans.as_slice() {
             let held = status.pauses.iter().any(|pause| {
                 pause.state.is_effective() && pause.record.caravan_head == target_caravan.id
             });
@@ -2885,17 +2906,20 @@ fn check_analysis_with_recommendation(
         }
     }
 
-    // Seed from fleet problems, but never inherit another *unadmitted*
-    // candidate's incompatibility. That is advisory evidence about a PR which is
-    // in no caravan and blocks nothing, so letting it land here made one
-    // conflicting unqueued PR mark every other candidate ineligible — including
-    // the clean one that should have formed the first caravan.
+    // Seed from active-fleet problems, but never inherit another *unadmitted*
+    // candidate's incompatibility or a parked caravan's quarantined repair
+    // state. Both remain exact status/scheduler evidence, but neither is an
+    // admission target and neither may make an independent clean candidate look
+    // like it needs repair.
     let mut problems = status
         .analysis
         .fleet
         .problems
         .iter()
-        .filter(|problem| problem.kind.blocks_fleet() || problem.prs.contains(&current_pr))
+        .filter(|problem| {
+            status.analysis.problem_blocks_active_fleet(problem)
+                || problem.prs.contains(&current_pr)
+        })
         .cloned()
         .collect::<Vec<_>>();
     let mut ordering_note: Option<String> = None;
@@ -3056,7 +3080,13 @@ fn check_analysis_with_recommendation(
             &mut problems,
             &mut reconciliations,
         )?;
-        for caravan in &status.analysis.fleet.caravans {
+        for caravan in status
+            .analysis
+            .fleet
+            .caravans
+            .iter()
+            .filter(|caravan| !caravan.parked)
+        {
             if caravan.id == target_caravan.id {
                 continue;
             }
@@ -3155,7 +3185,13 @@ fn check_new(
         problems,
         reconciliations,
     )?;
-    for caravan in &status.analysis.fleet.caravans {
+    for caravan in status
+        .analysis
+        .fleet
+        .caravans
+        .iter()
+        .filter(|caravan| !caravan.parked)
+    {
         let head_number = caravan.head().expect("caravans are non-empty");
         let tail_number = caravan.tail().expect("caravans are non-empty");
         let head = status
@@ -3194,13 +3230,40 @@ fn resolve_target_caravan<'a>(
     status: &'a StatusOutput,
     input: &CheckInput,
 ) -> Result<&'a Caravan, AppError> {
+    let require_active = |caravan: &'a Caravan| {
+        if caravan.parked {
+            Err(AppError::structured(
+                ErrorCategory::Validation,
+                "caravan_target_parked",
+                format!(
+                    "caravan #{} is parked for repair and cannot accept new members",
+                    caravan.id
+                ),
+                Some(json!({
+                    "caravan_id": caravan.id,
+                    "head_pr": caravan.head(),
+                    "transition": "repair the parked head until a sync tick unparks it",
+                    "responsible_actor": "the parked head owner or a dispatched repair agent",
+                    "alternative": "use `cara new` for independent work instead of targeting the parked caravan",
+                    "mutated": false,
+                })),
+            ))
+        } else {
+            Ok(caravan)
+        }
+    };
     if let Some(head) = input.head_pr.map(PrNumber) {
-        return status.analysis.fleet.caravan(head).ok_or_else(|| {
-            AppError::validation(
-                "caravan_head_not_found",
-                format!("PR #{head} is not a current caravan head"),
-            )
-        });
+        return status
+            .analysis
+            .fleet
+            .caravan(head)
+            .ok_or_else(|| {
+                AppError::validation(
+                    "caravan_head_not_found",
+                    format!("PR #{head} is not a current caravan head"),
+                )
+            })
+            .and_then(require_active);
     }
     if let Some(tail) = input.tail_pr.map(PrNumber) {
         return status
@@ -3214,20 +3277,28 @@ fn resolve_target_caravan<'a>(
                     "caravan_tail_not_found",
                     format!("PR #{tail} is not a current caravan tail"),
                 )
-            });
+            })
+            .and_then(require_active);
     }
-    match status.analysis.fleet.caravans.as_slice() {
+    let active = status
+        .analysis
+        .fleet
+        .caravans
+        .iter()
+        .filter(|caravan| !caravan.parked)
+        .collect::<Vec<_>>();
+    match active.as_slice() {
         [caravan] => Ok(caravan),
         [] => Err(AppError::validation(
             "caravan_tail_not_found",
-            "there is no caravan to join; use `cara new`",
+            "there is no active caravan to join; use `cara new` while parked caravans await repair",
         )),
         caravans => Err(AppError::structured(
             ErrorCategory::Validation,
             "ambiguous_caravan_tail",
-            "multiple caravan tails exist; pass --tail-pr or --head-pr",
+            "multiple active caravan tails exist; pass --tail-pr or --head-pr",
             Some(json!({
-                "candidate_tails": caravans.iter().filter_map(Caravan::tail).collect::<Vec<_>>(),
+                "candidate_tails": caravans.iter().filter_map(|caravan| caravan.tail()).collect::<Vec<_>>(),
             })),
         )),
     }
@@ -4269,6 +4340,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn first_status_over_eight_candidates_yields_current_evidence_then_can_complete() {
         let active = (1..=12)
             .map(|number| pr(number, &format!("branch-{number}"), "main", true))

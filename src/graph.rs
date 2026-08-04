@@ -78,19 +78,44 @@ pub struct BoundedGraphAnalysis {
 }
 
 impl GraphAnalysis {
+    /// Whether one problem gates the active fleet rather than a quarantined
+    /// parked caravan.
+    ///
+    /// Parking is the exact terminal-red repair route: the complete topology
+    /// and its problems remain visible, but that caravan leaves convergence,
+    /// capacity, tail selection, and independent admission until its owner
+    /// repairs it. A problem spanning any unparked caravan still gates. A
+    /// repository-global problem with no identifiable caravan also fails
+    /// closed.
+    #[must_use]
+    pub fn problem_blocks_active_fleet(&self, problem: &GraphProblem) -> bool {
+        if !problem.kind.blocks_fleet() {
+            return false;
+        }
+        let mut parked_caravan_observed = false;
+        for number in &problem.prs {
+            if let Some(caravan) = self.fleet.containing(*number) {
+                if !caravan.parked {
+                    return true;
+                }
+                parked_caravan_observed = true;
+            }
+        }
+        !parked_caravan_observed
+    }
+
     #[must_use]
     pub fn healthy(&self) -> bool {
         // An unadmitted candidate's incompatibility says nothing about the health
         // of the fleet: it is advisory evidence about a PR that is not in any
-        // caravan and blocks nothing. Counting it here marked the whole fleet
-        // unhealthy, which cascaded into `check` eligibility and stopped an
-        // empty fleet from ever bootstrapping its first caravan while any
-        // unqueued PR happened to conflict with the default branch.
+        // caravan and blocks nothing. A parked caravan is likewise quarantined:
+        // keep its exact repair evidence, but do not let it mark the active
+        // fleet unhealthy and reject every independent candidate.
         !self
             .fleet
             .problems
             .iter()
-            .any(|problem| problem.kind.blocks_fleet())
+            .any(|problem| self.problem_blocks_active_fleet(problem))
     }
 }
 
@@ -914,8 +939,20 @@ fn compatibility_tasks(
         }
     }
 
-    for (index, caravan) in caravans.iter().enumerate() {
-        for (other_index, other) in caravans.iter().enumerate() {
+    // A parked caravan is quarantined for exact repair. Keep its own
+    // head/default and internal-edge evidence above, but do not compare it to
+    // active caravans: cross-compatibility with a queue slot that cannot be a
+    // target must not contaminate active-fleet health or admission.
+    for (index, caravan) in caravans
+        .iter()
+        .enumerate()
+        .filter(|(_, caravan)| !caravan.parked)
+    {
+        for (other_index, other) in caravans
+            .iter()
+            .enumerate()
+            .filter(|(_, caravan)| !caravan.parked)
+        {
             if index == other_index {
                 continue;
             }
