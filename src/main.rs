@@ -647,24 +647,73 @@ fn emit_status_result(
     }
 }
 
-fn process_rows(id_field: &str) -> Vec<(u32, u32)> {
-    let columns = format!("pid=,{id_field}=");
-    let Ok(output) = ProcessCommand::new("ps")
-        .args(["-eo", columns.as_str()])
-        .output()
-    else {
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug)]
+struct LinuxProcessRow {
+    pid: u32,
+    ppid: u32,
+    session: u32,
+    start_time: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_row(pid: u32) -> Option<LinuxProcessRow> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_name = stat.rsplit_once(')')?.1;
+    let fields = after_name.split_whitespace().collect::<Vec<_>>();
+    Some(LinuxProcessRow {
+        pid,
+        ppid: fields.get(1)?.parse().ok()?,
+        session: fields.get(3)?.parse().ok()?,
+        // Fields after comm start at proc field 3; starttime is field 22.
+        start_time: fields.get(19)?.parse().ok()?,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_rows() -> Vec<LinuxProcessRow> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
         return Vec::new();
     };
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            Some((
-                fields.next()?.parse::<u32>().ok()?,
-                fields.next()?.parse::<u32>().ok()?,
-            ))
-        })
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_string_lossy().parse::<u32>().ok())
+        .filter_map(linux_process_row)
         .collect()
+}
+
+fn process_rows(id_field: &str) -> Vec<(u32, u32)> {
+    #[cfg(target_os = "linux")]
+    {
+        return linux_process_rows()
+            .into_iter()
+            .filter_map(|row| match id_field {
+                "ppid" => Some((row.pid, row.ppid)),
+                "sid" => Some((row.pid, row.session)),
+                _ => None,
+            })
+            .collect();
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let columns = format!("pid=,{id_field}=");
+        let Ok(output) = ProcessCommand::new("ps")
+            .args(["-eo", columns.as_str()])
+            .output()
+        else {
+            return Vec::new();
+        };
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                Some((
+                    fields.next()?.parse::<u32>().ok()?,
+                    fields.next()?.parse::<u32>().ok()?,
+                ))
+            })
+            .collect()
+    }
 }
 
 fn descendant_pids(root: u32) -> Vec<u32> {
@@ -691,10 +740,7 @@ fn session_pids(session: u32) -> Vec<u32> {
 
 #[cfg(target_os = "linux")]
 fn linux_process_start_time(pid: u32) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let after_name = stat.rsplit_once(')')?.1;
-    // Fields after comm start at proc field 3; starttime is field 22.
-    after_name.split_whitespace().nth(19)?.parse().ok()
+    linux_process_row(pid).map(|row| row.start_time)
 }
 
 #[cfg(unix)]
@@ -3801,6 +3847,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[allow(clippy::too_many_lines)] // Keep the full PID/PGID/SID handshake and receipt proof together.
     fn status_watchdog_reaps_descendants_without_waiting_for_output_eof() {
         #[cfg(target_os = "linux")]
         let _ = rustix::process::set_child_subreaper(Some(rustix::process::Pid::INIT));
@@ -3874,6 +3921,22 @@ provider.wait()
                 .is_ok_and(|status| status.success())
         };
         assert!(process_is_alive(descendant_pid));
+        let registered = capture_status_identities(child.id());
+        let provider_registered = registered
+            .iter()
+            .find(|identity| identity.pid == descendant_pid);
+        assert!(
+            provider_registered.is_some(),
+            "provider {descendant_pid} was absent from pre-teardown registration"
+        );
+        #[cfg(target_os = "linux")]
+        if let Some(provider_registered) = provider_registered {
+            assert_eq!(
+                provider_registered.pidfd_receipt(),
+                PidfdAcquisition::Acquired
+            );
+        }
+        drop(registered);
         let started = std::time::Instant::now();
         let cleanup = terminate_status_tree(&mut child);
         assert!(started.elapsed() < Duration::from_secs(2));
