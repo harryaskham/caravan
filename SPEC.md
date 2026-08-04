@@ -256,8 +256,9 @@ checkpoints current repository/caravan/candidate structure plus request counts.
 Worker output is redirected to parent-owned bounded files rather than pipes and,
 on Unix, the worker creates a dedicated session before launching providers. If
 the executor itself wedges, the parent keeps the original PID/group inventory
-across TERM and KILL, includes remaining session members even after reparenting,
-and polls reaping only within a hard local bound before returning the checkpoint
+across TERM and KILL, binds Linux identities with pidfds, adopts orphaned
+providers as a child subreaper, includes remaining session members after
+reparenting, and polls exact-child reaping only within a hard local bound before returning the checkpoint
 as `status_partial` with phase `command_boundary_watchdog`. Final envelope
 emission is outside any unbounded process wait, stays inside Cacophony's
 60-second collection window, and cannot block on descendant EOF. With neither current bounded

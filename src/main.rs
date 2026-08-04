@@ -690,68 +690,123 @@ fn session_pids(session: u32) -> Vec<u32> {
 }
 
 #[cfg(unix)]
-fn signal_status_process(pid: u32, signal: rustix::process::Signal) {
-    let Ok(raw_pid) = i32::try_from(pid) else {
-        return;
-    };
-    let Some(pid) = rustix::process::Pid::from_raw(raw_pid) else {
-        return;
-    };
-    // A nested ProcessRunner gives each provider command its own process group.
-    // Signal both identities: some descendants are group leaders, others are not.
-    let _ = rustix::process::kill_process_group(pid, signal);
-    let _ = rustix::process::kill_process(pid, signal);
+struct StatusProcessIdentity {
+    pid: u32,
+    #[cfg(target_os = "linux")]
+    pidfd: Option<std::os::fd::OwnedFd>,
+}
+
+#[cfg(unix)]
+impl StatusProcessIdentity {
+    fn capture(pid: u32) -> Self {
+        #[cfg(target_os = "linux")]
+        let pidfd = i32::try_from(pid)
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+            .and_then(|pid| {
+                rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).ok()
+            });
+        Self {
+            pid,
+            #[cfg(target_os = "linux")]
+            pidfd,
+        }
+    }
+
+    fn signal(&self, signal: rustix::process::Signal) {
+        #[cfg(target_os = "linux")]
+        if let Some(pidfd) = &self.pidfd {
+            // pidfd binds the signal to this exact process generation, so a
+            // rapidly reused numeric PID cannot receive a stale watchdog KILL.
+            let _ = rustix::process::pidfd_send_signal(pidfd, signal);
+            return;
+        }
+        let Ok(raw_pid) = i32::try_from(self.pid) else {
+            return;
+        };
+        let Some(pid) = rustix::process::Pid::from_raw(raw_pid) else {
+            return;
+        };
+        let _ = rustix::process::kill_process_group(pid, signal);
+        let _ = rustix::process::kill_process(pid, signal);
+    }
+
+    fn reap_if_child(&self) {
+        let Ok(raw_pid) = i32::try_from(self.pid) else {
+            return;
+        };
+        let Some(pid) = rustix::process::Pid::from_raw(raw_pid) else {
+            return;
+        };
+        let _ = rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::NOHANG);
+    }
+}
+
+#[cfg(unix)]
+fn capture_status_identities(root: u32) -> Vec<StatusProcessIdentity> {
+    let mut pids = descendant_pids(root);
+    for pid in session_pids(root) {
+        if pid != root && !pids.contains(&pid) {
+            pids.push(pid);
+        }
+    }
+    pids.reverse();
+    pids.into_iter()
+        .map(StatusProcessIdentity::capture)
+        .collect()
 }
 
 fn terminate_status_tree(child: &mut Child) {
     #[cfg(unix)]
-    {
+    let identities = {
         use rustix::process::Signal;
 
         let root = child.id();
-        let mut original_descendants = descendant_pids(root);
-        for pid in session_pids(root) {
-            if pid != root && !original_descendants.contains(&pid) {
-                original_descendants.push(pid);
-            }
+        let root_identity = StatusProcessIdentity::capture(root);
+        let mut identities = capture_status_identities(root);
+        for identity in &identities {
+            identity.signal(Signal::TERM);
         }
-        original_descendants.reverse();
-        for pid in &original_descendants {
-            signal_status_process(*pid, Signal::TERM);
-        }
-        signal_status_process(root, Signal::TERM);
+        root_identity.signal(Signal::TERM);
         std::thread::sleep(Duration::from_millis(500));
 
         // TERM can kill an intermediate worker and reparent a TERM-resistant
-        // provider before the KILL inventory. Preserve every original identity
-        // so the reparented process and its independent group still receive KILL.
-        let mut kill_targets = original_descendants;
-        for pid in descendant_pids(root)
-            .into_iter()
-            .chain(session_pids(root))
-            .rev()
-        {
-            if pid != root && !kill_targets.contains(&pid) {
-                kill_targets.push(pid);
+        // provider. Retain pidfds for the original generations and add any new
+        // session member observed after the topology transition.
+        for identity in capture_status_identities(root) {
+            if !identities
+                .iter()
+                .any(|existing| existing.pid == identity.pid)
+            {
+                identities.push(identity);
             }
         }
-        for pid in &kill_targets {
-            signal_status_process(*pid, Signal::KILL);
+        for identity in &identities {
+            identity.signal(Signal::KILL);
         }
-        signal_status_process(root, Signal::KILL);
-    }
+        root_identity.signal(Signal::KILL);
+        identities
+    };
     let _ = child.kill();
 
-    // Envelope emission must not live behind an unbounded wait(2). A process in
-    // an uninterruptible kernel wait can ignore even SIGKILL until that wait
-    // resolves; poll reaping briefly, then let process exit/reparenting own it.
-    let reap_deadline = std::time::Instant::now() + Duration::from_millis(250);
+    // Linux adopts orphaned grandchildren into this CLI via child-subreaper.
+    // Reap only the exact recorded identities, never an unrelated child. The
+    // whole loop remains bounded so typed envelope emission cannot wedge.
+    let reap_deadline = std::time::Instant::now() + Duration::from_millis(500);
     loop {
-        match child.try_wait() {
-            Ok(Some(_)) | Err(_) => break,
-            Ok(None) if std::time::Instant::now() >= reap_deadline => break,
-            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+        let _ = child.try_wait();
+        #[cfg(unix)]
+        for identity in &identities {
+            identity.reap_if_child();
         }
+        if std::time::Instant::now() >= reap_deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    #[cfg(unix)]
+    for identity in &identities {
+        identity.reap_if_child();
     }
 }
 
@@ -775,6 +830,8 @@ fn run_status(cli: &Cli) -> Result<(), i32> {
         return emit_status_result(cli.json, caravan::read::status_resilient(&context));
     }
     let context = load_context(cli)?;
+    #[cfg(target_os = "linux")]
+    let _ = rustix::process::set_child_subreaper(Some(rustix::process::Pid::INIT));
 
     let checkpoint = std::env::temp_dir().join(format!(
         "cara-status-watchdog-{}-{}.json",
@@ -3506,6 +3563,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn status_watchdog_reaps_descendants_without_waiting_for_output_eof() {
+        #[cfg(target_os = "linux")]
+        let _ = rustix::process::set_child_subreaper(Some(rustix::process::Pid::INIT));
         let directory = tempfile::tempdir().expect("temporary directory");
         let ready = directory.path().join("descendant-ready");
         let stdout = std::fs::File::create(directory.path().join("stdout")).unwrap();

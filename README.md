@@ -909,8 +909,9 @@ compatibility. Worker stdout/stderr go to parent-owned bounded files, never
 pipes whose EOF an orphan can retain. On Unix the worker also owns a dedicated
 session, so provider groups remain identifiable after an intermediate worker
 exits and reparents them. If the executor wedges, the parent preserves the
-original PID/group inventory through TERM and KILL, adds any remaining session
-members, and performs only a bounded reap poll before returning the checkpoint
+original PID/group inventory through TERM and KILL, binds Linux identities with
+pidfds, adopts orphaned providers as a child subreaper, adds any remaining
+session members, and performs only a bounded exact-child reap poll before returning the checkpoint
 with phase `command_boundary_watchdog`, still inside Cacophony's 60-second
 adapter window. Envelope emission is never behind an unbounded `wait`. Other
 timeouts terminate and reap
