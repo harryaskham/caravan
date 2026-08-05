@@ -88,12 +88,15 @@ today.
   receipt; unchanged generations are not retried, while candidate, default,
   tail, config, or heuristic changes invalidate the skip automatically.
 - Trusted sync terminalizes provider `CLOSED` rows with no merge timestamp before
-  any active queue work: it adds `caravan-closed`, removes `caravan` and
+  any active queue work: after a fresh authoritative eligibility read, one exact
+  complete-label write adds `caravan-closed` while removing `caravan` and
   `caravan-parked`, preserves branches and provider history, then returns after
-  authoritative rediscovery. Reopened or merged rows lose only the stale
-  terminal marker. Every write is exact-state fenced and carries provider
-  before/after receipts; duplicate syncs issue no provider write. Status reports
-  terminal-closed rows separately and they never consume `max_caravans`.
+  authoritative rediscovery. Open, unknown, stale, reopened, merged, or drifted
+  plans refuse cleanup before writing. Independently discovered reopened or
+  merged rows lose only the stale terminal marker. Provider reads and writes
+  carry exact before/after evidence; duplicate syncs issue no provider write.
+  Status reports terminal-closed rows separately and they never consume
+  `max_caravans`.
 - Every non-clean attachment check also returns exact squash-equivalence
   evidence. A landed member reaches the default branch as one squash commit
   whose content matches that member's cumulative content but whose commit
@@ -735,6 +738,18 @@ provider lease. It removes only `caravan-parked`, reruns fleet analysis, and
 returns a durable idempotent receipt with old/new labels and evidence. Use
 `cara --json unpark --help` (or the MCP `unpark` tool) to construct the reviewed
 request.
+
+If a stale closed-row cleanup stripped both `caravan` and `caravan-parked` from
+that same open generation, use `cara restore-parked` (or MCP `restore_parked`)
+after deploying a fixed Cara build. The request binds exact repository, PR,
+head/base, prior membership generation, latest durable `caravan_parked`
+fingerprint, `--provider-state open_labels_missing`, actor, and reason. Cara
+requires the parking event's provider receipt to prove both prior labels on the
+same generation, requires auto-merge to remain disabled, and restores both
+labels in one complete-label write before rediscovering the identical parked
+topology. Partial labels, an unpark event, close/merge/reopen drift, terminal or
+evicted labels, missing provenance, capacity substitution, and replacement PRs
+all fail closed.
 
 `sync.missing_required_runs_grace_secs` is the bounded wait before a required
 context with zero reporting run or check-suite lineage on the exact current head

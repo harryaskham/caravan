@@ -20,6 +20,7 @@ use caravan::{
         RepairAbortInput, RepairAuthorizeAgentEditsInput, RepairContinueInput, RepairGrantInput,
         RepairRevokeGrantInput, RepairStartInput, RepairStatusInput,
     },
+    restore_parked::RestoreParkedInput,
     self_update_check, self_update_run, self_update_status,
     unpark::UnparkInput,
 };
@@ -115,6 +116,8 @@ enum Command {
     Resume(ResumeInput),
     /// Recover one exact engine-owned terminal-red parked generation.
     Unpark(UnparkInput),
+    /// Restore labels stripped from one exact, durably proven parked generation.
+    RestoreParked(RestoreParkedInput),
     /// Exact-owner checkpoint/finalize/rollback for an already-paused caravan.
     #[command(subcommand)]
     PauseRecovery(Box<PauseRecoveryCommand>),
@@ -452,6 +455,7 @@ fn run(cli: &Cli) -> Result<(), i32> {
         Command::Pause(input) => run_pause(cli, input),
         Command::Resume(input) => run_resume(cli, input),
         Command::Unpark(input) => run_unpark(cli, input),
+        Command::RestoreParked(input) => run_restore_parked(cli, input),
         Command::PauseRecovery(command) => run_pause_recovery(cli, command),
         Command::Sync(input) => run_sync(cli, input),
         Command::Plan(command) => run_plan(cli, command),
@@ -1774,6 +1778,30 @@ fn run_unpark(cli: &Cli, input: &UnparkInput) -> Result<(), i32> {
                     "changed"
                 } else {
                     "already recovered"
+                },
+                output.next
+            );
+            Ok(())
+        }
+        Err(error) => emit_human_error(error),
+    }
+}
+
+fn run_restore_parked(cli: &Cli, input: &RestoreParkedInput) -> Result<(), i32> {
+    let context = load_context(cli)?;
+    let result = caravan::restore_parked::restore_parked(&context, input);
+    if cli.json {
+        return emit_result(true, result);
+    }
+    match result {
+        Ok(output) => {
+            println!(
+                "restore-parked #{}: {} — {}",
+                output.pr,
+                if output.mutated {
+                    "restored"
+                } else {
+                    "already restored"
                 },
                 output.next
             );

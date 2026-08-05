@@ -34,6 +34,8 @@ struct FakeProvider {
     pulls: RefCell<BTreeMap<PrNumber, PullRequestSnapshot>>,
     /// Scripted stale provider list/read responses served before live facts.
     refetch_overrides: RefCell<BTreeMap<PrNumber, VecDeque<PullRequestSnapshot>>>,
+    /// Bounded provider read failures injected before any live facts are served.
+    refetch_failures: RefCell<u32>,
     /// Arming requests the provider accepts but silently never persists.
     unpersisted_armings: RefCell<BTreeMap<PrNumber, u32>>,
     refetches: RefCell<Vec<PrNumber>>,
@@ -80,6 +82,7 @@ impl FakeProvider {
             ),
             failures: RefCell::new(VecDeque::new()),
             refetch_overrides: RefCell::new(BTreeMap::new()),
+            refetch_failures: RefCell::new(0),
             unpersisted_armings: RefCell::new(BTreeMap::new()),
             refetches: RefCell::new(Vec::new()),
             calls: RefCell::new(Vec::new()),
@@ -149,6 +152,11 @@ impl FakeProvider {
             .entry(number)
             .or_default()
             .push_back(stale);
+    }
+
+    /// Fail the next fresh PR refetch before exposing any provider state.
+    fn fail_next_refetch(&self) {
+        *self.refetch_failures.borrow_mut() += 1;
     }
 
     /// Accept `count` arming requests without ever persisting auto-merge.
@@ -249,6 +257,17 @@ impl SyncProvider for FakeProvider {
         number: PrNumber,
     ) -> Result<PullRequestSnapshot, MutationError> {
         self.refetches.borrow_mut().push(number);
+        let failures = *self.refetch_failures.borrow();
+        if failures > 0 {
+            *self.refetch_failures.borrow_mut() = failures - 1;
+            return Err(MutationError::Provider(
+                crate::github::DiscoveryError::CommandFailed {
+                    command: crate::command::CommandSpec::new("fake-provider-read"),
+                    code: None,
+                    stderr: "injected provider read timeout".to_owned(),
+                },
+            ));
+        }
         if let Some(stale) = self
             .refetch_overrides
             .borrow_mut()
@@ -424,6 +443,17 @@ impl SyncProvider for FakeProvider {
     ) -> Result<GitHubMutationReceipt, MutationError> {
         self.mutate(expected, MutationKind::RemoveLabel, |pull_request| {
             pull_request.labels.remove(label);
+        })
+    }
+
+    fn replace_labels(
+        &self,
+        _repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+        labels: &BTreeSet<String>,
+    ) -> Result<GitHubMutationReceipt, MutationError> {
+        self.mutate(expected, MutationKind::SetLabels, |pull_request| {
+            pull_request.labels.clone_from(labels);
         })
     }
 
@@ -1025,15 +1055,12 @@ fn closed_unmerged_active_member_is_terminalized_outside_capacity() {
     assert_eq!(transition.before.base, transition.after.base);
     assert_eq!(transition.removed_active_labels, ["caravan"]);
     assert!(transition.terminal_label_added);
-    assert_eq!(transition.provider_receipts.len(), 2);
+    assert_eq!(transition.provider_receipts.len(), 1);
     assert_eq!(
         provider.pulls.borrow()[&closed.number].labels,
         BTreeSet::from([CLOSED_LABEL.to_owned()])
     );
-    assert_eq!(
-        *provider.calls.borrow(),
-        [MutationKind::AddLabel, MutationKind::RemoveLabel]
-    );
+    assert_eq!(*provider.calls.borrow(), [MutationKind::SetLabels]);
 }
 
 #[test]
@@ -1060,7 +1087,8 @@ fn closed_unmerged_parked_member_loses_both_active_labels() {
         provider.pulls.borrow()[&closed.number].labels,
         BTreeSet::from([CLOSED_LABEL.to_owned()])
     );
-    assert_eq!(output.provider_receipts.len(), 3);
+    assert_eq!(output.provider_receipts.len(), 1);
+    assert_eq!(*provider.calls.borrow(), [MutationKind::SetLabels]);
 }
 
 #[test]
@@ -1088,7 +1116,42 @@ fn merged_pr_never_retains_terminal_closed_label() {
     assert!(observed.has_label("caravan"));
     assert!(!observed.has_label(CLOSED_LABEL));
     assert!(observed.is_merged());
-    assert_eq!(*provider.calls.borrow(), [MutationKind::RemoveLabel]);
+    assert_eq!(*provider.calls.borrow(), [MutationKind::SetLabels]);
+}
+
+#[test]
+fn open_active_and_parked_rows_are_untouched() {
+    let active = pull_request(
+        47,
+        "open-active",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    let mut parked = pull_request(
+        48,
+        "open-parked",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    parked.labels.insert(PARKED_LABEL.to_owned());
+    let status = status(vec![active.clone(), parked.clone()], None, &clean);
+    let provider = FakeProvider::with_pull_requests(vec![active.clone(), parked.clone()]);
+
+    let output = reconcile_closed_lifecycle(&status, &provider).expect("open rows are ignored");
+
+    assert!(!output.changed);
+    assert!(provider.calls.borrow().is_empty());
+    assert!(provider.refetches.borrow().is_empty());
+    assert_eq!(
+        provider.pulls.borrow()[&active.number].labels,
+        active.labels
+    );
+    assert_eq!(
+        provider.pulls.borrow()[&parked.number].labels,
+        parked.labels
+    );
 }
 
 #[test]
@@ -1100,7 +1163,7 @@ fn reopened_pr_returns_to_normal_labels_without_terminal_marker() {
         PullRequestState::Open,
         AutoMergeState::disabled(),
     );
-    reopened.labels.clear();
+    reopened.labels.insert(PARKED_LABEL.to_owned());
     reopened.labels.insert(CLOSED_LABEL.to_owned());
     let status = status(vec![reopened.clone()], None, &clean);
     let provider = FakeProvider::with_pull_requests(vec![reopened.clone()]);
@@ -1115,12 +1178,14 @@ fn reopened_pr_returns_to_normal_labels_without_terminal_marker() {
     let pulls = provider.pulls.borrow();
     let observed = &pulls[&reopened.number];
     assert_eq!(observed.state, PullRequestState::Open);
+    assert!(observed.has_label("caravan"));
+    assert!(observed.has_label(PARKED_LABEL));
     assert!(!observed.has_label(CLOSED_LABEL));
-    assert_eq!(*provider.calls.borrow(), [MutationKind::RemoveLabel]);
+    assert_eq!(*provider.calls.borrow(), [MutationKind::SetLabels]);
 }
 
 #[test]
-fn closed_terminalization_refuses_a_provider_reopen_race_before_write() {
+fn stale_cached_closed_plan_refuses_a_fresh_open_provider_row() {
     let closed = pull_request(
         45,
         "provider-race",
@@ -1140,15 +1205,77 @@ fn closed_terminalization_refuses_a_provider_reopen_race_before_write() {
     let error = reconcile_closed_lifecycle(&status, &provider)
         .expect_err("exact closed state must fence provider races");
 
+    assert_eq!(error.code(), "closed_pr_terminalization_plan_drift");
+    assert_eq!(
+        error.details().unwrap()["classification"],
+        "provider_race_reopened"
+    );
+    assert!(provider.calls.borrow().is_empty());
+    let pulls = provider.pulls.borrow();
+    let observed = &pulls[&closed.number];
+    assert!(!observed.has_label(CLOSED_LABEL));
+    assert!(observed.has_label("caravan"));
+}
+
+#[test]
+fn reopened_between_fresh_read_and_write_retains_complete_open_labels() {
+    let planned = pull_request(
+        49,
+        "reopen-race",
+        "main",
+        PullRequestState::Closed,
+        AutoMergeState::disabled(),
+    );
+    let status = status(vec![planned.clone()], None, &clean);
+    let mut reopened = planned.clone();
+    reopened.state = PullRequestState::Open;
+    let provider = FakeProvider::with_pull_requests(vec![reopened.clone()]);
+    provider.serve_stale_read(planned.number, planned);
+
+    let error = reconcile_closed_lifecycle(&status, &provider)
+        .expect_err("the mutation precondition catches a reopen after the fresh read");
+
     assert_eq!(error.code(), "closed_pr_terminalization_failed");
     assert_eq!(
         error.details().unwrap()["classification"],
         "provider_race_reopened"
     );
-    let pulls = provider.pulls.borrow();
-    let observed = &pulls[&closed.number];
-    assert!(!observed.has_label(CLOSED_LABEL));
-    assert!(observed.has_label("caravan"));
+    assert_eq!(*provider.calls.borrow(), [MutationKind::SetLabels]);
+    assert_eq!(
+        provider.pulls.borrow()[&reopened.number].labels,
+        reopened.labels
+    );
+}
+
+#[test]
+fn provider_read_timeout_refuses_terminalization_without_label_writes() {
+    let closed = pull_request(
+        50,
+        "provider-timeout",
+        "main",
+        PullRequestState::Closed,
+        AutoMergeState::disabled(),
+    );
+    let status = status(vec![closed.clone()], None, &clean);
+    let provider = FakeProvider::with_pull_requests(vec![closed.clone()]);
+    provider.fail_next_refetch();
+
+    let error = reconcile_closed_lifecycle(&status, &provider)
+        .expect_err("unknown provider state cannot authorize cleanup");
+
+    assert_eq!(
+        error.code(),
+        "closed_pr_terminalization_provider_read_failed"
+    );
+    assert_eq!(
+        error.details().unwrap()["classification"],
+        "provider_state_unknown"
+    );
+    assert!(provider.calls.borrow().is_empty());
+    assert_eq!(
+        provider.pulls.borrow()[&closed.number].labels,
+        closed.labels
+    );
 }
 
 #[test]

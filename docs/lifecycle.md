@@ -155,12 +155,24 @@ discover  → terminalize exact closed-unmerged rows (return if changed)
           → rediscover   → merge the root if it is green
 ```
 
-Terminalization runs only inside the reviewed sync writer boundary. It adds
-`caravan-closed` before removing `caravan-parked` and `caravan`, never deletes a
-branch, and emits exact before/after receipts. Merged and reopened rows lose only
-a stale terminal marker. State or `mergedAt` drift aborts with a classified,
-resumable provider-race receipt, and an already-terminal duplicate pass writes
-nothing.
+Terminalization runs only inside the reviewed sync writer boundary. It freshly
+refetches each candidate and requires exact provider state `CLOSED` without a
+merge timestamp immediately before one complete-label write. That write adds
+`caravan-closed` while removing `caravan-parked` and `caravan`; it never deletes
+a branch and emits exact before/after facts. Open, unknown, stale, reopened,
+merged, or drifted plans abort without mutation. Independently discovered merged
+and reopened rows lose only a stale terminal marker. Provider read failures and
+state drift are classified and resumable, and an already-terminal duplicate pass
+writes nothing.
+
+A still-open parked generation whose `caravan` and `caravan-parked` labels were
+both stripped is repaired only through `cara restore-parked`. The reviewed input
+binds exact head/base, prior membership generation, and the latest durable
+parking fingerprint; its event must include a same-generation provider receipt
+proving both old labels. One complete-label write restores both labels while
+auto-merge stays disabled, then authoritative rediscovery must reproduce the
+same parked topology outside active capacity. No raw relabel, capacity eviction,
+or replacement generation is accepted.
 
 Every pass emits one compact receipt naming the verb and the counts it saw, so
 "the loop is running and declining to join" is distinguishable from "the loop is

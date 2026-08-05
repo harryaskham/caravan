@@ -1153,6 +1153,23 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
         )
     }
 
+    /// Replace the complete label set in one provider write after an exact
+    /// precondition read. This is the safe primitive for lifecycle transitions
+    /// that would otherwise expose an add/remove partial state between calls.
+    pub fn replace_labels(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+        labels: &BTreeSet<String>,
+    ) -> Result<GitHubMutationReceipt, MutationError> {
+        self.mutate_pull_request(
+            repository,
+            expected,
+            MutationKind::SetLabels,
+            replace_labels_command(repository, expected.number, labels),
+        )
+    }
+
     /// Enable squash auto-merge after exact precondition verification.
     pub fn enable_squash_auto_merge(
         &self,
@@ -2712,6 +2729,26 @@ fn edit_pull_request_command(
             flag.to_owned(),
             value.to_owned(),
         ])
+        .provider_write()
+}
+
+fn replace_labels_command(
+    repository: &RepositoryId,
+    number: PrNumber,
+    labels: &BTreeSet<String>,
+) -> CommandSpec {
+    let payload = serde_json::to_string(&serde_json::json!({"labels": labels}))
+        .expect("label replacement payload serializes");
+    CommandSpec::new("gh")
+        .args([
+            "api".to_owned(),
+            "--method".to_owned(),
+            "PUT".to_owned(),
+            format!("repos/{}/issues/{number}/labels", repository.slug()),
+            "--input".to_owned(),
+            "-".to_owned(),
+        ])
+        .stdin(payload)
         .provider_write()
 }
 
@@ -4384,6 +4421,46 @@ mod tests {
             MutationError::StalePrecondition { changed_fields, .. }
                 if changed_fields == ["checks"]
         ));
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn complete_label_replacement_is_one_exact_provider_write() {
+        let repository = repository();
+        let mut expected = precondition(12);
+        expected.labels.insert("caravan-parked".to_owned());
+        let desired = BTreeSet::from(["caravan-closed".to_owned()]);
+        let before = pr_object_json(12, "feature/widget", "acme/widgets").replace(
+            r#""labels":[{"name":"caravan"}]"#,
+            r#""labels":[{"name":"caravan"},{"name":"caravan-parked"}]"#,
+        );
+        let after = before.replace(
+            r#""labels":[{"name":"caravan"},{"name":"caravan-parked"}]"#,
+            r#""labels":[{"name":"caravan-closed"}]"#,
+        );
+        let runner = FakeRunner::new(vec![
+            (
+                pull_request_command(&repository, "12"),
+                CommandOutput::success(before),
+            ),
+            (
+                replace_labels_command(&repository, PrNumber(12), &desired),
+                CommandOutput::success(r#"[{"name":"caravan-closed"}]"#),
+            ),
+            (
+                pull_request_command(&repository, "12"),
+                CommandOutput::success(after),
+            ),
+        ]);
+        let adapter = GitHubMutationAdapter::new(runner);
+
+        let receipt = adapter
+            .replace_labels(&repository, &expected, &desired)
+            .expect("complete label replacement succeeds");
+
+        assert_eq!(receipt.kind, MutationKind::SetLabels);
+        assert_eq!(receipt.before.unwrap().labels, expected.labels);
+        assert_eq!(receipt.after.labels, desired);
         adapter.runner.assert_exhausted();
     }
 

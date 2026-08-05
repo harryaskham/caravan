@@ -245,8 +245,8 @@ pub struct ClosedLifecycleTransitionReceipt {
     #[serde(default)]
     pub removed_active_labels: Vec<String>,
     pub terminal_label_added: bool,
-    /// Primitive exact-precondition writes, each with its own provider
-    /// before/after facts. Retaining these makes partial failures replayable.
+    /// The one exact-precondition complete-label replacement, with provider
+    /// before/after facts. A transition never exposes a multi-write partial state.
     #[serde(default)]
     pub provider_receipts: Vec<GitHubMutationReceipt>,
 }
@@ -1047,6 +1047,14 @@ pub trait SyncProvider {
         label: &str,
     ) -> Result<GitHubMutationReceipt, MutationError>;
 
+    /// Replace all labels in one provider mutation after an exact-state read.
+    fn replace_labels(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+        labels: &BTreeSet<String>,
+    ) -> Result<GitHubMutationReceipt, MutationError>;
+
     fn pull_request_comment_bodies(
         &self,
         repository: &RepositoryId,
@@ -1300,6 +1308,15 @@ impl<R: crate::command::CommandRunner> SyncProvider for GitHubMutationAdapter<R>
         self.remove_label(repository, expected, label)
     }
 
+    fn replace_labels(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+        labels: &BTreeSet<String>,
+    ) -> Result<GitHubMutationReceipt, MutationError> {
+        self.replace_labels(repository, expected, labels)
+    }
+
     fn pull_request_comment_bodies(
         &self,
         repository: &RepositoryId,
@@ -1470,6 +1487,63 @@ fn closed_lifecycle_failure_classification(error: &MutationError) -> &'static st
     }
 }
 
+fn closed_lifecycle_provider_read_error(
+    error: &MutationError,
+    planned: &PullRequestSnapshot,
+) -> AppError {
+    AppError::structured(
+        ErrorCategory::ExecutionFailure,
+        "closed_pr_terminalization_provider_read_failed",
+        format!(
+            "could not freshly read provider state for PR #{} immediately before label cleanup: {error}",
+            planned.number
+        ),
+        Some(json!({
+            "classification": "provider_state_unknown",
+            "operation": "fresh_provider_read",
+            "pr": planned.number,
+            "planned": planned,
+            "source": error.to_string(),
+            "mutated": false,
+            "resumable": true,
+            "branch_action": "preserved",
+            "safe_next_action": "rerun the same trusted sync; cleanup requires a fresh authoritative CLOSED-without-merge read",
+        })),
+    )
+}
+
+fn closed_lifecycle_plan_drift_error(
+    planned: &PullRequestSnapshot,
+    fresh: &PullRequestSnapshot,
+) -> AppError {
+    let classification = if fresh.is_merged() {
+        "provider_race_merged"
+    } else if fresh.state == PullRequestState::Open {
+        "provider_race_reopened"
+    } else {
+        "provider_race_closed_generation_changed"
+    };
+    AppError::structured(
+        ErrorCategory::ExecutionFailure,
+        "closed_pr_terminalization_plan_drift",
+        format!(
+            "PR #{} changed after cleanup planning; no labels were written",
+            planned.number
+        ),
+        Some(json!({
+            "classification": classification,
+            "operation": "fresh_provider_read",
+            "pr": planned.number,
+            "planned": planned,
+            "fresh": fresh,
+            "mutated": false,
+            "resumable": true,
+            "branch_action": "preserved",
+            "safe_next_action": "rerun the same trusted sync from fresh provider discovery",
+        })),
+    )
+}
+
 fn closed_lifecycle_mutation_error(
     error: &MutationError,
     operation: &str,
@@ -1545,11 +1619,14 @@ fn record_closed_lifecycle_mutation(
 
 /// Converge terminal closed records before any active queue logic runs.
 ///
-/// Closed-unmerged rows gain `caravan-closed` before active labels are removed,
-/// so a provider race cannot silently erase provenance. Open/merged rows lose a
-/// stale terminal label and otherwise retain normal lifecycle labels. Every
-/// primitive is exact-precondition fenced and a changed pass returns before
-/// repair/rebase/auto-merge so terminal records never trigger active work.
+/// Closed-unmerged rows gain `caravan-closed` while active labels are removed
+/// in one complete-label provider mutation, so a race cannot expose partial
+/// lifecycle labels. Open/merged rows lose only a stale terminal label. Every
+/// candidate is freshly refetched and exact-precondition fenced immediately
+/// before its single write; a changed pass returns before repair/rebase/auto-
+/// merge so terminal records never trigger active work.
+// Keep the fresh-read lease, one-write label transaction, and lifecycle-specific
+// postconditions visible in one linear safety boundary.
 #[allow(clippy::too_many_lines)]
 fn reconcile_closed_lifecycle(
     status: &StatusOutput,
@@ -1566,154 +1643,129 @@ fn reconcile_closed_lifecycle(
         .cloned()
         .collect::<Vec<_>>();
 
-    for before in candidates {
+    for planned in candidates {
         let receipt_start = output.provider_receipts.len();
-        let mut current = before.clone();
-        let mut removed_active_labels = Vec::new();
-        let mut terminal_label_added = false;
+        // Discovery may be historical last-good evidence. Eligibility is
+        // therefore established again from a fresh authoritative provider read
+        // before constructing any write. Open, merged, reopened, or otherwise
+        // drifted facts refuse the stale plan with zero label mutations.
+        let fresh = provider
+            .refetch_pull_request(&status.repository, planned.number)
+            .map_err(|error| closed_lifecycle_provider_read_error(&error, &planned))?;
+        if !PullRequestPrecondition::from(&planned)
+            .mutation_identity_eq(&PullRequestPrecondition::from(&fresh))
+        {
+            return Err(closed_lifecycle_plan_drift_error(&planned, &fresh));
+        }
 
-        if before.is_closed_unmerged() {
-            if !current.has_label(CLOSED_LABEL) {
-                let receipt = provider
-                    .add_label(
-                        &status.repository,
-                        &PullRequestPrecondition::from(&current),
-                        CLOSED_LABEL,
-                    )
-                    .map_err(|error| {
-                        closed_lifecycle_mutation_error(
-                            &error,
-                            "add_terminal_label",
-                            &before,
-                            &output.provider_receipts[receipt_start..],
-                        )
-                    })?;
-                current = receipt.after.clone();
-                record_closed_lifecycle_mutation(
-                    &mut output,
-                    receipt,
-                    "added terminal caravan-closed provenance to closed-unmerged PR",
-                );
-                terminal_label_added = true;
-                if !current.is_closed_unmerged() {
-                    return Err(closed_lifecycle_postcondition_error(
-                        "add_terminal_label",
-                        &before,
-                        &current,
+        if fresh.is_closed_unmerged() {
+            let mut desired_labels = fresh.labels.clone();
+            let terminal_label_added = desired_labels.insert(CLOSED_LABEL.to_owned());
+            let removed_active_labels = [PARKED_LABEL, "caravan"]
+                .into_iter()
+                .filter(|label| desired_labels.remove(*label))
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            if !terminal_label_added && removed_active_labels.is_empty() {
+                continue;
+            }
+
+            // One complete-label replacement avoids the observable partial
+            // states produced by add-then-remove sequencing. The adapter repeats
+            // the exact provider precondition immediately before this one write.
+            let receipt = provider
+                .replace_labels(
+                    &status.repository,
+                    &PullRequestPrecondition::from(&fresh),
+                    &desired_labels,
+                )
+                .map_err(|error| {
+                    closed_lifecycle_mutation_error(
+                        &error,
+                        "replace_terminal_labels",
+                        &planned,
                         &output.provider_receipts[receipt_start..],
-                    ));
-                }
-            }
-
-            for label in [PARKED_LABEL, "caravan"] {
-                if !current.has_label(label) {
-                    continue;
-                }
-                let operation = if label == PARKED_LABEL {
-                    "remove_parked_label"
-                } else {
-                    "remove_active_label"
-                };
-                let receipt = provider
-                    .remove_label(
-                        &status.repository,
-                        &PullRequestPrecondition::from(&current),
-                        label,
                     )
-                    .map_err(|error| {
-                        closed_lifecycle_mutation_error(
-                            &error,
-                            operation,
-                            &before,
-                            &output.provider_receipts[receipt_start..],
-                        )
-                    })?;
-                current = receipt.after.clone();
-                record_closed_lifecycle_mutation(
-                    &mut output,
-                    receipt,
-                    if label == PARKED_LABEL {
-                        "removed caravan-parked from closed-unmerged PR"
-                    } else {
-                        "removed active caravan membership from closed-unmerged PR"
-                    },
-                );
-                removed_active_labels.push(label.to_owned());
-                if !current.is_closed_unmerged() {
-                    return Err(closed_lifecycle_postcondition_error(
-                        operation,
-                        &before,
-                        &current,
-                        &output.provider_receipts[receipt_start..],
-                    ));
-                }
+                })?;
+            let current = receipt.after.clone();
+            record_closed_lifecycle_mutation(
+                &mut output,
+                receipt,
+                "atomically replaced closed-unmerged PR lifecycle labels",
+            );
+            if !current.is_closed_unmerged() || current.labels != desired_labels {
+                return Err(closed_lifecycle_postcondition_error(
+                    "replace_terminal_labels",
+                    &planned,
+                    &current,
+                    &output.provider_receipts[receipt_start..],
+                ));
             }
-
-            if terminal_label_added || !removed_active_labels.is_empty() {
-                output.transitions.push(ClosedLifecycleTransitionReceipt {
-                    pr: before.number,
-                    disposition: ClosedLifecycleDisposition::ClosedUnmerged,
-                    before,
-                    after: current,
-                    removed_active_labels,
-                    terminal_label_added,
-                    provider_receipts: output.provider_receipts[receipt_start..].to_vec(),
-                });
-            }
+            output.transitions.push(ClosedLifecycleTransitionReceipt {
+                pr: planned.number,
+                disposition: ClosedLifecycleDisposition::ClosedUnmerged,
+                before: planned,
+                after: current,
+                removed_active_labels,
+                terminal_label_added,
+                provider_receipts: output.provider_receipts[receipt_start..].to_vec(),
+            });
             continue;
         }
 
-        // `caravan-closed` never survives a reopen or merge. Remove only that
-        // terminal marker; active/parked membership remains governed by normal
-        // open-PR policy, while merged labels retain historical semantics.
-        if current.has_label(CLOSED_LABEL) {
-            let disposition = if current.is_merged() {
+        // `caravan-closed` never survives an independently discovered reopen or
+        // merge. Remove only that marker in one complete-label write; active and
+        // parked membership labels are preserved byte-for-byte.
+        if fresh.has_label(CLOSED_LABEL) {
+            let disposition = if fresh.is_merged() {
                 ClosedLifecycleDisposition::Merged
             } else {
                 ClosedLifecycleDisposition::Reopened
             };
+            let mut desired_labels = fresh.labels.clone();
+            desired_labels.remove(CLOSED_LABEL);
             let receipt = provider
-                .remove_label(
+                .replace_labels(
                     &status.repository,
-                    &PullRequestPrecondition::from(&current),
-                    CLOSED_LABEL,
+                    &PullRequestPrecondition::from(&fresh),
+                    &desired_labels,
                 )
                 .map_err(|error| {
                     closed_lifecycle_mutation_error(
                         &error,
                         "remove_stale_terminal_label",
-                        &before,
+                        &planned,
                         &output.provider_receipts[receipt_start..],
                     )
                 })?;
-            current = receipt.after.clone();
+            let current = receipt.after.clone();
             record_closed_lifecycle_mutation(
                 &mut output,
                 receipt,
-                "removed caravan-closed from non-terminal provider state",
+                "removed caravan-closed while preserving open or merged labels",
             );
-            let still_matches = match disposition {
+            let lifecycle_matches = match disposition {
                 ClosedLifecycleDisposition::Merged => current.is_merged(),
                 ClosedLifecycleDisposition::Reopened => {
                     current.state == PullRequestState::Open && current.merged_at.is_none()
                 }
                 ClosedLifecycleDisposition::ClosedUnmerged => false,
             };
-            if !still_matches {
+            if !lifecycle_matches || current.labels != desired_labels {
                 return Err(closed_lifecycle_postcondition_error(
                     "remove_stale_terminal_label",
-                    &before,
+                    &planned,
                     &current,
                     &output.provider_receipts[receipt_start..],
                 ));
             }
             output.transitions.push(ClosedLifecycleTransitionReceipt {
-                pr: before.number,
+                pr: planned.number,
                 disposition,
-                before,
+                before: planned,
                 after: current,
-                removed_active_labels,
-                terminal_label_added,
+                removed_active_labels: Vec::new(),
+                terminal_label_added: false,
                 provider_receipts: output.provider_receipts[receipt_start..].to_vec(),
             });
         }

@@ -1310,6 +1310,10 @@ pub enum MutationKind {
     SetBase,
     AddLabel,
     RemoveLabel,
+    /// One exact provider write replacing the complete label set. Used where a
+    /// multi-label lifecycle transition must never expose a partially applied
+    /// add/remove sequence.
+    SetLabels,
     /// One reviewed provider transaction coupling exact-head force intent with
     /// the requested queue-owned squash auto-merge postcondition.
     ForceIntentTransaction,

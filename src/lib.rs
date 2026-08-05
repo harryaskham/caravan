@@ -33,6 +33,7 @@ pub mod remote_lease;
 pub mod repair;
 pub mod required_runs;
 pub mod reshape;
+pub mod restore_parked;
 pub mod root_auto_merge;
 pub mod root_merge;
 pub mod squash_equivalence;
@@ -1288,6 +1289,13 @@ pub fn build_router() -> ToolRouter<AppContext> {
         "unpark",
         "Remove only engine-owned terminal-red parking after exact repository, head/base, membership, durable parking provenance, provider state, newest authoritative green checks, and every protection-declared required context are freshly revalidated with a check-sensitive provider preflight.",
         |context: &AppContext, input: unpark::UnparkInput| unpark::unpark(context, &input),
+    );
+    router.add_typed_tool_with_output_schema(
+        "restore_parked",
+        "Restore caravan and caravan-parked together on one exact open generation only when the latest durable parking event, membership generation, provider head/base, disabled auto-merge, and missing-label state all match; never creates or activates a replacement generation.",
+        |context: &AppContext, input: restore_parked::RestoreParkedInput| {
+            restore_parked::restore_parked(context, &input)
+        },
     );
     router.add_typed_tool_with_output_schema(
         "pause_recovery_prepare",

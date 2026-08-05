@@ -245,16 +245,21 @@ preconditions.
 
 Trusted `cara sync` discovery retains bounded closed history selected by each of
 `caravan`, `caravan-parked`, and `caravan-closed`. Before root merge, repair,
-physical rebase, admission, or auto-merge logic, sync detects exact provider
-state `CLOSED` with `mergedAt == null`, adds `caravan-closed`, removes
-`caravan-parked` and `caravan`, and returns after authoritative rediscovery.
-Branches, source/head/base identity, ownership, dead-letter evidence, and PR
-history are never deleted by this transition. Merged rows never retain
-`caravan-closed`; reopened rows lose only that terminal marker and resume normal
-open-PR policy. Each primitive write compares state, `mergedAt`, head, base,
-labels, and auto-merge immediately before mutation and returns provider
-before/after facts. Provider races are classified and resumable; an unchanged
-terminal row performs zero writes on every duplicate sync.
+physical rebase, admission, or auto-merge logic, sync freshly refetches each
+candidate from the authoritative provider. Only exact state `CLOSED` with
+`mergedAt == null` is eligible: one complete-label provider write adds
+`caravan-closed` while removing `caravan-parked` and `caravan`, then sync returns
+after authoritative rediscovery. Open, unknown, stale, reopened, merged, or
+drifted planned state refuses cleanup before any write. Branches,
+source/head/base identity, ownership, dead-letter evidence, and PR history are
+never deleted by this transition. Independently discovered merged rows never
+retain `caravan-closed`; independently discovered reopened rows lose only that
+terminal marker and resume normal open-PR policy. The complete-label write
+compares state, `mergedAt`, head, base, labels, and auto-merge immediately before
+mutation and returns provider before/after facts, so no multi-write partial label
+state is observable. Provider races and read failures are classified and
+resumable; an unchanged terminal row performs zero writes on every duplicate
+sync.
 
 ### Inspection
 
@@ -540,6 +545,7 @@ Splitting retargets the selected non-head to the default branch, making it a new
 - `cara pause --head-pr N --actor A --reason R` — place an explicit incident or maintenance hold on one exact caravan and disable only its head auto-merge.
 - `cara resume --head-pr N --actor A` — explicitly revalidate and release that hold.
 - `cara unpark --repository-slug OWNER/NAME --pr N --head H --base-ref BRANCH --base B --membership-generation G --parking-fingerprint F --provider-state open_parked --actor A --reason R` — recover one exact engine-owned terminal-red parked generation after its newest authoritative checks become green; this is separate from explicit pause resume.
+- `cara restore-parked --repository-slug OWNER/NAME --pr N --head H --base-ref BRANCH --base B --membership-generation G --parking-fingerprint F --provider-state open_labels_missing --actor A --reason R` — restore `caravan` and `caravan-parked` together after a stale cleanup stripped both from the exact still-open parked generation; require the latest durable parking event and its same-generation provider receipt, preserve unrelated labels, keep auto-merge disabled, and never create or activate a replacement.
 - `cara --json pause-recovery prepare|checkpoint-base|checkpoint-head|finalize|rollback ...` — bind one exact external owner generation to an already-active pause; checkpoint independently rediscovered external base/head writes; then release only after exact final virtual-merge/check attestation or exact old-state rollback. This surface never mutates the provider.
 - `cara loop` — repeatedly run `sync --all` at the configured interval. A failed tick is bounded evidence, not a stop condition: canonical events are dispatched to configured hooks and the loop keeps ticking so retryable provider races, moved default branches, and unresolved external decisions converge without an operator restart. Only an explicit stop signal ends it, and the summary reports total, failed, and consecutive-failure counts plus bounded recent-failure receipts. `loop --once` remains a single bounded tick and still returns its typed error.
 - `cara loop --manual [--shell COMMAND]` — CLI-only human controller. At an exact `external_decision`, persist private bounded decision JSON, release the operation lock, inherit the controlling TTY in a safe affected/repair workspace, and run `$SHELL -i` or the explicit command. Zero exit triggers fresh rediscovery and another exact tick; nonzero stops with evidence. Refuse JSON/MCP/non-TTY use.
@@ -708,6 +714,18 @@ records old/new labels and state, required-context assessment,
 provider evidence, and an evidence fingerprint; an exact retry returns that
 receipt without mutation. `pause_not_found`, raw label edits, and `rejoin` are
 never fallback authority.
+
+`restore-parked` is the only repair authority when a stale terminalization pass
+removed both active and parking labels from an otherwise unchanged open parked
+generation. It requires exact repository/head/base, the prior membership
+generation, the latest non-retired `caravan_parked` event fingerprint, and that
+event's provider receipt proving both labels on the same generation. Fresh
+provider state must be open and unmerged with auto-merge disabled, both lifecycle
+labels missing, and no terminal or evicted marker. One complete-label write
+restores `caravan` plus `caravan-parked` while preserving unrelated labels, then
+full rediscovery must reproduce the event's member ordering outside active
+capacity. Partial labels, stale or unknown provider state, later unpark
+provenance, topology drift, or a replacement PR all refuse.
 
 The parked topology and its problems remain visible for exact
 scheduler repair routing, but a problem scoped wholly to parked caravans does
