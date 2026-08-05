@@ -608,7 +608,7 @@ mod tests {
         for (name, source, expected) in [
             ("force", include_str!("force.rs"), 1),
             ("force_intent", include_str!("force_intent.rs"), 1),
-            ("pause_resume", include_str!("pause.rs"), 2),
+            ("pause_resume_recovery", include_str!("pause.rs"), 3),
             ("priority", include_str!("priority.rs"), 1),
             ("reshape", include_str!("reshape.rs"), 1),
             ("navigation", include_str!("navigation.rs"), 2),
@@ -623,6 +623,20 @@ mod tests {
                 production.matches("lock.runner(").count(),
                 expected,
                 "{name} has an unfenced operation runner"
+            );
+        }
+
+        let pause = include_str!("pause.rs")
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+        for operation in ["pause", "resume", "pause-recovery"] {
+            assert_eq!(
+                pause
+                    .matches(&format!("acquire_writer_operation(\"{operation}\")"))
+                    .count(),
+                1,
+                "{operation} must have exactly one operation boundary"
             );
         }
     }
