@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "bead": "bd-71e444",
+  "result": "accepted",
+  "cara": {
+    "version": "0.0.79",
+    "release_tag": "v0.0.79",
+    "release_commit": "1d2194abdd6bedbcf36350cb1c7ecb5a2fcd98f2",
+    "workflow_run": "https://github.com/harryaskham/caravan/actions/runs/30718000286",
+    "workflow_conclusion": "success",
+    "published_assets": [
+      "cara-0.0.79-aarch64-darwin.sha256",
+      "cara-0.0.79-aarch64-darwin.tar.gz",
+      "cara-0.0.79-x86_64-linux.sha256",
+      "cara-0.0.79-x86_64-linux.tar.gz"
+    ]
+  },
+  "github_app": {
+    "slug": "caravan-agentic-merge-queue",
+    "installation_id": 150598516,
+    "repository": "harryaskham/caravan",
+    "provider_actor": "caravan-agentic-merge-queue[bot]"
+  },
+  "disposable_pr": {
+    "number": 16,
+    "url": "https://github.com/harryaskham/caravan/pull/16",
+    "branch": "canary/bd-71e444-app-telemetry-v079-20260801",
+    "never_merged": true
+  },
+  "physical_rewrite": {
+    "old_head_oid": "004616d5fe0ecabff510d60a11e1fc1b066312dd",
+    "new_head_oid": "f494a810fac2dc44f21f7160cd8341c1a530e768",
+    "old_base_oid": "d96d79c730e4042ead7501db5f4cedf3153d46c2",
+    "new_base_oid": "1d2194abdd6bedbcf36350cb1c7ecb5a2fcd98f2",
+    "new_tree_oid": "db7d2347284880bb31c4ac04b637cc7928865060",
+    "provider_force_push_actor": "caravan-agentic-merge-queue[bot]",
+    "provider_force_push_at": "2026-08-01T21:14:30Z",
+    "provider_head_after": "f494a810fac2dc44f21f7160cd8341c1a530e768"
+  },
+  "resumability": {
+    "first_attempt": "physical push completed, then stale_remote_revision compared provider new head against pre-push old head",
+    "first_attempt_expected_oid": "004616d5fe0ecabff510d60a11e1fc1b066312dd",
+    "first_attempt_advertised_oid": "f494a810fac2dc44f21f7160cd8341c1a530e768",
+    "retry_result": "success",
+    "retry_rebase_already_satisfied": true,
+    "follow_up_bug": "bd-59f6d2"
+  },
+  "membership_telemetry": {
+    "authenticated": true,
+    "auth_source": "github_app_installation",
+    "github_app_slug": "caravan-agentic-merge-queue",
+    "github_app_installation_id": 150598516,
+    "github_app_git_transport": "https_credential_helper",
+    "github_app_git_repository": "harryaskham/caravan",
+    "receipt": "v079-new-retry2-receipt.json"
+  },
+  "provider_actors": {
+    "pr_author": "caravan-agentic-merge-queue[bot]",
+    "force_push_actor": "caravan-agentic-merge-queue[bot]",
+    "label_actor": "caravan-agentic-merge-queue[bot]",
+    "comment_actor": "caravan-agentic-merge-queue[bot]"
+  },
+  "stale_lease_negative": {
+    "expected_stale_oid": "004616d5fe0ecabff510d60a11e1fc1b066312dd",
+    "remote_before": "f494a810fac2dc44f21f7160cd8341c1a530e768",
+    "result": "rejected: stale info",
+    "remote_after": "f494a810fac2dc44f21f7160cd8341c1a530e768",
+    "overwritten": false
+  },
+  "secret_audit": {
+    "token_or_private_key_pattern_files": 0,
+    "remote_url": "https://github.com/harryaskham/caravan.git",
+    "credential_in_remote_url": false,
+    "token_in_git_config": false,
+    "token_in_receipt_journal_comment_or_retained_artifact": false,
+    "broker_stdout_rendered": false
+  },
+  "cleanup": {
+    "evicted": true,
+    "pr_state": "closed",
+    "labels_after": [],
+    "branch_after": "absent",
+    "main_before": "1d2194abdd6bedbcf36350cb1c7ecb5a2fcd98f2",
+    "main_after": "1d2194abdd6bedbcf36350cb1c7ecb5a2fcd98f2",
+    "main_unchanged": true
+  }
+}

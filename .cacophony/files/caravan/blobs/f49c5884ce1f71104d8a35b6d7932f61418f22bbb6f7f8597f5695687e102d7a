@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "bead": "bd-71e444",
+  "result": "provider_identity_proven_telemetry_projection_gap",
+  "cara": {
+    "version": "0.0.78",
+    "release_tag": "v0.0.78",
+    "release_commit": "2c4e5c6d63ddc8681051912e58a6ecd61e98ef2d"
+  },
+  "github_app": {
+    "slug": "caravan-agentic-merge-queue",
+    "installation_id": 150598516,
+    "repository": "harryaskham/caravan",
+    "expected_actor": "caravan-agentic-merge-queue[bot]"
+  },
+  "disposable_pr": {
+    "number": 15,
+    "url": "https://github.com/harryaskham/caravan/pull/15",
+    "branch": "canary/bd-71e444-app-actor-20260801",
+    "never_merged": true
+  },
+  "positive_rewrite": {
+    "operation_id": "019fbef7-90b3-78b2-8fa5-66c81bc253ee",
+    "reason": "current_default_advanced",
+    "old_head_oid": "529dab29f4bf7859b267d886867c961f4253de14",
+    "new_head_oid": "b2e8cacf4b3efe30aa1f0e3228e40915b4637910",
+    "old_base_oid": "147153789b9173aff6413a52a457d77d812b883a",
+    "new_base_oid": "2c4e5c6d63ddc8681051912e58a6ecd61e98ef2d",
+    "new_tree_oid": "5f496ea014709720512977c96f064218f2b55d99",
+    "commit_count": 1,
+    "lease": "--force-with-lease=refs/heads/canary/bd-71e444-app-actor-20260801:529dab29f4bf7859b267d886867c961f4253de14",
+    "provider_head_after": "b2e8cacf4b3efe30aa1f0e3228e40915b4637910"
+  },
+  "provider_actors": {
+    "pr_author": "caravan-agentic-merge-queue[bot]",
+    "force_push_actor": "caravan-agentic-merge-queue[bot]",
+    "label_actor": "caravan-agentic-merge-queue[bot]",
+    "comment_actors": [
+      {
+        "actor": "caravan-agentic-merge-queue[bot]",
+        "url": "https://github.com/harryaskham/caravan/pull/15#issuecomment-5153231132"
+      },
+      {
+        "actor": "caravan-agentic-merge-queue[bot]",
+        "url": "https://github.com/harryaskham/caravan/pull/15#issuecomment-5153231704"
+      }
+    ],
+    "force_push_event": {
+      "actor": "caravan-agentic-merge-queue[bot]",
+      "created_at": "2026-08-01T20:15:15Z",
+      "new_head_oid": "b2e8cacf4b3efe30aa1f0e3228e40915b4637910"
+    }
+  },
+  "provider_api_telemetry": {
+    "authenticated": true,
+    "auth_source": "github_app_installation",
+    "github_app_slug": "caravan-agentic-merge-queue",
+    "github_app_installation_id": 150598516
+  },
+  "git_transport_telemetry": {
+    "expected": {
+      "github_app_git_transport": "https_credential_helper",
+      "github_app_git_repository": "harryaskham/caravan"
+    },
+    "observed_in_membership_receipt": false,
+    "note": "Provider force-push actor proves App-authenticated Git transport, but released Cara 0.0.78 new/evict receipts omit provider_api entirely, so the documented secret-free transport telemetry cannot be serialized from the mutating operation. Follow-up required."
+  },
+  "stale_lease_negative": {
+    "expected_stale_oid": "529dab29f4bf7859b267d886867c961f4253de14",
+    "remote_before": "b2e8cacf4b3efe30aa1f0e3228e40915b4637910",
+    "result": "rejected: stale info",
+    "remote_after": "b2e8cacf4b3efe30aa1f0e3228e40915b4637910",
+    "overwritten": false
+  },
+  "secret_audit": {
+    "token_or_private_key_pattern_files": 0,
+    "remote_url": "https://github.com/harryaskham/caravan.git",
+    "credential_in_remote_url": false,
+    "token_in_git_config": false,
+    "token_in_receipt_journal_comment_or_retained_artifact": false,
+    "broker_stdout_rendered": false
+  },
+  "cleanup": {
+    "evict_operation_id": "019fbefd-a8aa-7751-9eae-f0c340a32d94",
+    "pr_state": "closed",
+    "labels_after": [],
+    "branch_after": "absent",
+    "main_before": "2c4e5c6d63ddc8681051912e58a6ecd61e98ef2d",
+    "main_after": "2c4e5c6d63ddc8681051912e58a6ecd61e98ef2d",
+    "main_unchanged": true
+  }
+}
