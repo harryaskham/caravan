@@ -713,6 +713,18 @@ verdict removes the label and re-enters the caravan at its original FIFO age.
 Hooks may repair parked work but are never required for unrelated throughput.
 Run `cara init` after enabling park so the fixed label exists.
 
+If the same immutable parked head later becomes green but no normal sync tick can
+release it, use the reviewed `cara unpark` surface—not `resume`, `rejoin`, or a
+raw label edit. It requires exact repository/PR/head/base, current Caravan
+membership generation, the durable `caravan_parked` event fingerprint,
+`--provider-state open_parked`, actor, and reason. Cara freshly verifies one
+open enrolled non-evicted parked head, no explicit pause/recovery fence, and the
+newest authoritative green check generation under the normal writer guard and
+provider lease. It removes only `caravan-parked`, reruns fleet analysis, and
+returns a durable idempotent receipt with old/new labels and evidence. Use
+`cara --json unpark --help` (or the MCP `unpark` tool) to construct the reviewed
+request.
+
 `sync.missing_required_runs_grace_secs` is the bounded wait before a required
 context with zero reporting run or check-suite lineage on the exact current head
 is reported as `missing_required_runs` instead of pending. GitHub sometimes
@@ -970,6 +982,19 @@ CLI-only and creates no queue cursor or authority.
 Caravan intentionally owns no cross-process hook dedupe. A long-running hook can
 use an external lock and return success while that lock exists; repeated ticks
 then become visible no-ops rather than duplicate coordination.
+
+## Exact terminal-red parking recovery
+
+`unpark` is deliberately separate from incident-hold `resume`. After deploying
+a Cara build containing this transition, a live recovery must first capture
+fresh `cara status --json` and `cara log --kind caravan_parked --pr N --json`
+evidence, then invoke the exact reviewed request once and retain its JSON
+receipt. Never test deployment by mutating the parked PR with an older binary.
+For the motivating PR #2452, preserve head
+`8cbd01d9674e27a502f253e51e171d1b13822a53` and base
+`db3ceb84eea033a381aef3141988396ceb6d6ca4` as comparison evidence, but use the
+freshly re-read values and membership/provenance fingerprints at execution time;
+any drift must refuse.
 
 ## Incident holds
 

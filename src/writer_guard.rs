@@ -609,6 +609,7 @@ mod tests {
             ("force", include_str!("force.rs"), 1),
             ("force_intent", include_str!("force_intent.rs"), 1),
             ("pause_resume_recovery", include_str!("pause.rs"), 3),
+            ("terminal_red_unpark", include_str!("unpark.rs"), 1),
             ("priority", include_str!("priority.rs"), 1),
             ("reshape", include_str!("reshape.rs"), 1),
             ("navigation", include_str!("navigation.rs"), 2),

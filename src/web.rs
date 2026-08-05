@@ -304,6 +304,7 @@ pub enum WebAction {
     Evict(EvictInput),
     Pause(PauseInput),
     Resume(ResumeInput),
+    Unpark(crate::unpark::UnparkInput),
     PauseRecoveryPrepare(crate::pause::PauseRecoveryInput),
     PauseRecoveryCheckpointBase(crate::pause::PauseRecoveryInput),
     PauseRecoveryCheckpointHead(crate::pause::PauseRecoveryInput),
@@ -337,6 +338,7 @@ impl WebAction {
             Self::Evict(_) => "evict",
             Self::Pause(_) => "pause",
             Self::Resume(_) => "resume",
+            Self::Unpark(_) => "unpark",
             Self::PauseRecoveryPrepare(_) => "pause_recovery_prepare",
             Self::PauseRecoveryCheckpointBase(_) => "pause_recovery_checkpoint_base",
             Self::PauseRecoveryCheckpointHead(_) => "pause_recovery_checkpoint_head",
@@ -2138,6 +2140,7 @@ fn run_action(context: &AppContext, action: WebAction) -> Result<serde_json::Val
         WebAction::Evict(input) => serialize_action(crate::reshape::evict(context, &input)),
         WebAction::Pause(input) => serialize_action(crate::pause::pause(context, &input)),
         WebAction::Resume(input) => serialize_action(crate::pause::resume(context, &input)),
+        WebAction::Unpark(input) => serialize_action(crate::unpark::unpark(context, &input)),
         WebAction::PauseRecoveryPrepare(input) => serialize_action(crate::pause::pause_recovery(
             context,
             crate::pause::PauseRecoveryPhase::Prepare,

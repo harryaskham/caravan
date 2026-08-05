@@ -21,6 +21,7 @@ use caravan::{
         RepairRevokeGrantInput, RepairStartInput, RepairStatusInput,
     },
     self_update_check, self_update_run, self_update_status,
+    unpark::UnparkInput,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use feedback_cli::{FeedbackEvent, FeedbackKind, Reporter, Severity};
@@ -112,6 +113,8 @@ enum Command {
     Pause(PauseInput),
     /// Explicitly revalidate and resume one paused caravan.
     Resume(ResumeInput),
+    /// Recover one exact engine-owned terminal-red parked generation.
+    Unpark(UnparkInput),
     /// Exact-owner checkpoint/finalize/rollback for an already-paused caravan.
     #[command(subcommand)]
     PauseRecovery(Box<PauseRecoveryCommand>),
@@ -448,6 +451,7 @@ fn run(cli: &Cli) -> Result<(), i32> {
         Command::ForceIntent(command) => run_reviewed_force_intent(cli, command),
         Command::Pause(input) => run_pause(cli, input),
         Command::Resume(input) => run_resume(cli, input),
+        Command::Unpark(input) => run_unpark(cli, input),
         Command::PauseRecovery(command) => run_pause_recovery(cli, command),
         Command::Sync(input) => run_sync(cli, input),
         Command::Plan(command) => run_plan(cli, command),
@@ -1746,6 +1750,30 @@ fn run_resume(cli: &Cli, input: &ResumeInput) -> Result<(), i32> {
                     "changed"
                 } else {
                     "already resumed"
+                },
+                output.next
+            );
+            Ok(())
+        }
+        Err(error) => emit_human_error(error),
+    }
+}
+
+fn run_unpark(cli: &Cli, input: &UnparkInput) -> Result<(), i32> {
+    let context = load_context(cli)?;
+    let result = caravan::unpark::unpark(&context, input);
+    if cli.json {
+        return emit_result(true, result);
+    }
+    match result {
+        Ok(output) => {
+            println!(
+                "unpark #{}: {} — {}",
+                output.pr,
+                if output.mutated {
+                    "changed"
+                } else {
+                    "already recovered"
                 },
                 output.next
             );

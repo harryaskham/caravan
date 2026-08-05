@@ -40,6 +40,7 @@ mod stack_checkpoint;
 pub mod stack_membership;
 pub mod stack_policy;
 pub mod sync;
+pub mod unpark;
 pub mod web;
 pub mod writer_guard;
 
@@ -1282,6 +1283,11 @@ pub fn build_router() -> ToolRouter<AppContext> {
         "resume",
         "Explicitly resume a paused caravan only after exact head, base, labels, checks, state, and topology revalidation; stale facts fail closed.",
         |context: &AppContext, input: ResumeInput| pause::resume(context, &input),
+    );
+    router.add_typed_tool_with_output_schema(
+        "unpark",
+        "Remove only engine-owned terminal-red parking after exact repository, head/base, membership, durable parking provenance, provider state, and newest authoritative green checks are freshly revalidated.",
+        |context: &AppContext, input: unpark::UnparkInput| unpark::unpark(context, &input),
     );
     router.add_typed_tool_with_output_schema(
         "pause_recovery_prepare",

@@ -512,6 +512,7 @@ Splitting retargets the selected non-head to the default branch, making it a new
 - `cara repair abort --session ID --confirm` — after explicit review, remove only the local persisted workspace/session; provider state is never changed.
 - `cara pause --head-pr N --actor A --reason R` — place an explicit incident or maintenance hold on one exact caravan and disable only its head auto-merge.
 - `cara resume --head-pr N --actor A` — explicitly revalidate and release that hold.
+- `cara unpark --repository-slug OWNER/NAME --pr N --head H --base-ref BRANCH --base B --membership-generation G --parking-fingerprint F --provider-state open_parked --actor A --reason R` — recover one exact engine-owned terminal-red parked generation after its newest authoritative checks become green; this is separate from explicit pause resume.
 - `cara --json pause-recovery prepare|checkpoint-base|checkpoint-head|finalize|rollback ...` — bind one exact external owner generation to an already-active pause; checkpoint independently rediscovered external base/head writes; then release only after exact final virtual-merge/check attestation or exact old-state rollback. This surface never mutates the provider.
 - `cara loop` — repeatedly run `sync --all` at the configured interval. A failed tick is bounded evidence, not a stop condition: canonical events are dispatched to configured hooks and the loop keeps ticking so retryable provider races, moved default branches, and unresolved external decisions converge without an operator restart. Only an explicit stop signal ends it, and the summary reports total, failed, and consecutive-failure counts plus bounded recent-failure receipts. `loop --once` remains a single bounded tick and still returns its typed error.
 - `cara loop --manual [--shell COMMAND]` — CLI-only human controller. At an exact `external_decision`, persist private bounded decision JSON, release the operation lock, inherit the controlling TTY in a safe affected/repair workspace, and run `$SHELL -i` or the explicit command. Zero exit triggers fresh rediscovery and another exact tick; nonzero stops with evidence. Refuse JSON/MCP/non-TTY use.
@@ -657,7 +658,26 @@ even before matching downstream job names materialize. A new head or latest
 nonterminal/green verdict removes the parked label; re-entry retains the root's
 immutable original FIFO age. Park/unpark events bind exact ordering, member
 heads, current/superseded check evidence, classification, fingerprint and
-provider receipt. The parked topology and its problems remain visible for exact
+provider receipt.
+
+The reviewed `unpark` transition is the first-party recovery path when a parked
+immutable generation becomes green outside a normal sync tick. Its CLI, JSON,
+and MCP inputs bind the exact repository, PR, 40-character head and base,
+membership generation, durable `caravan_parked` event fingerprint,
+`open_parked` provider state, actor, and reason. Under the ordinary writer guard
+and provider lease it freshly rediscovers provider and Cara truth, requires one
+open enrolled non-evicted parked head, no active explicit pause/recovery fence,
+and the newest authoritative required-check lineage to be safely green. Older
+same-head red/cancelled/synthetic rows are retained as superseded evidence but
+do not veto a newer authoritative green generation. The operation removes only
+`caravan-parked`, reruns complete fleet analysis before releasing authority,
+and fails closed on topology, head, base, membership, provider-state, or check
+drift. Its durable exact-generation receipt records old/new labels and state,
+provider evidence, and an evidence fingerprint; an exact retry returns that
+receipt without mutation. `pause_not_found`, raw label edits, and `rejoin` are
+never fallback authority.
+
+The parked topology and its problems remain visible for exact
 scheduler repair routing, but a problem scoped wholly to parked caravans does
 not make the active fleet unhealthy, reject an independent candidate, or enter
 cross-caravan compatibility. A problem touching any unparked caravan still
