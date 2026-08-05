@@ -468,6 +468,19 @@ impl PullRequestSnapshot {
             && self.has_label("caravan")
             && !self.has_label("caravan-evicted")
     }
+
+    /// Provider terminal state that closed without landing a merge commit.
+    #[must_use]
+    pub fn is_closed_unmerged(&self) -> bool {
+        self.state == PullRequestState::Closed && self.merged_at.is_none()
+    }
+
+    /// Provider state that represents landed work, including a conservative
+    /// timestamp fallback for forges that report `CLOSED` plus `mergedAt`.
+    #[must_use]
+    pub fn is_merged(&self) -> bool {
+        self.state == PullRequestState::Merged || self.merged_at.is_some()
+    }
 }
 
 /// Latest provider rate-limit evidence observed during one Cara operation.
@@ -1190,6 +1203,10 @@ impl CumulativeTreeProof {
 pub struct PullRequestPrecondition {
     pub number: PrNumber,
     pub state: PullRequestState,
+    /// Provider merge timestamp is part of mutation authority: a `CLOSED`
+    /// row is terminal-unmerged only while this remains absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merged_at: Option<String>,
     pub head_oid: CommitOid,
     pub base_ref: String,
     pub base_oid: CommitOid,
@@ -1208,6 +1225,7 @@ impl PullRequestPrecondition {
     pub fn mutation_identity_eq(&self, other: &Self) -> bool {
         self.number == other.number
             && self.state == other.state
+            && self.merged_at == other.merged_at
             && self.head_oid == other.head_oid
             && self.base_ref == other.base_ref
             && self.base_oid == other.base_oid
@@ -1221,6 +1239,7 @@ impl From<&PullRequestSnapshot> for PullRequestPrecondition {
         Self {
             number: snapshot.number,
             state: snapshot.state,
+            merged_at: snapshot.merged_at.clone(),
             head_oid: snapshot.head.oid.clone(),
             base_ref: snapshot.base.name.clone(),
             base_oid: snapshot.base.oid.clone(),

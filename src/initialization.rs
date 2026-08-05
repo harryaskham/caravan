@@ -51,6 +51,11 @@ pub fn required_labels(
             "D93F0B",
             "Allow configured force handling for known CI failures",
         ),
+        required_label(
+            "caravan-closed",
+            "6E7781",
+            "Closed without merge; terminal Caravan provenance outside queue capacity",
+        ),
     ];
     if include_parked {
         labels.push(required_label(
@@ -954,7 +959,7 @@ mod tests {
                 .required_status_checks,
             ["Check & Lint"]
         );
-        assert_eq!(first.labels.len(), 6);
+        assert_eq!(first.labels.len(), 7);
         assert_eq!(
             first
                 .labels
@@ -965,6 +970,7 @@ mod tests {
                 "caravan",
                 "caravan-evicted",
                 "caravan-force",
+                "caravan-closed",
                 "caravan-priority:high",
                 "caravan-priority:normal",
                 "caravan-priority:low",
@@ -976,11 +982,11 @@ mod tests {
                 .iter()
                 .all(|receipt| receipt.state == ResourceState::Created)
         );
-        assert_eq!(first.labels[3].color, "B60205");
-        assert_eq!(first.labels[4].color, "D93F0B");
-        assert_eq!(first.labels[5].color, "FBCA04");
+        assert_eq!(first.labels[4].color, "B60205");
+        assert_eq!(first.labels[5].color, "D93F0B");
+        assert_eq!(first.labels[6].color, "FBCA04");
         assert_eq!(
-            first.labels[3].description,
+            first.labels[4].description,
             "Caravan automatic admission priority rank 1 (1 highest)"
         );
         let generated =
@@ -1041,7 +1047,7 @@ mod tests {
 
         let output = init_with_provider(&context, &repository(), "main", &provider).unwrap();
 
-        assert_eq!(output.labels.len(), 7);
+        assert_eq!(output.labels.len(), 8);
         let skip = output
             .labels
             .iter()
@@ -1316,6 +1322,7 @@ mod tests {
             status.missing_labels,
             [
                 "caravan-force",
+                "caravan-closed",
                 "caravan-priority:high",
                 "caravan-priority:normal",
                 "caravan-priority:low",

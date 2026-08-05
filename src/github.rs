@@ -24,6 +24,8 @@ const WORKFLOW_RUN_JSON_FIELDS: &str =
     "databaseId,headSha,status,conclusion,event,name,workflowName,url";
 /// Keeps JSON/MCP output and GraphQL cost bounded on pathological repositories.
 const MERGE_CANDIDATE_LIMIT: usize = 100;
+const PARKED_LABEL: &str = "caravan-parked";
+const CLOSED_LABEL: &str = "caravan-closed";
 
 /// Limits and label used by one discovery pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1584,6 +1586,9 @@ pub(crate) fn changed_precondition_fields(
     if expected.state != actual.state {
         changed.push("state".to_owned());
     }
+    if expected.merged_at != actual.merged_at {
+        changed.push("merged_at".to_owned());
+    }
     if expected.head_oid != actual.head_oid {
         changed.push("head_oid".to_owned());
     }
@@ -1816,27 +1821,53 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
                 ),
                 &repository,
             )?;
-        // bd-61024a: a member CLOSED without merging took its caravan with it,
-        // and `DissolvedMember` cannot report what discovery never fetches. Open
-        // and merged were both requested; closed was not, so the detection was
-        // dead code against the live fleet while passing a test whose fixture
-        // supplied the closed pull request by hand.
-        //
-        // `--state closed` also returns merged rows, so genuinely-unmerged ones
-        // are kept explicitly rather than by trusting the filter.
-        let (closed_labeled_prs, _closed_generation_facts) = self.pull_requests_with_generation(
-            labeled_pr_command(
-                &repository.slug(),
-                "closed",
-                &self.options.label,
-                self.options.merged_limit,
-                true,
-            ),
-            &repository,
-        )?;
-        let dissolved_labeled_prs = closed_labeled_prs
+        // Closed lifecycle rows remain provider history, but never active graph
+        // membership. Read every lifecycle label independently so an interrupted
+        // or older transition (active-only, parked-only, or terminal-only) is
+        // still discoverable and can be converged by the trusted sync adapter.
+        // `--state closed` also returns merged rows; retaining terminal-labelled
+        // merged rows lets sync remove an invalid `caravan-closed` label without
+        // ever treating landed work as closed-unmerged.
+        let (closed_active_prs, _closed_active_generation_facts) = self
+            .pull_requests_with_generation(
+                labeled_pr_command(
+                    &repository.slug(),
+                    "closed",
+                    &self.options.label,
+                    self.options.merged_limit,
+                    true,
+                ),
+                &repository,
+            )?;
+        let (closed_parked_prs, _closed_parked_generation_facts) = self
+            .pull_requests_with_generation(
+                labeled_pr_command(
+                    &repository.slug(),
+                    "closed",
+                    PARKED_LABEL,
+                    self.options.merged_limit,
+                    true,
+                ),
+                &repository,
+            )?;
+        let (closed_terminal_prs, _closed_terminal_generation_facts) = self
+            .pull_requests_with_generation(
+                labeled_pr_command(
+                    &repository.slug(),
+                    "closed",
+                    CLOSED_LABEL,
+                    self.options.merged_limit,
+                    true,
+                ),
+                &repository,
+            )?;
+        let closed_lifecycle_prs = closed_active_prs
             .into_iter()
-            .filter(|pull_request| pull_request.state == model::PullRequestState::Closed)
+            .chain(closed_parked_prs)
+            .chain(closed_terminal_prs)
+            .filter(|pull_request| {
+                pull_request.is_closed_unmerged() || pull_request.has_label(CLOSED_LABEL)
+            })
             .collect::<Vec<_>>();
         let generation_facts = generation_facts
             .into_iter()
@@ -1848,7 +1879,7 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
             .into_iter()
             .chain(open_labeled_prs)
             .chain(recently_merged_labeled_prs)
-            .chain(dissolved_labeled_prs)
+            .chain(closed_lifecycle_prs)
             .chain(current_pr.clone())
         {
             pull_requests
@@ -3258,10 +3289,18 @@ mod tests {
                 labeled_pr_command("acme/widgets", "merged", "caravan", 100, true),
                 CommandOutput::success(merged_pr_json()),
             ),
-            // bd-61024a: closed labelled pull requests are fetched so a member
-            // closed WITHOUT merging is reported rather than vanishing.
+            // Closed lifecycle rows are read by every lifecycle label so
+            // interrupted and already-terminal transitions remain visible.
             (
                 labeled_pr_command("acme/widgets", "closed", "caravan", 100, true),
+                CommandOutput::success("[]"),
+            ),
+            (
+                labeled_pr_command("acme/widgets", "closed", PARKED_LABEL, 100, true),
+                CommandOutput::success("[]"),
+            ),
+            (
+                labeled_pr_command("acme/widgets", "closed", CLOSED_LABEL, 100, true),
                 CommandOutput::success("[]"),
             ),
         ]
@@ -3275,6 +3314,20 @@ mod tests {
 
     fn merged_pr_json() -> &'static str {
         r#"[{"number":9,"title":"Merged queue change","state":"MERGED","isDraft":false,"headRefName":"old-head","headRefOid":"head-9","headRepository":{"name":"widgets","nameWithOwner":"acme/widgets"},"headRepositoryOwner":{"login":"acme"},"isCrossRepository":false,"baseRefName":"main","baseRefOid":"base-9","labels":[{"name":"caravan"}],"autoMergeRequest":null,"createdAt":"2026-07-17T08:00:00Z","mergedAt":"2026-07-17T09:00:00Z","url":"https://example.test/pr/9","updatedAt":"2026-07-17T09:00:00Z"}]"#
+    }
+
+    fn closed_pr_json(number: u64, label: &str) -> String {
+        let mut rows: Vec<serde_json::Value> = serde_json::from_str(&pr_list_json(
+            number,
+            &format!("closed-{number}"),
+            "acme/widgets",
+            false,
+        ))
+        .unwrap();
+        rows[0]["state"] = serde_json::json!("CLOSED");
+        rows[0]["mergedAt"] = serde_json::Value::Null;
+        rows[0]["labels"] = serde_json::json!([{"name": label}]);
+        serde_json::to_string(&rows).unwrap()
     }
 
     fn pr_object_json(number: u64, branch: &str, repository: &str) -> String {
@@ -3310,6 +3363,7 @@ mod tests {
         PullRequestPrecondition {
             number: PrNumber(number),
             state: model::PullRequestState::Open,
+            merged_at: None,
             head_oid: CommitOid(format!("head-{number}")),
             base_ref: "main".to_owned(),
             base_oid: CommitOid(format!("base-{number}")),
@@ -3399,6 +3453,39 @@ mod tests {
             .expect("merged predecessor is present");
         assert_eq!(merged.state, model::PullRequestState::Merged);
         assert!(merged.checks.is_empty());
+        discovery.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn discovery_retains_active_parked_and_terminal_closed_lifecycle_rows() {
+        let mut calls = successful_discovery_calls("[]");
+        calls[7].1 = CommandOutput::success(closed_pr_json(20, "caravan"));
+        calls[8].1 = CommandOutput::success(closed_pr_json(21, PARKED_LABEL));
+        calls[9].1 = CommandOutput::success(closed_pr_json(22, CLOSED_LABEL));
+        // The checkout branch has no matching PR, so fleet discovery attempts
+        // one bounded historical lookup after lifecycle inventory.
+        calls.push((
+            branch_pr_history_command("acme/widgets", "feature/widget", 100),
+            CommandOutput::success("[]"),
+        ));
+        let discovery = GitHubDiscovery::new(FakeRunner::new(calls));
+
+        let snapshot = discovery
+            .discover()
+            .expect("closed lifecycle history resolves");
+
+        let observed = snapshot
+            .pull_requests
+            .iter()
+            .filter(|pull_request| pull_request.is_closed_unmerged())
+            .map(|pull_request| pull_request.number)
+            .collect::<Vec<_>>();
+        assert_eq!(observed, [PrNumber(20), PrNumber(21), PrNumber(22)]);
+        assert_eq!(
+            snapshot.pull_requests.len(),
+            4,
+            "merged history is preserved too"
+        );
         discovery.runner.assert_exhausted();
     }
 
@@ -3878,6 +3965,14 @@ mod tests {
                 labeled_pr_command("acme/widgets", "closed", "caravan", 100, true),
                 CommandOutput::success("[]"),
             ),
+            (
+                labeled_pr_command("acme/widgets", "closed", PARKED_LABEL, 100, true),
+                CommandOutput::success("[]"),
+            ),
+            (
+                labeled_pr_command("acme/widgets", "closed", CLOSED_LABEL, 100, true),
+                CommandOutput::success("[]"),
+            ),
         ]);
         let discovery = GitHubDiscovery::new(runner);
 
@@ -3906,8 +4001,8 @@ mod tests {
         ));
         assert_eq!(
             calls.len(),
-            9,
-            "non-PR branches add only one bounded history lookup"
+            11,
+            "non-PR branches add only one bounded history lookup beyond lifecycle discovery"
         );
         let merged_command = &calls[6].0;
         let projection = merged_command.args.last().unwrap();
@@ -4116,9 +4211,9 @@ mod tests {
     fn rejects_fork_only_active_caravan_heads() {
         let fork_prs = pr_list_json(14, "fork-feature", "someone/widgets", true);
         let mut calls = successful_discovery_calls(&fork_prs);
-        calls.pop(); // closed-labelled dissolution query
-        calls.pop(); // merged-history query
-        calls.pop(); // lineage/history query; active-head validation stops before it
+        // Active-head validation stops immediately after the open inventory,
+        // before merge-candidate, merged-history, or three closed-lifecycle reads.
+        calls.truncate(5);
         let runner = FakeRunner::new(calls);
         let discovery = GitHubDiscovery::new(runner);
 
@@ -4171,6 +4266,14 @@ mod tests {
                 labeled_pr_command("acme/widgets", "closed", "caravan", 100, true),
                 CommandOutput::success("[]"),
             ),
+            (
+                labeled_pr_command("acme/widgets", "closed", PARKED_LABEL, 100, true),
+                CommandOutput::success("[]"),
+            ),
+            (
+                labeled_pr_command("acme/widgets", "closed", CLOSED_LABEL, 100, true),
+                CommandOutput::success("[]"),
+            ),
         ]);
         let discovery = GitHubDiscovery::new(runner);
 
@@ -4179,6 +4282,21 @@ mod tests {
         assert_eq!(snapshot.current_branch, None);
         assert_eq!(snapshot.current_pr, None);
         discovery.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn merge_timestamp_is_exact_mutation_authority() {
+        let mut expected = precondition(12);
+        expected.state = model::PullRequestState::Closed;
+        expected.merged_at = None;
+        let mut actual = expected.clone();
+        actual.merged_at = Some("2026-08-05T12:00:00Z".to_owned());
+
+        assert_eq!(
+            changed_precondition_fields(&expected, &actual),
+            ["merged_at"]
+        );
+        assert!(!expected.mutation_identity_eq(&actual));
     }
 
     #[test]

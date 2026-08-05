@@ -52,6 +52,7 @@ statement about one exact set of objects, never a permanent verdict about a PR.
 | A required check has **failed** | **skipped, queue advances** | the PR's owner |
 | A required check is still **running** | admitted; the tick then waits | nobody — automatic |
 | An existing Caravan is `caravan-parked` | exact head is repair-routed; independent admission advances | parked head owner or dispatched repair agent |
+| Provider PR is closed without merge | terminalized as `caravan-closed`; never enters active order or capacity | trusted sync, automatically |
 | Owner rejected it via `cara check --pr N` | **stays canonical, blocks** | the owner |
 | Behind the default branch but compatible | admitted; Cara rebases it | nobody — automatic |
 | Your checkout is on a merged/historical branch | irrelevant to selection | nobody — automatic |
@@ -113,7 +114,9 @@ as part of creation.
 
 `sync.max_caravans` defaults to `1` and fences only operations that form a new
 active caravan. Joining an existing caravan consumes no additional slot. Parked
-caravans are retained but excluded from the count. If policy is lowered below
+caravans are retained but excluded from the count. Closed-unmerged PRs are
+retained under `caravan-closed` as terminal records, reported separately by
+status, and never count as active or parked caravans. If policy is lowered below
 the number already active, all excess chains remain intact and continue to
 converge; status reports the excess and `new` fails before any provider write.
 Capacity is never permission to evict, merge, delete, or reshape existing work.
@@ -146,10 +149,18 @@ One `cara sync` tick is bounded and idempotent. It either converges or returns
 exactly one structured decision point.
 
 ```
-discover  → plan rebases → apply under exact leases
+discover  → terminalize exact closed-unmerged rows (return if changed)
+          → plan rebases → apply under exact leases
           → rediscover   → converge provider state
           → rediscover   → merge the root if it is green
 ```
+
+Terminalization runs only inside the reviewed sync writer boundary. It adds
+`caravan-closed` before removing `caravan-parked` and `caravan`, never deletes a
+branch, and emits exact before/after receipts. Merged and reopened rows lose only
+a stale terminal marker. State or `mergedAt` drift aborts with a classified,
+resumable provider-race receipt, and an already-terminal duplicate pass writes
+nothing.
 
 Every pass emits one compact receipt naming the verb and the counts it saw, so
 "the loop is running and declining to join" is distinguishable from "the loop is

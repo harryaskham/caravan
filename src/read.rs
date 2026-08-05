@@ -612,6 +612,13 @@ pub struct AutoAdmissionStatus {
     /// Deterministic parked caravan IDs excluded from capacity.
     #[serde(default)]
     pub parked_caravan_ids: Vec<PrNumber>,
+    /// Closed-without-merge lifecycle rows retained as terminal provenance.
+    /// These are records, never caravans, and consume no active capacity.
+    #[serde(default)]
+    pub terminal_closed_prs: usize,
+    /// Deterministic closed-without-merge PR IDs observed in bounded history.
+    #[serde(default)]
+    pub terminal_closed_pr_ids: Vec<PrNumber>,
     /// Active caravans above the configured fence; never repaired destructively.
     #[serde(default)]
     pub excess_active_caravans: usize,
@@ -641,6 +648,8 @@ impl Default for AutoAdmissionStatus {
             active_caravan_ids: Vec::new(),
             parked_caravans: 0,
             parked_caravan_ids: Vec::new(),
+            terminal_closed_prs: 0,
+            terminal_closed_pr_ids: Vec::new(),
             excess_active_caravans: 0,
             at_caravan_capacity: false,
             first_blocked_root_candidate: None,
@@ -675,6 +684,13 @@ impl AutoAdmissionStatus {
             .collect::<Vec<_>>();
         let active_caravans = active_caravan_ids.len();
         let parked_caravans = parked_caravan_ids.len();
+        let terminal_closed_pr_ids = analysis
+            .pull_requests
+            .values()
+            .filter(|pull_request| pull_request.is_closed_unmerged())
+            .map(|pull_request| pull_request.number)
+            .collect::<Vec<_>>();
+        let terminal_closed_prs = terminal_closed_pr_ids.len();
         let max_caravans = usize::try_from(config.max_caravans).unwrap_or(usize::MAX);
         Self {
             enabled: config.actions.join_unlabelled_prs,
@@ -684,6 +700,8 @@ impl AutoAdmissionStatus {
             active_caravan_ids,
             parked_caravans,
             parked_caravan_ids,
+            terminal_closed_prs,
+            terminal_closed_pr_ids,
             excess_active_caravans: active_caravans.saturating_sub(max_caravans),
             at_caravan_capacity: active_caravans >= max_caravans,
             first_blocked_root_candidate: (active_caravans >= max_caravans)

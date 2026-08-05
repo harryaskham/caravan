@@ -58,9 +58,11 @@ evidence once the number of active, non-parked caravans reaches the bound.
 Parked caravans never consume this capacity. Lowering the bound below an
 existing fleet is fault-safe: excess caravans remain valid and keep converging;
 the fence never authorizes deletion, eviction, merging, or reshaping. Status
-reports `max_caravans`, active/parked counts, `excess_active_caravans`, and
-`at_caravan_capacity`; plan and mutation refusals carry the same counts.
- A candidate incompatible with every target is
+reports `max_caravans`, active/parked counts, `terminal_closed_prs` and its
+bounded deterministic PR IDs, `excess_active_caravans`, and
+`at_caravan_capacity`; plan and mutation refusals carry the same active counts.
+Closed-unmerged records are terminal provenance, not caravans, and never consume
+capacity. A candidate incompatible with every target is
 labelled `caravan-join-skipped` and receives a durable generation-bound comment,
 then later candidates may be considered. The skip binds repository, candidate
 head/base, default generation, every tested tail generation, config fingerprint,
@@ -212,7 +214,8 @@ preconditions.
 - Init preflights repository write capability, squash auto-merge support, and
   default-branch protection with a required check or review policy. It creates
   `caravan` (`5319E7`, active member), `caravan-evicted` (`B60205`, evicted
-  member), and `caravan-force` (`D93F0B`, operator force exception). When
+  member), `caravan-force` (`D93F0B`, operator force exception), and
+  `caravan-closed` (`6E7781`, closed-unmerged terminal provenance). When
   `sync.actions.join_unlabelled_prs` is enabled it also requires
   `caravan-join-skipped` (`6F42C1`, generation-bound optimiser skip). Every
   configured `agent_priority_labels` entry follows in configured order. Priority-label
@@ -237,6 +240,21 @@ preconditions.
 - Status and check are read-only and report initialization readiness and the
   `cara init` continuation. Membership and sync fail before PR mutation while
   initialization is incomplete. Mutating commands perform a complete preflight before their first mutation, rediscover immediately before each GitHub mutation, and abort on stale preconditions.
+
+### Closed-unmerged terminalization
+
+Trusted `cara sync` discovery retains bounded closed history selected by each of
+`caravan`, `caravan-parked`, and `caravan-closed`. Before root merge, repair,
+physical rebase, admission, or auto-merge logic, sync detects exact provider
+state `CLOSED` with `mergedAt == null`, adds `caravan-closed`, removes
+`caravan-parked` and `caravan`, and returns after authoritative rediscovery.
+Branches, source/head/base identity, ownership, dead-letter evidence, and PR
+history are never deleted by this transition. Merged rows never retain
+`caravan-closed`; reopened rows lose only that terminal marker and resume normal
+open-PR policy. Each primitive write compares state, `mergedAt`, head, base,
+labels, and auto-merge immediately before mutation and returns provider
+before/after facts. Provider races are classified and resumable; an unchanged
+terminal row performs zero writes on every duplicate sync.
 
 ### Inspection
 
@@ -1370,7 +1388,7 @@ receipt policy.
 
 One local process at a time may mutate a repository, enforced by an operation lock under Git metadata. Read-only commands may run concurrently. The owner file remains below 16 KiB even for large fleets: sync checkpoints store schema-versioned counts, complete deterministic hashes, and bounded first/last samples of affected PRs, steps, plans, receipts, and events rather than embedding unbounded histories. The latest provider preconditions remain in the tail sample; GitHub rediscovery is still recovery authority and hashes bind omitted evidence.
 
-No local lock can serialize distributed machines. Every mutation therefore carries optimistic preconditions over PR number, head SHA, base ref/SHA, labels, state, and auto-merge state. CI/check progress is observation, not topology/base/label/comment/auto-merge mutation identity: queued/running/completed churn alone cannot stale an exact sync or join. CI diagnostics and rerun operations still bind exact checks, run IDs and heads. A real mismatch aborts with `stale_precondition`; the caller rediscover/reruns rather than overwriting concurrent work. Human CLI errors show bounded colored changed-field/count/OID/next-action summaries and direct operators to `--json` when full evidence exceeds 4 KiB; JSON/MCP always retain complete details.
+No local lock can serialize distributed machines. Every mutation therefore carries optimistic preconditions over PR number, head SHA, base ref/SHA, labels, state, `mergedAt`, and auto-merge state. CI/check progress is observation, not topology/base/label/comment/auto-merge mutation identity: queued/running/completed churn alone cannot stale an exact sync or join. CI diagnostics and rerun operations still bind exact checks, run IDs and heads. A real mismatch aborts with `stale_precondition`; the caller rediscover/reruns rather than overwriting concurrent work. Human CLI errors show bounded colored changed-field/count/OID/next-action summaries and direct operators to `--json` when full evidence exceeds 4 KiB; JSON/MCP always retain complete details.
 
 Lightweight provider/Git children remain bounded by `command_timeout_secs`. Repair cache-seed/fetch/checkout materialization is separately bounded by `repair.materialization_timeout_secs` because authenticated object transfer is not a lightweight probe. The manifest is checkpointed before each external phase and retains exact phase, budget, process-group/error evidence, object-cache Git identity, partial path, and safe resume/abort guidance after timeout or transport disconnect. A valid partial repository is resumed in place and reuses verified objects; invalid partial state is removed only after exact manifest/path validation. Provider head and target are always re-read, so the local cache is never publication authority.
 

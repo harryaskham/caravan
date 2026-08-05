@@ -993,6 +993,196 @@ fn healthy_chain() -> Vec<PullRequestSnapshot> {
 }
 
 #[test]
+fn closed_unmerged_active_member_is_terminalized_outside_capacity() {
+    let closed = pull_request(
+        41,
+        "closed-active",
+        "main",
+        PullRequestState::Closed,
+        AutoMergeState::disabled(),
+    );
+    let status = status(vec![closed.clone()], None, &clean);
+    assert_eq!(status.auto_admission.active_caravans, 0);
+    assert!(status.analysis.fleet.caravans.is_empty());
+    assert!(status.admission.candidates.is_empty());
+    assert_eq!(status.auto_admission.terminal_closed_prs, 1);
+    assert_eq!(
+        status.auto_admission.terminal_closed_pr_ids,
+        [closed.number]
+    );
+    let provider = FakeProvider::with_pull_requests(vec![closed.clone()]);
+
+    let output = reconcile_closed_lifecycle(&status, &provider).expect("trusted sync converges");
+
+    assert!(output.changed);
+    assert_eq!(output.transitions.len(), 1);
+    let transition = &output.transitions[0];
+    assert_eq!(
+        transition.disposition,
+        ClosedLifecycleDisposition::ClosedUnmerged
+    );
+    assert_eq!(transition.before.head, transition.after.head);
+    assert_eq!(transition.before.base, transition.after.base);
+    assert_eq!(transition.removed_active_labels, ["caravan"]);
+    assert!(transition.terminal_label_added);
+    assert_eq!(transition.provider_receipts.len(), 2);
+    assert_eq!(
+        provider.pulls.borrow()[&closed.number].labels,
+        BTreeSet::from([CLOSED_LABEL.to_owned()])
+    );
+    assert_eq!(
+        *provider.calls.borrow(),
+        [MutationKind::AddLabel, MutationKind::RemoveLabel]
+    );
+}
+
+#[test]
+fn closed_unmerged_parked_member_loses_both_active_labels() {
+    let mut closed = pull_request(
+        42,
+        "closed-parked",
+        "main",
+        PullRequestState::Closed,
+        AutoMergeState::disabled(),
+    );
+    closed.labels.insert(PARKED_LABEL.to_owned());
+    let status = status(vec![closed.clone()], None, &clean);
+    let provider = FakeProvider::with_pull_requests(vec![closed.clone()]);
+
+    let output = reconcile_closed_lifecycle(&status, &provider).expect("parked row converges");
+
+    assert_eq!(output.transitions.len(), 1);
+    assert_eq!(
+        output.transitions[0].removed_active_labels,
+        [PARKED_LABEL, "caravan"]
+    );
+    assert_eq!(
+        provider.pulls.borrow()[&closed.number].labels,
+        BTreeSet::from([CLOSED_LABEL.to_owned()])
+    );
+    assert_eq!(output.provider_receipts.len(), 3);
+}
+
+#[test]
+fn merged_pr_never_retains_terminal_closed_label() {
+    let mut merged = pull_request(
+        43,
+        "merged",
+        "main",
+        PullRequestState::Merged,
+        AutoMergeState::disabled(),
+    );
+    merged.labels.insert(CLOSED_LABEL.to_owned());
+    let status = status(vec![merged.clone()], None, &clean);
+    let provider = FakeProvider::with_pull_requests(vec![merged.clone()]);
+
+    let output = reconcile_closed_lifecycle(&status, &provider).expect("merged row converges");
+
+    assert_eq!(output.transitions.len(), 1);
+    assert_eq!(
+        output.transitions[0].disposition,
+        ClosedLifecycleDisposition::Merged
+    );
+    let pulls = provider.pulls.borrow();
+    let observed = &pulls[&merged.number];
+    assert!(observed.has_label("caravan"));
+    assert!(!observed.has_label(CLOSED_LABEL));
+    assert!(observed.is_merged());
+    assert_eq!(*provider.calls.borrow(), [MutationKind::RemoveLabel]);
+}
+
+#[test]
+fn reopened_pr_returns_to_normal_labels_without_terminal_marker() {
+    let mut reopened = pull_request(
+        44,
+        "reopened",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    reopened.labels.clear();
+    reopened.labels.insert(CLOSED_LABEL.to_owned());
+    let status = status(vec![reopened.clone()], None, &clean);
+    let provider = FakeProvider::with_pull_requests(vec![reopened.clone()]);
+
+    let output = reconcile_closed_lifecycle(&status, &provider).expect("reopened row converges");
+
+    assert_eq!(output.transitions.len(), 1);
+    assert_eq!(
+        output.transitions[0].disposition,
+        ClosedLifecycleDisposition::Reopened
+    );
+    let pulls = provider.pulls.borrow();
+    let observed = &pulls[&reopened.number];
+    assert_eq!(observed.state, PullRequestState::Open);
+    assert!(!observed.has_label(CLOSED_LABEL));
+    assert_eq!(*provider.calls.borrow(), [MutationKind::RemoveLabel]);
+}
+
+#[test]
+fn closed_terminalization_refuses_a_provider_reopen_race_before_write() {
+    let closed = pull_request(
+        45,
+        "provider-race",
+        "main",
+        PullRequestState::Closed,
+        AutoMergeState::disabled(),
+    );
+    let status = status(vec![closed.clone()], None, &clean);
+    let provider = FakeProvider::with_pull_requests(vec![closed.clone()]);
+    provider
+        .pulls
+        .borrow_mut()
+        .get_mut(&closed.number)
+        .unwrap()
+        .state = PullRequestState::Open;
+
+    let error = reconcile_closed_lifecycle(&status, &provider)
+        .expect_err("exact closed state must fence provider races");
+
+    assert_eq!(error.code(), "closed_pr_terminalization_failed");
+    assert_eq!(
+        error.details().unwrap()["classification"],
+        "provider_race_reopened"
+    );
+    let pulls = provider.pulls.borrow();
+    let observed = &pulls[&closed.number];
+    assert!(!observed.has_label(CLOSED_LABEL));
+    assert!(observed.has_label("caravan"));
+}
+
+#[test]
+fn duplicate_closed_terminalization_sync_issues_no_provider_writes() {
+    let closed = pull_request(
+        46,
+        "duplicate-sync",
+        "main",
+        PullRequestState::Closed,
+        AutoMergeState::disabled(),
+    );
+    let initial = status(vec![closed.clone()], None, &clean);
+    let provider = FakeProvider::with_pull_requests(vec![closed]);
+    let first = reconcile_closed_lifecycle(&initial, &provider).expect("first pass converges");
+    assert!(first.changed);
+    let call_count = provider.calls.borrow().len();
+    let terminal = provider.pulls.borrow()[&PrNumber(46)].clone();
+    let terminal_status = status(vec![terminal], None, &clean);
+
+    let duplicate = reconcile_closed_lifecycle(&terminal_status, &provider)
+        .expect("duplicate pass is idempotent");
+
+    assert!(!duplicate.changed);
+    assert!(duplicate.transitions.is_empty());
+    assert_eq!(provider.calls.borrow().len(), call_count);
+    assert_eq!(terminal_status.auto_admission.terminal_closed_prs, 1);
+    assert_eq!(terminal_status.auto_admission.active_caravans, 0);
+    assert_eq!(terminal_status.auto_admission.parked_caravans, 0);
+    assert!(terminal_status.analysis.fleet.problems.is_empty());
+    assert!(terminal_status.analysis.fleet.caravans.is_empty());
+    assert!(terminal_status.admission.candidates.is_empty());
+}
+
+#[test]
 fn no_write_caravan_plan_records_actions_without_provider_mutation() {
     let pulls = healthy_chain();
     let status = status(pulls.clone(), Some(PrNumber(1)), &clean);

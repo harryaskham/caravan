@@ -74,6 +74,7 @@ use plan::{plan_auto_admission_with_checker, plan_caravan_convergence};
 const MAX_SYNC_OPERATION_SECS: u64 = 3_600;
 const MAX_PARALLEL_REBASE_CHAINS: usize = 2;
 const PARKED_LABEL: &str = "caravan-parked";
+const CLOSED_LABEL: &str = "caravan-closed";
 /// Exact remote range/target verification plus one force-with-lease push.
 const PHYSICAL_APPLY_COMMAND_SLOTS_PER_PENDING_MEMBER: u64 = 3;
 /// A member whose exact cumulative ancestry already holds still revalidates
@@ -220,6 +221,34 @@ pub struct SyncTiming {
     pub initial_status_ms: u64,
     pub provider_convergence_ms: u64,
     pub final_status_ms: u64,
+}
+
+/// Exact terminal lifecycle outcome for a PR carrying `caravan-closed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ClosedLifecycleDisposition {
+    /// Provider reports CLOSED with no merge timestamp.
+    ClosedUnmerged,
+    /// A formerly terminal generation is open again.
+    Reopened,
+    /// Provider merge evidence wins over any stale terminal label.
+    Merged,
+}
+
+/// Trusted-sync receipt for one closed lifecycle label transition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ClosedLifecycleTransitionReceipt {
+    pub pr: PrNumber,
+    pub disposition: ClosedLifecycleDisposition,
+    pub before: PullRequestSnapshot,
+    pub after: PullRequestSnapshot,
+    #[serde(default)]
+    pub removed_active_labels: Vec<String>,
+    pub terminal_label_added: bool,
+    /// Primitive exact-precondition writes, each with its own provider
+    /// before/after facts. Retaining these makes partial failures replayable.
+    #[serde(default)]
+    pub provider_receipts: Vec<GitHubMutationReceipt>,
 }
 
 /// Scheduler-facing outcome of one bounded, idempotent sync tick.
@@ -803,6 +832,10 @@ pub struct SyncOutput {
     /// Exact provider before/after facts for completed remote mutations.
     #[serde(default)]
     pub provider_receipts: Vec<GitHubMutationReceipt>,
+    /// Closed/unmerged, reopened, and merged label convergence performed before
+    /// any active repair, rebase, capacity, or auto-merge logic.
+    #[serde(default)]
+    pub closed_lifecycle_transitions: Vec<ClosedLifecycleTransitionReceipt>,
     /// Durable proof that every converged caravan root carries required native
     /// SQUASH auto-merge on its exact current head, with engine provenance.
     /// Only populated under the historical `head_merge_actor="github"` policy.
@@ -1414,6 +1447,278 @@ fn sync_operation_budget(context: &AppContext) -> Duration {
             .max_duration_secs
             .min(MAX_SYNC_OPERATION_SECS),
     )
+}
+
+#[derive(Debug, Default)]
+struct ClosedLifecycleReconciliation {
+    changed: bool,
+    steps: Vec<MutationStep>,
+    provider_receipts: Vec<GitHubMutationReceipt>,
+    transitions: Vec<ClosedLifecycleTransitionReceipt>,
+}
+
+fn closed_lifecycle_failure_classification(error: &MutationError) -> &'static str {
+    match error {
+        MutationError::StalePrecondition { actual, .. } => match actual.state {
+            PullRequestState::Open => "provider_race_reopened",
+            PullRequestState::Merged => "provider_race_merged",
+            PullRequestState::Closed if actual.merged_at.is_some() => "provider_race_merged",
+            PullRequestState::Closed => "provider_race_closed_generation_changed",
+        },
+        MutationError::Provider(_) => "provider_mutation_failed",
+        _ => "provider_mutation_refused",
+    }
+}
+
+fn closed_lifecycle_mutation_error(
+    error: &MutationError,
+    operation: &str,
+    before: &PullRequestSnapshot,
+    completed: &[GitHubMutationReceipt],
+) -> AppError {
+    AppError::structured(
+        ErrorCategory::ExecutionFailure,
+        "closed_pr_terminalization_failed",
+        format!("closed PR lifecycle transition failed during {operation}: {error}"),
+        Some(json!({
+            "classification": closed_lifecycle_failure_classification(error),
+            "operation": operation,
+            "pr": before.number,
+            "before": before,
+            "completed_provider_receipts": completed,
+            "source": error.to_string(),
+            "resumable": true,
+            "branch_action": "preserved",
+            "safe_next_action": "rerun the same trusted sync; fresh provider state is the only cursor",
+        })),
+    )
+}
+
+fn closed_lifecycle_postcondition_error(
+    operation: &str,
+    before: &PullRequestSnapshot,
+    after: &PullRequestSnapshot,
+    completed: &[GitHubMutationReceipt],
+) -> AppError {
+    let classification = if after.is_merged() {
+        "provider_race_merged"
+    } else if after.state == PullRequestState::Open {
+        "provider_race_reopened"
+    } else {
+        "provider_race_closed_generation_changed"
+    };
+    AppError::structured(
+        ErrorCategory::ExecutionFailure,
+        "closed_pr_terminalization_provider_race",
+        format!(
+            "PR #{} changed provider lifecycle state during {operation}",
+            before.number
+        ),
+        Some(json!({
+            "classification": classification,
+            "operation": operation,
+            "pr": before.number,
+            "before": before,
+            "after": after,
+            "completed_provider_receipts": completed,
+            "resumable": true,
+            "branch_action": "preserved",
+            "safe_next_action": "rerun the same trusted sync; reopened and merged rows are reconciled without active-label repair",
+        })),
+    )
+}
+
+fn record_closed_lifecycle_mutation(
+    output: &mut ClosedLifecycleReconciliation,
+    receipt: GitHubMutationReceipt,
+    summary: &str,
+) {
+    output.changed = true;
+    output.steps.push(MutationStep {
+        kind: receipt.kind,
+        state: MutationStepState::Completed,
+        pr: Some(receipt.after.number),
+        summary: summary.to_owned(),
+    });
+    output.provider_receipts.push(receipt);
+}
+
+/// Converge terminal closed records before any active queue logic runs.
+///
+/// Closed-unmerged rows gain `caravan-closed` before active labels are removed,
+/// so a provider race cannot silently erase provenance. Open/merged rows lose a
+/// stale terminal label and otherwise retain normal lifecycle labels. Every
+/// primitive is exact-precondition fenced and a changed pass returns before
+/// repair/rebase/auto-merge so terminal records never trigger active work.
+#[allow(clippy::too_many_lines)]
+fn reconcile_closed_lifecycle(
+    status: &StatusOutput,
+    provider: &impl SyncProvider,
+) -> Result<ClosedLifecycleReconciliation, AppError> {
+    let mut output = ClosedLifecycleReconciliation::default();
+    let candidates = status
+        .analysis
+        .pull_requests
+        .values()
+        .filter(|pull_request| {
+            pull_request.is_closed_unmerged() || pull_request.has_label(CLOSED_LABEL)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    for before in candidates {
+        let receipt_start = output.provider_receipts.len();
+        let mut current = before.clone();
+        let mut removed_active_labels = Vec::new();
+        let mut terminal_label_added = false;
+
+        if before.is_closed_unmerged() {
+            if !current.has_label(CLOSED_LABEL) {
+                let receipt = provider
+                    .add_label(
+                        &status.repository,
+                        &PullRequestPrecondition::from(&current),
+                        CLOSED_LABEL,
+                    )
+                    .map_err(|error| {
+                        closed_lifecycle_mutation_error(
+                            &error,
+                            "add_terminal_label",
+                            &before,
+                            &output.provider_receipts[receipt_start..],
+                        )
+                    })?;
+                current = receipt.after.clone();
+                record_closed_lifecycle_mutation(
+                    &mut output,
+                    receipt,
+                    "added terminal caravan-closed provenance to closed-unmerged PR",
+                );
+                terminal_label_added = true;
+                if !current.is_closed_unmerged() {
+                    return Err(closed_lifecycle_postcondition_error(
+                        "add_terminal_label",
+                        &before,
+                        &current,
+                        &output.provider_receipts[receipt_start..],
+                    ));
+                }
+            }
+
+            for label in [PARKED_LABEL, "caravan"] {
+                if !current.has_label(label) {
+                    continue;
+                }
+                let operation = if label == PARKED_LABEL {
+                    "remove_parked_label"
+                } else {
+                    "remove_active_label"
+                };
+                let receipt = provider
+                    .remove_label(
+                        &status.repository,
+                        &PullRequestPrecondition::from(&current),
+                        label,
+                    )
+                    .map_err(|error| {
+                        closed_lifecycle_mutation_error(
+                            &error,
+                            operation,
+                            &before,
+                            &output.provider_receipts[receipt_start..],
+                        )
+                    })?;
+                current = receipt.after.clone();
+                record_closed_lifecycle_mutation(
+                    &mut output,
+                    receipt,
+                    if label == PARKED_LABEL {
+                        "removed caravan-parked from closed-unmerged PR"
+                    } else {
+                        "removed active caravan membership from closed-unmerged PR"
+                    },
+                );
+                removed_active_labels.push(label.to_owned());
+                if !current.is_closed_unmerged() {
+                    return Err(closed_lifecycle_postcondition_error(
+                        operation,
+                        &before,
+                        &current,
+                        &output.provider_receipts[receipt_start..],
+                    ));
+                }
+            }
+
+            if terminal_label_added || !removed_active_labels.is_empty() {
+                output.transitions.push(ClosedLifecycleTransitionReceipt {
+                    pr: before.number,
+                    disposition: ClosedLifecycleDisposition::ClosedUnmerged,
+                    before,
+                    after: current,
+                    removed_active_labels,
+                    terminal_label_added,
+                    provider_receipts: output.provider_receipts[receipt_start..].to_vec(),
+                });
+            }
+            continue;
+        }
+
+        // `caravan-closed` never survives a reopen or merge. Remove only that
+        // terminal marker; active/parked membership remains governed by normal
+        // open-PR policy, while merged labels retain historical semantics.
+        if current.has_label(CLOSED_LABEL) {
+            let disposition = if current.is_merged() {
+                ClosedLifecycleDisposition::Merged
+            } else {
+                ClosedLifecycleDisposition::Reopened
+            };
+            let receipt = provider
+                .remove_label(
+                    &status.repository,
+                    &PullRequestPrecondition::from(&current),
+                    CLOSED_LABEL,
+                )
+                .map_err(|error| {
+                    closed_lifecycle_mutation_error(
+                        &error,
+                        "remove_stale_terminal_label",
+                        &before,
+                        &output.provider_receipts[receipt_start..],
+                    )
+                })?;
+            current = receipt.after.clone();
+            record_closed_lifecycle_mutation(
+                &mut output,
+                receipt,
+                "removed caravan-closed from non-terminal provider state",
+            );
+            let still_matches = match disposition {
+                ClosedLifecycleDisposition::Merged => current.is_merged(),
+                ClosedLifecycleDisposition::Reopened => {
+                    current.state == PullRequestState::Open && current.merged_at.is_none()
+                }
+                ClosedLifecycleDisposition::ClosedUnmerged => false,
+            };
+            if !still_matches {
+                return Err(closed_lifecycle_postcondition_error(
+                    "remove_stale_terminal_label",
+                    &before,
+                    &current,
+                    &output.provider_receipts[receipt_start..],
+                ));
+            }
+            output.transitions.push(ClosedLifecycleTransitionReceipt {
+                pr: before.number,
+                disposition,
+                before,
+                after: current,
+                removed_active_labels,
+                terminal_label_added,
+                provider_receipts: output.provider_receipts[receipt_start..].to_vec(),
+            });
+        }
+    }
+    Ok(output)
 }
 
 #[derive(Default)]
@@ -2702,6 +3007,7 @@ fn bounded_prefix_output(
         }),
         lock_recovery,
         provider_receipts: progress.provider_receipts,
+        closed_lifecycle_transitions: Vec::new(),
         root_auto_merge: Vec::new(),
         root_promotion: progress.root_promotion,
         root_merge: progress.root_merge,
@@ -2780,6 +3086,7 @@ fn root_first_output(
         }),
         lock_recovery,
         provider_receipts: progress.provider_receipts,
+        closed_lifecycle_transitions: Vec::new(),
         root_auto_merge: progress.root_auto_merge,
         root_promotion: progress.root_promotion,
         root_merge: progress.root_merge,
@@ -2796,6 +3103,90 @@ fn root_first_output(
         hook_deliveries: Vec::new(),
         // This is intentionally the bounded pre-merge snapshot. Root receipts
         // are authoritative; whole-fleet rediscovery belongs to the next tick.
+        status,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn closed_lifecycle_output(
+    context: &AppContext,
+    input: &SyncInput,
+    started: Instant,
+    operation_deadline: Instant,
+    initial_status_elapsed: Duration,
+    convergence_elapsed: Duration,
+    final_status_elapsed: Duration,
+    reconciliation: ClosedLifecycleReconciliation,
+    status: StatusOutput,
+    lock_recovery: Option<OperationLockRecovery>,
+    lock: &mut WriterOperationGuard,
+) -> Result<SyncOutput, AppError> {
+    let operation_id = OperationId::new();
+    let receipt = OperationReceipt {
+        operation_id,
+        operation: "sync".to_owned(),
+        changed: reconciliation.changed,
+        completed_steps: reconciliation.steps,
+    };
+    lock.checkpoint(
+        "closed_lifecycle_converged",
+        json!({
+            "operation_receipt": &receipt,
+            "closed_lifecycle_transitions": &reconciliation.transitions,
+            "provider_receipts": checkpoint_provider_receipts(&reconciliation.provider_receipts),
+            "continuation": "ordinary active-fleet work is deferred to the next trusted sync tick",
+        }),
+        false,
+    )?;
+    lock.checkpoint("completed", json!({"operation_receipt": &receipt}), false)?;
+
+    let mut scheduler_status =
+        successful_scheduler_status(&status, &[], &[], context.config.rebase_on_join, &[], &[]);
+    if scheduler_status.disposition == SchedulerDisposition::Healthy {
+        scheduler_status.disposition = SchedulerDisposition::RetryTick;
+        scheduler_status.wake_class = SchedulerWakeClass::RetryTick;
+        scheduler_status.reason = format!(
+            "converged {} closed lifecycle row(s); active repair, rebase, admission, and merge work is deferred to the next tick",
+            reconciliation.transitions.len()
+        );
+    }
+    Ok(SyncOutput {
+        tick: SyncTickReceipt {
+            schema_version: 1,
+            verb: "sync".to_owned(),
+            caravans: status.analysis.fleet.caravans.len(),
+            unqueued: status.analysis.fleet.unqueued.len(),
+            synchronized: 0,
+            joins: 0,
+            changed: receipt.changed,
+        },
+        receipt,
+        auto_admission: AutoAdmissionOutput::disabled(context, input.all),
+        scheduler_status,
+        timing: Some(SyncTiming {
+            deadline_ms: duration_millis(operation_deadline.saturating_duration_since(started)),
+            total_ms: duration_millis(started.elapsed()),
+            initial_status_ms: duration_millis(initial_status_elapsed),
+            provider_convergence_ms: duration_millis(convergence_elapsed),
+            final_status_ms: duration_millis(final_status_elapsed),
+        }),
+        lock_recovery,
+        provider_receipts: reconciliation.provider_receipts,
+        closed_lifecycle_transitions: reconciliation.transitions,
+        root_auto_merge: Vec::new(),
+        root_promotion: Vec::new(),
+        root_merge: Vec::new(),
+        native_stack_land: Vec::new(),
+        required_runs: Vec::new(),
+        rebase_plans: Vec::new(),
+        rebase_receipts: Vec::new(),
+        historical_predecessor: read::historical_predecessor(&status),
+        synchronized_caravans: Vec::new(),
+        paused_caravans: Vec::new(),
+        head_advancements: Vec::new(),
+        ci: Vec::new(),
+        events: Vec::new(),
+        hook_deliveries: Vec::new(),
         status,
     })
 }
@@ -2897,9 +3288,63 @@ fn sync_with_lock(
     )?;
     let provider = GitHubMutationAdapter::new(runner);
 
-    // Root landing is the first provider-owned convergence action. A large
-    // unrelated inventory may consume later planning/analysis, but cannot make
-    // an already-admitted exact-green root miss the parent scheduler window.
+    // Terminal provider state is reconciled before root landing, repair,
+    // physical rebase, capacity, or admission. A changed pass returns after an
+    // authoritative rediscovery, so a closed generation can never trigger
+    // active queue work in the same tick.
+    let closed_lifecycle_started = Instant::now();
+    progress::emit(
+        "closed_lifecycle",
+        "converging closed-unmerged, reopened, and merged lifecycle labels",
+    );
+    let closed_lifecycle = reconcile_closed_lifecycle(&status, &provider)?;
+    if closed_lifecycle.changed {
+        let final_status_started = Instant::now();
+        status = read::status_with_deadline_and_budget(
+            context,
+            operation_deadline,
+            Some(&github_budget),
+        )
+        .map_err(|error| {
+            AppError::structured(
+                error.category(),
+                "closed_pr_terminalization_rediscovery_failed",
+                "closed PR labels changed but the authoritative postcondition could not be rediscovered",
+                Some(json!({
+                    "source": error.details(),
+                    "closed_lifecycle_transitions": &closed_lifecycle.transitions,
+                    "provider_receipts": &closed_lifecycle.provider_receipts,
+                    "resumable": true,
+                    "branch_action": "preserved",
+                    "safe_next_action": "rerun the same trusted sync to rediscover and converge exact provider state",
+                })),
+            )
+        })?;
+        progress::emit(
+            "closed_lifecycle",
+            format!(
+                "converged {} closed lifecycle row(s); active work deferred",
+                closed_lifecycle.transitions.len()
+            ),
+        );
+        return closed_lifecycle_output(
+            context,
+            input,
+            started,
+            operation_deadline,
+            initial_status_elapsed,
+            closed_lifecycle_started.elapsed(),
+            final_status_started.elapsed(),
+            closed_lifecycle,
+            status,
+            lock_recovery,
+            &mut lock,
+        );
+    }
+
+    // Root landing is the first active-fleet provider convergence action. A
+    // large unrelated inventory may consume later planning/analysis, but cannot
+    // make an already-admitted exact-green root miss the parent scheduler window.
     let root_first_started = Instant::now();
     progress::emit(
         "root_first",
@@ -3372,6 +3817,7 @@ fn sync_with_lock(
         }),
         lock_recovery,
         provider_receipts: progress.provider_receipts,
+        closed_lifecycle_transitions: Vec::new(),
         root_auto_merge: progress.root_auto_merge,
         root_promotion: progress.root_promotion,
         root_merge: progress.root_merge,
@@ -5080,6 +5526,7 @@ fn compact_precondition(precondition: &PullRequestPrecondition) -> Value {
     json!({
         "number": precondition.number,
         "state": precondition.state,
+        "merged_at": precondition.merged_at,
         "head_oid": precondition.head_oid,
         "base_ref": precondition.base_ref,
         "base_oid": precondition.base_oid,

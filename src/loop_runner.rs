@@ -373,6 +373,7 @@ mod tests {
                 timing: None,
                 lock_recovery: None,
                 provider_receipts: Vec::new(),
+                closed_lifecycle_transitions: Vec::new(),
                 root_auto_merge: Vec::new(),
                 root_promotion: Vec::new(),
                 root_merge: Vec::new(),

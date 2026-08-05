@@ -87,6 +87,13 @@ today.
   generations receive `caravan-join-skipped` plus a durable exact evidence
   receipt; unchanged generations are not retried, while candidate, default,
   tail, config, or heuristic changes invalidate the skip automatically.
+- Trusted sync terminalizes provider `CLOSED` rows with no merge timestamp before
+  any active queue work: it adds `caravan-closed`, removes `caravan` and
+  `caravan-parked`, preserves branches and provider history, then returns after
+  authoritative rediscovery. Reopened or merged rows lose only the stale
+  terminal marker. Every write is exact-state fenced and carries provider
+  before/after receipts; duplicate syncs issue no provider write. Status reports
+  terminal-closed rows separately and they never consume `max_caravans`.
 - Every non-clean attachment check also returns exact squash-equivalence
   evidence. A landed member reaches the default branch as one squash commit
   whose content matches that member's cumulative content but whose commit
@@ -262,8 +269,8 @@ as an absolute identity; outside a non-bare worktree fails without writing.
 First use is always explicit: run `cara status`, then `cara init`. Init atomically
 creates `.caravan/config.yaml` only when absent, verifies repository permission,
 default-branch protection, and squash auto-merge policy, and creates only the
-three fixed control labels (`caravan`, `caravan-evicted`, and `caravan-force`),
-the opt-in `caravan-join-skipped` label when greedy admission is enabled, and
+four fixed control labels (`caravan`, `caravan-evicted`, `caravan-force`, and
+`caravan-closed`), the opt-in `caravan-join-skipped` label when greedy admission is enabled, and
 configured priority labels. It never overwrites an existing config or label and
 never mutates a pull request. Repeated init calls are verification-only no-ops. Before creating any missing
 label, init reads the REST core rate-limit resource and requires a conservative

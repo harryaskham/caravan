@@ -554,6 +554,7 @@ mod tests {
         PullRequestPrecondition {
             number: PrNumber(12),
             state: PullRequestState::Open,
+            merged_at: None,
             head_oid: CommitOid("current-head".to_owned()),
             base_ref: "main".to_owned(),
             base_oid: CommitOid("current-base".to_owned()),
