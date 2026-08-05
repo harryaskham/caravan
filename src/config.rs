@@ -931,11 +931,7 @@ impl CaravanConfig {
                 "command_timeout_secs must be between 1 and {MAX_COMMAND_TIMEOUT_SECS}"
             )));
         }
-        if self.sync.max_caravans == 0 {
-            return Err(ConfigError::Validation(
-                "sync.max_caravans must be at least 1".to_owned(),
-            ));
-        }
+        self.validate_max_caravans()?;
         if !(1..=MAX_COMMAND_TIMEOUT_SECS).contains(&self.repair.materialization_timeout_secs) {
             return Err(ConfigError::Validation(format!(
                 "repair.materialization_timeout_secs must be between 1 and {MAX_COMMAND_TIMEOUT_SECS}"
@@ -995,6 +991,15 @@ impl CaravanConfig {
                     "hooks.{event:?}.timeout_secs must be between 1 and {MAX_HOOK_TIMEOUT_SECS}"
                 )));
             }
+        }
+        Ok(())
+    }
+
+    fn validate_max_caravans(&self) -> Result<(), ConfigError> {
+        if self.sync.max_caravans == 0 {
+            return Err(ConfigError::Validation(
+                "sync.max_caravans must be at least 1".to_owned(),
+            ));
         }
         Ok(())
     }

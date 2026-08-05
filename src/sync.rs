@@ -3889,8 +3889,7 @@ pub(crate) fn caravan_fleet_capacity_refusal(
         parked_caravan_ids,
         excess_active_caravans: active_caravans.saturating_sub(max),
         safe_next_action: format!(
-            "join candidate #{candidate_pr} to an existing compatible caravan, or let an active caravan land before forming another; {} parked caravan(s) do not consume the configured capacity and existing excess caravans remain untouched",
-            parked_caravans,
+            "join candidate #{candidate_pr} to an existing compatible caravan, or let an active caravan land before forming another; {parked_caravans} parked caravan(s) do not consume the configured capacity and existing excess caravans remain untouched",
         ),
     })
 }

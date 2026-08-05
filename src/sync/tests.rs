@@ -2708,9 +2708,8 @@ fn green_parked_caravan_stays_parked_when_reactivation_would_exceed_capacity() {
     let mut context = AppContext::default();
     context.config.sync.terminal_red.action = crate::config::TerminalRedAction::Park;
 
-    let error = match reconcile_terminal_red_parking(&context, &status, &provider) {
-        Err(error) => error,
-        Ok(_) => panic!("reactivation must not displace an active caravan"),
+    let Err(error) = reconcile_terminal_red_parking(&context, &status, &provider) else {
+        panic!("reactivation must not displace an active caravan");
     };
     assert_eq!(error.code(), "max_caravans_reached");
     assert_eq!(error.details().unwrap()["active_caravan_ids"], json!([10]));
