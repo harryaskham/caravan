@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::Args;
 use mcp_cli::ErrorCategory;
@@ -26,6 +26,10 @@ use crate::model::{
     RepositoryId,
 };
 use crate::read::StatusOutput;
+use crate::required_runs::{
+    RequiredContextsRead, RequiredRunsAssessment, RequiredRunsClock, RequiredRunsInput,
+    RequiredRunsStatus,
+};
 use crate::{AppContext, AppError};
 
 const PARKED_LABEL: &str = "caravan-parked";
@@ -89,11 +93,65 @@ pub struct UnparkOutput {
     pub authoritative_checks: Vec<CheckSnapshot>,
     #[serde(default)]
     pub superseded_checks: Vec<CheckSnapshot>,
+    /// Exact base-branch protection declaration consulted for this generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_context_read: Option<RequiredContextsRead>,
+    /// Protection-declared required-context proof on the exact generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_runs: Option<RequiredRunsAssessment>,
     pub mutated: bool,
     pub receipt: OperationReceipt,
     #[serde(default)]
     pub provider_receipts: Vec<GitHubMutationReceipt>,
     pub next: String,
+}
+
+trait UnparkProvider {
+    fn branch_required_contexts(
+        &self,
+        repository: &RepositoryId,
+        branch: &str,
+    ) -> Result<RequiredContextsRead, MutationError>;
+
+    fn verify_precondition_with_checks(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+    ) -> Result<PullRequestSnapshot, MutationError>;
+
+    fn remove_label(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+        label: &str,
+    ) -> Result<GitHubMutationReceipt, MutationError>;
+}
+
+impl<R: CommandRunner> UnparkProvider for GitHubMutationAdapter<R> {
+    fn branch_required_contexts(
+        &self,
+        repository: &RepositoryId,
+        branch: &str,
+    ) -> Result<RequiredContextsRead, MutationError> {
+        self.branch_required_contexts(repository, branch)
+    }
+
+    fn verify_precondition_with_checks(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+    ) -> Result<PullRequestSnapshot, MutationError> {
+        self.verify_precondition_with_checks(repository, expected)
+    }
+
+    fn remove_label(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+        label: &str,
+    ) -> Result<GitHubMutationReceipt, MutationError> {
+        self.remove_label(repository, expected, label)
+    }
 }
 
 /// Release one exact engine-owned parking fence. Explicit pauses remain a
@@ -125,14 +183,15 @@ pub fn unpark(context: &AppContext, input: &UnparkInput) -> Result<UnparkOutput,
                         .to_owned(),
                 ),
             };
-            let mut output = finish(&initial, &initial, input, prepared, recovered)?;
+            let required = read_required_contexts(&provider, &initial, input, true)?;
+            let mut output = finish(&initial, &initial, input, prepared, recovered, &required)?;
             "run `cara status`, then `cara sync --all`; Caravan membership was preserved"
                 .clone_into(&mut output.next);
             write_receipt(&context.repository_path, input, &output)?;
             remove_pending(&context.repository_path, input)?;
             return Ok(output);
         }
-        let fresh = prepare(&initial, input, &parked_fingerprint)?;
+        let fresh = prepare_with_provider(&initial, input, &parked_fingerprint, &provider)?;
         if fresh.evidence_fingerprint != prepared.evidence_fingerprint {
             return Err(refusal(
                 "unpark_pending_authority_drift",
@@ -143,7 +202,7 @@ pub fn unpark(context: &AppContext, input: &UnparkInput) -> Result<UnparkOutput,
         }
         prepared
     } else {
-        let prepared = prepare(&initial, input, &parked_fingerprint)?;
+        let prepared = prepare_with_provider(&initial, input, &parked_fingerprint, &provider)?;
         write_pending(&context.repository_path, input, &prepared)?;
         prepared
     };
@@ -162,12 +221,7 @@ pub fn unpark(context: &AppContext, input: &UnparkInput) -> Result<UnparkOutput,
         }),
         true,
     )?;
-    let provider_receipt = provider
-        .remove_label(
-            &initial.repository,
-            &PullRequestPrecondition::from(&prepared.pull),
-            PARKED_LABEL,
-        )
+    let provider_receipt = remove_parked_label(&provider, &initial.repository, &prepared)
         .map_err(|error| provider_error(&error, input))?;
 
     // Re-run complete fleet analysis while the operation guard and provider
@@ -175,7 +229,15 @@ pub fn unpark(context: &AppContext, input: &UnparkInput) -> Result<UnparkOutput,
     // authority: topology, membership, head/base, checks, and labels must all
     // survive rediscovery.
     let final_status = crate::read::status(context)?;
-    let mut output = finish(&initial, &final_status, input, prepared, provider_receipt)?;
+    let final_required = read_required_contexts(&provider, &final_status, input, true)?;
+    let mut output = finish(
+        &initial,
+        &final_status,
+        input,
+        prepared,
+        provider_receipt,
+        &final_required,
+    )?;
     "run `cara status`, then `cara sync --all`; Caravan membership was preserved"
         .clone_into(&mut output.next);
     write_receipt(&context.repository_path, input, &output)?;
@@ -196,6 +258,55 @@ struct Prepared {
     evidence_fingerprint: String,
     authoritative_checks: Vec<CheckSnapshot>,
     superseded_checks: Vec<CheckSnapshot>,
+    #[serde(default)]
+    required_context_read: Option<RequiredContextsRead>,
+    #[serde(default)]
+    required_runs: Option<RequiredRunsAssessment>,
+}
+
+fn prepare_with_provider(
+    status: &StatusOutput,
+    input: &UnparkInput,
+    parked_fingerprint: &str,
+    provider: &impl UnparkProvider,
+) -> Result<Prepared, AppError> {
+    let required = read_required_contexts(provider, status, input, false)?;
+    let prepared = prepare(status, input, parked_fingerprint, &required)?;
+    provider
+        .verify_precondition_with_checks(
+            &status.repository,
+            &PullRequestPrecondition::from(&prepared.pull),
+        )
+        .map_err(|error| provider_preflight_error(&error, input))?;
+    Ok(prepared)
+}
+
+fn read_required_contexts(
+    provider: &impl UnparkProvider,
+    status: &StatusOutput,
+    input: &UnparkInput,
+    provider_mutated: bool,
+) -> Result<RequiredContextsRead, AppError> {
+    let branch = status
+        .analysis
+        .pull_requests
+        .get(&PrNumber(input.pr))
+        .map_or(input.base_ref.as_str(), |pull| pull.base.name.as_str());
+    provider
+        .branch_required_contexts(&status.repository, branch)
+        .map_err(|error| required_contexts_error(&error, input, provider_mutated))
+}
+
+fn remove_parked_label(
+    provider: &impl UnparkProvider,
+    repository: &RepositoryId,
+    prepared: &Prepared,
+) -> Result<GitHubMutationReceipt, MutationError> {
+    provider.remove_label(
+        repository,
+        &PullRequestPrecondition::from(&prepared.pull),
+        PARKED_LABEL,
+    )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -203,6 +314,7 @@ fn prepare(
     status: &StatusOutput,
     input: &UnparkInput,
     parked_fingerprint: &str,
+    required_contexts: &RequiredContextsRead,
 ) -> Result<Prepared, AppError> {
     if status.repository.slug() != input.repository {
         return Err(refusal(
@@ -334,6 +446,24 @@ fn prepare(
     }
     let authoritative_checks = authoritative.into_iter().cloned().collect::<Vec<_>>();
     let superseded_checks = superseded.into_iter().cloned().collect::<Vec<_>>();
+    let required_runs = required_runs(&pull, required_contexts, &authoritative_checks);
+    if !matches!(
+        required_runs.status,
+        RequiredRunsStatus::Satisfied | RequiredRunsStatus::NotRequired
+    ) {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "unpark_required_checks_not_green",
+            "protection-declared required checks are not proven green on the exact parked generation",
+            Some(json!({
+                "pr": pr,
+                "head": input.head,
+                "required_runs": required_runs,
+                "mutated": false,
+                "next": "leave the exact generation parked until every protection-declared context reports success, then retry the same unpark",
+            })),
+        ));
+    }
     let evidence_fingerprint = crate::membership::fnv1a64(
         &serde_json::to_vec(&json!({
             "schema_version": 1,
@@ -346,6 +476,8 @@ fn prepare(
             "parking_fingerprint": parked_fingerprint,
             "authoritative_checks": authoritative_checks,
             "superseded_checks": superseded_checks,
+            "required_context_read": required_contexts,
+            "required_runs": stable_required_runs_evidence(&required_runs),
         }))
         .expect("unpark evidence serializes"),
     );
@@ -356,15 +488,62 @@ fn prepare(
         evidence_fingerprint,
         authoritative_checks,
         superseded_checks,
+        required_context_read: Some(required_contexts.clone()),
+        required_runs: Some(required_runs),
     })
 }
 
+fn stable_required_runs_evidence(assessment: &RequiredRunsAssessment) -> Value {
+    // Wall-clock-derived age/grace diagnostics are useful in the receipt but
+    // can never be retry identity: an unchanged pending authorization must not
+    // drift merely because another second elapsed.
+    json!({
+        "pr": assessment.pr,
+        "head": assessment.head,
+        "base": assessment.base,
+        "status": assessment.status,
+        "required_contexts": assessment.required_contexts,
+        "coverage": assessment.coverage,
+        "missing_contexts": assessment.missing_contexts,
+        "observed_check_suites": assessment.observed_check_suites,
+        "observed_runs": assessment.observed_runs,
+        "stale_head_runs": assessment.stale_head_runs,
+        "provider_reads_complete": assessment.provider_reads_complete,
+        "recovery": assessment.recovery,
+    })
+}
+
+fn required_runs(
+    pull: &PullRequestSnapshot,
+    contexts: &RequiredContextsRead,
+    authoritative_checks: &[CheckSnapshot],
+) -> RequiredRunsAssessment {
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    crate::required_runs::assess(&RequiredRunsInput {
+        pr: pull.number,
+        head: &pull.head,
+        base: &pull.base,
+        contexts,
+        lineage: None,
+        checks: authoritative_checks,
+        head_published_at: pull.updated_at.as_deref(),
+        clock: RequiredRunsClock {
+            now_unix,
+            grace_secs: 0,
+        },
+    })
+}
+
+#[allow(clippy::too_many_lines)]
 fn finish(
     initial: &StatusOutput,
     final_status: &StatusOutput,
     input: &UnparkInput,
     prepared: Prepared,
     provider_receipt: GitHubMutationReceipt,
+    required_contexts: &RequiredContextsRead,
 ) -> Result<UnparkOutput, AppError> {
     let pr = PrNumber(input.pr);
     let current = final_status
@@ -429,6 +608,20 @@ fn finish(
             final_status,
         ));
     }
+    let authoritative = authoritative.into_iter().cloned().collect::<Vec<_>>();
+    let post_required_runs = required_runs(current, required_contexts, &authoritative);
+    if !matches!(
+        post_required_runs.status,
+        RequiredRunsStatus::Satisfied | RequiredRunsStatus::NotRequired
+    ) {
+        return Err(postcondition(
+            "unpark_postcondition_required_checks_drift",
+            "protection-declared required checks drifted after parking transition",
+            input,
+            &provider_receipt,
+            final_status,
+        ));
+    }
     let step = MutationStep {
         kind: MutationKind::RemoveLabel,
         state: MutationStepState::Completed,
@@ -454,6 +647,8 @@ fn finish(
         new_labels: current.labels.clone(),
         authoritative_checks: prepared.authoritative_checks,
         superseded_checks: prepared.superseded_checks,
+        required_context_read: prepared.required_context_read,
+        required_runs: prepared.required_runs,
         mutated: true,
         receipt: OperationReceipt {
             operation_id: OperationId(prepared.receipt_id),
@@ -719,6 +914,51 @@ fn refusal(
         ),
     )
 }
+fn required_contexts_error(
+    error: &MutationError,
+    input: &UnparkInput,
+    provider_mutated: bool,
+) -> AppError {
+    AppError::structured(
+        ErrorCategory::ExecutionFailure,
+        "unpark_required_contexts_failed",
+        format!("could not revalidate protection-declared required contexts: {error}"),
+        Some(json!({
+            "pr": input.pr,
+            "head": input.head,
+            "provider_mutated": provider_mutated,
+            "mutated": provider_mutated,
+            "next": if provider_mutated {
+                "stop and inspect the durable pending unpark receipt before retrying"
+            } else {
+                "restore the exact branch-protection read and retry; no provider mutation was attempted"
+            },
+        })),
+    )
+}
+
+fn provider_preflight_error(error: &MutationError, input: &UnparkInput) -> AppError {
+    AppError::structured(
+        if matches!(error, MutationError::StalePrecondition { .. }) {
+            ErrorCategory::Validation
+        } else {
+            ErrorCategory::ExecutionFailure
+        },
+        if matches!(error, MutationError::StalePrecondition { .. }) {
+            "unpark_provider_preflight_drift"
+        } else {
+            "unpark_provider_preflight_failed"
+        },
+        format!("check-sensitive provider preflight failed: {error}"),
+        Some(json!({
+            "pr": input.pr,
+            "head": input.head,
+            "mutated": false,
+            "next": "rediscover the exact parked generation and required checks before retrying; no provider mutation was attempted",
+        })),
+    )
+}
+
 fn provider_error(error: &MutationError, input: &UnparkInput) -> AppError {
     AppError::structured(
         ErrorCategory::ExecutionFailure,
@@ -746,6 +986,7 @@ fn postcondition(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::BTreeSet;
 
     use mcp_cli::StructuredError;
@@ -875,6 +1116,87 @@ mod tests {
         }
     }
 
+    fn required_contexts(contexts: &[&str]) -> RequiredContextsRead {
+        RequiredContextsRead {
+            branch: "main".to_owned(),
+            protected: true,
+            contexts: contexts
+                .iter()
+                .map(|context| (*context).to_owned())
+                .collect(),
+            complete: true,
+        }
+    }
+
+    struct FakeProvider {
+        current: RefCell<PullRequestSnapshot>,
+        required_contexts: RequiredContextsRead,
+        mutations: RefCell<Vec<MutationKind>>,
+    }
+
+    impl FakeProvider {
+        fn new(current: PullRequestSnapshot, contexts: &[&str]) -> Self {
+            Self {
+                current: RefCell::new(current),
+                required_contexts: required_contexts(contexts),
+                mutations: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn verify(
+            &self,
+            expected: &PullRequestPrecondition,
+        ) -> Result<PullRequestSnapshot, MutationError> {
+            let current = self.current.borrow().clone();
+            let actual = PullRequestPrecondition::from(&current);
+            if actual == *expected {
+                Ok(current)
+            } else {
+                Err(MutationError::StalePrecondition {
+                    expected: Box::new(expected.clone()),
+                    actual: Box::new(actual),
+                    changed_fields: vec!["provider_snapshot".to_owned()],
+                })
+            }
+        }
+    }
+
+    impl UnparkProvider for FakeProvider {
+        fn branch_required_contexts(
+            &self,
+            _repository: &RepositoryId,
+            branch: &str,
+        ) -> Result<RequiredContextsRead, MutationError> {
+            assert_eq!(branch, self.required_contexts.branch);
+            Ok(self.required_contexts.clone())
+        }
+
+        fn verify_precondition_with_checks(
+            &self,
+            _repository: &RepositoryId,
+            expected: &PullRequestPrecondition,
+        ) -> Result<PullRequestSnapshot, MutationError> {
+            self.verify(expected)
+        }
+
+        fn remove_label(
+            &self,
+            _repository: &RepositoryId,
+            expected: &PullRequestPrecondition,
+            label: &str,
+        ) -> Result<GitHubMutationReceipt, MutationError> {
+            let before = self.verify(expected)?;
+            self.current.borrow_mut().labels.remove(label);
+            self.mutations.borrow_mut().push(MutationKind::RemoveLabel);
+            Ok(GitHubMutationReceipt {
+                kind: MutationKind::RemoveLabel,
+                before: Some(before),
+                after: self.current.borrow().clone(),
+                provider_output: Some("fake exact label removal".to_owned()),
+            })
+        }
+    }
+
     fn receipt(before: &PullRequestSnapshot, after: &PullRequestSnapshot) -> GitHubMutationReceipt {
         GitHubMutationReceipt {
             kind: MutationKind::RemoveLabel,
@@ -888,7 +1210,8 @@ mod tests {
     fn green_recovery_preserves_membership_and_removes_only_parking() {
         let initial = status(pull(vec![check("CI", CheckState::Success, 2)]));
         let input = input(&initial);
-        let prepared = prepare(&initial, &input, &input.parking_fingerprint).unwrap();
+        let required = required_contexts(&["CI"]);
+        let prepared = prepare(&initial, &input, &input.parking_fingerprint, &required).unwrap();
         let mut final_pull = prepared.pull.clone();
         final_pull.labels.remove(PARKED_LABEL);
         let final_status = status(final_pull.clone());
@@ -898,6 +1221,7 @@ mod tests {
             &input,
             prepared.clone(),
             receipt(&prepared.pull, &final_pull),
+            &required,
         )
         .unwrap();
         assert!(output.mutated);
@@ -906,13 +1230,91 @@ mod tests {
     }
 
     #[test]
+    fn exact_required_check_preflight_then_removes_only_parking() {
+        let status = status(pull(vec![check("CI", CheckState::Success, 2)]));
+        let input = input(&status);
+        let provider =
+            FakeProvider::new(status.analysis.pull_requests[&PrNumber(1)].clone(), &["CI"]);
+
+        let prepared =
+            prepare_with_provider(&status, &input, &input.parking_fingerprint, &provider).unwrap();
+        let provider_receipt =
+            remove_parked_label(&provider, &status.repository, &prepared).unwrap();
+
+        assert_eq!(
+            prepared.required_runs.as_ref().unwrap().status,
+            RequiredRunsStatus::Satisfied
+        );
+        assert_eq!(
+            *provider.mutations.borrow(),
+            vec![MutationKind::RemoveLabel]
+        );
+        assert!(provider_receipt.after.has_label("caravan"));
+        assert!(!provider_receipt.after.has_label(PARKED_LABEL));
+    }
+
+    #[test]
+    fn required_check_clock_does_not_change_pending_authority_identity() {
+        let status = status(pull(vec![check("CI", CheckState::Success, 2)]));
+        let current = &status.analysis.pull_requests[&PrNumber(1)];
+        let checks = current.checks.clone();
+        let first = required_runs(current, &required_contexts(&["CI"]), &checks);
+        let mut later = first.clone();
+        later.head_age_secs = Some(86_400);
+        later.grace_elapsed = true;
+
+        assert_eq!(
+            stable_required_runs_evidence(&first),
+            stable_required_runs_evidence(&later)
+        );
+    }
+
+    #[test]
+    fn missing_required_context_refuses_before_provider_mutation() {
+        let status = status(pull(vec![check("optional", CheckState::Success, 2)]));
+        let input = input(&status);
+        let provider = FakeProvider::new(
+            status.analysis.pull_requests[&PrNumber(1)].clone(),
+            &["required"],
+        );
+
+        let error = prepare_with_provider(&status, &input, &input.parking_fingerprint, &provider)
+            .expect_err("missing protection-declared coverage must stay parked");
+
+        assert_eq!(error.code(), "unpark_required_checks_not_green");
+        assert!(provider.mutations.borrow().is_empty());
+        assert!(provider.current.borrow().has_label(PARKED_LABEL));
+    }
+
+    #[test]
+    fn check_sensitive_provider_drift_refuses_before_provider_mutation() {
+        let status = status(pull(vec![check("CI", CheckState::Success, 2)]));
+        let input = input(&status);
+        let mut drifted = status.analysis.pull_requests[&PrNumber(1)].clone();
+        drifted.head = branch("topic", 'c');
+        let provider = FakeProvider::new(drifted, &["CI"]);
+
+        let error = prepare_with_provider(&status, &input, &input.parking_fingerprint, &provider)
+            .expect_err("provider drift must refuse before the label write");
+
+        assert_eq!(error.code(), "unpark_provider_preflight_drift");
+        assert!(provider.mutations.borrow().is_empty());
+        assert!(provider.current.borrow().has_label(PARKED_LABEL));
+    }
+
+    #[test]
     fn still_red_refuses_without_mutation() {
         let status = status(pull(vec![check("CI", CheckState::Failure, 2)]));
         let input = input(&status);
         assert_eq!(
-            prepare(&status, &input, &input.parking_fingerprint)
-                .unwrap_err()
-                .code(),
+            prepare(
+                &status,
+                &input,
+                &input.parking_fingerprint,
+                &required_contexts(&["CI"]),
+            )
+            .unwrap_err()
+            .code(),
             "unpark_ci_not_green"
         );
     }
@@ -924,7 +1326,13 @@ mod tests {
             check("CI", CheckState::Success, 2),
         ]));
         let input = input(&status);
-        let prepared = prepare(&status, &input, &input.parking_fingerprint).unwrap();
+        let prepared = prepare(
+            &status,
+            &input,
+            &input.parking_fingerprint,
+            &required_contexts(&["CI"]),
+        )
+        .unwrap();
         assert_eq!(prepared.authoritative_checks[0].state, CheckState::Success);
         assert_eq!(prepared.superseded_checks[0].state, CheckState::Failure);
     }
@@ -940,9 +1348,14 @@ mod tests {
                 input.base = "c".repeat(40);
             }
             assert_eq!(
-                prepare(&status, &input, &input.parking_fingerprint)
-                    .unwrap_err()
-                    .code(),
+                prepare(
+                    &status,
+                    &input,
+                    &input.parking_fingerprint,
+                    &required_contexts(&["CI"]),
+                )
+                .unwrap_err()
+                .code(),
                 "unpark_generation_drift"
             );
         }
@@ -974,9 +1387,14 @@ mod tests {
         });
         let input = input(&status);
         assert_eq!(
-            prepare(&status, &input, &input.parking_fingerprint)
-                .unwrap_err()
-                .code(),
+            prepare(
+                &status,
+                &input,
+                &input.parking_fingerprint,
+                &required_contexts(&["CI"]),
+            )
+            .unwrap_err()
+            .code(),
             "unpark_explicit_pause_present"
         );
     }
@@ -993,9 +1411,14 @@ mod tests {
                 current.labels.remove(PARKED_LABEL);
             }
             let status = status(current);
-            let code = prepare(&status, &input, &input.parking_fingerprint)
-                .unwrap_err()
-                .code();
+            let code = prepare(
+                &status,
+                &input,
+                &input.parking_fingerprint,
+                &required_contexts(&["CI"]),
+            )
+            .unwrap_err()
+            .code();
             assert!(matches!(
                 code.as_str(),
                 "unpark_membership_ineligible" | "unpark_parking_label_missing"
@@ -1013,7 +1436,8 @@ mod tests {
             .unwrap();
         let initial = status(pull(vec![check("CI", CheckState::Success, 2)]));
         let input = input(&initial);
-        let prepared = prepare(&initial, &input, &input.parking_fingerprint).unwrap();
+        let required = required_contexts(&["CI"]);
+        let prepared = prepare(&initial, &input, &input.parking_fingerprint, &required).unwrap();
         let mut final_pull = prepared.pull.clone();
         final_pull.labels.remove(PARKED_LABEL);
         let output = finish(
@@ -1022,6 +1446,7 @@ mod tests {
             &input,
             prepared.clone(),
             receipt(&prepared.pull, &final_pull),
+            &required,
         )
         .unwrap();
         write_receipt(directory.path(), &input, &output).unwrap();
@@ -1041,7 +1466,8 @@ mod tests {
             .unwrap();
         let initial = status(pull(vec![check("CI", CheckState::Success, 2)]));
         let input = input(&initial);
-        let prepared = prepare(&initial, &input, &input.parking_fingerprint).unwrap();
+        let required = required_contexts(&["CI"]);
+        let prepared = prepare(&initial, &input, &input.parking_fingerprint, &required).unwrap();
         write_pending(directory.path(), &input, &prepared).unwrap();
         let replay = load_pending(directory.path(), &input).unwrap().unwrap();
         assert_eq!(replay.receipt_id, prepared.receipt_id);
@@ -1054,6 +1480,7 @@ mod tests {
             &input,
             replay,
             receipt(&prepared.pull, &recovered_pull),
+            &required,
         )
         .unwrap();
         assert_eq!(output.receipt_id, prepared.receipt_id);
@@ -1083,9 +1510,14 @@ mod tests {
         let status = status(pull(vec![check("CI", CheckState::Success, 2)]));
         let input = input(&status);
         assert_eq!(
-            prepare(&status, &input, "fnv1a64:ffffffffffffffff")
-                .unwrap_err()
-                .code(),
+            prepare(
+                &status,
+                &input,
+                "fnv1a64:ffffffffffffffff",
+                &required_contexts(&["CI"]),
+            )
+            .unwrap_err()
+            .code(),
             "unpark_parking_provenance_drift"
         );
     }

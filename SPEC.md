@@ -667,12 +667,17 @@ membership generation, durable `caravan_parked` event fingerprint,
 `open_parked` provider state, actor, and reason. Under the ordinary writer guard
 and provider lease it freshly rediscovers provider and Cara truth, requires one
 open enrolled non-evicted parked head, no active explicit pause/recovery fence,
-and the newest authoritative required-check lineage to be safely green. Older
-same-head red/cancelled/synthetic rows are retained as superseded evidence but
-do not veto a newer authoritative green generation. The operation removes only
-`caravan-parked`, reruns complete fleet analysis before releasing authority,
-and fails closed on topology, head, base, membership, provider-state, or check
-drift. Its durable exact-generation receipt records old/new labels and state,
+and the newest authoritative check lineage to be safely green. It separately
+reads the protection-declared contexts on the exact base and requires every one
+to report success on the exact head, then performs a check-sensitive provider
+refetch before persisting mutation authority. Older same-head
+red/cancelled/synthetic rows are retained as superseded evidence but do not veto
+a newer authoritative green generation. Missing, partial, pending, or failing
+required-context evidence refuses before any provider mutation. The operation
+removes only `caravan-parked`, reruns complete fleet analysis and required-context
+proof before releasing authority, and fails closed on topology, head, base,
+membership, provider-state, or check drift. Its durable exact-generation receipt
+records old/new labels and state, required-context assessment,
 provider evidence, and an evidence fingerprint; an exact retry returns that
 receipt without mutation. `pause_not_found`, raw label edits, and `rejoin` are
 never fallback authority.

@@ -1286,7 +1286,7 @@ pub fn build_router() -> ToolRouter<AppContext> {
     );
     router.add_typed_tool_with_output_schema(
         "unpark",
-        "Remove only engine-owned terminal-red parking after exact repository, head/base, membership, durable parking provenance, provider state, and newest authoritative green checks are freshly revalidated.",
+        "Remove only engine-owned terminal-red parking after exact repository, head/base, membership, durable parking provenance, provider state, newest authoritative green checks, and every protection-declared required context are freshly revalidated with a check-sensitive provider preflight.",
         |context: &AppContext, input: unpark::UnparkInput| unpark::unpark(context, &input),
     );
     router.add_typed_tool_with_output_schema(
