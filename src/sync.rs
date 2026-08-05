@@ -363,6 +363,9 @@ pub enum AutoAdmissionContinuation {
     /// joins fail loudly as a defect instead of being quietly gated by a bound
     /// that no drain could ever clear.
     CaravanBudgetCapacityDefect,
+    /// Forming another caravan would exceed `sync.max_caravans`. Existing
+    /// excess remains untouched and parked caravans do not consume capacity.
+    MaxCaravansReached,
     /// The existing fleet is mid-rebuild after a bounded prefix apply, so no
     /// candidate is admitted until a tick converges it.
     RequiresConvergedFleet,
@@ -506,6 +509,28 @@ pub struct AutoAdmissionOutput {
     /// longer guarantee that a larger chain drains.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capacity_refusal: Option<CaravanCapacityRefusal>,
+    /// Exact repository-wide refusal when forming another caravan would exceed
+    /// `sync.max_caravans`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fleet_capacity_refusal: Option<CaravanFleetCapacityRefusal>,
+}
+
+/// Typed, zero-write repository-wide capacity evidence for a new caravan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CaravanFleetCapacityRefusal {
+    pub code: String,
+    pub candidate_pr: PrNumber,
+    pub max_caravans: u32,
+    pub active_caravans: usize,
+    #[serde(default)]
+    pub active_caravan_ids: Vec<PrNumber>,
+    pub parked_caravans: usize,
+    #[serde(default)]
+    pub parked_caravan_ids: Vec<PrNumber>,
+    /// Existing active caravans above the configured fence. They remain valid
+    /// and continue converging; capacity is never destructive repair authority.
+    pub excess_active_caravans: usize,
+    pub safe_next_action: String,
 }
 
 /// Typed capacity evidence for one refused join.
@@ -548,6 +573,7 @@ impl Default for AutoAdmissionOutput {
             skips: Vec::new(),
             remaining_candidates: Vec::new(),
             capacity_refusal: None,
+            fleet_capacity_refusal: None,
         }
     }
 }
@@ -574,6 +600,7 @@ impl AutoAdmissionOutput {
             skips: Vec::new(),
             remaining_candidates: Vec::new(),
             capacity_refusal: None,
+            fleet_capacity_refusal: None,
         }
     }
 }
@@ -647,6 +674,8 @@ pub struct SyncAutoAdmissionPlan {
     pub enabled: bool,
     pub heuristic_version: String,
     pub continuation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fleet_capacity_refusal: Option<CaravanFleetCapacityRefusal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidate_pr: Option<PrNumber>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1469,6 +1498,12 @@ fn reconcile_terminal_red_parking(
                 output.provider_receipts.push(receipt);
             }
             continue;
+        }
+
+        if !should_park
+            && let Some(refusal) = caravan_fleet_capacity_refusal(context, status, caravan.id)
+        {
+            return Err(caravan_fleet_capacity_error(&refusal));
         }
 
         let expected = PullRequestPrecondition::from(head);
@@ -3216,6 +3251,9 @@ fn sync_with_lock(
             "automatic_admission_in_flight",
             json!({
                 "heuristic_version": AUTO_ADMISSION_HEURISTIC_VERSION,
+                "max_caravans": context.config.sync.max_caravans,
+                "active_caravans": final_status.auto_admission.active_caravans,
+                "parked_caravans": final_status.auto_admission.parked_caravans,
                 "candidate_limit": context.config.sync.max_candidates_per_tick,
                 "mutation_limit": context.config.sync.max_mutations_per_tick,
                 "github_request_limit": github_budget.limit(),
@@ -3492,6 +3530,7 @@ fn run_auto_admission(
         skips: Vec::new(),
         remaining_candidates: Vec::new(),
         capacity_refusal: None,
+        fleet_capacity_refusal: None,
     };
     progress.current = status.analysis.pull_requests.clone();
     progress.merge_candidates = status
@@ -3683,6 +3722,14 @@ fn run_auto_admission(
             &checker,
             configured_batch_bound(context),
         )?;
+        if matches!(evaluation.target, AutoCandidateTarget::New)
+            && let Some(refusal) =
+                caravan_fleet_capacity_refusal(context, &status, candidate.number)
+        {
+            output.continuation = AutoAdmissionContinuation::MaxCaravansReached;
+            output.fleet_capacity_refusal = Some(refusal);
+            break;
+        }
 
         let mut admitted_this_iteration = false;
         if matches!(evaluation.target, AutoCandidateTarget::Skip) {
@@ -3802,13 +3849,88 @@ fn has_mutation_capacity(context: &AppContext, progress: &SyncProgress, reserve:
         <= context.config.sync.max_mutations_per_tick
 }
 
+/// Repository-wide admission fence for forming one new caravan.
+///
+/// This counts only active, non-parked caravans. It deliberately preserves an
+/// already-excess fleet: lowering the bound never authorizes deletion, merging,
+/// eviction, or reshaping, and joins to an existing caravan do not increase the
+/// count.
+pub(crate) fn caravan_fleet_capacity_refusal(
+    context: &AppContext,
+    status: &StatusOutput,
+    candidate_pr: PrNumber,
+) -> Option<CaravanFleetCapacityRefusal> {
+    let active_caravan_ids = status
+        .analysis
+        .fleet
+        .caravans
+        .iter()
+        .filter(|caravan| !caravan.parked)
+        .map(|caravan| caravan.id)
+        .collect::<Vec<_>>();
+    let parked_caravan_ids = status
+        .analysis
+        .fleet
+        .caravans
+        .iter()
+        .filter(|caravan| caravan.parked)
+        .map(|caravan| caravan.id)
+        .collect::<Vec<_>>();
+    let active_caravans = active_caravan_ids.len();
+    let parked_caravans = parked_caravan_ids.len();
+    let max = usize::try_from(context.config.sync.max_caravans).unwrap_or(usize::MAX);
+    (active_caravans >= max).then(|| CaravanFleetCapacityRefusal {
+        code: "max_caravans_reached".to_owned(),
+        candidate_pr,
+        max_caravans: context.config.sync.max_caravans,
+        active_caravans,
+        active_caravan_ids,
+        parked_caravans,
+        parked_caravan_ids,
+        excess_active_caravans: active_caravans.saturating_sub(max),
+        safe_next_action: format!(
+            "join candidate #{candidate_pr} to an existing compatible caravan, or let an active caravan land before forming another; {} parked caravan(s) do not consume the configured capacity and existing excess caravans remain untouched",
+            parked_caravans,
+        ),
+    })
+}
+
+/// Typed zero-write error for an explicit request to form a new caravan at
+/// repository capacity.
+pub(crate) fn caravan_fleet_capacity_error(refusal: &CaravanFleetCapacityRefusal) -> AppError {
+    AppError::structured(
+        ErrorCategory::Validation,
+        refusal.code.clone(),
+        "forming another caravan would exceed sync.max_caravans",
+        Some(json!({
+            "mutated": false,
+            "candidate_pr": refusal.candidate_pr,
+            "max_caravans": refusal.max_caravans,
+            "active_caravans": refusal.active_caravans,
+            "active_caravan_ids": refusal.active_caravan_ids,
+            "parked_caravans": refusal.parked_caravans,
+            "parked_caravan_ids": refusal.parked_caravan_ids,
+            "excess_active_caravans": refusal.excess_active_caravans,
+            "preserves_existing_caravans": true,
+            "retryable": false,
+            "safe_next_action": refusal.safe_next_action,
+            "suggested_actions": [
+                "join an existing compatible caravan instead of creating another",
+                "let an active caravan land, then retry new",
+                "raise sync.max_caravans through reviewed repository policy when parallel caravans are intentional"
+            ],
+        })),
+    )
+}
+
 /// Deterministic pre-admission capacity gate for one candidate join.
 ///
 /// Returns typed refusal evidence when accepting the candidate would push the
 /// exact target chain past the largest size the configured deadline can still
 /// guarantee to drain, or when the configured arithmetic yields no bound
-/// admission could honestly enforce. Forming a brand-new caravan is never
-/// refused here: an independent chain has its own bounded prefix.
+/// admission could honestly enforce. This chain-local gate does not evaluate a
+/// new caravan; [`caravan_fleet_capacity_refusal`] owns that repository-wide
+/// decision.
 pub(crate) fn caravan_capacity_refusal(
     context: &AppContext,
     status: &StatusOutput,
@@ -5086,6 +5208,8 @@ fn checkpoint_auto_admission(output: &AutoAdmissionOutput) -> Value {
         "mutation_limit": output.mutation_limit,
         "github_requests_used": output.github_requests_used,
         "github_request_limit": output.github_request_limit,
+        "capacity_refusal": output.capacity_refusal,
+        "fleet_capacity_refusal": output.fleet_capacity_refusal,
         "candidate_budget_reserved_ms": output.candidate_budget_reserved_ms,
         "candidate_budget_remaining_ms": output.candidate_budget_remaining_ms,
         "joins": bounded_checkpoint_sequence(output.joins.iter().map(|join| json!({

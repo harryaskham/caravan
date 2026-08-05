@@ -736,6 +736,7 @@ pub(super) fn plan_auto_admission_with_checker(
         } else {
             "disabled".to_owned()
         },
+        fleet_capacity_refusal: None,
         candidate_pr: None,
         target_tail: None,
         tested_tails: Vec::new(),
@@ -832,6 +833,34 @@ pub(super) fn plan_auto_admission_with_checker(
     output.candidate_pr = Some(candidate_pr);
     output.tested_tails.clone_from(&evaluation.tested_tails);
     output.compatibility_reasons.clone_from(&evaluation.reasons);
+    if matches!(evaluation.target, AutoCandidateTarget::New)
+        && let Some(refusal) = super::caravan_fleet_capacity_refusal(context, status, candidate_pr)
+    {
+        "max_caravans_reached".clone_into(&mut output.continuation);
+        output.fleet_capacity_refusal = Some(refusal.clone());
+        push_plan_action(
+            actions,
+            SyncPlanAction {
+                order: 0,
+                phase: SyncPlanPhase::AutoAdmission,
+                state: SyncPlanActionState::WouldStop,
+                kind: "refuse_new_caravan_at_capacity".to_owned(),
+                pr: Some(candidate_pr),
+                caravan_id: None,
+                expected: Some(PullRequestPrecondition::from(candidate)),
+                target: Some(json!({
+                    "max_caravans": refusal.max_caravans,
+                    "active_caravans": refusal.active_caravans,
+                    "active_caravan_ids": refusal.active_caravan_ids,
+                    "parked_caravans": refusal.parked_caravans,
+                    "parked_caravan_ids": refusal.parked_caravan_ids,
+                    "preserves_existing_caravans": true,
+                })),
+                reason: refusal.safe_next_action,
+            },
+        )?;
+        return Ok(output);
+    }
     let (kind, target_tail, reason, events) = match evaluation.target {
         AutoCandidateTarget::New => (
             "auto_admission_new",

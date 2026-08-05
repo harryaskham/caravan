@@ -80,9 +80,13 @@ today.
 - Optional sync-owned auto-admission is strictly opt-in. After the existing
   fleet converges, `sync --all` considers unlabelled PRs in configured-priority
   then immutable-FIFO order and greedily joins the first compatible live tail.
-  Incompatible generations receive `caravan-join-skipped` plus a durable exact
-  evidence receipt; unchanged generations are not retried, while candidate,
-  default, tail, config, or heuristic changes invalidate the skip automatically.
+  `sync.max_caravans` defaults to `1` and bounds active, non-parked caravans:
+  joining an existing chain remains possible, but creating another returns a
+  typed zero-write capacity refusal. Parked chains consume no slot, and lowering
+  the bound never deletes or reshapes excess existing chains. Incompatible
+  generations receive `caravan-join-skipped` plus a durable exact evidence
+  receipt; unchanged generations are not retried, while candidate, default,
+  tail, config, or heuristic changes invalidate the skip automatically.
 - Every non-clean attachment check also returns exact squash-equivalence
   evidence. A landed member reaches the default branch as one squash commit
   whose content matches that member's cumulative content but whose commit

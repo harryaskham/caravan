@@ -1,0 +1,3 @@
+version: 1
+sync:
+  max_caravans: 3

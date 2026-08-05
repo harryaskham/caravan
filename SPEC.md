@@ -51,7 +51,16 @@ An operator may override this automatic order for an explicit canary selection o
 The strict opt-in `sync.actions.join_unlabelled_prs` policy is the one automatic
 exception to no-leapfrog admission. After the existing fleet converges, sync
 uses `priority_fifo_greedy_v1` to try canonical candidates and existing caravan
-tails in deterministic order. A candidate incompatible with every target is
+tails in deterministic order. `sync.max_caravans` is a typed repository-wide
+admission fence and defaults to `1`: joining an existing caravan does not consume
+another slot, while forming a new caravan fails with exact zero-write capacity
+evidence once the number of active, non-parked caravans reaches the bound.
+Parked caravans never consume this capacity. Lowering the bound below an
+existing fleet is fault-safe: excess caravans remain valid and keep converging;
+the fence never authorizes deletion, eviction, merging, or reshaping. Status
+reports `max_caravans`, active/parked counts, `excess_active_caravans`, and
+`at_caravan_capacity`; plan and mutation refusals carry the same counts.
+ A candidate incompatible with every target is
 labelled `caravan-join-skipped` and receives a durable generation-bound comment,
 then later candidates may be considered. The skip binds repository, candidate
 head/base, default generation, every tested tail generation, config fingerprint,

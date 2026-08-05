@@ -314,6 +314,10 @@ fn default_sync_max_candidates_per_tick() -> u32 {
     8
 }
 
+const fn default_sync_max_caravans() -> u32 {
+    1
+}
+
 fn default_sync_max_mutations_per_tick() -> u32 {
     64
 }
@@ -495,6 +499,15 @@ pub struct TerminalRedConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct SyncConfig {
     pub actions: SyncActionsConfig,
+    /// Maximum number of non-parked caravans admission may create.
+    ///
+    /// Existing excess caravans remain valid and continue converging; this is
+    /// an admission fence, never authority to delete, merge, or reshape them.
+    /// Terminal-red parked caravans do not consume this capacity.
+    #[serde(default = "default_sync_max_caravans")]
+    #[schemars(default = "default_sync_max_caravans")]
+    #[schemars(range(min = 1))]
+    pub max_caravans: u32,
     /// Configurable response to exact latest terminal-red CI. Default `block`
     /// preserves existing queue behavior; `park` is explicit opt-in.
     pub terminal_red: TerminalRedConfig,
@@ -597,6 +610,7 @@ impl Default for SyncConfig {
     fn default() -> Self {
         Self {
             actions: SyncActionsConfig::default(),
+            max_caravans: default_sync_max_caravans(),
             terminal_red: TerminalRedConfig::default(),
             reserve_secs_per_command: default_sync_reserve_secs_per_command(),
             max_candidates_per_tick: default_sync_max_candidates_per_tick(),
@@ -916,6 +930,11 @@ impl CaravanConfig {
             return Err(ConfigError::Validation(format!(
                 "command_timeout_secs must be between 1 and {MAX_COMMAND_TIMEOUT_SECS}"
             )));
+        }
+        if self.sync.max_caravans == 0 {
+            return Err(ConfigError::Validation(
+                "sync.max_caravans must be at least 1".to_owned(),
+            ));
         }
         if !(1..=MAX_COMMAND_TIMEOUT_SECS).contains(&self.repair.materialization_timeout_secs) {
             return Err(ConfigError::Validation(format!(
@@ -1351,11 +1370,27 @@ mod tests {
             "parking is opt-in; upgrades preserve strict blocking"
         );
         assert_eq!(config.sync.max_candidates_per_tick, 8);
+        assert_eq!(config.sync.max_caravans, 1);
         assert_eq!(config.sync.max_mutations_per_tick, 64);
         assert_eq!(config.sync.max_github_requests_per_tick, 256);
         assert_eq!(config.sync.max_duration_secs, 120);
         assert_eq!(config.loop_config.interval_secs, 60);
         assert!(config.hooks.is_empty());
+    }
+
+    #[test]
+    fn sync_max_caravans_schema_is_typed_and_defaults_to_one() {
+        let schema = serde_json::to_value(schemars::schema_for!(SyncConfig))
+            .expect("sync config schema serializes deterministically");
+        let property = &schema["properties"]["max_caravans"];
+        assert_eq!(property["type"], "integer");
+        assert_eq!(property["minimum"], 1);
+        assert_eq!(property["default"], 1);
+
+        let explicit =
+            CaravanConfig::parse(include_str!("../tests/fixtures/config-max-caravans.yaml"))
+                .expect("typed caravan capacity fixture parses");
+        assert_eq!(explicit.sync.max_caravans, 3);
     }
 
     #[test]
@@ -1374,6 +1409,7 @@ sync:
   terminal_red:
     action: park
   max_candidates_per_tick: 5
+  max_caravans: 3
   max_mutations_per_tick: 40
   max_github_requests_per_tick: 200
   max_duration_secs: 90
@@ -1394,6 +1430,7 @@ hooks:
         assert!(config.sync.actions.join_unlabelled_prs);
         assert_eq!(config.sync.terminal_red.action, TerminalRedAction::Park);
         assert_eq!(config.sync.max_candidates_per_tick, 5);
+        assert_eq!(config.sync.max_caravans, 3);
         assert_eq!(config.sync.max_mutations_per_tick, 40);
         assert_eq!(config.sync.max_github_requests_per_tick, 200);
         assert_eq!(config.sync.max_duration_secs, 90);
@@ -1566,6 +1603,12 @@ hooks:
                 "a mutating tick still refuses it: {document}"
             );
         }
+        assert_eq!(
+            CaravanConfig::parse("version: 1\nsync:\n  max_caravans: 0\n")
+                .unwrap_err()
+                .code(),
+            "invalid_config"
+        );
         assert_eq!(
             CaravanConfig::parse("version: 1\nhooks:\n  sync_failed:\n    command: '  '\n")
                 .unwrap_err()

@@ -946,7 +946,11 @@ fn status(
         repository: repository(),
         rebase_on_join: crate::read::RebaseOnJoinStatus::default(),
         stack_backend: crate::read::StackBackendStatus::default(),
-        auto_admission: crate::read::AutoAdmissionStatus::default(),
+        auto_admission: crate::read::AutoAdmissionStatus::from_config(
+            &crate::config::SyncConfig::default(),
+            &analysis,
+            None,
+        ),
         default_branch: "main".to_owned(),
         current_branch: snapshot.current_branch,
         current_pr: snapshot.current_pr,
@@ -1074,6 +1078,229 @@ fn no_write_auto_admission_plans_only_first_exact_candidate() {
 }
 
 #[test]
+fn fleet_capacity_never_blocks_joining_an_existing_caravan() {
+    let active = pull_request(
+        1,
+        "active",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::squash(),
+    );
+    let mut candidate = pull_request(
+        9,
+        "candidate",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    candidate.labels.clear();
+    let status = status(
+        vec![active, candidate.clone()],
+        Some(candidate.number),
+        &clean,
+    );
+    let mut context = AppContext::default();
+    context.config.rebase_on_join = true;
+    context.config.sync.actions.join_unlabelled_prs = true;
+    let mut actions = Vec::new();
+    let mut events = Vec::new();
+
+    let plan = plan_auto_admission_with_checker(
+        &context,
+        &status,
+        &SyncInput {
+            all: true,
+            rerun_failed: false,
+            dry_run: false,
+        },
+        false,
+        &mut actions,
+        &mut events,
+        &clean,
+    )
+    .expect("joining does not consume a caravan slot");
+
+    assert_eq!(plan.target_tail, Some(PrNumber(1)));
+    assert!(plan.fleet_capacity_refusal.is_none());
+    assert_eq!(actions[0].kind, "auto_admission_join");
+    assert_eq!(actions[0].state, SyncPlanActionState::WouldMutate);
+}
+
+#[test]
+fn default_fleet_capacity_is_a_typed_no_write_plan_stop() {
+    let active = pull_request(
+        1,
+        "active",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::squash(),
+    );
+    let child = pull_request(
+        2,
+        "child",
+        "active",
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    let mut candidate = pull_request(
+        9,
+        "candidate",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    candidate.labels.clear();
+    let status = status(
+        vec![active, child, candidate.clone()],
+        Some(candidate.number),
+        &clean,
+    );
+    let mut context = AppContext::default();
+    context.config.rebase_on_join = true;
+    context.config.max_caravan_length = Some(2);
+    context.config.sync.actions.join_unlabelled_prs = true;
+    assert_eq!(context.config.sync.max_caravans, 1);
+    let mut actions = Vec::new();
+    let mut events = Vec::new();
+
+    let plan = plan_auto_admission_with_checker(
+        &context,
+        &status,
+        &SyncInput {
+            all: true,
+            rerun_failed: false,
+            dry_run: false,
+        },
+        false,
+        &mut actions,
+        &mut events,
+        &clean,
+    )
+    .expect("capacity is rendered rather than mutated");
+
+    assert_eq!(plan.continuation, "max_caravans_reached");
+    let refusal = plan.fleet_capacity_refusal.expect("typed refusal");
+    assert_eq!(refusal.max_caravans, 1);
+    assert_eq!(refusal.active_caravans, 1);
+    assert_eq!(refusal.active_caravan_ids, vec![PrNumber(1)]);
+    assert_eq!(refusal.parked_caravans, 0);
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0].kind, "refuse_new_caravan_at_capacity");
+    assert_eq!(actions[0].state, SyncPlanActionState::WouldStop);
+    assert!(events.is_empty());
+
+    context.config.sync.max_caravans = 2;
+    actions.clear();
+    let allowed = plan_auto_admission_with_checker(
+        &context,
+        &status,
+        &SyncInput {
+            all: true,
+            rerun_failed: false,
+            dry_run: false,
+        },
+        false,
+        &mut actions,
+        &mut events,
+        &clean,
+    )
+    .expect("a reviewed second slot permits a second caravan");
+    assert!(allowed.fleet_capacity_refusal.is_none());
+    assert_eq!(actions[0].kind, "auto_admission_new");
+    assert_eq!(actions[0].state, SyncPlanActionState::WouldMutate);
+}
+
+#[test]
+fn parked_caravans_do_not_consume_fleet_capacity() {
+    let mut parked = pull_request(
+        1,
+        "parked",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    parked.labels.insert("caravan-parked".to_owned());
+    let mut candidate = pull_request(
+        9,
+        "candidate",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    candidate.labels.clear();
+    let status = status(
+        vec![parked, candidate.clone()],
+        Some(candidate.number),
+        &clean,
+    );
+    let context = AppContext::default();
+
+    assert_eq!(status.auto_admission.active_caravans, 0);
+    assert!(status.auto_admission.active_caravan_ids.is_empty());
+    assert_eq!(status.auto_admission.parked_caravans, 1);
+    assert_eq!(status.auto_admission.parked_caravan_ids, vec![PrNumber(1)]);
+    assert!(!status.auto_admission.at_caravan_capacity);
+    assert!(
+        caravan_fleet_capacity_refusal(&context, &status, candidate.number).is_none(),
+        "a parked chain is retained outside active admission capacity"
+    );
+}
+
+#[test]
+fn lowering_capacity_preserves_and_reports_existing_excess() {
+    let first = pull_request(
+        1,
+        "first",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::squash(),
+    );
+    let second = pull_request(
+        2,
+        "second",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::squash(),
+    );
+    let status = status(vec![first, second], None, &clean);
+    let context = AppContext::default();
+
+    let refusal = crate::membership::root_admission_capacity_refusal(
+        &context,
+        &status,
+        crate::membership::MembershipOperation::New,
+        PrNumber(9),
+    )
+    .expect("explicit new is fenced while existing chains survive");
+    assert!(
+        crate::membership::root_admission_capacity_refusal(
+            &context,
+            &status,
+            crate::membership::MembershipOperation::Join,
+            PrNumber(9),
+        )
+        .is_none(),
+        "joining an existing caravan never consumes a fleet slot"
+    );
+    assert_eq!(refusal.active_caravans, 2);
+    assert_eq!(refusal.excess_active_caravans, 1);
+    assert_eq!(status.auto_admission.max_caravans, 1);
+    assert_eq!(status.auto_admission.active_caravans, 2);
+    assert_eq!(
+        status.auto_admission.active_caravan_ids,
+        vec![PrNumber(1), PrNumber(2)]
+    );
+    assert_eq!(status.auto_admission.excess_active_caravans, 1);
+    assert!(status.auto_admission.at_caravan_capacity);
+    assert_eq!(status.analysis.fleet.caravans.len(), 2);
+    let error = caravan_fleet_capacity_error(&refusal);
+    assert_eq!(error.code(), "max_caravans_reached");
+    let details = error.details().expect("typed capacity details");
+    assert_eq!(details["mutated"], false);
+    assert_eq!(details["preserves_existing_caravans"], true);
+}
+
+#[test]
 fn no_write_auto_admission_never_leapfrogs_rejected_canonical_candidate() {
     let mut candidate = pull_request(
         9,
@@ -1146,6 +1373,7 @@ fn plan_hash_binds_exact_actions_not_telemetry() {
             enabled: false,
             heuristic_version: AUTO_ADMISSION_HEURISTIC_VERSION.to_owned(),
             continuation: "disabled".to_owned(),
+            fleet_capacity_refusal: None,
             candidate_pr: None,
             target_tail: None,
             tested_tails: Vec::new(),
@@ -2458,6 +2686,35 @@ fn green_rerun_unparks_without_changing_multi_member_topology() {
     assert_eq!(observed[&PrNumber(2)].base.name, "one");
     assert_eq!(observed[&PrNumber(3)].base.name, "two");
     assert!(observed.values().all(|pull| pull.has_label("caravan")));
+}
+
+#[test]
+fn green_parked_caravan_stays_parked_when_reactivation_would_exceed_capacity() {
+    let mut pulls = healthy_chain();
+    pulls[0].labels.insert("caravan-parked".to_owned());
+    pulls[0].auto_merge = AutoMergeState::disabled();
+    for pull in &mut pulls {
+        pull.checks = vec![check("build-test", CheckState::Success, Some(20))];
+    }
+    pulls.push(pull_request(
+        10,
+        "ten",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::squash(),
+    ));
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+    let mut context = AppContext::default();
+    context.config.sync.terminal_red.action = crate::config::TerminalRedAction::Park;
+
+    let error = match reconcile_terminal_red_parking(&context, &status, &provider) {
+        Err(error) => error,
+        Ok(_) => panic!("reactivation must not displace an active caravan"),
+    };
+    assert_eq!(error.code(), "max_caravans_reached");
+    assert_eq!(error.details().unwrap()["active_caravan_ids"], json!([10]));
+    assert!(provider.pulls.borrow()[&PrNumber(1)].has_label("caravan-parked"));
 }
 
 #[test]

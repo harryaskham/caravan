@@ -170,6 +170,12 @@ pub fn unpark(context: &AppContext, input: &UnparkInput) -> Result<UnparkOutput,
         .with_timeout(Duration::from_secs(context.config.command_timeout_secs));
     let provider = GitHubMutationAdapter::new(lock.runner(runner));
     let pending = load_pending(&context.repository_path, input)?;
+    if pending.is_none()
+        && let Some(refusal) =
+            crate::sync::caravan_fleet_capacity_refusal(context, &initial, PrNumber(input.pr))
+    {
+        return Err(crate::sync::caravan_fleet_capacity_error(&refusal));
+    }
     let prepared = if let Some(prepared) = pending {
         let current = initial.analysis.pull_requests.get(&PrNumber(input.pr));
         if current.is_some_and(|pull| !pull.has_label(PARKED_LABEL)) {

@@ -596,10 +596,39 @@ pub struct StatusTiming {
 pub struct AutoAdmissionStatus {
     pub enabled: bool,
     pub heuristic_version: String,
+    /// Admission fence for simultaneously active, non-parked caravans.
+    #[serde(default = "default_max_caravans")]
+    #[schemars(default = "default_max_caravans")]
+    pub max_caravans: u32,
+    /// Current non-parked caravans. Existing excess is preserved and converged.
+    #[serde(default)]
+    pub active_caravans: usize,
+    /// Deterministic capacity-consuming caravan IDs.
+    #[serde(default)]
+    pub active_caravan_ids: Vec<PrNumber>,
+    /// Parked caravans retained outside active admission capacity.
+    #[serde(default)]
+    pub parked_caravans: usize,
+    /// Deterministic parked caravan IDs excluded from capacity.
+    #[serde(default)]
+    pub parked_caravan_ids: Vec<PrNumber>,
+    /// Active caravans above the configured fence; never repaired destructively.
+    #[serde(default)]
+    pub excess_active_caravans: usize,
+    /// Whether forming another caravan is currently refused.
+    #[serde(default)]
+    pub at_caravan_capacity: bool,
+    /// First priority/FIFO candidate blocked if it needs a new root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_blocked_root_candidate: Option<PrNumber>,
     pub max_candidates_per_tick: u32,
     pub max_mutations_per_tick: u32,
     pub max_github_requests_per_tick: u32,
     pub max_duration_secs: u64,
+}
+
+const fn default_max_caravans() -> u32 {
+    1
 }
 
 impl Default for AutoAdmissionStatus {
@@ -607,10 +636,63 @@ impl Default for AutoAdmissionStatus {
         Self {
             enabled: false,
             heuristic_version: crate::sync::AUTO_ADMISSION_HEURISTIC_VERSION.to_owned(),
+            max_caravans: 1,
+            active_caravans: 0,
+            active_caravan_ids: Vec::new(),
+            parked_caravans: 0,
+            parked_caravan_ids: Vec::new(),
+            excess_active_caravans: 0,
+            at_caravan_capacity: false,
+            first_blocked_root_candidate: None,
             max_candidates_per_tick: 0,
             max_mutations_per_tick: 0,
             max_github_requests_per_tick: 0,
             max_duration_secs: 0,
+        }
+    }
+}
+
+impl AutoAdmissionStatus {
+    #[must_use]
+    pub(crate) fn from_config(
+        config: &crate::config::SyncConfig,
+        analysis: &GraphAnalysis,
+        first_candidate: Option<PrNumber>,
+    ) -> Self {
+        let active_caravan_ids = analysis
+            .fleet
+            .caravans
+            .iter()
+            .filter(|caravan| !caravan.parked)
+            .map(|caravan| caravan.id)
+            .collect::<Vec<_>>();
+        let parked_caravan_ids = analysis
+            .fleet
+            .caravans
+            .iter()
+            .filter(|caravan| caravan.parked)
+            .map(|caravan| caravan.id)
+            .collect::<Vec<_>>();
+        let active_caravans = active_caravan_ids.len();
+        let parked_caravans = parked_caravan_ids.len();
+        let max_caravans = usize::try_from(config.max_caravans).unwrap_or(usize::MAX);
+        Self {
+            enabled: config.actions.join_unlabelled_prs,
+            heuristic_version: crate::sync::AUTO_ADMISSION_HEURISTIC_VERSION.to_owned(),
+            max_caravans: config.max_caravans,
+            active_caravans,
+            active_caravan_ids,
+            parked_caravans,
+            parked_caravan_ids,
+            excess_active_caravans: active_caravans.saturating_sub(max_caravans),
+            at_caravan_capacity: active_caravans >= max_caravans,
+            first_blocked_root_candidate: (active_caravans >= max_caravans)
+                .then_some(first_candidate)
+                .flatten(),
+            max_candidates_per_tick: config.max_candidates_per_tick,
+            max_mutations_per_tick: config.max_mutations_per_tick,
+            max_github_requests_per_tick: config.max_github_requests_per_tick,
+            max_duration_secs: config.max_duration_secs,
         }
     }
 }
@@ -1283,14 +1365,11 @@ fn current_checkpoint_status(
         rebase_on_join: rebase_on_join_status(context),
         stack_backend,
         head_merge: HeadMergeStatus::from_config(&context.config.sync),
-        auto_admission: AutoAdmissionStatus {
-            enabled: context.config.sync.actions.join_unlabelled_prs,
-            heuristic_version: crate::sync::AUTO_ADMISSION_HEURISTIC_VERSION.to_owned(),
-            max_candidates_per_tick: context.config.sync.max_candidates_per_tick,
-            max_mutations_per_tick: context.config.sync.max_mutations_per_tick,
-            max_github_requests_per_tick: context.config.sync.max_github_requests_per_tick,
-            max_duration_secs: context.config.sync.max_duration_secs,
-        },
+        auto_admission: AutoAdmissionStatus::from_config(
+            &context.config.sync,
+            &analysis,
+            admission.next_candidate,
+        ),
         sync_budget: crate::sync::SyncBudgetStatus::default(),
         default_branch: snapshot.default_branch.name.clone(),
         current_branch: snapshot.current_branch.clone(),
@@ -1925,14 +2004,11 @@ fn status_with_discovery_options(
         repository: snapshot.repository,
         rebase_on_join: rebase_on_join_status(context),
         stack_backend,
-        auto_admission: AutoAdmissionStatus {
-            enabled: context.config.sync.actions.join_unlabelled_prs,
-            heuristic_version: crate::sync::AUTO_ADMISSION_HEURISTIC_VERSION.to_owned(),
-            max_candidates_per_tick: context.config.sync.max_candidates_per_tick,
-            max_mutations_per_tick: context.config.sync.max_mutations_per_tick,
-            max_github_requests_per_tick: context.config.sync.max_github_requests_per_tick,
-            max_duration_secs: context.config.sync.max_duration_secs,
-        },
+        auto_admission: AutoAdmissionStatus::from_config(
+            &context.config.sync,
+            &analysis,
+            admission.next_candidate,
+        ),
         default_branch: snapshot.default_branch.name,
         current_branch: snapshot.current_branch,
         current_pr: snapshot.current_pr,

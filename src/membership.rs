@@ -806,6 +806,27 @@ fn revalidate_join_root(
     ))
 }
 
+/// Return repository-wide capacity evidence only for a root admission that
+/// would actually create another caravan. Existing membership is idempotent;
+/// join/rejoin never consume a caravan slot.
+pub(crate) fn root_admission_capacity_refusal(
+    context: &AppContext,
+    status: &StatusOutput,
+    operation: MembershipOperation,
+    candidate_pr: PrNumber,
+) -> Option<crate::sync::CaravanFleetCapacityRefusal> {
+    let forms_new_caravan = matches!(
+        operation,
+        MembershipOperation::New | MembershipOperation::Renew
+    ) && status
+        .current_pr
+        .is_none_or(|pr| status.analysis.fleet.containing(pr).is_none());
+    if !forms_new_caravan {
+        return None;
+    }
+    crate::sync::caravan_fleet_capacity_refusal(context, status, candidate_pr)
+}
+
 fn validate_membership_source_request(
     status: &StatusOutput,
     request: &MembershipRequest,
@@ -1279,6 +1300,20 @@ fn execute_locked(
     } else {
         read::status_with_deadline_and_budget(context, operation_deadline, github_budget)?
     };
+    crate::initialization::require_ready(&status.initialization)?;
+    // Root admission (`new`, plus `renew` for an evicted root) increases the
+    // repository-wide caravan count. Apply the fence before PR creation or any
+    // provider mutation. An already-enrolled candidate remains idempotent, and
+    // joins never become destructive merely because legacy caravans already
+    // exceed a newly lowered bound.
+    if let Some(refusal) = root_admission_capacity_refusal(
+        context,
+        &status,
+        request.operation,
+        candidate_pr.map_or(PrNumber(0), PrNumber),
+    ) {
+        return Err(crate::sync::caravan_fleet_capacity_error(&refusal));
+    }
     let mut checker = GitCompatibilityChecker::new(&context.repository_path, "origin")
         .with_timeout(timeout)
         .with_operation_deadline(operation_deadline);

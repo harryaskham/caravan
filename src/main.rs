@@ -3091,14 +3091,36 @@ fn render_status(output: &caravan::read::StatusOutput) -> String {
     }
     let _ = writeln!(
         text,
-        "auto-admission={} heuristic={} candidates={} mutations={} github={} duration={}s",
+        "auto-admission={} heuristic={} caravans={}/{} active ({} parked, {} excess, at_capacity={}) candidates={} mutations={} github={} duration={}s",
         output.auto_admission.enabled,
         output.auto_admission.heuristic_version,
+        output.auto_admission.active_caravans,
+        output.auto_admission.max_caravans,
+        output.auto_admission.parked_caravans,
+        output.auto_admission.excess_active_caravans,
+        output.auto_admission.at_caravan_capacity,
         output.auto_admission.max_candidates_per_tick,
         output.auto_admission.max_mutations_per_tick,
         output.auto_admission.max_github_requests_per_tick,
         output.auto_admission.max_duration_secs,
     );
+    if output.auto_admission.at_caravan_capacity {
+        let active = output
+            .auto_admission
+            .active_caravan_ids
+            .iter()
+            .map(|id| format!("#{id}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let blocked = output
+            .auto_admission
+            .first_blocked_root_candidate
+            .map_or_else(|| "none".to_owned(), |pr| format!("#{pr}"));
+        let _ = writeln!(
+            text,
+            "  max_caravans reached: active=[{active}] first_root_candidate={blocked}"
+        );
+    }
     let history = &output.analysis.fleet.history;
     let parked_count = output
         .analysis

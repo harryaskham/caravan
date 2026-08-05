@@ -111,6 +111,13 @@ Every one of these physically rebases when `rebase_on_join` is set. `cara new`
 is not exempt: a root candidate behind the default branch is brought up to date
 as part of creation.
 
+`sync.max_caravans` defaults to `1` and fences only operations that form a new
+active caravan. Joining an existing caravan consumes no additional slot. Parked
+caravans are retained but excluded from the count. If policy is lowered below
+the number already active, all excess chains remain intact and continue to
+converge; status reports the excess and `new` fails before any provider write.
+Capacity is never permission to evict, merge, delete, or reshape existing work.
+
 ### 2.1 Roots flatten, members replay
 
 A **root** is squash-merged by Cara, so its history is discarded at landing.
@@ -123,6 +130,9 @@ follow the chain, so an unauthorized merge-preserving replay fails closed.
 
 ### 2.2 Refusals before any mutation
 
+- `max_caravans_reached` reports the candidate, configured bound,
+  active count, parked count, and preserved excess before `new` or automatic
+  admission can create a PR or mutate provider state.
 - Empty source (no effective patch beyond the target) is refused *before* a PR
   is created, so a no-op candidate never becomes a real PR.
 - A reused branch name is not identity: a base OID is bound to the resolved
