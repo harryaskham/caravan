@@ -76,6 +76,12 @@ pub struct GitHubStackUnstackPlan {
     pub operation_id: String,
     pub actor: String,
     pub before: GitHubStackGeneration,
+    /// A tail being removed may still target its predecessor's prior head after
+    /// that predecessor was reconciled in place. The exception is valid only
+    /// for exact whole-Stack removal and only for this final open entry; every
+    /// other identity, position, repository, state, and base edge stays strict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_stale_tail_base: Option<PrNumber>,
     /// `None` means the Stack must disappear after every removable entry is
     /// unstacked. A retained merged/queued generation can be supplied exactly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -280,9 +286,21 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
         repository: &RepositoryId,
         stack_number: u64,
     ) -> Result<Option<GitHubStackGeneration>, GitHubStackMutationError> {
+        self.native_stack_generation_allowing_stale_tail_base(repository, stack_number, None)
+    }
+
+    /// Read one exact generation while tolerating only a named final entry's
+    /// stale base. Reshape uses this read to remove that tail atomically from
+    /// the provider Stack; every ordinary read remains strict.
+    pub fn native_stack_generation_allowing_stale_tail_base(
+        &self,
+        repository: &RepositoryId,
+        stack_number: u64,
+        allowed_stale_tail_base: Option<PrNumber>,
+    ) -> Result<Option<GitHubStackGeneration>, GitHubStackMutationError> {
         let snapshot = self.read_native_stack_snapshot(repository, stack_number)?;
         snapshot
-            .map(|stack| self.observe_stack_generation(repository, &stack))
+            .map(|stack| self.observe_stack_generation(repository, &stack, allowed_stale_tail_base))
             .transpose()
     }
 
@@ -447,11 +465,26 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
         plan: &GitHubStackUnstackPlan,
     ) -> Result<GitHubStackMutationReceipt, GitHubStackMutationError> {
         validate_operation_identity(&plan.operation_id, &plan.actor)?;
-        validate_topology(repository, &plan.before.topology, 1)?;
+        if plan.allowed_stale_tail_base.is_some() && plan.desired_after.is_some() {
+            return Err(invalid_plan(
+                "github_stack_stale_tail_unstack_scope_invalid",
+                "a stale tail base may be tolerated only while removing the exact whole Stack",
+            ));
+        }
+        validate_topology_allowing_stale_tail_base(
+            repository,
+            &plan.before.topology,
+            1,
+            plan.allowed_stale_tail_base,
+        )?;
         if let Some(desired) = plan.desired_after.as_ref() {
             validate_topology(repository, desired, 1)?;
         }
-        let actual = self.native_stack_generation(repository, plan.before.number)?;
+        let actual = self.native_stack_generation_allowing_stale_tail_base(
+            repository,
+            plan.before.number,
+            plan.allowed_stale_tail_base,
+        )?;
         let already_satisfied = match (&actual, &plan.desired_after) {
             (None, None) => true,
             (Some(actual), Some(desired)) => {
@@ -628,6 +661,7 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
         &self,
         repository: &RepositoryId,
         stack: &GitHubStackSnapshot,
+        allowed_stale_tail_base: Option<PrNumber>,
     ) -> Result<GitHubStackGeneration, GitHubStackMutationError> {
         let base: StackRefResponse = self
             .json(native_stack_base_ref_command(
@@ -677,7 +711,12 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
             entries.push(entry_from_pr(position, &stack_pr.state, pr)?);
         }
         let topology = GitHubStackTopology { base, entries };
-        validate_topology(repository, &topology, 1)?;
+        validate_topology_allowing_stale_tail_base(
+            repository,
+            &topology,
+            1,
+            allowed_stale_tail_base,
+        )?;
         Ok(GitHubStackGeneration {
             id: stack.id,
             number: stack.number,
@@ -759,7 +798,7 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
         }
         candidates
             .first()
-            .map(|stack| self.observe_stack_generation(repository, stack))
+            .map(|stack| self.observe_stack_generation(repository, stack, None))
             .transpose()
     }
 
@@ -840,6 +879,23 @@ pub(super) fn validate_topology(
     topology: &GitHubStackTopology,
     minimum_entries: usize,
 ) -> Result<(), GitHubStackMutationError> {
+    validate_topology_allowing_stale_tail_base(repository, topology, minimum_entries, None)
+}
+
+pub(super) fn validate_topology_allowing_stale_tail_base(
+    repository: &RepositoryId,
+    topology: &GitHubStackTopology,
+    minimum_entries: usize,
+    allowed_stale_tail_base: Option<PrNumber>,
+) -> Result<(), GitHubStackMutationError> {
+    if allowed_stale_tail_base.is_some()
+        && topology.entries.last().map(|entry| entry.pr) != allowed_stale_tail_base
+    {
+        return Err(invalid_plan(
+            "github_stack_stale_tail_identity_invalid",
+            "the only tolerated stale base must belong to the exact final Stack entry",
+        ));
+    }
     if topology.entries.len() < minimum_entries || topology.entries.len() > 100 {
         return Err(invalid_plan(
             "github_stack_size_invalid",
@@ -881,7 +937,10 @@ pub(super) fn validate_topology(
             // the Stack but rebases/retargets the first remaining open PR to
             // the Stack base. Subsequent open entries continue the live chain.
             let expected_base = previous_open_head.unwrap_or(&topology.base);
-            if entry.base != *expected_base {
+            let allowed_same_ref_stale_tail = allowed_stale_tail_base == Some(entry.pr)
+                && entry.base.repository == expected_base.repository
+                && entry.base.name == expected_base.name;
+            if entry.base != *expected_base && !allowed_same_ref_stale_tail {
                 return Err(invalid_plan(
                     "github_stack_base_chain_invalid",
                     &format!(
@@ -1699,6 +1758,7 @@ mod tests {
             operation_id: "op-unstack".to_owned(),
             actor: "cara".to_owned(),
             before: before.clone(),
+            allowed_stale_tail_base: None,
             desired_after: None,
         };
         let mut calls = direct_generation_calls(&before_topology);
@@ -1726,6 +1786,56 @@ mod tests {
     }
 
     #[test]
+    fn stale_tail_exception_cannot_retain_or_rewrite_a_partial_stack() {
+        let mut before_topology = topology(2);
+        let tail = before_topology.entries[1].pr;
+        before_topology.entries[1].base.oid = CommitOid("stale-parent-head".to_owned());
+        let plan = GitHubStackUnstackPlan {
+            operation_id: "reject-partial-stale-tail".to_owned(),
+            actor: "cara".to_owned(),
+            before: generation(before_topology),
+            allowed_stale_tail_base: Some(tail),
+            desired_after: Some(topology(1)),
+        };
+        let adapter = GitHubMutationAdapter::new(FakeRunner::new(Vec::new()));
+
+        let error = adapter
+            .native_stack_unstack(&repository(), &plan)
+            .expect_err("stale-tail recovery may remove only the complete exact Stack");
+        assert!(matches!(
+            error,
+            GitHubStackMutationError::InvalidPlan { ref code, .. }
+                if code == "github_stack_stale_tail_unstack_scope_invalid"
+        ));
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn stale_tail_exception_rejects_a_different_predecessor_ref_before_provider_access() {
+        let mut before_topology = topology(2);
+        let tail = before_topology.entries[1].pr;
+        before_topology.entries[1].base = branch("unrelated-parent", "stale-parent-head");
+        let plan = GitHubStackUnstackPlan {
+            operation_id: "reject-wrong-stale-tail-parent".to_owned(),
+            actor: "cara".to_owned(),
+            before: generation(before_topology),
+            allowed_stale_tail_base: Some(tail),
+            desired_after: None,
+        };
+        let adapter = GitHubMutationAdapter::new(FakeRunner::new(Vec::new()));
+
+        let error = adapter
+            .native_stack_unstack(&repository(), &plan)
+            .expect_err("stale-tail exception must retain the exact predecessor ref identity");
+        assert!(matches!(
+            error,
+            GitHubStackMutationError::InvalidPlan { ref code, .. }
+                if code == "github_stack_base_chain_invalid"
+        ));
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
     fn exact_unstack_retry_proves_absence_without_an_unstack_write() {
         let before = generation(topology(2));
         let adapter = GitHubMutationAdapter::new(FakeRunner::new(vec![
@@ -1739,6 +1849,7 @@ mod tests {
             operation_id: "op-unstack-retry".to_owned(),
             actor: "cara".to_owned(),
             before,
+            allowed_stale_tail_base: None,
             desired_after: None,
         };
 
