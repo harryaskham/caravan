@@ -8664,7 +8664,13 @@ fn native_sync_waits_before_lock_when_the_ready_prefix_is_empty() {
 /// after landing the ready prefix. That turns an immutable source generation
 /// into a GitHub-authored merge commit and starts CI again. Cara must stop
 /// before lock/submission and demand typed suffix reshape instead.
+///
+/// The intentionally complete incident fixture retains Stack topology,
+/// candidate lineage, CI state, source OIDs, provider calls, scheduler routing,
+/// and checkpoint absence in one test so its zero-write claim cannot become a
+/// collection of independently passing partial assertions.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn native_sync_refuses_partial_prefix_without_touching_source_heads() {
     let pulls = linear_chain(2);
     let mut status = status(pulls.clone(), None, &clean);

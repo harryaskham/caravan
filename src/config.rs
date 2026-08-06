@@ -1397,8 +1397,10 @@ mod tests {
 
     #[test]
     fn native_stack_mode_can_never_enable_physical_branch_rewrites() {
-        let mut stable = CaravanConfig::default();
-        stable.rebase_on_join = true;
+        let mut stable = CaravanConfig {
+            rebase_on_join: true,
+            ..CaravanConfig::default()
+        };
         assert!(stable.physical_branch_rewrites_enabled());
 
         // This directly constructed combination is intentionally invalid and
