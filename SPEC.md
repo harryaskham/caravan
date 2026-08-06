@@ -1234,7 +1234,10 @@ caravan, and opens a new one when every visible caravan is full, so a bounded
 batch never stalls the queue. Sync never waits for occupancy; it lands the
 maximal contiguous ready prefix, and a fully ready batch lands as one atomic
 native merge. Status reports the effective bound and exact per-caravan
-full-batch evidence.
+full-batch evidence. Native source heads are immutable: `stack_type: github`
+forces the effective physical-branch-writer predicate off at sync, membership,
+reshape, and planning seams even if a stale in-memory config bypasses parse-time
+validation.
 
 Native rollout is additionally gated by an explicit per-repository allowlist.
 `stack_rollout.mutations_opt_in` requires `stack_type: github` and a non-empty
@@ -1254,12 +1257,20 @@ generation. Cara seals that outcome as `indeterminate`, but post-merge detection
 cannot prevent it. The installed `gh stack` CLI does not contain a merge command
 or hidden stronger lease; web merge uses the same endpoint.
 
-The 2026-08-01 follow-up proved the accepted preventive equivalent. Cara creates
-one active repository ruleset with no bypass actors, exact selected source refs,
-and exactly `update` plus `deletion` restrictions. Exact readback must report
-`current_user_can_bypass: never`; owner SSH pushes and owner-authenticated REST
-force-update/delete were all rejected while direct prefix merge and unselected
-suffix rebase succeeded. The ruleset generation is checkpointed with the async
+The 2026-08-01 follow-up proved exact-ref rulesets can fence external writers,
+but its successful unselected-suffix rebase is not a harmless postcondition: it
+replaces an immutable source head and starts CI again. Cara now creates one
+active repository ruleset with no bypass actors over every source ref in the
+complete exact Stack generation, with exactly `update` plus `deletion`
+restrictions. Exact readback must report `current_user_can_bypass: never`.
+Native sync submits only when every entry is ready. A ready prefix with a blocked
+suffix returns `github_stack_partial_prefix_requires_tail_eviction` with zero
+provider writes and requires typed evict/split before retrying; it never asks
+GitHub to rebase the suffix. Each readiness verdict also requires an exact fresh
+two-parent synthetic merge candidate whose parents are the entry's current base
+(current main for the root, predecessor source head for a child) and immutable
+source head. Candidate regeneration, not scheduler force-push, is the only
+automatic CI refresh. The ruleset generation is checkpointed with the async
 UUID, revalidated before each submit/poll, and released only by exact ID and
 generation after terminal proof. Missing/drifted lock is `indeterminate`.
 Repository ruleset mutation requires an explicit Administration(write) upgrade,

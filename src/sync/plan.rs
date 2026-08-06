@@ -249,7 +249,7 @@ fn plan_sync_inner(context: &AppContext, input: &SyncInput) -> Result<SyncPlanOu
         tick_refusal,
         mutated: provider_writes > 0,
         provider_writes,
-        local_ephemeral_preflight: context.config.rebase_on_join,
+        local_ephemeral_preflight: context.config.physical_branch_rewrites_enabled(),
         repository: status.repository.clone(),
         default_branch: status.analysis.fleet.default_branch.clone(),
         all: input.all,

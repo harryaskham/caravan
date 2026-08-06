@@ -1245,6 +1245,7 @@ fn execute_locked(
     dispatch_hooks: bool,
     writer_guard: &crate::writer_guard::WriterOperationGuard,
 ) -> Result<MembershipOutput, AppError> {
+    let physical_branch_rewrites = context.config.physical_branch_rewrites_enabled();
     if candidate_pr.is_some() && request.create_pr {
         return Err(AppError::validation(
             "remote_candidate_create_conflict",
@@ -1253,7 +1254,7 @@ fn execute_locked(
     }
     if candidate_pr.is_some()
         && request.operation.is_join()
-        && !context.config.rebase_on_join
+        && !physical_branch_rewrites
         && context.config.stack_type == crate::config::StackType::Caravan
     {
         return Err(AppError::structured(
@@ -1360,7 +1361,7 @@ fn execute_locked(
         },
     );
     let mut join_source_receipt = None;
-    if context.config.rebase_on_join {
+    if physical_branch_rewrites {
         validate_membership_source_request(&status, request)?;
         let target = initial_join_target.as_ref();
         if let Some(target) = target
@@ -1451,7 +1452,7 @@ fn execute_locked(
     }
     let mut creation_state = None;
     let mut rewrite_comment_receipt = None;
-    let rebase_receipt = if context.config.rebase_on_join {
+    let rebase_receipt = if physical_branch_rewrites {
         if request.create_pr && status.current_pr.is_none() {
             let current_branch = status.current_branch.clone().ok_or_else(|| {
                 AppError::validation(
@@ -1821,7 +1822,7 @@ fn execute_locked(
     } else {
         EventKind::CaravanCreated
     };
-    if request.operation.is_join() || context.config.rebase_on_join {
+    if request.operation.is_join() || physical_branch_rewrites {
         let join_receipt = build_join_receipt(
             context,
             &repository,
@@ -1835,7 +1836,7 @@ fn execute_locked(
             },
             &output,
         )?;
-        if context.config.rebase_on_join
+        if physical_branch_rewrites
             && (!join_receipt.ancestry_verified || !join_receipt.membership_durable)
         {
             return Err(AppError::structured(
@@ -1914,7 +1915,7 @@ fn build_join_receipt(
         )
     })?;
     let source = evidence.source;
-    if context.config.rebase_on_join && source.is_none() {
+    if context.config.physical_branch_rewrites_enabled() && source.is_none() {
         return Err(AppError::structured(
             ErrorCategory::ExecutionFailure,
             "join_receipt_source_provenance_missing",
@@ -1963,7 +1964,7 @@ fn build_join_receipt(
             base_oid: output.pull_request.base.oid.clone(),
             state: output.pull_request.state,
         },
-        rebase_on_join: context.config.rebase_on_join,
+        rebase_on_join: context.config.physical_branch_rewrites_enabled(),
         ancestry_verified,
         membership_durable,
         force_intent,

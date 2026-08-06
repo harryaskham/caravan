@@ -17,7 +17,8 @@ use crate::github::{
     GitHubStackMergeEntryEvidence,
 };
 use crate::model::{
-    CompatibilityOutcome, CompatibilityReport, PrNumber, PullRequestSnapshot, PullRequestState,
+    CompatibilityOutcome, CompatibilityReport, MergeCandidateFreshness, MergeCandidateIdentity,
+    PrNumber, PullRequestSnapshot, PullRequestState,
 };
 use crate::read::StatusOutput;
 
@@ -40,6 +41,9 @@ pub enum StackEntryCi {
 #[derive(Debug, Clone, Copy)]
 pub struct StackPolicyFacts<'a> {
     pub pull_requests: &'a BTreeMap<PrNumber, PullRequestSnapshot>,
+    /// Exact provider merge refs. Native readiness is candidate-scoped: source
+    /// heads remain immutable and are never made cumulative by force-pushing.
+    pub merge_candidates: &'a BTreeMap<PrNumber, MergeCandidateIdentity>,
     pub compatibility: &'a [CompatibilityReport],
     /// Members of every caravan under an effective hold.
     pub held_members: &'a BTreeSet<PrNumber>,
@@ -125,6 +129,9 @@ fn entry_blockers(
         }
     }
 
+    if let Some(blocker) = synthetic_candidate_blocker(facts, entry) {
+        blockers.push(blocker);
+    }
     if facts.held_members.contains(&entry.pr) {
         blockers.push(GitHubStackMergeBlocker::Held);
     }
@@ -148,6 +155,35 @@ fn mechanically_blocked(facts: StackPolicyFacts<'_>, entry: &GitHubStackEntryGen
             && report.target == entry.base
             && report.outcome != CompatibilityOutcome::Clean
     })
+}
+
+/// Require the exact current two-parent provider candidate for this immutable
+/// source generation. The first parent is the Stack entry's exact base (current
+/// main for the root, predecessor source head for a child); the second is the
+/// immutable source head. This is the cumulative CI identity. A stale/missing
+/// candidate waits for provider regeneration and never authorizes a source push.
+fn synthetic_candidate_blocker(
+    facts: StackPolicyFacts<'_>,
+    entry: &GitHubStackEntryGeneration,
+) -> Option<GitHubStackMergeBlocker> {
+    let Some(candidate) = facts.merge_candidates.get(&entry.pr) else {
+        return Some(GitHubStackMergeBlocker::SyntheticCandidateMissing);
+    };
+    if candidate.base != entry.base || candidate.head != entry.head {
+        return Some(GitHubStackMergeBlocker::SyntheticCandidateStale);
+    }
+    let Some(synthetic) = candidate.synthetic.as_ref() else {
+        return Some(GitHubStackMergeBlocker::SyntheticCandidateMissing);
+    };
+    if candidate.freshness != MergeCandidateFreshness::Fresh
+        || candidate.compared_base.as_ref() != Some(&entry.base)
+    {
+        return Some(GitHubStackMergeBlocker::SyntheticCandidateStale);
+    }
+    if synthetic.parents.as_slice() != [entry.base.oid.clone(), entry.head.oid.clone()] {
+        return Some(GitHubStackMergeBlocker::SyntheticCandidateTopologyMismatch);
+    }
+    None
 }
 
 /// Which landing path a caravan must use.
@@ -252,7 +288,9 @@ fn route_refusal(code: &str, message: String, next: &str) -> crate::AppError {
 mod tests {
     use super::*;
     use crate::github::GitHubStackTopology;
-    use crate::model::{AutoMergeState, BranchSnapshot, CommitOid, RepositoryId};
+    use crate::model::{
+        AutoMergeState, BranchSnapshot, CommitOid, RepositoryId, SyntheticMergeCandidate,
+    };
 
     fn repository() -> RepositoryId {
         RepositoryId {
@@ -329,13 +367,53 @@ mod tests {
             .collect()
     }
 
+    fn merge_candidates(
+        stack: &GitHubStackGeneration,
+    ) -> BTreeMap<PrNumber, MergeCandidateIdentity> {
+        stack
+            .topology
+            .entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.pr,
+                    MergeCandidateIdentity {
+                        pr: entry.pr,
+                        provider_updated_at: "2026-08-01T09:00:00Z".to_owned(),
+                        observed_at: "2026-08-01T09:00:01Z".to_owned(),
+                        base: entry.base.clone(),
+                        head: entry.head.clone(),
+                        synthetic: Some(SyntheticMergeCandidate {
+                            git_ref: format!("refs/pull/{}/merge", entry.pr),
+                            oid: CommitOid(format!("candidate-{}", entry.pr)),
+                            tree_oid: CommitOid(format!("tree-{}", entry.pr)),
+                            parents: vec![entry.base.oid.clone(), entry.head.oid.clone()],
+                        }),
+                        auto_merge: crate::model::NativeAutoMergeState {
+                            enabled: false,
+                            merge_method: None,
+                            actor: None,
+                        },
+                        freshness: MergeCandidateFreshness::Fresh,
+                        compared_base: Some(entry.base.clone()),
+                        stale_base: false,
+                        stale_head: false,
+                        stale_reasons: Vec::new(),
+                    },
+                )
+            })
+            .collect()
+    }
+
     fn facts<'a>(
         pull_requests: &'a BTreeMap<PrNumber, PullRequestSnapshot>,
+        merge_candidates: &'a BTreeMap<PrNumber, MergeCandidateIdentity>,
         compatibility: &'a [CompatibilityReport],
         held: &'a BTreeSet<PrNumber>,
     ) -> StackPolicyFacts<'a> {
         StackPolicyFacts {
             pull_requests,
+            merge_candidates,
             compatibility,
             held_members: held,
         }
@@ -349,8 +427,9 @@ mod tests {
     fn a_clean_exact_stack_reports_no_policy_blockers() {
         let stack = stack();
         let pulls = pull_requests(&stack);
+        let candidates = merge_candidates(&stack);
         let held = BTreeSet::new();
-        let evidence = stack_merge_evidence(facts(&pulls, &[], &held), &stack, &ready);
+        let evidence = stack_merge_evidence(facts(&pulls, &candidates, &[], &held), &stack, &ready);
 
         assert_eq!(evidence.len(), 2);
         assert!(evidence.iter().all(|entry| entry.blockers.is_empty()));
@@ -369,9 +448,10 @@ mod tests {
         let mut pulls = pull_requests(&stack);
         pulls.get_mut(&PrNumber(102)).expect("child").head = branch("head-102", "moved0");
         pulls.remove(&PrNumber(101));
+        let candidates = merge_candidates(&stack);
         let held = BTreeSet::new();
 
-        let evidence = stack_merge_evidence(facts(&pulls, &[], &held), &stack, &ready);
+        let evidence = stack_merge_evidence(facts(&pulls, &candidates, &[], &held), &stack, &ready);
 
         assert!(
             evidence[0]
@@ -387,6 +467,46 @@ mod tests {
     }
 
     #[test]
+    fn native_readiness_requires_exact_fresh_cumulative_candidates() {
+        let stack = stack();
+        let pulls = pull_requests(&stack);
+        let held = BTreeSet::new();
+
+        let missing = BTreeMap::new();
+        let evidence = stack_merge_evidence(facts(&pulls, &missing, &[], &held), &stack, &ready);
+        assert!(evidence.iter().all(|entry| {
+            entry
+                .blockers
+                .contains(&GitHubStackMergeBlocker::SyntheticCandidateMissing)
+        }));
+
+        let mut stale = merge_candidates(&stack);
+        stale.get_mut(&PrNumber(101)).expect("root").freshness = MergeCandidateFreshness::StaleBase;
+        let evidence = stack_merge_evidence(facts(&pulls, &stale, &[], &held), &stack, &ready);
+        assert!(
+            evidence[0]
+                .blockers
+                .contains(&GitHubStackMergeBlocker::SyntheticCandidateStale)
+        );
+
+        let mut malformed = merge_candidates(&stack);
+        malformed
+            .get_mut(&PrNumber(102))
+            .expect("child")
+            .synthetic
+            .as_mut()
+            .expect("candidate")
+            .parents
+            .reverse();
+        let evidence = stack_merge_evidence(facts(&pulls, &malformed, &[], &held), &stack, &ready);
+        assert!(
+            evidence[1]
+                .blockers
+                .contains(&GitHubStackMergeBlocker::SyntheticCandidateTopologyMismatch)
+        );
+    }
+
+    #[test]
     fn durable_force_intent_is_refused_because_native_merge_has_no_admin_bypass() {
         let stack = stack();
         let mut pulls = pull_requests(&stack);
@@ -395,9 +515,10 @@ mod tests {
             .expect("root")
             .labels
             .insert(FORCE_LABEL.to_owned());
+        let candidates = merge_candidates(&stack);
         let held = BTreeSet::new();
 
-        let evidence = stack_merge_evidence(facts(&pulls, &[], &held), &stack, &ready);
+        let evidence = stack_merge_evidence(facts(&pulls, &candidates, &[], &held), &stack, &ready);
 
         assert!(
             evidence[0]
@@ -421,15 +542,20 @@ mod tests {
             conflicting_paths: vec!["src/lib.rs".to_owned()],
             diagnostic: None,
         }];
+        let candidates = merge_candidates(&stack);
         let held = BTreeSet::from([PrNumber(102)]);
 
-        let evidence = stack_merge_evidence(facts(&pulls, &compatibility, &held), &stack, &|pr| {
-            if pr == PrNumber(101) {
-                StackEntryCi::NotReady
-            } else {
-                StackEntryCi::Ready
-            }
-        });
+        let evidence = stack_merge_evidence(
+            facts(&pulls, &candidates, &compatibility, &held),
+            &stack,
+            &|pr| {
+                if pr == PrNumber(101) {
+                    StackEntryCi::NotReady
+                } else {
+                    StackEntryCi::Ready
+                }
+            },
+        );
 
         for blocker in [
             GitHubStackMergeBlocker::PullRequestNotOpen,
@@ -452,9 +578,10 @@ mod tests {
         stack.open = false;
         stack.topology.entries[1].stack_state = "queued".to_owned();
         let pulls = pull_requests(&stack);
+        let candidates = merge_candidates(&stack);
         let held = BTreeSet::new();
 
-        let evidence = stack_merge_evidence(facts(&pulls, &[], &held), &stack, &ready);
+        let evidence = stack_merge_evidence(facts(&pulls, &candidates, &[], &held), &stack, &ready);
 
         assert!(evidence.iter().all(|entry| {
             entry

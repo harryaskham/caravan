@@ -281,8 +281,8 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
     /// Release the lock, and only after terminal provider proof.
     ///
     /// A pending or still-submitted transaction is refused here rather than
-    /// quietly unlocking the selected refs mid-flight, which is exactly the
-    /// lower-head race the lock exists to prevent.
+    /// quietly unlocking the complete Stack source-ref set mid-flight, which
+    /// would reopen both the lower-head race and provider tail-rewrite window.
     pub fn native_stack_land_release(
         &self,
         repository: &RepositoryId,

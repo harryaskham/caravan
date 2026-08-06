@@ -722,6 +722,18 @@ impl CaravanConfig {
             (None, StackType::Caravan) => None,
         }
     }
+
+    /// Whether Cara may ever rewrite a pull request's source branch.
+    ///
+    /// Native GitHub Stack entries are immutable source generations. Keep this
+    /// backend check at every physical-writer seam in addition to config
+    /// validation: a directly constructed or stale in-memory config must still
+    /// be unable to turn a native sync, membership, or reshape operation into a
+    /// force-push and an accidental CI retrigger.
+    #[must_use]
+    pub const fn physical_branch_rewrites_enabled(&self) -> bool {
+        self.rebase_on_join && matches!(self.stack_type, StackType::Caravan)
+    }
 }
 
 impl Default for CaravanConfig {
@@ -1381,6 +1393,22 @@ mod tests {
         assert_eq!(config.sync.max_duration_secs, 120);
         assert_eq!(config.loop_config.interval_secs, 60);
         assert!(config.hooks.is_empty());
+    }
+
+    #[test]
+    fn native_stack_mode_can_never_enable_physical_branch_rewrites() {
+        let mut stable = CaravanConfig {
+            rebase_on_join: true,
+            ..CaravanConfig::default()
+        };
+        assert!(stable.physical_branch_rewrites_enabled());
+
+        // This directly constructed combination is intentionally invalid and
+        // parse-time validation rejects it too. The runtime predicate remains a
+        // second fence so stale/in-memory policy cannot reach a force-push seam.
+        stable.stack_type = StackType::Github;
+        assert!(!stable.physical_branch_rewrites_enabled());
+        assert!(stable.validate().is_err());
     }
 
     #[test]

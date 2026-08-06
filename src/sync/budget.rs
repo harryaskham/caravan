@@ -764,7 +764,7 @@ fn caravan_next_action(
     gate: &CapacityGate,
     admission: &PhysicalApplyAdmission,
 ) -> String {
-    if !context.config.rebase_on_join {
+    if !context.config.physical_branch_rewrites_enabled() {
         return "physical chain rebuilding is disabled; no apply reserve applies".to_owned();
     }
     let admitted = admission.admitted_prs.len();
@@ -800,7 +800,7 @@ fn project(
     selected: &[Caravan],
     deadline: Duration,
 ) -> SyncBudgetStatus {
-    let rebase_on_join = context.config.rebase_on_join;
+    let rebase_on_join = context.config.physical_branch_rewrites_enabled();
     let batch_bound = configured_batch_bound(context);
     let capacity = admission_capacity(context, deadline);
     let mut projections = Vec::with_capacity(selected.len());

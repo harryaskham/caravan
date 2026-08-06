@@ -44,6 +44,12 @@ pub enum GitHubStackMergeBlocker {
     Draft,
     StackEntryNotOpen,
     GraphInexact,
+    /// The exact provider synthetic merge candidate is absent.
+    SyntheticCandidateMissing,
+    /// The synthetic merge candidate does not bind the exact current base/head.
+    SyntheticCandidateStale,
+    /// The synthetic candidate is not the two-parent cumulative base+head shape.
+    SyntheticCandidateTopologyMismatch,
     Held,
     MechanicallyBlocked,
     RequiredChecksNotReady,
@@ -201,7 +207,11 @@ impl GitHubStackAsyncMergePlan {
             operation_id: self.operation_id.clone(),
             actor: self.actor.clone(),
             stack_number: self.before.number,
-            selected: self.selected.clone(),
+            // GitHub may update an unmerged suffix source branch after landing
+            // a lower prefix. Lock the complete immutable Stack generation, not
+            // merely the entries selected for merge, so provider-owned
+            // update-branch work cannot rewrite a tail and retrigger its CI.
+            selected: self.before.topology.entries.clone(),
         }
     }
 }
@@ -932,12 +942,16 @@ fn validate_merge_lock(
     lock: &GitHubStackBranchLockGeneration,
 ) -> Result<(), GitHubStackMergeError> {
     let expected_prs = plan
-        .selected
+        .before
+        .topology
+        .entries
         .iter()
         .map(|entry| entry.pr)
         .collect::<Vec<_>>();
     let mut expected_refs = plan
-        .selected
+        .before
+        .topology
+        .entries
         .iter()
         .map(|entry| format!("refs/heads/{}", entry.head.name))
         .collect::<Vec<_>>();
@@ -950,7 +964,7 @@ fn validate_merge_lock(
     {
         return Err(invalid_plan(
             "github_stack_merge_lock_mismatch",
-            "branch lock does not bind every exact selected Stack source ref",
+            "branch lock does not bind every exact source ref in the immutable Stack generation",
         ));
     }
     Ok(())
@@ -1495,7 +1509,9 @@ mod tests {
 
     fn branch_lock(plan: &GitHubStackAsyncMergePlan) -> GitHubStackBranchLockGeneration {
         let mut selected_refs = plan
-            .selected
+            .before
+            .topology
+            .entries
             .iter()
             .map(|entry| format!("refs/heads/{}", entry.head.name))
             .collect::<Vec<_>>();
@@ -1509,7 +1525,13 @@ mod tests {
             source_type: "Repository".to_owned(),
             target: "branch".to_owned(),
             enforcement: "active".to_owned(),
-            selected_pull_requests: plan.selected.iter().map(|entry| entry.pr).collect(),
+            selected_pull_requests: plan
+                .before
+                .topology
+                .entries
+                .iter()
+                .map(|entry| entry.pr)
+                .collect(),
             selected_refs,
             current_user_can_bypass: "never".to_owned(),
             created_at: "2026-08-01T10:00:00Z".to_owned(),
@@ -1585,11 +1607,20 @@ mod tests {
 
         assert_eq!(selected.selected, stack.topology.entries[..1]);
         assert_eq!(
-            selected.first_blocked.unwrap().blockers,
+            selected.first_blocked.as_ref().unwrap().blockers,
             vec![
                 GitHubStackMergeBlocker::RequiredChecksNotReady,
                 GitHubStackMergeBlocker::ForceUnsupported
             ]
+        );
+        let plan = selected
+            .direct_squash_plan("op-prefix", "cara")
+            .expect("policy primitive retains the exact prefix");
+        assert_eq!(plan.selected, stack.topology.entries[..1]);
+        assert_eq!(
+            plan.branch_lock_plan().selected,
+            stack.topology.entries,
+            "the provider may rewrite an unselected tail after prefix landing, so the lock must cover the complete immutable Stack"
         );
     }
 
