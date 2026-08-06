@@ -8659,3 +8659,163 @@ fn native_sync_waits_before_lock_when_the_ready_prefix_is_empty() {
         "waiting creates no durable landing intent"
     );
 }
+
+/// bd-48d662: GitHub's partial Stack merge updates an unselected tail branch
+/// after landing the ready prefix. That turns an immutable source generation
+/// into a GitHub-authored merge commit and starts CI again. Cara must stop
+/// before lock/submission and demand typed suffix reshape instead.
+#[test]
+fn native_sync_refuses_partial_prefix_without_touching_source_heads() {
+    let pulls = linear_chain(2);
+    let mut status = status(pulls.clone(), None, &clean);
+    let caravan = status.analysis.fleet.caravans[0].clone();
+    let base = status.analysis.fleet.default_branch.clone();
+    let root = status.analysis.pull_requests.get(&PrNumber(1)).unwrap();
+    let child = status.analysis.pull_requests.get(&PrNumber(2)).unwrap();
+    let generation = crate::github::GitHubStackGeneration {
+        id: 1,
+        number: 42,
+        node_id: "S_sync".to_owned(),
+        open: true,
+        created_at: "2026-08-01T09:00:00Z".to_owned(),
+        topology: crate::github::GitHubStackTopology {
+            base,
+            entries: vec![
+                crate::github::GitHubStackEntryGeneration {
+                    position: 0,
+                    pr: root.number,
+                    stack_state: "open".to_owned(),
+                    pull_request_state: root.state,
+                    draft: root.draft,
+                    merged_at: None,
+                    base: root.base.clone(),
+                    head: root.head.clone(),
+                },
+                crate::github::GitHubStackEntryGeneration {
+                    position: 1,
+                    pr: child.number,
+                    stack_state: "open".to_owned(),
+                    pull_request_state: child.state,
+                    draft: child.draft,
+                    merged_at: None,
+                    base: child.base.clone(),
+                    head: child.head.clone(),
+                },
+            ],
+        },
+    };
+    status.merge_candidates = generation
+        .topology
+        .entries
+        .iter()
+        .map(|entry| crate::model::MergeCandidateIdentity {
+            pr: entry.pr,
+            provider_updated_at: "2026-08-06T15:00:00Z".to_owned(),
+            observed_at: "2026-08-06T15:00:01Z".to_owned(),
+            base: entry.base.clone(),
+            head: entry.head.clone(),
+            synthetic: Some(crate::model::SyntheticMergeCandidate {
+                git_ref: format!("refs/pull/{}/merge", entry.pr),
+                oid: crate::model::CommitOid(format!("candidate-{}", entry.pr)),
+                tree_oid: crate::model::CommitOid(format!("tree-{}", entry.pr)),
+                parents: vec![entry.base.oid.clone(), entry.head.oid.clone()],
+            }),
+            auto_merge: crate::model::NativeAutoMergeState {
+                enabled: false,
+                merge_method: None,
+                actor: None,
+            },
+            freshness: crate::model::MergeCandidateFreshness::Fresh,
+            compared_base: Some(entry.base.clone()),
+            stale_base: false,
+            stale_head: false,
+            stale_reasons: Vec::new(),
+        })
+        .collect();
+    let original_heads = pulls
+        .iter()
+        .map(|pull| (pull.number, pull.head.oid.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let provider = FakeProvider::with_pull_requests(pulls);
+    *provider.native_stack.borrow_mut() = Some(generation);
+
+    let directory = tempfile::tempdir().unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(directory.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut config = crate::config::CaravanConfig::default();
+    config.stack_type = crate::config::StackType::Github;
+    config.stack_rollout.mutations_opt_in = true;
+    config.stack_rollout.reviewed_by = "operator".to_owned();
+    let native = NativeSyncContext {
+        config,
+        repository_path: directory.path().to_path_buf(),
+    };
+    let mut progress = SyncProgress::new(&status, vec![caravan.id], 64);
+    progress.ci = vec![
+        CiObservation {
+            pr: PrNumber(1),
+            disposition: CiDisposition::Passing,
+            checks: Vec::new(),
+            failed_runs: Vec::new(),
+            failure_diagnostics: Vec::new(),
+            rerunnable_run_ids: Vec::new(),
+            cancellation: crate::sync::CiCancellationSummary::default(),
+        },
+        CiObservation {
+            pr: PrNumber(2),
+            disposition: CiDisposition::Waiting,
+            checks: Vec::new(),
+            failed_runs: Vec::new(),
+            failure_diagnostics: Vec::new(),
+            rerunnable_run_ids: Vec::new(),
+            cancellation: crate::sync::CiCancellationSummary::default(),
+        },
+    ];
+
+    let error = progress
+        .drain_native_stack(&provider, &status, &caravan, 42, &native)
+        .expect_err("a partial prefix must require explicit tail reshape");
+
+    assert_eq!(
+        error.code(),
+        "github_stack_partial_prefix_requires_tail_eviction"
+    );
+    let details = error.details().expect("typed immutable-head receipt");
+    assert_eq!(details["mutated"], false);
+    assert_eq!(details["selected_ready_prefix"], serde_json::json!([1]));
+    assert_eq!(details["blocked_suffix"], serde_json::json!([2]));
+    let scheduler = scheduler_failure_status(&error);
+    assert_eq!(
+        scheduler.disposition,
+        SchedulerDisposition::ExternalDecision
+    );
+    assert_eq!(scheduler.wake_class, SchedulerWakeClass::ExternalDecision);
+    assert!(!scheduler.retryable);
+    assert_eq!(*provider.native_stack_reads.borrow(), 1);
+    assert!(provider.calls.borrow().is_empty());
+    assert_eq!(
+        provider
+            .pulls
+            .borrow()
+            .iter()
+            .map(|(number, pull)| (*number, pull.head.oid.clone()))
+            .collect::<BTreeMap<_, _>>(),
+        original_heads,
+        "neither scheduler nor provider path may replace a source head"
+    );
+    assert!(
+        crate::stack_checkpoint::load::<crate::github::GitHubStackLandCheckpoint>(
+            directory.path(),
+            "land-42",
+        )
+        .unwrap()
+        .is_none(),
+        "the refusal occurs before any lock or durable submit intent"
+    );
+}

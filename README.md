@@ -644,13 +644,20 @@ generation, holds, compatibility, CI, and unsupported force intent all fail
 closed before provider mutation. The installed
 `gh stack` CLI does not merge Stacks; GitHub's web merge uses the top-SHA-only
 async REST endpoint. A disposable sandbox proved an unlocked lower rewind can
-merge at a changed generation. A follow-up sandbox then proved Cara's preventive
-equivalent: one active no-bypass repository ruleset over every selected source
-ref rejects owner SSH and REST mutations while the selected prefix merges and
-the unselected suffix rebases. The adapter now acquires, verifies, checkpoints,
-and exactly releases that lock. The ruleset path requires the explicit,
-conditional Administration(write) App permission documented below; default
-Caravan mode never needs it.
+merge at a changed generation. A follow-up sandbox proved that an exact-ref
+ruleset fences external writers, but also exposed GitHub's dangerous partial
+merge postcondition: the provider rebases an unselected suffix and thereby
+replaces its source head and starts CI again. Cara therefore locks every source
+ref in the complete Stack generation, never only the ready prefix. Native sync
+submits only a fully ready Stack; a ready prefix with a blocked suffix returns
+`github_stack_partial_prefix_requires_tail_eviction` before lock/submission and
+requires typed evict/split first. Readiness binds each immutable source head to
+its exact fresh two-parent synthetic merge candidate (current main for the root,
+predecessor candidate base for descendants), so provider candidate regeneration
+rather than scheduler force-pushes drives CI. The adapter acquires, verifies,
+checkpoints, and exactly releases the complete lock. The ruleset path requires
+the explicit, conditional Administration(write) App permission documented
+below; default Caravan mode never needs it.
 GitHub exposes no arbitrary Stack remove/reorder, so evict and split are a
 phased unstack/rebuild transaction whose sealed checkpoints record
 `preflighted`, `unstacked`, `reshape_applied`, `rebuilding`, `rebuilt`, and
@@ -660,8 +667,9 @@ provider truth without repeating a proven unstack or replacement creation.
 2..=100 Stack range. It is absent by default, preserving the existing dynamic
 capacity model, and defaults to 8 only under `stack_type: github`. A full batch
 is never extended: admission uses another compatible caravan or opens a new one,
-while sync still lands the maximal contiguous ready prefix instead of waiting
-for occupancy. Native mode is enabled per repository only with a reviewed
+while sync never waits for occupancy. Native sync lands a fully ready batch; a
+partial ready prefix first requires typed suffix reshape so GitHub cannot rewrite
+an unselected source head. Native mode is enabled per repository only with a reviewed
 allowlist:
 
 ```yaml

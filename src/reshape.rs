@@ -229,7 +229,7 @@ fn execute_live(
     let rewrite = RewriteContext {
         repository_path: &context.repository_path,
         timeout,
-        enabled: context.config.rebase_on_join,
+        enabled: context.config.physical_branch_rewrites_enabled(),
         writer_fence: lock.remote_fence(),
     };
     let native = if context.config.stack_type == crate::config::StackType::Github {

@@ -119,6 +119,22 @@ This closes the ordinary-user and repository-owner lower-head race without prete
 
 The executable path is now restricted to the exact ruleset-locked orchestrator and requires the explicit, conditional Administration(write) permission plus a reviewed per-repository opt-in. An unlocked top-SHA-only merge remains permanently invalid.
 
+## 2026-08-06 immutable-source correction
+
+The observed suffix rebase in item 6 was later proven unsafe for Caravan's
+native mode: GitHub replaced the unselected PR source head with a provider-owned
+merge commit and started its CI again. That is a source mutation, not harmless
+provider continuation. The corrected executable contract keeps this historical
+observation but rejects its previous policy interpretation:
+
+- lock every source ref in the complete exact Stack generation;
+- submit only a fully ready Stack;
+- return `github_stack_partial_prefix_requires_tail_eviction` before any
+  provider write when a blocked suffix remains;
+- use exact fresh synthetic merge candidates for cumulative readiness; and
+- refresh candidates through provider regeneration, never scheduler
+  force-pushes of immutable source branches.
+
 ## Cleanup
 
 The sandbox is private and archived with description `DISPOSABLE Cara Stack sandbox completed 2026-07-31; delete when delete_repo-scoped operator token is available`. The attempted REST deletion returned HTTP 403 because the active token has `repo` but not `delete_repo`; no broader token was requested or stored. Final deletion is tracked by `bd-7aa0aa` and remains the only cleanup action.

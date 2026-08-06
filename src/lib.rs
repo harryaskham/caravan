@@ -263,12 +263,16 @@ GITHUB NATIVE STACKS (EXPLICIT OPT-IN)
   the same asynchronous REST endpoint that accepts only the selected top SHA.
 - An unlocked async Stack merge is invalid for Cara: a lower branch can rewind
   after submission while preserving ancestry, and GitHub may merge the changed
-  generation. Cara's accepted preventive contract is one active repository
-  ruleset with no bypass actors, exact selected refs, and update+deletion
-  restrictions. Acquire it, read it back with `current_user_can_bypass: never`,
-  re-read the whole Stack, keep it through terminal UUID proof, then release
-  only the exact ruleset generation. Lost lock or lower-head drift is
-  `indeterminate`, never permission to retry unlocked.
+  generation. Locking only the ready prefix is also invalid: after a partial
+  merge GitHub updates the unselected suffix source branch, replacing its head
+  and starting CI again. Cara locks every exact source ref in the complete Stack
+  generation with one active no-bypass update+deletion ruleset, submits only a
+  fully ready Stack, and requires typed tail evict/split before retrying a
+  partial prefix. Acquire the lock, read it back with
+  `current_user_can_bypass: never`, re-read the whole Stack, keep it through
+  terminal UUID proof, then release only the exact ruleset generation. Lost
+  lock or lower-head drift is `indeterminate`, never permission to retry
+  unlocked.
 - The ruleset path requires explicit GitHub Administration(write), which is not
   part of the baseline App policy. Grant it only to a reviewed native-Stack
   deployment; ordinary Caravan mode never needs it.
@@ -282,8 +286,9 @@ GITHUB NATIVE STACKS (EXPLICIT OPT-IN)
   absent by default, preserving the existing dynamic capacity model, and
   defaults to 8 only under `stack_type: github`. A full batch is never extended:
   admission deterministically uses another compatible caravan or opens a new
-  one, and sync still lands the maximal contiguous ready prefix rather than
-  waiting for a batch to fill.
+  one. Native readiness requires each immutable source generation's exact fresh
+  two-parent synthetic candidate. Sync lands a fully ready Stack; a blocked
+  suffix must be reshaped first, never refreshed by a scheduler force-push.
 - `stack_rollout.mutations_opt_in` with a recorded `reviewed_by` is the required
   per-repository allowlist. Without it status reports
   `github_stack_repository_not_opted_in`; unavailable or unproven capability

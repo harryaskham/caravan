@@ -2,8 +2,9 @@
 //!
 //! GitHub's async merge endpoint leases only the selected top SHA. Cara closes
 //! the lower-head race by creating one active, no-bypass repository ruleset
-//! over every selected source ref, then re-reading the complete Stack while the
-//! ruleset is active. The ruleset remains through terminal merge proof and is
+//! over every source ref in the complete immutable Stack generation, then
+//! re-reading the complete Stack while the ruleset is active. GitHub may update
+//! an unselected suffix after a partial merge, so prefix-only locking is unsafe. The ruleset remains through terminal merge proof and is
 //! released only by exact id/generation. This requires Administration(write)
 //! and is never reached by the default Caravan backend.
 
@@ -213,8 +214,9 @@ struct LockReceiptInput<'a> {
 }
 
 impl<R: CommandRunner> GitHubMutationAdapter<R> {
-    /// Acquire one atomic exact-ref ruleset over every selected source branch.
-    /// Exact retries are zero-write; ambiguous writes recover only from an exact
+    /// Acquire one atomic exact-ref ruleset over every source branch in the
+    /// complete Stack generation. Exact retries are zero-write; ambiguous writes
+    /// recover only from an exact
     /// active no-bypass ruleset readback.
     pub fn native_stack_branch_lock_acquire(
         &self,

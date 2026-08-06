@@ -3448,7 +3448,7 @@ fn sync_with_lock(
     }
     let convergence_started = Instant::now();
     let mut physical_rebuild = PhysicalRebuildOutcome::default();
-    if context.config.rebase_on_join {
+    if context.config.physical_branch_rewrites_enabled() {
         lock.checkpoint(
             "physical_rebase_planning_in_flight",
             json!({
@@ -3676,7 +3676,7 @@ fn sync_with_lock(
                 .count(),
         ),
     );
-    if context.config.rebase_on_join {
+    if context.config.physical_branch_rewrites_enabled() {
         physical_rebuild.steps.append(&mut progress.steps);
         progress.steps = physical_rebuild.steps;
         physical_rebuild
@@ -4457,7 +4457,7 @@ pub(crate) fn caravan_capacity_refusal(
             });
         }
     }
-    if !context.config.rebase_on_join {
+    if !context.config.physical_branch_rewrites_enabled() {
         return None;
     }
     let caravan = status.analysis.fleet.containing(target_tail?)?;
@@ -7619,9 +7619,12 @@ impl SyncProgress {
         Ok(())
     }
 
-    /// Land the maximal contiguous ready native Stack prefix under one
-    /// complete-group ruleset lock. Every phase is persisted before the next
-    /// provider write, so another tick resumes rather than resubmits.
+    /// Land one fully ready native Stack under a complete-generation source-ref
+    /// lock. The readiness planner still identifies a maximal prefix, but a
+    /// blocked suffix requires typed reshape before submission because GitHub
+    /// otherwise rewrites that suffix's source branch. Every phase is persisted
+    /// before the next provider write, so another tick resumes rather than
+    /// resubmits.
     #[allow(clippy::too_many_lines)]
     fn drain_native_stack(
         &mut self,
@@ -7659,6 +7662,7 @@ impl SyncProgress {
             let held = crate::stack_policy::held_caravan_members(status);
             let facts = crate::stack_policy::StackPolicyFacts {
                 pull_requests: &self.current,
+                merge_candidates: &self.merge_candidates,
                 compatibility: &status.analysis.compatibility,
                 held_members: &held,
             };
@@ -7702,6 +7706,40 @@ impl SyncProgress {
                     detail,
                 );
                 return Ok(());
+            }
+            if prefix.selected.len() != stack.topology.entries.len() {
+                let selected = prefix
+                    .selected
+                    .iter()
+                    .map(|entry| entry.pr)
+                    .collect::<Vec<_>>();
+                let blocked_suffix = stack.topology.entries[prefix.selected.len()..]
+                    .iter()
+                    .map(|entry| entry.pr)
+                    .collect::<Vec<_>>();
+                let immutable_heads = stack
+                    .topology
+                    .entries
+                    .iter()
+                    .map(|entry| (entry.pr, entry.head.clone()))
+                    .collect::<BTreeMap<_, _>>();
+                return Err(AppError::structured(
+                    ErrorCategory::Validation,
+                    "github_stack_partial_prefix_requires_tail_eviction",
+                    "native Stack partial-prefix merge would let GitHub rewrite an unselected tail source branch",
+                    Some(json!({
+                        "repository": repository,
+                        "caravan_id": caravan.id,
+                        "stack_number": stack_number,
+                        "selected_ready_prefix": selected,
+                        "blocked_suffix": blocked_suffix,
+                        "first_blocked": prefix.first_blocked,
+                        "immutable_source_heads": immutable_heads,
+                        "mutated": false,
+                        "resumable": false,
+                        "safe_next_action": "use the typed native Stack reshape path to evict/split the blocked final suffix, then rerun sync against the remaining exact Stack; never update or force-push a source branch to refresh CI",
+                    })),
+                ));
             }
             let plan = prefix
                 .direct_squash_plan(

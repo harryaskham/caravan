@@ -193,13 +193,22 @@ Cara remains responsible for:
 - holds and force-intent refusal;
 - candidacy and priority;
 - webhook/tick scheduling;
-- deciding the maximal contiguous ready prefix.
+- identifying the maximal contiguous ready prefix, then refusing submission if a
+  blocked suffix remains.
 
-In virtual native-Stack mode, moving the default or a parent changes GitHub's synthetic merge candidates and may rerun CI without rewriting source heads. Cara waits for checks bound to those exact current candidates.
+In virtual native-Stack mode, moving the default or a parent changes GitHub's
+synthetic merge candidates and may rerun CI without rewriting source heads. Cara
+waits for checks bound to the exact fresh two-parent candidate for each immutable
+source generation. It never force-pushes a source branch to make it cumulative.
 
 ### Merge selection
 
-A tick may submit only a contiguous prefix beginning at the Stack bottom. It chooses the highest entry for which every lower entry is:
+The planner identifies the maximal contiguous prefix beginning at the Stack
+bottom. The executable sync path submits only when that prefix is the complete
+Stack. If a blocked suffix remains, sync returns
+`github_stack_partial_prefix_requires_tail_eviction` before lock/submission and
+requires typed evict/split; GitHub's partial merge would otherwise replace the
+unselected tail source head. Every submitted entry is:
 
 - open and non-draft;
 - exact and unheld;
@@ -207,11 +216,22 @@ A tick may submit only a contiguous prefix beginning at the Stack bottom. It cho
 - fully covered by successful current-generation required checks;
 - free of unsupported force intent or graph problems.
 
-Before submission Cara re-reads the Stack and every selected PR. It binds the top selected `sha` accepted by the API and records every lower exact head even though the current API does not expose per-entry lease fields.
+Before submission Cara re-reads the Stack and every PR. It binds the top
+selected `sha` accepted by the API, records every lower exact head, and locks
+every source ref in the complete generation even though the current API does not
+expose per-entry lease fields.
 
 The absence of lower-entry lease parameters was resolved negatively by the 2026-07-31 disposable-repository sandbox. A lower fast-forward that broke ancestry failed all-or-none, but a lower rewind to an ancestor after the provider returned 202 preserved linearity and GitHub merged every selected PR at the changed lower generation. The merge API therefore does not snapshot or lease the complete group, and post-merge `indeterminate` detection is not prevention.
 
-The 2026-08-01 follow-up proved a preventive equivalent: one active repository ruleset with no bypass actors and exact selected refs, containing `update` and `deletion` restrictions, rejected both repository-owner SSH pushes and owner-authenticated REST ref mutations while direct Stack merge succeeded and GitHub rebased the unselected suffix. Cara must acquire and exactly read back that ruleset, re-read the complete Stack, keep the lock through terminal UUID proof, and release only its exact ruleset generation. This path requires Administration(write), remains explicit, and never changes default Caravan permissions; see `docs/validation/github-native-stack-sandbox-2026-07-31.md`.
+The 2026-08-01 follow-up proved exact-ref rulesets fence external writers, but
+also proved that prefix-only locking is insufficient: GitHub rebased the
+unselected suffix, replacing an immutable source head and retriggering CI. Cara
+must lock every exact source ref in the complete Stack generation, acquire and
+exactly read back that ruleset, re-read the complete Stack, keep the lock through
+terminal UUID proof, and release only its exact ruleset generation. Partial
+prefixes must be reshaped before submission. This path requires
+Administration(write), remains explicit, and never changes default Caravan
+permissions; see `docs/validation/github-native-stack-sandbox-2026-07-31.md`.
 
 ### Async transaction
 
@@ -219,7 +239,9 @@ The 2026-08-01 follow-up proved a preventive equivalent: one active repository r
 2. `PUT merge-async` with `merge_method: squash`, configured merge action, and exact top head SHA.
 3. Persist `uuid`, expected head, selected entries, and initial status before polling.
 4. Poll under the one tick deadline with bounded cadence.
-5. On `merged`, fresh-read default, every selected PR, and remaining Stack entries. Prove all selected PRs merged and remaining entries were rebased/retargeted exactly.
+5. On `merged`, fresh-read default and every selected PR. Prove every entry in
+   the fully selected Stack merged at its sealed immutable source head; no
+   unselected suffix is permitted.
 6. On `enqueued`, return queue-owned state and observe later; do not claim merge.
 7. On `failed`, return the provider message plus unchanged/partial provider proof. The documented direct operation is atomic, but Cara still verifies.
 8. On timeout/transport ambiguity, rediscover before any retry. The uuid result lasts 24 hours.

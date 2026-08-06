@@ -483,6 +483,7 @@ pub(super) fn scheduler_failure_status(error: &AppError) -> SyncFailureScheduler
                 | "rebase_prepared_object_changed"
                 | "rebase_result_invalid"
                 | "rebase_worker_panicked"
+                | "github_stack_partial_prefix_requires_tail_eviction"
         ) =>
         {
             (
