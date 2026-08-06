@@ -175,7 +175,11 @@ with exact already-created retries, and final verification proves each
 multi-member chain exists exactly once with singleton chains proven by exact
 inventory absence.
 
-Tail eviction can use the same rebuild initially. A narrower provider operation may replace it only when GitHub documents one.
+Tail eviction uses the same rebuild.
+A reconciled parent may have advanced in place while the selected tail still targets that parent's prior head; preflight may tolerate only this one stale edge, only when it belongs to the exact final entry being evicted, and only for whole-Stack unstack with a sealed before/after receipt.
+Every surviving replacement chain remains strictly base-linked to current parent heads.
+A stale non-tail edge, retained partial Stack, changed head, ambiguous identity, or any second mismatch is refused before provider access, preserving existing heads and labels.
+A narrower provider operation may replace this rebuild only when GitHub documents one.
 
 ## Sync and landing
 

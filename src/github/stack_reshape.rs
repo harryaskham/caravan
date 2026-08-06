@@ -12,7 +12,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::stack::{validate_open_entries, validate_operation_identity, validate_topology};
+use super::stack::{
+    validate_open_entries, validate_operation_identity, validate_topology,
+    validate_topology_allowing_stale_tail_base,
+};
 use super::{
     GitHubMutationAdapter, GitHubStackCreatePlan, GitHubStackGeneration, GitHubStackMutationError,
     GitHubStackMutationOperation, GitHubStackMutationReceipt, GitHubStackReadError,
@@ -277,7 +280,11 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
         plan: &GitHubStackReshapePlan,
     ) -> Result<GitHubStackReshapeCheckpoint, GitHubStackReshapeError> {
         validate_plan(repository, plan)?;
-        let actual = self.native_stack_generation(repository, plan.before.number)?;
+        let actual = self.native_stack_generation_allowing_stale_tail_base(
+            repository,
+            plan.before.number,
+            stale_tail_base_exception(plan),
+        )?;
         if actual.as_ref() != Some(&plan.before) {
             return Err(GitHubStackReshapeError::StaleGeneration {
                 expected: Box::new(plan.before.clone()),
@@ -306,6 +313,7 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
                 operation_id: unstack_operation_id(plan),
                 actor: plan.actor.clone(),
                 before: plan.before.clone(),
+                allowed_stale_tail_base: stale_tail_base_exception(plan),
                 desired_after: None,
             },
         )?;
@@ -540,7 +548,13 @@ fn validate_plan_semantics(plan: &GitHubStackReshapePlan) -> Result<(), GitHubSt
             "reshape requires one open identified provider Stack",
         ));
     }
-    validate_topology(&plan.repository, &plan.before.topology, 2).map_err(map_plan_error)?;
+    validate_topology_allowing_stale_tail_base(
+        &plan.repository,
+        &plan.before.topology,
+        2,
+        stale_tail_base_exception(plan),
+    )
+    .map_err(map_plan_error)?;
     validate_open_entries(&plan.before.topology, 0).map_err(map_plan_error)?;
     if plan.replacement_chains.len() > MAX_REPLACEMENT_CHAINS {
         return Err(invalid_plan(
@@ -841,6 +855,12 @@ fn provider_replacement_chains(plan: &GitHubStackReshapePlan) -> Vec<&GitHubStac
         .collect()
 }
 
+fn stale_tail_base_exception(plan: &GitHubStackReshapePlan) -> Option<PrNumber> {
+    (plan.operation == GitHubStackReshapeOperation::Evict
+        && plan.before.topology.entries.last().map(|entry| entry.pr) == Some(plan.selected_pr))
+    .then_some(plan.selected_pr)
+}
+
 fn unstack_operation_id(plan: &GitHubStackReshapePlan) -> String {
     format!("{}:unstack", plan.operation_id)
 }
@@ -1010,6 +1030,59 @@ mod tests {
             }],
         )
         .unwrap()
+    }
+
+    fn stale_tail_eviction_plan() -> GitHubStackReshapePlan {
+        // Exact authority-local PR 2483 -> PR 2486 evidence: the parent head
+        // advanced to e420e514, while the tail still targets prior head
+        // 05b78276. Removing that exact stale tail closes the bad edge; every
+        // surviving generation remains byte-for-byte unchanged.
+        let base = branch(
+            "agent/ms-dev-2/cacophony/mqegnry93bttwu43-pr-g2494e4ac3f1f6fef588b7afe7359c20489d85070",
+            "b9929b3b0c2bfac4f0e262c31fe9ee56be611cd0",
+        );
+        let parent = entry(
+            0,
+            2483,
+            base.clone(),
+            "agent/ms-dev-3/cacophony/e0371ba58e492e06-pr-g05b782765a958553a3928c2dda8f44556eb0b735",
+            "e420e514282f5ee7d7da78776082de1a955cb5a5",
+        );
+        let stale_parent = branch(
+            &parent.head.name,
+            "05b782765a958553a3928c2dda8f44556eb0b735",
+        );
+        let tail = entry(
+            1,
+            2486,
+            stale_parent,
+            "agent/ms-dev-3/cacophony/4e1a88065f44732f-pr-g60ac31df852749da6d4dc3f91c286646587f9bbc",
+            "60ac31df852749da6d4dc3f91c286646587f9bbc",
+        );
+        let before = GitHubStackGeneration {
+            id: 8_483,
+            number: 2_470,
+            node_id: "S_pr2483_pr2486".to_owned(),
+            open: true,
+            created_at: "2026-08-06T08:00:00Z".to_owned(),
+            topology: GitHubStackTopology {
+                base: base.clone(),
+                entries: vec![parent.clone(), tail],
+            },
+        };
+        GitHubStackReshapePlan::new(
+            repository(),
+            "evict-pr2486-stale-tail",
+            "cara-test",
+            GitHubStackReshapeOperation::Evict,
+            PrNumber(2486),
+            before,
+            vec![GitHubStackTopology {
+                base,
+                entries: vec![parent],
+            }],
+        )
+        .expect("tail eviction removes the sole stale base edge")
     }
 
     fn split_plan() -> GitHubStackReshapePlan {
@@ -1263,6 +1336,79 @@ mod tests {
         assert!(checkpoint.verify());
         assert_eq!(adapter.runner.write_count(), 0);
         adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn stale_tail_eviction_preflights_and_unstacks_with_exact_receipts() {
+        let plan = stale_tail_eviction_plan();
+        assert!(plan.verify());
+        assert_eq!(plan.selected_pr, PrNumber(2486));
+        assert_eq!(plan.before.topology.entries[0].pr, PrNumber(2483));
+        assert_eq!(
+            plan.before.topology.entries[0].head.oid.0,
+            "e420e514282f5ee7d7da78776082de1a955cb5a5"
+        );
+        assert_eq!(
+            plan.before.topology.entries[1].base.oid.0,
+            "05b782765a958553a3928c2dda8f44556eb0b735"
+        );
+
+        let mut outputs = vec![stack_json(&plan.before)];
+        outputs.extend(observe_outputs(&plan.before));
+        outputs.push(stack_json(&plan.before));
+        outputs.extend(observe_outputs(&plan.before));
+        outputs.push(CommandOutput::success("{}"));
+        outputs.push(not_found());
+        outputs.push(inventory_json(&[]));
+        let adapter = GitHubMutationAdapter::new(RecordingRunner::new(outputs));
+
+        let preflight = adapter
+            .native_stack_reshape_preflight(&repository(), &plan)
+            .expect("exact stale-tail generation preflights without mutation");
+        assert_eq!(preflight.phase, GitHubStackReshapePhase::Preflighted);
+        assert!(preflight.verify());
+        assert_eq!(adapter.runner.write_count(), 0);
+
+        let unstacked = adapter
+            .native_stack_reshape_unstack(&repository(), &preflight)
+            .expect("whole-Stack removal accepts only the selected stale tail edge");
+        assert_eq!(unstacked.phase, GitHubStackReshapePhase::Unstacked);
+        let receipt = unstacked
+            .unstack_receipt
+            .as_ref()
+            .expect("durable before/after unstack receipt");
+        assert_eq!(receipt.before.as_ref(), Some(&plan.before));
+        assert!(receipt.after.is_none());
+        assert!(receipt.verify());
+        assert!(unstacked.verify());
+        assert_eq!(adapter.runner.write_count(), 1);
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn stale_non_tail_base_remains_fail_closed_before_provider_access() {
+        let mut before = before_generation();
+        before.topology.entries[1].base = branch("root", "prior-root-head");
+        let root = before.topology.entries[0].clone();
+        let child = before.topology.entries[1].clone();
+        let error = GitHubStackReshapePlan::new(
+            repository(),
+            "reject-stale-middle",
+            "cara-test",
+            GitHubStackReshapeOperation::Evict,
+            PrNumber(103),
+            before.clone(),
+            vec![GitHubStackTopology {
+                base: before.topology.base,
+                entries: vec![root, child],
+            }],
+        )
+        .expect_err("only the exact selected tail may carry a stale base");
+        assert!(matches!(
+            error,
+            GitHubStackReshapeError::InvalidPlan { ref code, .. }
+                if code == "github_stack_base_chain_invalid"
+        ));
     }
 
     #[test]

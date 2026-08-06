@@ -638,8 +638,15 @@ fn native_reshape_unstack<R: crate::command::CommandRunner>(
             "native reshape requires an exact provider Stack generation",
         ));
     }
+    let allowed_stale_tail_base = (operation == ReshapeOperation::Evict
+        && caravan.members.last().copied() == Some(prepared.number))
+    .then_some(prepared.number);
     let before = provider
-        .native_stack_generation(&status.repository, native.stack.number)
+        .native_stack_generation_allowing_stale_tail_base(
+            &status.repository,
+            native.stack.number,
+            allowed_stale_tail_base,
+        )
         .map_err(|error| native_reshape_error(&error, None))?
         .ok_or_else(|| {
             AppError::validation(
