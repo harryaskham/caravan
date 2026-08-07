@@ -669,8 +669,12 @@ capacity model, and defaults to 8 only under `stack_type: github`. A full batch
 is never extended: admission uses another compatible caravan or opens a new one,
 while sync never waits for occupancy. Native sync lands a fully ready batch; a
 partial ready prefix first requires typed suffix reshape so GitHub cannot rewrite
-an unselected source head. Native mode is enabled per repository only with a reviewed
-allowlist:
+an unselected source head. A one-member caravan is valid but has no representable
+GitHub Stack object: after complete inventory proves zero mappings, sync routes
+that exact singleton through Cara's ordinary root validation/merge path. One
+exact mapping remains lock-fenced native; multiple mappings, or zero mappings
+for 2+ members, fail closed. Native mode is enabled per repository only with a
+reviewed allowlist:
 
 ```yaml
 min_cara_version: "0.0.65"

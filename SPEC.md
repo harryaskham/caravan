@@ -1221,8 +1221,16 @@ sync. GitHub exposes no arbitrary Stack remove or reorder, so reshape is a
 sealed `preflighted` → `unstacked` → `reshape_applied` → `rebuilding` →
 `rebuilt` → `verified` sequence that persists `provider_atomic: false`, binds
 the exact per-PR base/head/control-label/auto-merge postcondition the existing
-Cara reshape must establish, creates replacement Stacks one at a time with exact
-zero-write retries, and proves singleton chains by exact inventory absence.
+Cara reshape must establish and creates replacement Stacks one at a time with
+exact zero-write retries. Singleton chains are valid Cara topology but are not
+representable by GitHub's 2-entry minimum. Complete inventory plus authoritative
+one-member order and zero mappings selects the explicit
+`singleton_caravan_owned` route: Cara reuses ordinary exact head/base/check/tree
+root validation and direct squash merge, creates no Stack, and never rewrites the
+source head. One exact mapping remains native; singleton multiple mappings and
+multi-member zero/multiple mappings fail closed. This is what lets a final tail
+continue on the tick after its native prefix lands and the provider Stack
+disappears.
 
 `max_caravan_length` bounds one caravan as a merge batch. It accepts only
 GitHub's 2..=100 Stack range, is absent by default so existing repositories keep

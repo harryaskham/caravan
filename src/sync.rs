@@ -5259,9 +5259,9 @@ fn reconcile_caravan(
     }
 
     if let Some(native) = progress.native_stack.clone() {
-        match crate::stack_policy::route_landing(&native.config, &status.stack_backend, caravan.id)?
-        {
-            crate::stack_policy::StackLandingRoute::CaravanOwned => {}
+        match crate::stack_policy::route_landing(&native.config, &status.stack_backend, caravan)? {
+            crate::stack_policy::StackLandingRoute::CaravanOwned
+            | crate::stack_policy::StackLandingRoute::SingletonCaravanOwned => {}
             crate::stack_policy::StackLandingRoute::NativeStack { stack_number } => {
                 return progress.drain_native_stack(
                     provider,
