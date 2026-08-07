@@ -1857,12 +1857,10 @@ fn reconcile_terminal_red_parking(
             continue;
         }
 
-        if !should_park
-            && let Some(refusal) = caravan_fleet_capacity_refusal(context, status, caravan.id)
-        {
-            return Err(caravan_fleet_capacity_error(&refusal));
-        }
-
+        // Unparking reactivates an already-enrolled caravan; it never forms an
+        // additional one. `sync.max_caravans` is an admission fence only, so an
+        // already-excess fleet must keep converging instead of being frozen at
+        // the moment a parked generation becomes green.
         let expected = PullRequestPrecondition::from(head);
         let receipt = if should_park {
             provider.add_label(&status.repository, &expected, PARKED_LABEL)

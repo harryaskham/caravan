@@ -83,7 +83,12 @@ today.
   `sync.max_caravans` defaults to `1` and bounds active, non-parked caravans:
   joining an existing chain remains possible, but creating another returns a
   typed zero-write capacity refusal. Parked chains consume no slot, and lowering
-  the bound never deletes or reshapes excess existing chains. Incompatible
+  the bound never deletes or reshapes excess existing chains. The cap is never a
+  convergence gate: every already-enrolled caravan continues check/merge/
+  collapse, and a recovered parked caravan may reactivate even when that makes
+  the retained active fleet exceed the current bound. Automatic and explicit
+  unpark remove an existing quarantine; they do not admit a new caravan.
+  Incompatible
   generations receive `caravan-join-skipped` plus a durable exact evidence
   receipt; unchanged generations are not retried, while candidate, default,
   tail, config, or heuristic changes invalidate the skip automatically.
