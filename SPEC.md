@@ -57,7 +57,11 @@ another slot, while forming a new caravan fails with exact zero-write capacity
 evidence once the number of active, non-parked caravans reaches the bound.
 Parked caravans never consume this capacity. Lowering the bound below an
 existing fleet is fault-safe: excess caravans remain valid and keep converging;
-the fence never authorizes deletion, eviction, merging, or reshaping. Status
+the fence never authorizes deletion, eviction, merging, or reshaping. It also
+never blocks checks, merge/collapse, or reactivation of an already-enrolled
+parked generation. Automatic and explicit unpark remove an existing quarantine,
+not admit a new caravan, so a recovered caravan may make the retained active
+count exceed the bound while every genuinely new root remains fenced. Status
 reports `max_caravans`, active/parked counts, `terminal_closed_prs` and its
 bounded deterministic PR IDs, `excess_active_caravans`, and
 `at_caravan_capacity`; plan and mutation refusals carry the same active counts.

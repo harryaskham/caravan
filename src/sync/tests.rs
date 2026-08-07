@@ -3242,7 +3242,7 @@ fn green_rerun_unparks_without_changing_multi_member_topology() {
 }
 
 #[test]
-fn green_parked_caravan_stays_parked_when_reactivation_would_exceed_capacity() {
+fn green_parked_caravan_reactivates_even_when_existing_fleet_exceeds_capacity() {
     let mut pulls = healthy_chain();
     pulls[0].labels.insert("caravan-parked".to_owned());
     pulls[0].auto_merge = AutoMergeState::disabled();
@@ -3260,13 +3260,18 @@ fn green_parked_caravan_stays_parked_when_reactivation_would_exceed_capacity() {
     let status = status(pulls, Some(PrNumber(1)), &clean);
     let mut context = AppContext::default();
     context.config.sync.terminal_red.action = crate::config::TerminalRedAction::Park;
+    assert_eq!(context.config.sync.max_caravans, 1);
+    assert_eq!(status.auto_admission.active_caravan_ids, vec![PrNumber(10)]);
 
-    let Err(error) = reconcile_terminal_red_parking(&context, &status, &provider) else {
-        panic!("reactivation must not displace an active caravan");
-    };
-    assert_eq!(error.code(), "max_caravans_reached");
-    assert_eq!(error.details().unwrap()["active_caravan_ids"], json!([10]));
-    assert!(provider.pulls.borrow()[&PrNumber(1)].has_label("caravan-parked"));
+    let result = reconcile_terminal_red_parking(&context, &status, &provider)
+        .expect("capacity never blocks an already-enrolled caravan");
+
+    assert!(result.changed);
+    assert_eq!(result.events[0].kind, EventKind::CaravanUnparked);
+    let observed = provider.pulls.borrow();
+    assert!(!observed[&PrNumber(1)].has_label("caravan-parked"));
+    assert!(observed[&PrNumber(10)].has_label("caravan"));
+    assert_eq!(observed[&PrNumber(10)].head.name, "ten");
 }
 
 #[test]
@@ -7383,6 +7388,33 @@ fn caravan_member(number: u64, head: &str, base: &str) -> PullRequestSnapshot {
     );
     pull_request.checks = vec![check("build-test", CheckState::Success, None)];
     pull_request
+}
+
+#[test]
+fn max_caravans_only_fences_admission_while_two_existing_green_caravans_merge() {
+    let pulls = vec![
+        caravan_member(1, "one", "main"),
+        caravan_member(2, "two", "main"),
+    ];
+    let status = caravan_status(pulls.clone(), None, true);
+    assert_eq!(status.auto_admission.max_caravans, 1);
+    assert_eq!(status.analysis.fleet.caravans.len(), 2);
+    let refusal = caravan_fleet_capacity_refusal(&AppContext::default(), &status, PrNumber(99))
+        .expect("a third caravan remains fenced");
+    assert_eq!(refusal.active_caravans, 2);
+    assert_eq!(refusal.excess_active_caravans, 1);
+
+    let provider = FakeProvider::with_pull_requests(pulls);
+    let progress = execute(&status, &provider, true, false, false)
+        .expect("existing caravans converge regardless of admission capacity");
+
+    assert_eq!(
+        progress.synchronized_caravans,
+        vec![PrNumber(1), PrNumber(2)]
+    );
+    assert_eq!(progress.root_merge.len(), 2);
+    assert!(provider.pulls.borrow()[&PrNumber(1)].is_merged());
+    assert!(provider.pulls.borrow()[&PrNumber(2)].is_merged());
 }
 
 #[test]
