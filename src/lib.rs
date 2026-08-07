@@ -289,6 +289,11 @@ GITHUB NATIVE STACKS (EXPLICIT OPT-IN)
   one. Native readiness requires each immutable source generation's exact fresh
   two-parent synthetic candidate. Sync lands a fully ready Stack; a blocked
   suffix must be reshaped first, never refreshed by a scheduler force-push.
+- GitHub cannot represent a one-member Stack. Complete zero-mapping inventory
+  plus an authoritative one-member caravan selects the explicit singleton
+  Caravan-owned route, which reuses exact head/base/check/tree validation and
+  creates no provider Stack. One exact mapping stays native; multiple singleton
+  mappings and every zero/multiple mapping for 2+ members fail closed.
 - `stack_rollout.mutations_opt_in` with a recorded `reviewed_by` is the required
   per-repository allowlist. Without it status reports
   `github_stack_repository_not_opted_in`; unavailable or unproven capability

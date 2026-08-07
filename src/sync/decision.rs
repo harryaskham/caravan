@@ -484,6 +484,7 @@ pub(super) fn scheduler_failure_status(error: &AppError) -> SyncFailureScheduler
                 | "rebase_result_invalid"
                 | "rebase_worker_panicked"
                 | "github_stack_partial_prefix_requires_tail_eviction"
+                | "github_stack_caravan_mapping_ambiguous"
         ) =>
         {
             (
@@ -525,6 +526,7 @@ pub(super) fn scheduler_failure_status(error: &AppError) -> SyncFailureScheduler
                 | "repository_not_initialized"
                 | "squash_merge_not_enabled"
                 | "unsafe_checkout"
+                | "github_stack_repository_not_opted_in"
         ) =>
         {
             (

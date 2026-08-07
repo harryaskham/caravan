@@ -3266,6 +3266,29 @@ fn unsupported_exact_range_shapes_are_never_retry_ticks() {
 }
 
 #[test]
+fn impossible_native_mapping_is_external_decision_not_retry_tick() {
+    let error = AppError::structured(
+        ErrorCategory::Validation,
+        "github_stack_caravan_mapping_ambiguous",
+        "two-member caravan maps to zero provider Stacks",
+        Some(json!({
+            "member_count": 2,
+            "mapping_count": 0,
+            "mutated": false,
+            "retryable": false,
+        })),
+    );
+
+    let scheduler = scheduler_failure_status(&error);
+    assert_eq!(
+        scheduler.disposition,
+        SchedulerDisposition::ExternalDecision
+    );
+    assert_eq!(scheduler.wake_class, SchedulerWakeClass::ExternalDecision);
+    assert!(!scheduler.retryable);
+}
+
+#[test]
 fn stale_run_generation_requires_fresh_trigger_and_is_never_rerunnable() {
     let mut pulls = healthy_chain();
     pulls[0].checks = vec![check("build-test", CheckState::Failure, Some(10))];
@@ -8823,5 +8846,92 @@ fn native_sync_refuses_partial_prefix_without_touching_source_heads() {
         .unwrap()
         .is_none(),
         "the refusal occurs before any lock or durable submit intent"
+    );
+}
+
+/// bd-c712af: after a native prefix lands, GitHub removes the Stack resource and
+/// leaves one exact open tail. That authoritative singleton must continue via
+/// Cara's ordinary exact-head/root path without inventing a one-entry Stack or
+/// touching its immutable source head.
+#[test]
+fn native_singleton_tail_without_stack_lands_and_retries_idempotently() {
+    let mut merged = caravan_member(1, "landed-prefix", "main");
+    merged.state = PullRequestState::Merged;
+    merged.merged_at = Some("2026-08-07T09:00:00Z".to_owned());
+    let tail = caravan_member(2, "singleton-tail", "main");
+    let original_head = tail.head.oid.clone();
+    let mut status = caravan_status(vec![merged, tail.clone()], Some(tail.number), true);
+    status.stack_backend = crate::read::StackBackendStatus {
+        configured: crate::config::StackType::Github,
+        capability: crate::read::StackCapability::Available,
+        mutation_support: crate::read::StackMutationSupport::NativeStack,
+        native_stacks: Vec::new(),
+        provider_stacks_truncated: false,
+        missing_caravans: Vec::new(),
+        problems: Vec::new(),
+    };
+    assert_eq!(status.analysis.fleet.caravans.len(), 1);
+    assert_eq!(status.analysis.fleet.caravans[0].members, vec![tail.number]);
+
+    let provider =
+        FakeProvider::with_pull_requests(status.analysis.pull_requests.values().cloned().collect());
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = crate::config::CaravanConfig::default();
+    config.stack_type = crate::config::StackType::Github;
+    config.stack_rollout.mutations_opt_in = true;
+    config.stack_rollout.reviewed_by = "operator".to_owned();
+    let native = NativeSyncContext {
+        config: config.clone(),
+        repository_path: directory.path().to_path_buf(),
+    };
+
+    let progress = execute_bounded_with_native(
+        &status,
+        &provider,
+        false,
+        false,
+        false,
+        64,
+        &BTreeMap::new(),
+        RequiredRunsPolicy::from_config(&config.sync),
+        Some(native.clone()),
+    )
+    .expect("reviewed singleton route progresses");
+
+    assert_eq!(progress.root_merge.len(), 1);
+    assert_eq!(progress.root_merge[0].pr, tail.number);
+    assert!(progress.native_stack_land.is_empty());
+    assert_eq!(*provider.native_stack_reads.borrow(), 0);
+    assert!(
+        !provider
+            .calls
+            .borrow()
+            .contains(&MutationKind::NativeStackLand)
+    );
+    assert_eq!(
+        provider.pulls.borrow()[&tail.number].head.oid,
+        original_head,
+        "singleton landing never rewrites the source head"
+    );
+
+    let refreshed_pulls = provider.pulls.borrow().values().cloned().collect();
+    let mut refreshed = caravan_status(refreshed_pulls, None, true);
+    refreshed.stack_backend = status.stack_backend;
+    let retry = execute_bounded_with_native(
+        &refreshed,
+        &provider,
+        true,
+        false,
+        false,
+        64,
+        &BTreeMap::new(),
+        RequiredRunsPolicy::from_config(&config.sync),
+        Some(native),
+    )
+    .expect("terminal retry is a zero-write no-op");
+    assert!(retry.root_merge.is_empty());
+    assert_eq!(
+        provider.pulls.borrow()[&tail.number].head.oid,
+        original_head
     );
 }
