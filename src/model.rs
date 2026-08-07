@@ -1408,6 +1408,9 @@ pub enum EventKind {
     CaravanCreated,
     PrJoined,
     ReadyPrUnqueued,
+    /// Exact current provider generation is mechanically conflicting. This is
+    /// notification evidence for repair coordinators, never merge authority.
+    ConflictDetected,
     SyncFailed,
     JoinFailed,
     EvictionFailed,
@@ -1593,6 +1596,10 @@ mod tests {
             "\"head_advanced\""
         );
         assert_eq!(EventKind::CiFailed.to_string(), "ci_failed");
+        assert_eq!(
+            serde_json::to_string(&EventKind::ConflictDetected).unwrap(),
+            "\"conflict_detected\""
+        );
     }
 }
 

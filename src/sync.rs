@@ -3932,18 +3932,22 @@ fn completed_mutation_count(progress: &SyncProgress) -> u32 {
     .unwrap_or(u32::MAX)
 }
 
-/// Keep one hook notification per distinct required-run problem fingerprint.
-fn dedupe_required_runs_events(events: &mut Vec<CaravanEvent>) {
-    let mut seen = BTreeSet::new();
-    events.retain(|event| {
-        if event.kind != EventKind::RequiredRunsMissing {
-            return true;
-        }
-        event
+/// Keep one hook notification per distinct exact-generation problem.
+fn dedupe_hook_events(events: &mut Vec<CaravanEvent>) {
+    let mut required_runs = BTreeSet::new();
+    let mut conflicts = BTreeSet::new();
+    events.retain(|event| match event.kind {
+        EventKind::RequiredRunsMissing => event
             .metadata
             .get("fingerprint")
             .and_then(Value::as_str)
-            .is_none_or(|fingerprint| seen.insert(fingerprint.to_owned()))
+            .is_none_or(|fingerprint| required_runs.insert(fingerprint.to_owned())),
+        EventKind::ConflictDetected => event
+            .metadata
+            .get("dedupe_key")
+            .and_then(Value::as_str)
+            .is_none_or(|fingerprint| conflicts.insert(fingerprint.to_owned())),
+        _ => true,
     });
 }
 
@@ -3978,7 +3982,7 @@ fn merge_sync_progress(target: &mut SyncProgress, mut source: SyncProgress) {
     target.events.append(&mut source.events);
     // Two convergence passes over the same member inside one tick must not
     // notify hooks twice about the same exact stall.
-    dedupe_required_runs_events(&mut target.events);
+    dedupe_hook_events(&mut target.events);
     for observation in source.ci {
         target.ci.retain(|existing| existing.pr != observation.pr);
         target.ci.push(observation);
@@ -6821,6 +6825,135 @@ impl NativeSyncContext {
     }
 }
 
+const CONFLICT_EVENT_MAX_PATHS: usize = 64;
+
+fn conflict_class(status: &StatusOutput, problem: &GraphProblem) -> &'static str {
+    match problem.kind {
+        GraphProblemKind::CandidateIncompatible => "candidate",
+        GraphProblemKind::Incompatible if problem.prs.len() == 1 => "head",
+        GraphProblemKind::Incompatible if is_adjacent_pair(status, &problem.prs) => "link",
+        GraphProblemKind::Incompatible => "cross_caravan",
+        _ => "unknown",
+    }
+}
+
+/// Project current exact graph evidence into repair notifications. This performs
+/// no provider access and grants no mutation authority: hooks receive only the
+/// facts already proven by discovery and mechanical compatibility analysis.
+// Keep the complete exact-generation filter, classification, bounded evidence,
+// and no-authority payload construction together: splitting these gates across
+// helpers makes it easier for one event path to omit a safety condition.
+#[allow(clippy::too_many_lines)]
+fn conflict_detected_events(
+    status: &StatusOutput,
+    operation_id: &OperationId,
+) -> Vec<CaravanEvent> {
+    let mut events = Vec::new();
+    let mut seen = BTreeSet::new();
+    for problem in &status.analysis.fleet.problems {
+        if !matches!(
+            problem.kind,
+            GraphProblemKind::Incompatible | GraphProblemKind::CandidateIncompatible
+        ) {
+            continue;
+        }
+        let class = conflict_class(status, problem);
+        for report in status
+            .analysis
+            .compatibility
+            .iter()
+            .filter(|report| report.outcome == CompatibilityOutcome::Conflict)
+        {
+            let Some((number, pull_request)) = problem.prs.iter().find_map(|number| {
+                status
+                    .analysis
+                    .pull_requests
+                    .get(number)
+                    .filter(|pull_request| pull_request.head == report.candidate)
+                    .map(|pull_request| (*number, pull_request))
+            }) else {
+                continue;
+            };
+            if pull_request.state != PullRequestState::Open {
+                continue;
+            }
+            let target_matches = if problem.prs.len() == 1 {
+                report.target == status.analysis.fleet.default_branch
+            } else {
+                problem
+                    .prs
+                    .iter()
+                    .filter(|target| **target != number)
+                    .any(|target| {
+                        status
+                            .analysis
+                            .pull_requests
+                            .get(target)
+                            .is_some_and(|target| target.head == report.target)
+                    })
+            };
+            if !target_matches {
+                continue;
+            }
+            let dedupe_key = format!(
+                "{}/{}#{}@{}",
+                status.repository.owner, status.repository.name, number, pull_request.head.oid
+            );
+            let identity = (dedupe_key.clone(), class, report.target.oid.clone());
+            if !seen.insert(identity) {
+                continue;
+            }
+            let paths = report
+                .conflicting_paths
+                .iter()
+                .take(CONFLICT_EVENT_MAX_PATHS)
+                .cloned()
+                .collect::<Vec<_>>();
+            let prs = std::iter::once(number)
+                .chain(problem.prs.iter().copied().filter(|pr| *pr != number))
+                .collect();
+            events.push(hooks::event(
+                EventKind::ConflictDetected,
+                operation_id.clone(),
+                status.repository.clone(),
+                status
+                    .analysis
+                    .fleet
+                    .containing(number)
+                    .map(|caravan| caravan.id),
+                prs,
+                None,
+                Some(problem.message.clone()),
+                BTreeMap::from([
+                    ("dedupe_key".to_owned(), json!(dedupe_key)),
+                    ("pr".to_owned(), json!(number)),
+                    ("head".to_owned(), json!(pull_request.head)),
+                    ("observed_base".to_owned(), json!(pull_request.base)),
+                    (
+                        "default_branch".to_owned(),
+                        json!(status.analysis.fleet.default_branch),
+                    ),
+                    ("target".to_owned(), json!(report.target)),
+                    ("conflict_class".to_owned(), json!(class)),
+                    ("conflicting_paths".to_owned(), json!(paths)),
+                    (
+                        "conflicting_paths_truncated".to_owned(),
+                        json!(
+                            report
+                                .conflicting_paths
+                                .len()
+                                .saturating_sub(CONFLICT_EVENT_MAX_PATHS)
+                        ),
+                    ),
+                    ("provider_state".to_owned(), json!("exact_current_open")),
+                    ("mutation_authority".to_owned(), json!("none")),
+                ]),
+            ));
+        }
+    }
+    events
+}
+
 #[derive(Debug)]
 struct SyncProgress {
     operation_id: OperationId,
@@ -6871,8 +7004,10 @@ impl SyncProgress {
         synchronized_caravans: Vec<PrNumber>,
         mutation_limit: u32,
     ) -> Self {
+        let operation_id = OperationId::new();
+        let events = conflict_detected_events(status, &operation_id);
         Self {
-            operation_id: OperationId::new(),
+            operation_id,
             repository: status.repository.clone(),
             default_branch: status.default_branch.clone(),
             steps: Vec::new(),
@@ -6898,7 +7033,7 @@ impl SyncProgress {
             paused_caravans: Vec::new(),
             head_advancements: Vec::new(),
             ci: Vec::new(),
-            events: Vec::new(),
+            events,
             current: status.analysis.pull_requests.clone(),
             merge_candidates: status
                 .merge_candidates

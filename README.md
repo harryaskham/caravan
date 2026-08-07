@@ -723,7 +723,20 @@ hooks:
     command: ./scripts/on-caravan-sync-failed
     timeout_secs: 30
     blocking: false
+  conflict_detected:
+    command: ./scripts/request-caravan-conflict-repair
+    timeout_secs: 30
+    blocking: false
 ```
+
+`conflict_detected` is a versioned, secret-free notification for one exact open
+PR generation with a mechanically proven conflict. It includes immutable
+head/base/default/target identities, conflict class, bounded paths, operation
+ID, and stable repository+PR+head dedupe key. Unknown or stale provider state
+emits nothing. Candidate conflicts remain advisory, repeated ticks may redeliver,
+and the delivery is forcibly best-effort even if configured as blocking. The
+hook may request a first-party repair; it is not itself authorized to merge,
+rebase, push, comment, or mutate topology.
 
 `sync.terminal_red.action` configures deterministic latest-verdict liveness.
 `block` is the backward-compatible default: terminal red stops the tick. `park`

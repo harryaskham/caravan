@@ -996,6 +996,242 @@ fn status(
     }
 }
 
+#[allow(clippy::unnecessary_wraps)]
+fn conflict(
+    candidate: &BranchSnapshot,
+    target: &BranchSnapshot,
+) -> Result<CompatibilityReport, AppError> {
+    Ok(CompatibilityReport {
+        candidate: candidate.clone(),
+        target: target.clone(),
+        outcome: CompatibilityOutcome::Conflict,
+        conflicting_paths: vec!["src/lib.rs".to_owned()],
+        diagnostic: None,
+    })
+}
+
+#[test]
+fn conflict_events_classify_head_link_and_cross_caravan_edges() {
+    let root_status = status(
+        vec![pull_request(
+            1,
+            "one",
+            "main",
+            PullRequestState::Open,
+            AutoMergeState::disabled(),
+        )],
+        None,
+        &conflict,
+    );
+    let root_events = conflict_detected_events(&root_status, &OperationId::new());
+    let root = root_events
+        .iter()
+        .find(|event| event.metadata["conflict_class"] == "head")
+        .expect("root/default conflict event");
+    assert_eq!(root.kind, EventKind::ConflictDetected);
+    assert_eq!(root.prs, vec![PrNumber(1)]);
+    assert_eq!(root.metadata["head"]["name"], "one");
+    assert_eq!(root.metadata["observed_base"]["name"], "main");
+    assert_eq!(root.metadata["conflicting_paths"], json!(["src/lib.rs"]));
+    assert_eq!(root.metadata["mutation_authority"], "none");
+
+    let link_status = status(
+        vec![
+            pull_request(
+                1,
+                "one",
+                "main",
+                PullRequestState::Open,
+                AutoMergeState::disabled(),
+            ),
+            pull_request(
+                2,
+                "two",
+                "one",
+                PullRequestState::Open,
+                AutoMergeState::disabled(),
+            ),
+        ],
+        None,
+        &conflict,
+    );
+    let link_events = conflict_detected_events(&link_status, &OperationId::new());
+    let link = link_events
+        .iter()
+        .find(|event| event.metadata["conflict_class"] == "link")
+        .expect("child/predecessor conflict event");
+    assert_eq!(link.prs, vec![PrNumber(2), PrNumber(1)]);
+    assert_eq!(link.metadata["target"]["name"], "one");
+
+    let cross_status = status(
+        vec![
+            pull_request(
+                3,
+                "three",
+                "main",
+                PullRequestState::Open,
+                AutoMergeState::disabled(),
+            ),
+            pull_request(
+                4,
+                "four",
+                "main",
+                PullRequestState::Open,
+                AutoMergeState::disabled(),
+            ),
+        ],
+        None,
+        &conflict,
+    );
+    assert!(
+        conflict_detected_events(&cross_status, &OperationId::new())
+            .iter()
+            .any(|event| event.metadata["conflict_class"] == "cross_caravan")
+    );
+}
+
+#[test]
+fn candidate_conflict_event_is_exact_stable_and_does_not_block_green_work() {
+    let root = pull_request(
+        1,
+        "root",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::squash(),
+    );
+    let mut candidate = pull_request(
+        9,
+        "candidate",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    candidate.labels.clear();
+    let checker = |candidate: &BranchSnapshot, target: &BranchSnapshot| {
+        if candidate.name == "candidate" {
+            conflict(candidate, target)
+        } else {
+            clean(candidate, target)
+        }
+    };
+    let first_status = status(vec![root, candidate.clone()], None, &checker);
+    let first = conflict_detected_events(&first_status, &OperationId::new());
+    let event = first
+        .iter()
+        .find(|event| event.metadata["conflict_class"] == "candidate")
+        .expect("candidate conflict event");
+    assert_eq!(event.prs, vec![PrNumber(9)]);
+    let dedupe = event.metadata["dedupe_key"].clone();
+
+    let second = conflict_detected_events(&first_status, &OperationId::new());
+    assert_eq!(second[0].metadata["dedupe_key"], dedupe);
+    assert_ne!(second[0].event_id, event.event_id);
+
+    candidate.head.oid = CommitOid("new-candidate-head".to_owned());
+    let moved_status = status(
+        vec![
+            pull_request(
+                1,
+                "root",
+                "main",
+                PullRequestState::Open,
+                AutoMergeState::squash(),
+            ),
+            candidate,
+        ],
+        None,
+        &checker,
+    );
+    let moved = conflict_detected_events(&moved_status, &OperationId::new());
+    assert_ne!(moved[0].metadata["dedupe_key"], dedupe);
+
+    let provider = FakeProvider::with_pull_requests(
+        first_status
+            .analysis
+            .pull_requests
+            .values()
+            .cloned()
+            .collect(),
+    );
+    let progress = execute(&first_status, &provider, true, false, false)
+        .expect("candidate conflict remains advisory while green fleet converges");
+    assert!(
+        progress
+            .events
+            .iter()
+            .any(|event| event.kind == EventKind::ConflictDetected)
+    );
+}
+
+#[test]
+fn conflict_event_paths_are_bounded_with_explicit_truncation() {
+    let checker = |candidate: &BranchSnapshot, target: &BranchSnapshot| {
+        Ok(CompatibilityReport {
+            candidate: candidate.clone(),
+            target: target.clone(),
+            outcome: CompatibilityOutcome::Conflict,
+            conflicting_paths: (0..100).map(|index| format!("src/{index}.rs")).collect(),
+            diagnostic: None,
+        })
+    };
+    let status = status(
+        vec![pull_request(
+            1,
+            "one",
+            "main",
+            PullRequestState::Open,
+            AutoMergeState::disabled(),
+        )],
+        None,
+        &checker,
+    );
+
+    let events = conflict_detected_events(&status, &OperationId::new());
+    let paths = events[0].metadata["conflicting_paths"]
+        .as_array()
+        .expect("bounded path list");
+    assert_eq!(paths.len(), CONFLICT_EVENT_MAX_PATHS);
+    assert_eq!(events[0].metadata["conflicting_paths_truncated"], 36);
+}
+
+#[test]
+fn unknown_or_closed_conflict_facts_emit_no_repair_event() {
+    let unknown = |candidate: &BranchSnapshot, target: &BranchSnapshot| {
+        Ok(CompatibilityReport {
+            candidate: candidate.clone(),
+            target: target.clone(),
+            outcome: CompatibilityOutcome::Unknown,
+            conflicting_paths: Vec::new(),
+            diagnostic: Some("provider mergeability unknown".to_owned()),
+        })
+    };
+    let unknown_status = status(
+        vec![pull_request(
+            1,
+            "one",
+            "main",
+            PullRequestState::Open,
+            AutoMergeState::disabled(),
+        )],
+        None,
+        &unknown,
+    );
+    assert!(conflict_detected_events(&unknown_status, &OperationId::new()).is_empty());
+
+    let closed_status = status(
+        vec![pull_request(
+            2,
+            "two",
+            "main",
+            PullRequestState::Closed,
+            AutoMergeState::disabled(),
+        )],
+        None,
+        &conflict,
+    );
+    assert!(conflict_detected_events(&closed_status, &OperationId::new()).is_empty());
+}
+
 fn healthy_chain() -> Vec<PullRequestSnapshot> {
     vec![
         pull_request(

@@ -248,14 +248,26 @@ fn dispatch_events_with_deadline(
         if journaled.insert(event.event_id.clone()) {
             crate::journal::append_event(context, event)?;
         }
-        let Some(hook) = context.config.hook(event.kind) else {
+        let Some(configured_hook) = context.config.hook(event.kind) else {
             continue;
         };
-        let delivery = dispatch_event(&context.repository_path, hook, event, operation_deadline)?;
+        // Conflict detection is notification-only. A repair coordinator may
+        // fail, time out, or deduplicate externally, but it cannot turn one
+        // candidate conflict into a sync failure or become a second scheduler.
+        let mut effective_hook = configured_hook.clone();
+        if event.kind == EventKind::ConflictDetected {
+            effective_hook.blocking = false;
+        }
+        let delivery = dispatch_event(
+            &context.repository_path,
+            &effective_hook,
+            event,
+            operation_deadline,
+        )?;
         crate::journal::append_delivery(context, event, &delivery)?;
         let failed = delivery.state != HookDeliveryState::Succeeded;
         deliveries.push(delivery.clone());
-        if failed && hook.blocking {
+        if failed && effective_hook.blocking {
             return Err(hook_failure(event, &delivery, &deliveries));
         }
     }
@@ -603,6 +615,28 @@ mod tests {
 
         assert_eq!(deliveries[0].state, HookDeliveryState::TimedOut);
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn conflict_hook_is_always_nonblocking_even_when_configured_blocking() {
+        let repository = tempfile::tempdir().unwrap();
+        let hook = HookConfig {
+            command: "exit 17".to_owned(),
+            timeout_secs: 5,
+            blocking: true,
+        };
+        let mut context = context(repository.path(), hook.clone());
+        context
+            .config
+            .hooks
+            .insert(EventKind::ConflictDetected, hook);
+
+        let deliveries = dispatch_events(&context, &[event(EventKind::ConflictDetected)])
+            .expect("a repair-notification failure never fails sync");
+
+        assert_eq!(deliveries[0].state, HookDeliveryState::Failed);
+        assert!(!deliveries[0].blocking);
+        assert_eq!(deliveries[0].exit_code, Some(17));
     }
 
     #[test]

@@ -1107,6 +1107,7 @@ Hook events include:
 - `caravan_created`;
 - `pr_joined`;
 - `ready_pr_unqueued`;
+- `conflict_detected`;
 - `sync_failed`;
 - `join_failed`;
 - `eviction_failed`;
@@ -1123,6 +1124,19 @@ Hook events include:
 - `root_auto_merge_armed` (historical `head_merge_actor: github`);
 - `required_runs_missing`;
 - `required_runs_retriggered`.
+
+`conflict_detected` is emitted only from exact current open provider generations
+with a mechanically proven `conflict` compatibility report. Its bounded,
+secret-free payload carries repository, candidate PR and immutable head,
+observed base, exact default/target generation, `head`/`link`/`cross_caravan`/
+`candidate` class, bounded conflicting paths, reason, operation ID, and stable
+`owner/repo#pr@head` dedupe key. Unknown/stale mergeability emits nothing.
+Candidate events remain advisory and never block unrelated green convergence.
+Repeated ticks may redeliver with a new event ID; coordinators deduplicate by the
+stable generation key. Conflict-hook delivery is always best-effort even if its
+config says `blocking: true`, and the payload explicitly grants no mutation
+authority. Hooks may request a first-party repair but are never a merge, rebase,
+push, comment, or topology actor.
 
 `examples/hooks/caco-bead-dispatch.sh` is the worked scheduler-side consumer:
 it routes on `wake_class`, staying silent for `none` and `retry_tick` because
