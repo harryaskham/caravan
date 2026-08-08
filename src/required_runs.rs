@@ -536,6 +536,14 @@ pub fn assess(input: &RequiredRunsInput<'_>) -> RequiredRunsAssessment {
         };
     }
 
+    // Required-run coverage must consume the same canonical current-check
+    // projection as CI classification. Keep the full matching lineage below
+    // for diagnostics, but only rows not positively proven superseded may vote.
+    // Reducing the complete rollup (rather than each context independently) is
+    // important: a newer workflow generation can retire an older job before
+    // that job has materialized in the replacement run.
+    let (current_checks, _superseded_checks) =
+        crate::model::latest_checks_per_identity(input.checks);
     let mut coverage = Vec::new();
     for context in &input.contexts.contexts {
         let matching = input
@@ -543,12 +551,17 @@ pub fn assess(input: &RequiredRunsInput<'_>) -> RequiredRunsAssessment {
             .iter()
             .filter(|check| check.name == *context)
             .collect::<Vec<_>>();
+        let current_matching = current_checks
+            .iter()
+            .copied()
+            .filter(|check| check.name == *context)
+            .collect::<Vec<_>>();
         let reporting_checks = matching
             .iter()
             .filter(|check| check.state != CheckState::Expected)
             .map(|check| check.name.clone())
             .collect::<Vec<_>>();
-        let (state, provider_state) = match state_from_checks(&matching) {
+        let (state, provider_state) = match state_from_checks(&current_matching) {
             Some(reported) => reported,
             None => (state_from_lineage(input.lineage, &head_sha), None),
         };

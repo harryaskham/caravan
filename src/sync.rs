@@ -7313,9 +7313,14 @@ impl SyncProgress {
         current: &PullRequestSnapshot,
         contexts: &RequiredContextsRead,
     ) -> Result<crate::required_runs::RequiredRunsAssessment, AppError> {
-        let reporting = current
-            .checks
-            .iter()
+        // Decide whether lineage is needed from the same canonical current
+        // projection used by CI and required-run assessment. Historical rows
+        // must not make a context appear covered after a newer workflow
+        // generation supersedes them.
+        let (current_checks, _superseded_checks) =
+            crate::model::latest_checks_per_identity(&current.checks);
+        let reporting = current_checks
+            .into_iter()
             .filter(|check| check.state != crate::model::CheckState::Expected)
             .map(|check| check.name.as_str())
             .collect::<BTreeSet<_>>();
