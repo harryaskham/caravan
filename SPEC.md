@@ -1497,22 +1497,35 @@ The first skeleton establishes:
 
 Subsequent beads implement GitHub discovery, graph validation, compatibility, mutations, sync/CI, hooks/loop, and recovery behavior without changing this contract silently.
 
-`sync.checkout_on_decision` (default `false`) leaves the working tree exactly
-where it was. Setting it `true` restores the historical affordance of checking
-out a decision's PR so it can be repaired in place. `CARA_CHECKOUT_ON_DECISION`
-overrides the configured value for one invocation, so a scheduled hook or an
-interactive shell can differ from repository policy without editing a shared
-file. Only unambiguous values are honoured (`1/true/yes/on`, `0/false/no/off`);
-anything else leaves configuration in force rather than guessing. That is right for an
-interactive checkout and wrong for an unattended sync worktree, which otherwise
-silently becomes whatever PR was last inspected — one was found parked on a dead
-agent's branch 95 commits behind the default, so every policy value came from
-that old commit. The default records a `skipped` checkout receipt naming the PR, so the
-between-runs state is always explained rather than implied and a well-known
-worktree never silently becomes the last PR inspected. `config_provenance.behind_default_branch`
-reports the distance on every read, and a tick refuses with
-`stale_repository_policy` when the effective config both differs from the
-default branch and comes from a checkout that is behind it.
+`sync.checkout_on_decision` (default `false`) leaves the invoking working tree
+exactly where it was. Setting it `true` restores the historical affordance of
+checking out a decision's PR inside Cara's operation worktree so it can be
+repaired in place. `CARA_CHECKOUT_ON_DECISION` overrides the configured value
+for one invocation. Only unambiguous values are honoured (`1/true/yes/on`,
+`0/false/no/off`); anything else leaves configuration in force.
+
+`sync.allow_fetch` defaults to `true`. Before `sync`, `plan sync`, or a loop
+tick, Cara resolves `origin/HEAD`, performs one bounded exact-ref fetch of that
+branch, pins the resulting commit, and materializes a detached temporary Git
+worktree. The materialized worktree shares the repository common Git directory,
+so operation locks, journals, and checkpoints retain one authority domain, but
+policy, repository-relative hooks, and Git reads come from the fetched default
+snapshot. The invoking branch, HEAD, index, tracked/untracked files, in-progress
+Git state, remotes, and local branches are never checked out, reset, stashed, or
+rewritten. The remote-tracking generation is revalidated after provider
+discovery and before the first possible provider mutation; movement refuses
+with `sync_default_branch_moved` and zero provider writes. Cleanup removes only
+the Cara-owned detached worktree. `CARA_ALLOW_FETCH` is the strict per-invocation
+override. An explicit `--config` remains explicit authority and is never
+silently replaced.
+
+A reviewed `sync.allow_fetch: false` retains branch-local operation. In that
+mode `config_provenance.behind_default_branch` still reports distance and
+`stale_repository_policy` refuses a differing older policy, directing the
+operator to enable authoritative fetching or pass an explicit reviewed config—
+never to reset an arbitrary invocation branch. A missing/ambiguous default ref,
+fetch failure, materialization failure, or generation race likewise returns a
+typed local-preparation error before provider mutation.
 
 Configuration validation is two-tier. Structure, version, `min_cara_version`,
 label syntax, command timeouts, journal bounds, and hook policy are always

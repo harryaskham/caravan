@@ -42,6 +42,7 @@ pub mod stack_membership;
 pub mod stack_policy;
 pub mod stack_recovery;
 pub mod sync;
+mod sync_authority;
 pub mod unpark;
 pub mod web;
 pub mod writer_guard;
@@ -229,6 +230,12 @@ the exact pinned binary. It performs strict parsing and no repository/provider a
    writes. Review ordered actions, no-ops, decisions, and rediscovery barriers.
 6. Run `cara sync` for the current caravan or `cara sync --all` for the fleet.
    Continue until it converges, reports waiting CI, or returns one typed decision.
+   Sync is safe from any branch: default-on `sync.allow_fetch` fetches the exact
+   `origin/HEAD` branch and runs policy, Git reads, and repository-relative hooks
+   from a detached temporary worktree without resetting, checking out, stashing,
+   or changing the caller's branch/index/worktree. The fetched ref is fenced
+   again before provider mutation. Use `CARA_ALLOW_FETCH=false` only as a
+   deliberate per-invocation opt-out; an explicit `--config` remains explicit.
    With `sync.actions.join_unlabelled_prs: true`, only sync-all also grows the
    fleet after existing caravans converge: `priority_fifo_greedy_v1` tries
    canonical candidates and deterministic live tails, joins the first compatible
@@ -723,6 +730,44 @@ impl AppContext {
                 (relative, false, CaravanConfig::default())
             }
         };
+        config.validate_runtime_environment()?;
+        Ok(Self {
+            repository_path,
+            config_path,
+            config_existed,
+            config,
+        })
+    }
+
+    /// Bootstrap sync from the invocation directory without trusting its branch
+    /// policy.
+    pub fn load_for_sync(path: Option<&Path>) -> Result<Self, ConfigError> {
+        let invocation_directory =
+            std::env::current_dir().map_err(|error| ConfigError::RepositoryNotFound {
+                path: PathBuf::from("."),
+                message: error.to_string(),
+            })?;
+        Self::load_for_sync_from_directory(&invocation_directory, path)
+    }
+
+    /// Bootstrap sync without parsing policy from the invoking branch.
+    ///
+    /// An explicit config remains explicit and is loaded normally. Otherwise
+    /// only repository identity is resolved here; default-on sync preparation
+    /// fetches and loads the complete policy from the remote default snapshot.
+    /// This lets even a branch carrying malformed or too-old proposed policy
+    /// run `sync` without making that proposal authoritative.
+    pub fn load_for_sync_from_directory(
+        invocation_directory: &Path,
+        path: Option<&Path>,
+    ) -> Result<Self, ConfigError> {
+        if path.is_some() {
+            return Self::load_from_directory(invocation_directory, path);
+        }
+        let repository_path = resolve_repository_root(invocation_directory)?;
+        let config_path = PathBuf::from(config::DEFAULT_CONFIG_PATH);
+        let config_existed = repository_path.join(&config_path).exists();
+        let config = CaravanConfig::sync_bootstrap_default();
         config.validate_runtime_environment()?;
         Ok(Self {
             repository_path,

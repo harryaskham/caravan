@@ -1410,7 +1410,8 @@ impl<R: crate::command::CommandRunner> SyncProvider for GitHubMutationAdapter<R>
 
 /// Synchronize the current caravan or every caravan and dispatch its canonical events.
 pub fn sync(context: &AppContext, input: &SyncInput) -> Result<SyncOutput, AppError> {
-    sync_with_optional_writer_guard(context, input, None)
+    let prepared = crate::sync_authority::prepare(context)?;
+    sync_with_optional_writer_guard(prepared.context(), input, None, prepared.authority())
 }
 
 pub(crate) fn sync_with_writer_guard(
@@ -1418,18 +1419,40 @@ pub(crate) fn sync_with_writer_guard(
     input: &SyncInput,
     writer_guard: WriterOperationGuard,
 ) -> Result<SyncOutput, AppError> {
-    sync_with_optional_writer_guard(context, input, Some(writer_guard))
+    let prepared = crate::sync_authority::prepare(context)?;
+    sync_with_optional_writer_guard(
+        prepared.context(),
+        input,
+        Some(writer_guard),
+        prepared.authority(),
+    )
+}
+
+pub(crate) fn sync_prepared(
+    context: &AppContext,
+    input: &SyncInput,
+    authority: Option<&crate::sync_authority::DefaultBranchAuthority>,
+) -> Result<SyncOutput, AppError> {
+    sync_with_optional_writer_guard(context, input, None, authority)
 }
 
 fn sync_with_optional_writer_guard(
     context: &AppContext,
     input: &SyncInput,
     writer_guard: Option<WriterOperationGuard>,
+    authority: Option<&crate::sync_authority::DefaultBranchAuthority>,
 ) -> Result<SyncOutput, AppError> {
     let started = Instant::now();
     let budget = sync_operation_budget(context);
     let operation_deadline = started + budget;
-    match sync_without_hooks(context, input, started, operation_deadline, writer_guard) {
+    match sync_without_hooks(
+        context,
+        input,
+        started,
+        operation_deadline,
+        writer_guard,
+        authority,
+    ) {
         Ok(mut output) => {
             output.hook_deliveries =
                 hooks::dispatch_events_before(context, &output.events, operation_deadline)?;
@@ -3247,6 +3270,7 @@ fn sync_without_hooks(
     started: Instant,
     operation_deadline: Instant,
     writer_guard: Option<WriterOperationGuard>,
+    authority: Option<&crate::sync_authority::DefaultBranchAuthority>,
 ) -> Result<SyncOutput, AppError> {
     let lock = match writer_guard {
         Some(lock) => lock,
@@ -3260,6 +3284,7 @@ fn sync_without_hooks(
         operation_deadline,
         lock,
         lock_recovery.clone(),
+        authority,
     )
     .map_err(|error| attach_lock_recovery(error, lock_recovery.as_ref()))
 }
@@ -3272,6 +3297,7 @@ fn sync_with_lock(
     operation_deadline: Instant,
     mut lock: WriterOperationGuard,
     lock_recovery: Option<OperationLockRecovery>,
+    authority: Option<&crate::sync_authority::DefaultBranchAuthority>,
 ) -> Result<SyncOutput, AppError> {
     lock.checkpoint(
         "initial_discovery_in_flight",
@@ -3292,10 +3318,13 @@ fn sync_with_lock(
     );
     let mut status =
         // A sync tick operates on the whole fleet and addresses every PR
-        // explicitly, so it must not abort because the invoking checkout sits on
-        // a merged or ambiguous branch. That state is one Cara produces itself
-        // by retiring merged heads after a successful landing.
+        // explicitly, so provider discovery does not depend on the temporary
+        // authoritative worktree's detached HEAD. The invocation identity is
+        // rebound below for targeted (non-`--all`) selection only.
         read::fleet_status(context, operation_deadline, Some(&github_budget))?;
+    if let Some(authority) = authority {
+        authority.bind_invocation(&mut status)?;
+    }
     let initial_status_elapsed = initial_status_started.elapsed();
     progress::emit(
         "initial_discovery",
@@ -3307,7 +3336,14 @@ fn sync_with_lock(
         ),
     );
     crate::initialization::require_ready(&status.initialization)?;
-    require_current_policy(&status)?;
+    require_current_policy(context, &status)?;
+    if let Some(authority) = authority {
+        // Provider discovery above is read-only. Fence the first possible
+        // provider mutation on the exact default-policy generation fetched for
+        // this tick; a concurrent main movement gets a fresh tick, never mixed
+        // policy and writes.
+        authority.revalidate()?;
+    }
     // Tick budgets are enforced here rather than at config load, so a bad budget
     // can never silence the read-only surfaces needed to diagnose it.
     context.config.validate_tick_bounds().map_err(|error| {
@@ -9071,7 +9107,7 @@ fn classify_cancellation(
 /// time; only nothing consulted it. A deliberate branch proposal is still
 /// allowed: refusal requires differing policy *and* a checkout that is behind
 /// (bd-6f234e).
-fn require_current_policy(status: &StatusOutput) -> Result<(), AppError> {
+fn require_current_policy(context: &AppContext, status: &StatusOutput) -> Result<(), AppError> {
     let Some(provenance) = status
         .config_provenance
         .as_ref()
@@ -9087,9 +9123,17 @@ fn require_current_policy(status: &StatusOutput) -> Result<(), AppError> {
             "provenance": provenance,
             "resumable": true,
             "operator_action_required": true,
-            "next": "update this checkout to the current default branch, then rerun the same idempotent sync",
-            "safe_next_action": "`git fetch origin` then reset or check out the recorded default branch in the sync worktree",
-            "why": "every admission, budget, and hook decision is read from this config; an older generation silently applies policy the repository has already replaced",
+            "next": if context.config.sync.allow_fetch {
+                "rerun after resolving the reported authoritative-default materialization failure"
+            } else {
+                "enable sync.allow_fetch (or CARA_ALLOW_FETCH=true) and rerun the same idempotent sync"
+            },
+            "safe_next_action": if context.config.sync.allow_fetch {
+                "inspect the preceding sync_default_branch_* error; never reset the invoking branch just to run sync"
+            } else {
+                "enable the default-on bounded fetch, or pass an explicit reviewed --config; Cara will not reset or check out the invoking branch"
+            },
+            "why": "every admission, budget, and hook decision must come from one exact authoritative policy generation; an older branch-local generation is never used for provider writes",
         })),
     ))
 }

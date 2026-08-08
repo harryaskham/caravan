@@ -15,12 +15,12 @@ const MAX_SYNC_PLAN_ACTIONS: usize = 512;
 
 /// Build an exact, bounded sync plan without invoking any provider mutation.
 pub fn plan_sync(context: &AppContext, input: &SyncInput) -> Result<SyncPlanOutput, AppError> {
-    // A plan cannot fail a mutation, because it performs none. The machinery is
-    // shared with the real tick, so a provider READ failure surfaced under the
-    // real tick's name: a TLS timeout on `gh api repos/...` was reported as
-    // `github_mutation_failed`, which tells the one reader who most needs the
-    // truth that a write was attempted (bd-070cdf).
-    plan_sync_inner(context, input).map_err(rename_mutation_failure_for_plan)
+    // A plan cannot fail a provider mutation, because it performs none. A
+    // default-branch fetch and temporary materialization are local read-side
+    // preparation and leave the invoking branch/index/worktree untouched.
+    let prepared = crate::sync_authority::prepare(context)?;
+    plan_sync_inner(prepared.context(), input, prepared.authority())
+        .map_err(rename_mutation_failure_for_plan)
 }
 
 /// Rename a shared-machinery mutation failure for the no-write plan path.
@@ -46,15 +46,24 @@ pub(crate) fn rename_mutation_failure_for_plan(error: AppError) -> AppError {
 }
 
 #[allow(clippy::too_many_lines)]
-fn plan_sync_inner(context: &AppContext, input: &SyncInput) -> Result<SyncPlanOutput, AppError> {
+fn plan_sync_inner(
+    context: &AppContext,
+    input: &SyncInput,
+    authority: Option<&crate::sync_authority::DefaultBranchAuthority>,
+) -> Result<SyncPlanOutput, AppError> {
     let lock = context.acquire_planning_operation("plan-sync")?;
     let started = Instant::now();
     let operation_deadline = started + sync_operation_budget(context);
     let github_budget =
         crate::command::GithubRequestBudget::new(context.config.sync.max_github_requests_per_tick);
-    let status =
-        read::status_with_deadline_and_budget(context, operation_deadline, Some(&github_budget))?;
+    let mut status = read::fleet_status(context, operation_deadline, Some(&github_budget))?;
+    if let Some(authority) = authority {
+        authority.bind_invocation(&mut status)?;
+    }
     crate::initialization::require_ready(&status.initialization)?;
+    if let Some(authority) = authority {
+        authority.revalidate()?;
+    }
     // A plan for a tick that cannot start is worse than no plan: it converts
     // "I checked" into false confidence. Tick bounds moved out of config load so
     // a bad budget could not silence read-only surfaces (bd-a4a7e9), which was

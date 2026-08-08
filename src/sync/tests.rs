@@ -8737,7 +8737,8 @@ fn a_tick_refuses_policy_read_from_a_checkout_behind_the_default_branch() {
     let mut status = status(healthy_chain(), Some(PrNumber(1)), &clean);
     status.config_provenance = Some(stale.clone());
 
-    let error = crate::sync::require_current_policy(&status)
+    let context = AppContext::default();
+    let error = crate::sync::require_current_policy(&context, &status)
         .expect_err("a tick must never mutate under superseded policy");
     assert_eq!(
         mcp_cli::StructuredError::code(&error),
@@ -8752,7 +8753,7 @@ fn a_tick_refuses_policy_read_from_a_checkout_behind_the_default_branch() {
         behind_default_branch: Some(0),
         ..stale
     });
-    crate::sync::require_current_policy(&status)
+    crate::sync::require_current_policy(&context, &status)
         .expect("a current branch proposal is legitimate policy");
 }
 
