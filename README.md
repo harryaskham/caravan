@@ -646,7 +646,19 @@ native Stack API. The explicit `github` value plus a reviewed
 `stack_rollout.mutations_opt_in` enables exact Stack membership, reshape, and
 lock-fenced landing. Capability, complete inventory, unique mapping, exact
 generation, holds, compatibility, CI, and unsupported force intent all fail
-closed before provider mutation. The installed
+closed before provider mutation. Joining the second member writes a sealed local
+native-membership continuation before Stack creation; successful create clears
+it, while a provider failure returns the exact checkpoint instead of telling a
+scheduler to re-admit an already-labelled PR. A legacy or checkpointed
+multi-member caravan with zero mappings is repaired only through
+`cara native-stack recovery-preview` followed by `recovery-apply` with the exact
+plan hash. Apply independently revalidates ordered membership, immutable
+heads/bases, current CLEAN/green evidence, rollout capability, and complete
+mapping truth. A legacy first-child gap permits zero mappings; a checkpointed
+append permits only its exact provider prefix; a response-loss retry permits one
+exact desired mapping. Apply then issues at most one idempotent Stack create/add.
+It never changes a source head, base, label, comment, or merge state;
+multiple/partial mappings and singleton inputs fail closed. The installed
 `gh stack` CLI does not merge Stacks; GitHub's web merge uses the top-SHA-only
 async REST endpoint. A disposable sandbox proved an unlocked lower rewind can
 merge at a changed generation. A follow-up sandbox proved that an exact-ref

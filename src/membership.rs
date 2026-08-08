@@ -1857,10 +1857,44 @@ fn execute_locked(
             &output,
             &context.config.stack_rollout.reviewed_by,
         )
-        .map_err(|error| native_membership_error(&error, &output))?;
-        let native_receipt = provider
-            .converge_native_membership(&native_plan)
-            .map_err(|error| native_membership_error(&error, &output))?;
+        .map_err(|error| native_membership_error(&error, &output, None))?;
+        // Ordinary membership is already provider-visible here. Persist the
+        // exact create/add continuation before touching the native Stack API so
+        // a timeout or process loss never leaves an unreachable "rerun join"
+        // instruction for a candidate that is now already enrolled.
+        let native_checkpoint =
+            crate::stack_membership::persist_pending(&context.repository_path, &native_plan)?;
+        let native_receipt = match provider.converge_native_membership(&native_plan) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                return Err(native_membership_error(
+                    &error,
+                    &output,
+                    native_checkpoint.as_ref(),
+                ));
+            }
+        };
+        if let Some(checkpoint) = native_checkpoint
+            && let Err(error) = crate::stack_membership::clear_pending(
+                &context.repository_path,
+                checkpoint.caravan_id,
+            )
+        {
+            return Err(AppError::structured(
+                ErrorCategory::ExecutionFailure,
+                "github_stack_membership_checkpoint_clear_failed",
+                "native Stack convergence succeeded, but its local continuation checkpoint could not be cleared",
+                Some(json!({
+                    "ordinary_membership_receipt": output.receipt,
+                    "native_membership_checkpoint": checkpoint,
+                    "native_stack_receipt": native_receipt,
+                    "source": error.to_string(),
+                    "mutated": true,
+                    "resumable": true,
+                    "safe_next_action": "preserve both receipts and use the plan-hash-gated native Stack recovery path; an exact retry is provider-idempotent",
+                })),
+            ));
+        }
         output.native_stack_receipt = Some(native_receipt);
     }
     let event = hooks::event(
@@ -2324,6 +2358,7 @@ struct JoinTarget {
 fn native_membership_error(
     error: &crate::stack_membership::NativeMembershipError,
     output: &MembershipOutput,
+    checkpoint: Option<&crate::stack_membership::NativeMembershipCheckpoint>,
 ) -> AppError {
     AppError::structured(
         ErrorCategory::ExecutionFailure,
@@ -2336,7 +2371,11 @@ fn native_membership_error(
             "resumable": true,
             "ordinary_membership_receipt": output.receipt,
             "provider_receipts": output.provider_receipts,
-            "safe_next_action": "rerun the same membership command; ordinary Cara mutations are idempotent and native Stack create/add converges from exact provider truth",
+            "native_membership_checkpoint": checkpoint,
+            "safe_next_action": format!(
+                "run `cara native-stack recovery-preview --root {} --actor <identity> --reason <text>`, review its exact plan hash, then use recovery-apply; do not rerun admission for an already-enrolled member",
+                output.caravan_id,
+            ),
         })),
     )
 }

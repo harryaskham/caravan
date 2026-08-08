@@ -40,6 +40,7 @@ pub mod squash_equivalence;
 mod stack_checkpoint;
 pub mod stack_membership;
 pub mod stack_policy;
+pub mod stack_recovery;
 pub mod sync;
 pub mod unpark;
 pub mod web;
@@ -258,6 +259,15 @@ GITHUB NATIVE STACKS (EXPLICIT OPT-IN)
   enables exact Stack membership, reshape, and lock-fenced landing; capability,
   mapping, generation, hold, compatibility, CI, and force gates still fail
   closed before provider mutation.
+- Native membership persists an exact continuation before Stack create/add. If
+  ordinary base/label membership completed but provider representation did not,
+  do not rerun admission: use `native-stack recovery-preview`, review its exact
+  immutable membership/head/base/green-check/mapping plan hash, then pass that
+  hash to `recovery-apply`. The apply path permits only zero mappings for legacy
+  create, an exact checkpointed provider prefix for append, or one exact desired
+  mapping on an idempotent response-loss retry—never singleton, truncated,
+  uncheckpointed partial, drifted, or multiple mappings—and never rewrites
+  source heads or mutates PR bases/labels/comments.
 - The installed `gh stack` CLI does not merge Stacks. It creates, links,
   submits, rebases, and synchronizes branch/PR topology; GitHub's web merge uses
   the same asynchronous REST endpoint that accepts only the selected top SHA.
@@ -1299,6 +1309,20 @@ pub fn build_router() -> ToolRouter<AppContext> {
         "unpark",
         "Remove only engine-owned terminal-red parking after exact repository, head/base, membership, durable parking provenance, provider state, newest authoritative green checks, and every protection-declared required context are freshly revalidated with a check-sensitive provider preflight.",
         |context: &AppContext, input: unpark::UnparkInput| unpark::unpark(context, &input),
+    );
+    router.add_typed_tool_with_output_schema(
+        "native_stack_recovery_preview",
+        "Build a no-write plan binding one exact multi-member caravan, immutable source heads/bases, current green checks, reviewed native rollout, zero-or-exact provider mapping, and any pending formation checkpoint into a recovery plan hash.",
+        |context: &AppContext, input: stack_recovery::NativeStackRecoveryPreviewInput| {
+            stack_recovery::preview(context, &input)
+        },
+    );
+    router.add_typed_tool_with_output_schema(
+        "native_stack_recovery_apply",
+        "Independently rediscover and apply one exact reviewed recovery plan, creating one missing Stack or completing one checkpointed append with an idempotent sealed receipt while never rewriting source heads or changing PR bases, labels, comments, or merge state.",
+        |context: &AppContext, input: stack_recovery::NativeStackRecoveryApplyInput| {
+            stack_recovery::apply(context, &input)
+        },
     );
     router.add_typed_tool_with_output_schema(
         "restore_parked",
