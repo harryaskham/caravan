@@ -7390,6 +7390,26 @@ fn caravan_member(number: u64, head: &str, base: &str) -> PullRequestSnapshot {
     pull_request
 }
 
+fn required_workflow_check(
+    name: &str,
+    state: CheckState,
+    run_id: u64,
+    started_at: &str,
+) -> CheckSnapshot {
+    CheckSnapshot {
+        name: name.to_owned(),
+        state,
+        provider_state: Some(format!("{state:?}").to_uppercase()),
+        details_url: Some(format!(
+            "https://github.com/harryaskham/cacophony/actions/runs/{run_id}/job/1"
+        )),
+        provider_kind: Some("CheckRun".to_owned()),
+        workflow_name: Some("CI".to_owned()),
+        started_at: Some(started_at.to_owned()),
+        ..CheckSnapshot::default()
+    }
+}
+
 #[test]
 fn max_caravans_only_fences_admission_while_two_existing_green_caravans_merge() {
     let pulls = vec![
@@ -7527,6 +7547,90 @@ fn a_promoted_green_root_is_squash_merged_by_cara_with_sealed_landing_proof() {
         progress.root_auto_merge.is_empty(),
         "cara never arms provider auto-merge"
     );
+}
+
+#[test]
+fn plan_and_sync_agree_that_newer_green_required_runs_make_the_root_eligible() {
+    const OLD_RUN: u64 = 31_270_552_471;
+    const NEW_RUN: u64 = 31_270_627_003;
+    let mut root = caravan_member(2575, "pr2575-head", "main");
+    root.checks = vec![
+        required_workflow_check(
+            CHECK_LINT,
+            CheckState::Failure,
+            OLD_RUN,
+            "2026-08-08T20:00:00Z",
+        ),
+        required_workflow_check(
+            FAST_TESTS,
+            CheckState::Failure,
+            OLD_RUN,
+            "2026-08-08T20:00:01Z",
+        ),
+        required_workflow_check(
+            CHECK_LINT,
+            CheckState::Success,
+            NEW_RUN,
+            "2026-08-08T20:10:00Z",
+        ),
+        required_workflow_check(
+            FAST_TESTS,
+            CheckState::Success,
+            NEW_RUN,
+            "2026-08-08T20:10:01Z",
+        ),
+    ];
+    let pulls = vec![root];
+    let status = caravan_status(pulls.clone(), Some(PrNumber(2575)), true);
+    let caravan = status.analysis.fleet.caravans[0].clone();
+
+    let plan_provider = FakeProvider::with_pull_requests(pulls.clone());
+    plan_provider.require_contexts("main", &required_context_names());
+    let mut plan_progress = SyncProgress::new(&status, vec![caravan.id], 20);
+    let mut actions = Vec::new();
+    let mut decisions = Vec::new();
+    let mut events = Vec::new();
+    plan_caravan_convergence(
+        &status,
+        &plan_provider,
+        &caravan,
+        &SyncInput {
+            all: true,
+            rerun_failed: false,
+            dry_run: false,
+        },
+        false,
+        false,
+        &mut plan_progress,
+        &mut actions,
+        &mut decisions,
+        &mut events,
+    )
+    .expect("the no-write plan accepts the newest green generation");
+    let planned_required_runs = actions
+        .iter()
+        .find(|action| action.kind == "verify_required_runs" && action.pr == Some(PrNumber(2575)))
+        .expect("plan records required-run readiness");
+    assert_eq!(
+        planned_required_runs.target.as_ref().unwrap()["status"],
+        serde_json::json!(RequiredRunsStatus::Satisfied)
+    );
+    assert!(plan_provider.calls.borrow().is_empty());
+
+    let sync_provider = FakeProvider::with_pull_requests(pulls);
+    sync_provider.require_contexts("main", &required_context_names());
+    let progress = execute(&status, &sync_provider, false, false, false)
+        .expect("sync uses the same snapshot verdict and lands the eligible root");
+    assert_eq!(
+        required_runs_receipt(&progress, 2575).assessment.status,
+        RequiredRunsStatus::Satisfied
+    );
+    assert_eq!(
+        *sync_provider.calls.borrow(),
+        vec![MutationKind::SquashMerge]
+    );
+    assert_eq!(progress.root_merge.len(), 1);
+    assert_eq!(progress.root_merge[0].pr, PrNumber(2575));
 }
 
 #[test]

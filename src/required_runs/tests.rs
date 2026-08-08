@@ -47,6 +47,18 @@ fn check(name: &str, state: CheckState) -> CheckSnapshot {
     }
 }
 
+fn workflow_check(name: &str, state: CheckState, run_id: u64, started_at: &str) -> CheckSnapshot {
+    CheckSnapshot {
+        details_url: Some(format!(
+            "https://github.com/harryaskham/cacophony/actions/runs/{run_id}/job/1"
+        )),
+        provider_kind: Some("CheckRun".to_owned()),
+        workflow_name: Some("CI".to_owned()),
+        started_at: Some(started_at.to_owned()),
+        ..check(name, state)
+    }
+}
+
 fn suite(id: u64, head_sha: &str, status: &str, conclusion: &str) -> CheckSuiteLineage {
     CheckSuiteLineage {
         id,
@@ -409,6 +421,77 @@ fn fully_reported_contexts_are_satisfied_pending_or_failing() {
         "honest failures stay owned by CI decision policy"
     );
     assert!(!failing.requires_problem());
+}
+
+#[test]
+fn superseded_required_rows_remain_diagnostic_but_never_vote() {
+    const OLD_RUN: u64 = 31_270_552_471;
+    const NEW_RUN: u64 = 31_270_627_003;
+
+    let live_shape = |new_state| {
+        let mut case = Case::new();
+        case.lineage = None;
+        case.pr = 2575;
+        case.checks = vec![
+            workflow_check(
+                "Check & Lint",
+                CheckState::Failure,
+                OLD_RUN,
+                "2026-08-08T20:00:00Z",
+            ),
+            workflow_check(
+                "Fast Tests (unit)",
+                CheckState::Failure,
+                OLD_RUN,
+                "2026-08-08T20:00:01Z",
+            ),
+            workflow_check("Check & Lint", new_state, NEW_RUN, "2026-08-08T20:10:00Z"),
+            workflow_check(
+                "Fast Tests (unit)",
+                new_state,
+                NEW_RUN,
+                "2026-08-08T20:10:01Z",
+            ),
+        ];
+        case
+    };
+
+    let satisfied = live_shape(CheckState::Success).assess();
+    assert_eq!(satisfied.status, RequiredRunsStatus::Satisfied);
+    assert!(
+        satisfied.coverage.iter().all(|context| {
+            context.state == RequiredContextState::Passing && context.reporting_checks.len() == 2
+        }),
+        "both historical and current rows remain in receipt diagnostics"
+    );
+
+    assert_eq!(
+        live_shape(CheckState::InProgress).assess().status,
+        RequiredRunsStatus::Pending,
+        "the newest reporting generation owns the pending verdict"
+    );
+    assert_eq!(
+        live_shape(CheckState::Failure).assess().status,
+        RequiredRunsStatus::Failing,
+        "a genuinely newest failure remains fail-closed"
+    );
+}
+
+#[test]
+fn ambiguous_unordered_failure_is_not_superseded() {
+    let mut case = Case::new();
+    case.lineage = None;
+    case.checks = vec![
+        check("Check & Lint", CheckState::Failure),
+        check("Check & Lint", CheckState::Success),
+        check("Fast Tests (unit)", CheckState::Success),
+    ];
+
+    assert_eq!(
+        case.assess().status,
+        RequiredRunsStatus::Failing,
+        "without positive ordering evidence every row remains current"
+    );
 }
 
 #[test]
