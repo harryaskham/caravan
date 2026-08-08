@@ -344,8 +344,9 @@ impl CompatibilityChecker for GitCompatibilityChecker {
                     self.operation_deadline
                         .unwrap_or_else(|| std::time::Instant::now() + self.timeout),
                 );
-            compatibility::check_resolved_compatibility_with_runner(
+            compatibility::check_resolved_compatibility_with_provenance_runner(
                 &runner,
+                &self.remote,
                 candidate,
                 target,
                 candidate_oid,
