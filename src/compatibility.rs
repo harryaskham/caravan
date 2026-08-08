@@ -434,6 +434,26 @@ pub(crate) fn prepare_branch_snapshots_with_runner(
     verify_advertised_batch(runner, remote, &branches, &references)?;
     materialize_complete_history(runner, remote, &references, provider_repository)?;
 
+    let prepared = verify_prepared_commit_objects(runner, branches)?;
+    let commits = prepared.values().cloned().collect::<Vec<_>>();
+    if let Some(first) = commits.first() {
+        for commit in commits.iter().skip(1) {
+            validate_common_ancestry_with_runner(
+                runner,
+                provider_repository,
+                remote,
+                first,
+                commit,
+            )?;
+        }
+    }
+    Ok(prepared)
+}
+
+fn verify_prepared_commit_objects(
+    runner: &impl CommandRunner,
+    branches: Vec<(String, String, String)>,
+) -> Result<std::collections::BTreeMap<(String, String), CommitOid>, AppError> {
     let input = branches
         .iter()
         .fold(String::new(), |mut input, (_, oid, _)| {
@@ -474,18 +494,6 @@ pub(crate) fn prepare_branch_snapshots_with_runner(
             ));
         }
         prepared.insert((name, expected.clone()), CommitOid(expected));
-    }
-    let commits = prepared.values().cloned().collect::<Vec<_>>();
-    if let Some(first) = commits.first() {
-        for commit in commits.iter().skip(1) {
-            validate_common_ancestry_with_runner(
-                runner,
-                provider_repository,
-                remote,
-                first,
-                commit,
-            )?;
-        }
     }
     Ok(prepared)
 }
