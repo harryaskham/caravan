@@ -17,6 +17,7 @@ use crate::command::{
 };
 use crate::model::{
     BranchSnapshot, CommitOid, CompatibilityOutcome, CompatibilityReport, CumulativeTreeProof,
+    RepositoryId,
 };
 
 /// Check a child PR against its declared predecessor.
@@ -90,28 +91,63 @@ fn check_compatibility_with_runner(
         ));
     }
 
-    let target_oid = resolve_branch_snapshot_with_runner(runner, remote, target)?;
-    let candidate_oid = resolve_branch_snapshot_with_runner(runner, remote, candidate)?;
-    check_resolved_compatibility_with_runner(runner, candidate, target, &candidate_oid, &target_oid)
+    let prepared =
+        prepare_branch_snapshots_with_runner(runner, remote, &[candidate.clone(), target.clone()])?;
+    let candidate_oid = prepared
+        .get(&prepared_snapshot_key(candidate))
+        .expect("candidate snapshot was prepared");
+    let target_oid = prepared
+        .get(&prepared_snapshot_key(target))
+        .expect("target snapshot was prepared");
+    check_resolved_compatibility_with_provenance_runner(
+        runner,
+        remote,
+        candidate,
+        target,
+        candidate_oid,
+        target_oid,
+    )
 }
 
 /// Construct one merge report from revisions already validated and fetched by
-/// a bounded graph preparation phase.
-pub(crate) fn check_resolved_compatibility_with_runner(
+/// a bounded graph preparation phase, retaining checkout provenance.
+pub(crate) fn check_resolved_compatibility_with_provenance_runner(
     runner: &impl CommandRunner,
+    remote: &str,
     candidate: &BranchSnapshot,
     target: &BranchSnapshot,
     candidate_oid: &CommitOid,
     target_oid: &CommitOid,
 ) -> Result<CompatibilityReport, AppError> {
+    let merge_base = validate_common_ancestry_with_runner(
+        runner,
+        &candidate.repository,
+        remote,
+        candidate_oid,
+        target_oid,
+    )?;
     let (outcome, merge_tree_oid, conflicting_paths) =
         merge_tree_with_runner(runner, candidate_oid, target_oid)?;
+    let shallow = git_output(runner, ["rev-parse", "--is-shallow-repository"])
+        .ok()
+        .is_some_and(|probe| probe.is_success() && probe.stdout.trim() == "true");
     Ok(CompatibilityReport {
         candidate: candidate.clone(),
         target: target.clone(),
         outcome,
         conflicting_paths,
-        diagnostic: Some(format!("git merge-tree result {merge_tree_oid}")),
+        diagnostic: Some(format!(
+            "repository={} remote={} remote_url={} object_source=exact_remote_refs objects_present=true shallow={} filter={} merge_base={} merge_tree={}",
+            candidate.repository,
+            remote,
+            remote_url(runner, remote)
+                .as_deref()
+                .unwrap_or("unresolved"),
+            shallow,
+            checkout_filter(runner, remote).as_deref().unwrap_or("none"),
+            merge_base.0,
+            merge_tree_oid,
+        )),
     })
 }
 
@@ -306,6 +342,7 @@ pub(crate) fn resolve_branch_snapshot_with_runner(
     snapshot: &BranchSnapshot,
 ) -> Result<CommitOid, AppError> {
     validate_remote(remote)?;
+    validate_checkout_remote_identity(runner, remote, &snapshot.repository)?;
     validate_expected_oid(&snapshot.oid.0)?;
     let reference = branch_reference(runner, &snapshot.name)?;
     require_advertised_oid(runner, remote, &reference, &snapshot.oid.0)?;
@@ -345,6 +382,19 @@ pub(crate) fn prepare_branch_snapshots_with_runner(
     snapshots: &[BranchSnapshot],
 ) -> Result<std::collections::BTreeMap<(String, String), CommitOid>, AppError> {
     validate_remote(remote)?;
+    let Some(provider_repository) = snapshots.first().map(|snapshot| &snapshot.repository) else {
+        return Ok(std::collections::BTreeMap::new());
+    };
+    if snapshots
+        .iter()
+        .any(|snapshot| snapshot.repository != *provider_repository)
+    {
+        return Err(AppError::validation(
+            "cross_repository_compatibility_unsupported",
+            "one compatibility preparation cannot mix provider repositories",
+        ));
+    }
+    validate_checkout_remote_identity(runner, remote, provider_repository)?;
     let mut branches = Vec::with_capacity(snapshots.len());
     for snapshot in snapshots {
         validate_expected_oid(&snapshot.oid.0)?;
@@ -382,7 +432,28 @@ pub(crate) fn prepare_branch_snapshots_with_runner(
         ));
     }
     verify_advertised_batch(runner, remote, &branches, &references)?;
+    materialize_complete_history(runner, remote, &references, provider_repository)?;
 
+    let prepared = verify_prepared_commit_objects(runner, branches)?;
+    let commits = prepared.values().cloned().collect::<Vec<_>>();
+    if let Some(first) = commits.first() {
+        for commit in commits.iter().skip(1) {
+            validate_common_ancestry_with_runner(
+                runner,
+                provider_repository,
+                remote,
+                first,
+                commit,
+            )?;
+        }
+    }
+    Ok(prepared)
+}
+
+fn verify_prepared_commit_objects(
+    runner: &impl CommandRunner,
+    branches: Vec<(String, String, String)>,
+) -> Result<std::collections::BTreeMap<(String, String), CommitOid>, AppError> {
     let input = branches
         .iter()
         .fold(String::new(), |mut input, (_, oid, _)| {
@@ -425,6 +496,164 @@ pub(crate) fn prepare_branch_snapshots_with_runner(
         prepared.insert((name, expected.clone()), CommitOid(expected));
     }
     Ok(prepared)
+}
+
+fn materialize_complete_history(
+    runner: &impl CommandRunner,
+    remote: &str,
+    references: &[String],
+    repository: &RepositoryId,
+) -> Result<(), AppError> {
+    let shallow = git_output(runner, ["rev-parse", "--is-shallow-repository"])?;
+    if !shallow.is_success() {
+        return Err(git_failure(
+            "checkout_topology_probe_failed",
+            "Git could not inspect checkout history materialization",
+            shallow.code,
+            &shallow,
+        ));
+    }
+    if shallow.stdout.trim() != "true" {
+        return Ok(());
+    }
+
+    let fetch = git_output(
+        runner,
+        [
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--refmap=",
+            "--unshallow",
+            remote,
+        ]
+        .into_iter()
+        .chain(references.iter().map(String::as_str)),
+    )?;
+    if !fetch.is_success() {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "checkout_history_incomplete",
+            "the compatibility checkout is shallow and its provider history could not be fully materialized",
+            Some(json!({
+                "repository": repository.to_string(),
+                "remote": remote,
+                "shallow": true,
+                "filter": checkout_filter(runner, remote),
+                "exit_code": fetch.code,
+                "stderr": bounded_text(&fetch.stderr),
+                "repairable": true,
+                "next": "use a fully materialized checkout of the provider repository and retry the read-only plan",
+            })),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_common_ancestry_with_runner(
+    runner: &impl CommandRunner,
+    repository: &RepositoryId,
+    remote: &str,
+    first: &CommitOid,
+    second: &CommitOid,
+) -> Result<CommitOid, AppError> {
+    let output = git_output(runner, ["merge-base", first.0.as_str(), second.0.as_str()])?;
+    if output.is_success() {
+        return parse_single_oid("git merge-base", &output).map(CommitOid);
+    }
+
+    let shallow = git_output(runner, ["rev-parse", "--is-shallow-repository"])
+        .ok()
+        .is_some_and(|probe| probe.is_success() && probe.stdout.trim() == "true");
+    let code = if shallow {
+        "checkout_history_incomplete"
+    } else {
+        "unrelated_repository_histories"
+    };
+    let message = if shallow {
+        "the compatibility checkout still lacks history required to prove a common ancestor"
+    } else {
+        "the exact provider revisions have no common ancestor in this checkout"
+    };
+    Err(AppError::structured(
+        ErrorCategory::Validation,
+        code,
+        message,
+        Some(json!({
+            "repository": repository.to_string(),
+            "remote": remote,
+            "remote_url": remote_url(runner, remote),
+            "first_oid": first.0,
+            "second_oid": second.0,
+            "objects_present": true,
+            "shallow": shallow,
+            "filter": checkout_filter(runner, remote),
+            "merge_base": null,
+            "exit_code": output.code,
+            "stderr": bounded_text(&output.stderr),
+            "repairable": true,
+            "next": "materialize both exact revisions from the named provider repository in one complete object database and retry",
+        })),
+    ))
+}
+
+fn validate_checkout_remote_identity(
+    runner: &impl CommandRunner,
+    remote: &str,
+    expected: &RepositoryId,
+) -> Result<(), AppError> {
+    let Some(url) = remote_url(runner, remote) else {
+        return Ok(());
+    };
+    let Some((owner, name)) = github_repository_from_url(&url) else {
+        return Ok(());
+    };
+    if owner.eq_ignore_ascii_case(&expected.owner) && name.eq_ignore_ascii_case(&expected.name) {
+        return Ok(());
+    }
+    Err(AppError::structured(
+        ErrorCategory::Validation,
+        "checkout_repository_mismatch",
+        "the compatibility remote points at a different provider repository",
+        Some(json!({
+            "expected_repository": expected.to_string(),
+            "actual_repository": format!("{owner}/{name}"),
+            "remote": remote,
+            "remote_url": url,
+            "repairable": true,
+            "next": "use a checkout whose fetch remote names the provider repository from the exact PR snapshot",
+        })),
+    ))
+}
+
+fn remote_url(runner: &impl CommandRunner, remote: &str) -> Option<String> {
+    let output = git_output(runner, ["remote", "get-url", remote]).ok()?;
+    output
+        .is_success()
+        .then(|| output.stdout.trim().to_owned())
+        .filter(|url| !url.is_empty())
+}
+
+fn checkout_filter(runner: &impl CommandRunner, remote: &str) -> Option<String> {
+    let key = format!("remote.{remote}.partialclonefilter");
+    let output = git_output(runner, ["config".to_owned(), "--get".to_owned(), key]).ok()?;
+    output
+        .is_success()
+        .then(|| output.stdout.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn github_repository_from_url(url: &str) -> Option<(String, String)> {
+    let path = url
+        .strip_prefix("https://github.com/")
+        .or_else(|| url.strip_prefix("http://github.com/"))
+        .or_else(|| url.strip_prefix("ssh://git@github.com/"))
+        .or_else(|| url.strip_prefix("git@github.com:"))?;
+    let path = path.trim_end_matches('/').trim_end_matches(".git");
+    let (owner, name) = path.split_once('/')?;
+    (!owner.is_empty() && !name.is_empty() && !name.contains('/'))
+        .then(|| (owner.to_owned(), name.to_owned()))
 }
 
 fn verify_advertised_batch(
@@ -477,6 +706,10 @@ fn verify_advertised_batch(
         }
     }
     Ok(())
+}
+
+fn prepared_snapshot_key(snapshot: &BranchSnapshot) -> (String, String) {
+    (snapshot.name.clone(), snapshot.oid.0.clone())
 }
 
 fn validate_remote(remote: &str) -> Result<(), AppError> {
@@ -855,16 +1088,18 @@ mod tests {
             commands: std::cell::RefCell::new(Vec::new()),
         };
         let prepared = prepare_branch_snapshots_with_runner(&runner, "fixture", &branches).unwrap();
-        check_resolved_compatibility_with_runner(
+        check_resolved_compatibility_with_provenance_runner(
             &runner,
+            "fixture",
             &branches[1],
             &branches[0],
             prepared.get(&("one".to_owned(), one.clone())).unwrap(),
             prepared.get(&("main".to_owned(), main)).unwrap(),
         )
         .unwrap();
-        check_resolved_compatibility_with_runner(
+        check_resolved_compatibility_with_provenance_runner(
             &runner,
+            "fixture",
             &branches[2],
             &branches[1],
             prepared.get(&("two".to_owned(), two)).unwrap(),
@@ -888,7 +1123,11 @@ mod tests {
             .count();
         assert_eq!(network, 3, "two advertised snapshots plus one batch fetch");
         assert_eq!(merge_reports, 2);
-        assert_eq!(commands.len(), branches.len() + 4 + merge_reports);
+        let ancestry_probes = commands
+            .iter()
+            .filter(|command| command.args.first().is_some_and(|arg| arg == "merge-base"))
+            .count();
+        assert_eq!(ancestry_probes, 4, "prepare and each report prove ancestry");
     }
 
     #[test]
@@ -1000,6 +1239,184 @@ mod tests {
 
         assert_eq!(resolved, CommitOid(expected));
         assert_eq!(git_stdout(consumer.path(), ["show-ref"]), refs_before);
+    }
+
+    #[test]
+    fn provider_clean_same_repository_pr_proves_exact_merge_base() {
+        let repository = TestRepo::new();
+        let base = repository.commit_file("flake.lock", "old\n", "base");
+        repository.switch("bd-39a859-caravan-v0.0.96", &base);
+        let head = repository.commit_file("flake.lock", "new\n", "pin Cara v0.0.96");
+
+        let report = check_head_to_default(
+            repository.path(),
+            "fixture",
+            &TestRepo::branch("bd-39a859-caravan-v0.0.96", &head),
+            &TestRepo::branch("main", &base),
+        )
+        .expect("provider-clean one-commit PR");
+
+        assert_eq!(report.outcome, CompatibilityOutcome::Clean);
+        assert!(report.conflicting_paths.is_empty());
+    }
+
+    #[test]
+    fn shallow_checkout_is_unshallowed_before_merge_tree() {
+        let source = TestRepo::new();
+        let base = source.commit_file("base.txt", "base\n", "base");
+        source.switch("feature", &base);
+        let head = source.commit_file("feature.txt", "feature\n", "feature");
+        let clone = tempfile::tempdir().expect("shallow clone directory");
+        let source_url = format!("file://{}", source.path().display());
+        git(
+            clone.path(),
+            [
+                "clone",
+                "--quiet",
+                "--depth=1",
+                "--branch=feature",
+                &source_url,
+                ".",
+            ],
+        );
+        assert_eq!(
+            git_stdout(clone.path(), ["rev-parse", "--is-shallow-repository"]).trim(),
+            "true"
+        );
+
+        let report = check_head_to_default(
+            clone.path(),
+            "origin",
+            &TestRepo::branch("feature", &head),
+            &TestRepo::branch("main", &base),
+        )
+        .expect("bounded provider fetch repairs shallow ancestry");
+
+        assert_eq!(report.outcome, CompatibilityOutcome::Clean);
+        assert_eq!(
+            git_stdout(clone.path(), ["rev-parse", "--is-shallow-repository"]).trim(),
+            "false"
+        );
+    }
+
+    #[test]
+    fn missing_base_history_returns_repairable_materialization_error() {
+        let source = TestRepo::new();
+        let base = source.commit_file("base.txt", "base\n", "base");
+        source.switch("feature", &base);
+        let head = source.commit_file("feature.txt", "feature\n", "feature");
+        let clone = tempfile::tempdir().expect("shallow fixture");
+        let source_url = format!("file://{}", source.path().display());
+        git(
+            clone.path(),
+            [
+                "clone",
+                "--quiet",
+                "--depth=1",
+                "--no-single-branch",
+                &source_url,
+                ".",
+            ],
+        );
+        git(clone.path(), ["branch", "main", &base]);
+        let self_url = format!("file://{}", clone.path().display());
+        git(clone.path(), ["remote", "set-url", "origin", &self_url]);
+
+        let error = check_head_to_default(
+            clone.path(),
+            "origin",
+            &TestRepo::branch("feature", &head),
+            &TestRepo::branch("main", &base),
+        )
+        .expect_err("a shallow remote cannot repair its own missing history");
+
+        assert_eq!(error.code(), "checkout_history_incomplete");
+        let details = error.details().expect("materialization details");
+        assert_eq!(details["shallow"], true);
+        assert_eq!(details["repairable"], true);
+    }
+
+    #[test]
+    fn genuinely_unrelated_provider_branches_return_typed_topology_error() {
+        let repository = TestRepo::new();
+        let main = repository.commit_file("main.txt", "main\n", "main");
+        git(
+            repository.path(),
+            ["switch", "--quiet", "--orphan", "orphan"],
+        );
+        git(
+            repository.path(),
+            ["rm", "--quiet", "--cached", "--ignore-unmatch", "main.txt"],
+        );
+        let orphan = repository.commit_file("orphan.txt", "orphan\n", "orphan");
+
+        let error = check_head_to_default(
+            repository.path(),
+            "fixture",
+            &TestRepo::branch("orphan", &orphan),
+            &TestRepo::branch("main", &main),
+        )
+        .expect_err("unrelated provider histories must not leak generic Git stderr");
+
+        assert_eq!(error.code(), "unrelated_repository_histories");
+        let details = error.details().expect("topology details");
+        assert_eq!(details["objects_present"], true);
+        assert_eq!(details["shallow"], false);
+        assert!(details["merge_base"].is_null());
+    }
+
+    #[test]
+    fn provider_remote_identity_mismatch_is_repairable_before_fetch() {
+        let repository = TestRepo::new();
+        let head = repository.commit_file("main.txt", "main\n", "main");
+        git(
+            repository.path(),
+            [
+                "remote",
+                "set-url",
+                "fixture",
+                "git@github.com:other/wrong.git",
+            ],
+        );
+
+        let error = resolve_branch_snapshot(
+            repository.path(),
+            "fixture",
+            &TestRepo::branch("main", &head),
+        )
+        .expect_err("wrong provider remote must fail before object reuse");
+
+        assert_eq!(error.code(), "checkout_repository_mismatch");
+        let details = error.details().expect("identity provenance");
+        assert_eq!(details["expected_repository"], "harryaskham/caravan");
+        assert_eq!(details["actual_repository"], "other/wrong");
+        assert_eq!(details["repairable"], true);
+    }
+
+    #[test]
+    fn filtered_checkout_records_filter_and_still_proves_ancestry() {
+        let repository = TestRepo::new();
+        let base = repository.commit_file("base.txt", "base\n", "base");
+        repository.switch("feature", &base);
+        let head = repository.commit_file("feature.txt", "feature\n", "feature");
+        git(
+            repository.path(),
+            ["config", "remote.fixture.promisor", "true"],
+        );
+        git(
+            repository.path(),
+            ["config", "remote.fixture.partialclonefilter", "blob:none"],
+        );
+
+        let report = check_head_to_default(
+            repository.path(),
+            "fixture",
+            &TestRepo::branch("feature", &head),
+            &TestRepo::branch("main", &base),
+        )
+        .expect("filtered checkout with complete commits is usable");
+
+        assert_eq!(report.outcome, CompatibilityOutcome::Clean);
     }
 
     #[test]
