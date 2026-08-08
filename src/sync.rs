@@ -4080,6 +4080,10 @@ fn run_auto_admission(
         .with_timeout(Duration::from_secs(context.config.command_timeout_secs))
         .with_operation_deadline(operation_deadline);
     let mut validated_skips = BTreeSet::new();
+    // GitHub can lag regeneration of refs/pull/<n>/merge after default moves.
+    // Give each immutable native candidate exactly one uncached provider
+    // rediscovery before considering the exact-Git stale-base fallback.
+    let mut refreshed_stale_native_candidates = BTreeSet::new();
 
     // Revalidate persisted skips without recomputing compatibility. Exact
     // candidate/default/tail/config generations are enough to prove whether the
@@ -4224,6 +4228,31 @@ fn run_auto_admission(
         let Some(next_pr) = status.admission.next_candidate else {
             break;
         };
+        let needs_native_candidate_refresh = context.config.stack_type
+            == crate::config::StackType::Github
+            && !context.config.physical_branch_rewrites_enabled()
+            && status.merge_candidates.iter().any(|identity| {
+                identity.pr == next_pr
+                    && identity.freshness == crate::model::MergeCandidateFreshness::StaleBase
+                    && identity.stale_base
+                    && !identity.stale_head
+            });
+        if needs_native_candidate_refresh && refreshed_stale_native_candidates.insert(next_pr) {
+            read::invalidate_status_cache(context);
+            status = read::status_with_deadline_and_budget(
+                context,
+                operation_deadline,
+                Some(github_budget),
+            )?;
+            progress.current = status.analysis.pull_requests.clone();
+            progress.merge_candidates = status
+                .merge_candidates
+                .iter()
+                .cloned()
+                .map(|candidate| (candidate.pr, candidate))
+                .collect();
+            continue;
+        }
         let Some(candidate_order) = status
             .admission
             .candidates

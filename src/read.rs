@@ -850,6 +850,24 @@ pub enum CandidateNextAction {
     Reject,
 }
 
+/// Exact authority used to admit an immutable native-Stack join candidate.
+///
+/// Provider identity is preferred. `ExactGitProof` is the bounded recovery for
+/// GitHub retaining an old first parent in `refs/pull/<n>/merge`; it preserves
+/// both the stale provider observation and the clean independently constructed
+/// candidate-to-tail merge so the decision is auditable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", tag = "authority")]
+pub enum AdmissionCompatibilityAuthorization {
+    ProviderIdentity {
+        identity: crate::model::MergeCandidateIdentity,
+    },
+    ExactGitProof {
+        stale_identity: crate::model::MergeCandidateIdentity,
+        compatibility: CompatibilityReport,
+    },
+}
+
 /// Successful read-only eligibility/health result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CheckOutput {
@@ -867,6 +885,10 @@ pub struct CheckOutput {
     /// Canonical provider merge-candidate identity and freshness from status/show.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_candidate: Option<crate::model::MergeCandidateIdentity>,
+    /// Whether fresh provider lineage or the fenced exact-Git fallback
+    /// authorized this immutable native join generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_compatibility_authorization: Option<AdmissionCompatibilityAuthorization>,
     /// Whether the candidate was already in the discovered active fleet.
     pub enrolled: bool,
     /// Whether this is the canonical first priority/FIFO admission attempt.
@@ -2966,6 +2988,7 @@ fn check_analysis_with_recommendation(
             candidate: pull_request.clone(),
             head_repository_owner: pull_request.head.repository.owner.clone(),
             merge_candidate,
+            admission_compatibility_authorization: None,
             enrolled: true,
             canonical_candidate,
             admission_note: None,
@@ -3048,8 +3071,12 @@ fn check_analysis_with_recommendation(
     // topology, and push under force-with-lease. Requiring a fresh synthetic
     // parent here can deadlock the rewrite which would refresh that ref. Virtual
     // mode retains strict provider-candidate freshness.
-    let candidate_stale_blocks_admission = candidate_stale && !status.rebase_on_join.enabled;
-    if candidate_stale_blocks_admission {
+    let mut candidate_stale_blocks_admission = candidate_stale && !status.rebase_on_join.enabled;
+    // A stale immutable native-join base gets one narrower decision after the
+    // candidate-to-tail Git proof is available below. New-caravan admission,
+    // physical membership, stale heads, and every other incomplete identity
+    // retain the existing fail-closed behavior here.
+    if candidate_stale_blocks_admission && !explicit_join {
         problems.push(GraphProblem {
             kind: GraphProblemKind::Unknown,
             prs: vec![current_pr],
@@ -3164,6 +3191,7 @@ fn check_analysis_with_recommendation(
                 candidate: pull_request.clone(),
                 head_repository_owner: pull_request.head.repository.owner.clone(),
                 merge_candidate,
+                admission_compatibility_authorization: None,
                 enrolled: false,
                 canonical_candidate,
                 admission_note: ordering_note.clone(),
@@ -3226,6 +3254,23 @@ fn check_analysis_with_recommendation(
         }
     }
 
+    let admission_compatibility_authorization = native_join_authorization(
+        status,
+        pull_request,
+        tail,
+        merge_candidate.as_ref(),
+        &reports,
+    );
+    if candidate_stale_blocks_admission && admission_compatibility_authorization.is_none() {
+        problems.push(GraphProblem {
+            kind: GraphProblemKind::Unknown,
+            prs: vec![current_pr],
+            message: "provider merge-candidate identity is stale or incomplete; wait for the current generation".to_owned(),
+        });
+    } else if admission_compatibility_authorization.is_some() {
+        candidate_stale_blocks_admission = false;
+    }
+
     let eligible = problems.is_empty();
     admission_intent.record_preflight(
         reports
@@ -3269,6 +3314,7 @@ fn check_analysis_with_recommendation(
             candidate: pull_request.clone(),
             head_repository_owner: pull_request.head.repository.owner.clone(),
             merge_candidate,
+            admission_compatibility_authorization,
             enrolled: false,
             canonical_candidate,
             admission_note: ordering_note.clone(),
@@ -3284,6 +3330,87 @@ fn check_analysis_with_recommendation(
         },
         remote,
     )
+}
+
+fn native_join_authorization(
+    status: &StatusOutput,
+    candidate: &PullRequestSnapshot,
+    tail: &PullRequestSnapshot,
+    identity: Option<&crate::model::MergeCandidateIdentity>,
+    reports: &[CompatibilityReport],
+) -> Option<AdmissionCompatibilityAuthorization> {
+    if status.stack_backend.configured != crate::config::StackType::Github
+        || status.rebase_on_join.enabled
+    {
+        return None;
+    }
+    let identity = identity?;
+    let compared_base = identity.compared_base.as_ref()?;
+    let synthetic = identity.synthetic.as_ref()?;
+    let exact_generation = identity.pr == candidate.number
+        && identity.base == candidate.base
+        && identity.head == candidate.head
+        && compared_base == &status.analysis.fleet.default_branch
+        && candidate.head.repository == status.repository
+        && candidate.base.repository == status.repository
+        && tail.head.repository == status.repository
+        && tail.base.repository == status.repository
+        && synthetic.parents.len() == 2
+        && synthetic.parents[1] == candidate.head.oid;
+    if !exact_generation {
+        return None;
+    }
+
+    if identity.freshness == crate::model::MergeCandidateFreshness::Fresh
+        && !identity.stale_base
+        && !identity.stale_head
+        && synthetic.parents[0] == compared_base.oid
+    {
+        return Some(AdmissionCompatibilityAuthorization::ProviderIdentity {
+            identity: identity.clone(),
+        });
+    }
+
+    // Native GitHub Stack mode is the only immutable-head lane. The fallback
+    // accepts exactly one provider defect: an old synthetic first parent. It
+    // cannot mask a stale head, missing lineage, a different repository, or a
+    // moved candidate/default/tail generation.
+    if identity.freshness != crate::model::MergeCandidateFreshness::StaleBase
+        || !identity.stale_base
+        || identity.stale_head
+        || synthetic.parents[0] == compared_base.oid
+    {
+        return None;
+    }
+
+    let proof = reports.iter().find(|report| {
+        report.candidate == candidate.head
+            && report.target == tail.head
+            && report.outcome == CompatibilityOutcome::Clean
+            && report
+                .diagnostic
+                .as_deref()
+                .is_some_and(|diagnostic| exact_git_diagnostic(diagnostic, &synthetic.parents[0]))
+    })?;
+    Some(AdmissionCompatibilityAuthorization::ExactGitProof {
+        stale_identity: identity.clone(),
+        compatibility: proof.clone(),
+    })
+}
+
+fn exact_git_diagnostic(diagnostic: &str, stale_base: &crate::model::CommitOid) -> bool {
+    diagnostic.contains("object_source=exact_remote_refs")
+        && diagnostic.contains("objects_present=true")
+        && diagnostic.contains("shallow=false")
+        && diagnostic.contains("filter=none")
+        && diagnostic
+            .split_ascii_whitespace()
+            .find_map(|field| field.strip_prefix("merge_base="))
+            == Some(stale_base.0.as_str())
+        && diagnostic
+            .split_ascii_whitespace()
+            .find_map(|field| field.strip_prefix("merge_tree="))
+            .is_some_and(|tree| !tree.is_empty())
 }
 
 fn check_new(
@@ -5780,6 +5907,193 @@ mod tests {
                 .map(|identity| identity.freshness),
             Some(crate::model::MergeCandidateFreshness::StaleHead)
         );
+    }
+
+    fn native_candidate_identity(
+        candidate: &PullRequestSnapshot,
+        freshness: crate::model::MergeCandidateFreshness,
+    ) -> crate::model::MergeCandidateIdentity {
+        let stale_base = freshness == crate::model::MergeCandidateFreshness::StaleBase;
+        let stale_head = freshness == crate::model::MergeCandidateFreshness::StaleHead;
+        crate::model::MergeCandidateIdentity {
+            pr: candidate.number,
+            provider_updated_at: "2026-01-01T00:00:00Z".to_owned(),
+            observed_at: "2026-01-01T00:00:01Z".to_owned(),
+            base: candidate.base.clone(),
+            head: candidate.head.clone(),
+            synthetic: Some(crate::model::SyntheticMergeCandidate {
+                git_ref: format!("refs/pull/{}/merge", candidate.number),
+                oid: CommitOid("synthetic0000000000000000000000000000000".to_owned()),
+                tree_oid: CommitOid("tree000000000000000000000000000000000000".to_owned()),
+                parents: vec![
+                    if stale_base {
+                        branch("oldbase").oid
+                    } else {
+                        branch("main").oid
+                    },
+                    if stale_head {
+                        CommitOid("oldhead000000000000000000000000000000000".to_owned())
+                    } else {
+                        candidate.head.oid.clone()
+                    },
+                ],
+            }),
+            auto_merge: crate::model::NativeAutoMergeState {
+                enabled: false,
+                merge_method: None,
+                actor: None,
+            },
+            freshness,
+            compared_base: Some(branch("main")),
+            stale_base,
+            stale_head,
+            stale_reasons: Vec::new(),
+        }
+    }
+
+    fn exact_native_checker(
+        candidate: &crate::model::BranchSnapshot,
+        target: &crate::model::BranchSnapshot,
+    ) -> Result<CompatibilityReport, AppError> {
+        Ok(CompatibilityReport {
+            candidate: candidate.clone(),
+            target: target.clone(),
+            outcome: CompatibilityOutcome::Clean,
+            conflicting_paths: Vec::new(),
+            diagnostic: Some(format!(
+                "repository=harryaskham/caravan remote=origin remote_url=git@example.invalid objects_present=true object_source=exact_remote_refs shallow=false filter=none merge_base={} merge_tree=clean",
+                branch("oldbase").oid,
+            )),
+        })
+    }
+
+    #[test]
+    fn native_join_stale_synthetic_base_uses_exact_git_proof() {
+        let candidate = pr(2573, "candidate", "main", false);
+        let tail = pr(2575, "tail", "main", true);
+        let mut status = status(candidate.clone(), vec![tail]);
+        status.stack_backend.configured = crate::config::StackType::Github;
+        status.merge_candidates.push(native_candidate_identity(
+            &candidate,
+            crate::model::MergeCandidateFreshness::StaleBase,
+        ));
+
+        let output = check_analysis(
+            &status,
+            &CheckInput {
+                pr: Some(2573),
+                tail_pr: Some(2575),
+                head_pr: None,
+            },
+            &exact_native_checker,
+        )
+        .expect("an exact clean immutable native proof admits the stale synthetic base");
+
+        assert!(output.eligible, "problems: {:?}", output.problems);
+        assert!(matches!(
+            output.admission_compatibility_authorization,
+            Some(AdmissionCompatibilityAuthorization::ExactGitProof { .. })
+        ));
+    }
+
+    #[test]
+    fn native_join_stale_head_conflict_and_incomplete_objects_refuse() {
+        let candidate = pr(2573, "candidate", "main", false);
+        let tail = pr(2575, "tail", "main", true);
+        let mut status = status(candidate.clone(), vec![tail.clone()]);
+        status.stack_backend.configured = crate::config::StackType::Github;
+
+        let mut stale_head =
+            native_candidate_identity(&candidate, crate::model::MergeCandidateFreshness::StaleHead);
+        assert!(
+            native_join_authorization(
+                &status,
+                &candidate,
+                &tail,
+                Some(&stale_head),
+                &[exact_native_checker(&candidate.head, &tail.head).unwrap()],
+            )
+            .is_none()
+        );
+
+        stale_head =
+            native_candidate_identity(&candidate, crate::model::MergeCandidateFreshness::StaleBase);
+        let conflict = CompatibilityReport {
+            candidate: candidate.head.clone(),
+            target: tail.head.clone(),
+            outcome: CompatibilityOutcome::Conflict,
+            conflicting_paths: vec!["src/lib.rs".to_owned()],
+            diagnostic: exact_native_checker(&candidate.head, &tail.head)
+                .unwrap()
+                .diagnostic,
+        };
+        assert!(
+            native_join_authorization(&status, &candidate, &tail, Some(&stale_head), &[conflict],)
+                .is_none()
+        );
+
+        let incomplete = CompatibilityReport {
+            candidate: candidate.head.clone(),
+            target: tail.head.clone(),
+            outcome: CompatibilityOutcome::Clean,
+            conflicting_paths: Vec::new(),
+            diagnostic: Some("object_source=exact_remote_refs objects_present=false shallow=true filter=blob:none merge_base=x merge_tree=y".to_owned()),
+        };
+        assert!(native_join_authorization(
+            &status,
+            &candidate,
+            &tail,
+            Some(&stale_head),
+            &[incomplete],
+        )
+        .is_none());
+
+        let mut moved = stale_head.clone();
+        moved.head.oid = CommitOid("moved00000000000000000000000000000000000".to_owned());
+        assert!(
+            native_join_authorization(
+                &status,
+                &candidate,
+                &tail,
+                Some(&moved),
+                &[exact_native_checker(&candidate.head, &tail.head).unwrap()],
+            )
+            .is_none()
+        );
+
+        let mut foreign_tail = tail.clone();
+        foreign_tail.head.repository.owner = "fork".to_owned();
+        assert!(
+            native_join_authorization(
+                &status,
+                &candidate,
+                &foreign_tail,
+                Some(&stale_head),
+                &[exact_native_checker(&candidate.head, &foreign_tail.head).unwrap()],
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn native_join_refreshed_current_identity_uses_provider_authority() {
+        let candidate = pr(2573, "candidate", "main", false);
+        let tail = pr(2575, "tail", "main", true);
+        let mut status = status(candidate.clone(), vec![tail.clone()]);
+        status.stack_backend.configured = crate::config::StackType::Github;
+        let refreshed =
+            native_candidate_identity(&candidate, crate::model::MergeCandidateFreshness::Fresh);
+        let authorization = native_join_authorization(
+            &status,
+            &candidate,
+            &tail,
+            Some(&refreshed),
+            &[exact_native_checker(&candidate.head, &tail.head).unwrap()],
+        );
+        assert!(matches!(
+            authorization,
+            Some(AdmissionCompatibilityAuthorization::ProviderIdentity { .. })
+        ));
     }
 
     #[test]

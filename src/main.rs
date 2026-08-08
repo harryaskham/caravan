@@ -3598,6 +3598,35 @@ fn render_check(output: &caravan::read::CheckOutput) -> String {
             identity.stale_head,
         );
     }
+    if let Some(authorization) = &output.admission_compatibility_authorization {
+        match authorization {
+            caravan::read::AdmissionCompatibilityAuthorization::ProviderIdentity { identity } => {
+                let _ = writeln!(
+                    text,
+                    "  admission compatibility authority: provider_identity synthetic={} observed={}",
+                    identity
+                        .synthetic
+                        .as_ref()
+                        .map_or("missing", |synthetic| synthetic.oid.0.as_str()),
+                    identity.observed_at,
+                );
+            }
+            caravan::read::AdmissionCompatibilityAuthorization::ExactGitProof {
+                stale_identity,
+                compatibility,
+            } => {
+                let _ = writeln!(
+                    text,
+                    "  admission compatibility authority: exact_git_proof stale_synthetic={} proof={}",
+                    stale_identity
+                        .synthetic
+                        .as_ref()
+                        .map_or("missing", |synthetic| synthetic.oid.0.as_str()),
+                    compatibility.diagnostic.as_deref().unwrap_or("missing"),
+                );
+            }
+        }
+    }
     if let Some(intent) = &output.admission_intent {
         text.push_str(&render_admission_intent(intent));
     }
