@@ -53,6 +53,11 @@ pub struct DiscoveryOptions {
     /// subject as `input.pr.or(current_pr).ok_or(current_pr_not_found)`, so an
     /// unresolved branch refuses to mutate rather than mutating the wrong PR.
     pub require_current_pr_resolution: bool,
+    /// Restrict unlabelled candidate discovery to one exact PR while retaining
+    /// every active labelled caravan member and lightweight generation facts.
+    /// Exact admission must not pay for full check-rollup discovery across an
+    /// unrelated open-PR fleet (bd-b915a6).
+    pub focus_pr: Option<PrNumber>,
     /// Exact `owner/name` from configuration. Managed checkouts point at a local
     /// daemon mirror, so git-remote inference cannot name the repository and
     /// `gh` has no other input (bd-ff639b).
@@ -69,6 +74,7 @@ impl Default for DiscoveryOptions {
             // Strict by default: a caller that has not declared itself a
             // fleet-level read keeps the precise historical diagnostics.
             require_current_pr_resolution: true,
+            focus_pr: None,
             repository: None,
         }
     }
@@ -1779,10 +1785,39 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
         // One bounded snapshot supplies current-branch lookup, active members,
         // admission candidates, and all live check rollups. Do not re-fetch the
         // same expensive rollups through current/labelled provider queries.
-        let (all_open_prs, generation_facts) = self.pull_requests_with_generation(
-            open_pr_command(&repository.slug(), self.options.open_limit),
-            &repository,
-        )?;
+        let (all_open_prs, generation_facts) = if let Some(focus_pr) = self.options.focus_pr {
+            let (mut active, _active_facts) = self.pull_requests_with_generation(
+                labeled_pr_command(
+                    &repository.slug(),
+                    "open",
+                    &self.options.label,
+                    self.options.open_limit,
+                    false,
+                ),
+                &repository,
+            )?;
+            let exact: PullRequestJson =
+                self.json(pull_request_command(&repository, &focus_pr.0.to_string()))?;
+            let exact = exact.into_snapshot(&repository)?;
+            if !active
+                .iter()
+                .any(|pull_request| pull_request.number == focus_pr)
+            {
+                active.push(exact);
+            }
+            let generation_rows: Vec<GenerationPullRequestJson> =
+                self.json(open_generation_pr_command(&repository.slug(), 1_000))?;
+            let generation_facts = generation_rows
+                .iter()
+                .map(GenerationPullRequestJson::generation_fact)
+                .collect();
+            (active, generation_facts)
+        } else {
+            self.pull_requests_with_generation(
+                open_pr_command(&repository.slug(), self.options.open_limit),
+                &repository,
+            )?
+        };
         let current_pr = match &current_branch {
             Some(branch) => {
                 let mut matches = all_open_prs
@@ -1845,47 +1880,55 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
         // `--state closed` also returns merged rows; retaining terminal-labelled
         // merged rows lets sync remove an invalid `caravan-closed` label without
         // ever treating landed work as closed-unmerged.
-        let (closed_active_prs, _closed_active_generation_facts) = self
-            .pull_requests_with_generation(
-                labeled_pr_command(
-                    &repository.slug(),
-                    "closed",
-                    &self.options.label,
-                    self.options.merged_limit,
-                    true,
-                ),
-                &repository,
-            )?;
-        let (closed_parked_prs, _closed_parked_generation_facts) = self
-            .pull_requests_with_generation(
-                labeled_pr_command(
-                    &repository.slug(),
-                    "closed",
-                    PARKED_LABEL,
-                    self.options.merged_limit,
-                    true,
-                ),
-                &repository,
-            )?;
-        let (closed_terminal_prs, _closed_terminal_generation_facts) = self
-            .pull_requests_with_generation(
-                labeled_pr_command(
-                    &repository.slug(),
-                    "closed",
-                    CLOSED_LABEL,
-                    self.options.merged_limit,
-                    true,
-                ),
-                &repository,
-            )?;
-        let closed_lifecycle_prs = closed_active_prs
-            .into_iter()
-            .chain(closed_parked_prs)
-            .chain(closed_terminal_prs)
-            .filter(|pull_request| {
-                pull_request.is_closed_unmerged() || pull_request.has_label(CLOSED_LABEL)
-            })
-            .collect::<Vec<_>>();
+        let closed_lifecycle_prs = if self.options.focus_pr.is_some() {
+            // Exact candidate admission never converges closed lifecycle rows.
+            // Keep those three provider scans on fleet status/sync only; the
+            // lightweight open+merged generation facts above retain every
+            // supersession/lineage proof the candidate guard consumes.
+            Vec::new()
+        } else {
+            let (closed_active_prs, _closed_active_generation_facts) = self
+                .pull_requests_with_generation(
+                    labeled_pr_command(
+                        &repository.slug(),
+                        "closed",
+                        &self.options.label,
+                        self.options.merged_limit,
+                        true,
+                    ),
+                    &repository,
+                )?;
+            let (closed_parked_prs, _closed_parked_generation_facts) = self
+                .pull_requests_with_generation(
+                    labeled_pr_command(
+                        &repository.slug(),
+                        "closed",
+                        PARKED_LABEL,
+                        self.options.merged_limit,
+                        true,
+                    ),
+                    &repository,
+                )?;
+            let (closed_terminal_prs, _closed_terminal_generation_facts) = self
+                .pull_requests_with_generation(
+                    labeled_pr_command(
+                        &repository.slug(),
+                        "closed",
+                        CLOSED_LABEL,
+                        self.options.merged_limit,
+                        true,
+                    ),
+                    &repository,
+                )?;
+            closed_active_prs
+                .into_iter()
+                .chain(closed_parked_prs)
+                .chain(closed_terminal_prs)
+                .filter(|pull_request| {
+                    pull_request.is_closed_unmerged() || pull_request.has_label(CLOSED_LABEL)
+                })
+                .collect::<Vec<_>>()
+        };
         let generation_facts = generation_facts
             .into_iter()
             .chain(merged_generation_facts)
@@ -3254,7 +3297,7 @@ mod tests {
                 .calls
                 .borrow_mut()
                 .pop_front()
-                .expect("unexpected subprocess call");
+                .unwrap_or_else(|| panic!("unexpected subprocess call: {command:?}"));
             assert_eq!(&expected, command);
             Ok(output)
         }
@@ -3341,6 +3384,71 @@ mod tests {
                 CommandOutput::success("[]"),
             ),
         ]
+    }
+
+    #[test]
+    fn focused_candidate_discovery_avoids_unrelated_full_rollups_bd_b915a6() {
+        let active = pr_list_json(1, "active", "acme/widgets", false);
+        let exact_list = pr_list_json(2, "candidate", "acme/widgets", false)
+            .replace(r#""labels":[{"name":"caravan"}]"#, r#""labels":[]"#);
+        let unrelated = pr_list_json(99, "unrelated", "acme/widgets", false);
+        let exact = exact_list[1..exact_list.len() - 1].to_owned();
+        let generation_rows = format!(
+            "[{},{},{}]",
+            &active[1..active.len() - 1],
+            &exact_list[1..exact_list.len() - 1],
+            &unrelated[1..unrelated.len() - 1],
+        );
+        let mut calls = successful_discovery_calls(&active);
+        calls[1] = (current_branch_command(), CommandOutput::success("main\n"));
+        calls.splice(
+            4..5,
+            [
+                (
+                    labeled_pr_command("acme/widgets", "open", "caravan", 1_000, false),
+                    CommandOutput::success(active),
+                ),
+                (
+                    pull_request_command(&repository(), "2"),
+                    CommandOutput::success(exact),
+                ),
+                (
+                    open_generation_pr_command("acme/widgets", 1_000),
+                    CommandOutput::success(generation_rows),
+                ),
+            ],
+        );
+        calls.truncate(calls.len().saturating_sub(3));
+        let discovery =
+            GitHubDiscovery::new(FakeRunner::new(calls)).with_options(DiscoveryOptions {
+                focus_pr: Some(PrNumber(2)),
+                require_current_pr_resolution: false,
+                ..DiscoveryOptions::default()
+            });
+
+        let snapshot = discovery.discover().expect("focused discovery");
+        let numbers = snapshot
+            .pull_requests
+            .iter()
+            .map(|pull_request| pull_request.number)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            numbers,
+            BTreeSet::from([PrNumber(1), PrNumber(2), PrNumber(9)])
+        );
+        assert!(
+            snapshot
+                .generation_facts
+                .iter()
+                .any(|fact| fact.pr == PrNumber(99))
+        );
+        assert!(
+            snapshot
+                .pull_requests
+                .iter()
+                .all(|pull_request| pull_request.number != PrNumber(99))
+        );
+        discovery.runner.assert_exhausted();
     }
 
     fn pr_list_json(number: u64, branch: &str, repository: &str, cross_repo: bool) -> String {

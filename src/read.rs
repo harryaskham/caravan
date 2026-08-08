@@ -1616,7 +1616,16 @@ fn status_with_resilient_deadline(
     context: &AppContext,
     operation_deadline: std::time::Instant,
 ) -> Result<StatusOutput, AppError> {
-    status_with_discovery_options(context, operation_deadline, None, false, true, None, true)
+    status_with_discovery_options(
+        context,
+        operation_deadline,
+        None,
+        false,
+        true,
+        None,
+        None,
+        true,
+    )
 }
 
 /// Status with one shared exact authenticated GitHub request budget.
@@ -1631,6 +1640,7 @@ pub(crate) fn status_with_deadline_and_budget(
         github_budget,
         false,
         true,
+        None,
         None,
         false,
     )
@@ -1655,6 +1665,7 @@ pub(crate) fn fleet_status(
         false,
         false,
         None,
+        None,
         false,
     )
 }
@@ -1673,6 +1684,7 @@ pub(crate) fn status_for_pr_creation(
         github_budget,
         true,
         true,
+        None,
         None,
         false,
     )
@@ -1738,7 +1750,7 @@ fn bind_expected_candidate_head(
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn status_with_discovery_options(
     context: &AppContext,
     operation_deadline: std::time::Instant,
@@ -1746,6 +1758,7 @@ fn status_with_discovery_options(
     allow_unlabelled_historical_pr_creation: bool,
     require_current_pr_resolution: bool,
     expected_candidate_head: Option<&ExpectedCandidateHead>,
+    focus_pr: Option<PrNumber>,
     bounded_compatibility: bool,
 ) -> Result<StatusOutput, AppError> {
     // Sharing one absolute deadline prevents a large repository from
@@ -1763,6 +1776,7 @@ fn status_with_discovery_options(
         crate::github::DiscoveryOptions {
             allow_unlabelled_historical_pr_creation,
             require_current_pr_resolution,
+            focus_pr,
             repository: context.config.repository.clone(),
             ..crate::github::DiscoveryOptions::default()
         },
@@ -2646,6 +2660,7 @@ pub(crate) fn status_after_branch_rewrite_with_deadline(
         false,
         true,
         Some(&expected),
+        Some(number),
         false,
     )?;
     Ok(BoundRemoteCandidateStatus {
@@ -2671,7 +2686,16 @@ pub(crate) fn status_for_remote_candidate_with_deadline(
     discovery_deadline: std::time::Instant,
     github_budget: Option<&crate::command::GithubRequestBudget>,
 ) -> Result<BoundRemoteCandidateStatus, AppError> {
-    let status = status_with_deadline_and_budget(context, discovery_deadline, github_budget)?;
+    let status = status_with_discovery_options(
+        context,
+        discovery_deadline,
+        github_budget,
+        false,
+        false,
+        None,
+        Some(number),
+        false,
+    )?;
     bind_remote_candidate_from_status(context, status, number, github_budget)
 }
 
