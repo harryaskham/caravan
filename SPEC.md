@@ -1235,7 +1235,24 @@ CI, and unsupported force intent all fail closed before provider mutation.
 Exact REST create/add/unstack, asynchronous direct-merge planning, submission,
 UUID-polling, receipt primitives, and the phased evict/split unstack/rebuild
 transaction remain policy-free adapters composed by membership, reshape, and
-sync. GitHub exposes no arbitrary Stack remove or reorder, so reshape is a
+sync. Before membership invokes native create/add it persists a sealed,
+repository-local continuation keyed by the exact caravan root. A successful
+provider receipt clears the continuation; failure returns it alongside ordinary
+membership receipts. Recovery never asks automatic admission to select the now-
+labelled member again. `native-stack recovery-preview` instead seals current
+repository, ordered membership, immutable head/base generations, CLEAN/current-
+green checks, rollout configuration, complete provider inventory, and any
+continuation into a plan hash. `recovery-apply` requires that hash, independently
+rediscovers the same evidence, and accepts only the mapping shape authorized by
+the action: zero for legacy create, the exact checkpointed provider prefix for
+append, or one exact desired mapping on an idempotent lost-response retry. It
+then calls the existing exact Stack create/add adapter. Truncated inventory,
+singleton input, pauses/parking, non-green
+or changed generations, missing capability/opt-in, and multiple/partial/drifted
+mappings refuse before mutation. Its postcondition rereads every source PR and
+proves no head, base, state, label, or auto-merge identity changed.
+
+GitHub exposes no arbitrary Stack remove or reorder, so reshape is a
 sealed `preflighted` → `unstacked` → `reshape_applied` → `rebuilding` →
 `rebuilt` → `verified` sequence that persists `provider_atomic: false`, binds
 the exact per-PR base/head/control-label/auto-merge postcondition the existing

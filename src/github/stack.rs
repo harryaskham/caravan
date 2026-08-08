@@ -137,7 +137,7 @@ pub struct GitHubStackMutationReceipt {
 }
 
 impl GitHubStackMutationReceipt {
-    fn seal(mut self) -> Self {
+    pub(crate) fn seal(mut self) -> Self {
         self.evidence_hash.clear();
         let material = serde_json::to_vec(&self).expect("GitHub Stack receipt serializes");
         self.evidence_hash = crate::membership::fnv1a64(&material);

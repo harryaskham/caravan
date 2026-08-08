@@ -22,6 +22,7 @@ use caravan::{
     },
     restore_parked::RestoreParkedInput,
     self_update_check, self_update_run, self_update_status,
+    stack_recovery::{NativeStackRecoveryApplyInput, NativeStackRecoveryPreviewInput},
     unpark::UnparkInput,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -118,6 +119,9 @@ enum Command {
     Unpark(UnparkInput),
     /// Restore labels stripped from one exact, durably proven parked generation.
     RestoreParked(RestoreParkedInput),
+    /// Receipt-gated repair of a missing provider Stack representation.
+    #[command(subcommand)]
+    NativeStack(NativeStackCommand),
     /// Exact-owner checkpoint/finalize/rollback for an already-paused caravan.
     #[command(subcommand)]
     PauseRecovery(Box<PauseRecoveryCommand>),
@@ -219,6 +223,14 @@ struct ForceCommand {
 enum ForceSubcommand {
     /// Revoke current durable PR-scoped force intent.
     Revoke(caravan::force::ForceIntentInput),
+}
+
+#[derive(Debug, Subcommand)]
+enum NativeStackCommand {
+    /// Build a no-write exact-generation recovery plan and hash.
+    RecoveryPreview(NativeStackRecoveryPreviewInput),
+    /// Apply one independently revalidated preview hash.
+    RecoveryApply(NativeStackRecoveryApplyInput),
 }
 
 #[derive(Debug, Subcommand)]
@@ -456,6 +468,7 @@ fn run(cli: &Cli) -> Result<(), i32> {
         Command::Resume(input) => run_resume(cli, input),
         Command::Unpark(input) => run_unpark(cli, input),
         Command::RestoreParked(input) => run_restore_parked(cli, input),
+        Command::NativeStack(command) => run_native_stack(cli, command),
         Command::PauseRecovery(command) => run_pause_recovery(cli, command),
         Command::Sync(input) => run_sync(cli, input),
         Command::Plan(command) => run_plan(cli, command),
@@ -1802,6 +1815,38 @@ fn run_restore_parked(cli: &Cli, input: &RestoreParkedInput) -> Result<(), i32> 
                     "restored"
                 } else {
                     "already restored"
+                },
+                output.next
+            );
+            Ok(())
+        }
+        Err(error) => emit_human_error(error),
+    }
+}
+
+fn run_native_stack(cli: &Cli, command: &NativeStackCommand) -> Result<(), i32> {
+    let context = load_context(cli)?;
+    let result = match command {
+        NativeStackCommand::RecoveryPreview(input) => {
+            caravan::stack_recovery::preview(&context, input)
+        }
+        NativeStackCommand::RecoveryApply(input) => caravan::stack_recovery::apply(&context, input),
+    };
+    if cli.json {
+        return emit_result(true, result);
+    }
+    match result {
+        Ok(output) => {
+            println!(
+                "native-stack #{}: {:?}, {} — {}",
+                output.plan.caravan_id,
+                output.observation,
+                if output.mutated {
+                    "provider Stack created"
+                } else if output.provider_receipt.is_some() {
+                    "exact provider Stack already satisfied"
+                } else {
+                    "preview only"
                 },
                 output.next
             );

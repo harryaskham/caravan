@@ -6,6 +6,8 @@
 //! to represent the same caravan. A Stack failure is therefore a resumable
 //! partial membership operation, never permission to roll back Cara policy.
 
+use std::path::Path;
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -58,6 +60,97 @@ pub enum NativeMembershipReceipt {
     StackMutation {
         receipt: Box<GitHubStackMutationReceipt>,
     },
+}
+
+/// Durable, secret-free continuation written before a native Stack create/add.
+/// Ordinary Cara membership may already be visible when the provider operation
+/// fails; this checkpoint gives the scheduler an exact first-party recovery
+/// target instead of asking it to re-admit a now-labelled PR.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct NativeMembershipCheckpoint {
+    pub schema_version: u32,
+    pub caravan_id: PrNumber,
+    pub plan: NativeMembershipPlan,
+    pub evidence_hash: String,
+}
+
+impl NativeMembershipCheckpoint {
+    fn from_plan(plan: &NativeMembershipPlan) -> Option<Self> {
+        let caravan_id = plan.caravan_id()?;
+        let mut checkpoint = Self {
+            schema_version: 1,
+            caravan_id,
+            plan: plan.clone(),
+            evidence_hash: String::new(),
+        };
+        checkpoint.evidence_hash = checkpoint.expected_hash();
+        Some(checkpoint)
+    }
+
+    fn expected_hash(&self) -> String {
+        let mut material = self.clone();
+        material.evidence_hash.clear();
+        crate::membership::fnv1a64(
+            &serde_json::to_vec(&material).expect("native membership checkpoint serializes"),
+        )
+    }
+
+    #[must_use]
+    pub fn verify(&self) -> bool {
+        !self.evidence_hash.is_empty() && self.evidence_hash == self.expected_hash()
+    }
+}
+
+impl NativeMembershipPlan {
+    #[must_use]
+    pub fn caravan_id(&self) -> Option<PrNumber> {
+        match self {
+            Self::AbsentSingleton { .. } => None,
+            Self::Create { plan } => plan.desired.entries.first().map(|entry| entry.pr),
+            Self::Add {
+                expected_members, ..
+            } => expected_members.first().copied(),
+        }
+    }
+}
+
+pub(crate) fn persist_pending(
+    repository: &Path,
+    plan: &NativeMembershipPlan,
+) -> Result<Option<NativeMembershipCheckpoint>, crate::AppError> {
+    let Some(checkpoint) = NativeMembershipCheckpoint::from_plan(plan) else {
+        return Ok(None);
+    };
+    crate::stack_checkpoint::write(repository, &pending_key(checkpoint.caravan_id), &checkpoint)?;
+    Ok(Some(checkpoint))
+}
+
+pub(crate) fn load_pending(
+    repository: &Path,
+    caravan_id: PrNumber,
+) -> Result<Option<NativeMembershipCheckpoint>, crate::AppError> {
+    let checkpoint = crate::stack_checkpoint::load(repository, &pending_key(caravan_id))?;
+    if checkpoint
+        .as_ref()
+        .is_some_and(|checkpoint: &NativeMembershipCheckpoint| !checkpoint.verify())
+    {
+        return Err(crate::AppError::validation(
+            "github_stack_membership_checkpoint_invalid",
+            "native membership checkpoint evidence hash is invalid",
+        ));
+    }
+    Ok(checkpoint)
+}
+
+pub(crate) fn clear_pending(
+    repository: &Path,
+    caravan_id: PrNumber,
+) -> Result<(), crate::AppError> {
+    crate::stack_checkpoint::remove(repository, &pending_key(caravan_id))
+}
+
+fn pending_key(caravan_id: PrNumber) -> String {
+    format!("membership-{}", caravan_id.0)
 }
 
 #[derive(Debug)]
@@ -242,24 +335,59 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
                     .iter()
                     .map(|entry| entry.pr)
                     .collect::<Vec<_>>();
-                if &actual != expected_members {
+                let expected_full = expected_members
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(candidate.number))
+                    .collect::<Vec<_>>();
+                if &actual != expected_members && actual != expected_full {
                     return Err(invalid_plan(
                         "github_stack_membership_members_drifted",
                         "provider Stack members changed before append",
                     ));
                 }
-                let mut desired = before.topology.clone();
-                desired.entries.push(entry_from_pull(
-                    desired.entries.len(),
-                    candidate,
-                    desired.entries.last().map(|entry| &entry.head),
-                )?);
+                // An exact full generation means the prior add response was
+                // lost. Reconstruct its expected prefix and let the CRUD
+                // adapter return a sealed AlreadySatisfied receipt rather than
+                // rejecting the successful continuation as member drift.
+                let (expected_before, desired) = if actual == expected_full {
+                    let desired = before.topology.clone();
+                    let mut expected_before = before.clone();
+                    expected_before
+                        .topology
+                        .entries
+                        .truncate(expected_members.len());
+                    let expected_candidate = entry_from_pull(
+                        expected_members.len(),
+                        candidate,
+                        expected_before
+                            .topology
+                            .entries
+                            .last()
+                            .map(|entry| &entry.head),
+                    )?;
+                    if desired.entries.get(expected_members.len()) != Some(&expected_candidate) {
+                        return Err(invalid_plan(
+                            "github_stack_membership_candidate_drifted",
+                            "already-appended provider entry differs from the exact candidate generation",
+                        ));
+                    }
+                    (expected_before, desired)
+                } else {
+                    let mut desired = before.topology.clone();
+                    desired.entries.push(entry_from_pull(
+                        desired.entries.len(),
+                        candidate,
+                        desired.entries.last().map(|entry| &entry.head),
+                    )?);
+                    (before, desired)
+                };
                 self.native_stack_add(
                     repository,
                     &GitHubStackAddPlan {
                         operation_id: operation_id.clone(),
                         actor: actor.clone(),
-                        before,
+                        before: expected_before,
                         desired,
                     },
                 )
@@ -272,7 +400,7 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
     }
 }
 
-fn topology_from_members<'a>(
+pub(crate) fn topology_from_members<'a>(
     base: &crate::model::BranchSnapshot,
     members: impl IntoIterator<Item = &'a PullRequestSnapshot>,
 ) -> Result<GitHubStackTopology, NativeMembershipError> {
@@ -460,6 +588,42 @@ mod tests {
         );
         assert_eq!(plan.desired.entries[1].base, root.head);
         assert_eq!(plan.desired.entries[1].head, child.head);
+    }
+
+    #[test]
+    fn failed_native_create_has_a_durable_exact_continuation_checkpoint() {
+        let repository_path = tempfile::tempdir().unwrap();
+        let initialized = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(repository_path.path())
+            .output()
+            .unwrap();
+        assert!(initialized.status.success());
+        let main = branch("main", "main000");
+        let root = pull(101, main.clone());
+        let child = pull(102, root.head.clone());
+        let caravans = vec![Caravan::new(vec![PrNumber(101)]).unwrap()];
+        let pulls = BTreeMap::from([(PrNumber(101), root)]);
+        let output = output("join", child, PrNumber(101));
+        let plan =
+            plan_native_membership(&facts(&main, &caravans, &pulls, &[]), &output, "cara").unwrap();
+
+        let written = persist_pending(repository_path.path(), &plan)
+            .unwrap()
+            .expect("a native create carries a continuation");
+        let loaded = load_pending(repository_path.path(), PrNumber(101))
+            .unwrap()
+            .expect("continuation survives process boundaries");
+
+        assert!(loaded.verify());
+        assert_eq!(loaded, written);
+        assert_eq!(loaded.plan, plan);
+        clear_pending(repository_path.path(), PrNumber(101)).unwrap();
+        assert!(
+            load_pending(repository_path.path(), PrNumber(101))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
