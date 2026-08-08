@@ -860,11 +860,11 @@ pub enum CandidateNextAction {
 #[serde(rename_all = "snake_case", tag = "authority")]
 pub enum AdmissionCompatibilityAuthorization {
     ProviderIdentity {
-        identity: crate::model::MergeCandidateIdentity,
+        identity: Box<crate::model::MergeCandidateIdentity>,
     },
     ExactGitProof {
-        stale_identity: crate::model::MergeCandidateIdentity,
-        compatibility: CompatibilityReport,
+        stale_identity: Box<crate::model::MergeCandidateIdentity>,
+        compatibility: Box<CompatibilityReport>,
     },
 }
 
@@ -3367,7 +3367,7 @@ fn native_join_authorization(
         && synthetic.parents[0] == compared_base.oid
     {
         return Some(AdmissionCompatibilityAuthorization::ProviderIdentity {
-            identity: identity.clone(),
+            identity: Box::new(identity.clone()),
         });
     }
 
@@ -3393,8 +3393,8 @@ fn native_join_authorization(
                 .is_some_and(|diagnostic| exact_git_diagnostic(diagnostic, &synthetic.parents[0]))
     })?;
     Some(AdmissionCompatibilityAuthorization::ExactGitProof {
-        stale_identity: identity.clone(),
-        compatibility: proof.clone(),
+        stale_identity: Box::new(identity.clone()),
+        compatibility: Box::new(proof.clone()),
     })
 }
 
@@ -5951,6 +5951,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::unnecessary_wraps)]
     fn exact_native_checker(
         candidate: &crate::model::BranchSnapshot,
         target: &crate::model::BranchSnapshot,
