@@ -133,23 +133,30 @@ fn dispatch_failure_hooks(
     if events.is_empty() {
         return Ok(Vec::new());
     }
-    hooks::dispatch_events(context, &events)
+    let prepared = crate::sync_authority::prepare(context)?;
+    hooks::dispatch_events(prepared.context(), &events)
 }
 
 /// Run one canonical sync-all tick including ordinary hook delivery.
 pub fn tick(context: &AppContext) -> Result<LoopTickOutput, AppError> {
-    match crate::sync::sync(
+    let prepared = crate::sync_authority::prepare(context)?;
+    let context = prepared.context();
+    match crate::sync::sync_prepared(
         context,
         &SyncInput {
             all: true,
             rerun_failed: false,
             dry_run: false,
         },
+        prepared.authority(),
     ) {
         Ok(sync) => {
             let mut events = sync.events.clone();
             let ready_events = ready_unqueued_events(&sync);
             let mut hook_deliveries = sync.hook_deliveries.clone();
+            // Repository-relative hooks run from the same fetched source
+            // snapshot whose policy authorized this tick, never the caller's
+            // arbitrary branch.
             hook_deliveries.extend(hooks::dispatch_events(context, &ready_events)?);
             events.extend(ready_events);
             Ok(LoopTickOutput {

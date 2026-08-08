@@ -359,6 +359,15 @@ const fn default_checkout_on_decision() -> bool {
     false
 }
 
+/// Fetch and materialize the authoritative remote default branch before sync.
+///
+/// Sync is a repository service, not a property of whichever branch happens to
+/// be checked out. Default-on keeps an old/dirty feature branch from becoming
+/// policy authority while leaving that branch, its index, and worktree intact.
+const fn default_allow_fetch() -> bool {
+    true
+}
+
 fn default_sync_max_duration_secs() -> u64 {
     120
 }
@@ -499,6 +508,10 @@ pub struct TerminalRedConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct SyncConfig {
     pub actions: SyncActionsConfig,
+    /// Fetch and use one exact remote-default snapshot for policy, hooks, and
+    /// Git reads without checking out or resetting the invoking worktree.
+    #[serde(default = "default_allow_fetch")]
+    pub allow_fetch: bool,
     /// Maximum number of non-parked caravans admission may create.
     ///
     /// Existing excess caravans remain valid and continue converging; this is
@@ -610,6 +623,7 @@ impl Default for SyncConfig {
     fn default() -> Self {
         Self {
             actions: SyncActionsConfig::default(),
+            allow_fetch: default_allow_fetch(),
             max_caravans: default_sync_max_caravans(),
             terminal_red: TerminalRedConfig::default(),
             reserve_secs_per_command: default_sync_reserve_secs_per_command(),
@@ -761,6 +775,15 @@ impl Default for CaravanConfig {
 }
 
 impl CaravanConfig {
+    /// Defaults plus strict per-invocation environment overrides, used only to
+    /// bootstrap authoritative sync materialization before branch-local policy
+    /// is trusted.
+    pub(crate) fn sync_bootstrap_default() -> Self {
+        let mut config = Self::default();
+        config.apply_environment_overrides();
+        config
+    }
+
     /// Parse YAML and validate the complete policy.
     pub fn parse(yaml: &str) -> Result<Self, ConfigError> {
         Self::check_reader_compatibility(yaml, CARA_VERSION)?;
@@ -783,6 +806,9 @@ impl CaravanConfig {
     fn apply_environment_overrides(&mut self) {
         if let Some(value) = environment_flag("CARA_CHECKOUT_ON_DECISION") {
             self.sync.checkout_on_decision = value;
+        }
+        if let Some(value) = environment_flag("CARA_ALLOW_FETCH") {
+            self.sync.allow_fetch = value;
         }
     }
 
@@ -1712,6 +1738,28 @@ sync:
             default_sync_max_duration_secs(),
             "opting out must not silently change any other bound"
         );
+    }
+}
+
+#[cfg(test)]
+mod sync_fetch_policy_tests {
+    use super::*;
+
+    #[test]
+    fn authoritative_default_fetch_is_enabled_by_default() {
+        assert!(
+            CaravanConfig::default().sync.allow_fetch,
+            "sync must not inherit policy from an arbitrary invocation branch"
+        );
+    }
+
+    #[test]
+    fn repository_policy_can_deliberately_disable_local_fetch() {
+        let config: CaravanConfig =
+            serde_yaml::from_str("version: 1\nsync:\n  allow_fetch: false\n")
+                .expect("allow_fetch is an optional strict boolean");
+
+        assert!(!config.sync.allow_fetch);
     }
 }
 

@@ -724,6 +724,7 @@ command_timeout_secs: 30
 repair:
   materialization_timeout_secs: 180
 sync:
+  allow_fetch: true  # default: sync policy/hooks come from fetched origin default
   actions:
     join_unlabelled_prs: false
   terminal_red:
@@ -749,6 +750,18 @@ hooks:
     timeout_secs: 30
     blocking: false
 ```
+
+`cara sync`, `cara plan sync`, and loop ticks are safe to invoke from any
+branch. Unless an explicit `--config` or reviewed `sync.allow_fetch: false`
+opts out, Cara fetches the exact `origin/HEAD` branch, pins its commit, and runs
+against a detached temporary worktree sharing the repository's common Git
+metadata. Policy and repository-relative hooks therefore come from one
+fetched default-branch snapshot while the caller's branch, HEAD, index, tracked
+changes, untracked files, and in-progress Git state remain untouched. The
+remote-tracking default ref is rechecked after provider discovery and before the
+first possible provider mutation; movement returns a typed retry instead of
+mixing policy generations. `CARA_ALLOW_FETCH=true|false` is the strict
+per-invocation override.
 
 `conflict_detected` is a versioned, secret-free notification for one exact open
 PR generation with a mechanically proven conflict. It includes immutable

@@ -528,6 +528,23 @@ fn load_context(cli: &Cli) -> Result<AppContext, i32> {
         Some(repository) => AppContext::load_from_directory(repository, cli.config.as_deref()),
         None => AppContext::load(cli.config.as_deref()),
     };
+    emit_context_error(cli, loaded)
+}
+
+fn load_sync_context(cli: &Cli) -> Result<AppContext, i32> {
+    let loaded = match cli.repo.as_deref() {
+        Some(repository) => {
+            AppContext::load_for_sync_from_directory(repository, cli.config.as_deref())
+        }
+        None => AppContext::load_for_sync(cli.config.as_deref()),
+    };
+    emit_context_error(cli, loaded)
+}
+
+fn emit_context_error(
+    cli: &Cli,
+    loaded: Result<AppContext, caravan::config::ConfigError>,
+) -> Result<AppContext, i32> {
     loaded.map_err(|error| {
         if cli.json {
             emit_result::<serde_json::Value, _>(true, Err(error))
@@ -1875,7 +1892,7 @@ fn run_pause_recovery(cli: &Cli, command: &PauseRecoveryCommand) -> Result<(), i
 }
 
 fn run_sync(cli: &Cli, input: &SyncInput) -> Result<(), i32> {
-    let context = load_context(cli)?;
+    let context = load_sync_context(cli)?;
     // A dry-run must be reachable from the mutating command itself. Routing it
     // here keeps exactly one planner rather than a second, drift-prone preview.
     if input.dry_run {
@@ -1914,9 +1931,9 @@ fn run_sync(cli: &Cli, input: &SyncInput) -> Result<(), i32> {
 }
 
 fn run_plan(cli: &Cli, command: &PlanCommand) -> Result<(), i32> {
-    let context = load_context(cli)?;
     match command {
         PlanCommand::Sync(input) => {
+            let context = load_sync_context(cli)?;
             let result = caravan::sync::plan_sync(&context, input);
             if cli.json {
                 return emit_result(true, result);
@@ -1930,6 +1947,7 @@ fn run_plan(cli: &Cli, command: &PlanCommand) -> Result<(), i32> {
             }
         }
         PlanCommand::Concat(input) => {
+            let context = load_context(cli)?;
             let result = caravan::concat::plan(&context, input);
             if cli.json {
                 return emit_result(true, result);
@@ -2237,7 +2255,7 @@ fn run_loop(cli: &Cli, input: &LoopInput) -> Result<(), i32> {
                 "manual decision mode requires a controlling TTY",
             ));
         }
-        let context = load_context(cli)?;
+        let context = load_sync_context(cli)?;
         return run_manual_loop(&context, input);
     }
     if cli.json && !input.once {
@@ -2249,7 +2267,7 @@ fn run_loop(cli: &Cli, input: &LoopInput) -> Result<(), i32> {
             )),
         );
     }
-    let context = load_context(cli)?;
+    let context = load_sync_context(cli)?;
     if cli.json {
         return emit_result(
             true,
