@@ -1,12 +1,30 @@
 version: 1
 # Rolling system runtime sentinel: wrapper compatibility is source/config
 # checked, while upgrades do not require a pin edit.
-min_cara_version: "0.0.0"
+#
+# Bumped to the github-native-stacks reader floor (MIN_GITHUB_STACK_READER_VERSION
+# = 0.0.65) because this repo now opts into `stack_type: github`.
+min_cara_version: "0.0.65"
 # This repository dogfoods every mutating Cara policy. Force remains one-shot,
 # exact-generation operator intent and never bypasses textual conflicts.
 force_merge: true
-# Explicit opt-in: rewrites owned PR branches under exact force-with-lease.
-rebase_on_join: true
+# Provider representation + landing backend: GitHub-native Stack objects with
+# atomic stack-merge, matching how the caco layer now configures caravan
+# (cacophony-config#114). Cara remains the scheduler/policy authority; this is a
+# provider adapter, not a bypass of candidacy, priority, holds, CI, or receipts.
+stack_type: github
+# Explicit reviewed per-repository opt-in required before any native-Stack
+# mutation (selecting stack_type: github alone never silently enables mutations).
+stack_rollout:
+  mutations_opt_in: true
+  reviewed_by: "harryaskham (cacophony-config#114 caco-layer gh-stacks rollout)"
+# Exact owner/name this policy governs (bd-ff639b): a managed agent checkout
+# whose origin is a local daemon mirror cannot otherwise infer its repository.
+repository: "harryaskham/caravan"
+# Under stack_type: github, GitHub Stack mode owns physical branch rewriting
+# (gh stack rebase/retarget); cara must not be a second physical branch writer,
+# so rebase_on_join MUST be false here (enforced by `cara config check`).
+rebase_on_join: false
 # Highest to lowest; ties and unlabelled attempts use immutable PR createdAt FIFO.
 agent_priority_labels:
   - caravan-priority:high
@@ -17,6 +35,9 @@ command_timeout_secs: 30
 # converges. Every candidate, provider call, mutation, and wall-clock phase is
 # bounded; incompatible generations receive exact advisory skip receipts.
 sync:
+  # GitHub native Stack entries do not support provider auto-merge; cara must
+  # own the head merge under stack_type: github.
+  head_merge_actor: caravan
   actions:
     join_unlabelled_prs: true
   max_candidates_per_tick: 8
