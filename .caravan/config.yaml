@@ -5,9 +5,9 @@ version: 1
 # Bumped to the github-native-stacks reader floor (MIN_GITHUB_STACK_READER_VERSION
 # = 0.0.65) because this repo now opts into `stack_type: github`.
 min_cara_version: "0.0.65"
-# This repository dogfoods every mutating Cara policy. Force remains one-shot,
-# exact-generation operator intent and never bypasses textual conflicts.
-force_merge: true
+# GitHub-native Stack owns landing; legacy one-shot force merge is disabled so
+# Cacophony admission has a single reviewed merge actor.
+force_merge: false
 # Provider representation + landing backend: GitHub-native Stack objects with
 # atomic stack-merge, matching how the caco layer now configures caravan
 # (cacophony-config#114). Cara remains the scheduler/policy authority; this is a

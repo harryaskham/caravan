@@ -32,6 +32,7 @@ use crate::read::{self, StatusOutput};
 use crate::required_runs::{
     self, HeadRunLineage, MissingRequiredRunsProblem, RequiredContextsRead, RequiredRunsClock,
     RequiredRunsInput, RequiredRunsReceipt, RequiredRunsRecovery, RequiredRunsRetrigger,
+    RequiredRunsStatus,
 };
 use crate::root_auto_merge::{
     self, ROOT_AUTO_MERGE_ARMING_ATTEMPTS, ROOT_AUTO_MERGE_CONFIRMATION_DELAY,
@@ -973,6 +974,14 @@ pub trait SyncProvider {
         expected: &PullRequestPrecondition,
     ) -> Result<PullRequestSnapshot, MutationError>;
 
+    /// Refetch mutation identity plus the exact check observation that decided
+    /// a CI-sensitive transition.
+    fn verify_pull_request_with_checks(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+    ) -> Result<PullRequestSnapshot, MutationError>;
+
     fn refetch_pull_request(
         &self,
         repository: &RepositoryId,
@@ -1234,6 +1243,14 @@ impl<R: crate::command::CommandRunner> SyncProvider for GitHubMutationAdapter<R>
         expected: &PullRequestPrecondition,
     ) -> Result<PullRequestSnapshot, MutationError> {
         self.verify_precondition(repository, expected)
+    }
+
+    fn verify_pull_request_with_checks(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+    ) -> Result<PullRequestSnapshot, MutationError> {
+        self.verify_precondition_with_checks(repository, expected)
     }
 
     fn refetch_pull_request(
@@ -1866,6 +1883,8 @@ fn reconcile_terminal_red_parking(
     for caravan in &status.analysis.fleet.caravans {
         let receipt_start = output.provider_receipts.len();
         let mut failures = Vec::new();
+        let mut verdicts = Vec::new();
+        let mut all_members_green = true;
         for number in &caravan.members {
             let pull_request = status
                 .analysis
@@ -1887,13 +1906,42 @@ fn reconcile_terminal_red_parking(
                 })
                 .copied()
                 .collect::<Vec<_>>();
+            let member_green = !current.is_empty()
+                && current.iter().all(|check| {
+                    matches!(
+                        check.state,
+                        CheckState::Success | CheckState::Neutral | CheckState::Skipped
+                    )
+                });
+            all_members_green &= member_green;
+            let classification = if !terminal.is_empty() {
+                parking_failure_classification(&current)
+            } else if member_green {
+                "green"
+            } else if current.iter().any(|check| {
+                matches!(
+                    check.state,
+                    CheckState::Expected | CheckState::Queued | CheckState::InProgress
+                )
+            }) {
+                "pending"
+            } else {
+                "unknown"
+            };
+            verdicts.push(json!({
+                "pr": number,
+                "head": pull_request.head.oid,
+                "checks": &current,
+                "superseded_checks": &superseded,
+                "classification": classification,
+            }));
             if !terminal.is_empty() {
                 failures.push(json!({
                     "pr": number,
                     "head": pull_request.head.oid,
-                    "checks": terminal,
-                    "superseded_checks": superseded,
-                    "classification": parking_failure_classification(&current),
+                    "checks": &terminal,
+                    "superseded_checks": &superseded,
+                    "classification": classification,
                 }));
             }
         }
@@ -1904,10 +1952,21 @@ fn reconcile_terminal_red_parking(
             .expect("caravan head has provider facts");
         let should_park = !failures.is_empty();
         let is_parked = head.has_label(PARKED_LABEL);
-        if should_park == is_parked {
+        let green_required_runs = if is_parked && !should_park && all_members_green {
+            parking_required_runs_green(status, caravan, provider)
+        } else {
+            None
+        };
+        // Parking is a three-state transition. Terminal red parks, complete
+        // protection-declared green evidence can unpark, and
+        // pending/unknown/incomplete evidence preserves the existing label.
+        // Treating every non-red observation as recovery made label-triggered
+        // checks flap the same immutable head.
+        let should_unpark = green_required_runs.is_some();
+        if is_parked && !should_unpark {
             // Parked heads must never remain armed even after a partial earlier
             // transition. This is idempotent and exact-precondition fenced.
-            if is_parked && head.auto_merge.enabled {
+            if head.auto_merge.enabled {
                 let receipt = provider
                     .disable_auto_merge(&status.repository, &PullRequestPrecondition::from(head))
                     .map_err(|error| parking_mutation_error(&error, caravan, &failures))?;
@@ -1922,12 +1981,18 @@ fn reconcile_terminal_red_parking(
             }
             continue;
         }
+        if !is_parked && !should_park {
+            continue;
+        }
 
         // Unparking reactivates an already-enrolled caravan; it never forms an
         // additional one. `sync.max_caravans` is an admission fence only, so an
         // already-excess fleet must keep converging instead of being frozen at
         // the moment a parked generation becomes green.
         let expected = PullRequestPrecondition::from(head);
+        provider
+            .verify_pull_request_with_checks(&status.repository, &expected)
+            .map_err(|error| parking_mutation_error(&error, caravan, &failures))?;
         let receipt = if should_park {
             provider.add_label(&status.repository, &expected, PARKED_LABEL)
         } else {
@@ -1946,7 +2011,8 @@ fn reconcile_terminal_red_parking(
             summary: if should_park {
                 "parked exact terminal-red caravan outside active capacity".to_owned()
             } else {
-                "reactivated parked caravan after current verdict recovered".to_owned()
+                "reactivated parked caravan after the complete current verdict turned green"
+                    .to_owned()
             },
         });
         let after = receipt.after.clone();
@@ -1968,6 +2034,8 @@ fn reconcile_terminal_red_parking(
             &serde_json::to_vec(&json!({
                 "caravan": caravan,
                 "failures": failures,
+                "verdicts": verdicts,
+                "required_runs": &green_required_runs,
                 "head": head.head,
                 "policy": "park",
             }))
@@ -1987,12 +2055,14 @@ fn reconcile_terminal_red_parking(
             Some(if should_park {
                 "exact current terminal-red verdict parked the caravan".to_owned()
             } else {
-                "new/nonterminal/green current verdict reactivated the caravan".to_owned()
+                "complete current green verdict reactivated the caravan".to_owned()
             }),
             BTreeMap::from([
                 ("policy".to_owned(), json!("park")),
                 ("fingerprint".to_owned(), json!(fingerprint)),
                 ("failures".to_owned(), json!(failures)),
+                ("verdicts".to_owned(), json!(verdicts)),
+                ("required_runs".to_owned(), json!(green_required_runs)),
                 ("ordering".to_owned(), json!(caravan.members)),
                 (
                     "provider_receipts".to_owned(),
@@ -2002,6 +2072,53 @@ fn reconcile_terminal_red_parking(
         ));
     }
     Ok(output)
+}
+
+/// Require the same protection-declared complete-green evidence as explicit
+/// `unpark` before a normal sync can remove parking. A partial/unreadable
+/// protection response or a required context that has not materialized is a
+/// provider-write-free hold, never implicit recovery authority.
+fn parking_required_runs_green(
+    status: &StatusOutput,
+    caravan: &Caravan,
+    provider: &impl SyncProvider,
+) -> Option<Vec<crate::required_runs::RequiredRunsAssessment>> {
+    let mut contexts_by_branch: BTreeMap<String, RequiredContextsRead> = BTreeMap::new();
+    let mut assessments = Vec::new();
+    for number in &caravan.members {
+        let pull = status.analysis.pull_requests.get(number)?;
+        let contexts = if let Some(contexts) = contexts_by_branch.get(&pull.base.name) {
+            contexts.clone()
+        } else {
+            let contexts = provider
+                .branch_required_contexts(&status.repository, &pull.base.name)
+                .ok()?
+                .normalized();
+            contexts_by_branch.insert(pull.base.name.clone(), contexts.clone());
+            contexts
+        };
+        let assessment = required_runs::assess(&RequiredRunsInput {
+            pr: pull.number,
+            head: &pull.head,
+            base: &pull.base,
+            contexts: &contexts,
+            lineage: None,
+            checks: &pull.checks,
+            head_published_at: pull.updated_at.as_deref(),
+            clock: RequiredRunsClock {
+                now_unix: now_unix(),
+                grace_secs: 0,
+            },
+        });
+        if !matches!(
+            assessment.status,
+            RequiredRunsStatus::Satisfied | RequiredRunsStatus::NotRequired
+        ) {
+            return None;
+        }
+        assessments.push(assessment);
+    }
+    Some(assessments)
 }
 
 fn parking_failure_classification(checks: &[&CheckSnapshot]) -> &'static str {

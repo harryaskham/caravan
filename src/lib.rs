@@ -138,9 +138,12 @@ CORE MODEL AND INVARIANTS
   for scheduler repair routing, but problems wholly owned by parked caravans do
   not contaminate active-fleet health, candidate preflight, or cross-caravan
   compatibility. Explicitly targeting a parked caravan names its head and the
-  responsible repair actor. Pending and superseded red never park;
-  new/nonterminal/green current evidence deterministically unparks at the root's
-  original FIFO age. Hooks are optional recovery, never queue liveness.
+  responsible repair actor. Pending and superseded red never park. Once parked,
+  queued/expected/in-progress/unknown evidence preserves the label without a
+  provider write; only a nonempty, fully green current verdict for every member
+  with every protection-declared context proven satisfied deterministically
+  unparks at the root's original FIFO age. A check-sensitive reread fences
+  either label transition. Hooks are optional recovery, never queue liveness.
 - A successful tick names every `head_of_line` stall: the exact blocking PR, its
   one-based queue position, the members waiting behind it, the block class, and
   ordered repair/reshape/evict remedies. A stalled front is an external

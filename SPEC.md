@@ -691,11 +691,16 @@ auto-merge, and excludes the whole preserved caravan from active convergence,
 capacity and admission-tail selection. It never changes member labels, branches
 or bases. Pending/running and superseded red remain active; a newer Actions run
 on the exact head supersedes terminal rows from its older workflow generation
-even before matching downstream job names materialize. A new head or latest
-nonterminal/green verdict removes the parked label; re-entry retains the root's
-immutable original FIFO age. Park/unpark events bind exact ordering, member
-heads, current/superseded check evidence, classification, fingerprint and
-provider receipt.
+even before matching downstream job names materialize. Once parked,
+queued/expected/in-progress/unknown or absent current evidence preserves the
+label with zero provider writes. Only a nonempty, fully green latest verdict for
+every member with every protection-declared context proven satisfied removes
+the parked label; re-entry retains the root's immutable original FIFO age.
+Immediately before either label transition, a check-sensitive provider reread
+must still match the deciding observation; check drift refuses with zero writes.
+Park/unpark events bind exact ordering, member heads, current/superseded check
+evidence, required-context assessment, classification, fingerprint and provider
+receipt.
 
 The reviewed `unpark` transition is the first-party recovery path when a parked
 immutable generation becomes green outside a normal sync tick. Its CLI, JSON,

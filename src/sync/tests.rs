@@ -317,6 +317,33 @@ impl SyncProvider for FakeProvider {
         Ok(actual)
     }
 
+    fn verify_pull_request_with_checks(
+        &self,
+        _repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+    ) -> Result<PullRequestSnapshot, MutationError> {
+        let actual = self
+            .pulls
+            .borrow()
+            .get(&expected.number)
+            .cloned()
+            .expect("fake PR");
+        let actual_precondition = PullRequestPrecondition::from(&actual);
+        if actual_precondition != *expected {
+            let changed_fields = if actual_precondition.mutation_identity_eq(expected) {
+                vec!["checks".to_owned()]
+            } else {
+                vec!["fake_race".to_owned()]
+            };
+            return Err(MutationError::StalePrecondition {
+                expected: Box::new(expected.clone()),
+                actual: Box::new(actual_precondition),
+                changed_fields,
+            });
+        }
+        Ok(actual)
+    }
+
     fn refetch_pull_request(
         &self,
         _repository: &RepositoryId,
@@ -3186,7 +3213,7 @@ fn parking_uses_latest_verdict_only_and_pending_never_parks() {
 /// Parking consumes the shared lineage reducer, so the older generation is
 /// historical even before the replacement run materializes matching job names.
 #[test]
-fn cancelled_prerequisite_generation_never_parks_and_unparks_automatically() {
+fn cancelled_prerequisite_generation_never_parks_or_releases_pending_parking() {
     let workflow_run =
         |name: &str, run_id: u64, state: CheckState, started: &str, completed: &str| {
             let mut check = check(name, state, Some(run_id));
@@ -3239,11 +3266,159 @@ fn cancelled_prerequisite_generation_never_parks_and_unparks_automatically() {
     parked[0].auto_merge = AutoMergeState::disabled();
     let provider = FakeProvider::with_pull_requests(parked.clone());
     let parked_status = status(parked, Some(PrNumber(1)), &clean);
-    let recovered = reconcile_terminal_red_parking(&context, &parked_status, &provider)
-        .expect("newer exact-head workflow automatically removes stale parking");
-    assert!(recovered.changed);
-    assert_eq!(recovered.events[0].kind, EventKind::CaravanUnparked);
-    assert!(!provider.pulls.borrow()[&PrNumber(1)].has_label("caravan-parked"));
+    let pending = reconcile_terminal_red_parking(&context, &parked_status, &provider)
+        .expect("newer exact-head workflow stays quarantined until recovery is green");
+    assert!(!pending.changed);
+    assert!(pending.provider_receipts.is_empty());
+    assert!(pending.events.is_empty());
+    assert!(provider.pulls.borrow()[&PrNumber(1)].has_label("caravan-parked"));
+}
+
+/// bd-2b70af: label-driven check generations on an unchanged source-red head
+/// must not turn a pending verdict into implicit unpark authority. The provider
+/// is already one generation ahead of the status snapshot to reproduce the
+/// check-only precondition race observed on Cacophony #2580.
+#[test]
+fn parked_unchanged_head_is_idempotent_across_pending_check_races() {
+    let workflow_run = |run_id: u64, state: CheckState, started: &str| {
+        let mut check = check("Check & Lint", state, Some(run_id));
+        check.provider_kind = Some("CheckRun".to_owned());
+        check.workflow_name = Some("CI".to_owned());
+        check.started_at = Some(started.to_owned());
+        check.completed_at =
+            (state != CheckState::InProgress).then(|| "2026-08-09T08:00:30Z".to_owned());
+        check
+    };
+    let mut observed = healthy_chain();
+    observed.truncate(1);
+    observed[0].labels.insert("caravan-parked".to_owned());
+    observed[0].auto_merge = AutoMergeState::disabled();
+    observed[0].checks = vec![
+        workflow_run(100, CheckState::Failure, "2026-08-09T08:00:00Z"),
+        workflow_run(200, CheckState::InProgress, "2026-08-09T08:01:00Z"),
+    ];
+
+    let mut provider_view = observed.clone();
+    provider_view[0].checks.push(workflow_run(
+        201,
+        CheckState::InProgress,
+        "2026-08-09T08:02:00Z",
+    ));
+    let provider = FakeProvider::with_pull_requests(provider_view);
+    let mut context = AppContext::default();
+    context.config.sync.terminal_red.action = crate::config::TerminalRedAction::Park;
+
+    let stale_status = status(observed, Some(PrNumber(1)), &clean);
+    let first = reconcile_terminal_red_parking(&context, &stale_status, &provider)
+        .expect("check-only drift never authorizes a label transition");
+    assert!(!first.changed);
+    assert!(first.provider_receipts.is_empty());
+    assert!(first.events.is_empty());
+    assert!(provider.calls.borrow().is_empty());
+    assert!(provider.pulls.borrow()[&PrNumber(1)].has_label("caravan-parked"));
+
+    let current = provider
+        .pulls
+        .borrow()
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    let current_status = status(current, Some(PrNumber(1)), &clean);
+    let repeated = reconcile_terminal_red_parking(&context, &current_status, &provider)
+        .expect("the next unchanged-head tick is the same no-op");
+    assert!(!repeated.changed);
+    assert!(repeated.provider_receipts.is_empty());
+    assert!(provider.calls.borrow().is_empty());
+    assert!(provider.pulls.borrow()[&PrNumber(1)].has_label("caravan-parked"));
+}
+
+/// A newer workflow can briefly expose only a successful preparation job while
+/// its protection-required lint job has not materialized. That is green data,
+/// but not a complete green replacement generation and therefore not unpark
+/// authority.
+#[test]
+fn parked_head_requires_complete_required_green_before_automatic_unpark() {
+    let workflow_check = |name: &str, run_id: u64, state: CheckState, started: &str| {
+        let mut check = check(name, state, Some(run_id));
+        check.provider_kind = Some("CheckRun".to_owned());
+        check.workflow_name = Some("CI".to_owned());
+        check.started_at = Some(started.to_owned());
+        check.completed_at = Some(started.to_owned());
+        check
+    };
+    let mut pulls = healthy_chain();
+    pulls.truncate(1);
+    pulls[0].labels.insert("caravan-parked".to_owned());
+    pulls[0].auto_merge = AutoMergeState::disabled();
+    pulls[0].checks = vec![
+        workflow_check(
+            "Check & Lint",
+            100,
+            CheckState::Failure,
+            "2026-08-09T08:00:00Z",
+        ),
+        workflow_check(
+            "Changed surface admission",
+            200,
+            CheckState::Success,
+            "2026-08-09T08:01:00Z",
+        ),
+    ];
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    provider.require_contexts("main", &["Check & Lint"]);
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+    let mut context = AppContext::default();
+    context.config.sync.terminal_red.action = crate::config::TerminalRedAction::Park;
+
+    let result = reconcile_terminal_red_parking(&context, &status, &provider)
+        .expect("incomplete required green is a provider-write-free hold");
+    assert!(!result.changed);
+    assert!(result.provider_receipts.is_empty());
+    assert!(result.events.is_empty());
+    assert!(provider.calls.borrow().is_empty());
+    assert!(provider.pulls.borrow()[&PrNumber(1)].has_label("caravan-parked"));
+}
+
+/// Even complete green evidence is observation, not durable write authority.
+/// A new check generation between status discovery and the label transition
+/// must refuse before the provider sees a remove-label mutation.
+#[test]
+fn automatic_unpark_refuses_check_drift_before_label_write() {
+    let workflow_check = |run_id: u64, state: CheckState, started: &str| {
+        let mut check = check("Check & Lint", state, Some(run_id));
+        check.provider_kind = Some("CheckRun".to_owned());
+        check.workflow_name = Some("CI".to_owned());
+        check.started_at = Some(started.to_owned());
+        check.completed_at = (state == CheckState::Success).then(|| started.to_owned());
+        check
+    };
+    let mut observed = healthy_chain();
+    observed.truncate(1);
+    observed[0].labels.insert("caravan-parked".to_owned());
+    observed[0].auto_merge = AutoMergeState::disabled();
+    observed[0].checks = vec![workflow_check(
+        200,
+        CheckState::Success,
+        "2026-08-09T08:01:00Z",
+    )];
+    let mut provider_view = observed.clone();
+    provider_view[0].checks.push(workflow_check(
+        201,
+        CheckState::InProgress,
+        "2026-08-09T08:02:00Z",
+    ));
+    let provider = FakeProvider::with_pull_requests(provider_view);
+    provider.require_contexts("main", &["Check & Lint"]);
+    let status = status(observed, Some(PrNumber(1)), &clean);
+    let mut context = AppContext::default();
+    context.config.sync.terminal_red.action = crate::config::TerminalRedAction::Park;
+
+    let Err(error) = reconcile_terminal_red_parking(&context, &status, &provider) else {
+        panic!("check drift must invalidate unpark authority");
+    };
+    assert_eq!(error.code(), "terminal_red_parking_failed");
+    assert!(provider.calls.borrow().is_empty());
+    assert!(provider.pulls.borrow()[&PrNumber(1)].has_label("caravan-parked"));
 }
 
 #[test]
@@ -3287,6 +3462,9 @@ fn green_rerun_unparks_without_changing_multi_member_topology() {
         pull.checks = vec![check("build-test", CheckState::Success, Some(20))];
     }
     let provider = FakeProvider::with_pull_requests(pulls.clone());
+    for branch in ["main", "one", "two"] {
+        provider.require_contexts(branch, &["build-test"]);
+    }
     let status = status(pulls, Some(PrNumber(1)), &clean);
     assert_eq!(
         status.analysis.fleet.caravans[0].members,
@@ -3299,6 +3477,17 @@ fn green_rerun_unparks_without_changing_multi_member_topology() {
     let result = reconcile_terminal_red_parking(&context, &status, &provider).unwrap();
     assert!(result.changed);
     assert_eq!(result.events[0].kind, EventKind::CaravanUnparked);
+    assert_eq!(
+        result.events[0].metadata["verdicts"][0]["classification"],
+        "green"
+    );
+    assert!(
+        result.events[0].metadata["required_runs"]
+            .as_array()
+            .is_some_and(
+                |runs| runs.len() == 3 && runs.iter().all(|run| run["status"] == "satisfied")
+            )
+    );
     let observed = provider.pulls.borrow();
     assert!(!observed[&PrNumber(1)].has_label("caravan-parked"));
     assert_eq!(observed[&PrNumber(1)].base.name, "main");
