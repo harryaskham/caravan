@@ -3413,9 +3413,8 @@ fn automatic_unpark_refuses_check_drift_before_label_write() {
     let mut context = AppContext::default();
     context.config.sync.terminal_red.action = crate::config::TerminalRedAction::Park;
 
-    let error = match reconcile_terminal_red_parking(&context, &status, &provider) {
-        Ok(_) => panic!("check drift must invalidate unpark authority"),
-        Err(error) => error,
+    let Err(error) = reconcile_terminal_red_parking(&context, &status, &provider) else {
+        panic!("check drift must invalidate unpark authority");
     };
     assert_eq!(error.code(), "terminal_red_parking_failed");
     assert!(provider.calls.borrow().is_empty());
