@@ -224,6 +224,10 @@ pub struct MembershipOutput {
     /// including exact provider-mutation and idempotency evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admission_intent: Option<crate::admission::AdmissionIntentDecision>,
+    /// Exact provider-or-Git authority used by immutable native join preflight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_compatibility_authorization:
+        Option<crate::read::AdmissionCompatibilityAuthorization>,
     /// Canonical events emitted after the complete membership operation.
     #[serde(default)]
     pub events: Vec<CaravanEvent>,
@@ -2315,6 +2319,7 @@ fn execute_with_rebase_guard(
     let caravan_id = target
         .as_ref()
         .map_or(pull_request.number, |target| target.caravan.id);
+    let admission_compatibility_authorization = eligibility.admission_compatibility_authorization;
     let mut admission_intent = eligibility.admission_intent;
     if let Some(decision) = admission_intent.as_mut() {
         decision.record_execution(receipt.changed);
@@ -2344,6 +2349,7 @@ fn execute_with_rebase_guard(
         caravan_id,
         coexisting_caravans,
         admission_intent,
+        admission_compatibility_authorization,
         events: Vec::new(),
         hook_deliveries: Vec::new(),
     })

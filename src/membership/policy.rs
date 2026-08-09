@@ -243,6 +243,7 @@ pub(super) fn preflight_eligibility(
                 .iter()
                 .find(|identity| identity.pr == candidate.number)
                 .cloned(),
+            admission_compatibility_authorization: None,
             enrolled: true,
             canonical_candidate: status.admission.next_candidate == Some(candidate.number),
             admission_note: None,

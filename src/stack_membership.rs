@@ -523,6 +523,7 @@ mod tests {
             caravan_id,
             coexisting_caravans: Vec::new(),
             admission_intent: None,
+            admission_compatibility_authorization: None,
             events: Vec::new(),
             hook_deliveries: Vec::new(),
         }

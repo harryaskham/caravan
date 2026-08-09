@@ -2398,6 +2398,7 @@ fn membership_output_serializes_app_api_and_git_transport_identity_without_secre
         caravan_id: PrNumber(15),
         coexisting_caravans: Vec::new(),
         admission_intent: None,
+        admission_compatibility_authorization: None,
         events: Vec::new(),
         hook_deliveries: Vec::new(),
     };

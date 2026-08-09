@@ -3538,6 +3538,47 @@ fn render_admission_intent(intent: &caravan::admission::AdmissionIntentDecision)
     text
 }
 
+fn render_merge_candidate(identity: &caravan::model::MergeCandidateIdentity) -> String {
+    format!(
+        "  provider identity: {:?} base={}@{} head={}@{} stale_base={} stale_head={}\n",
+        identity.freshness,
+        identity.base.name,
+        identity.base.oid,
+        identity.head.name,
+        identity.head.oid,
+        identity.stale_base,
+        identity.stale_head,
+    )
+}
+
+fn render_admission_compatibility_authorization(
+    authorization: &caravan::read::AdmissionCompatibilityAuthorization,
+) -> String {
+    match authorization {
+        caravan::read::AdmissionCompatibilityAuthorization::ProviderIdentity { identity } => {
+            format!(
+                "  admission compatibility authority: provider_identity synthetic={} observed={}\n",
+                identity
+                    .synthetic
+                    .as_ref()
+                    .map_or("missing", |synthetic| synthetic.oid.0.as_str()),
+                identity.observed_at,
+            )
+        }
+        caravan::read::AdmissionCompatibilityAuthorization::ExactGitProof {
+            stale_identity,
+            compatibility,
+        } => format!(
+            "  admission compatibility authority: exact_git_proof stale_synthetic={} proof={}\n",
+            stale_identity
+                .synthetic
+                .as_ref()
+                .map_or("missing", |synthetic| synthetic.oid.0.as_str()),
+            compatibility.diagnostic.as_deref().unwrap_or("missing"),
+        ),
+    }
+}
+
 fn render_check(output: &caravan::read::CheckOutput) -> String {
     let eligibility = if output.eligible {
         success("eligible")
@@ -3586,17 +3627,10 @@ fn render_check(output: &caravan::read::CheckOutput) -> String {
         output.canonical_candidate,
     );
     if let Some(identity) = &output.merge_candidate {
-        let _ = writeln!(
-            text,
-            "  provider identity: {:?} base={}@{} head={}@{} stale_base={} stale_head={}",
-            identity.freshness,
-            identity.base.name,
-            identity.base.oid,
-            identity.head.name,
-            identity.head.oid,
-            identity.stale_base,
-            identity.stale_head,
-        );
+        text.push_str(&render_merge_candidate(identity));
+    }
+    if let Some(authorization) = &output.admission_compatibility_authorization {
+        text.push_str(&render_admission_compatibility_authorization(authorization));
     }
     if let Some(intent) = &output.admission_intent {
         text.push_str(&render_admission_intent(intent));
