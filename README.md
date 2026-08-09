@@ -687,10 +687,19 @@ is never extended: admission uses another compatible caravan or opens a new one,
 while sync never waits for occupancy. Native sync lands a fully ready batch; a
 partial ready prefix first requires typed suffix reshape so GitHub cannot rewrite
 an unselected source head. A one-member caravan is valid but has no representable
-GitHub Stack object: after complete inventory proves zero mappings, sync routes
-that exact singleton through Cara's ordinary root validation/merge path. One
-exact mapping remains lock-fenced native; multiple mappings, or zero mappings
-for 2+ members, fail closed. Native mode is enabled per repository only with a
+GitHub Stack object created by Cara. Native-mode sync nevertheless performs a
+fresh complete inventory read and rebinds every provider Stack intersecting any
+candidate member to its exact current ordered PR/base/head/state generation
+**before** root-first landing, promotion, auto-merge disarm, force handling, or
+ordinary merge. Only an authoritative singleton with proven zero intersections
+uses Cara's ordinary root validation/merge path. One exact singleton or
+multi-entry intersection uses the lock-fenced asynchronous Stack backend;
+partial, cross-mapped, stale, truncated, unreadable, or multiple intersections
+fail as non-retryable external decisions without a landing write. If a Stack
+races into existence after the absence proof and GitHub refuses the ordinary
+merge, Cara returns `github_stack_membership_detected_during_owned_merge`
+instead of retrying the same synchronous call. Zero intersections for 2+
+members still fail closed. Native mode is enabled per repository only with a
 reviewed allowlist:
 
 ```yaml

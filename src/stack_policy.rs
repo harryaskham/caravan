@@ -192,8 +192,9 @@ fn synthetic_candidate_blocker(
 pub enum StackLandingRoute {
     /// The stable default: Cara owns the landing exactly as before.
     CaravanOwned,
-    /// A one-member native caravan has no representable provider Stack. Cara
-    /// validates and lands its exact root through the ordinary owned path.
+    /// Cara-created one-member topology has no representable provider Stack.
+    /// This route is valid only after a complete fresh inventory proves that no
+    /// provider Stack intersects the authoritative singleton.
     SingletonCaravanOwned,
     /// One exact provider Stack, reached only through the lock-fenced
     /// transaction in `github::stack_land`.
@@ -206,14 +207,18 @@ pub enum StackLandingRoute {
 /// rollout opt-in, or provider Stack state, so a repository that never selected
 /// `stack_type: github` is unaffected by any of this logic.
 ///
-/// This never opens the workflow fence. `initialization::require_ready` still
-/// refuses native mutation ahead of any caller reaching this decision; routing
-/// exists so the remaining rollout step is exactly one reviewed change rather
-/// than new untested wiring.
+/// The supplied intersections must come from the fresh complete provider read;
+/// discovery-time `caravan_id` projection is deliberately ignored. This never
+/// opens the workflow fence. `initialization::require_ready` still refuses
+/// native mutation ahead of any caller reaching this decision; routing exists
+/// so the remaining rollout step is exactly one reviewed change rather than new
+/// untested wiring.
 pub fn route_landing(
     config: &crate::config::CaravanConfig,
     backend: &crate::read::StackBackendStatus,
     caravan: &Caravan,
+    intersections: &[GitHubStackGeneration],
+    pull_requests: &BTreeMap<PrNumber, PullRequestSnapshot>,
 ) -> Result<StackLandingRoute, crate::AppError> {
     if config.stack_type != crate::config::StackType::Github {
         return Ok(StackLandingRoute::CaravanOwned);
@@ -226,7 +231,7 @@ pub fn route_landing(
                 backend.capability.code()
             ),
             "an unproven capability is never absence; resolve it or set stack_type: caravan",
-            true,
+            false,
         ));
     }
     if !config.stack_rollout.mutations_opt_in {
@@ -242,36 +247,64 @@ pub fn route_landing(
             "github_stack_inventory_truncated",
             "a truncated Stack inventory cannot prove which Stack owns this caravan".to_owned(),
             "re-read status once the provider returns a complete inventory page",
-            true,
+            false,
         ));
     }
 
-    let matching = backend
-        .native_stacks
-        .iter()
-        .filter(|native| native.caravan_id == Some(caravan.id))
-        .collect::<Vec<_>>();
-    if caravan.members.len() == 1 && matching.is_empty() {
+    if caravan.members.len() == 1 && intersections.is_empty() {
         return Ok(StackLandingRoute::SingletonCaravanOwned);
     }
-    let [native] = matching.as_slice() else {
-        return Err(mapping_refusal(caravan, matching.len()));
+    let [generation] = intersections else {
+        return Err(mapping_refusal(caravan, intersections));
     };
-    if native.consistency != crate::read::StackConsistency::Exact {
-        return Err(route_refusal(
-            "github_stack_generation_drifted",
-            format!(
-                "caravan #{} Stack #{} is `{}`, not exact",
-                caravan.id,
-                native.stack.number,
-                native.consistency.code()
-            ),
-            "reconcile the drifted Stack generation before landing",
-            true,
+
+    let actual_members = generation
+        .topology
+        .entries
+        .iter()
+        .map(|entry| entry.pr)
+        .collect::<Vec<_>>();
+    let mut changed_fields = Vec::new();
+    if actual_members != caravan.members {
+        changed_fields.push("ordered_members".to_owned());
+    }
+    if !generation.open {
+        changed_fields.push("stack_open".to_owned());
+    }
+    for entry in &generation.topology.entries {
+        let Some(current) = pull_requests.get(&entry.pr) else {
+            changed_fields.push(format!("pr_{}_missing", entry.pr.0));
+            continue;
+        };
+        if entry.pull_request_state != current.state {
+            changed_fields.push(format!("pr_{}_state", entry.pr.0));
+        }
+        if entry.draft != current.draft {
+            changed_fields.push(format!("pr_{}_draft", entry.pr.0));
+        }
+        if entry.merged_at != current.merged_at {
+            changed_fields.push(format!("pr_{}_merged_at", entry.pr.0));
+        }
+        if entry.base != current.base {
+            changed_fields.push(format!("pr_{}_base", entry.pr.0));
+        }
+        if entry.head != current.head {
+            changed_fields.push(format!("pr_{}_head", entry.pr.0));
+        }
+    }
+    changed_fields.sort();
+    changed_fields.dedup();
+    if !changed_fields.is_empty() {
+        return Err(generation_refusal(
+            caravan,
+            generation,
+            &actual_members,
+            &changed_fields,
         ));
     }
+
     Ok(StackLandingRoute::NativeStack {
-        stack_number: native.stack.number,
+        stack_number: generation.number,
     })
 }
 
@@ -288,23 +321,57 @@ fn route_refusal(code: &str, message: String, next: &str, retryable: bool) -> cr
     )
 }
 
-fn mapping_refusal(caravan: &Caravan, mapping_count: usize) -> crate::AppError {
+fn mapping_refusal(caravan: &Caravan, intersections: &[GitHubStackGeneration]) -> crate::AppError {
+    let stack_numbers = intersections
+        .iter()
+        .map(|generation| generation.number)
+        .collect::<Vec<_>>();
     crate::AppError::structured(
         mcp_cli::ErrorCategory::Validation,
         "github_stack_caravan_mapping_ambiguous",
         format!(
-            "{}-member caravan #{} maps to {mapping_count} provider Stacks; exactly one is required",
+            "{}-member caravan #{} intersects {} provider Stacks; exactly one exact generation is required",
             caravan.members.len(),
             caravan.id,
+            intersections.len(),
         ),
         Some(serde_json::json!({
             "caravan_id": caravan.id,
             "members": caravan.members,
             "member_count": caravan.members.len(),
-            "mapping_count": mapping_count,
+            "mapping_count": intersections.len(),
+            "stack_numbers": stack_numbers,
             "mutated": false,
             "retryable": false,
-            "safe_next_action": "resolve the provider/Caravan mapping before landing; only an authoritative singleton with zero mappings may use the reviewed singleton route",
+            "safe_next_action": "resolve every provider Stack intersection before landing; only an authoritative singleton with zero intersections may use the reviewed singleton route",
+        })),
+    )
+}
+
+fn generation_refusal(
+    caravan: &Caravan,
+    generation: &GitHubStackGeneration,
+    actual_members: &[PrNumber],
+    changed_fields: &[String],
+) -> crate::AppError {
+    crate::AppError::structured(
+        mcp_cli::ErrorCategory::Validation,
+        "github_stack_generation_drifted",
+        format!(
+            "caravan #{} intersects Stack #{} but its exact current generation differs",
+            caravan.id, generation.number,
+        ),
+        Some(serde_json::json!({
+            "caravan_id": caravan.id,
+            "expected_members": caravan.members,
+            "actual_members": actual_members,
+            "stack_number": generation.number,
+            "stack_id": generation.id,
+            "changed_fields": changed_fields,
+            "generation": generation,
+            "mutated": false,
+            "retryable": false,
+            "safe_next_action": "inspect and explicitly reconcile the intersecting provider Stack generation; an unchanged sync must not fall back to ordinary PR merge",
         })),
     )
 }
@@ -316,6 +383,7 @@ mod tests {
     use crate::model::{
         AutoMergeState, BranchSnapshot, CommitOid, RepositoryId, SyntheticMergeCandidate,
     };
+    use mcp_cli::StructuredError;
 
     fn repository() -> RepositoryId {
         RepositoryId {
@@ -625,39 +693,14 @@ mod tests {
         );
     }
 
-    fn backend(
-        capability: crate::read::StackCapability,
-        natives: Vec<crate::read::NativeStackStatus>,
-    ) -> crate::read::StackBackendStatus {
+    fn backend(capability: crate::read::StackCapability) -> crate::read::StackBackendStatus {
         crate::read::StackBackendStatus {
             configured: crate::config::StackType::Github,
             capability,
             mutation_support: crate::read::StackMutationSupport::ReadOnlyPreview,
-            native_stacks: natives,
+            native_stacks: Vec::new(),
             provider_stacks_truncated: false,
             missing_caravans: Vec::new(),
-            problems: Vec::new(),
-        }
-    }
-
-    fn native(
-        caravan_id: Option<PrNumber>,
-        consistency: crate::read::StackConsistency,
-    ) -> crate::read::NativeStackStatus {
-        crate::read::NativeStackStatus {
-            stack: crate::github::GitHubStackSnapshot {
-                id: 1,
-                number: 42,
-                node_id: "S_route".to_owned(),
-                base: crate::github::GitHubStackBase {
-                    ref_name: "main".to_owned(),
-                },
-                open: true,
-                created_at: "2026-08-01T09:00:00Z".to_owned(),
-                pull_requests: Vec::new(),
-            },
-            caravan_id,
-            consistency,
             problems: Vec::new(),
         }
     }
@@ -674,98 +717,88 @@ mod tests {
         Caravan::new(members.iter().copied().map(PrNumber).collect()).expect("non-empty caravan")
     }
 
+    fn singleton_stack() -> GitHubStackGeneration {
+        let mut generation = stack();
+        generation.topology.entries.truncate(1);
+        generation
+    }
+
     #[test]
     fn the_default_backend_routes_to_caravan_without_consulting_any_gate() {
-        // Deliberately hostile native state: the default path must ignore it.
-        let hostile = backend(
-            crate::read::StackCapability::Unavailable,
-            vec![native(
-                Some(PrNumber(101)),
-                crate::read::StackConsistency::Drifted,
-            )],
-        );
+        let hostile = backend(crate::read::StackCapability::Unavailable);
         let route = route_landing(
             &crate::config::CaravanConfig::default(),
             &hostile,
             &caravan(&[101, 102]),
+            &[stack()],
+            &BTreeMap::new(),
         )
         .expect("the stable default never fails on native state");
         assert_eq!(route, StackLandingRoute::CaravanOwned);
     }
 
     #[test]
-    fn an_exact_opted_in_available_stack_routes_natively() {
-        let route = route_landing(
-            &github_config(),
-            &backend(
-                crate::read::StackCapability::Available,
-                vec![native(
-                    Some(PrNumber(101)),
-                    crate::read::StackConsistency::Exact,
-                )],
-            ),
-            &caravan(&[101, 102]),
-        )
-        .expect("an exact opted-in Stack routes natively");
-        assert_eq!(route, StackLandingRoute::NativeStack { stack_number: 42 });
+    fn exact_multi_entry_and_singleton_stacks_route_natively() {
+        for generation in [stack(), singleton_stack()] {
+            let members = generation
+                .topology
+                .entries
+                .iter()
+                .map(|entry| entry.pr.0)
+                .collect::<Vec<_>>();
+            let pulls = pull_requests(&generation);
+            let route = route_landing(
+                &github_config(),
+                &backend(crate::read::StackCapability::Available),
+                &caravan(&members),
+                std::slice::from_ref(&generation),
+                &pulls,
+            )
+            .expect("an exact intersecting Stack always uses the native backend");
+            assert_eq!(route, StackLandingRoute::NativeStack { stack_number: 42 });
+        }
     }
 
     #[test]
     fn authoritative_singleton_without_provider_stack_uses_owned_route() {
         let route = route_landing(
             &github_config(),
-            &backend(crate::read::StackCapability::Available, Vec::new()),
+            &backend(crate::read::StackCapability::Available),
             &caravan(&[101]),
+            &[],
+            &BTreeMap::new(),
         )
-        .expect("provider cannot represent a one-member Stack");
-
+        .expect("provider cannot represent a one-member Stack created by Cara");
         assert_eq!(route, StackLandingRoute::SingletonCaravanOwned);
     }
 
     #[test]
-    fn singleton_with_one_exact_stack_keeps_lock_fenced_native_route() {
-        let route = route_landing(
-            &github_config(),
-            &backend(
-                crate::read::StackCapability::Available,
-                vec![native(
-                    Some(PrNumber(101)),
-                    crate::read::StackConsistency::Exact,
-                )],
-            ),
-            &caravan(&[101]),
-        )
-        .expect("one exact mapping remains native");
-
-        assert_eq!(route, StackLandingRoute::NativeStack { stack_number: 42 });
-    }
-
-    #[test]
     fn singleton_multiple_and_multi_member_absence_fail_closed_consistently() {
-        for (caravan, natives, mappings) in [
+        let first = singleton_stack();
+        let mut second = first.clone();
+        second.id = 2;
+        second.number = 43;
+        second.node_id = "S_second".to_owned();
+        for (candidate, intersections, pulls, mappings) in [
             (
                 caravan(&[101]),
-                vec![
-                    native(Some(PrNumber(101)), crate::read::StackConsistency::Exact),
-                    native(Some(PrNumber(101)), crate::read::StackConsistency::Exact),
-                ],
+                vec![first.clone(), second],
+                pull_requests(&first),
                 2,
             ),
-            (caravan(&[101, 102]), Vec::new(), 0),
+            (caravan(&[101, 102]), Vec::new(), BTreeMap::new(), 0),
         ] {
             let error = route_landing(
                 &github_config(),
-                &backend(crate::read::StackCapability::Available, natives),
-                &caravan,
+                &backend(crate::read::StackCapability::Available),
+                &candidate,
+                &intersections,
+                &pulls,
             )
-            .expect_err("only singleton+zero is a valid absent mapping");
-            assert_eq!(
-                mcp_cli::StructuredError::code(&error),
-                "github_stack_caravan_mapping_ambiguous"
-            );
-            let details =
-                mcp_cli::StructuredError::details(&error).expect("typed mapping evidence");
-            assert_eq!(details["member_count"], caravan.members.len());
+            .expect_err("only singleton plus exact absence may use ordinary merge");
+            assert_eq!(error.code(), "github_stack_caravan_mapping_ambiguous");
+            let details = error.details().expect("typed mapping evidence");
+            assert_eq!(details["member_count"], candidate.members.len());
             assert_eq!(details["mapping_count"], mappings);
             assert_eq!(details["mutated"], false);
             assert_eq!(details["retryable"], false);
@@ -773,12 +806,9 @@ mod tests {
     }
 
     #[test]
-    fn every_native_gate_fails_closed_with_its_exact_code() {
-        let exact = vec![native(
-            Some(PrNumber(101)),
-            crate::read::StackConsistency::Exact,
-        )];
-
+    fn capability_opt_in_and_inventory_gates_fail_closed() {
+        let generation = stack();
+        let pulls = pull_requests(&generation);
         for capability in [
             crate::read::StackCapability::Unavailable,
             crate::read::StackCapability::Unknown,
@@ -786,75 +816,85 @@ mod tests {
         ] {
             let error = route_landing(
                 &github_config(),
-                &backend(capability, exact.clone()),
+                &backend(capability),
                 &caravan(&[101, 102]),
+                std::slice::from_ref(&generation),
+                &pulls,
             )
             .expect_err("an unproven capability can never route natively");
-            assert_eq!(
-                mcp_cli::StructuredError::code(&error),
-                "github_stack_capability_not_proven"
-            );
+            assert_eq!(error.code(), "github_stack_capability_not_proven");
+            assert_eq!(error.details().unwrap()["retryable"], false);
         }
 
         let mut unlisted = github_config();
         unlisted.stack_rollout = crate::config::StackRolloutConfig::default();
         let error = route_landing(
             &unlisted,
-            &backend(crate::read::StackCapability::Available, exact.clone()),
+            &backend(crate::read::StackCapability::Available),
             &caravan(&[101, 102]),
+            std::slice::from_ref(&generation),
+            &pulls,
         )
-        .expect_err("a repository without an opt-in can never route natively");
-        assert_eq!(
-            mcp_cli::StructuredError::code(&error),
-            "github_stack_repository_not_opted_in"
-        );
+        .expect_err("a repository without reviewed opt-in can never route natively");
+        assert_eq!(error.code(), "github_stack_repository_not_opted_in");
 
-        let mut truncated = backend(crate::read::StackCapability::Available, exact.clone());
+        let mut truncated = backend(crate::read::StackCapability::Available);
         truncated.provider_stacks_truncated = true;
-        let error = route_landing(&github_config(), &truncated, &caravan(&[101, 102]))
-            .expect_err("a truncated inventory proves nothing about ownership");
-        assert_eq!(
-            mcp_cli::StructuredError::code(&error),
-            "github_stack_inventory_truncated"
-        );
+        let error = route_landing(
+            &github_config(),
+            &truncated,
+            &caravan(&[101, 102]),
+            std::slice::from_ref(&generation),
+            &pulls,
+        )
+        .expect_err("a truncated inventory proves nothing about ownership");
+        assert_eq!(error.code(), "github_stack_inventory_truncated");
+        assert_eq!(error.details().unwrap()["retryable"], false);
+    }
 
-        for natives in [
-            Vec::new(),
-            vec![
-                native(Some(PrNumber(101)), crate::read::StackConsistency::Exact),
-                native(Some(PrNumber(101)), crate::read::StackConsistency::Exact),
-            ],
-        ] {
+    #[test]
+    fn stale_membership_head_base_and_state_never_fall_back_to_owned_merge() {
+        let exact = stack();
+        let candidate = caravan(&[101, 102]);
+        let mut cases = Vec::new();
+
+        let mut cross = exact.clone();
+        cross.topology.entries[1].pr = PrNumber(999);
+        cases.push((cross, pull_requests(&exact), "ordered_members"));
+
+        let mut moved_head = pull_requests(&exact);
+        moved_head.get_mut(&PrNumber(102)).unwrap().head.oid = CommitOid("moved".to_owned());
+        cases.push((exact.clone(), moved_head, "pr_102_head"));
+
+        let mut moved_base = pull_requests(&exact);
+        moved_base.get_mut(&PrNumber(102)).unwrap().base.oid = CommitOid("moved".to_owned());
+        cases.push((exact.clone(), moved_base, "pr_102_base"));
+
+        let mut closed = exact.clone();
+        closed.open = false;
+        cases.push((closed, pull_requests(&exact), "stack_open"));
+
+        for (generation, pulls, changed) in cases {
             let error = route_landing(
                 &github_config(),
-                &backend(crate::read::StackCapability::Available, natives),
-                &caravan(&[101, 102]),
+                &backend(crate::read::StackCapability::Available),
+                &candidate,
+                &[generation],
+                &pulls,
             )
-            .expect_err("ambiguous or absent mapping is never resolved by choosing one");
-            assert_eq!(
-                mcp_cli::StructuredError::code(&error),
-                "github_stack_caravan_mapping_ambiguous"
+            .expect_err("drifted intersection must never choose ordinary PR merge");
+            assert_eq!(error.code(), "github_stack_generation_drifted");
+            let details = error.details().unwrap();
+            assert!(
+                details["changed_fields"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|field| field == changed),
+                "missing changed field {changed}: {details}"
             );
-        }
-
-        for consistency in [
-            crate::read::StackConsistency::Drifted,
-            crate::read::StackConsistency::Orphaned,
-            crate::read::StackConsistency::Unknown,
-        ] {
-            let error = route_landing(
-                &github_config(),
-                &backend(
-                    crate::read::StackCapability::Available,
-                    vec![native(Some(PrNumber(101)), consistency)],
-                ),
-                &caravan(&[101, 102]),
-            )
-            .expect_err("a non-exact generation can never land");
-            assert_eq!(
-                mcp_cli::StructuredError::code(&error),
-                "github_stack_generation_drifted"
-            );
+            assert_eq!(details["mutated"], false);
+            assert_eq!(details["retryable"], false);
         }
     }
 }

@@ -485,6 +485,11 @@ pub(super) fn scheduler_failure_status(error: &AppError) -> SyncFailureScheduler
                 | "rebase_worker_panicked"
                 | "github_stack_partial_prefix_requires_tail_eviction"
                 | "github_stack_caravan_mapping_ambiguous"
+                | "github_stack_capability_not_proven"
+                | "github_stack_inventory_truncated"
+                | "github_stack_generation_drifted"
+                | "github_stack_routing_read_refused"
+                | "github_stack_membership_detected_during_owned_merge"
         ) =>
         {
             (

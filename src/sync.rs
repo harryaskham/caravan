@@ -890,6 +890,26 @@ pub struct SyncOutput {
 
 /// Provider facts and primitives required by sync policy.
 pub trait SyncProvider {
+    /// Every complete, fresh provider Stack generation intersecting the
+    /// candidate caravan. Default refuses so a provider double cannot turn an
+    /// unimplemented inventory read into false absence and ordinary PR merge.
+    fn native_stack_intersections_for_sync(
+        &self,
+        _repository: &RepositoryId,
+        _members: &[PrNumber],
+    ) -> Result<Vec<crate::github::GitHubStackGeneration>, AppError> {
+        Err(AppError::structured(
+            ErrorCategory::Validation,
+            "github_stack_routing_read_refused",
+            "this sync provider does not implement exact native Stack intersection reads",
+            Some(json!({
+                "mutated": false,
+                "retryable": false,
+                "safe_next_action": "use a provider with complete native Stack inventory support or set stack_type: caravan through review",
+            })),
+        ))
+    }
+
     /// Exact native Stack generation. Default refuses so test/provider doubles
     /// and the stable Caravan path gain no accidental native authority.
     fn native_stack_generation_for_sync(
@@ -1139,7 +1159,30 @@ fn native_sync_error(error: impl std::fmt::Display) -> AppError {
     )
 }
 
+fn native_routing_error(error: &crate::github::GitHubStackMutationError) -> AppError {
+    AppError::structured(
+        ErrorCategory::Validation,
+        "github_stack_routing_read_refused",
+        format!("exact native Stack routing preflight failed: {error}"),
+        Some(json!({
+            "source": format!("{error:?}"),
+            "mutated": false,
+            "retryable": false,
+            "safe_next_action": "inspect provider Stack capability and the complete intersecting inventory; rerun only after the provider evidence or repository policy changes",
+        })),
+    )
+}
+
 impl<R: crate::command::CommandRunner> SyncProvider for GitHubMutationAdapter<R> {
+    fn native_stack_intersections_for_sync(
+        &self,
+        repository: &RepositoryId,
+        members: &[PrNumber],
+    ) -> Result<Vec<crate::github::GitHubStackGeneration>, AppError> {
+        self.native_stack_intersections(repository, members)
+            .map_err(|error| native_routing_error(&error))
+    }
+
     fn native_stack_generation_for_sync(
         &self,
         repository: &RepositoryId,
@@ -3428,40 +3471,43 @@ fn sync_with_lock(
         );
     }
 
-    // Root landing is the first active-fleet provider convergence action. A
-    // large unrelated inventory may consume later planning/analysis, but cannot
-    // make an already-admitted exact-green root miss the parent scheduler window.
-    let root_first_started = Instant::now();
-    progress::emit(
-        "root_first",
-        "evaluating one exact green Cara-owned root before fleet planning",
-    );
-    if let Some(progress) = execute_root_first(
-        &status,
-        &provider,
-        input.all,
-        context.config.sync.max_mutations_per_tick,
-        RequiredRunsPolicy::from_config(&context.config.sync),
-    )? {
+    // Root landing is the first active-fleet provider convergence action for
+    // the Caravan-owned backend. Native mode must first perform the complete
+    // fresh Stack-intersection read in `reconcile_caravan`; otherwise this fast
+    // path could bypass routing and issue synchronous `gh pr merge`.
+    if context.config.stack_type != crate::config::StackType::Github {
+        let root_first_started = Instant::now();
         progress::emit(
             "root_first",
-            format!(
-                "landed {} root(s); deferring unrelated analysis to the next tick",
-                progress.root_merge.len()
-            ),
+            "evaluating one exact green Cara-owned root before fleet planning",
         );
-        return root_first_output(
-            context,
-            input,
-            started,
-            operation_deadline,
-            initial_status_elapsed,
-            root_first_started.elapsed(),
-            progress,
-            status,
-            lock_recovery,
-            &mut lock,
-        );
+        if let Some(progress) = execute_root_first(
+            &status,
+            &provider,
+            input.all,
+            context.config.sync.max_mutations_per_tick,
+            RequiredRunsPolicy::from_config(&context.config.sync),
+        )? {
+            progress::emit(
+                "root_first",
+                format!(
+                    "landed {} root(s); deferring unrelated analysis to the next tick",
+                    progress.root_merge.len()
+                ),
+            );
+            return root_first_output(
+                context,
+                input,
+                started,
+                operation_deadline,
+                initial_status_elapsed,
+                root_first_started.elapsed(),
+                progress,
+                status,
+                lock_recovery,
+                &mut lock,
+            );
+        }
     }
 
     let parking = reconcile_terminal_red_parking(context, &status, &provider)?;
@@ -5239,6 +5285,21 @@ fn execute_bounded_with_native(
     Ok(progress)
 }
 
+fn native_route_context(error: &AppError, status: &StatusOutput, caravan: &Caravan) -> AppError {
+    let mut details = error.details().unwrap_or_else(|| json!({}));
+    if let Some(object) = details.as_object_mut() {
+        object.insert("repository".to_owned(), json!(status.repository));
+        object.insert("caravan_id".to_owned(), json!(caravan.id));
+        object.insert("affected_prs".to_owned(), json!(caravan.members));
+    }
+    AppError::structured(
+        error.category(),
+        error.code(),
+        error.message(),
+        Some(details),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn reconcile_caravan(
     status: &StatusOutput,
@@ -5251,6 +5312,31 @@ fn reconcile_caravan(
 ) -> Result<(), AppError> {
     let head = caravan.head().expect("caravans are non-empty");
     let predecessor = merged_predecessor(status, caravan).map(|snapshot| snapshot.number);
+
+    // Native routing is a fresh provider-intersection precondition, not a
+    // discovery-time projection. It runs before promotion, auto-merge disarm,
+    // force handling, or any landing write, so an intersecting provider Stack
+    // can never fall through to synchronous `gh pr merge`.
+    let landing_route = if let Some(native) = progress.native_stack.as_ref() {
+        let intersections = provider
+            .native_stack_intersections_for_sync(&status.repository, &caravan.members)
+            .map_err(|error| native_route_context(&error, status, caravan))?;
+        crate::stack_policy::route_landing(
+            &native.config,
+            &status.stack_backend,
+            caravan,
+            &intersections,
+            &status.analysis.pull_requests,
+        )
+        .map_err(|error| native_route_context(&error, status, caravan))?
+    } else {
+        crate::stack_policy::StackLandingRoute::CaravanOwned
+    };
+    let native_stack_number = match landing_route {
+        crate::stack_policy::StackLandingRoute::NativeStack { stack_number } => Some(stack_number),
+        crate::stack_policy::StackLandingRoute::CaravanOwned
+        | crate::stack_policy::StackLandingRoute::SingletonCaravanOwned => None,
+    };
 
     // Step 1 of the fenced transaction. Promotion always precedes any merge
     // mechanism: a root whose base is still an already-merged predecessor
@@ -5283,10 +5369,11 @@ fn reconcile_caravan(
     // one check generation. Once that PR is the root, skip every CI and
     // required-run read for the caravan and attempt the fresh mechanical/admin
     // force transaction immediately (bd-91e96a).
-    if progress
-        .current
-        .get(&head)
-        .is_some_and(|current| current.has_label("caravan-force"))
+    if native_stack_number.is_none()
+        && progress
+            .current
+            .get(&head)
+            .is_some_and(|current| current.has_label("caravan-force"))
     {
         return force_merge_head(
             status,
@@ -5325,20 +5412,12 @@ fn reconcile_caravan(
         }
     }
 
-    if let Some(native) = progress.native_stack.clone() {
-        match crate::stack_policy::route_landing(&native.config, &status.stack_backend, caravan)? {
-            crate::stack_policy::StackLandingRoute::CaravanOwned
-            | crate::stack_policy::StackLandingRoute::SingletonCaravanOwned => {}
-            crate::stack_policy::StackLandingRoute::NativeStack { stack_number } => {
-                return progress.drain_native_stack(
-                    provider,
-                    status,
-                    caravan,
-                    stack_number,
-                    &native,
-                );
-            }
-        }
+    if let Some(stack_number) = native_stack_number {
+        let native = progress
+            .native_stack
+            .clone()
+            .expect("native route requires native sync context");
+        return progress.drain_native_stack(provider, status, caravan, stack_number, &native);
     }
 
     if progress.head_merge_actor.github() {
@@ -8301,7 +8380,13 @@ impl SyncProgress {
         self.ensure_mutation_capacity(1)?;
         let receipt = provider
             .squash_merge(&repository, &self.precondition(number))
-            .map_err(|error| mutation_error(&error, self, Some(number)))?;
+            .map_err(|error| {
+                if provider_requires_native_stack_merge(&error) {
+                    stack_membership_detected_during_owned_merge(&error, self, caravan_id, number)
+                } else {
+                    mutation_error(&error, self, Some(number))
+                }
+            })?;
         self.record(
             receipt,
             "squash-merged the promoted caravan root into the exact default branch",
@@ -8944,6 +9029,39 @@ fn comment_mutation_error(
             "resumable": true,
             "dedupe": "deterministic GitHub-visible caravan-control-label-audit marker",
             "next": "rediscover and rerun `cara sync`",
+        })),
+    )
+}
+
+fn provider_requires_native_stack_merge(error: &MutationError) -> bool {
+    let diagnostic = error.to_string().to_ascii_lowercase();
+    diagnostic.contains("part of a stack")
+        || diagnostic.contains("use the stack api")
+        || diagnostic.contains("use stack api")
+}
+
+fn stack_membership_detected_during_owned_merge(
+    error: &MutationError,
+    progress: &SyncProgress,
+    caravan_id: PrNumber,
+    affected_pr: PrNumber,
+) -> AppError {
+    AppError::structured(
+        ErrorCategory::Validation,
+        "github_stack_membership_detected_during_owned_merge",
+        "GitHub refused ordinary PR merge because the exact PR became a native Stack member after routing preflight",
+        Some(json!({
+            "repository": progress.repository,
+            "caravan_id": caravan_id,
+            "affected_prs": [affected_pr],
+            "provider_error": format!("{error:?}"),
+            "operation_receipt": progress.operation_receipt(),
+            "provider_receipts": progress.provider_receipts,
+            "events": progress.events,
+            "merge_mutated": false,
+            "retryable": false,
+            "resumable": false,
+            "safe_next_action": "rediscover the complete provider Stack inventory and inspect the exact intersecting generation; do not retry unchanged synchronous PR merge",
         })),
     )
 }
