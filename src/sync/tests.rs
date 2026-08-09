@@ -62,6 +62,14 @@ struct FakeProvider {
     /// Optional exact native Stack generation for sync integration tests.
     native_stack: RefCell<Option<crate::github::GitHubStackGeneration>>,
     native_stack_reads: RefCell<u32>,
+    /// Optional explicit routing intersections. `None` derives intersections
+    /// from `native_stack`; `Some` can model multiple or exact absence.
+    native_stack_intersections: RefCell<Option<Vec<crate::github::GitHubStackGeneration>>>,
+    native_stack_intersection_reads: RefCell<u32>,
+    native_stack_routing_failure: RefCell<Option<String>>,
+    /// Ordinary squash requests GitHub refuses because a Stack appeared after
+    /// the exact routing read.
+    stack_merge_refusals: RefCell<u32>,
 }
 
 impl FakeProvider {
@@ -101,6 +109,10 @@ impl FakeProvider {
             rerequests: RefCell::new(Vec::new()),
             native_stack: RefCell::new(None),
             native_stack_reads: RefCell::new(0),
+            native_stack_intersections: RefCell::new(None),
+            native_stack_intersection_reads: RefCell::new(0),
+            native_stack_routing_failure: RefCell::new(None),
+            stack_merge_refusals: RefCell::new(0),
         }
     }
 
@@ -145,6 +157,14 @@ impl FakeProvider {
         self.failures.borrow_mut().push_back(kind);
     }
 
+    fn refuse_next_merge_as_stack_member(&self) {
+        *self.stack_merge_refusals.borrow_mut() += 1;
+    }
+
+    fn fail_native_stack_routing(&self, diagnostic: &str) {
+        *self.native_stack_routing_failure.borrow_mut() = Some(diagnostic.to_owned());
+    }
+
     /// Serve one stale provider generation before live facts are exposed.
     fn serve_stale_read(&self, number: PrNumber, stale: PullRequestSnapshot) {
         self.refetch_overrides
@@ -183,6 +203,17 @@ impl FakeProvider {
         change: impl FnOnce(&mut PullRequestSnapshot),
     ) -> Result<GitHubMutationReceipt, MutationError> {
         self.calls.borrow_mut().push(kind);
+        if kind == MutationKind::SquashMerge && *self.stack_merge_refusals.borrow() > 0 {
+            *self.stack_merge_refusals.borrow_mut() -= 1;
+            return Err(MutationError::Provider(
+                crate::github::DiscoveryError::CommandFailed {
+                    command: crate::command::CommandSpec::new("gh pr merge"),
+                    code: Some(1),
+                    stderr: "pull request is part of a Stack; use the Stack API to merge it"
+                        .to_owned(),
+                },
+            ));
+        }
         if self.failures.borrow().front() == Some(&kind) {
             self.failures.borrow_mut().pop_front();
             return Err(MutationError::Provider(
@@ -220,6 +251,41 @@ impl FakeProvider {
 }
 
 impl SyncProvider for FakeProvider {
+    fn native_stack_intersections_for_sync(
+        &self,
+        _repository: &RepositoryId,
+        members: &[PrNumber],
+    ) -> Result<Vec<crate::github::GitHubStackGeneration>, AppError> {
+        *self.native_stack_intersection_reads.borrow_mut() += 1;
+        if let Some(diagnostic) = self.native_stack_routing_failure.borrow().as_ref() {
+            return Err(AppError::structured(
+                ErrorCategory::Validation,
+                "github_stack_routing_read_refused",
+                diagnostic.clone(),
+                Some(json!({
+                    "mutated": false,
+                    "retryable": false,
+                })),
+            ));
+        }
+        if let Some(scripted) = self.native_stack_intersections.borrow().as_ref() {
+            return Ok(scripted.clone());
+        }
+        Ok(self
+            .native_stack
+            .borrow()
+            .iter()
+            .filter(|generation| {
+                generation
+                    .topology
+                    .entries
+                    .iter()
+                    .any(|entry| members.contains(&entry.pr))
+            })
+            .cloned()
+            .collect())
+    }
+
     fn native_stack_generation_for_sync(
         &self,
         _repository: &RepositoryId,
@@ -8967,6 +9033,82 @@ fn a_full_batch_opens_another_caravan_instead_of_waiting() {
     );
 }
 
+fn native_generation(
+    status: &StatusOutput,
+    stack_number: u64,
+    members: &[PrNumber],
+) -> crate::github::GitHubStackGeneration {
+    let entries = members
+        .iter()
+        .enumerate()
+        .map(|(position, number)| {
+            let pull_request = status
+                .analysis
+                .pull_requests
+                .get(number)
+                .expect("native generation member");
+            crate::github::GitHubStackEntryGeneration {
+                position: u32::try_from(position).unwrap(),
+                pr: *number,
+                stack_state: "open".to_owned(),
+                pull_request_state: pull_request.state,
+                draft: pull_request.draft,
+                merged_at: pull_request.merged_at.clone(),
+                base: pull_request.base.clone(),
+                head: pull_request.head.clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+    crate::github::GitHubStackGeneration {
+        id: stack_number,
+        number: stack_number,
+        node_id: format!("S_sync_{stack_number}"),
+        open: true,
+        created_at: "2026-08-09T06:00:00Z".to_owned(),
+        topology: crate::github::GitHubStackTopology {
+            base: entries.first().expect("non-empty generation").base.clone(),
+            entries,
+        },
+    }
+}
+
+fn github_native_fixture() -> (
+    tempfile::TempDir,
+    crate::config::CaravanConfig,
+    NativeSyncContext,
+) {
+    let directory = tempfile::tempdir().unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(directory.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut config = crate::config::CaravanConfig::default();
+    config.stack_type = crate::config::StackType::Github;
+    config.stack_rollout.mutations_opt_in = true;
+    config.stack_rollout.reviewed_by = "operator".to_owned();
+    let native = NativeSyncContext {
+        config: config.clone(),
+        repository_path: directory.path().to_path_buf(),
+    };
+    (directory, config, native)
+}
+
+fn enable_native_backend(status: &mut StatusOutput) {
+    status.stack_backend = crate::read::StackBackendStatus {
+        configured: crate::config::StackType::Github,
+        capability: crate::read::StackCapability::Available,
+        mutation_support: crate::read::StackMutationSupport::NativeStack,
+        native_stacks: Vec::new(),
+        provider_stacks_truncated: false,
+        missing_caravans: Vec::new(),
+        problems: Vec::new(),
+    };
+}
+
 /// bd-3eae33: the executable sync seam reads one exact mapped Stack and feeds
 /// it through Cara readiness. A non-ready bottom entry waits without acquiring
 /// a ruleset or writing a durable landing checkpoint.
@@ -9274,6 +9416,7 @@ fn native_singleton_tail_without_stack_lands_and_retries_idempotently() {
     assert_eq!(progress.root_merge.len(), 1);
     assert_eq!(progress.root_merge[0].pr, tail.number);
     assert!(progress.native_stack_land.is_empty());
+    assert_eq!(*provider.native_stack_intersection_reads.borrow(), 1);
     assert_eq!(*provider.native_stack_reads.borrow(), 0);
     assert!(
         !provider
@@ -9307,4 +9450,235 @@ fn native_singleton_tail_without_stack_lands_and_retries_idempotently() {
         provider.pulls.borrow()[&tail.number].head.oid,
         original_head
     );
+}
+
+/// bd-ef8e3b: one complete fresh intersection read chooses the lock-fenced
+/// native backend for both a provider-represented singleton and a normal
+/// multi-entry Stack. Neither shape may reach ordinary synchronous squash.
+#[test]
+fn exact_singleton_and_multi_entry_stacks_never_call_synchronous_merge() {
+    for member_count in [1_u64, 2] {
+        let mut pulls = vec![caravan_member(1, "head-1", "main")];
+        if member_count == 2 {
+            pulls.push(caravan_member(2, "head-2", "head-1"));
+        }
+        for pull_request in &mut pulls {
+            pull_request.checks = vec![check("build-test", CheckState::InProgress, None)];
+        }
+        let mut status = caravan_status(pulls.clone(), Some(PrNumber(1)), true);
+        enable_native_backend(&mut status);
+        let members = status.analysis.fleet.caravans[0].members.clone();
+        let generation = native_generation(&status, 42, &members);
+        let provider = FakeProvider::with_pull_requests(pulls);
+        *provider.native_stack.borrow_mut() = Some(generation);
+        let (_directory, config, native) = github_native_fixture();
+
+        let progress = execute_bounded_with_native(
+            &status,
+            &provider,
+            false,
+            false,
+            false,
+            64,
+            &BTreeMap::new(),
+            RequiredRunsPolicy::from_config(&config.sync),
+            Some(native),
+        )
+        .expect("a waiting exact Stack remains on the native route");
+
+        assert!(progress.root_merge.is_empty());
+        assert!(progress.native_stack_land.is_empty());
+        assert_eq!(*provider.native_stack_intersection_reads.borrow(), 1);
+        assert_eq!(*provider.native_stack_reads.borrow(), 1);
+        assert!(
+            !provider.calls.borrow().contains(&MutationKind::SquashMerge),
+            "{member_count}-member provider Stack reached synchronous merge"
+        );
+    }
+}
+
+/// Ambiguous, cross-mapped, and changed Stack generations are routing
+/// decisions. The first write remains unreachable and unchanged ticks are not
+/// classified as scheduler retries.
+#[test]
+fn ambiguous_cross_mapped_and_changed_intersections_are_zero_write_decisions() {
+    let pulls = vec![caravan_member(1, "head-1", "main")];
+    let mut status = caravan_status(pulls.clone(), Some(PrNumber(1)), true);
+    enable_native_backend(&mut status);
+    let exact = native_generation(&status, 42, &[PrNumber(1)]);
+    let (_directory, config, native) = github_native_fixture();
+
+    let mut second = exact.clone();
+    second.id = 43;
+    second.number = 43;
+    second.node_id = "S_sync_43".to_owned();
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    *provider.native_stack_intersections.borrow_mut() = Some(vec![exact.clone(), second]);
+    let error = execute_bounded_with_native(
+        &status,
+        &provider,
+        false,
+        false,
+        false,
+        64,
+        &BTreeMap::new(),
+        RequiredRunsPolicy::from_config(&config.sync),
+        Some(native.clone()),
+    )
+    .expect_err("multiple intersections must fail before mutation");
+    assert_eq!(error.code(), "github_stack_caravan_mapping_ambiguous");
+    assert!(provider.calls.borrow().is_empty());
+    assert_eq!(
+        scheduler_failure_status(&error).wake_class,
+        SchedulerWakeClass::ExternalDecision
+    );
+
+    let mut changed = exact.clone();
+    changed.topology.entries[0].head.oid = CommitOid("changed-head".to_owned());
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    *provider.native_stack.borrow_mut() = Some(changed);
+    let error = execute_bounded_with_native(
+        &status,
+        &provider,
+        false,
+        false,
+        false,
+        64,
+        &BTreeMap::new(),
+        RequiredRunsPolicy::from_config(&config.sync),
+        Some(native.clone()),
+    )
+    .expect_err("head drift must fail before mutation");
+    assert_eq!(error.code(), "github_stack_generation_drifted");
+    assert!(provider.calls.borrow().is_empty());
+
+    let mut cross = exact;
+    let root = cross.topology.entries[0].clone();
+    cross
+        .topology
+        .entries
+        .push(crate::github::GitHubStackEntryGeneration {
+            position: 1,
+            pr: PrNumber(99),
+            stack_state: "open".to_owned(),
+            pull_request_state: PullRequestState::Open,
+            draft: false,
+            merged_at: None,
+            base: root.head,
+            head: branch("foreign-head"),
+        });
+    let provider = FakeProvider::with_pull_requests(pulls);
+    *provider.native_stack.borrow_mut() = Some(cross);
+    let error = execute_bounded_with_native(
+        &status,
+        &provider,
+        false,
+        false,
+        false,
+        64,
+        &BTreeMap::new(),
+        RequiredRunsPolicy::from_config(&config.sync),
+        Some(native),
+    )
+    .expect_err("cross-mapped membership must fail before mutation");
+    assert_eq!(error.code(), "github_stack_generation_drifted");
+    assert!(provider.calls.borrow().is_empty());
+    assert_eq!(error.details().unwrap()["retryable"], false);
+}
+
+#[test]
+fn capability_and_inventory_read_uncertainty_are_external_zero_write_decisions() {
+    let pulls = vec![caravan_member(1, "head-1", "main")];
+    let mut status = caravan_status(pulls.clone(), Some(PrNumber(1)), true);
+    enable_native_backend(&mut status);
+    let generation = native_generation(&status, 42, &[PrNumber(1)]);
+    let (_directory, config, native) = github_native_fixture();
+
+    status.stack_backend.capability = crate::read::StackCapability::Unknown;
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    *provider.native_stack.borrow_mut() = Some(generation);
+    let error = execute_bounded_with_native(
+        &status,
+        &provider,
+        false,
+        false,
+        false,
+        64,
+        &BTreeMap::new(),
+        RequiredRunsPolicy::from_config(&config.sync),
+        Some(native.clone()),
+    )
+    .expect_err("unproven capability must never imply Stack absence");
+    assert_eq!(error.code(), "github_stack_capability_not_proven");
+    assert!(provider.calls.borrow().is_empty());
+    assert_eq!(
+        scheduler_failure_status(&error).wake_class,
+        SchedulerWakeClass::ExternalDecision
+    );
+
+    status.stack_backend.capability = crate::read::StackCapability::Available;
+    let provider = FakeProvider::with_pull_requests(pulls);
+    provider.fail_native_stack_routing("provider Stack inventory timed out");
+    let error = execute_bounded_with_native(
+        &status,
+        &provider,
+        false,
+        false,
+        false,
+        64,
+        &BTreeMap::new(),
+        RequiredRunsPolicy::from_config(&config.sync),
+        Some(native),
+    )
+    .expect_err("routing read uncertainty must never imply absence");
+    assert_eq!(error.code(), "github_stack_routing_read_refused");
+    assert!(provider.calls.borrow().is_empty());
+    let scheduler = scheduler_failure_status(&error);
+    assert_eq!(scheduler.wake_class, SchedulerWakeClass::ExternalDecision);
+    assert!(!scheduler.retryable);
+}
+
+/// A Stack can still race into existence after the complete preflight read.
+/// GitHub's typed refusal is proof that ordinary merge did not run; Cara must
+/// surface an external decision rather than repeat the same synchronous call.
+#[test]
+fn stack_membership_race_never_retries_synchronous_merge() {
+    let pulls = vec![caravan_member(1, "head-1", "main")];
+    let mut status = caravan_status(pulls.clone(), Some(PrNumber(1)), true);
+    enable_native_backend(&mut status);
+    let provider = FakeProvider::with_pull_requests(pulls);
+    provider.refuse_next_merge_as_stack_member();
+    let (_directory, config, native) = github_native_fixture();
+
+    let error = execute_bounded_with_native(
+        &status,
+        &provider,
+        false,
+        false,
+        false,
+        64,
+        &BTreeMap::new(),
+        RequiredRunsPolicy::from_config(&config.sync),
+        Some(native),
+    )
+    .expect_err("a provider Stack race must not become a retry tick");
+
+    assert_eq!(
+        error.code(),
+        "github_stack_membership_detected_during_owned_merge"
+    );
+    assert_eq!(*provider.native_stack_intersection_reads.borrow(), 1);
+    assert_eq!(
+        provider
+            .calls
+            .borrow()
+            .iter()
+            .filter(|kind| **kind == MutationKind::SquashMerge)
+            .count(),
+        1
+    );
+    let scheduler = scheduler_failure_status(&error);
+    assert_eq!(scheduler.wake_class, SchedulerWakeClass::ExternalDecision);
+    assert!(!scheduler.retryable);
+    assert_eq!(error.details().unwrap()["merge_mutated"], false);
 }

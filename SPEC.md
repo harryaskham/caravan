@@ -1258,14 +1258,29 @@ sealed `preflighted` → `unstacked` → `reshape_applied` → `rebuilding` →
 the exact per-PR base/head/control-label/auto-merge postcondition the existing
 Cara reshape must establish and creates replacement Stacks one at a time with
 exact zero-write retries. Singleton chains are valid Cara topology but are not
-representable by GitHub's 2-entry minimum. Complete inventory plus authoritative
-one-member order and zero mappings selects the explicit
-`singleton_caravan_owned` route: Cara reuses ordinary exact head/base/check/tree
-root validation and direct squash merge, creates no Stack, and never rewrites the
-source head. One exact mapping remains native; singleton multiple mappings and
-multi-member zero/multiple mappings fail closed. This is what lets a final tail
-continue on the tick after its native prefix lands and the provider Stack
-disappears.
+representable by GitHub's 2-entry minimum. For every `stack_type: github`
+caravan selected to reconcile, sync reads one complete current provider Stack
+inventory, identifies every Stack whose PR set intersects the caravan, and
+rereads each intersecting Stack by number with fresh base-ref and per-PR
+head/base/state facts. This routing precondition runs before root-first landing,
+root promotion, auto-merge disarm, force handling, and every landing write.
+Complete inventory plus authoritative one-member order and zero intersections
+selects the explicit `singleton_caravan_owned` route: Cara reuses ordinary exact
+head/base/check/tree root validation and direct squash merge, creates no Stack,
+and never rewrites the source head. Exactly one intersecting generation routes
+to the existing checkpointed complete-generation lock and asynchronous Stack
+merge backend only when its ordered members and every current PR generation
+exactly match Cara authority; this includes provider-represented singletons.
+Partial/cross/orphan mappings, head/base/state drift, multiple intersections,
+truncated inventory, and capability/read uncertainty refuse before a landing
+mutation with `retryable: false` and scheduler `external_decision`. Multi-member
+zero-intersection topology also refuses. If native membership races into
+existence after an exact singleton absence read, GitHub's Stack-specific direct-
+merge refusal becomes
+`github_stack_membership_detected_during_owned_merge`; the scheduler never
+repeats the unchanged synchronous merge. This is what lets a final tail continue
+only after the provider Stack has verifiably disappeared, while an orphaned or
+hidden Stack can never fall through to `gh pr merge`.
 
 `max_caravan_length` bounds one caravan as a merge batch. It accepts only
 GitHub's 2..=100 Stack range, is absent by default so existing repositories keep

@@ -6,6 +6,8 @@
 //! Stack before returning a sealed receipt. It never invokes the local
 //! `gh stack` tracking, sync, rebase, or link workflows.
 
+use std::collections::BTreeSet;
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -287,6 +289,83 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
         stack_number: u64,
     ) -> Result<Option<GitHubStackGeneration>, GitHubStackMutationError> {
         self.native_stack_generation_allowing_stale_tail_base(repository, stack_number, None)
+    }
+
+    /// Read every complete provider Stack generation intersecting any supplied
+    /// PR. Inventory is used only to identify candidates; each candidate is
+    /// then reread by exact Stack number and rebound to fresh PR head/base/state
+    /// facts. A candidate that disappears, changes identity, or loses the
+    /// observed intersection during the bounded read is uncertainty, never
+    /// proof of absence.
+    pub fn native_stack_intersections(
+        &self,
+        repository: &RepositoryId,
+        members: &[PrNumber],
+    ) -> Result<Vec<GitHubStackGeneration>, GitHubStackMutationError> {
+        if members.is_empty() {
+            return Err(invalid_plan(
+                "github_stack_intersection_members_missing",
+                "native Stack intersection reads require at least one pull request",
+            ));
+        }
+        let members = members.iter().copied().collect::<BTreeSet<_>>();
+        let inventory = self.exact_inventory(repository)?;
+        let candidates = inventory
+            .stacks
+            .into_iter()
+            .filter(|stack| {
+                stack
+                    .pull_requests
+                    .iter()
+                    .any(|pull_request| members.contains(&PrNumber(pull_request.number)))
+            })
+            .collect::<Vec<_>>();
+
+        let mut generations = Vec::with_capacity(candidates.len());
+        let mut identities = BTreeSet::new();
+        for candidate in candidates {
+            if !identities.insert((candidate.id, candidate.number, candidate.node_id.clone())) {
+                return Err(GitHubStackMutationError::InconsistentProviderState {
+                    diagnostic: format!(
+                        "Stack #{} appears more than once in the complete provider inventory",
+                        candidate.number
+                    ),
+                });
+            }
+            let Some(generation) = self.native_stack_generation(repository, candidate.number)?
+            else {
+                return Err(GitHubStackMutationError::InconsistentProviderState {
+                    diagnostic: format!(
+                        "intersecting Stack #{} disappeared during exact routing preflight",
+                        candidate.number
+                    ),
+                });
+            };
+            if generation.id != candidate.id || generation.node_id != candidate.node_id {
+                return Err(GitHubStackMutationError::InconsistentProviderState {
+                    diagnostic: format!(
+                        "Stack #{} changed provider identity during exact routing preflight",
+                        candidate.number
+                    ),
+                });
+            }
+            if !generation
+                .topology
+                .entries
+                .iter()
+                .any(|entry| members.contains(&entry.pr))
+            {
+                return Err(GitHubStackMutationError::InconsistentProviderState {
+                    diagnostic: format!(
+                        "Stack #{} lost its observed PR intersection during exact routing preflight",
+                        candidate.number
+                    ),
+                });
+            }
+            generations.push(generation);
+        }
+        generations.sort_by_key(|generation| (generation.number, generation.id));
+        Ok(generations)
     }
 
     /// Read one exact generation while tolerating only a named final entry's
@@ -1512,6 +1591,35 @@ mod tests {
             .unwrap();
 
         assert_eq!(observed, generation(expected));
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn intersection_read_lists_once_then_rebinds_every_matching_generation() {
+        let expected = topology(2);
+        let mut calls = vec![inventory_call(std::slice::from_ref(&expected))];
+        calls.extend(direct_generation_calls(&expected));
+        let adapter = GitHubMutationAdapter::new(FakeRunner::new(calls));
+
+        let observed = adapter
+            .native_stack_intersections(&repository(), &[PrNumber(102)])
+            .expect("complete inventory and generation are readable");
+
+        assert_eq!(observed, vec![generation(expected)]);
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn intersection_read_proves_absence_only_from_complete_inventory() {
+        let expected = topology(2);
+        let adapter =
+            GitHubMutationAdapter::new(FakeRunner::new(vec![inventory_call(&[expected])]));
+
+        let observed = adapter
+            .native_stack_intersections(&repository(), &[PrNumber(999)])
+            .expect("complete inventory proves no intersection");
+
+        assert!(observed.is_empty());
         adapter.runner.assert_exhausted();
     }
 
