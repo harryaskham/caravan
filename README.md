@@ -786,9 +786,14 @@ rebase, push, comment, or mutate topology.
 adds `caravan-parked` to the exact caravan head, disables its auto-merge,
 preserves every member/base/head, excludes it from active convergence/tail
 capacity, and allows independent green candidates to advance. Pending/running
-and superseded historical red never park. A new head or current nonterminal/green
-verdict removes the label and re-enters the caravan at its original FIFO age.
-Hooks may repair parked work but are never required for unrelated throughput.
+and superseded historical red never park. Once parked, queued, expected,
+running, unknown, or absent current evidence preserves the label without a
+provider write. Only a nonempty, fully green latest verdict for every member,
+with every protection-declared context proven satisfied, removes it and
+re-enters the caravan at its original FIFO age. A check-sensitive provider
+reread fences either label transition, so a new same-head check generation
+refuses before mutation. Hooks may repair parked work but are never required for
+unrelated throughput.
 Run `cara init` after enabling park so the fixed label exists.
 
 If the same immutable parked head later becomes green but no normal sync tick can
