@@ -13,45 +13,88 @@ concurrency:
   group: caravan-ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Main run 31349811279 proved host-default 16-way Cargo fan-out can exhaust the
+# 32-GiB generic runner. PR run 31352989063 proved two-way cold Clippy exceeds
+# the controller's external 60-minute execution ceiling. Four workers keep a
+# 4x memory bound while separate required jobs keep each cold gate below that
+# ceiling. Incremental state stays disabled to bound memory/disk (bd-480dbc).
+env:
+  CARGO_BUILD_JOBS: "4"
+  CARGO_INCREMENTAL: "0"
+
 jobs:
-  build-test:
-    # Match the registered persistent Nix runner fleet explicitly. Generic
-    # `azure-ephemeral` is intentionally not required for this repository.
+  format:
     runs-on: [self-hosted, nix, x86_64-linux]
-    # Main run 31349811279 exposed 16 logical CPUs to cold Cargo compilation on
-    # caravan-ms-dev-5, then SIGKILLed the Caravan crate with exit 137. Bound
-    # concurrent rustc/test processes and incremental-state memory on every
-    # generic matching runner rather than depending on host CPU count
-    # (bd-480dbc).
-    env:
-      CARGO_BUILD_JOBS: "2"
-      CARGO_INCREMENTAL: "0"
-    # Serializing a cold gate trades peak memory for wall time. Keep a finite
-    # 90-minute runaway bound rather than weakening any required command.
-    timeout-minutes: 90
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-
       - name: Use anonymous HTTPS for public ecosystem crates
         shell: bash
-        run: |
-          git config --global --unset-all url."ssh://git@github.com/".insteadOf 2>/dev/null || true
+        run: git config --global --unset-all url."ssh://git@github.com/".insteadOf 2>/dev/null || true
+      - name: Check formatting
+        run: nix develop --command cargo fmt --all --check
 
-      - name: Run pinned format, lint, test, and agent-surface gates
+  clippy:
+    runs-on: [self-hosted, nix, x86_64-linux]
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use anonymous HTTPS for public ecosystem crates
+        shell: bash
+        run: git config --global --unset-all url."ssh://git@github.com/".insteadOf 2>/dev/null || true
+      - name: Run strict Clippy
+        run: nix develop --command cargo clippy --all-targets -- -D warnings
+
+  tests:
+    runs-on: [self-hosted, nix, x86_64-linux]
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use anonymous HTTPS for public ecosystem crates
+        shell: bash
+        run: git config --global --unset-all url."ssh://git@github.com/".insteadOf 2>/dev/null || true
+      - name: Run complete test suite
+        # tests/hook_example.rs requires environmental-hook-acceptance and is
+        # owned by the schedule/manual lane, not blocking PR CI.
+        run: nix develop --command cargo test --all
+
+  agent-surface:
+    runs-on: [self-hosted, nix, x86_64-linux]
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use anonymous HTTPS for public ecosystem crates
+        shell: bash
+        run: git config --global --unset-all url."ssh://git@github.com/".insteadOf 2>/dev/null || true
+      - name: Verify help and MCP surfaces
         shell: bash
         run: |
-          # Not a login shell: `-l` re-sources the runner's profile files after
-          # `nix develop` has established the devShell, which replaces PATH and
-          # loses cargo/rustc/clippy/rustfmt (`cargo: command not found`, exit
-          # 127, before any compilation). The gate needs no login semantics, so
-          # this stays immune to runner profile drift (bd-07a962).
+          # Not a login shell: `-l` would replace the Nix devShell PATH with
+          # runner profile state (bd-07a962).
           nix develop --command bash -c '
             set -euo pipefail
-            cargo fmt --all --check
-            cargo clippy --all-targets -- -D warnings
-            # tests/hook_example.rs requires environmental-hook-acceptance and
-            # is owned by the schedule/manual lane, not blocking PR CI.
-            cargo test --all
             cargo run -- help
             cargo run -- mcp tools >/dev/null
           '
+
+  # Preserve the existing required check name while failing closed if any
+  # parallel gate fails, times out, or is cancelled.
+  build-test:
+    if: ${{ always() }}
+    needs: [format, clippy, tests, agent-surface]
+    runs-on: [self-hosted, nix, x86_64-linux]
+    timeout-minutes: 5
+    steps:
+      - name: Require every pinned gate
+        shell: bash
+        env:
+          FORMAT_RESULT: ${{ needs.format.result }}
+          CLIPPY_RESULT: ${{ needs.clippy.result }}
+          TESTS_RESULT: ${{ needs.tests.result }}
+          AGENT_SURFACE_RESULT: ${{ needs.agent-surface.result }}
+        run: |
+          set -euo pipefail
+          test "$FORMAT_RESULT" = success
+          test "$CLIPPY_RESULT" = success
+          test "$TESTS_RESULT" = success
+          test "$AGENT_SURFACE_RESULT" = success
