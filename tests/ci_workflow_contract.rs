@@ -2,11 +2,12 @@
 
 const CI_WORKFLOW: &str = include_str!("../.github/workflows/ci.yml");
 
-/// bd-877ded: main run 31345354513 spent 29m46s in the pinned gate and then
-/// exhausted the old 30-minute job budget during finalization. Keep a finite
-/// 45-minute budget (50% measured headroom) and preserve every required gate.
+/// bd-480dbc: main run 31349811279 exposed 16 host CPUs to cold compilation
+/// and SIGKILLed the Caravan crate with exit 137. Bound Cargo parallelism and
+/// incremental-state memory across generic runners, retain a finite 90-minute
+/// budget for the deliberately serialized gate, and preserve every command.
 #[test]
-fn ci_gate_has_bounded_measured_headroom_without_weaker_commands() {
+fn ci_gate_has_portable_resource_bounds_without_weaker_commands() {
     let timeout_minutes = CI_WORKFLOW
         .lines()
         .filter_map(|line| line.trim().strip_prefix("timeout-minutes:"))
@@ -15,9 +16,15 @@ fn ci_gate_has_bounded_measured_headroom_without_weaker_commands() {
         .collect::<Vec<_>>();
     assert_eq!(
         timeout_minutes,
-        vec![45],
-        "CI must retain exactly one reviewed 45-minute runaway bound"
+        vec![90],
+        "CI must retain exactly one reviewed 90-minute runaway bound"
     );
+    for required in ["CARGO_BUILD_JOBS: \"2\"", "CARGO_INCREMENTAL: \"0\""] {
+        assert!(
+            CI_WORKFLOW.contains(required),
+            "generic runners must retain resource control `{required}`"
+        );
+    }
 
     for required in [
         "cargo fmt --all --check",

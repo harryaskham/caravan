@@ -18,10 +18,17 @@ jobs:
     # Match the registered persistent Nix runner fleet explicitly. Generic
     # `azure-ephemeral` is intentionally not required for this repository.
     runs-on: [self-hosted, nix, x86_64-linux]
-    # Main run 31345354513 completed the pinned gate in 29m46s, then hit the
-    # 30-minute ceiling during finalization. Keep 50% measured headroom while
-    # retaining a finite runaway bound (bd-877ded).
-    timeout-minutes: 45
+    # Main run 31349811279 exposed 16 logical CPUs to cold Cargo compilation on
+    # caravan-ms-dev-5, then SIGKILLed the Caravan crate with exit 137. Bound
+    # concurrent rustc/test processes and incremental-state memory on every
+    # generic matching runner rather than depending on host CPU count
+    # (bd-480dbc).
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+    # Serializing a cold gate trades peak memory for wall time. Keep a finite
+    # 90-minute runaway bound rather than weakening any required command.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
