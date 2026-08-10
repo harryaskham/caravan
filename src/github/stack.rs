@@ -736,6 +736,115 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
         }
     }
 
+    fn prove_collapsed_frontier(
+        &self,
+        repository: &RepositoryId,
+        topology: &GitHubStackTopology,
+    ) -> Result<Option<CollapsedFrontierProof>, GitHubStackMutationError> {
+        let Some(first_open) = topology
+            .entries
+            .iter()
+            .position(|entry| entry.pull_request_state == PullRequestState::Open)
+        else {
+            return Ok(None);
+        };
+        if first_open == 0 {
+            return Ok(None);
+        }
+        let merged = &topology.entries[..first_open];
+        if merged.iter().any(|entry| {
+            entry.pull_request_state != PullRequestState::Merged || entry.merged_at.is_none()
+        }) {
+            return Err(invalid_plan(
+                "github_stack_merged_prefix_invalid",
+                "a collapsed frontier requires a complete freshly merged predecessor prefix",
+            ));
+        }
+
+        let first_merged = &merged[0];
+        if first_merged.base.repository != topology.base.repository
+            || first_merged.base.name != topology.base.name
+        {
+            return Err(invalid_plan(
+                "github_stack_collapsed_frontier_base_invalid",
+                "the merged Stack prefix does not originate from the exact Stack base ref",
+            ));
+        }
+        for pair in merged.windows(2) {
+            if pair[1].base != pair[0].head {
+                return Err(invalid_plan(
+                    "github_stack_collapsed_frontier_order_invalid",
+                    "the merged Stack prefix does not preserve the exact historical base/head chain",
+                ));
+            }
+        }
+        let current = &topology.entries[first_open];
+        if current.base.repository != topology.base.repository
+            || current.base.name != topology.base.name
+        {
+            return Err(invalid_plan(
+                "github_stack_collapsed_frontier_base_invalid",
+                "the first remaining open PR must target the Stack base ref after prefix merge",
+            ));
+        }
+
+        for (label, ancestor) in std::iter::once(("recorded current base", &current.base.oid))
+            .chain(std::iter::once((
+                "merged prefix base",
+                &first_merged.base.oid,
+            )))
+        {
+            let relation = self.compare_commits(repository, ancestor, &topology.base.oid)?;
+            if !matches!(
+                relation,
+                crate::generation::CommitRelation::Ahead
+                    | crate::generation::CommitRelation::Identical
+            ) {
+                return Err(invalid_plan(
+                    "github_stack_collapsed_frontier_ancestry_invalid",
+                    &format!(
+                        "{label} {} is not an ancestor of current Stack base {}",
+                        ancestor, topology.base.oid
+                    ),
+                ));
+            }
+        }
+        for predecessor in merged {
+            let merge_commit = self
+                .merge_commit_oid(repository, predecessor.pr)?
+                .ok_or_else(|| {
+                    invalid_plan(
+                        "github_stack_merged_predecessor_commit_missing",
+                        &format!(
+                            "merged predecessor PR #{} has no exact provider merge commit",
+                            predecessor.pr
+                        ),
+                    )
+                })?;
+            let relation = self.compare_commits(repository, &merge_commit, &topology.base.oid)?;
+            if !matches!(
+                relation,
+                crate::generation::CommitRelation::Ahead
+                    | crate::generation::CommitRelation::Identical
+            ) {
+                return Err(invalid_plan(
+                    "github_stack_merged_predecessor_ancestry_invalid",
+                    &format!(
+                        "merge commit {} for predecessor PR #{} is not contained by Stack base {}",
+                        merge_commit, predecessor.pr, topology.base.oid
+                    ),
+                ));
+            }
+        }
+
+        Ok(Some(CollapsedFrontierProof {
+            merged_predecessors: merged.iter().map(|entry| entry.pr).collect(),
+            current_open_pr: current.pr,
+            recorded_base: current.base.clone(),
+            stack_base: topology.base.clone(),
+        }))
+    }
+
     fn observe_stack_generation(
         &self,
         repository: &RepositoryId,
@@ -790,11 +899,13 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
             entries.push(entry_from_pr(position, &stack_pr.state, pr)?);
         }
         let topology = GitHubStackTopology { base, entries };
-        validate_topology_allowing_stale_tail_base(
+        let collapsed = self.prove_collapsed_frontier(repository, &topology)?;
+        validate_topology_with_collapsed_frontier(
             repository,
             &topology,
             1,
             allowed_stale_tail_base,
+            collapsed.as_ref(),
         )?;
         Ok(GitHubStackGeneration {
             id: stack.id,
@@ -927,6 +1038,14 @@ fn normalized_stack_pr_state(
     }
 }
 
+#[derive(Debug)]
+struct CollapsedFrontierProof {
+    merged_predecessors: Vec<PrNumber>,
+    current_open_pr: PrNumber,
+    recorded_base: BranchSnapshot,
+    stack_base: BranchSnapshot,
+}
+
 fn validate_add_plan(
     repository: &RepositoryId,
     plan: &GitHubStackAddPlan,
@@ -967,6 +1086,22 @@ pub(super) fn validate_topology_allowing_stale_tail_base(
     minimum_entries: usize,
     allowed_stale_tail_base: Option<PrNumber>,
 ) -> Result<(), GitHubStackMutationError> {
+    validate_topology_with_collapsed_frontier(
+        repository,
+        topology,
+        minimum_entries,
+        allowed_stale_tail_base,
+        None,
+    )
+}
+
+fn validate_topology_with_collapsed_frontier(
+    repository: &RepositoryId,
+    topology: &GitHubStackTopology,
+    minimum_entries: usize,
+    allowed_stale_tail_base: Option<PrNumber>,
+    collapsed: Option<&CollapsedFrontierProof>,
+) -> Result<(), GitHubStackMutationError> {
     if allowed_stale_tail_base.is_some()
         && topology.entries.last().map(|entry| entry.pr) != allowed_stale_tail_base
     {
@@ -991,7 +1126,9 @@ pub(super) fn validate_topology_allowing_stale_tail_base(
         ));
     }
     let mut seen = std::collections::BTreeSet::new();
+    let mut merged_predecessors = Vec::new();
     let mut previous_open_head: Option<&BranchSnapshot> = None;
+    let mut collapsed_frontier_consumed = false;
     for (position, entry) in topology.entries.iter().enumerate() {
         if entry.position != u32::try_from(position).unwrap_or(u32::MAX) {
             return Err(invalid_plan(
@@ -1019,7 +1156,26 @@ pub(super) fn validate_topology_allowing_stale_tail_base(
             let allowed_same_ref_stale_tail = allowed_stale_tail_base == Some(entry.pr)
                 && entry.base.repository == expected_base.repository
                 && entry.base.name == expected_base.name;
-            if entry.base != *expected_base && !allowed_same_ref_stale_tail {
+            let collapsed_shape = previous_open_head.is_none()
+                && !merged_predecessors.is_empty()
+                && entry.base.repository == topology.base.repository
+                && entry.base.name == topology.base.name;
+            let collapsed_proof_matches = collapsed.is_some_and(|proof| {
+                proof.current_open_pr == entry.pr
+                    && proof.merged_predecessors == merged_predecessors
+                    && proof.recorded_base == entry.base
+                    && proof.stack_base == topology.base
+            });
+            // Plan validation may see a previously sealed generation without
+            // its transient read proof. The same-ref shape is accepted there;
+            // every provider write fresh-reads the generation and must rebuild
+            // the ancestry proof before its equality lease can pass.
+            let allowed_collapsed_frontier =
+                collapsed_shape && (collapsed.is_none() || collapsed_proof_matches);
+            if entry.base != *expected_base
+                && !allowed_same_ref_stale_tail
+                && !allowed_collapsed_frontier
+            {
                 return Err(invalid_plan(
                     "github_stack_base_chain_invalid",
                     &format!(
@@ -1028,13 +1184,29 @@ pub(super) fn validate_topology_allowing_stale_tail_base(
                     ),
                 ));
             }
+            collapsed_frontier_consumed |= collapsed_proof_matches;
             previous_open_head = Some(&entry.head);
-        } else if previous_open_head.is_some() {
-            return Err(invalid_plan(
-                "github_stack_state_order_invalid",
-                "closed or merged Stack entries may only precede the open suffix",
-            ));
+        } else {
+            if previous_open_head.is_some() {
+                return Err(invalid_plan(
+                    "github_stack_state_order_invalid",
+                    "closed or merged Stack entries may only precede the open suffix",
+                ));
+            }
+            if entry.pull_request_state != PullRequestState::Merged || entry.merged_at.is_none() {
+                return Err(invalid_plan(
+                    "github_stack_merged_prefix_invalid",
+                    "only freshly proven merged entries may precede the open Stack suffix",
+                ));
+            }
+            merged_predecessors.push(entry.pr);
         }
+    }
+    if collapsed.is_some() && !collapsed_frontier_consumed {
+        return Err(invalid_plan(
+            "github_stack_collapsed_frontier_invalid",
+            "collapsed-frontier proof does not match the exact first open Stack entry",
+        ));
     }
     Ok(())
 }
@@ -1448,6 +1620,44 @@ mod tests {
         GitHubStackTopology { base, entries }
     }
 
+    fn collapsed_topology(merged_prefix: usize) -> GitHubStackTopology {
+        assert!((1..=2).contains(&merged_prefix));
+        let base = branch("main", "main-current");
+        let mut entries: Vec<GitHubStackEntryGeneration> = Vec::new();
+        for position in 0..merged_prefix {
+            let entry_base = if position == 0 {
+                branch("main", "main-before-prefix")
+            } else {
+                entries[position - 1].head.clone()
+            };
+            entries.push(GitHubStackEntryGeneration {
+                position: u32::try_from(position).unwrap(),
+                pr: PrNumber(101 + u64::try_from(position).unwrap()),
+                stack_state: "merged".to_owned(),
+                pull_request_state: PullRequestState::Merged,
+                draft: false,
+                merged_at: Some(format!("2026-08-0{}T09:00:00Z", position + 1)),
+                base: entry_base,
+                head: branch(
+                    &format!("merged-{position}"),
+                    &format!("merged-head-{position}"),
+                ),
+            });
+        }
+        let current = 101 + u64::try_from(merged_prefix).unwrap();
+        entries.push(GitHubStackEntryGeneration {
+            position: u32::try_from(merged_prefix).unwrap(),
+            pr: PrNumber(current),
+            stack_state: "open".to_owned(),
+            pull_request_state: PullRequestState::Open,
+            draft: false,
+            merged_at: None,
+            base: branch("main", "main-at-collapse"),
+            head: branch("current", "current-head"),
+        });
+        GitHubStackTopology { base, entries }
+    }
+
     fn generation(topology: GitHubStackTopology) -> GitHubStackGeneration {
         GitHubStackGeneration {
             id: 9_876_543,
@@ -1560,6 +1770,49 @@ mod tests {
         calls
     }
 
+    fn compare_call(
+        base: &CommitOid,
+        head: &CommitOid,
+        status: &str,
+    ) -> (CommandSpec, CommandOutput) {
+        (
+            super::super::compare_commits_command(&repository(), base, head),
+            CommandOutput::success(serde_json::json!({"status": status}).to_string()),
+        )
+    }
+
+    fn collapsed_proof_calls(topology: &GitHubStackTopology) -> Vec<(CommandSpec, CommandOutput)> {
+        let first_open = topology
+            .entries
+            .iter()
+            .position(|entry| entry.pull_request_state == PullRequestState::Open)
+            .expect("collapsed fixture has an open suffix");
+        let current = &topology.entries[first_open];
+        let mut calls = vec![
+            compare_call(&current.base.oid, &topology.base.oid, "ahead"),
+            compare_call(&topology.entries[0].base.oid, &topology.base.oid, "ahead"),
+        ];
+        for predecessor in &topology.entries[..first_open] {
+            let merge_commit = CommitOid(format!("merge-{}", predecessor.pr.0));
+            calls.push((
+                super::super::merge_commit_command(&repository(), predecessor.pr),
+                CommandOutput::success(
+                    serde_json::json!({"mergeCommit": {"oid": merge_commit.0}}).to_string(),
+                ),
+            ));
+            calls.push(compare_call(&merge_commit, &topology.base.oid, "ahead"));
+        }
+        calls
+    }
+
+    fn direct_collapsed_generation_calls(
+        topology: &GitHubStackTopology,
+    ) -> Vec<(CommandSpec, CommandOutput)> {
+        let mut calls = direct_generation_calls(topology);
+        calls.extend(collapsed_proof_calls(topology));
+        calls
+    }
+
     fn fresh_topology_calls(topology: &GitHubStackTopology) -> Vec<(CommandSpec, CommandOutput)> {
         generation_observation_calls(topology)
     }
@@ -1591,6 +1844,101 @@ mod tests {
             .unwrap();
 
         assert_eq!(observed, generation(expected));
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn merged_predecessor_frontier_requires_exact_main_ancestry() {
+        for merged_count in [1, 2] {
+            let expected = collapsed_topology(merged_count);
+            let adapter = GitHubMutationAdapter::new(FakeRunner::new(
+                direct_collapsed_generation_calls(&expected),
+            ));
+
+            let observed = adapter
+                .native_stack_generation(&repository(), 42)
+                .expect("collapsed frontier is readable")
+                .expect("Stack exists");
+
+            assert_eq!(observed, generation(expected));
+            adapter.runner.assert_exhausted();
+        }
+    }
+
+    #[test]
+    fn collapsed_frontier_refuses_wrong_base_unmerged_prefix_and_missing_ancestry() {
+        let mut wrong_base = collapsed_topology(1);
+        wrong_base.entries[1].base = branch("foreign-base", "main-at-collapse");
+        let adapter =
+            GitHubMutationAdapter::new(FakeRunner::new(direct_generation_calls(&wrong_base)));
+        assert!(matches!(
+            adapter.native_stack_generation(&repository(), 42),
+            Err(GitHubStackMutationError::InvalidPlan { ref code, .. })
+                if code == "github_stack_collapsed_frontier_base_invalid"
+        ));
+        adapter.runner.assert_exhausted();
+
+        let mut unmerged = collapsed_topology(1);
+        unmerged.entries[0].pull_request_state = PullRequestState::Closed;
+        unmerged.entries[0].stack_state = "closed".to_owned();
+        unmerged.entries[0].merged_at = None;
+        let adapter =
+            GitHubMutationAdapter::new(FakeRunner::new(direct_generation_calls(&unmerged)));
+        assert!(matches!(
+            adapter.native_stack_generation(&repository(), 42),
+            Err(GitHubStackMutationError::InvalidPlan { ref code, .. })
+                if code == "github_stack_merged_prefix_invalid"
+        ));
+        adapter.runner.assert_exhausted();
+
+        let mut wrong_order = collapsed_topology(2);
+        wrong_order.entries[1].base = branch("wrong-predecessor", "wrong-order");
+        let adapter =
+            GitHubMutationAdapter::new(FakeRunner::new(direct_generation_calls(&wrong_order)));
+        assert!(matches!(
+            adapter.native_stack_generation(&repository(), 42),
+            Err(GitHubStackMutationError::InvalidPlan { ref code, .. })
+                if code == "github_stack_collapsed_frontier_order_invalid"
+        ));
+        adapter.runner.assert_exhausted();
+
+        let stale = collapsed_topology(1);
+        let mut calls = direct_generation_calls(&stale);
+        calls.push(compare_call(
+            &stale.entries[1].base.oid,
+            &stale.base.oid,
+            "diverged",
+        ));
+        let adapter = GitHubMutationAdapter::new(FakeRunner::new(calls));
+        assert!(matches!(
+            adapter.native_stack_generation(&repository(), 42),
+            Err(GitHubStackMutationError::InvalidPlan { ref code, .. })
+                if code == "github_stack_collapsed_frontier_ancestry_invalid"
+        ));
+        adapter.runner.assert_exhausted();
+
+        let missing_merge = collapsed_topology(1);
+        let mut calls = direct_generation_calls(&missing_merge);
+        calls.push(compare_call(
+            &missing_merge.entries[1].base.oid,
+            &missing_merge.base.oid,
+            "ahead",
+        ));
+        calls.push(compare_call(
+            &missing_merge.entries[0].base.oid,
+            &missing_merge.base.oid,
+            "ahead",
+        ));
+        calls.push((
+            super::super::merge_commit_command(&repository(), PrNumber(101)),
+            CommandOutput::success(serde_json::json!({"mergeCommit": null}).to_string()),
+        ));
+        let adapter = GitHubMutationAdapter::new(FakeRunner::new(calls));
+        assert!(matches!(
+            adapter.native_stack_generation(&repository(), 42),
+            Err(GitHubStackMutationError::InvalidPlan { ref code, .. })
+                if code == "github_stack_merged_predecessor_commit_missing"
+        ));
         adapter.runner.assert_exhausted();
     }
 

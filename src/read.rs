@@ -287,6 +287,7 @@ fn validate_native_stack_entries(
     problems: &mut Vec<StackBackendProblem>,
     consistency: &mut StackConsistency,
 ) {
+    let mut previous_open_head: Option<&str> = None;
     for (index, entry) in stack.pull_requests.iter().enumerate() {
         let number = PrNumber(entry.number);
         let Some(pull) = analysis.pull_requests.get(&number) else {
@@ -310,10 +311,38 @@ fn validate_native_stack_entries(
             });
             *consistency = StackConsistency::Drifted;
         }
-        let expected_base = if index == 0 {
-            analysis.fleet.default_branch.name.as_str()
+        let expected_base = if pull.state == crate::model::PullRequestState::Open {
+            previous_open_head.unwrap_or(analysis.fleet.default_branch.name.as_str())
+        } else if pull.is_merged() {
+            if previous_open_head.is_some() {
+                problems.push(StackBackendProblem {
+                    code: "github_stack_state_order_invalid".to_owned(),
+                    message: format!(
+                        "Stack #{} merged PR #{} appears after the open suffix began",
+                        stack.number, number
+                    ),
+                });
+                *consistency = StackConsistency::Drifted;
+            }
+            if index == 0 {
+                analysis.fleet.default_branch.name.as_str()
+            } else {
+                stack.pull_requests[index - 1].head.ref_name.as_str()
+            }
         } else {
-            stack.pull_requests[index - 1].head.ref_name.as_str()
+            problems.push(StackBackendProblem {
+                code: "github_stack_merged_prefix_invalid".to_owned(),
+                message: format!(
+                    "Stack #{} PR #{} is neither open nor freshly merged",
+                    stack.number, number
+                ),
+            });
+            *consistency = StackConsistency::Drifted;
+            if index == 0 {
+                analysis.fleet.default_branch.name.as_str()
+            } else {
+                stack.pull_requests[index - 1].head.ref_name.as_str()
+            }
         };
         if pull.base.name != expected_base {
             problems.push(StackBackendProblem {
@@ -324,6 +353,9 @@ fn validate_native_stack_entries(
                 ),
             });
             *consistency = StackConsistency::Drifted;
+        }
+        if pull.state == crate::model::PullRequestState::Open {
+            previous_open_head = Some(&pull.head.name);
         }
     }
 }
@@ -338,20 +370,30 @@ fn native_stack_status(
         .iter()
         .map(|pull| PrNumber(pull.number))
         .collect::<Vec<_>>();
-    let caravan = members
+    let current_members = members
+        .iter()
+        .copied()
+        .filter(|number| {
+            analysis
+                .pull_requests
+                .get(number)
+                .is_some_and(|pull| pull.state == crate::model::PullRequestState::Open)
+        })
+        .collect::<Vec<_>>();
+    let caravan = current_members
         .first()
         .and_then(|member| analysis.fleet.containing(*member));
     let mut problems = Vec::new();
     let (caravan_id, mut consistency) = if let Some(caravan) = caravan {
         represented.insert(caravan.id);
-        if caravan.members == members {
+        if caravan.members == current_members {
             (Some(caravan.id), StackConsistency::Exact)
         } else {
             problems.push(StackBackendProblem {
                 code: "github_stack_member_order_drift".to_owned(),
                 message: format!(
-                    "Stack #{} members {:?} do not equal caravan #{} members {:?}",
-                    stack.number, members, caravan.id, caravan.members
+                    "Stack #{} current open members {:?} do not equal caravan #{} members {:?}",
+                    stack.number, current_members, caravan.id, caravan.members
                 ),
             });
             (Some(caravan.id), StackConsistency::Drifted)
@@ -360,8 +402,8 @@ fn native_stack_status(
         problems.push(StackBackendProblem {
             code: "github_stack_orphaned".to_owned(),
             message: format!(
-                "Stack #{} does not map to any current Caravan",
-                stack.number
+                "Stack #{} current open members {:?} do not map to any current Caravan",
+                stack.number, current_members
             ),
         });
         (None, StackConsistency::Orphaned)
@@ -6823,6 +6865,65 @@ mod tests {
             StackMutationSupport::ReadOnlyPreview
         );
         assert_eq!(backend.native_stacks[0].caravan_id, Some(PrNumber(1)));
+        assert_eq!(
+            backend.native_stacks[0].consistency,
+            StackConsistency::Exact
+        );
+        assert!(backend.problems.is_empty());
+    }
+
+    #[test]
+    fn github_stack_read_model_accepts_merged_prefix_and_collapsed_open_base() {
+        let mut predecessor = pr(1, "root", "main", true);
+        predecessor.state = crate::model::PullRequestState::Merged;
+        predecessor.merged_at = Some("2026-08-09T09:00:00Z".to_owned());
+        let current = pr(2, "child", "main", true);
+        let status = status(current.clone(), vec![predecessor.clone(), current.clone()]);
+        assert_eq!(status.analysis.fleet.caravans[0].members, vec![PrNumber(2)]);
+        let provider = FixedStackProvider(Ok(crate::github::GitHubStackInventory {
+            truncated: false,
+            stacks: vec![crate::github::GitHubStackSnapshot {
+                id: 9001,
+                number: 42,
+                node_id: "S_collapsed".to_owned(),
+                base: crate::github::GitHubStackBase {
+                    ref_name: "main".to_owned(),
+                },
+                open: true,
+                created_at: "2026-08-09T08:00:00Z".to_owned(),
+                pull_requests: vec![
+                    crate::github::GitHubStackPullRequest {
+                        number: 1,
+                        state: "merged".to_owned(),
+                        draft: false,
+                        merged_at: predecessor.merged_at.clone(),
+                        head: crate::github::GitHubStackPullRequestHead {
+                            ref_name: predecessor.head.name.clone(),
+                            sha: predecessor.head.oid.clone(),
+                        },
+                    },
+                    crate::github::GitHubStackPullRequest {
+                        number: 2,
+                        state: "open".to_owned(),
+                        draft: false,
+                        merged_at: None,
+                        head: crate::github::GitHubStackPullRequestHead {
+                            ref_name: current.head.name.clone(),
+                            sha: current.head.oid.clone(),
+                        },
+                    },
+                ],
+            }],
+        }));
+
+        let backend = stack_backend_status(
+            crate::config::StackType::Github,
+            &provider,
+            &status.repository,
+            &status.analysis,
+        );
+
+        assert_eq!(backend.native_stacks[0].caravan_id, Some(PrNumber(2)));
         assert_eq!(
             backend.native_stacks[0].consistency,
             StackConsistency::Exact

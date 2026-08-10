@@ -9686,6 +9686,81 @@ fn exact_singleton_and_multi_entry_stacks_never_call_synchronous_merge() {
     }
 }
 
+/// A provider Stack may retain merged predecessors after GitHub retargets the
+/// first remaining open PR to main. The current one-member Cara caravan must
+/// still route through native Stack ownership and never fall back to ordinary
+/// synchronous squash.
+#[test]
+fn merged_predecessor_frontier_remains_on_native_route() {
+    let mut predecessor = caravan_member(1, "merged-head", "main");
+    predecessor.state = PullRequestState::Merged;
+    predecessor.merged_at = Some("2026-08-09T09:00:00Z".to_owned());
+    let mut current = caravan_member(2, "current-head", "main");
+    current.checks = vec![check("build-test", CheckState::InProgress, None)];
+    let pulls = vec![predecessor.clone(), current.clone()];
+    let mut status = caravan_status(pulls.clone(), Some(current.number), true);
+    enable_native_backend(&mut status);
+    assert_eq!(
+        status.analysis.fleet.caravans[0].members,
+        vec![current.number]
+    );
+
+    let generation = crate::github::GitHubStackGeneration {
+        id: 42,
+        number: 42,
+        node_id: "S_collapsed_sync".to_owned(),
+        open: true,
+        created_at: "2026-08-09T08:00:00Z".to_owned(),
+        topology: crate::github::GitHubStackTopology {
+            base: status.analysis.fleet.default_branch.clone(),
+            entries: vec![
+                crate::github::GitHubStackEntryGeneration {
+                    position: 0,
+                    pr: predecessor.number,
+                    stack_state: "merged".to_owned(),
+                    pull_request_state: predecessor.state,
+                    draft: predecessor.draft,
+                    merged_at: predecessor.merged_at.clone(),
+                    base: predecessor.base.clone(),
+                    head: predecessor.head.clone(),
+                },
+                crate::github::GitHubStackEntryGeneration {
+                    position: 1,
+                    pr: current.number,
+                    stack_state: "open".to_owned(),
+                    pull_request_state: current.state,
+                    draft: current.draft,
+                    merged_at: None,
+                    base: current.base.clone(),
+                    head: current.head.clone(),
+                },
+            ],
+        },
+    };
+    let provider = FakeProvider::with_pull_requests(pulls);
+    *provider.native_stack.borrow_mut() = Some(generation);
+    let (_directory, config, native) = github_native_fixture();
+
+    let progress = execute_bounded_with_native(
+        &status,
+        &provider,
+        false,
+        false,
+        false,
+        64,
+        &BTreeMap::new(),
+        RequiredRunsPolicy::from_config(&config.sync),
+        Some(native),
+    )
+    .expect("pending current CI is a native Stack wait");
+
+    assert!(progress.root_merge.is_empty());
+    assert!(progress.native_stack_land.is_empty());
+    assert_eq!(*provider.native_stack_intersection_reads.borrow(), 1);
+    assert_eq!(*provider.native_stack_reads.borrow(), 1);
+    assert!(!provider.calls.borrow().contains(&MutationKind::SquashMerge));
+}
+
 /// Ambiguous, cross-mapped, and changed Stack generations are routing
 /// decisions. The first write remains unreachable and unchanged ticks are not
 /// classified as scheduler retries.
