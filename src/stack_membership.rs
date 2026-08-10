@@ -320,83 +320,105 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
                 stack_number,
                 expected_members,
                 candidate,
-            } => {
-                let before = self
-                    .native_stack_generation(repository, *stack_number)?
-                    .ok_or_else(|| {
-                        invalid_plan(
-                            "github_stack_membership_stack_missing",
-                            "the exact provider Stack disappeared before append",
-                        )
-                    })?;
-                let actual = before
+            } => self.converge_native_add(
+                repository,
+                operation_id,
+                actor,
+                *stack_number,
+                expected_members,
+                candidate,
+            ),
+        }
+    }
+
+    fn converge_native_add(
+        &self,
+        repository: &RepositoryId,
+        operation_id: &str,
+        actor: &str,
+        stack_number: u64,
+        expected_members: &[PrNumber],
+        candidate: &PullRequestSnapshot,
+    ) -> Result<NativeMembershipReceipt, NativeMembershipError> {
+        let before = self
+            .native_stack_generation(repository, stack_number)?
+            .ok_or_else(|| {
+                invalid_plan(
+                    "github_stack_membership_stack_missing",
+                    "the exact provider Stack disappeared before append",
+                )
+            })?;
+        let actual = before
+            .topology
+            .entries
+            .iter()
+            .map(|entry| entry.pr)
+            .collect::<Vec<_>>();
+        let expected_full = expected_members
+            .iter()
+            .copied()
+            .chain(std::iter::once(candidate.number))
+            .collect::<Vec<_>>();
+        if actual != expected_members && actual != expected_full {
+            return Err(invalid_plan(
+                "github_stack_membership_members_drifted",
+                "provider Stack members changed before append",
+            ));
+        }
+        // An exact full generation means the prior add response was lost.
+        // Accept only the provider-converged new tail; every prefix entry is
+        // immutable and a retry remains zero-write.
+        let (expected_before, desired) = if actual == expected_full {
+            let desired = before.topology.clone();
+            let mut expected_before = before.clone();
+            expected_before
+                .topology
+                .entries
+                .truncate(expected_members.len());
+            let expected_candidate = entry_from_pull(
+                expected_members.len(),
+                candidate,
+                expected_before
                     .topology
                     .entries
-                    .iter()
-                    .map(|entry| entry.pr)
-                    .collect::<Vec<_>>();
-                let expected_full = expected_members
-                    .iter()
-                    .copied()
-                    .chain(std::iter::once(candidate.number))
-                    .collect::<Vec<_>>();
-                if &actual != expected_members && actual != expected_full {
-                    return Err(invalid_plan(
-                        "github_stack_membership_members_drifted",
-                        "provider Stack members changed before append",
-                    ));
-                }
-                // An exact full generation means the prior add response was
-                // lost. Reconstruct its expected prefix and let the CRUD
-                // adapter return a sealed AlreadySatisfied receipt rather than
-                // rejecting the successful continuation as member drift.
-                let (expected_before, desired) = if actual == expected_full {
-                    let desired = before.topology.clone();
-                    let mut expected_before = before.clone();
-                    expected_before
-                        .topology
-                        .entries
-                        .truncate(expected_members.len());
-                    let expected_candidate = entry_from_pull(
-                        expected_members.len(),
-                        candidate,
-                        expected_before
-                            .topology
-                            .entries
-                            .last()
-                            .map(|entry| &entry.head),
-                    )?;
-                    if desired.entries.get(expected_members.len()) != Some(&expected_candidate) {
-                        return Err(invalid_plan(
-                            "github_stack_membership_candidate_drifted",
-                            "already-appended provider entry differs from the exact candidate generation",
-                        ));
-                    }
-                    (expected_before, desired)
-                } else {
-                    let mut desired = before.topology.clone();
-                    desired.entries.push(entry_from_pull(
-                        desired.entries.len(),
-                        candidate,
-                        desired.entries.last().map(|entry| &entry.head),
-                    )?);
-                    (before, desired)
-                };
-                self.native_stack_add(
-                    repository,
-                    &GitHubStackAddPlan {
-                        operation_id: operation_id.clone(),
-                        actor: actor.clone(),
-                        before: expected_before,
-                        desired,
-                    },
-                )
-                .map(|receipt| NativeMembershipReceipt::StackMutation {
-                    receipt: Box::new(receipt),
-                })
-                .map_err(Into::into)
+                    .last()
+                    .map(|entry| &entry.head),
+            )?;
+            let mut intended = expected_before.topology.clone();
+            intended.entries.push(expected_candidate);
+            if !crate::github::provider_converged_add_topology(
+                &expected_before.topology,
+                &intended,
+                &desired,
+            ) {
+                return Err(invalid_plan(
+                    "github_stack_membership_candidate_drifted",
+                    "already-appended provider entry changed existing members or does not represent the exact converged tail",
+                ));
             }
-        }
+            (expected_before, desired)
+        } else {
+            let mut desired = before.topology.clone();
+            desired.entries.push(entry_from_pull(
+                desired.entries.len(),
+                candidate,
+                desired.entries.last().map(|entry| &entry.head),
+            )?);
+            (before, desired)
+        };
+        self.native_stack_add(
+            repository,
+            &GitHubStackAddPlan {
+                operation_id: operation_id.to_owned(),
+                actor: actor.to_owned(),
+                before: expected_before,
+                desired,
+            },
+        )
+        .map(|receipt| NativeMembershipReceipt::StackMutation {
+            receipt: Box::new(receipt),
+        })
+        .map_err(Into::into)
     }
 }
 

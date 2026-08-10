@@ -201,6 +201,22 @@ synthetic merge candidates and may rerun CI without rewriting source heads. Cara
 waits for checks bound to the exact fresh two-parent candidate for each immutable
 source generation. It never force-pushes a source branch to make it cumulative.
 
+### Join and terminal convergence
+
+A native membership append seals every existing entry and the intended new tail
+before the provider write. GitHub may rebase exactly that new tail while
+committing Stack membership. Cara accepts the result only when every existing
+head/base/state remains byte-for-byte exact, the appended PR and branch identity
+are unchanged, and the observed tail base equals the sealed predecessor head.
+The provider-converged tail head is retained in the receipt; replay against that
+same generation is zero-write. Any rewrite of an earlier member is drift, not an
+intended join.
+
+After a whole-Stack tail merge, a closed provider Stack whose complete members
+are freshly merged is terminal audit history. Provider collapse of historical
+bases does not make it orphaned or inconsistent; mixed/open/missing members and
+head drift still fail closed.
+
 ### Merge selection
 
 The planner identifies the maximal contiguous prefix beginning at the first

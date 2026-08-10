@@ -273,11 +273,16 @@ GITHUB NATIVE STACKS (EXPLICIT OPT-IN)
   ordinary base/label membership completed but provider representation did not,
   do not rerun admission: use `native-stack recovery-preview`, review its exact
   immutable membership/head/base/green-check/mapping plan hash, then pass that
-  hash to `recovery-apply`. The apply path permits only zero mappings for legacy
-  create, an exact checkpointed provider prefix for append, or one exact desired
-  mapping on an idempotent response-loss retry—never singleton, truncated,
-  uncheckpointed partial, drifted, or multiple mappings—and never rewrites
-  source heads or mutates PR bases/labels/comments.
+  hash to `recovery-apply`. GitHub may rebase exactly the newly joined tail while
+  committing membership; Cara accepts that converged result only when every
+  existing entry is byte-exact, the tail keeps its PR/branch identity, and its
+  base is the sealed predecessor head. The observed tail head is receipted and
+  an exact retry is zero-write. Any earlier-member rewrite remains drift. The
+  apply path permits only zero mappings for legacy create, an exact checkpointed
+  provider prefix for append, or one exact desired/converged-tail mapping on an
+  idempotent response-loss retry—never singleton, truncated, uncheckpointed
+  partial, drifted, or multiple mappings—and never independently rewrites source
+  heads or mutates PR bases/labels/comments.
 - The installed `gh stack` CLI does not merge Stacks. It creates, links,
   submits, rebases, and synchronizes branch/PR topology; GitHub's web merge uses
   the same asynchronous REST endpoint that accepts only the selected top SHA.
@@ -290,9 +295,13 @@ GITHUB NATIVE STACKS (EXPLICIT OPT-IN)
   fully ready Stack, and requires typed tail evict/split before retrying a
   partial prefix. Acquire the lock, read it back with
   `current_user_can_bypass: never`, re-read the whole Stack, keep it through
-  terminal UUID proof, then release only the exact ruleset generation. Lost
-  lock or lower-head drift is `indeterminate`, never permission to retry
-  unlocked.
+  terminal UUID proof, then release only the exact ruleset generation. Terminal
+  success additionally requires every selected PR's exact provider squash
+  commit plus final-main truth. A closed Stack whose complete membership is
+  freshly merged is retained as terminal audit history, not reported as orphan
+  or base drift merely because GitHub collapsed historical bases. Lost lock,
+  missing member commit, or lower-head drift is `indeterminate`, never
+  permission to retry unlocked.
 - The ruleset path requires explicit GitHub Administration(write), which is not
   part of the baseline App policy. Grant it only to a reviewed native-Stack
   deployment; ordinary Caravan mode never needs it.

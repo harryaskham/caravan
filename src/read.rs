@@ -284,6 +284,7 @@ fn apply_stack_backend_mutation_policy(
 fn validate_native_stack_entries(
     stack: &crate::github::GitHubStackSnapshot,
     analysis: &GraphAnalysis,
+    terminal_merged: bool,
     problems: &mut Vec<StackBackendProblem>,
     consistency: &mut StackConsistency,
 ) {
@@ -310,6 +311,19 @@ fn validate_native_stack_entries(
                 ),
             });
             *consistency = StackConsistency::Drifted;
+        }
+        if terminal_merged {
+            if !pull.is_merged() {
+                problems.push(StackBackendProblem {
+                    code: "github_stack_terminal_member_not_merged".to_owned(),
+                    message: format!(
+                        "closed Stack #{} PR #{} is not freshly merged",
+                        stack.number, number
+                    ),
+                });
+                *consistency = StackConsistency::Drifted;
+            }
+            continue;
         }
         let expected_base = if pull.state == crate::model::PullRequestState::Open {
             previous_open_head.unwrap_or(analysis.fleet.default_branch.name.as_str())
@@ -380,11 +394,21 @@ fn native_stack_status(
                 .is_some_and(|pull| pull.state == crate::model::PullRequestState::Open)
         })
         .collect::<Vec<_>>();
+    let terminal_merged = !stack.open
+        && !members.is_empty()
+        && members.iter().all(|number| {
+            analysis
+                .pull_requests
+                .get(number)
+                .is_some_and(crate::model::PullRequestSnapshot::is_merged)
+        });
     let caravan = current_members
         .first()
         .and_then(|member| analysis.fleet.containing(*member));
     let mut problems = Vec::new();
-    let (caravan_id, mut consistency) = if let Some(caravan) = caravan {
+    let (caravan_id, mut consistency) = if terminal_merged {
+        (None, StackConsistency::Exact)
+    } else if let Some(caravan) = caravan {
         represented.insert(caravan.id);
         if caravan.members == current_members {
             (Some(caravan.id), StackConsistency::Exact)
@@ -418,7 +442,13 @@ fn native_stack_status(
         });
         consistency = StackConsistency::Drifted;
     }
-    validate_native_stack_entries(&stack, analysis, &mut problems, &mut consistency);
+    validate_native_stack_entries(
+        &stack,
+        analysis,
+        terminal_merged,
+        &mut problems,
+        &mut consistency,
+    );
     NativeStackStatus {
         stack,
         caravan_id,
@@ -1199,15 +1229,20 @@ pub fn status(context: &AppContext) -> Result<StatusOutput, AppError> {
     status_with_deadline(context, std::time::Instant::now() + budget)
 }
 
-const STATUS_READ_BUDGET: Duration = Duration::from_secs(35);
+// bd-37a02e: live Stack #2608 discovery spent 20.9s enumerating 117 candidates,
+// leaving 3.3s and completing 0/9 active-caravan proofs. Stay just inside the
+// Cacophony adapter's 60s command bound while reserving roughly 30s for active
+// compatibility plus 5s for provider projection/final assembly.
+const STATUS_READ_BUDGET: Duration = Duration::from_secs(58);
 const STATUS_COMPLETION_RESERVE: Duration = Duration::from_secs(2);
 /// Outer CLI subprocess bound. This is independent of the executor's own
-/// deadline and leaves Cacophony's 60-second adapter time to collect JSON.
-pub const STATUS_COMMAND_WATCHDOG: Duration = Duration::from_secs(40);
+/// deadline and leaves one second inside Cacophony's 60-second adapter bound to
+/// collect JSON and terminate the process group cleanly.
+pub const STATUS_COMMAND_WATCHDOG: Duration = Duration::from_secs(59);
 /// Compatibility is local but can be quadratic in caravan count. Keep a second
 /// in-operation reserve for provider-backed stack projection and final status
 /// assembly instead of letting the final merge-tree consume the whole window.
-const STATUS_POST_ANALYSIS_RESERVE: Duration = Duration::from_secs(8);
+const STATUS_POST_ANALYSIS_RESERVE: Duration = Duration::from_secs(5);
 const STATUS_LAST_GOOD_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const STATUS_LAST_GOOD_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const STATUS_LAST_GOOD_SCHEMA_VERSION: u32 = 1;
@@ -4614,12 +4649,13 @@ mod tests {
         context.config.command_timeout_secs = 3_600;
         context.config.sync.max_duration_secs = 3_600;
 
-        assert_eq!(STATUS_READ_BUDGET, std::time::Duration::from_secs(35));
+        assert_eq!(STATUS_READ_BUDGET, std::time::Duration::from_secs(58));
         assert_eq!(STATUS_COMPLETION_RESERVE, std::time::Duration::from_secs(2));
         assert_eq!(
             STATUS_POST_ANALYSIS_RESERVE,
-            std::time::Duration::from_secs(8)
+            std::time::Duration::from_secs(5)
         );
+        assert_eq!(STATUS_COMMAND_WATCHDOG, std::time::Duration::from_secs(59));
         assert_ne!(
             STATUS_READ_BUDGET,
             std::time::Duration::from_secs(context.config.sync.max_duration_secs),
@@ -4668,7 +4704,7 @@ mod tests {
         output.timing = Some(StatusTiming {
             deadline_ms: 33_000,
             total_ms: 30_000,
-            completion_reserve_ms: 10_000,
+            completion_reserve_ms: 7_000,
             compatibility_budget_ms: 25_000,
             compatibility_analysis: bounded.progress,
             phases_ms: std::collections::BTreeMap::from([
@@ -4699,9 +4735,9 @@ mod tests {
                 .as_ref()
                 .expect("timing")
                 .completion_reserve_ms,
-            10_000
+            7_000
         );
-        assert!(partial.elapsed_ms < 35_000);
+        assert!(partial.elapsed_ms < 58_000);
 
         // The Caco adapter consumes a successful-but-unhealthy envelope as a
         // degraded canonical engine, not an unavailable command failure.
@@ -4741,6 +4777,51 @@ mod tests {
             later.progress.planned_analyses
         );
         assert!(later.progress.deferred_analyses.is_empty());
+    }
+
+    #[test]
+    fn active_three_member_caravan_proofs_precede_one_hundred_candidates() {
+        let active = vec![
+            pr(1, "root", "main", true),
+            pr(2, "middle", "root", true),
+            pr(3, "tail", "middle", true),
+        ];
+        let mut provider_rows = active.clone();
+        provider_rows.extend(
+            (100..=219).map(|number| pr(number, &format!("candidate-{number}"), "main", false)),
+        );
+        let repository_snapshot = snapshot(active[2].clone(), provider_rows);
+        let bounded = analyze_for_actor_bounded(
+            &repository_snapshot,
+            &TimeoutAfterChecks {
+                calls: AtomicUsize::new(0),
+                // Root-to-main and both adjacent proofs consume three checks;
+                // cumulative-tree evidence is a separate active task. The first
+                // candidate check must be the one that times out.
+                completed_before_timeout: 3,
+            },
+            crate::model::HeadMergeActor::default(),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .expect("candidate pressure yields after active-caravan proofs");
+
+        assert!(!bounded.progress.complete);
+        assert_eq!(bounded.progress.candidate_count, 123);
+        assert_eq!(bounded.progress.unqueued_candidate_count, 120);
+        assert_eq!(bounded.progress.caravan_count, 1);
+        assert_eq!(bounded.progress.completed_analyses, 4);
+        assert_eq!(bounded.analysis.compatibility.len(), 3);
+        assert!(
+            bounded
+                .progress
+                .deferred_analyses
+                .first()
+                .is_some_and(|task| task.starts_with("candidate_to_default:")),
+            "all active root/cumulative/adjacent work must precede candidates: {:?}",
+            bounded.progress.deferred_analyses
+        );
+        assert!(bounded.progress.skipped_analyses.len() >= 64);
+        assert!(bounded.progress.skipped_analyses_truncated > 0);
     }
 
     #[test]
@@ -4793,7 +4874,7 @@ mod tests {
         assert!(partial.cursor.starts_with("last_good_complete_status:"));
         assert!(partial.last_good_age_ms.is_some_and(|age| age >= 1_250));
         assert_eq!(partial.attempt_provider_api.calls, 17);
-        assert_eq!(partial.deadline_ms, 35_000);
+        assert_eq!(partial.deadline_ms, 58_000);
         let expected_repository = receipt.output.repository.clone();
         let adapter_payload = serde_json::to_value(&receipt).expect("status receipt serializes");
         assert_eq!(adapter_payload["healthy"], false);
@@ -4869,8 +4950,8 @@ mod tests {
                 exhausted_phase: "compatibility_analysis".to_owned(),
                 cursor: "provider_discovery_checkpoint:fixture".to_owned(),
                 elapsed_ms: 10,
-                deadline_ms: 35_000,
-                remaining_ms: 34_990,
+                deadline_ms: 58_000,
+                remaining_ms: 57_990,
                 evidence_source: StatusPartialEvidenceSource::CurrentBoundedEvidence,
                 last_good_age_ms: None,
                 unknown_fields: vec!["analysis.compatibility".to_owned()],
@@ -4896,7 +4977,7 @@ mod tests {
         assert!(!recovered.output.healthy);
         assert_eq!(partial.exhausted_phase, "command_boundary_watchdog");
         assert_eq!(partial.elapsed_ms, 45_000);
-        assert_eq!(partial.deadline_ms, 40_000);
+        assert_eq!(partial.deadline_ms, 59_000);
         assert_eq!(partial.remaining_ms, 0);
         assert_eq!(partial.attempt_provider_api.calls, 11);
         assert!(!partial.mutated);
@@ -6929,6 +7010,68 @@ mod tests {
             StackConsistency::Exact
         );
         assert!(backend.problems.is_empty());
+    }
+
+    #[test]
+    fn fully_merged_closed_stack_is_terminal_history_not_orphan_drift() {
+        let mut root = pr(1, "root", "main", true);
+        root.state = crate::model::PullRequestState::Merged;
+        root.merged_at = Some("2026-08-10T14:08:18Z".to_owned());
+        let mut tail = pr(2, "tail", "main", true);
+        tail.state = crate::model::PullRequestState::Merged;
+        tail.merged_at = Some("2026-08-10T14:08:19Z".to_owned());
+        let status = status(tail.clone(), vec![root.clone(), tail.clone()]);
+        let provider = FixedStackProvider(Ok(crate::github::GitHubStackInventory {
+            truncated: false,
+            stacks: vec![crate::github::GitHubStackSnapshot {
+                id: 9001,
+                number: 42,
+                node_id: "S_terminal".to_owned(),
+                base: crate::github::GitHubStackBase {
+                    ref_name: "main".to_owned(),
+                },
+                open: false,
+                created_at: "2026-08-10T14:00:00Z".to_owned(),
+                pull_requests: vec![
+                    crate::github::GitHubStackPullRequest {
+                        number: 1,
+                        state: "merged".to_owned(),
+                        draft: false,
+                        merged_at: root.merged_at.clone(),
+                        head: crate::github::GitHubStackPullRequestHead {
+                            ref_name: root.head.name.clone(),
+                            sha: root.head.oid.clone(),
+                        },
+                    },
+                    crate::github::GitHubStackPullRequest {
+                        number: 2,
+                        state: "merged".to_owned(),
+                        draft: false,
+                        merged_at: tail.merged_at.clone(),
+                        head: crate::github::GitHubStackPullRequestHead {
+                            ref_name: tail.head.name.clone(),
+                            sha: tail.head.oid.clone(),
+                        },
+                    },
+                ],
+            }],
+        }));
+
+        let backend = stack_backend_status(
+            crate::config::StackType::Github,
+            &provider,
+            &status.repository,
+            &status.analysis,
+        );
+
+        assert_eq!(backend.native_stacks[0].caravan_id, None);
+        assert_eq!(
+            backend.native_stacks[0].consistency,
+            StackConsistency::Exact
+        );
+        assert!(backend.native_stacks[0].problems.is_empty());
+        assert!(backend.problems.is_empty());
+        assert!(backend.missing_caravans.is_empty());
     }
 
     #[test]

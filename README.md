@@ -706,7 +706,14 @@ commit and recorded base are contained by current main, the historical prefix
 order is exact, and the current open suffix exactly equals the Cara caravan.
 That typed `merged_predecessor_base_collapsed` frontier stays on the native
 backend; planning skips the proven merged prefix and selects from the first
-remaining open entry. Partial, cross-mapped, stale, truncated, unreadable, or
+remaining open entry. Appending a join may let GitHub rebase exactly the new
+tail head while committing Stack membership; Cara accepts that converged
+postcondition only when every previous entry remains byte-for-byte exact, the
+new tail retains its PR/branch identity, and its base is the sealed predecessor
+head. Exact retries recognize the same converged tail without another write.
+A closed Stack whose complete membership is freshly merged is terminal audit
+history, not `github_stack_orphaned` or base drift merely because GitHub
+collapsed merged bases. Partial, cross-mapped, stale, truncated, unreadable, or
 multiple intersections fail as non-retryable external decisions without a
 landing write. If a Stack
 races into existence after the absence proof and GitHub refuses the ordinary
@@ -1020,18 +1027,23 @@ rerun operations retain strict check/run/head identity.
 
 Status propagates one absolute deadline through discovery, label inventory,
 compatibility, and provider identity; every child receives only the remaining
-budget. The 35-second read-only surface reserves 2 seconds for serialization and
-8 seconds after compatibility for provider-backed/final projection. It performs
-the minimal provider inventory before local graph work. Compatibility therefore
-yields with a successful, unhealthy `status_partial` built from current bounded
-evidence — even when no historical snapshot exists — rather than consuming the
-whole deadline before a provider call. The receipt exposes candidate/caravan/
+budget. The 58-second read-only surface reserves 2 seconds for serialization and
+5 seconds after compatibility for provider-backed/final projection, leaving
+about 30 seconds for active proofs even after the measured 20.9-second,
+117-candidate discovery. Root/default, cumulative-tree, and every adjacent proof
+for active caravans are ordered before the bounded leading-candidate work; a
+100+-candidate fixture pins that non-starvation rule. It performs the minimal
+provider inventory before local graph work. Compatibility therefore yields with
+a successful, unhealthy `status_partial` built from current bounded evidence —
+even when no historical snapshot exists — rather than consuming the whole
+deadline before a provider call. The receipt exposes candidate/caravan/
 branch counts, planned/completed proofs, bounded skipped/deferred proof names,
 phase timings, completion reserve, provider calls, explicit unknown fields, and
 whether evidence is `current_bounded_evidence` or `historical_last_good`. Zero
 provider calls omit the authentication verdict instead of diagnosing
-`authenticated: false`. A separate 40-second CLI watchdog launches status in a
-subprocess and atomically checkpoints provider/structural evidence before
+`authenticated: false`. A separate 59-second CLI watchdog launches status in a
+subprocess (one second inside Cacophony's collection bound) and atomically
+checkpoints provider/structural evidence before
 compatibility. Worker stdout/stderr go to parent-owned bounded files, never
 pipes whose EOF an orphan can retain. On Unix the worker also owns a dedicated
 session, so provider groups remain identifiable after an intermediate worker
