@@ -269,10 +269,14 @@ sync.
 
 - `cara status` — repository overview: current PR, all caravans, the canonical priority-then-FIFO admission list with per-PR reasons, invalid graph fragments, and pending decision points.
 
-The CLI status read owns a dedicated 35-second wall-clock budget with a
-2-second serialization reserve and an additional bounded post-compatibility
-reserve; it never borrows `sync.max_duration_secs`, mutation capacity, or
-post-rewrite reserve. Each provider child remains bounded by
+The CLI status read owns a dedicated 58-second wall-clock budget with a
+2-second serialization reserve and a 5-second post-compatibility reserve; it
+never borrows `sync.max_duration_secs`, mutation capacity, or post-rewrite
+reserve. This leaves roughly 30 seconds for compatibility after the measured
+20.9-second, 117-candidate provider discovery. Active caravan root/default,
+cumulative-tree, and adjacent proofs are ordered before bounded unqueued
+candidate work; deterministic 100+-candidate fixtures must prove that a
+processable active prefix cannot starve. Each provider child remains bounded by
 `command_timeout_secs`. Status performs a minimal provider identity/inventory
 read before local compatibility, then yields compatibility before that reserve
 is consumed. A complete status atomically records a config-fenced, size-bounded,
@@ -286,8 +290,8 @@ and `evidence_source: current_bounded_evidence`. A later provider timeout may
 instead use a valid historical snapshot with
 `evidence_source: historical_last_good`, its cursor and age. A policy change or
 snapshot older than 24 hours invalidates that historical fallback. The CLI
-also owns a 40-second outer subprocess watchdog independent of the analysis
-executor. After provider discovery and label inventory, the worker atomically
+also owns a 59-second outer subprocess watchdog independent of the analysis
+executor, retaining one second inside Cacophony's 60-second collection bound. After provider discovery and label inventory, the worker atomically
 checkpoints current repository/caravan/candidate structure plus request counts.
 Worker output is redirected to parent-owned bounded files rather than pipes and,
 on Unix, the worker creates a dedicated session before launching providers. If
@@ -1283,8 +1287,15 @@ entry is freshly merged in provider order, every predecessor merge commit and
 the recorded collapsed base are ancestors of current main, the remaining open
 suffix exactly equals the current Cara caravan, and a pre-mutation reread proves
 the same generation. Planning skips only that proven merged prefix and treats
-the first remaining open entry as the bottom of the mergeable frontier. Missing
-merge commits, non-ancestor or wrong-base evidence, unmerged/partial prefixes,
+the first remaining open entry as the bottom of the mergeable frontier. During
+native membership append, GitHub may rebase exactly the newly joined tail; this
+is a valid converged generation only when every pre-existing entry remains
+exact, the tail PR/branch identity is unchanged, and its base is the sealed
+previous tail head. The observed head is retained in the receipt and an exact
+retry performs zero writes. A provider rewrite of any existing member is drift.
+A closed Stack whose complete membership is freshly merged is terminal audit
+history, not an orphan/base-drift blocker even when provider base refs collapse.
+Missing merge commits, non-ancestor or wrong-base evidence, unmerged/partial prefixes,
 cross/orphan mappings, head/base/state drift, multiple intersections, truncated
 inventory, and capability/read uncertainty refuse before a landing mutation
 with `retryable: false` and scheduler `external_decision`. Multi-member

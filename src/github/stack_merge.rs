@@ -286,6 +286,10 @@ pub struct GitHubStackMergePullRequestObservation {
     pub head: BranchSnapshot,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merged_at: Option<String>,
+    /// Exact provider squash commit for a merged member. Terminal success is
+    /// impossible until every selected entry carries this receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_commit: Option<CommitOid>,
 }
 
 impl From<PullRequestSnapshot> for GitHubStackMergePullRequestObservation {
@@ -297,6 +301,7 @@ impl From<PullRequestSnapshot> for GitHubStackMergePullRequestObservation {
             base: pr.base,
             head: pr.head,
             merged_at: pr.merged_at,
+            merge_commit: None,
         }
     }
 }
@@ -312,6 +317,8 @@ pub struct GitHubStackMergeObservation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stack_after: Option<GitHubStackGeneration>,
     pub selected_merged: usize,
+    /// Every selected merged PR exposes its exact resulting squash commit.
+    pub selected_merge_commits_complete: bool,
     /// Every selected PR still names the exact source head sealed before PUT.
     /// GitHub accepts a lease only for the selected top, so this can become
     /// false even when the provider reports every PR as merged.
@@ -810,9 +817,13 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
 
         let mut observed = Vec::with_capacity(plan.before.topology.entries.len());
         for entry in &plan.before.topology.entries {
-            observed.push(GitHubStackMergePullRequestObservation::from(
+            let mut observation = GitHubStackMergePullRequestObservation::from(
                 self.refetch_pull_request(repository, entry.pr)?,
-            ));
+            );
+            if observation.state == PullRequestState::Merged {
+                observation.merge_commit = self.merge_commit_oid(repository, entry.pr)?;
+            }
+            observed.push(observation);
         }
         let selected_start = plan
             .before
@@ -829,6 +840,11 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
             .iter()
             .filter(|entry| entry.state == PullRequestState::Merged && entry.merged_at.is_some())
             .count();
+        let selected_merge_commits_complete = selected.iter().all(|entry| {
+            entry.state == PullRequestState::Merged
+                && entry.merged_at.is_some()
+                && entry.merge_commit.is_some()
+        });
         let changed_selected_heads = selected
             .iter()
             .zip(&plan.selected)
@@ -861,6 +877,7 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
             remaining,
             stack_after,
             selected_merged,
+            selected_merge_commits_complete,
             selected_heads_exact,
             changed_selected_heads,
             remaining_order_exact,
@@ -1005,6 +1022,7 @@ fn classify_observation(
     observation: &GitHubStackMergeObservation,
 ) -> GitHubStackMergeStatus {
     if observation.selected_merged == plan.selected.len()
+        && observation.selected_merge_commits_complete
         && observation.selected_heads_exact
         && observation.remaining_order_exact
     {
@@ -1569,12 +1587,30 @@ mod tests {
             git_ref_command(&repository(), &stack_after.topology.base.name),
             CommandOutput::success(serde_json::json!({"object": {"sha": default_oid}}).to_string()),
         )];
-        calls.extend(stack_after.topology.entries.iter().map(|entry| {
-            (
+        let last_merged = stack_after
+            .topology
+            .entries
+            .iter()
+            .rposition(|entry| entry.pull_request_state == PullRequestState::Merged);
+        for (index, entry) in stack_after.topology.entries.iter().enumerate() {
+            calls.push((
                 super::super::pull_request_command(&repository(), &entry.pr.to_string()),
                 CommandOutput::success(pull_request_json(entry)),
-            )
-        }));
+            ));
+            if entry.pull_request_state == PullRequestState::Merged {
+                let merge_commit = if Some(index) == last_merged {
+                    default_oid.to_owned()
+                } else {
+                    format!("merge{}", entry.pr.0)
+                };
+                calls.push((
+                    super::super::merge_commit_command(&repository(), entry.pr),
+                    CommandOutput::success(
+                        serde_json::json!({"mergeCommit": {"oid": merge_commit}}).to_string(),
+                    ),
+                ));
+            }
+        }
         calls.extend(direct_generation_calls(stack_after));
         calls
     }
@@ -1999,8 +2035,58 @@ mod tests {
 
         assert_eq!(receipt.status, GitHubStackMergeStatus::Merged);
         assert_eq!(receipt.provider_sha, Some(CommitOid("merge999".to_owned())));
-        assert_eq!(receipt.observation.as_ref().unwrap().selected_merged, 2);
-        assert!(receipt.observation.as_ref().unwrap().remaining_order_exact);
+        let observation = receipt.observation.as_ref().unwrap();
+        assert_eq!(observation.selected_merged, 2);
+        assert!(observation.selected_merge_commits_complete);
+        assert_eq!(
+            observation
+                .selected
+                .iter()
+                .map(|entry| entry.merge_commit.clone().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                CommitOid("merge101".to_owned()),
+                CommitOid("merge999".to_owned())
+            ]
+        );
+        assert!(observation.remaining_order_exact);
+        assert!(receipt.verify());
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn merged_status_without_every_member_commit_is_indeterminate() {
+        let before = generation();
+        let checkpoint = checkpoint(direct_plan(&before));
+        let after = terminal_stack(before, 2);
+        let mut calls = vec![(
+            native_stack_merge_poll_command(&repository(), &checkpoint),
+            CommandOutput::success(
+                "HTTP/2 200 OK\n\n{\"uuid\":\"merge-uuid\",\"status\":\"merged\",\"details\":{\"sha\":\"merge999\"}}",
+            ),
+        )];
+        let mut observation_calls = merge_observation_calls(&after, "merge999");
+        let missing = super::super::merge_commit_command(&repository(), PrNumber(101));
+        let (_, output) = observation_calls
+            .iter_mut()
+            .find(|(command, _)| command == &missing)
+            .expect("fixture merge-commit read");
+        *output = CommandOutput::success(serde_json::json!({"mergeCommit": null}).to_string());
+        calls.extend(observation_calls);
+        let adapter = GitHubMutationAdapter::new(FakeRunner::new(calls));
+
+        let receipt = adapter
+            .native_stack_merge_poll_unlocked(&repository(), &checkpoint)
+            .unwrap();
+
+        assert_eq!(receipt.status, GitHubStackMergeStatus::Indeterminate);
+        assert!(
+            !receipt
+                .observation
+                .as_ref()
+                .unwrap()
+                .selected_merge_commits_complete
+        );
         assert!(receipt.verify());
         adapter.runner.assert_exhausted();
     }
@@ -2063,6 +2149,11 @@ mod tests {
         assert_eq!(receipt.status, GitHubStackMergeStatus::Merged);
         let observation = receipt.observation.as_ref().unwrap();
         assert_eq!(observation.selected_merged, 1);
+        assert!(observation.selected_merge_commits_complete);
+        assert_eq!(
+            observation.selected[0].merge_commit,
+            Some(CommitOid("merge111".to_owned()))
+        );
         assert!(observation.remaining_order_exact);
         assert_eq!(observation.remaining[0].base, observation.default_branch);
         assert!(receipt.verify());

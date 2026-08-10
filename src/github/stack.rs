@@ -398,7 +398,7 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
         if let Some(existing) =
             self.find_intersecting_generation(repository, &inventory, &plan.desired)?
         {
-            if existing.topology == plan.desired {
+            if provider_converged_create_topology(&plan.desired, &existing.topology) {
                 return Ok(stack_receipt(StackReceiptInput {
                     repository,
                     operation_id: &plan.operation_id,
@@ -424,7 +424,8 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
 
         match (response, rediscovered) {
             (Ok(output), Ok(Some(after)))
-                if output.is_success() && after.topology == plan.desired =>
+                if output.is_success()
+                    && provider_converged_create_topology(&plan.desired, &after.topology) =>
             {
                 let mut request = create_request(repository, &plan.desired);
                 request.github_request_id = request_id;
@@ -441,7 +442,8 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
                 }))
             }
             (Ok(output), Ok(Some(after)))
-                if !output.is_success() && after.topology == plan.desired =>
+                if !output.is_success()
+                    && provider_converged_create_topology(&plan.desired, &after.topology) =>
             {
                 let mut request = create_request(repository, &plan.desired);
                 request.github_request_id = request_id;
@@ -457,7 +459,9 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
                     provider_output,
                 }))
             }
-            (Err(_), Ok(Some(after))) if after.topology == plan.desired => {
+            (Err(_), Ok(Some(after)))
+                if provider_converged_create_topology(&plan.desired, &after.topology) =>
+            {
                 Ok(stack_receipt(StackReceiptInput {
                     repository,
                     operation_id: &plan.operation_id,
@@ -495,7 +499,12 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
         validate_add_plan(repository, plan)?;
         let actual = self.native_stack_generation(repository, plan.before.number)?;
         if actual.as_ref().is_some_and(|generation| {
-            same_stack_identity(generation, &plan.before) && generation.topology == plan.desired
+            same_stack_identity(generation, &plan.before)
+                && provider_converged_add_topology(
+                    &plan.before.topology,
+                    &plan.desired,
+                    &generation.topology,
+                )
         }) {
             let actual = actual.expect("checked Some");
             return Ok(stack_receipt(StackReceiptInput {
@@ -616,7 +625,16 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
             self.native_stack_generation(mutation.repository, mutation.before.number);
         let postcondition = |actual: &Option<GitHubStackGeneration>| match mutation.desired_after {
             Some(desired) => actual.as_ref().is_some_and(|generation| {
-                same_stack_identity(generation, mutation.before) && &generation.topology == desired
+                same_stack_identity(generation, mutation.before)
+                    && if mutation.operation == GitHubStackMutationOperation::Add {
+                        provider_converged_add_topology(
+                            &mutation.before.topology,
+                            desired,
+                            &generation.topology,
+                        )
+                    } else {
+                        &generation.topology == desired
+                    }
             }),
             None => actual.is_none(),
         };
@@ -1070,6 +1088,57 @@ fn validate_add_plan(
         ));
     }
     validate_open_entries(&plan.desired, plan.before.topology.entries.len())
+}
+
+/// GitHub may rebase exactly the newly appended tail while committing native
+/// Stack membership. Existing entries are immutable authority; accepting any
+/// earlier head/base change would turn an intended append into silent drift.
+fn provider_converged_create_topology(
+    desired: &GitHubStackTopology,
+    actual: &GitHubStackTopology,
+) -> bool {
+    let Some(prefix_len) = desired.entries.len().checked_sub(1) else {
+        return false;
+    };
+    let before = GitHubStackTopology {
+        base: desired.base.clone(),
+        entries: desired.entries[..prefix_len].to_vec(),
+    };
+    provider_converged_add_topology(&before, desired, actual)
+}
+
+pub(crate) fn provider_converged_add_topology(
+    before: &GitHubStackTopology,
+    desired: &GitHubStackTopology,
+    actual: &GitHubStackTopology,
+) -> bool {
+    let prefix_len = before.entries.len();
+    if desired.base != before.base
+        || actual.base != before.base
+        || desired.entries.len() != prefix_len.saturating_add(1)
+        || actual.entries.len() != desired.entries.len()
+        || actual.entries[..prefix_len] != before.entries
+    {
+        return false;
+    }
+    let (Some(predecessor), Some(expected), Some(observed)) = (
+        before.entries.last(),
+        desired.entries.get(prefix_len),
+        actual.entries.get(prefix_len),
+    ) else {
+        return false;
+    };
+    expected.base == predecessor.head
+        && observed.position == expected.position
+        && observed.pr == expected.pr
+        && observed.pull_request_state == PullRequestState::Open
+        && observed.stack_state.eq_ignore_ascii_case("open")
+        && !observed.draft
+        && observed.merged_at.is_none()
+        && observed.base == predecessor.head
+        && observed.head.repository == expected.head.repository
+        && observed.head.name == expected.head.name
+        && !observed.head.oid.0.trim().is_empty()
 }
 
 pub(super) fn validate_topology(
@@ -2010,6 +2079,61 @@ mod tests {
     }
 
     #[test]
+    fn create_accepts_only_provider_converged_new_tail_generation() {
+        let desired = topology(2);
+        let mut converged = desired.clone();
+        converged.entries[1].head.oid = CommitOid("provider-rebased-tail".to_owned());
+        let mut calls = vec![inventory_call(&[])];
+        calls.extend(fresh_topology_calls(&desired));
+        calls.push((
+            native_stack_create_command(&repository(), &desired),
+            success_with_request_id(),
+        ));
+        calls.push(inventory_call(std::slice::from_ref(&converged)));
+        calls.extend(generation_observation_calls(&converged));
+        let adapter = GitHubMutationAdapter::new(FakeRunner::new(calls));
+        let plan = GitHubStackCreatePlan {
+            operation_id: "op-create-converged-tail".to_owned(),
+            actor: "cara".to_owned(),
+            desired,
+        };
+
+        let receipt = adapter.native_stack_create(&repository(), &plan).unwrap();
+
+        assert_eq!(
+            receipt.disposition,
+            GitHubStackMutationDisposition::Completed
+        );
+        assert_eq!(receipt.after, Some(generation(converged)));
+        assert!(receipt.verify());
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn provider_converged_create_retry_is_zero_write() {
+        let desired = topology(2);
+        let mut converged = desired.clone();
+        converged.entries[1].head.oid = CommitOid("provider-rebased-tail".to_owned());
+        let mut calls = vec![inventory_call(std::slice::from_ref(&converged))];
+        calls.extend(generation_observation_calls(&converged));
+        let adapter = GitHubMutationAdapter::new(FakeRunner::new(calls));
+        let plan = GitHubStackCreatePlan {
+            operation_id: "op-create-converged-retry".to_owned(),
+            actor: "cara".to_owned(),
+            desired,
+        };
+
+        let receipt = adapter.native_stack_create(&repository(), &plan).unwrap();
+
+        assert_eq!(
+            receipt.disposition,
+            GitHubStackMutationDisposition::AlreadySatisfied
+        );
+        assert_eq!(receipt.after, Some(generation(converged)));
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
     fn create_rediscovery_recovers_an_ambiguous_provider_response() {
         let desired = topology(2);
         let mut calls = vec![inventory_call(&[])];
@@ -2155,6 +2279,101 @@ mod tests {
         assert_eq!(receipt.after, Some(generation(desired)));
         assert_eq!(receipt.request.ordered_pull_requests, [PrNumber(103)]);
         assert!(receipt.verify());
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn add_accepts_only_provider_converged_new_tail_generation() {
+        let before_topology = topology(2);
+        let desired = topology(3);
+        let mut converged = desired.clone();
+        converged.entries[2].head.oid = CommitOid("provider-rebased-tail".to_owned());
+        let before = generation(before_topology.clone());
+        let plan = GitHubStackAddPlan {
+            operation_id: "op-add-converged-tail".to_owned(),
+            actor: "cara".to_owned(),
+            before: before.clone(),
+            desired: desired.clone(),
+        };
+        let mut calls = direct_generation_calls(&before_topology);
+        calls.extend(fresh_topology_calls(&desired));
+        calls.extend(direct_generation_calls(&before_topology));
+        calls.push((
+            native_stack_add_command(&repository(), &plan),
+            success_with_request_id(),
+        ));
+        calls.extend(direct_generation_calls(&converged));
+        let adapter = GitHubMutationAdapter::new(FakeRunner::new(calls));
+
+        let receipt = adapter.native_stack_add(&repository(), &plan).unwrap();
+
+        assert_eq!(
+            receipt.disposition,
+            GitHubStackMutationDisposition::Completed
+        );
+        assert_eq!(receipt.before, Some(before));
+        assert_eq!(receipt.after, Some(generation(converged)));
+        assert!(receipt.verify());
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn provider_converged_add_retry_is_zero_write() {
+        let before_topology = topology(2);
+        let desired = topology(3);
+        let mut converged = desired.clone();
+        converged.entries[2].head.oid = CommitOid("provider-rebased-tail".to_owned());
+        let adapter =
+            GitHubMutationAdapter::new(FakeRunner::new(direct_generation_calls(&converged)));
+        let plan = GitHubStackAddPlan {
+            operation_id: "op-add-converged-retry".to_owned(),
+            actor: "cara".to_owned(),
+            before: generation(before_topology),
+            desired,
+        };
+
+        let receipt = adapter.native_stack_add(&repository(), &plan).unwrap();
+
+        assert_eq!(
+            receipt.disposition,
+            GitHubStackMutationDisposition::AlreadySatisfied
+        );
+        assert_eq!(receipt.after, Some(generation(converged)));
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn add_refuses_provider_rewrite_of_existing_member() {
+        let before_topology = topology(2);
+        let desired = topology(3);
+        let mut drifted = desired.clone();
+        drifted.entries[0].head.oid = CommitOid("rewritten-existing-root".to_owned());
+        drifted.entries[1].base = drifted.entries[0].head.clone();
+        let plan = GitHubStackAddPlan {
+            operation_id: "op-add-existing-drift".to_owned(),
+            actor: "cara".to_owned(),
+            before: generation(before_topology.clone()),
+            desired: desired.clone(),
+        };
+        let mut calls = direct_generation_calls(&before_topology);
+        calls.extend(fresh_topology_calls(&desired));
+        calls.extend(direct_generation_calls(&before_topology));
+        calls.push((
+            native_stack_add_command(&repository(), &plan),
+            success_with_request_id(),
+        ));
+        calls.extend(direct_generation_calls(&drifted));
+        let adapter = GitHubMutationAdapter::new(FakeRunner::new(calls));
+
+        let error = adapter.native_stack_add(&repository(), &plan).unwrap_err();
+
+        assert!(matches!(
+            error,
+            GitHubStackMutationError::PostconditionFailed {
+                operation: GitHubStackMutationOperation::Add,
+                ..
+            }
+        ));
         adapter.runner.assert_exhausted();
     }
 
