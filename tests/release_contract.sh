@@ -154,9 +154,18 @@ tar -xzf "$archive" -C "$workspace"
 # advertises the label; aarch64-linux is out until ms-dev-2 has spare capacity
 # or a second aarch64-capable runner exists.
 for target in x86_64-linux aarch64-darwin; do
-  grep -q -- "- target: $target" .github/workflows/release.yml
+  grep -q -- "\"target\":\"$target\"" .github/workflows/release.yml
 done
-if grep -q -- '^ *- target: aarch64-linux' .github/workflows/release.yml; then
+# shellcheck disable=SC2016 # workflow expressions are matched literally.
+grep -Fq 'matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}' .github/workflows/release.yml
+# shellcheck disable=SC2016 # runner environment reference is matched literally.
+grep -Fq 'git_config="$RUNNER_TEMP/' .github/workflows/release.yml
+grep -Fq 'unsupported release target' .github/workflows/release.yml
+if grep -Fq 'git config --global --unset-all' .github/workflows/release.yml; then
+  echo "release workflow must not mutate persistent-runner global Git config" >&2
+  exit 1
+fi
+if grep -q -- '"target":"aarch64-linux"' .github/workflows/release.yml; then
   echo "release.yml schedules aarch64-linux; it is starved on ms-dev-2, so keep it backfilled until another aarch64 runner exists" >&2
   exit 1
 fi
