@@ -78,6 +78,7 @@ fn release_workflow_isolates_git_and_selects_exact_backfill_target() {
         "} >> \"$GITHUB_OUTPUT\"",
         "matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}",
         "ref: ${{ needs.resolve.outputs.tag }}",
+        "git show \"$GITHUB_SHA:.github/workflows/release.yml\" > .github/workflows/release.yml",
     ] {
         assert!(
             RELEASE_WORKFLOW.contains(required),

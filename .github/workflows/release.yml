@@ -151,6 +151,7 @@ jobs:
           contract="$RUNNER_TEMP/release-contract.sh"
           git show "$GITHUB_SHA:tests/release_contract.sh" > "$contract"
           git show "$GITHUB_SHA:scripts/release.sh" > scripts/release.sh
+          git show "$GITHUB_SHA:.github/workflows/release.yml" > .github/workflows/release.yml
           chmod 0755 "$contract" scripts/release.sh
           nix develop --command "$contract" target/debug/cara
 
