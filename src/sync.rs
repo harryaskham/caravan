@@ -5418,6 +5418,35 @@ fn native_route_context(error: &AppError, status: &StatusOutput, caravan: &Carav
 }
 
 #[allow(clippy::too_many_arguments)]
+fn native_stack_number_for_caravan(
+    status: &StatusOutput,
+    provider: &impl SyncProvider,
+    caravan: &Caravan,
+    native: Option<&NativeSyncContext>,
+) -> Result<Option<u64>, AppError> {
+    let Some(native) = native else {
+        return Ok(None);
+    };
+    let intersections = provider
+        .native_stack_intersections_for_sync(&status.repository, &caravan.members)
+        .map_err(|error| native_route_context(&error, status, caravan))?;
+    let route = crate::stack_policy::route_landing(
+        &native.config,
+        &status.stack_backend,
+        caravan,
+        &intersections,
+        &status.analysis.pull_requests,
+    )
+    .map_err(|error| native_route_context(&error, status, caravan))?;
+    Ok(match route {
+        crate::stack_policy::StackLandingRoute::NativeStack { stack_number, .. } => {
+            Some(stack_number)
+        }
+        crate::stack_policy::StackLandingRoute::CaravanOwned
+        | crate::stack_policy::StackLandingRoute::SingletonCaravanOwned => None,
+    })
+}
+
 fn reconcile_caravan(
     status: &StatusOutput,
     provider: &impl SyncProvider,
@@ -5434,26 +5463,8 @@ fn reconcile_caravan(
     // discovery-time projection. It runs before promotion, auto-merge disarm,
     // force handling, or any landing write, so an intersecting provider Stack
     // can never fall through to synchronous `gh pr merge`.
-    let landing_route = if let Some(native) = progress.native_stack.as_ref() {
-        let intersections = provider
-            .native_stack_intersections_for_sync(&status.repository, &caravan.members)
-            .map_err(|error| native_route_context(&error, status, caravan))?;
-        crate::stack_policy::route_landing(
-            &native.config,
-            &status.stack_backend,
-            caravan,
-            &intersections,
-            &status.analysis.pull_requests,
-        )
-        .map_err(|error| native_route_context(&error, status, caravan))?
-    } else {
-        crate::stack_policy::StackLandingRoute::CaravanOwned
-    };
-    let native_stack_number = match landing_route {
-        crate::stack_policy::StackLandingRoute::NativeStack { stack_number } => Some(stack_number),
-        crate::stack_policy::StackLandingRoute::CaravanOwned
-        | crate::stack_policy::StackLandingRoute::SingletonCaravanOwned => None,
-    };
+    let native_stack_number =
+        native_stack_number_for_caravan(status, provider, caravan, progress.native_stack.as_ref())?;
 
     // Step 1 of the fenced transaction. Promotion always precedes any merge
     // mechanism: a root whose base is still an already-merged predecessor
@@ -8106,13 +8117,19 @@ impl SyncProgress {
                 );
                 return Ok(());
             }
-            if prefix.selected.len() != stack.topology.entries.len() {
+            let current_open = stack
+                .topology
+                .entries
+                .iter()
+                .filter(|entry| entry.pull_request_state == PullRequestState::Open)
+                .collect::<Vec<_>>();
+            if prefix.selected.len() != current_open.len() {
                 let selected = prefix
                     .selected
                     .iter()
                     .map(|entry| entry.pr)
                     .collect::<Vec<_>>();
-                let blocked_suffix = stack.topology.entries[prefix.selected.len()..]
+                let blocked_suffix = current_open[prefix.selected.len()..]
                     .iter()
                     .map(|entry| entry.pr)
                     .collect::<Vec<_>>();

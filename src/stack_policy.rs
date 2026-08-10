@@ -17,7 +17,7 @@ use crate::github::{
     GitHubStackMergeEntryEvidence,
 };
 use crate::model::{
-    Caravan, CompatibilityOutcome, CompatibilityReport, MergeCandidateFreshness,
+    BranchSnapshot, Caravan, CompatibilityOutcome, CompatibilityReport, MergeCandidateFreshness,
     MergeCandidateIdentity, PrNumber, PullRequestSnapshot, PullRequestState,
 };
 use crate::read::StatusOutput;
@@ -186,6 +186,26 @@ fn synthetic_candidate_blocker(
     None
 }
 
+/// One exact member generation named by a native routing classification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct NativeStackMemberIdentity {
+    pub pr: PrNumber,
+    pub head: BranchSnapshot,
+}
+
+/// Why one exact provider Stack owns the current caravan generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", tag = "classification")]
+pub enum NativeStackRoutingClassification {
+    Exact,
+    /// GitHub retained the merged prefix in the Stack resource and retargeted
+    /// the first remaining open PR to the Stack base.
+    MergedPredecessorBaseCollapsed {
+        merged_predecessors: Vec<NativeStackMemberIdentity>,
+        current_members: Vec<NativeStackMemberIdentity>,
+    },
+}
+
 /// Which landing path a caravan must use.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", tag = "route")]
@@ -198,7 +218,10 @@ pub enum StackLandingRoute {
     SingletonCaravanOwned,
     /// One exact provider Stack, reached only through the lock-fenced
     /// transaction in `github::stack_land`.
-    NativeStack { stack_number: u64 },
+    NativeStack {
+        stack_number: u64,
+        classification: NativeStackRoutingClassification,
+    },
 }
 
 /// Decide the landing path for one caravan, failing closed on every gate.
@@ -258,40 +281,52 @@ pub fn route_landing(
         return Err(mapping_refusal(caravan, intersections));
     };
 
+    route_native_generation(caravan, generation, pull_requests)
+}
+
+fn route_native_generation(
+    caravan: &Caravan,
+    generation: &GitHubStackGeneration,
+    pull_requests: &BTreeMap<PrNumber, PullRequestSnapshot>,
+) -> Result<StackLandingRoute, crate::AppError> {
     let actual_members = generation
         .topology
         .entries
         .iter()
         .map(|entry| entry.pr)
         .collect::<Vec<_>>();
-    let mut changed_fields = Vec::new();
-    if actual_members != caravan.members {
-        changed_fields.push("ordered_members".to_owned());
-    }
-    if !generation.open {
-        changed_fields.push("stack_open".to_owned());
-    }
-    for entry in &generation.topology.entries {
-        let Some(current) = pull_requests.get(&entry.pr) else {
-            changed_fields.push(format!("pr_{}_missing", entry.pr.0));
-            continue;
-        };
-        if entry.pull_request_state != current.state {
-            changed_fields.push(format!("pr_{}_state", entry.pr.0));
+    let first_open = generation
+        .topology
+        .entries
+        .iter()
+        .position(|entry| entry.pull_request_state == PullRequestState::Open)
+        .unwrap_or(generation.topology.entries.len());
+    let current_members = actual_members[first_open..].to_vec();
+    let identity = |entry: &GitHubStackEntryGeneration| NativeStackMemberIdentity {
+        pr: entry.pr,
+        head: entry.head.clone(),
+    };
+    let classification = if first_open == 0 {
+        NativeStackRoutingClassification::Exact
+    } else {
+        NativeStackRoutingClassification::MergedPredecessorBaseCollapsed {
+            merged_predecessors: generation.topology.entries[..first_open]
+                .iter()
+                .map(identity)
+                .collect(),
+            current_members: generation.topology.entries[first_open..]
+                .iter()
+                .map(identity)
+                .collect(),
         }
-        if entry.draft != current.draft {
-            changed_fields.push(format!("pr_{}_draft", entry.pr.0));
-        }
-        if entry.merged_at != current.merged_at {
-            changed_fields.push(format!("pr_{}_merged_at", entry.pr.0));
-        }
-        if entry.base != current.base {
-            changed_fields.push(format!("pr_{}_base", entry.pr.0));
-        }
-        if entry.head != current.head {
-            changed_fields.push(format!("pr_{}_head", entry.pr.0));
-        }
-    }
+    };
+    let mut changed_fields = generation_drift_fields(
+        generation,
+        pull_requests,
+        first_open,
+        &current_members,
+        caravan,
+    );
     changed_fields.sort();
     changed_fields.dedup();
     if !changed_fields.is_empty() {
@@ -302,10 +337,56 @@ pub fn route_landing(
             &changed_fields,
         ));
     }
-
     Ok(StackLandingRoute::NativeStack {
         stack_number: generation.number,
+        classification,
     })
+}
+
+fn generation_drift_fields(
+    generation: &GitHubStackGeneration,
+    pull_requests: &BTreeMap<PrNumber, PullRequestSnapshot>,
+    first_open: usize,
+    current_members: &[PrNumber],
+    caravan: &Caravan,
+) -> Vec<String> {
+    let mut changed = Vec::new();
+    if generation.topology.entries[..first_open]
+        .iter()
+        .any(|entry| {
+            entry.pull_request_state != PullRequestState::Merged || entry.merged_at.is_none()
+        })
+    {
+        changed.push("merged_prefix_state".to_owned());
+    }
+    if current_members != caravan.members {
+        changed.push("ordered_members".to_owned());
+    }
+    if !generation.open {
+        changed.push("stack_open".to_owned());
+    }
+    for entry in &generation.topology.entries {
+        let Some(current) = pull_requests.get(&entry.pr) else {
+            changed.push(format!("pr_{}_missing", entry.pr.0));
+            continue;
+        };
+        if entry.pull_request_state != current.state {
+            changed.push(format!("pr_{}_state", entry.pr.0));
+        }
+        if entry.draft != current.draft {
+            changed.push(format!("pr_{}_draft", entry.pr.0));
+        }
+        if entry.merged_at != current.merged_at {
+            changed.push(format!("pr_{}_merged_at", entry.pr.0));
+        }
+        if entry.base != current.base {
+            changed.push(format!("pr_{}_base", entry.pr.0));
+        }
+        if entry.head != current.head {
+            changed.push(format!("pr_{}_head", entry.pr.0));
+        }
+    }
+    changed
 }
 
 fn route_refusal(code: &str, message: String, next: &str, retryable: bool) -> crate::AppError {
@@ -442,8 +523,8 @@ mod tests {
                         number: entry.pr,
                         title: format!("PR {}", entry.pr),
                         url: String::new(),
-                        state: PullRequestState::Open,
-                        draft: false,
+                        state: entry.pull_request_state,
+                        draft: entry.draft,
                         head: entry.head.clone(),
                         base: entry.base.clone(),
                         cross_repository: false,
@@ -451,7 +532,7 @@ mod tests {
                         auto_merge: AutoMergeState::disabled(),
                         checks: Vec::new(),
                         created_at: None,
-                        merged_at: None,
+                        merged_at: entry.merged_at.clone(),
                         updated_at: None,
                         merge_state_status: None,
                     },
@@ -723,6 +804,51 @@ mod tests {
         generation
     }
 
+    fn collapsed_stack(merged_prefix: usize) -> GitHubStackGeneration {
+        assert!((1..=2).contains(&merged_prefix));
+        let base = branch("main", "main-current");
+        let mut entries: Vec<GitHubStackEntryGeneration> = Vec::new();
+        for position in 0..merged_prefix {
+            let entry_base = if position == 0 {
+                branch("main", "main-before-prefix")
+            } else {
+                entries[position - 1].head.clone()
+            };
+            entries.push(GitHubStackEntryGeneration {
+                position: u32::try_from(position).unwrap(),
+                pr: PrNumber(101 + u64::try_from(position).unwrap()),
+                stack_state: "merged".to_owned(),
+                pull_request_state: PullRequestState::Merged,
+                draft: false,
+                merged_at: Some(format!("2026-08-0{}T09:00:00Z", position + 1)),
+                base: entry_base,
+                head: branch(
+                    &format!("head-{}", position + 101),
+                    &format!("merged-{position}"),
+                ),
+            });
+        }
+        let current = 101 + u64::try_from(merged_prefix).unwrap();
+        entries.push(GitHubStackEntryGeneration {
+            position: u32::try_from(merged_prefix).unwrap(),
+            pr: PrNumber(current),
+            stack_state: "open".to_owned(),
+            pull_request_state: PullRequestState::Open,
+            draft: false,
+            merged_at: None,
+            base: branch("main", "main-after-prefix-merge"),
+            head: branch(&format!("head-{current}"), "current-open"),
+        });
+        GitHubStackGeneration {
+            id: 1,
+            number: 42,
+            node_id: "S_collapsed".to_owned(),
+            open: true,
+            created_at: "2026-08-01T09:00:00Z".to_owned(),
+            topology: GitHubStackTopology { base, entries },
+        }
+    }
+
     #[test]
     fn the_default_backend_routes_to_caravan_without_consulting_any_gate() {
         let hostile = backend(crate::read::StackCapability::Unavailable);
@@ -755,8 +881,96 @@ mod tests {
                 &pulls,
             )
             .expect("an exact intersecting Stack always uses the native backend");
-            assert_eq!(route, StackLandingRoute::NativeStack { stack_number: 42 });
+            assert_eq!(
+                route,
+                StackLandingRoute::NativeStack {
+                    stack_number: 42,
+                    classification: NativeStackRoutingClassification::Exact,
+                }
+            );
         }
+    }
+
+    #[test]
+    fn merged_prefix_routes_the_exact_remaining_frontier_natively() {
+        for merged_count in [1, 2] {
+            let generation = collapsed_stack(merged_count);
+            let current = generation.topology.entries[merged_count].pr;
+            let pulls = pull_requests(&generation);
+            let route = route_landing(
+                &github_config(),
+                &backend(crate::read::StackCapability::Available),
+                &caravan(&[current.0]),
+                std::slice::from_ref(&generation),
+                &pulls,
+            )
+            .expect("a proven merged prefix owns its exact remaining open frontier");
+            assert_eq!(
+                route,
+                StackLandingRoute::NativeStack {
+                    stack_number: 42,
+                    classification:
+                        NativeStackRoutingClassification::MergedPredecessorBaseCollapsed {
+                            merged_predecessors: generation.topology.entries[..merged_count]
+                                .iter()
+                                .map(|entry| NativeStackMemberIdentity {
+                                    pr: entry.pr,
+                                    head: entry.head.clone(),
+                                })
+                                .collect(),
+                            current_members: vec![NativeStackMemberIdentity {
+                                pr: current,
+                                head: generation.topology.entries[merged_count].head.clone(),
+                            }],
+                        },
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn collapsed_frontier_drift_and_unmerged_prefix_fail_closed() {
+        let exact = collapsed_stack(1);
+        let current = exact.topology.entries[1].pr;
+
+        let mut unmerged = exact.clone();
+        unmerged.topology.entries[0].pull_request_state = PullRequestState::Closed;
+        unmerged.topology.entries[0].merged_at = None;
+        let error = route_landing(
+            &github_config(),
+            &backend(crate::read::StackCapability::Available),
+            &caravan(&[current.0]),
+            &[unmerged.clone()],
+            &pull_requests(&unmerged),
+        )
+        .expect_err("an unmerged predecessor never authorizes collapsed routing");
+        assert_eq!(error.code(), "github_stack_generation_drifted");
+        assert!(
+            error.details().unwrap()["changed_fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "merged_prefix_state")
+        );
+
+        let mut moved = pull_requests(&exact);
+        moved.get_mut(&current).unwrap().head.oid = CommitOid("moved".to_owned());
+        let error = route_landing(
+            &github_config(),
+            &backend(crate::read::StackCapability::Available),
+            &caravan(&[current.0]),
+            &[exact],
+            &moved,
+        )
+        .expect_err("provider drift after routing evidence must refuse");
+        assert_eq!(error.code(), "github_stack_generation_drifted");
+        assert!(
+            error.details().unwrap()["changed_fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == format!("pr_{}_head", current.0).as_str())
+        );
     }
 
     #[test]

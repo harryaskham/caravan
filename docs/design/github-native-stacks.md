@@ -203,9 +203,15 @@ source generation. It never force-pushes a source branch to make it cumulative.
 
 ### Merge selection
 
-The planner identifies the maximal contiguous prefix beginning at the Stack
-bottom. The executable sync path submits only when that prefix is the complete
-Stack. If a blocked suffix remains, sync returns
+The planner identifies the maximal contiguous prefix beginning at the first
+remaining open Stack entry. Ordinarily that is the Stack bottom. After GitHub
+merges a prefix it may retain those merged entries while retargeting the first
+open entry to the Stack base; Cara accepts that
+`merged_predecessor_base_collapsed` frontier only after proving exact provider
+order/state, predecessor merge-commit and recorded-base ancestry in current
+main, and an exact current open suffix. The executable sync path submits only
+when the selected prefix is the complete remaining open frontier. If a blocked
+open suffix remains, sync returns
 `github_stack_partial_prefix_requires_tail_eviction` before lock/submission and
 requires typed evict/split; GitHub's partial merge would otherwise replace the
 unselected tail source head. Every submitted entry is:
@@ -239,9 +245,10 @@ permissions; see `docs/validation/github-native-stack-sandbox-2026-07-31.md`.
 2. `PUT merge-async` with `merge_method: squash`, configured merge action, and exact top head SHA.
 3. Persist `uuid`, expected head, selected entries, and initial status before polling.
 4. Poll under the one tick deadline with bounded cadence.
-5. On `merged`, fresh-read default and every selected PR. Prove every entry in
-   the fully selected Stack merged at its sealed immutable source head; no
-   unselected suffix is permitted.
+5. On `merged`, fresh-read default and every selected PR. Prove every selected
+   open-frontier entry merged at its sealed immutable source head; no unselected
+   open suffix is permitted. A previously proven merged prefix remains
+   observation-only evidence and is never resubmitted.
 6. On `enqueued`, return queue-owned state and observe later; do not claim merge.
 7. On `failed`, return the provider message plus unchanged/partial provider proof. The documented direct operation is atomic, but Cara still verifies.
 8. On timeout/transport ambiguity, rediscover before any retry. The uuid result lasts 24 hours.

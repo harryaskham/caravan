@@ -693,9 +693,16 @@ candidate member to its exact current ordered PR/base/head/state generation
 **before** root-first landing, promotion, auto-merge disarm, force handling, or
 ordinary merge. Only an authoritative singleton with proven zero intersections
 uses Cara's ordinary root validation/merge path. One exact singleton or
-multi-entry intersection uses the lock-fenced asynchronous Stack backend;
-partial, cross-mapped, stale, truncated, unreadable, or multiple intersections
-fail as non-retryable external decisions without a landing write. If a Stack
+multi-entry intersection uses the lock-fenced asynchronous Stack backend. When
+GitHub retains a merged prefix and retargets the first remaining open member to
+the Stack base, Cara proves every predecessor is freshly merged, its merge
+commit and recorded base are contained by current main, the historical prefix
+order is exact, and the current open suffix exactly equals the Cara caravan.
+That typed `merged_predecessor_base_collapsed` frontier stays on the native
+backend; planning skips the proven merged prefix and selects from the first
+remaining open entry. Partial, cross-mapped, stale, truncated, unreadable, or
+multiple intersections fail as non-retryable external decisions without a
+landing write. If a Stack
 races into existence after the absence proof and GitHub refuses the ordinary
 merge, Cara returns `github_stack_membership_detected_during_owned_merge`
 instead of retrying the same synchronous call. Zero intersections for 2+

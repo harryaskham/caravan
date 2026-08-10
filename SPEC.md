@@ -1274,11 +1274,20 @@ selects the explicit `singleton_caravan_owned` route: Cara reuses ordinary exact
 head/base/check/tree root validation and direct squash merge, creates no Stack,
 and never rewrites the source head. Exactly one intersecting generation routes
 to the existing checkpointed complete-generation lock and asynchronous Stack
-merge backend only when its ordered members and every current PR generation
+merge backend only when its current ordered members and every PR generation
 exactly match Cara authority; this includes provider-represented singletons.
-Partial/cross/orphan mappings, head/base/state drift, multiple intersections,
-truncated inventory, and capability/read uncertainty refuse before a landing
-mutation with `retryable: false` and scheduler `external_decision`. Multi-member
+GitHub may retain a merged prefix in the Stack resource after retargeting the
+first remaining open member to the Stack base. That
+`merged_predecessor_base_collapsed` frontier is exact only when every preceding
+entry is freshly merged in provider order, every predecessor merge commit and
+the recorded collapsed base are ancestors of current main, the remaining open
+suffix exactly equals the current Cara caravan, and a pre-mutation reread proves
+the same generation. Planning skips only that proven merged prefix and treats
+the first remaining open entry as the bottom of the mergeable frontier. Missing
+merge commits, non-ancestor or wrong-base evidence, unmerged/partial prefixes,
+cross/orphan mappings, head/base/state drift, multiple intersections, truncated
+inventory, and capability/read uncertainty refuse before a landing mutation
+with `retryable: false` and scheduler `external_decision`. Multi-member
 zero-intersection topology also refuses. If native membership races into
 existence after an exact singleton absence read, GitHub's Stack-specific direct-
 merge refusal becomes

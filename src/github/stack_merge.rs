@@ -123,9 +123,15 @@ pub fn plan_github_stack_ready_prefix(
         }
     }
 
+    let first_open = stack
+        .topology
+        .entries
+        .iter()
+        .position(|entry| entry.pull_request_state == PullRequestState::Open)
+        .unwrap_or(stack.topology.entries.len());
     let mut selected = Vec::new();
     let mut first_blocked = None;
-    for item in evidence {
+    for item in evidence.iter().skip(first_open) {
         let entry = &item.generation;
         let mut blockers = Vec::new();
         if !stack.open {
@@ -808,9 +814,17 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
                 self.refetch_pull_request(repository, entry.pr)?,
             ));
         }
+        let selected_start = plan
+            .before
+            .topology
+            .entries
+            .iter()
+            .position(|entry| entry.pull_request_state == PullRequestState::Open)
+            .unwrap_or(plan.before.topology.entries.len());
         let selected_count = plan.selected.len();
-        let selected = observed[..selected_count].to_vec();
-        let remaining = observed[selected_count..].to_vec();
+        let selected_end = selected_start + selected_count;
+        let selected = observed[selected_start..selected_end].to_vec();
+        let remaining = observed[selected_end..].to_vec();
         let selected_merged = selected
             .iter()
             .filter(|entry| entry.state == PullRequestState::Merged && entry.merged_at.is_some())
@@ -823,7 +837,7 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
             .collect::<Vec<_>>();
         let selected_heads_exact = changed_selected_heads.is_empty();
         let stack_after = self.native_stack_generation(repository, plan.before.number)?;
-        let expected_remaining = plan.before.topology.entries[selected_count..]
+        let expected_remaining = plan.before.topology.entries[selected_end..]
             .iter()
             .map(|entry| entry.pr)
             .collect::<Vec<_>>();
@@ -1030,12 +1044,32 @@ fn validate_merge_plan(
             "selected Stack merge prefix must be non-empty and bounded by the Stack",
         ));
     }
-    if !plan.before.open
-        || plan.selected.as_slice() != &plan.before.topology.entries[..plan.selected.len()]
+    let first_open = plan
+        .before
+        .topology
+        .entries
+        .iter()
+        .position(|entry| entry.pull_request_state == PullRequestState::Open)
+        .unwrap_or(plan.before.topology.entries.len());
+    if plan.before.topology.entries[..first_open]
+        .iter()
+        .any(|entry| {
+            entry.pull_request_state != PullRequestState::Merged || entry.merged_at.is_none()
+        })
     {
         return Err(invalid_plan(
             "github_stack_merge_prefix_invalid",
-            "selected entries must be the exact bottom prefix of one open Stack generation",
+            "only a freshly proven merged prefix may precede selected open entries",
+        ));
+    }
+    let selected_end = first_open + plan.selected.len();
+    if !plan.before.open
+        || selected_end > plan.before.topology.entries.len()
+        || plan.selected.as_slice() != &plan.before.topology.entries[first_open..selected_end]
+    {
+        return Err(invalid_plan(
+            "github_stack_merge_prefix_invalid",
+            "selected entries must be the exact first remaining open prefix of one open Stack generation",
         ));
     }
     for entry in &plan.selected {
@@ -1479,6 +1513,51 @@ mod tests {
                 CommandOutput::success(pull_request_json(entry)),
             )
         }));
+        if let Some(first_open) = stack
+            .topology
+            .entries
+            .iter()
+            .position(|entry| entry.pull_request_state == PullRequestState::Open)
+            .filter(|position| *position > 0)
+        {
+            let current = &stack.topology.entries[first_open];
+            for ancestor in [&current.base.oid, &stack.topology.entries[0].base.oid] {
+                calls.push((
+                    super::super::compare_commits_command(
+                        &repository(),
+                        ancestor,
+                        &stack.topology.base.oid,
+                    ),
+                    CommandOutput::success(
+                        serde_json::json!({
+                            "status": if ancestor == &stack.topology.base.oid {
+                                "identical"
+                            } else {
+                                "ahead"
+                            }
+                        })
+                        .to_string(),
+                    ),
+                ));
+            }
+            for predecessor in &stack.topology.entries[..first_open] {
+                let merge_commit = CommitOid(format!("merge{}", predecessor.pr.0));
+                calls.push((
+                    super::super::merge_commit_command(&repository(), predecessor.pr),
+                    CommandOutput::success(
+                        serde_json::json!({"mergeCommit": {"oid": merge_commit.0}}).to_string(),
+                    ),
+                ));
+                calls.push((
+                    super::super::compare_commits_command(
+                        &repository(),
+                        &merge_commit,
+                        &stack.topology.base.oid,
+                    ),
+                    CommandOutput::success(serde_json::json!({"status": "ahead"}).to_string()),
+                ));
+            }
+        }
         calls
     }
 
@@ -1622,6 +1701,22 @@ mod tests {
             stack.topology.entries,
             "the provider may rewrite an unselected tail after prefix landing, so the lock must cover the complete immutable Stack"
         );
+    }
+
+    #[test]
+    fn planner_skips_a_proven_merged_prefix_and_selects_the_open_frontier() {
+        let mut stack = terminal_stack(generation(), 1);
+        stack.topology.base.oid = CommitOid("merge101".to_owned());
+        stack.topology.entries[1].base = stack.topology.base.clone();
+        let selected = plan_github_stack_ready_prefix(&stack, &ready_evidence(&stack)).unwrap();
+
+        assert_eq!(selected.selected, stack.topology.entries[1..]);
+        assert!(selected.first_blocked.is_none());
+        let plan = selected
+            .direct_squash_plan("op-collapsed", "cara")
+            .expect("the first remaining open entry is the provider merge prefix");
+        assert_eq!(plan.selected, stack.topology.entries[1..]);
+        validate_merge_plan(&repository(), &plan).unwrap();
     }
 
     #[test]
