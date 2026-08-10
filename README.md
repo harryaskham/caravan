@@ -526,12 +526,15 @@ cara-<version>-<target>.tar.gz
 cara-<version>-<target>.sha256
 ```
 
-The two Linux targets are built by the tagged release workflow. `aarch64-darwin`
-is published separately with `just release-backfill-target <tag> aarch64-darwin`
-from a Mac, because no registered CI runner advertises that platform; scheduling
-a job nothing can accept made the whole run hang rather than fail, so the matrix
-omits it deliberately (bd-8b6d28). Restore the matrix entry once a darwin runner
-exists.
+The tagged release workflow builds `x86_64-linux` and `aarch64-darwin` on the
+matching registered runners. Every job uses a unique `RUNNER_TEMP`-scoped Git
+configuration, so anonymous HTTPS rewrites never mutate operator-global state
+on persistent runners. After a terminal platform failure and a reviewed workflow
+fix on green `main`, `workflow_dispatch` accepts the immutable existing `tag`
+plus an exact `target`; the generated matrix contains only that target, so a
+Darwin backfill cannot rebuild or overwrite an already-published Linux asset.
+`aarch64-linux` remains on the bounded `just release-backfill-target` path until
+more than one suitable runner can accept it.
 
 When a repository pins Cara through a flake, `flake.lock` is the upgrade path
 of record and `nix flake update` is the normal way to move versions. Self-update
@@ -591,10 +594,13 @@ just stress                             # timing-sensitive changes: shake out ra
 just release-tag v0.0.75                # fail-closed tag at exact landed main
 ```
 
-A tag is immutable once pushed. If its release workflow fails, do not move or
-reuse the tag: fix the cause and supersede it with the next patch version. A
-bare tag with no release object is not returned by the releases API, so
-`self-update` ignores it.
+A tag is immutable once pushed. If tagged source is wrong, supersede it with the
+next patch version rather than moving or reusing the tag. If green immutable
+source is only missing a platform asset because release infrastructure failed,
+land the workflow repair on green `main`, wait for the original run to become
+terminal, then dispatch that existing tag for the missing target only; never
+overwrite already-published assets. A bare tag with no release object is not
+returned by the releases API, so `self-update` ignores it.
 
 Run `./tests/release_contract.sh target/debug/cara` after building to exercise
 the asset/checksum layout and `cara self-update status` with an isolated home;

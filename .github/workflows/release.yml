@@ -15,6 +15,15 @@ on:
         description: "Existing vX.Y.Z tag to build and publish"
         required: true
         type: string
+      target:
+        description: "Exact target to backfill, or all targets"
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - x86_64-linux
+          - aarch64-darwin
 
 concurrency:
   group: release-${{ github.ref }}-${{ inputs.tag }}
@@ -31,7 +40,24 @@ jobs:
     outputs:
       tag: ${{ steps.context.outputs.tag }}
       version: ${{ steps.context.outputs.version }}
+      target: ${{ steps.context.outputs.target }}
+      matrix: ${{ steps.context.outputs.matrix }}
     steps:
+      - name: Configure isolated anonymous Git
+        shell: bash
+        run: |
+          set -euo pipefail
+          git_config="$RUNNER_TEMP/caravan-release-${GITHUB_RUN_ID}-${GITHUB_JOB}.gitconfig"
+          {
+            echo "GIT_CONFIG_GLOBAL=$git_config"
+            echo "GIT_CONFIG_NOSYSTEM=1"
+          } >> "$GITHUB_ENV"
+          export GIT_CONFIG_GLOBAL="$git_config"
+          export GIT_CONFIG_NOSYSTEM=1
+          umask 077
+          : > "$GIT_CONFIG_GLOBAL"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          test "$(git config --global --get url.https://github.com/.insteadOf)" = "ssh://git@github.com/"
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -40,6 +66,7 @@ jobs:
         run: |
           set -euo pipefail
           tag="${{ inputs.tag || github.ref_name }}"
+          target="${{ inputs.target || 'all' }}"
           version="${tag#v}"
           [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
             echo "release tag must be vX.Y.Z, got: $tag" >&2
@@ -61,8 +88,27 @@ jobs:
             echo "tag $tag does not match tagged Cargo.toml version $cargo_version" >&2
             exit 2
           }
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          case "$target" in
+            all)
+              matrix='{"include":[{"target":"x86_64-linux","runner":["self-hosted","nix","x86_64-linux"],"timeout_minutes":120},{"target":"aarch64-darwin","runner":["self-hosted","nix","aarch64-darwin"],"timeout_minutes":90}]}'
+              ;;
+            x86_64-linux)
+              matrix='{"include":[{"target":"x86_64-linux","runner":["self-hosted","nix","x86_64-linux"],"timeout_minutes":120}]}'
+              ;;
+            aarch64-darwin)
+              matrix='{"include":[{"target":"aarch64-darwin","runner":["self-hosted","nix","aarch64-darwin"],"timeout_minutes":90}]}'
+              ;;
+            *)
+              echo "unsupported release target: $target" >&2
+              exit 2
+              ;;
+          esac
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "target=$target"
+            echo "matrix=$matrix"
+          } >> "$GITHUB_OUTPUT"
 
   test:
     name: release contract
@@ -70,16 +116,25 @@ jobs:
     runs-on: [self-hosted, nix, x86_64-linux]
     timeout-minutes: 30
     steps:
-      - name: Reset persistent-runner Git URL rewrites
+      - name: Configure isolated anonymous Git
         shell: bash
-        run: git config --global --unset-all url."ssh://git@github.com/".insteadOf 2>/dev/null || true
+        run: |
+          set -euo pipefail
+          git_config="$RUNNER_TEMP/caravan-release-${GITHUB_RUN_ID}-${GITHUB_JOB}.gitconfig"
+          {
+            echo "GIT_CONFIG_GLOBAL=$git_config"
+            echo "GIT_CONFIG_NOSYSTEM=1"
+          } >> "$GITHUB_ENV"
+          export GIT_CONFIG_GLOBAL="$git_config"
+          export GIT_CONFIG_NOSYSTEM=1
+          umask 077
+          : > "$GIT_CONFIG_GLOBAL"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          test "$(git config --global --get url.https://github.com/.insteadOf)" = "ssh://git@github.com/"
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.resolve.outputs.tag }}
           fetch-depth: 0
-      - name: Use anonymous HTTPS for public source inputs
-        shell: bash
-        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
       - name: Run the deterministic release suite in the pinned development shell
         # The process/load-sensitive hook target is feature-gated and owned by
         # the scheduled/manual environmental acceptance workflow.
@@ -108,52 +163,27 @@ jobs:
     timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-linux
-            runner: [self-hosted, nix, x86_64-linux]
-            # 120, not 60: this leg builds `caravan-static`, a full musl
-            # cross-compile of the whole dependency tree, where darwin builds
-            # natively. With a warm Nix cache it finishes in minutes; with a cold
-            # or unreachable one it rebuilds everything from source. v0.0.42 was
-            # cancelled at exactly 60:18 on this step while the darwin leg took
-            # 95 seconds, after the internal binary cache had been observed
-            # timing out earlier the same night (bd-dcec46). The removed
-            # aarch64-linux entry already carried 120 for the same reason.
-            timeout_minutes: 120
-          # bd-8b6d28 removed this entry because no runner advertised the label
-          # and the job queued forever. `caravan-ms-mac` now registers
-          # `self-hosted,nix,macOS,ARM64,aarch64-darwin`, so the documented
-          # restore condition is met and darwin builds in CI again instead of
-          # being hand-backfilled after every release.
-          - target: aarch64-darwin
-            runner: [self-hosted, nix, aarch64-darwin]
-            timeout_minutes: 90
-          # bd-893ff0: aarch64-linux is NOT in this matrix, for the same reason
-          # darwin was removed and by the same remedy. Only ms-dev-2 advertises
-          # aarch64 in Nix extra-platforms, so the job is pinned to that one host.
-          # The labels match, so this is starvation rather than unschedulability:
-          # ms-dev-2 has been continuously busy and the job sat queued, leaving
-          # every release since v0.0.31 non-terminal. `continue-on-error` does not
-          # help, because it applies to a job that FAILED, not to one that never
-          # started. Publish the asset with
-          # `just release-backfill-target <tag> aarch64-linux`, and restore this
-          # entry once ms-dev-2 has spare capacity or a second aarch64-capable
-          # runner is registered:
-          #   - target: aarch64-linux
-          #     runner: [self-hosted, nix, ms-dev-2]
-          #     timeout_minutes: 120
+      matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
     steps:
-      - name: Reset persistent-runner Git URL rewrites
+      - name: Configure isolated anonymous Git
         shell: bash
-        run: git config --global --unset-all url."ssh://git@github.com/".insteadOf 2>/dev/null || true
+        run: |
+          set -euo pipefail
+          git_config="$RUNNER_TEMP/caravan-release-${GITHUB_RUN_ID}-${GITHUB_JOB}-${{ matrix.target }}.gitconfig"
+          {
+            echo "GIT_CONFIG_GLOBAL=$git_config"
+            echo "GIT_CONFIG_NOSYSTEM=1"
+          } >> "$GITHUB_ENV"
+          export GIT_CONFIG_GLOBAL="$git_config"
+          export GIT_CONFIG_NOSYSTEM=1
+          umask 077
+          : > "$GIT_CONFIG_GLOBAL"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          test "$(git config --global --get url.https://github.com/.insteadOf)" = "ssh://git@github.com/"
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.resolve.outputs.tag }}
           fetch-depth: 0
-      - name: Use anonymous HTTPS for public source inputs
-        shell: bash
-        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
 
       - name: Surface system toolchains
         shell: bash
