@@ -1286,6 +1286,27 @@ fn top_eviction_recovery_plan(
     .ok()
 }
 
+pub(crate) fn require_native_stack_backend_healthy(status: &StatusOutput) -> Result<(), AppError> {
+    if status.stack_backend.configured != crate::config::StackType::Github
+        || status.stack_backend.problems.is_empty()
+    {
+        return Ok(());
+    }
+    Err(AppError::structured(
+        ErrorCategory::Validation,
+        "github_stack_backend_unhealthy",
+        "native GitHub Stack state does not exactly match Cara's logical caravans",
+        Some(json!({
+            "problems": status.stack_backend.problems,
+            "native_stacks": status.stack_backend.native_stacks,
+            "mutated": false,
+            "provider_mutations": 0,
+            "resumable": true,
+            "safe_next_action": "resume or reconcile the exact pending native-membership checkpoint; preserve every current head and never fall back to an ordinary squash merge",
+        })),
+    ))
+}
+
 fn native_routing_error(error: &crate::github::GitHubStackMutationError) -> AppError {
     AppError::structured(
         ErrorCategory::Validation,
@@ -3614,6 +3635,7 @@ fn sync_with_lock(
         ),
     );
     crate::initialization::require_ready(&status.initialization)?;
+    require_native_stack_backend_healthy(&status)?;
     require_current_policy(context, &status)?;
     if let Some(authority) = authority {
         // Provider discovery above is read-only. Fence the first possible
@@ -5683,6 +5705,9 @@ fn execute_bounded_with_native(
     required_runs: RequiredRunsPolicy,
     native_stack: Option<NativeSyncContext>,
 ) -> Result<SyncProgress, AppError> {
+    if native_stack.is_some() {
+        require_native_stack_backend_healthy(status)?;
+    }
     let mut caravans = select_caravans(status, all)?;
     let paused_caravans = status
         .pauses

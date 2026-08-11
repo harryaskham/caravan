@@ -740,7 +740,10 @@ new tail retains its PR/branch identity, and its base is the sealed predecessor
 head. Exact retries recognize the same converged tail without another write.
 A closed Stack whose complete membership is freshly merged is terminal audit
 history, not `github_stack_orphaned` or base drift merely because GitHub
-collapsed merged bases. If exactly one blocked final member follows a ready
+collapsed merged bases. By contrast, every problem on an open provider Stack is
+promoted to backend health: `status` becomes unhealthy and both `plan sync` and
+`sync` refuse before root planning, native landing, or provider mutation. If
+exactly one blocked final member follows a ready
 prefix, the zero-write refusal now carries a hash-sealed `top_eviction_plan`:
 the complete provider generation, immutable source heads, exact evicted tail,
 surviving prefix and label/base postconditions. More than one blocked member

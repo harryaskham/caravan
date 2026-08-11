@@ -513,13 +513,18 @@ fn stack_backend_status(
             .map(|caravan| caravan.id)
             .collect::<Vec<_>>()
     };
-    let mut problems = missing_caravans
+    let mut problems = native_stacks
         .iter()
-        .map(|caravan| StackBackendProblem {
-            code: "github_stack_absent".to_owned(),
-            message: format!("caravan #{caravan} has no provider-native Stack"),
-        })
+        // Closed Stacks are historical audit rows; missing old PR snapshots do
+        // not authorize or block current queue work. Every open Stack problem
+        // is live mutation authority and must fail the whole backend closed.
+        .filter(|native| native.stack.open)
+        .flat_map(|native| native.problems.iter().cloned())
         .collect::<Vec<_>>();
+    problems.extend(missing_caravans.iter().map(|caravan| StackBackendProblem {
+        code: "github_stack_absent".to_owned(),
+        message: format!("caravan #{caravan} has no provider-native Stack"),
+    }));
     if inventory.truncated {
         problems.push(StackBackendProblem {
             code: "github_stack_inventory_truncated".to_owned(),
@@ -2191,8 +2196,10 @@ fn status_with_discovery_options(
     };
     crate::pause::apply_to_status(&context.repository_path, &mut output)?;
     output.sync_budget = crate::sync::project_status(context, &output);
-    output.healthy =
-        compatibility_complete && output.analysis.healthy() && output.initialization.ready;
+    output.healthy = compatibility_complete
+        && output.analysis.healthy()
+        && output.initialization.ready
+        && output.stack_backend.problems.is_empty();
 
     let total = started.elapsed();
     if (!bounded_compatibility || compatibility_complete)
@@ -6992,6 +6999,75 @@ mod tests {
             StackConsistency::Exact
         );
         assert!(backend.problems.is_empty());
+    }
+
+    #[test]
+    fn open_stack_member_drift_is_a_backend_health_problem() {
+        let root = pr(1, "root", "main", true);
+        let child = pr(2, "child", "root", true);
+        let tail = pr(3, "tail", "child", true);
+        let status = status(tail, vec![root.clone(), child.clone()]);
+        assert_eq!(
+            status.analysis.fleet.caravans[0].members,
+            vec![PrNumber(1), PrNumber(2), PrNumber(3)]
+        );
+        let provider = FixedStackProvider(Ok(crate::github::GitHubStackInventory {
+            truncated: false,
+            stacks: vec![crate::github::GitHubStackSnapshot {
+                id: 9001,
+                number: 42,
+                node_id: "S_missing_tail".to_owned(),
+                base: crate::github::GitHubStackBase {
+                    ref_name: "main".to_owned(),
+                },
+                open: true,
+                created_at: "2026-08-11T17:00:00Z".to_owned(),
+                pull_requests: vec![
+                    crate::github::GitHubStackPullRequest {
+                        number: 1,
+                        state: "open".to_owned(),
+                        draft: false,
+                        merged_at: None,
+                        head: crate::github::GitHubStackPullRequestHead {
+                            ref_name: root.head.name.clone(),
+                            sha: root.head.oid.clone(),
+                        },
+                    },
+                    crate::github::GitHubStackPullRequest {
+                        number: 2,
+                        state: "open".to_owned(),
+                        draft: false,
+                        merged_at: None,
+                        head: crate::github::GitHubStackPullRequestHead {
+                            ref_name: child.head.name.clone(),
+                            sha: child.head.oid.clone(),
+                        },
+                    },
+                ],
+            }],
+        }));
+
+        let backend = stack_backend_status(
+            crate::config::StackType::Github,
+            &provider,
+            &status.repository,
+            &status.analysis,
+        );
+
+        assert_eq!(
+            backend.native_stacks[0].consistency,
+            StackConsistency::Drifted
+        );
+        assert_eq!(
+            backend.native_stacks[0].problems[0].code,
+            "github_stack_member_order_drift"
+        );
+        assert!(
+            backend
+                .problems
+                .iter()
+                .any(|problem| problem.code == "github_stack_member_order_drift")
+        );
     }
 
     #[test]
