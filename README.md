@@ -344,8 +344,9 @@ authentication. It provisions no clones and performs no failover; see
 
 Repository inputs are explicit filesystem paths rather than slugs because every
 read and mutation remains bound to that exact worktree, config, operation lock,
-and provider identity. The initial server refuses non-loopback listeners,
-canonicalizes and deduplicates paths, periodically returns the same typed status
+and provider identity. The server defaults to `127.0.0.1:4774` and accepts an
+explicit bind address through `--listen ADDRESS`; it canonicalizes and
+deduplicates paths and periodically returns the same typed status
 used by CLI/JSON/MCP, and applies strict CSP/anti-frame/no-store headers. The
 responsive one-page dashboard renders trail-linked caravans, linked GitHub PRs,
 exact generations and check failures. Repositories and attention decisions live
@@ -392,8 +393,9 @@ updates coalesce into a fresh status refresh or one bounded `sync --all` action
 with `--webhook-sync`. Payloads are wake hints only: Cara always rediscovers
 provider truth under its normal lock/budgets. Polling remains a low-frequency
 reconciliation fallback; webhook counters are secret-free dashboard state. Use a
-TLS reverse proxy/tunnel to the loopback listener and never store the webhook
-secret in `.caravan/config.yaml`. Configure the GitHub App for JSON delivery and
+TLS reverse proxy or private tunnel in front of the listener when exposing it,
+and never store the webhook secret in `.caravan/config.yaml`. Configure the
+GitHub App for JSON delivery and
 subscribe to **Push**, **Pull request**, **Pull request review**, **Check run**,
 **Check suite**, **Status**, and **Workflow run** events; read-only Metadata,
 Contents, Pull requests, Checks, Commit statuses, and Actions permissions are

@@ -110,7 +110,7 @@ manual-decision, label, lease, result-tree, budget, and lock checks still apply.
 
 ## Webhooks
 
-`cara web` already provides a loopback GitHub webhook receiver:
+`cara web` already provides a GitHub webhook receiver (loopback by default):
 
 ```sh
 export CARA_GITHUB_WEBHOOK_SECRET='<from secret manager>'
@@ -120,8 +120,9 @@ cara web --repo /srv/caravan/repository \
   --webhook-sync
 ```
 
-Put a TLS reverse proxy or private tunnel in front of the loopback listener. The
-receiver verifies `X-Hub-Signature-256`, bounds payload/header sizes, binds the
+Put a TLS reverse proxy or private tunnel in front of the listener when exposing
+it, or select a protected interface explicitly with `--listen`. The receiver
+verifies `X-Hub-Signature-256`, bounds payload/header sizes, binds the
 installation and explicit repository, durably deduplicates
 `X-GitHub-Delivery`, coalesces bursts, and keeps fallback polling. Events are
 wake hints only; every job re-reads provider state. Current wake subscriptions
@@ -167,9 +168,10 @@ Startup refuses unless all of the following hold:
 
 Mixed installations, ambient auth, `local_only`, a missing slug, or a missing
 remote-lease broker/host/writer identity all fail closed before serving. The
-listener stays loopback-only; expose it through an operator-owned TLS reverse
-proxy or tunnel, and supply the webhook secret from a secret manager as an
-environment variable name, never a literal.
+listener defaults to loopback; an operator may select another protected
+interface with `--listen`. Use an operator-owned TLS reverse proxy or tunnel for exposed
+traffic, and supply the webhook secret from a secret manager as an environment
+variable name, never a literal.
 
 Dashboard state reports `hosted` plus each repository's non-secret auth/writer
 policy, so a misconfigured member is visible rather than silently ambient.

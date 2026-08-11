@@ -321,9 +321,14 @@ fn the_single_repository_global_does_not_collide_with_the_web_multi_repository_f
         "web must remain constructable: {}",
         String::from_utf8_lossy(&web.stderr)
     );
+    let web_help = String::from_utf8_lossy(&web.stdout);
     assert!(
-        String::from_utf8_lossy(&web.stdout).contains("--repo "),
+        web_help.contains("--repo "),
         "web keeps its own repeatable --repo"
+    );
+    assert!(
+        web_help.contains("HTTP address to listen on"),
+        "web documents --listen without claiming non-loopback addresses are refused"
     );
 
     let top = std::process::Command::new(env!("CARGO_BIN_EXE_cara"))
