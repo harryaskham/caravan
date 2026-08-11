@@ -8,7 +8,7 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::fs;
 use std::io::{Read, Write as IoWrite};
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -67,7 +67,7 @@ pub struct WebInput {
     #[arg(long = "repo", value_name = "PATH", required = true)]
     pub repositories: Vec<PathBuf>,
 
-    /// Loopback HTTP address. Non-loopback binds are refused in this release.
+    /// HTTP address to listen on.
     #[arg(long, default_value = "127.0.0.1:4774", value_name = "ADDRESS")]
     pub listen: SocketAddr,
 
@@ -496,7 +496,7 @@ pub fn serve(input: &WebInput) -> Result<(), AppError> {
                 "could not bind Cara web dashboard at {}: {error}",
                 input.listen
             ),
-            Some(json!({"listen": input.listen, "loopback_required": true})),
+            Some(json!({"listen": input.listen})),
         )
     })?;
     let stop = Arc::clone(&dashboard);
@@ -591,17 +591,6 @@ fn load_webhook_secret(input: &WebInput) -> Result<Option<Vec<u8>>, AppError> {
 }
 
 fn validate_input(input: &WebInput) -> Result<(), AppError> {
-    if !is_loopback(input.listen.ip()) {
-        return Err(AppError::structured(
-            ErrorCategory::Validation,
-            "web_non_loopback_refused",
-            "Cara web currently binds only to a loopback address",
-            Some(json!({
-                "listen": input.listen,
-                "safe_next_action": "use --listen 127.0.0.1:PORT or an SSH tunnel"
-            })),
-        ));
-    }
     if !(MIN_POLL_SECONDS..=MAX_POLL_SECONDS).contains(&input.poll_seconds) {
         return Err(AppError::validation(
             "web_poll_interval_invalid",
@@ -740,13 +729,6 @@ fn health_payload(dashboard: &Dashboard) -> serde_json::Value {
             "last_received_unix_ms": webhook.last_received_unix_ms,
         },
     })
-}
-
-fn is_loopback(address: IpAddr) -> bool {
-    match address {
-        IpAddr::V4(address) => address.is_loopback(),
-        IpAddr::V6(address) => address.is_loopback(),
-    }
 }
 
 /// Enforce the hosted worker contract over already-loaded repositories.
@@ -2300,7 +2282,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rejects_non_loopback_and_unbounded_polling() {
+    fn accepts_non_loopback_and_rejects_unbounded_polling() {
         let mut input = WebInput {
             repositories: vec![PathBuf::from(".")],
             listen: "0.0.0.0:4774".parse().unwrap(),
@@ -2312,11 +2294,7 @@ mod tests {
             webhook_sync: false,
             hosted: false,
         };
-        assert_eq!(
-            validate_input(&input).unwrap_err().code(),
-            "web_non_loopback_refused"
-        );
-        input.listen = "127.0.0.1:4774".parse().unwrap();
+        validate_input(&input).expect("explicit non-loopback listen addresses are supported");
         input.poll_seconds = 1;
         assert_eq!(
             validate_input(&input).unwrap_err().code(),

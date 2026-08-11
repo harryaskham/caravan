@@ -512,8 +512,9 @@ BUILT-IN WEB OPERATIONS
 - `cara web --repo PATH [--repo PATH ...]` serves a responsive dashboard from
   assets embedded in the Cara binary. Repository arguments are filesystem
   paths, never slugs, and are the complete trust boundary for the process.
-- The default listener is loopback-only. Status snapshots refresh on a bounded
-  cadence and show active caravan trails, exact PR generations and CI, open
+- The listener defaults to `127.0.0.1:4774`; `--listen ADDRESS` may select any
+  bindable socket address. Status snapshots refresh on a bounded cadence and
+  show active caravan trails, exact PR generations and CI, open
   unqueued/rejected PRs with reasons, decisions, pauses, and scheduler health.
 - Use `--read-only` to disable mutation endpoints. `--hosted` is the optional
   deployment contract for pre-provisioned checkouts: it requires signed
