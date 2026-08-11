@@ -713,9 +713,13 @@ new tail retains its PR/branch identity, and its base is the sealed predecessor
 head. Exact retries recognize the same converged tail without another write.
 A closed Stack whose complete membership is freshly merged is terminal audit
 history, not `github_stack_orphaned` or base drift merely because GitHub
-collapsed merged bases. Partial, cross-mapped, stale, truncated, unreadable, or
-multiple intersections fail as non-retryable external decisions without a
-landing write. If a Stack
+collapsed merged bases. If exactly one blocked final member follows a ready
+prefix, the zero-write refusal now carries a hash-sealed `top_eviction_plan`:
+the complete provider generation, immutable source heads, exact evicted tail,
+surviving prefix and label/base postconditions. More than one blocked member
+never fabricates that single-tail remedy. Partial, cross-mapped, stale,
+truncated, unreadable, or multiple intersections fail as non-retryable external
+decisions without a landing write. If a Stack
 races into existence after the absence proof and GitHub refuses the ordinary
 merge, Cara returns `github_stack_membership_detected_during_owned_merge`
 instead of retrying the same synchronous call. Zero intersections for 2+

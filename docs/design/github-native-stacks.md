@@ -251,7 +251,11 @@ unselected suffix, replacing an immutable source head and retriggering CI. Cara
 must lock every exact source ref in the complete Stack generation, acquire and
 exactly read back that ruleset, re-read the complete Stack, keep the lock through
 terminal UUID proof, and release only its exact ruleset generation. Partial
-prefixes must be reshaped before submission. This path requires
+prefixes must be reshaped before submission. When one blocked final member is
+the entire suffix, the refusal includes a hash-sealed `top_eviction_plan` with
+full generation/head authority, the exact evicted tail, the byte-identical
+surviving prefix, and Cara label/base postconditions. Two or more blocked
+members deliberately receive no single-tail plan. This path requires
 Administration(write), remains explicit, and never changes default Caravan
 permissions; see `docs/validation/github-native-stack-sandbox-2026-07-31.md`.
 

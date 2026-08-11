@@ -1168,6 +1168,43 @@ fn native_sync_error(error: impl std::fmt::Display) -> AppError {
     )
 }
 
+fn top_eviction_recovery_plan(
+    repository: &RepositoryId,
+    operation_id: &OperationId,
+    actor: &str,
+    stack: &crate::github::GitHubStackGeneration,
+    selected_open: usize,
+) -> Option<crate::github::GitHubStackReshapePlan> {
+    let current_open = stack
+        .topology
+        .entries
+        .iter()
+        .filter(|entry| entry.pull_request_state == PullRequestState::Open)
+        .collect::<Vec<_>>();
+    if current_open.len() != selected_open.saturating_add(1)
+        || stack.topology.entries.last().map(|entry| entry.pr)
+            != current_open.last().map(|entry| entry.pr)
+    {
+        return None;
+    }
+    let selected_pr = current_open.last()?.pr;
+    let mut replacement = stack.topology.clone();
+    replacement.entries.pop()?;
+    crate::github::GitHubStackReshapePlan::new(
+        repository.clone(),
+        format!(
+            "{}:stack:{}:evict:{selected_pr}",
+            operation_id, stack.number
+        ),
+        actor.to_owned(),
+        crate::github::GitHubStackReshapeOperation::Evict,
+        selected_pr,
+        stack.clone(),
+        vec![replacement],
+    )
+    .ok()
+}
+
 fn native_routing_error(error: &crate::github::GitHubStackMutationError) -> AppError {
     AppError::structured(
         ErrorCategory::Validation,
@@ -8139,6 +8176,14 @@ impl SyncProgress {
                     .iter()
                     .map(|entry| (entry.pr, entry.head.clone()))
                     .collect::<BTreeMap<_, _>>();
+                let top_eviction_plan = top_eviction_recovery_plan(
+                    repository,
+                    &self.operation_id,
+                    &native.config.stack_rollout.reviewed_by,
+                    &stack,
+                    prefix.selected.len(),
+                );
+                let top_eviction_resumable = top_eviction_plan.is_some();
                 return Err(AppError::structured(
                     ErrorCategory::Validation,
                     "github_stack_partial_prefix_requires_tail_eviction",
@@ -8151,9 +8196,10 @@ impl SyncProgress {
                         "blocked_suffix": blocked_suffix,
                         "first_blocked": prefix.first_blocked,
                         "immutable_source_heads": immutable_heads,
+                        "top_eviction_plan": top_eviction_plan,
                         "mutated": false,
-                        "resumable": false,
-                        "safe_next_action": "use the typed native Stack reshape path to evict/split the blocked final suffix, then rerun sync against the remaining exact Stack; never update or force-push a source branch to refresh CI",
+                        "resumable": top_eviction_resumable,
+                        "safe_next_action": "review and apply the exact top_eviction_plan through the typed native Stack reshape path, then rerun sync against the remaining exact Stack; never update or force-push a source branch to refresh CI",
                     })),
                 ));
             }
