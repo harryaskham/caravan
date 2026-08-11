@@ -19,6 +19,11 @@ use crate::config::{CaravanConfig, DEFAULT_CONFIG_PATH};
 use crate::{AppContext, AppError};
 
 const FETCH_TIMEOUT_SECS: u64 = 120;
+// Local shared-object worktree registration can contend with long-running Git
+// readers even when provider commands should retain a short timeout. Keep this
+// floor separate from network/API command tuning (bd-4dae44).
+const LOCAL_GIT_TIMEOUT_FLOOR_SECS: u64 = 30;
+const MATERIALIZATION_TIMEOUT_FLOOR_SECS: u64 = 60;
 const WORKTREE_PREFIX: &str = "cara-authoritative-sync";
 
 /// One exact fetched default-branch generation. Revalidate immediately before
@@ -31,6 +36,7 @@ pub(crate) struct DefaultBranchAuthority {
     oid: String,
     invocation_branch: Option<String>,
     invocation_head: String,
+    local_timeout: Duration,
 }
 
 impl DefaultBranchAuthority {
@@ -85,7 +91,7 @@ impl DefaultBranchAuthority {
                 "--verify",
                 &format!("{}^{{commit}}", self.default_ref),
             ],
-            Duration::from_secs(5),
+            self.local_timeout,
             "sync_default_branch_revalidation_failed",
             "could not re-read the fetched default-branch generation",
         )?;
@@ -158,24 +164,24 @@ pub(crate) fn prepare(context: &AppContext) -> Result<PreparedSyncContext, AppEr
             .command_timeout_secs
             .clamp(5, FETCH_TIMEOUT_SECS),
     );
+    let overall_sync_budget = Duration::from_secs(context.config.sync.max_duration_secs);
+    let local_timeout = authoritative_local_git_timeout(timeout, overall_sync_budget);
+    let materialization_timeout = authoritative_worktree_timeout(timeout, overall_sync_budget);
     let repository = context.repository_path.clone();
-    let invocation_branch = optional_git_value(
-        &repository,
-        &["branch", "--show-current"],
-        Duration::from_secs(5),
-    )?;
+    let invocation_branch =
+        optional_git_value(&repository, &["branch", "--show-current"], local_timeout)?;
     let invocation_head = git_value(
         &repository,
         &["rev-parse", "--verify", "HEAD^{commit}"],
-        Duration::from_secs(5),
+        local_timeout,
         "sync_invocation_head_missing",
         "the invoking checkout HEAD does not resolve to one commit",
     )?;
-    let default_ref = resolve_default_ref(&repository, timeout)?;
+    let default_ref = resolve_default_ref(&repository, timeout, local_timeout)?;
 
     // A locally observed explicit opt-out must be honoured before network I/O.
     // Missing/older policy has the new safe default: fetch is allowed.
-    if local_default_policy(&repository, &default_ref, timeout)?
+    if local_default_policy(&repository, &default_ref, local_timeout)?
         .is_some_and(|config| !config.sync.allow_fetch)
     {
         let mut local = AppContext::load_from_directory(&repository, None)
@@ -190,7 +196,31 @@ pub(crate) fn prepare(context: &AppContext) -> Result<PreparedSyncContext, AppEr
         invocation_branch,
         invocation_head,
         timeout,
+        local_timeout,
+        materialization_timeout,
     )
+}
+
+fn authoritative_local_git_timeout(
+    command_timeout: Duration,
+    overall_sync_budget: Duration,
+) -> Duration {
+    let seconds = command_timeout
+        .as_secs()
+        .clamp(LOCAL_GIT_TIMEOUT_FLOOR_SECS, FETCH_TIMEOUT_SECS)
+        .min(overall_sync_budget.as_secs().max(1));
+    Duration::from_secs(seconds)
+}
+
+fn authoritative_worktree_timeout(
+    command_timeout: Duration,
+    overall_sync_budget: Duration,
+) -> Duration {
+    let seconds = command_timeout
+        .as_secs()
+        .clamp(MATERIALIZATION_TIMEOUT_FLOOR_SECS, FETCH_TIMEOUT_SECS)
+        .min(overall_sync_budget.as_secs().max(1));
+    Duration::from_secs(seconds)
 }
 
 fn unmaterialized(context: AppContext) -> PreparedSyncContext {
@@ -207,6 +237,8 @@ fn materialize_fetched_default(
     invocation_branch: Option<String>,
     invocation_head: String,
     timeout: Duration,
+    local_timeout: Duration,
+    materialization_timeout: Duration,
 ) -> Result<PreparedSyncContext, AppError> {
     let branch = default_ref.strip_prefix("origin/").ok_or_else(|| {
         authority_error(
@@ -215,7 +247,7 @@ fn materialize_fetched_default(
             json!({"default_branch_ref": default_ref, "mutated": false}),
         )
     })?;
-    require_branch_name(&repository, branch, timeout)?;
+    require_branch_name(&repository, branch, local_timeout)?;
     let refspec = format!("refs/heads/{branch}:refs/remotes/origin/{branch}");
     crate::sync::progress::emit(
         "policy_fetch",
@@ -235,7 +267,7 @@ fn materialize_fetched_default(
             "--verify",
             &format!("{default_ref}^{{commit}}"),
         ],
-        Duration::from_secs(5),
+        local_timeout,
         "sync_default_branch_oid_missing",
         "the fetched default branch does not resolve to a commit",
     )?;
@@ -245,7 +277,8 @@ fn materialize_fetched_default(
         std::process::id(),
         uuid::Uuid::now_v7()
     ));
-    let materialized = MaterializedWorktree::create(&repository, path, &oid, timeout)?;
+    let materialized =
+        MaterializedWorktree::create(&repository, path, &oid, materialization_timeout)?;
     let loaded = AppContext::load_from_directory(&materialized.path, None)
         .map_err(|error| config_error_for_sync(&error))?;
     crate::sync::progress::emit(
@@ -274,16 +307,21 @@ fn materialize_fetched_default(
             oid,
             invocation_branch,
             invocation_head,
+            local_timeout,
         }),
         materialized: Some(materialized),
     })
 }
 
-fn resolve_default_ref(repository: &Path, timeout: Duration) -> Result<String, AppError> {
+fn resolve_default_ref(
+    repository: &Path,
+    timeout: Duration,
+    local_timeout: Duration,
+) -> Result<String, AppError> {
     if let Ok(reference) = git_value(
         repository,
         &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-        Duration::from_secs(5),
+        local_timeout,
         "sync_default_branch_unknown",
         "could not read the recorded origin default branch",
     ) {
@@ -574,6 +612,63 @@ mod tests {
         git(&checkout, &["push", "-u", "origin", "main"]);
         git(&checkout, &["remote", "set-head", "origin", "main"]);
         (root, checkout)
+    }
+
+    #[test]
+    fn authoritative_worktree_timeout_has_independent_floor_and_cap() {
+        assert_eq!(
+            authoritative_local_git_timeout(Duration::from_secs(5), Duration::from_secs(480)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            authoritative_local_git_timeout(Duration::from_secs(90), Duration::from_secs(480)),
+            Duration::from_secs(90)
+        );
+        assert_eq!(
+            authoritative_local_git_timeout(Duration::from_secs(300), Duration::from_secs(480)),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            authoritative_local_git_timeout(Duration::from_secs(5), Duration::from_secs(20)),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            authoritative_worktree_timeout(Duration::from_secs(30), Duration::from_secs(480)),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            authoritative_worktree_timeout(Duration::from_secs(90), Duration::from_secs(480)),
+            Duration::from_secs(90)
+        );
+        assert_eq!(
+            authoritative_worktree_timeout(Duration::from_secs(300), Duration::from_secs(480)),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            authoritative_worktree_timeout(Duration::from_secs(30), Duration::from_secs(45)),
+            Duration::from_secs(45),
+            "the local floor never exceeds the whole sync budget"
+        );
+    }
+
+    #[test]
+    fn failed_authoritative_worktree_creation_removes_partial_path() {
+        let (_root, checkout) = fixture();
+        let path = checkout.parent().unwrap().join("failed-materialization");
+
+        let error = MaterializedWorktree::create(
+            &checkout,
+            path.clone(),
+            "not-a-commit",
+            Duration::from_secs(60),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            mcp_cli::StructuredError::code(&error),
+            "sync_default_branch_materialization_failed"
+        );
+        assert!(!path.exists());
     }
 
     #[test]
