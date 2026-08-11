@@ -30,9 +30,9 @@ use crate::model::{
 use crate::operation_lock::{OperationLock, OperationLockRecovery};
 use crate::read::{self, StatusOutput};
 use crate::required_runs::{
-    self, HeadRunLineage, MissingRequiredRunsProblem, RequiredContextsRead, RequiredRunsClock,
-    RequiredRunsInput, RequiredRunsReceipt, RequiredRunsRecovery, RequiredRunsRetrigger,
-    RequiredRunsStatus,
+    self, CheckSuiteLineage, HeadRunLineage, MissingRequiredRunsProblem, RequiredContextsRead,
+    RequiredRunsClock, RequiredRunsInput, RequiredRunsReceipt, RequiredRunsRecovery,
+    RequiredRunsRetrigger, RequiredRunsStatus, WorkflowRunLineage,
 };
 use crate::root_auto_merge::{
     self, ROOT_AUTO_MERGE_ARMING_ATTEMPTS, ROOT_AUTO_MERGE_CONFIRMATION_DELAY,
@@ -163,6 +163,17 @@ pub struct ClassifiedWorkflowRunFailure {
     pub reasons: Vec<String>,
 }
 
+/// Newest complete provider generation selected for one exact-head workflow.
+///
+/// A workflow run alone is not authoritative: GitHub can expose a stale or
+/// cross-head run while its check-suite projection lags. Selection therefore
+/// retains the exact matching suite as the immutable same-head proof.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CiGenerationSelection {
+    pub workflow_run: WorkflowRunLineage,
+    pub check_suite: CheckSuiteLineage,
+}
+
 /// Exact check and workflow-run evidence for one selected PR.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CiObservation {
@@ -170,6 +181,21 @@ pub struct CiObservation {
     pub disposition: CiDisposition,
     #[serde(default)]
     pub checks: Vec<CheckSnapshot>,
+    /// Current classification projection. This may contain internal workflow
+    /// generation votes; it is evidence for policy, never a provider check row.
+    #[serde(default)]
+    pub effective_checks: Vec<CheckSnapshot>,
+    /// Historical rollup rows retained for diagnostics but excluded from the
+    /// current verdict by positive identity/generation evidence.
+    #[serde(default)]
+    pub superseded_checks: Vec<CheckSnapshot>,
+    /// Newest authoritative generation per exact-head workflow.
+    #[serde(default)]
+    pub selected_generations: Vec<CiGenerationSelection>,
+    /// Bounded raw lineage supporting generation selection. Incomplete or
+    /// mismatched lineage remains visible here but never suppresses a failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_lineage: Option<HeadRunLineage>,
     #[serde(default)]
     pub failed_runs: Vec<WorkflowRunSnapshot>,
     /// Bounded run/job/failed-step evidence with generation-aware policy.
@@ -5631,9 +5657,13 @@ fn execute_root_first(
         progress.promote_root(provider, status, caravan.id, root, None, false)?;
         progress.ensure_no_foreign_auto_merge(provider, &status.repository, caravan.id, root)?;
         let observation = progress.observe_ci(provider, &status.repository, root)?;
-        progress.ci.push(observation);
+        let disposition = observation.disposition;
+        progress.upsert_ci_observation(observation);
         let assessment = progress.observe_required_runs(provider, &status.repository, root)?;
         progress.push_required_runs(caravan.id, assessment, None);
+        if disposition != CiDisposition::Passing {
+            continue;
+        }
         if progress.merge_root(provider, status, caravan.id, root, &caravan.members, None)? {
             return Ok(Some(progress));
         }
@@ -5821,7 +5851,7 @@ fn reconcile_caravan(
     for number in caravan.members.iter().copied() {
         let observation = progress.observe_ci(provider, &status.repository, number)?;
         let disposition = observation.disposition;
-        progress.ci.push(observation.clone());
+        progress.upsert_ci_observation(observation.clone());
         // Required-run coverage is verified per member before any CI stop, so a
         // head whose required contexts never started a run is visible even when
         // an earlier member is legitimately failing, and one stalled member
@@ -5839,8 +5869,17 @@ fn reconcile_caravan(
                     &observation.rerunnable_run_ids,
                 )?;
             }
-            ci_failure = Some(observation);
-            break;
+            // Required-run discovery and an optional exact rerun are provider
+            // boundaries where a newer same-head generation may appear. Only a
+            // fresh observation immediately before the ci_failed decision has
+            // event/hook authority.
+            let final_observation = progress.observe_ci(provider, &status.repository, number)?;
+            let final_disposition = final_observation.disposition;
+            progress.upsert_ci_observation(final_observation.clone());
+            if final_disposition == CiDisposition::Failed {
+                ci_failure = Some(final_observation);
+                break;
+            }
         }
     }
 
@@ -6734,6 +6773,177 @@ fn retryable_infrastructure(diagnostic: &WorkflowRunFailureDiagnostic) -> bool {
             .failed_jobs
             .iter()
             .any(|job| conclusion_is_infra(&job.conclusion))
+}
+
+#[derive(Debug, Default)]
+struct CiGenerationEvidence {
+    effective_checks: Vec<CheckSnapshot>,
+    superseded_checks: Vec<CheckSnapshot>,
+    selected_generations: Vec<CiGenerationSelection>,
+}
+
+fn provider_generation_is_complete(status: &str) -> bool {
+    status.eq_ignore_ascii_case("completed")
+}
+
+fn successful_generation_conclusion(conclusion: &str) -> bool {
+    ["success", "neutral", "skipped"]
+        .iter()
+        .any(|candidate| conclusion.eq_ignore_ascii_case(candidate))
+}
+
+fn generation_check_state(run: &WorkflowRunLineage, suite: &CheckSuiteLineage) -> CheckState {
+    // A job-level failure is not the workflow verdict while either half of the
+    // provider generation is still producing checks. This is the stale
+    // merge-ref recovery shape: old aggregate failures coexist with a newer
+    // same-head run which has not finished materializing yet.
+    if !provider_generation_is_complete(&run.status)
+        || !provider_generation_is_complete(&suite.status)
+    {
+        return CheckState::InProgress;
+    }
+    if successful_generation_conclusion(&run.conclusion)
+        && successful_generation_conclusion(&suite.conclusion)
+    {
+        return CheckState::Success;
+    }
+    if run.conclusion.eq_ignore_ascii_case("cancelled")
+        || suite.conclusion.eq_ignore_ascii_case("cancelled")
+        || run.conclusion.eq_ignore_ascii_case("stale")
+        || suite.conclusion.eq_ignore_ascii_case("stale")
+    {
+        return CheckState::Cancelled;
+    }
+    if run.conclusion.eq_ignore_ascii_case("timed_out")
+        || suite.conclusion.eq_ignore_ascii_case("timed_out")
+    {
+        return CheckState::TimedOut;
+    }
+    if run.conclusion.eq_ignore_ascii_case("action_required")
+        || suite.conclusion.eq_ignore_ascii_case("action_required")
+    {
+        return CheckState::ActionRequired;
+    }
+    if run.conclusion.is_empty() || suite.conclusion.is_empty() {
+        return CheckState::Unknown;
+    }
+    CheckState::Failure
+}
+
+/// Replace positively identified workflow rows with one vote from the newest
+/// exact-head run + suite generation. Missing, partial, or cross-head lineage
+/// suppresses nothing and therefore keeps the ordinary rollup fail-closed.
+fn ci_generation_evidence(
+    checks: &[CheckSnapshot],
+    head_oid: &str,
+    lineage: Option<&HeadRunLineage>,
+) -> CiGenerationEvidence {
+    let (_current, model_superseded) = crate::model::latest_checks_per_identity(checks);
+    let mut evidence = CiGenerationEvidence {
+        effective_checks: checks.to_vec(),
+        superseded_checks: model_superseded.into_iter().cloned().collect(),
+        selected_generations: Vec::new(),
+    };
+    let Some(lineage) = lineage else {
+        return evidence;
+    };
+    if !lineage.complete || lineage.head_sha != head_oid {
+        return evidence;
+    }
+
+    let suites = lineage
+        .check_suites
+        .iter()
+        .filter(|suite| suite.head_sha == head_oid)
+        .map(|suite| (suite.id, suite))
+        .collect::<BTreeMap<_, _>>();
+    let mut newest_by_workflow: BTreeMap<&str, (&WorkflowRunLineage, &CheckSuiteLineage)> =
+        BTreeMap::new();
+    for run in lineage
+        .workflow_runs
+        .iter()
+        .filter(|run| run.head_sha == head_oid && !run.workflow_name.is_empty())
+    {
+        let Some(suite) = suites.get(&run.check_suite_id).copied() else {
+            continue;
+        };
+        newest_by_workflow
+            .entry(run.workflow_name.as_str())
+            .and_modify(|current| {
+                if run.run_id > current.0.run_id {
+                    *current = (run, suite);
+                }
+            })
+            .or_insert((run, suite));
+    }
+    if newest_by_workflow.is_empty() {
+        return evidence;
+    }
+
+    let workflow_by_run = lineage
+        .workflow_runs
+        .iter()
+        .filter(|run| run.head_sha == head_oid && !run.workflow_name.is_empty())
+        .map(|run| (run.run_id, run.workflow_name.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let mut effective = Vec::new();
+    let mut replacement_names: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+    for check in checks {
+        let run_id = check.details_url.as_deref().and_then(workflow_run_id);
+        let workflow_name = check
+            .workflow_name
+            .as_deref()
+            .or_else(|| run_id.and_then(|id| workflow_by_run.get(&id).copied()));
+        let positively_owned = workflow_name
+            .and_then(|workflow| newest_by_workflow.get(workflow))
+            .is_some_and(|(selected, _suite)| run_id.is_some_and(|id| id <= selected.run_id));
+        if positively_owned {
+            if let Some(workflow_name) = workflow_name {
+                replacement_names
+                    .entry(workflow_name)
+                    .or_default()
+                    .insert(check.name.clone());
+            }
+            if !evidence.superseded_checks.contains(check) {
+                evidence.superseded_checks.push(check.clone());
+            }
+        } else {
+            // A row without a run ID/workflow mapping is ambiguous. Retaining
+            // it is intentional: unknown lineage can never turn red green.
+            effective.push(check.clone());
+        }
+    }
+
+    for (workflow_name, (run, suite)) in newest_by_workflow {
+        let state = generation_check_state(run, suite);
+        let names = replacement_names
+            .remove(workflow_name)
+            .unwrap_or_else(|| BTreeSet::from([format!("workflow generation: {workflow_name}")]));
+        for name in names {
+            effective.push(CheckSnapshot {
+                name,
+                state,
+                provider_state: Some(format!(
+                    "run={}/{} suite={}/{}",
+                    run.status, run.conclusion, suite.status, suite.conclusion
+                )),
+                // Internal only: it lets exact failed-run selection bind to the
+                // authoritative run without presenting a fabricated provider row.
+                details_url: Some(format!("/actions/runs/{}", run.run_id)),
+                provider_kind: Some("WorkflowRunLineage".to_owned()),
+                workflow_name: Some(workflow_name.to_owned()),
+                started_at: None,
+                completed_at: None,
+                superseded: false,
+            });
+        }
+        evidence.selected_generations.push(CiGenerationSelection {
+            workflow_run: run.clone(),
+            check_suite: suite.clone(),
+        });
+    }
+    evidence.effective_checks = effective;
+    evidence
 }
 
 fn classify_checks(checks: &[CheckSnapshot], forced: bool) -> CiDisposition {
@@ -7739,14 +7949,74 @@ impl SyncProgress {
         ));
     }
 
+    /// Re-read one PR while accepting check-only drift and refusing every
+    /// mutation-authorizing identity change. CI is observation state, so a new
+    /// run may legitimately appear between discovery and this sync phase.
+    fn refetch_ci_snapshot(
+        &mut self,
+        provider: &impl SyncProvider,
+        repository: &RepositoryId,
+        number: PrNumber,
+    ) -> Result<PullRequestSnapshot, AppError> {
+        let expected = self.precondition(number);
+        let observed = provider
+            .refetch_pull_request(repository, number)
+            .map_err(|error| mutation_error(&error, self, Some(number)))?;
+        let actual = PullRequestPrecondition::from(&observed);
+        if !actual.mutation_identity_eq(&expected) {
+            return Err(mutation_error(
+                &MutationError::StalePrecondition {
+                    expected: Box::new(expected),
+                    actual: Box::new(actual),
+                    changed_fields: vec!["ci_refetch_mutation_identity".to_owned()],
+                },
+                self,
+                Some(number),
+            ));
+        }
+        self.current.insert(number, observed.clone());
+        Ok(observed)
+    }
+
+    fn upsert_ci_observation(&mut self, observation: CiObservation) {
+        if let Some(current) = self.ci.iter_mut().find(|item| item.pr == observation.pr) {
+            *current = observation;
+        } else {
+            self.ci.push(observation);
+        }
+    }
+
     fn observe_ci(
-        &self,
+        &mut self,
         provider: &impl SyncProvider,
         repository: &RepositoryId,
         number: PrNumber,
     ) -> Result<CiObservation, AppError> {
-        let current = self.current.get(&number).expect("sync member");
-        let disposition = classify_checks(&current.checks, current.has_label("caravan-force"));
+        let mut current = self.refetch_ci_snapshot(provider, repository, number)?;
+        let forced = current.has_label("caravan-force");
+        let mut disposition = classify_checks(&current.checks, forced);
+        let mut lineage = None;
+
+        // A red discovery is never event authority. Re-read once, then consult
+        // exact-head run + suite lineage so a run created during either read can
+        // supersede historical aggregate failures before any hook is emitted.
+        if disposition == CiDisposition::Failed {
+            current = self.refetch_ci_snapshot(provider, repository, number)?;
+            disposition = classify_checks(&current.checks, forced);
+            if disposition == CiDisposition::Failed {
+                lineage = Some(
+                    provider
+                        .head_run_lineage(repository, &self.precondition(number))
+                        .map_err(|error| mutation_error(&error, self, Some(number)))?,
+                );
+            }
+        }
+
+        let generation =
+            ci_generation_evidence(&current.checks, &current.head.oid.0, lineage.as_ref());
+        if !generation.selected_generations.is_empty() {
+            disposition = classify_checks(&generation.effective_checks, forced);
+        }
         let mut failed_runs =
             if matches!(disposition, CiDisposition::Failed | CiDisposition::Forced) {
                 provider
@@ -7757,7 +8027,8 @@ impl SyncProgress {
             };
         failed_runs.sort_by_key(|run| run.database_id);
         failed_runs.dedup_by_key(|run| run.database_id);
-        let selected_run_ids = select_rerunnable_run_ids(&current.checks, &failed_runs);
+        let selected_run_ids =
+            select_rerunnable_run_ids(&generation.effective_checks, &failed_runs);
         let failure_diagnostics = if selected_run_ids.is_empty() {
             Vec::new()
         } else {
@@ -7778,11 +8049,16 @@ impl SyncProgress {
             .collect::<Vec<_>>();
         rerunnable_run_ids.sort_unstable();
         rerunnable_run_ids.dedup();
-        let cancellation = classify_cancellation(&current.checks, &failure_diagnostics);
+        let cancellation =
+            classify_cancellation(&generation.effective_checks, &failure_diagnostics);
         Ok(CiObservation {
             pr: number,
             disposition,
-            checks: current.checks.clone(),
+            checks: current.checks,
+            effective_checks: generation.effective_checks,
+            superseded_checks: generation.superseded_checks,
+            selected_generations: generation.selected_generations,
+            generation_lineage: lineage.map(HeadRunLineage::bounded),
             failed_runs,
             failure_diagnostics,
             rerunnable_run_ids,
@@ -7889,12 +8165,18 @@ impl SyncProgress {
         current: &PullRequestSnapshot,
         contexts: &RequiredContextsRead,
     ) -> Result<crate::required_runs::RequiredRunsAssessment, AppError> {
-        // Decide whether lineage is needed from the same canonical current
-        // projection used by CI and required-run assessment. Historical rows
-        // must not make a context appear covered after a newer workflow
-        // generation supersedes them.
-        let (current_checks, _superseded_checks) =
-            crate::model::latest_checks_per_identity(&current.checks);
+        // Required-context policy must consume the same newest-generation
+        // projection as the CI verdict. Otherwise an old synthetic aggregate
+        // can still report `failing` after CI correctly selected a newer
+        // same-head pending/successful run.
+        let observation = self.ci.iter().rev().find(|item| item.pr == current.number);
+        let checks = observation
+            .filter(|item| !item.effective_checks.is_empty())
+            .map_or(current.checks.as_slice(), |item| {
+                item.effective_checks.as_slice()
+            });
+        let observed_lineage = observation.and_then(|item| item.generation_lineage.as_ref());
+        let (current_checks, _superseded_checks) = crate::model::latest_checks_per_identity(checks);
         let reporting = current_checks
             .into_iter()
             .filter(|check| check.state != crate::model::CheckState::Expected)
@@ -7905,15 +8187,18 @@ impl SyncProgress {
             .iter()
             .any(|context| !reporting.contains(context.as_str()));
         let lineage = if absent && contexts.complete && !contexts.contexts.is_empty() {
-            Some(
-                provider
-                    .head_run_lineage(repository, &PullRequestPrecondition::from(current))
-                    .map_err(|error| mutation_error(&error, self, Some(current.number)))?,
-            )
+            match observed_lineage {
+                Some(lineage) => Some(lineage.clone()),
+                None => Some(
+                    provider
+                        .head_run_lineage(repository, &PullRequestPrecondition::from(current))
+                        .map_err(|error| mutation_error(&error, self, Some(current.number)))?,
+                ),
+            }
         } else {
-            None
+            observed_lineage.cloned()
         };
-        Ok(self.assess_with_lineage(current, contexts, lineage.as_ref()))
+        Ok(self.assess_with_lineage(current, contexts, lineage.as_ref(), checks))
     }
 
     fn assess_with_lineage(
@@ -7921,6 +8206,7 @@ impl SyncProgress {
         current: &PullRequestSnapshot,
         contexts: &RequiredContextsRead,
         lineage: Option<&HeadRunLineage>,
+        checks: &[CheckSnapshot],
     ) -> crate::required_runs::RequiredRunsAssessment {
         let published = head_published_at(current, lineage);
         required_runs::assess(&RequiredRunsInput {
@@ -7929,7 +8215,7 @@ impl SyncProgress {
             base: &current.base,
             contexts,
             lineage,
-            checks: &current.checks,
+            checks,
             head_published_at: published.as_deref(),
             clock: RequiredRunsClock {
                 now_unix: now_unix(),
@@ -8010,7 +8296,8 @@ impl SyncProgress {
         let lineage = provider
             .head_run_lineage(repository, &PullRequestPrecondition::from(&refreshed))
             .map_err(|error| mutation_error(&error, self, Some(number)))?;
-        let assessment = self.assess_with_lineage(&refreshed, contexts, Some(&lineage));
+        let assessment =
+            self.assess_with_lineage(&refreshed, contexts, Some(&lineage), &refreshed.checks);
         Ok(RequiredRunsRetriggerOutcome {
             receipt: RequiredRunsRetrigger {
                 check_suite_id,

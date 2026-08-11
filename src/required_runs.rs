@@ -148,15 +148,22 @@ pub struct HeadRunLineage {
 }
 
 impl HeadRunLineage {
-    /// Bound retained lineage without changing any classification input.
+    /// Bound retained lineage while preserving the newest provider generations.
+    /// Classification consumes the complete read before this diagnostic bound
+    /// is applied; retaining the oldest rows here would hide the very selection
+    /// evidence that decided the current verdict.
     #[must_use]
     pub fn bounded(mut self) -> Self {
-        self.check_suites.sort_by_key(|suite| suite.id);
+        self.check_suites
+            .sort_by_key(|suite| std::cmp::Reverse(suite.id));
         self.check_suites.dedup_by_key(|suite| suite.id);
         self.check_suites.truncate(MAX_REPORTED_LINEAGE);
-        self.workflow_runs.sort_by_key(|run| run.run_id);
+        self.check_suites.sort_by_key(|suite| suite.id);
+        self.workflow_runs
+            .sort_by_key(|run| std::cmp::Reverse(run.run_id));
         self.workflow_runs.dedup_by_key(|run| run.run_id);
         self.workflow_runs.truncate(MAX_REPORTED_LINEAGE);
+        self.workflow_runs.sort_by_key(|run| run.run_id);
         self
     }
 }
