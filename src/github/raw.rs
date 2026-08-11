@@ -800,6 +800,31 @@ mod check_lineage_projection_tests {
         );
     }
 
+    /// REST check-run conclusions are lowercase, unlike GraphQL rollups. Feed
+    /// the provider-shaped JSON through the real projection path so a hard
+    /// failure can never collapse into an unreadable provider state.
+    #[test]
+    fn a_lowercase_provider_failure_stays_a_failure() {
+        let json = r#"{
+            "__typename": "CheckRun",
+            "name": "Fast Tests (unit)",
+            "context": null,
+            "status": "completed",
+            "conclusion": "failure",
+            "state": null,
+            "workflowName": "CI",
+            "detailsUrl": "https://example.test/actions/runs/2/job/3",
+            "targetUrl": null
+        }"#;
+
+        let snapshot = serde_json::from_str::<CheckJson>(json)
+            .expect("a REST-shaped check run parses")
+            .into_snapshot();
+
+        assert_eq!(snapshot.provider_state.as_deref(), Some("failure"));
+        assert_eq!(snapshot.state, model::CheckState::Failure);
+    }
+
     /// A `StatusContext` has no started/completed pair, so `createdAt` is its
     /// only ordering evidence. Without this fall-back an external provider's
     /// reruns would all look simultaneous.
