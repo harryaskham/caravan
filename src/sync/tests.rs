@@ -3153,6 +3153,10 @@ fn parked_repair_is_routed_without_poisoning_independent_admission() {
             pr: parked_root.number,
             disposition: CiDisposition::Failed,
             checks: parked_root.checks.clone(),
+            effective_checks: parked_root.checks.clone(),
+            superseded_checks: Vec::new(),
+            selected_generations: Vec::new(),
+            generation_lineage: None,
             failed_runs: Vec::new(),
             failure_diagnostics: Vec::new(),
             rerunnable_run_ids: Vec::new(),
@@ -3897,21 +3901,22 @@ fn rerun_failed_selects_only_exact_current_run_then_stops() {
         .insert(PrNumber(1), vec![spurious, matching]);
     let status = status(pulls, Some(PrNumber(1)), &clean);
 
-    let error = execute(&status, &provider, false, true, false)
-        .expect_err("rerun still returns unresolved decision");
+    let progress = execute(&status, &provider, false, true, false)
+        .expect("the fresh queued rerun is waiting rather than terminal red");
 
     assert_eq!(*provider.calls.borrow(), vec![MutationKind::RerunChecks]);
     assert_eq!(
         provider.pulls.borrow()[&PrNumber(1)].checks[0].state,
         CheckState::Queued
     );
-    let details = mcp_cli::StructuredError::details(&error).expect("details");
+    assert!(progress.root_merge.is_empty());
+    assert!(progress.events.is_empty());
+    assert_eq!(progress.ci[0].disposition, CiDisposition::Waiting);
     assert!(
-        details["decision"]["completed_steps"]
-            .as_array()
-            .expect("steps")
+        progress
+            .steps
             .iter()
-            .any(|step| step["summary"] == "reran failed jobs for exact workflow run 10")
+            .any(|step| step.summary == "reran failed jobs for exact workflow run 10")
     );
 }
 
@@ -7666,6 +7671,345 @@ fn required_workflow_check(
 }
 
 #[test]
+fn newest_same_head_pending_generation_supersedes_old_failure() {
+    let head = "same-head";
+    let old_failure =
+        required_workflow_check(CHECK_LINT, CheckState::Failure, 100, "2026-08-04T14:00:00Z");
+    let lineage = lineage(
+        head,
+        vec![
+            suite(100, head, "completed", "failure"),
+            suite(200, head, "in_progress", ""),
+        ],
+        vec![
+            head_run(100, head, "completed", "failure"),
+            head_run(200, head, "in_progress", ""),
+        ],
+    );
+
+    let evidence = ci_generation_evidence(std::slice::from_ref(&old_failure), head, Some(&lineage));
+
+    assert_eq!(
+        classify_checks(&evidence.effective_checks, false),
+        CiDisposition::Waiting
+    );
+    assert_eq!(
+        evidence
+            .selected_generations
+            .iter()
+            .map(|selection| selection.workflow_run.run_id)
+            .collect::<Vec<_>>(),
+        vec![200]
+    );
+    assert_eq!(evidence.superseded_checks, vec![old_failure]);
+}
+
+#[test]
+fn newest_same_head_success_supersedes_old_cancellation() {
+    let head = "same-head";
+    let old_cancelled = required_workflow_check(
+        FAST_TESTS,
+        CheckState::Cancelled,
+        100,
+        "2026-08-04T14:00:00Z",
+    );
+    let lineage = lineage(
+        head,
+        vec![
+            suite(100, head, "completed", "cancelled"),
+            suite(200, head, "completed", "success"),
+        ],
+        vec![
+            head_run(100, head, "completed", "cancelled"),
+            head_run(200, head, "completed", "success"),
+        ],
+    );
+
+    let evidence = ci_generation_evidence(&[old_cancelled], head, Some(&lineage));
+
+    assert_eq!(
+        classify_checks(&evidence.effective_checks, false),
+        CiDisposition::Passing
+    );
+    assert_eq!(evidence.selected_generations[0].workflow_run.run_id, 200);
+}
+
+#[test]
+fn newest_complete_same_head_failure_remains_authoritative() {
+    let head = "same-head";
+    let current_failure =
+        required_workflow_check(CHECK_LINT, CheckState::Failure, 200, "2026-08-04T15:00:00Z");
+    let lineage = lineage(
+        head,
+        vec![suite(200, head, "completed", "failure")],
+        vec![head_run(200, head, "completed", "failure")],
+    );
+
+    let evidence = ci_generation_evidence(&[current_failure], head, Some(&lineage));
+
+    assert_eq!(
+        classify_checks(&evidence.effective_checks, false),
+        CiDisposition::Failed
+    );
+    assert_eq!(evidence.selected_generations[0].workflow_run.run_id, 200);
+}
+
+#[test]
+fn incomplete_or_cross_head_lineage_never_suppresses_red() {
+    let head = "current-head";
+    let old_failure =
+        required_workflow_check(CHECK_LINT, CheckState::Failure, 100, "2026-08-04T14:00:00Z");
+    let mut incomplete = lineage(
+        head,
+        vec![suite(200, head, "in_progress", "")],
+        vec![head_run(200, head, "in_progress", "")],
+    );
+    incomplete.complete = false;
+    let cross_head = lineage(
+        "other-head",
+        vec![suite(200, "other-head", "in_progress", "")],
+        vec![head_run(200, "other-head", "in_progress", "")],
+    );
+
+    for lineage in [&incomplete, &cross_head] {
+        let evidence =
+            ci_generation_evidence(std::slice::from_ref(&old_failure), head, Some(lineage));
+        assert!(evidence.selected_generations.is_empty());
+        assert_eq!(
+            classify_checks(&evidence.effective_checks, false),
+            CiDisposition::Failed,
+            "unproven lineage must stay fail-closed"
+        );
+    }
+}
+
+#[test]
+fn stale_synthetic_wrapper_is_superseded_by_mapped_new_generation() {
+    let head = "same-head";
+    let mut synthetic =
+        required_workflow_check(CHECK_LINT, CheckState::Failure, 100, "2026-08-04T14:00:00Z");
+    synthetic.workflow_name = None;
+    let lineage = lineage(
+        head,
+        vec![
+            suite(100, head, "completed", "failure"),
+            suite(200, head, "in_progress", ""),
+        ],
+        vec![
+            head_run(100, head, "completed", "failure"),
+            head_run(200, head, "in_progress", ""),
+        ],
+    );
+
+    let evidence = ci_generation_evidence(&[synthetic], head, Some(&lineage));
+
+    assert_eq!(
+        classify_checks(&evidence.effective_checks, false),
+        CiDisposition::Waiting,
+        "the exact old run ID maps an aggregate wrapper to its workflow"
+    );
+}
+
+#[test]
+fn ci_refetch_observes_a_concurrently_created_same_head_run() {
+    let mut stale = caravan_member(1, "one", "main");
+    stale.checks = vec![required_workflow_check(
+        CHECK_LINT,
+        CheckState::Failure,
+        100,
+        "2026-08-04T14:00:00Z",
+    )];
+    let mut fresh = stale.clone();
+    fresh.checks.push(required_workflow_check(
+        "Changed surface admission",
+        CheckState::InProgress,
+        200,
+        "2026-08-04T15:00:00Z",
+    ));
+    let provider = FakeProvider::with_pull_requests(vec![fresh]);
+    provider.serve_stale_read(PrNumber(1), stale.clone());
+    let status = caravan_status(vec![stale], Some(PrNumber(1)), true);
+    let mut progress = SyncProgress::new(&status, vec![PrNumber(1)], 64);
+
+    let observation = progress
+        .observe_ci(&provider, &status.repository, PrNumber(1))
+        .expect("a check-only race is a normal fresh read");
+
+    assert_eq!(observation.disposition, CiDisposition::Waiting);
+    assert_eq!(
+        *provider.refetches.borrow(),
+        vec![PrNumber(1), PrNumber(1)],
+        "a red first read is refreshed once before it can control an event"
+    );
+    assert!(provider.lineage_reads.borrow().is_empty());
+}
+
+#[test]
+fn final_pre_event_reread_observes_a_run_created_during_ci_discovery() {
+    let mut stale = caravan_member(1, "one", "main");
+    stale.checks = vec![required_workflow_check(
+        CHECK_LINT,
+        CheckState::Failure,
+        100,
+        "2026-08-04T14:00:00Z",
+    )];
+    let mut fresh = stale.clone();
+    fresh.checks.push(required_workflow_check(
+        "Changed surface admission",
+        CheckState::InProgress,
+        200,
+        "2026-08-04T15:00:00Z",
+    ));
+    let head = stale.head.oid.0.clone();
+    let provider = FakeProvider::with_pull_requests(vec![fresh]);
+    // The first observation consumes two red reads and exact red lineage. The
+    // final pre-event observation then sees the concurrently created run.
+    provider.serve_stale_read(PrNumber(1), stale.clone());
+    provider.serve_stale_read(PrNumber(1), stale.clone());
+    provider.serve_lineage(
+        PrNumber(1),
+        lineage(
+            &head,
+            vec![suite(100, &head, "completed", "failure")],
+            vec![head_run(100, &head, "completed", "failure")],
+        ),
+    );
+    let status = caravan_status(vec![stale], Some(PrNumber(1)), true);
+
+    let progress = execute(&status, &provider, false, false, false)
+        .expect("the last provider read supersedes the provisional red verdict");
+
+    assert_eq!(progress.ci[0].disposition, CiDisposition::Waiting);
+    assert!(
+        provider.refetches.borrow().len() >= 3,
+        "the provisional red observation must be followed by a final provider read"
+    );
+    assert!(
+        progress
+            .events
+            .iter()
+            .all(|event| event.kind != EventKind::CiFailed)
+    );
+    assert!(!provider.calls.borrow().contains(&MutationKind::SquashMerge));
+}
+
+#[test]
+fn ci_refetch_refuses_an_exact_head_change() {
+    let mut discovered = caravan_member(1, "one", "main");
+    discovered.checks = vec![required_workflow_check(
+        CHECK_LINT,
+        CheckState::Failure,
+        100,
+        "2026-08-04T14:00:00Z",
+    )];
+    let mut advanced = discovered.clone();
+    advanced.head.oid = CommitOid("different-head".to_owned());
+    let provider = FakeProvider::with_pull_requests(vec![advanced]);
+    let status = caravan_status(vec![discovered], Some(PrNumber(1)), true);
+    let mut progress = SyncProgress::new(&status, vec![PrNumber(1)], 64);
+
+    let error = progress
+        .observe_ci(&provider, &status.repository, PrNumber(1))
+        .expect_err("a head change requires a fresh tick");
+
+    assert_eq!(error.code(), "stale_precondition");
+    let details = error.details().expect("typed stale evidence");
+    assert_eq!(
+        details["decision"]["evidence"]["actual"]["head_oid"],
+        "different-head"
+    );
+    assert_eq!(
+        details["decision"]["evidence"]["changed_fields"],
+        serde_json::json!(["ci_refetch_mutation_identity"])
+    );
+}
+
+#[test]
+fn same_head_pending_lineage_prevents_ci_failed_hook_and_merge() {
+    let mut pull = caravan_member(1, "one", "main");
+    pull.checks = vec![required_workflow_check(
+        CHECK_LINT,
+        CheckState::Failure,
+        100,
+        "2026-08-04T14:00:00Z",
+    )];
+    let head = pull.head.oid.0.clone();
+    let provider = FakeProvider::with_pull_requests(vec![pull.clone()]);
+    provider.require_contexts("main", &[CHECK_LINT]);
+    provider.serve_lineage(
+        PrNumber(1),
+        lineage(
+            &head,
+            vec![
+                suite(100, &head, "completed", "failure"),
+                suite(200, &head, "in_progress", ""),
+            ],
+            vec![
+                head_run(100, &head, "completed", "failure"),
+                head_run(200, &head, "in_progress", ""),
+            ],
+        ),
+    );
+    let status = caravan_status(vec![pull], Some(PrNumber(1)), true);
+
+    let progress = execute(&status, &provider, false, false, false)
+        .expect("historical red cannot abort the tick");
+
+    assert_eq!(progress.ci[0].disposition, CiDisposition::Waiting);
+    assert_eq!(
+        progress.ci[0].selected_generations[0].workflow_run.run_id,
+        200
+    );
+    assert_eq!(
+        required_runs_receipt(&progress, 1).assessment.status,
+        RequiredRunsStatus::Pending,
+        "required-context policy consumes the same newest workflow generation"
+    );
+    assert!(
+        progress
+            .events
+            .iter()
+            .all(|event| event.kind != EventKind::CiFailed)
+    );
+    assert!(
+        !provider.calls.borrow().contains(&MutationKind::SquashMerge),
+        "pending current CI never becomes merge authority"
+    );
+}
+
+#[test]
+fn bounded_lineage_retains_newest_provider_generations() {
+    let head = "same-head";
+    let count = crate::required_runs::MAX_REPORTED_LINEAGE as u64 + 5;
+    let bounded = lineage(
+        head,
+        (1..=count)
+            .map(|id| suite(id, head, "completed", "success"))
+            .collect(),
+        (1..=count)
+            .map(|id| head_run(id, head, "completed", "success"))
+            .collect(),
+    );
+
+    assert_eq!(
+        bounded.check_suites.first().map(|suite| suite.id),
+        Some(count - crate::required_runs::MAX_REPORTED_LINEAGE as u64 + 1)
+    );
+    assert_eq!(
+        bounded.check_suites.last().map(|suite| suite.id),
+        Some(count)
+    );
+    assert_eq!(
+        bounded.workflow_runs.first().map(|run| run.run_id),
+        Some(count - crate::required_runs::MAX_REPORTED_LINEAGE as u64 + 1)
+    );
+    assert_eq!(
+        bounded.workflow_runs.last().map(|run| run.run_id),
+        Some(count)
+    );
+}
+
+#[test]
 fn max_caravans_only_fences_admission_while_two_existing_green_caravans_merge() {
     let pulls = vec![
         caravan_member(1, "one", "main"),
@@ -8356,6 +8700,10 @@ fn head_of_line_stall_names_the_exact_blocking_member_and_its_remedies() {
             pr: PrNumber(1),
             disposition: CiDisposition::Passing,
             checks: Vec::new(),
+            effective_checks: Vec::new(),
+            superseded_checks: Vec::new(),
+            selected_generations: Vec::new(),
+            generation_lineage: None,
             failed_runs: Vec::new(),
             failure_diagnostics: Vec::new(),
             rerunnable_run_ids: Vec::new(),
@@ -8365,6 +8713,10 @@ fn head_of_line_stall_names_the_exact_blocking_member_and_its_remedies() {
             pr: PrNumber(2),
             disposition: CiDisposition::Failed,
             checks: Vec::new(),
+            effective_checks: Vec::new(),
+            superseded_checks: Vec::new(),
+            selected_generations: Vec::new(),
+            generation_lineage: None,
             failed_runs: Vec::new(),
             failure_diagnostics: Vec::new(),
             rerunnable_run_ids: Vec::new(),
@@ -8403,6 +8755,10 @@ fn converged_fleet_reports_no_head_of_line_stall() {
             pr: PrNumber(pr),
             disposition: CiDisposition::Passing,
             checks: Vec::new(),
+            effective_checks: Vec::new(),
+            superseded_checks: Vec::new(),
+            selected_generations: Vec::new(),
+            generation_lineage: None,
             failed_runs: Vec::new(),
             failure_diagnostics: Vec::new(),
             rerunnable_run_ids: Vec::new(),
@@ -9527,6 +9883,10 @@ fn native_sync_refuses_partial_prefix_without_touching_source_heads() {
             pr: PrNumber(1),
             disposition: CiDisposition::Passing,
             checks: Vec::new(),
+            effective_checks: Vec::new(),
+            superseded_checks: Vec::new(),
+            selected_generations: Vec::new(),
+            generation_lineage: None,
             failed_runs: Vec::new(),
             failure_diagnostics: Vec::new(),
             rerunnable_run_ids: Vec::new(),
@@ -9536,6 +9896,10 @@ fn native_sync_refuses_partial_prefix_without_touching_source_heads() {
             pr: PrNumber(2),
             disposition: CiDisposition::Waiting,
             checks: Vec::new(),
+            effective_checks: Vec::new(),
+            superseded_checks: Vec::new(),
+            selected_generations: Vec::new(),
+            generation_lineage: None,
             failed_runs: Vec::new(),
             failure_diagnostics: Vec::new(),
             rerunnable_run_ids: Vec::new(),

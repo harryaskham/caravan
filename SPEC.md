@@ -676,7 +676,12 @@ A sync tick:
 5. Walk head → tail.
 6. Ensure the head merges cleanly into current default.
 7. Ensure every child merges cleanly into its declared predecessor.
-8. Inspect CI/check state for each PR.
+8. Inspect CI/check state for each PR from a fresh single-PR read. A provisional
+   terminal-red result is re-read, then grouped by immutable head and Actions
+   workflow/check-suite generation. Only the newest workflow run with a matching
+   exact-head suite controls that workflow: an incomplete newer generation is
+   pending, and a failure is terminal only after both its run and suite complete.
+   Missing, partial, cross-head, or unmatchable lineage suppresses nothing.
 9. Enforce exactly one merge actor: under `head_merge_actor: caravan` no member carries native auto-merge and Cara performs the bounded squash merges itself; under `github` exactly the root is armed. Admission audit text names Cara direct squash in the former mode and never claims a GitHub `autoMergeRequest` was armed.
 10. Recheck cross-caravan head/tail compatibility.
 11. Emit events/hooks for observed transitions.
@@ -703,7 +708,12 @@ auto-merge, and excludes the whole preserved caravan from active convergence,
 capacity and admission-tail selection. It never changes member labels, branches
 or bases. Pending/running and superseded red remain active; a newer Actions run
 on the exact head supersedes terminal rows from its older workflow generation
-even before matching downstream job names materialize. Once parked,
+even before matching downstream job names materialize. Workflow-run evidence is
+authoritative only with its matching exact-head check suite. The newest matched
+generation votes pending until both rows complete; only then can its terminal
+success/failure/cancellation control. Older failures remain bounded diagnostics,
+never current verdicts. Missing, incomplete, mismatched, or unparsable lineage
+fails closed by retaining the ordinary rollup verdict. Once parked,
 queued/expected/in-progress/unknown or absent current evidence preserves the
 label with zero provider writes. Only a nonempty, fully green latest verdict for
 every member with every protection-declared context proven satisfied removes
@@ -756,7 +766,7 @@ blocks; repository-global problems with no parked owner fail closed. Hooks are
 optional recovery and never a green-queue liveness dependency. Phase one parks
 a complete caravan when any member is terminal red.
 
-Failed ticks carry a scheduler classification alongside their typed error. A provider/head/tail precondition race is `wake_class=retry_tick`: the next tick rediscovers and retries, and no `sync_failed` repair hook is emitted. Mechanical/semantic graph decisions, terminal current-generation CI, proven provider-generation invariant violations, and deterministic unsupported physical range shapes (`rebase_nonlinear_range`, ambiguous/empty ranges, rewritten target history, or invalid owned topology) are non-retryable `wake_class=external_decision`. They emit exactly one canonical `ci_failed` or `sync_failed` repair-wake event even when the same failed tick also completed ordinary topology events. The receipt preserves exact affected PR/caravan, merge OIDs/plans, zero/partial mutation evidence, actionable first-party choices, and a stable decision fingerprint for external deduplication. Local checkout, configuration, permission, or policy work that an external repair agent cannot safely decide is `wake_class=operator_action`. At an incompatible edge or unhandled CI failure, sync stops like an interactive rebase, checks out the affected PR when safe, emits a structured decision point, fires its hook, and exits. A dirty or internally-remoted caller must not trigger raw Git surgery: `repair start` resolves an explicit provider-owned URL, creates an independent workspace below Git's common Caravan state, seeds only content-addressed objects from the current canonical checkout, binds the explicit provider as a separate remote, minimally/bloblessly fetches and checks out exact provider OIDs, and leaves caller HEAD, refs, config, index, and files untouched.
+Failed ticks carry a scheduler classification alongside their typed error. A provider/head/tail precondition race is `wake_class=retry_tick`: the next tick rediscovers and retries, and no `sync_failed` repair hook is emitted. Immediately before accepting terminal-red CI as event authority, sync performs another check-only provider reread; a newer same-head pending/green generation replaces the provisional observation and emits no `ci_failed` event or hook, while head/base/label/auto-merge drift refuses the tick. Mechanical/semantic graph decisions, terminal current-generation CI, proven provider-generation invariant violations, and deterministic unsupported physical range shapes (`rebase_nonlinear_range`, ambiguous/empty ranges, rewritten target history, or invalid owned topology) are non-retryable `wake_class=external_decision`. They emit exactly one canonical `ci_failed` or `sync_failed` repair-wake event even when the same failed tick also completed ordinary topology events. The receipt preserves exact affected PR/caravan, merge OIDs/plans, zero/partial mutation evidence, actionable first-party choices, and a stable decision fingerprint for external deduplication. Local checkout, configuration, permission, or policy work that an external repair agent cannot safely decide is `wake_class=operator_action`. At an incompatible edge or unhandled CI failure, sync stops like an interactive rebase, checks out the affected PR when safe, emits a structured decision point, fires its hook, and exits. A dirty or internally-remoted caller must not trigger raw Git surgery: `repair start` resolves an explicit provider-owned URL, creates an independent workspace below Git's common Caravan state, seeds only content-addressed objects from the current canonical checkout, binds the explicit provider as a separate remote, minimally/bloblessly fetches and checks out exact provider OIDs, and leaves caller HEAD, refs, config, index, and files untouched.
 
 For deterministic repair, conflicts and exact semantic grants remain narrow. For a typed semantic/CI decision, an audited session-level authorization may permit one exact agent to add, modify, rename, or delete ordinary repository content inside the isolated workspace. It never authorizes Git internals, out-of-workspace paths, symlinks/gitlinks, staged secret-like operational files, unstaged/untracked residue, unresolved markers, excess bounded scope/diff, identity drift, or a different actor. Continue fingerprints the complete bounded broad path list, staged objects (including deletions), and binary diff before commit; the publication receipt carries that evidence and requires fresh CI.
 
