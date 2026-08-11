@@ -95,11 +95,11 @@
     "updatable-cli": {
       "flake": false,
       "locked": {
-        "lastModified": 1783936292,
-        "narHash": "sha256-mvfK2m4+lw9M2nTEKSRJSAvTT3Yw/6GLNS7XisSJ70g=",
-        "ref": "main",
-        "rev": "98f35cdc07c085155746bf0d0981bb52930f8c90",
-        "revCount": 25,
+        "lastModified": 1784353442,
+        "narHash": "sha256-Y8TvsWL0LE4g4moVENTn0r9B7VVSLxtmy8KHgRWWgeM=",
+        "ref": "refs/heads/main",
+        "rev": "5167a197f7c950b19e5c812931f0949e0cdedfd4",
+        "revCount": 26,
         "type": "git",
         "url": "https://github.com/harryaskham/updatable-cli"
       },
