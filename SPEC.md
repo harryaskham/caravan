@@ -1330,7 +1330,10 @@ previous tail head. The observed head is retained in the receipt and an exact
 retry performs zero writes. A provider rewrite of any existing member is drift.
 A closed Stack whose complete membership is freshly merged is terminal audit
 history, not an orphan/base-drift blocker even when provider base refs collapse.
-A partial ready prefix with exactly one blocked final member returns a
+Every problem on an open provider Stack is promoted into backend health;
+`status` is unhealthy and `plan sync`/`sync` refuse with zero provider writes
+before constructing any root/native landing action. A partial ready prefix with
+exactly one blocked final member returns a
 hash-sealed, zero-write `top_eviction_plan` containing the full provider
 generation, immutable source heads, selected tail, exact surviving prefix and
 Cara label/base postconditions; multiple blocked members do not receive that
