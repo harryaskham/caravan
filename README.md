@@ -812,11 +812,12 @@ fetched default-branch snapshot while the caller's branch, HEAD, index, tracked
 changes, untracked files, and in-progress Git state remain untouched. The
 remote-tracking default ref is rechecked after provider discovery and before the
 first possible provider mutation; movement returns a typed retry instead of
-mixing policy generations. Provider fetch/ref commands retain the configured
-command timeout, while local detached-worktree materialization has an independent
-60-second floor and 120-second cap, further bounded by the whole sync duration.
-This prevents shared-object-store contention from consuming a short provider
-timeout without weakening the overall action budget. `CARA_ALLOW_FETCH=true|false`
+mixing policy generations. Provider/network commands retain the configured
+command timeout. Local identity/ref reads have an independent 30-second floor,
+and detached-worktree materialization has a 60-second floor; both retain a
+120-second cap and are further bounded by the whole sync duration. This prevents
+shared-object-store contention from consuming a short provider timeout without
+weakening the overall action budget. `CARA_ALLOW_FETCH=true|false`
 is the strict per-invocation override.
 
 `conflict_detected` is a versioned, secret-free notification for one exact open
