@@ -62,6 +62,7 @@ fn plan_sync_inner(
         authority.bind_invocation(&mut status)?;
     }
     crate::initialization::require_ready(&status.initialization)?;
+    super::require_native_stack_backend_healthy(&status)?;
     if let Some(authority) = authority {
         authority.revalidate()?;
     }
