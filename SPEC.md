@@ -66,13 +66,20 @@ reports `max_caravans`, active/parked counts, `terminal_closed_prs` and its
 bounded deterministic PR IDs, `excess_active_caravans`, and
 `at_caravan_capacity`; plan and mutation refusals carry the same active counts.
 Closed-unmerged records are terminal provenance, not caravans, and never consume
-capacity. A candidate incompatible with every target is
-labelled `caravan-join-skipped` and receives a durable generation-bound comment,
-then later candidates may be considered. The skip binds repository, candidate
-head/base, default generation, every tested tail generation, config fingerprint,
-compatibility reasons, heuristic version, actor, and time. Unchanged evidence is
-not retried; any bound generation/config/heuristic change invalidates and removes
-the skip. Explicit `new`/`join`/`rejoin` always consumes the advisory skip label.
+capacity. A candidate incompatible with every target, terminal-red on its exact current
+check generation, or missing protection-required run coverage is refused before
+membership, labelled `caravan-join-skipped`, and receives a durable
+generation-bound comment; later candidates and every already-enrolled caravan
+continue in the same tick. Candidate-local refusal is never promoted to a
+fleet-wide sync failure. Provider/authentication failure, incomplete provider
+state, repository-global graph uncertainty, or integrity failure still aborts
+fail-closed. The skip binds repository, refusal kind, exact candidate CI and
+required-run evidence when relevant, candidate head/base, default generation,
+every tested tail generation, config fingerprint, reasons, heuristic version,
+actor, and time. Unchanged evidence is not retried and emits no repeated hook;
+any bound candidate/check/default/tail/config/heuristic change invalidates and
+removes the skip. Explicit `new`/`join`/`rejoin` always consumes the advisory
+skip label.
 
 Caravan v1 requires member head branches to exist in the base repository: GitHub cannot target a PR at a fork-only branch.
 
@@ -683,8 +690,14 @@ A sync tick:
 12. When `sync --all` auto-admission is enabled, rediscover and greedily admit
     canonical unlabelled candidates only after steps 1–10 converge. Empty fleets
     form a head; non-empty fleets use the first compatible deterministic tail.
-    Incompatible exact generations receive a durable skip and later candidates
-    may be considered. Before beginning another candidate, preserve a bounded
+    Before membership, inspect each candidate's current CI and protection-required
+    run evidence without honoring member-only force authority. Terminal CI,
+    missing required runs, and incompatible exact generations receive a durable
+    candidate-local skip event/receipt; they never undo or block the existing
+    convergence prefix, and later candidates may be considered. Pending CI or
+    required runs remain admissible under the ordinary scheduler wait contract.
+    Provider-global or incomplete evidence remains a tick failure. Before
+    beginning another candidate, preserve a bounded
     nonzero exact-Git reserve; exhaustion returns continuation without starting
     a doomed final fetch.
 13. Re-run normal convergence for admitted members and return exact joins,
@@ -1131,6 +1144,7 @@ Hook events include:
 - `conflict_detected`;
 - `sync_failed`;
 - `join_failed`;
+- `admission_skipped`;
 - `eviction_failed`;
 - `head_advanced`;
 - `evicted`;
@@ -1153,8 +1167,11 @@ observed base, exact default/target generation, `head`/`link`/`cross_caravan`/
 `candidate` class, bounded conflicting paths, reason, operation ID, and stable
 `owner/repo#pr@head` dedupe key. Unknown/stale mergeability emits nothing.
 Candidate events remain advisory and never block unrelated green convergence.
-Repeated ticks may redeliver with a new event ID; coordinators deduplicate by the
-stable generation key. Conflict-hook delivery is always best-effort even if its
+`admission_skipped` carries the exact durable skip receipt, refusal kind, and
+`candidate_local=true` / `tick_continued=true`; an unchanged receipt never emits
+the event again. Repeated conflict ticks may redeliver with a new event ID;
+coordinators deduplicate conflicts by the stable generation key. Conflict-hook
+delivery is always best-effort even if its
 config says `blocking: true`, and the payload explicitly grants no mutation
 authority. Hooks may request a first-party repair but are never a merge, rebase,
 push, comment, or topology actor.

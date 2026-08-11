@@ -417,6 +417,38 @@ pub struct AutoAdmissionTailGeneration {
     pub batch_full: bool,
 }
 
+/// Candidate-local reason automatic admission declined one exact generation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoAdmissionRefusalKind {
+    /// Mechanical compatibility or another deterministic admission preflight
+    /// rejected this exact generation.
+    #[default]
+    Compatibility,
+    /// Current terminal CI makes this candidate unsafe to enrol.
+    TerminalCi,
+    /// Protection requires run coverage this exact head does not have.
+    RequiredRuns,
+}
+
+impl AutoAdmissionRefusalKind {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Compatibility => "compatibility",
+            Self::TerminalCi => "terminal_ci",
+            Self::RequiredRuns => "required_runs",
+        }
+    }
+
+    // Serde's `skip_serializing_if` hook requires `fn(&T) -> bool`; taking this
+    // one-byte Copy enum by reference is therefore the interface contract.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    fn is_compatibility(&self) -> bool {
+        matches!(self, Self::Compatibility)
+    }
+}
+
 /// Durable generation-bound explanation for one best-effort skip.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AutoJoinSkipReceipt {
@@ -430,6 +462,17 @@ pub struct AutoJoinSkipReceipt {
     pub tested_tails: Vec<AutoAdmissionTailGeneration>,
     pub config_fingerprint: String,
     pub heuristic_version: String,
+    /// Omitted for legacy compatibility-only receipts so their encoded hash
+    /// remains byte-identical after this additive schema extension.
+    #[serde(
+        default,
+        skip_serializing_if = "AutoAdmissionRefusalKind::is_compatibility"
+    )]
+    pub refusal_kind: AutoAdmissionRefusalKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_ci: Option<CiObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_runs: Option<crate::required_runs::RequiredRunsAssessment>,
     #[serde(default)]
     pub compatibility_reasons: Vec<String>,
     pub actor: String,
@@ -462,11 +505,23 @@ impl AutoJoinSkipReceipt {
     }
 
     fn comment_body(&self) -> String {
+        let refusal = match self.refusal_kind {
+            AutoAdmissionRefusalKind::Compatibility => {
+                "was not mechanically eligible for any deterministic target"
+            }
+            AutoAdmissionRefusalKind::TerminalCi => {
+                "has a current terminal CI verdict and was refused before membership"
+            }
+            AutoAdmissionRefusalKind::RequiredRuns => {
+                "lacks required-run coverage and was refused before membership"
+            }
+        };
         format!(
-            "{}\n### Cara automatic admission skip\n\nPR #{} was not mechanically compatible with any deterministic target under `{}`. This evidence is bound to the exact candidate/default/tail/config generations and becomes stale automatically when any bound fact changes. Manual `cara new`, `join`, or `rejoin` remains authoritative.\n\n- **Evidence:** `{}`\n- **Exact compatibility findings:** {} (encoded in the receipt marker)\n",
+            "{}\n### Cara automatic admission skip\n\nPR #{} {refusal} under `{}`. This candidate-local refusal did not stop convergence of existing caravans. The evidence is bound to the exact candidate/default/tail/config and health generations and becomes stale automatically when any bound fact changes. Manual `cara new`, `join`, or `rejoin` remains authoritative.\n\n- **Refusal:** `{}`\n- **Evidence:** `{}`\n- **Exact findings:** {} (encoded in the receipt marker)\n",
             self.marker(),
             self.candidate_pr,
             self.heuristic_version,
+            self.refusal_kind.code(),
             self.evidence_hash,
             self.compatibility_reasons.len(),
         )
@@ -4313,10 +4368,27 @@ fn run_auto_admission(
             .iter()
             .rev()
             .find_map(|body| AutoJoinSkipReceipt::from_comment(body));
-        if retained
+        let generation_matches = retained
             .as_ref()
-            .is_some_and(|receipt| skip_receipt_matches(context, &status, receipt))
-        {
+            .is_some_and(|receipt| skip_receipt_matches(context, &status, receipt));
+        let health_matches = if generation_matches {
+            if let Some(expected) = retained
+                .as_ref()
+                .and_then(|receipt| receipt.required_runs.as_ref())
+            {
+                let observed =
+                    progress.observe_required_runs(provider, &status.repository, skipped.pr)?;
+                if observed.status == RequiredRunsStatus::UnknownProviderState {
+                    return Err(auto_admission_provider_state_unknown(skipped.pr, &observed));
+                }
+                required_runs_generation_matches(expected, &observed)
+            } else {
+                true
+            }
+        } else {
+            false
+        };
+        if generation_matches && health_matches {
             let receipt = retained.expect("checked as present");
             validated_skips.insert(skipped.pr);
             output.skips.push(receipt);
@@ -4481,12 +4553,29 @@ fn run_auto_admission(
             break;
         }
         output.candidates_considered += 1;
-        let evaluation = evaluate_auto_candidate_bounded(
-            &status,
-            &candidate,
-            &checker,
-            configured_batch_bound(context),
+        let local_refusal = candidate_local_admission_refusal(
+            provider,
+            progress,
+            &status.repository,
+            candidate.number,
         )?;
+        let evaluation = if let Some(refusal) = &local_refusal {
+            AutoCandidateEvaluation {
+                target: AutoCandidateTarget::Skip,
+                tested_tails: current_tail_generations_bounded(
+                    &status,
+                    configured_batch_bound(context),
+                ),
+                reasons: refusal.reasons.clone(),
+            }
+        } else {
+            evaluate_auto_candidate_bounded(
+                &status,
+                &candidate,
+                &checker,
+                configured_batch_bound(context),
+            )?
+        };
         if matches!(evaluation.target, AutoCandidateTarget::New)
             && let Some(refusal) =
                 caravan_fleet_capacity_refusal(context, &status, candidate.number)
@@ -4512,6 +4601,17 @@ fn run_auto_admission(
                 tested_tails: evaluation.tested_tails,
                 config_fingerprint: auto_admission_config_fingerprint(context),
                 heuristic_version: AUTO_ADMISSION_HEURISTIC_VERSION.to_owned(),
+                refusal_kind: local_refusal
+                    .as_ref()
+                    .map_or(AutoAdmissionRefusalKind::Compatibility, |refusal| {
+                        refusal.kind
+                    }),
+                candidate_ci: local_refusal
+                    .as_ref()
+                    .and_then(|refusal| refusal.ci.clone()),
+                required_runs: local_refusal
+                    .as_ref()
+                    .and_then(|refusal| refusal.required_runs.clone()),
                 compatibility_reasons: evaluation.reasons,
                 actor: "cara sync automatic admission".to_owned(),
                 observed_unix_secs: SystemTime::now()
@@ -4521,7 +4621,7 @@ fn run_auto_admission(
                 evidence_hash: String::new(),
             }
             .finalize_hash();
-            persist_auto_skip(provider, progress, &status.repository, &receipt)?;
+            record_auto_admission_skip(provider, progress, &status.repository, &receipt)?;
             output.skips.push(receipt);
         } else {
             let target_tail = match evaluation.target {
@@ -4863,6 +4963,136 @@ struct AutoCandidateEvaluation {
     reasons: Vec<String>,
 }
 
+#[derive(Debug)]
+struct AutoCandidateAdmissionRefusal {
+    kind: AutoAdmissionRefusalKind,
+    ci: Option<CiObservation>,
+    required_runs: Option<crate::required_runs::RequiredRunsAssessment>,
+    reasons: Vec<String>,
+}
+
+/// Classify only deterministic, candidate-scoped admission health. Provider
+/// errors and incomplete provider reads remain tick-wide failures: without a
+/// trustworthy snapshot Cara cannot prove that isolation is safe.
+fn candidate_local_admission_refusal(
+    provider: &impl SyncProvider,
+    progress: &mut SyncProgress,
+    repository: &RepositoryId,
+    candidate_pr: PrNumber,
+) -> Result<Option<AutoCandidateAdmissionRefusal>, AppError> {
+    let mut ci = progress.observe_ci(provider, repository, candidate_pr)?;
+    // `caravan-force` is member repair authority, not authority to enrol a
+    // known-red unjoined PR. Required CI is therefore never bypassed here.
+    ci.disposition = classify_checks(&ci.checks, false);
+    let unknown_checks = crate::model::latest_checks_per_identity(&ci.checks)
+        .0
+        .into_iter()
+        .filter(|check| check.state == CheckState::Unknown)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unknown_checks.is_empty() {
+        return Err(AppError::structured(
+            ErrorCategory::ExecutionFailure,
+            "auto_admission_provider_state_unknown",
+            "automatic admission CI evidence contains an uninterpretable provider state, so candidate-local isolation is unsafe",
+            Some(json!({
+                "candidate_pr": candidate_pr,
+                "candidate_local": false,
+                "mutated": false,
+                "unknown_checks": unknown_checks,
+                "candidate_ci": ci,
+                "safe_next_action": "restore a supported provider check state and rerun the same sync tick; existing completed convergence receipts remain authoritative",
+            })),
+        ));
+    }
+    if ci.disposition == CiDisposition::Failed {
+        let failed_checks = crate::model::latest_checks_per_identity(&ci.checks)
+            .0
+            .into_iter()
+            .filter(|check| check_is_failure(check))
+            .map(|check| format!("{}={:?}", check.name, check.state))
+            .collect::<Vec<_>>();
+        return Ok(Some(AutoCandidateAdmissionRefusal {
+            kind: AutoAdmissionRefusalKind::TerminalCi,
+            ci: Some(ci),
+            required_runs: None,
+            reasons: vec![format!(
+                "candidate #{candidate_pr} has terminal current CI: {}",
+                failed_checks.join(", "),
+            )],
+        }));
+    }
+
+    let required_runs = progress.observe_required_runs(provider, repository, candidate_pr)?;
+    let refusal_kind = match required_runs.status {
+        RequiredRunsStatus::Failing => Some(AutoAdmissionRefusalKind::TerminalCi),
+        RequiredRunsStatus::CancelledSuperseded | RequiredRunsStatus::MissingRequiredRuns => {
+            Some(AutoAdmissionRefusalKind::RequiredRuns)
+        }
+        RequiredRunsStatus::UnknownProviderState => {
+            return Err(auto_admission_provider_state_unknown(
+                candidate_pr,
+                &required_runs,
+            ));
+        }
+        RequiredRunsStatus::NotRequired
+        | RequiredRunsStatus::Satisfied
+        | RequiredRunsStatus::Pending
+        | RequiredRunsStatus::AwaitingGrace => None,
+    };
+    Ok(refusal_kind.map(|kind| AutoCandidateAdmissionRefusal {
+        kind,
+        ci: Some(ci),
+        reasons: vec![format!(
+            "candidate #{candidate_pr} required-run admission status is {}: {}",
+            required_runs.status.code(),
+            required_runs.reason,
+        )],
+        required_runs: Some(required_runs),
+    }))
+}
+
+fn auto_admission_provider_state_unknown(
+    candidate_pr: PrNumber,
+    required_runs: &crate::required_runs::RequiredRunsAssessment,
+) -> AppError {
+    AppError::structured(
+        ErrorCategory::ExecutionFailure,
+        "auto_admission_provider_state_unknown",
+        "automatic admission required-run evidence is incomplete, so candidate-local isolation is unsafe",
+        Some(json!({
+            "candidate_pr": candidate_pr,
+            "candidate_local": false,
+            "mutated": false,
+            "required_runs": required_runs,
+            "safe_next_action": "restore complete provider reads and rerun the same sync tick; existing completed convergence receipts remain authoritative",
+        })),
+    )
+}
+
+/// Compare policy/run generations while deliberately excluding elapsed wall
+/// time and rendered prose. An unchanged post-grace stall must stay stable;
+/// protection, coverage, lineage, or recovery changes must retry admission.
+fn required_runs_generation_matches(
+    expected: &crate::required_runs::RequiredRunsAssessment,
+    observed: &crate::required_runs::RequiredRunsAssessment,
+) -> bool {
+    expected.pr == observed.pr
+        && expected.head == observed.head
+        && expected.base == observed.base
+        && expected.status == observed.status
+        && expected.required_contexts == observed.required_contexts
+        && expected.coverage == observed.coverage
+        && expected.missing_contexts == observed.missing_contexts
+        && expected.observed_check_suites == observed.observed_check_suites
+        && expected.observed_runs == observed.observed_runs
+        && expected.stale_head_runs == observed.stale_head_runs
+        && expected.provider_reads_complete == observed.provider_reads_complete
+        && expected.grace_secs == observed.grace_secs
+        && expected.grace_elapsed == observed.grace_elapsed
+        && expected.recovery == observed.recovery
+}
+
 #[cfg(test)]
 fn evaluate_auto_candidate(
     status: &StatusOutput,
@@ -5076,10 +5306,41 @@ fn skip_receipt_matches(
         && receipt.repository == status.repository
         && receipt.candidate_head == candidate.head
         && receipt.candidate_base == candidate.base
+        && receipt.candidate_ci.as_ref().is_none_or(|observation| {
+            observation.checks == candidate.checks
+                && observation.disposition == classify_checks(&candidate.checks, false)
+        })
         && receipt.default_branch == status.analysis.fleet.default_branch
         && receipt.tested_tails == current_tail_generations(status)
         && receipt.config_fingerprint == auto_admission_config_fingerprint(context)
         && receipt.heuristic_version == AUTO_ADMISSION_HEURISTIC_VERSION
+}
+
+fn record_auto_admission_skip(
+    provider: &impl SyncProvider,
+    progress: &mut SyncProgress,
+    repository: &RepositoryId,
+    receipt: &AutoJoinSkipReceipt,
+) -> Result<bool, AppError> {
+    let changed = persist_auto_skip(provider, progress, repository, receipt)?;
+    if changed {
+        progress.events.push(progress.event(
+            EventKind::AdmissionSkipped,
+            None,
+            vec![receipt.candidate_pr],
+            Some(format!(
+                "automatic admission refused candidate #{} locally as {}; existing caravan convergence continued",
+                receipt.candidate_pr,
+                receipt.refusal_kind.code(),
+            )),
+            BTreeMap::from([
+                ("candidate_local".to_owned(), json!(true)),
+                ("tick_continued".to_owned(), json!(true)),
+                ("receipt".to_owned(), json!(receipt)),
+            ]),
+        ));
+    }
+    Ok(changed)
 }
 
 fn persist_auto_skip(
@@ -5087,7 +5348,7 @@ fn persist_auto_skip(
     progress: &mut SyncProgress,
     repository: &RepositoryId,
     receipt: &AutoJoinSkipReceipt,
-) -> Result<(), AppError> {
+) -> Result<bool, AppError> {
     let marker = receipt.marker();
     let body = receipt.comment_body();
     if body.len() > MAX_AUTO_ADMISSION_COMMENT_BYTES {
@@ -5133,6 +5394,10 @@ fn persist_auto_skip(
             &body,
         )
         .map_err(|error| mutation_error(&error, progress, Some(receipt.candidate_pr)))?;
+    let comment_changed = !comment
+        .provider_output
+        .as_deref()
+        .is_some_and(|output| output.starts_with("existing GitHub comment"));
     record_marked_comment(
         progress,
         comment,
@@ -5153,6 +5418,7 @@ fn persist_auto_skip(
                 ),
             )
         })?;
+    let mut label_changed = false;
     if !candidate.has_label(AUTO_ADMISSION_SKIP_LABEL) {
         let labelled = provider
             .add_label(
@@ -5162,8 +5428,9 @@ fn persist_auto_skip(
             )
             .map_err(|error| mutation_error(&error, progress, Some(receipt.candidate_pr)))?;
         progress.record(labelled, "added generation-bound automatic admission skip");
+        label_changed = true;
     }
-    Ok(())
+    Ok(comment_changed || label_changed)
 }
 
 /// Post one exact-generation rewrite reason, or prove no comment is required.

@@ -1413,6 +1413,9 @@ pub enum EventKind {
     ConflictDetected,
     SyncFailed,
     JoinFailed,
+    /// One exact unjoined candidate was refused locally before membership;
+    /// existing caravan convergence remained authoritative and continued.
+    AdmissionSkipped,
     EvictionFailed,
     HeadAdvanced,
     Evicted,

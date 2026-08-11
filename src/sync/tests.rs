@@ -2402,6 +2402,9 @@ fn skip_receipt_round_trips_and_invalidates_on_generation_change() {
         tested_tails: current_tail_generations(&status),
         config_fingerprint: auto_admission_config_fingerprint(&context),
         heuristic_version: AUTO_ADMISSION_HEURISTIC_VERSION.to_owned(),
+        refusal_kind: AutoAdmissionRefusalKind::Compatibility,
+        candidate_ci: None,
+        required_runs: None,
         compatibility_reasons: vec!["tail #1: conflict".to_owned()],
         actor: "cara sync automatic admission".to_owned(),
         observed_unix_secs: 1,
@@ -2683,6 +2686,261 @@ fn forty_candidate_auto_admission_preserves_nonzero_exact_git_budget() {
     assert!(provider.calls.borrow().is_empty());
 }
 
+fn admission_refusal_receipt(
+    status: &StatusOutput,
+    candidate: &PullRequestSnapshot,
+    refusal: &AutoCandidateAdmissionRefusal,
+) -> AutoJoinSkipReceipt {
+    AutoJoinSkipReceipt {
+        schema_version: 1,
+        repository: status.repository.clone(),
+        candidate_pr: candidate.number,
+        candidate_head: candidate.head.clone(),
+        candidate_base: candidate.base.clone(),
+        default_branch: status.analysis.fleet.default_branch.clone(),
+        tested_tails: current_tail_generations(status),
+        config_fingerprint: auto_admission_config_fingerprint(&AppContext::default()),
+        heuristic_version: AUTO_ADMISSION_HEURISTIC_VERSION.to_owned(),
+        refusal_kind: refusal.kind,
+        candidate_ci: refusal.ci.clone(),
+        required_runs: refusal.required_runs.clone(),
+        compatibility_reasons: refusal.reasons.clone(),
+        actor: "cara sync automatic admission".to_owned(),
+        observed_unix_secs: 1,
+        evidence_hash: String::new(),
+    }
+    .finalize_hash()
+}
+
+/// bd-655f52: admission health belongs to the unjoined candidate, not to the
+/// fleet transaction. A red candidate encountered after a green four-member
+/// caravan has converged must be durably refused without erasing that prefix or
+/// preventing later candidates from being considered.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn failing_unjoined_candidate_is_skipped_after_existing_caravan_progress() {
+    let mut pulls = vec![
+        caravan_member(1, "one", "main"),
+        caravan_member(2, "two", "one"),
+        caravan_member(3, "three", "two"),
+        caravan_member(4, "four", "three"),
+    ];
+    let mut candidate = pull_request(
+        2596,
+        "failing-candidate",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    candidate.labels.clear();
+    candidate.checks = vec![check("test", CheckState::Failure, None)];
+    pulls.push(candidate.clone());
+    let mut later_candidate = pull_request(
+        2597,
+        "passing-candidate",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    later_candidate.labels.clear();
+    later_candidate.checks = vec![check("test", CheckState::Success, None)];
+    pulls.push(later_candidate.clone());
+
+    let status = caravan_status(pulls.clone(), None, true);
+    let provider = FakeProvider::with_pull_requests(pulls);
+    let mut progress = execute(&status, &provider, true, false, false)
+        .expect("the existing green caravan converges before admission");
+    assert!(
+        !progress.root_merge.is_empty(),
+        "at least the permitted green root action completes"
+    );
+
+    let refusal = candidate_local_admission_refusal(
+        &provider,
+        &mut progress,
+        &status.repository,
+        candidate.number,
+    )
+    .expect("candidate health is readable")
+    .expect("terminal CI is candidate-local");
+    assert_eq!(refusal.kind, AutoAdmissionRefusalKind::TerminalCi);
+    let receipt = admission_refusal_receipt(&status, &candidate, &refusal);
+
+    assert!(
+        record_auto_admission_skip(&provider, &mut progress, &status.repository, &receipt,)
+            .expect("first skip persists"),
+        "the first exact refusal changes provider state"
+    );
+    assert!(
+        !record_auto_admission_skip(&provider, &mut progress, &status.repository, &receipt,)
+            .expect("exact retry is idempotent"),
+        "an exact retry performs no new skip transition"
+    );
+
+    let candidate_after = &provider.pulls.borrow()[&candidate.number];
+    assert!(!candidate_after.has_label("caravan"));
+    assert!(candidate_after.has_label(AUTO_ADMISSION_SKIP_LABEL));
+    assert_eq!(provider.comments.borrow()[&candidate.number].len(), 1);
+    assert_eq!(
+        progress
+            .events
+            .iter()
+            .filter(|event| event.kind == EventKind::AdmissionSkipped)
+            .count(),
+        1,
+        "retries do not churn hooks"
+    );
+    let calls = provider.calls.borrow();
+    let merge_at = calls
+        .iter()
+        .position(|kind| *kind == MutationKind::SquashMerge)
+        .expect("existing caravan merge occurs");
+    let skip_at = calls
+        .iter()
+        .position(|kind| *kind == MutationKind::Comment)
+        .expect("candidate refusal receipt occurs");
+    assert!(
+        merge_at < skip_at,
+        "existing caravan progress is preserved before candidate-local refusal: {calls:?}"
+    );
+    drop(calls);
+
+    assert!(
+        candidate_local_admission_refusal(
+            &provider,
+            &mut progress,
+            &status.repository,
+            later_candidate.number,
+        )
+        .expect("later candidate health is readable")
+        .is_none(),
+        "one local refusal must not prevent deterministic evaluation of the next candidate"
+    );
+    assert!(
+        !matches!(
+            evaluate_auto_candidate_bounded(&status, &later_candidate, &clean, None)
+                .expect("later candidate compatibility is evaluated")
+                .target,
+            AutoCandidateTarget::Skip
+        ),
+        "a later eligible candidate remains admissible after the red candidate is skipped"
+    );
+}
+
+#[test]
+fn candidate_health_distinguishes_pending_missing_and_unknown_provider_state() {
+    let mut candidate = pull_request(
+        9,
+        "candidate",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    candidate.labels.clear();
+    candidate.checks = vec![check("required", CheckState::Queued, None)];
+    let pending_status = status(vec![candidate.clone()], Some(candidate.number), &clean);
+    let provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
+    provider.require_contexts("main", &["required"]);
+    let mut progress = SyncProgress::new(&pending_status, Vec::new(), u32::MAX);
+    assert!(
+        candidate_local_admission_refusal(
+            &provider,
+            &mut progress,
+            &pending_status.repository,
+            candidate.number,
+        )
+        .expect("pending evidence is complete")
+        .is_none(),
+        "pending CI remains admissible and waits only after membership"
+    );
+
+    candidate.checks.clear();
+    let missing_status = status(vec![candidate.clone()], Some(candidate.number), &clean);
+    let missing_provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
+    missing_provider.require_contexts("main", &["required"]);
+    let mut missing_progress = SyncProgress::new(&missing_status, Vec::new(), u32::MAX);
+    let missing = candidate_local_admission_refusal(
+        &missing_provider,
+        &mut missing_progress,
+        &missing_status.repository,
+        candidate.number,
+    )
+    .expect("complete missing evidence is readable")
+    .expect("missing required runs refuse admission");
+    assert_eq!(missing.kind, AutoAdmissionRefusalKind::RequiredRuns);
+    assert_eq!(
+        missing.required_runs.as_ref().unwrap().status,
+        RequiredRunsStatus::MissingRequiredRuns
+    );
+    let recovered_provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
+    let mut recovered_progress = SyncProgress::new(&missing_status, Vec::new(), u32::MAX);
+    let recovered = recovered_progress
+        .observe_required_runs(
+            &recovered_provider,
+            &missing_status.repository,
+            candidate.number,
+        )
+        .expect("removed protection is complete evidence");
+    assert!(
+        !required_runs_generation_matches(missing.required_runs.as_ref().unwrap(), &recovered),
+        "a protection change invalidates the old missing-run skip even when the PR head is unchanged"
+    );
+
+    let partial_provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
+    partial_provider.partial_contexts("main");
+    let mut partial_progress = SyncProgress::new(&missing_status, Vec::new(), u32::MAX);
+    let error = candidate_local_admission_refusal(
+        &partial_provider,
+        &mut partial_progress,
+        &missing_status.repository,
+        candidate.number,
+    )
+    .expect_err("provider-global uncertainty must remain fail-closed");
+    assert_eq!(error.code(), "auto_admission_provider_state_unknown");
+}
+
+#[test]
+fn same_head_green_rerun_invalidates_terminal_ci_skip() {
+    let mut candidate = pull_request(
+        9,
+        "candidate",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    candidate.labels.clear();
+    candidate.checks = vec![check("test", CheckState::Failure, None)];
+    let status = status(vec![candidate.clone()], Some(candidate.number), &clean);
+    let provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
+    let mut progress = SyncProgress::new(&status, Vec::new(), u32::MAX);
+    let refusal = candidate_local_admission_refusal(
+        &provider,
+        &mut progress,
+        &status.repository,
+        candidate.number,
+    )
+    .unwrap()
+    .unwrap();
+    let receipt = admission_refusal_receipt(&status, &candidate, &refusal);
+    assert!(skip_receipt_matches(
+        &AppContext::default(),
+        &status,
+        &receipt
+    ));
+
+    let mut green = status.clone();
+    green
+        .analysis
+        .pull_requests
+        .get_mut(&candidate.number)
+        .unwrap()
+        .checks = vec![check("test", CheckState::Success, None)];
+    assert!(
+        !skip_receipt_matches(&AppContext::default(), &green, &receipt),
+        "a rerun on the same commit is a new health generation"
+    );
+}
+
 #[test]
 fn persist_skip_is_idempotent_and_manual_membership_can_consume_the_label() {
     let mut candidate = pull_request(
@@ -2706,6 +2964,9 @@ fn persist_skip_is_idempotent_and_manual_membership_can_consume_the_label() {
         tested_tails: Vec::new(),
         config_fingerprint: auto_admission_config_fingerprint(&AppContext::default()),
         heuristic_version: AUTO_ADMISSION_HEURISTIC_VERSION.to_owned(),
+        refusal_kind: AutoAdmissionRefusalKind::Compatibility,
+        candidate_ci: None,
+        required_runs: None,
         compatibility_reasons: vec!["default conflict".to_owned()],
         actor: "cara sync automatic admission".to_owned(),
         observed_unix_secs: 1,
@@ -2752,6 +3013,9 @@ fn oversized_skip_receipt_fails_before_label_mutation() {
         tested_tails: Vec::new(),
         config_fingerprint: auto_admission_config_fingerprint(&AppContext::default()),
         heuristic_version: AUTO_ADMISSION_HEURISTIC_VERSION.to_owned(),
+        refusal_kind: AutoAdmissionRefusalKind::Compatibility,
+        candidate_ci: None,
+        required_runs: None,
         compatibility_reasons: vec!["x".repeat(MAX_AUTO_ADMISSION_COMMENT_BYTES)],
         actor: "cara sync automatic admission".to_owned(),
         observed_unix_secs: 1,
@@ -9093,6 +9357,9 @@ fn the_skip_receipt_is_written_before_the_label_that_depends_on_it() {
         tested_tails: Vec::new(),
         config_fingerprint: auto_admission_config_fingerprint(&AppContext::default()),
         heuristic_version: AUTO_ADMISSION_HEURISTIC_VERSION.to_owned(),
+        refusal_kind: AutoAdmissionRefusalKind::Compatibility,
+        candidate_ci: None,
+        required_runs: None,
         compatibility_reasons: vec!["default conflict".to_owned()],
         actor: "cara sync automatic admission".to_owned(),
         observed_unix_secs: 1,
