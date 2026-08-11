@@ -1593,10 +1593,13 @@ snapshot. The invoking branch, HEAD, index, tracked/untracked files, in-progress
 Git state, remotes, and local branches are never checked out, reset, stashed, or
 rewritten. The remote-tracking generation is revalidated after provider
 discovery and before the first possible provider mutation; movement refuses
-with `sync_default_branch_moved` and zero provider writes. Cleanup removes only
-the Cara-owned detached worktree. `CARA_ALLOW_FETCH` is the strict per-invocation
-override. An explicit `--config` remains explicit authority and is never
-silently replaced.
+with `sync_default_branch_moved` and zero provider writes. Network/ref Git
+commands retain `command_timeout_secs`; detached local worktree creation uses a
+separate timeout of `max(command timeout, 60s)`, capped at 120 seconds and by the
+whole `sync.max_duration_secs` budget. Cleanup removes only the Cara-owned
+detached worktree on both success and failure. `CARA_ALLOW_FETCH` is the strict
+per-invocation override. An explicit `--config` remains explicit authority and
+is never silently replaced.
 
 A reviewed `sync.allow_fetch: false` retains branch-local operation. In that
 mode `config_provenance.behind_default_branch` still reports distance and

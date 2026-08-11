@@ -19,6 +19,10 @@ use crate::config::{CaravanConfig, DEFAULT_CONFIG_PATH};
 use crate::{AppContext, AppError};
 
 const FETCH_TIMEOUT_SECS: u64 = 120;
+// Local shared-object worktree registration can contend with long-running Git
+// readers even when provider commands should retain a short timeout. Keep this
+// floor separate from network/API command tuning (bd-4dae44).
+const MATERIALIZATION_TIMEOUT_FLOOR_SECS: u64 = 60;
 const WORKTREE_PREFIX: &str = "cara-authoritative-sync";
 
 /// One exact fetched default-branch generation. Revalidate immediately before
@@ -158,6 +162,10 @@ pub(crate) fn prepare(context: &AppContext) -> Result<PreparedSyncContext, AppEr
             .command_timeout_secs
             .clamp(5, FETCH_TIMEOUT_SECS),
     );
+    let materialization_timeout = authoritative_worktree_timeout(
+        timeout,
+        Duration::from_secs(context.config.sync.max_duration_secs),
+    );
     let repository = context.repository_path.clone();
     let invocation_branch = optional_git_value(
         &repository,
@@ -190,7 +198,19 @@ pub(crate) fn prepare(context: &AppContext) -> Result<PreparedSyncContext, AppEr
         invocation_branch,
         invocation_head,
         timeout,
+        materialization_timeout,
     )
+}
+
+fn authoritative_worktree_timeout(
+    command_timeout: Duration,
+    overall_sync_budget: Duration,
+) -> Duration {
+    let seconds = command_timeout
+        .as_secs()
+        .clamp(MATERIALIZATION_TIMEOUT_FLOOR_SECS, FETCH_TIMEOUT_SECS)
+        .min(overall_sync_budget.as_secs().max(1));
+    Duration::from_secs(seconds)
 }
 
 fn unmaterialized(context: AppContext) -> PreparedSyncContext {
@@ -207,6 +227,7 @@ fn materialize_fetched_default(
     invocation_branch: Option<String>,
     invocation_head: String,
     timeout: Duration,
+    materialization_timeout: Duration,
 ) -> Result<PreparedSyncContext, AppError> {
     let branch = default_ref.strip_prefix("origin/").ok_or_else(|| {
         authority_error(
@@ -245,7 +266,8 @@ fn materialize_fetched_default(
         std::process::id(),
         uuid::Uuid::now_v7()
     ));
-    let materialized = MaterializedWorktree::create(&repository, path, &oid, timeout)?;
+    let materialized =
+        MaterializedWorktree::create(&repository, path, &oid, materialization_timeout)?;
     let loaded = AppContext::load_from_directory(&materialized.path, None)
         .map_err(|error| config_error_for_sync(&error))?;
     crate::sync::progress::emit(
@@ -574,6 +596,47 @@ mod tests {
         git(&checkout, &["push", "-u", "origin", "main"]);
         git(&checkout, &["remote", "set-head", "origin", "main"]);
         (root, checkout)
+    }
+
+    #[test]
+    fn authoritative_worktree_timeout_has_independent_floor_and_cap() {
+        assert_eq!(
+            authoritative_worktree_timeout(Duration::from_secs(30), Duration::from_secs(480)),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            authoritative_worktree_timeout(Duration::from_secs(90), Duration::from_secs(480)),
+            Duration::from_secs(90)
+        );
+        assert_eq!(
+            authoritative_worktree_timeout(Duration::from_secs(300), Duration::from_secs(480)),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            authoritative_worktree_timeout(Duration::from_secs(30), Duration::from_secs(45)),
+            Duration::from_secs(45),
+            "the local floor never exceeds the whole sync budget"
+        );
+    }
+
+    #[test]
+    fn failed_authoritative_worktree_creation_removes_partial_path() {
+        let (_root, checkout) = fixture();
+        let path = checkout.parent().unwrap().join("failed-materialization");
+
+        let error = MaterializedWorktree::create(
+            &checkout,
+            path.clone(),
+            "not-a-commit",
+            Duration::from_secs(60),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            mcp_cli::StructuredError::code(&error),
+            "sync_default_branch_materialization_failed"
+        );
+        assert!(!path.exists());
     }
 
     #[test]
