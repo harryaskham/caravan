@@ -51,6 +51,8 @@ sha2 = "0.10"
 rustix = { version = "1", features = ["process"] }
 
 [dev-dependencies]
+flate2 = "1"
+tar = "0.4"
 tempfile = "3"
 
 [lints.rust]

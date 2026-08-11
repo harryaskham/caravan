@@ -3,8 +3,9 @@
 //! Every bounded v1 domain tool is backed by the same GitHub-facing operation
 //! used by the human and JSON CLI surfaces.
 
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub mod admission;
 pub mod ci;
@@ -1707,9 +1708,14 @@ fn register_feedback_tools(router: &mut ToolRouter<AppContext>) {
 /// Self-update configuration for GitHub release assets.
 #[must_use]
 pub fn updater_config() -> updatable_cli::UpdaterConfig {
-    let config =
+    let mut config =
         updatable_cli::UpdaterConfig::new(TOOL_NAME, env!("CARGO_PKG_VERSION"), UPDATE_REPO_SLUG)
             .with_gh_token_fallback(true);
+    // The cron prelude must never borrow the sync budget. Release discovery,
+    // archive download, and checksum download each receive a small independent
+    // network bound; the parent process additionally enforces one whole-run
+    // deadline before returning typed deferred evidence (bd-babf29).
+    config.http_timeout = Some(Duration::from_secs(SELF_UPDATE_HTTP_TIMEOUT_SECS));
     match std::env::var("GITHUB_TOKEN") {
         Ok(token) if !token.trim().is_empty() => config.with_github_token(token),
         _ => config,
@@ -2080,6 +2086,311 @@ fn update_error(error: &impl StructuredError) -> AppError {
     )
 }
 
+const SELF_UPDATE_CACHE_SCHEMA_VERSION: u32 = 1;
+const SELF_UPDATE_CACHE_FILE: &str = ".cara-release-cache-v1.json";
+const SELF_UPDATE_CACHE_MAX_BYTES: u64 = 1024 * 1024;
+const SELF_UPDATE_CACHE_TTL_SECS: u64 = 30 * 60;
+const SELF_UPDATE_HTTP_TIMEOUT_SECS: u64 = 8;
+const SELF_UPDATE_MAX_DURATION_SECS: u64 = 30;
+const SELF_UPDATE_WORKER_ENV: &str = "CARA_SELF_UPDATE_BOUNDED_WORKER";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SelfUpdateReleaseCache {
+    schema_version: u32,
+    tool: String,
+    repository: String,
+    current_version: String,
+    checked_at_unix_secs: u64,
+    release: updatable_cli::LatestReleaseInfo,
+    /// `updatable-cli` deliberately omits authenticated transport metadata
+    /// from its public JSON shape. The private cache must retain it separately
+    /// so a cached update preserves the exact verified asset request path.
+    #[serde(default)]
+    release_assets: Vec<SelfUpdateReleaseAssetCache>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SelfUpdateReleaseAssetCache {
+    name: String,
+    id: Option<u64>,
+    browser_download_url: Option<String>,
+}
+
+/// Cache and provider-read facts for one bounded self-update run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SelfUpdateCacheEvidence {
+    pub hit: bool,
+    pub age_secs: u64,
+    pub ttl_secs: u64,
+    pub release_checked: bool,
+}
+
+/// Whole-process timing evidence for one bounded self-update run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SelfUpdateTimingEvidence {
+    pub elapsed_ms: u64,
+    pub max_duration_ms: u64,
+}
+
+/// Backward-compatible update result plus bounded-cache evidence.
+///
+/// `outcome` is flattened so existing JSON consumers keep the original
+/// `current_version`, `latest_version`, path, and promotion fields.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SelfUpdateRunOutput {
+    #[serde(flatten)]
+    pub outcome: updatable_cli::UpdateOutcome,
+    pub cache: SelfUpdateCacheEvidence,
+    pub timing: SelfUpdateTimingEvidence,
+}
+
+fn self_update_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+fn self_update_elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn self_update_cache_path(config: &updatable_cli::UpdaterConfig) -> Result<PathBuf, AppError> {
+    config
+        .install_dir()
+        .map(|directory| directory.join(SELF_UPDATE_CACHE_FILE))
+        .map_err(updatable_cli::UpdateError::from)
+        .map_err(|error| update_error(&error))
+}
+
+fn read_self_update_cache(
+    config: &updatable_cli::UpdaterConfig,
+    now_secs: u64,
+) -> Option<(updatable_cli::LatestReleaseInfo, u64)> {
+    let path = self_update_cache_path(config).ok()?;
+    if fs::metadata(&path).ok()?.len() > SELF_UPDATE_CACHE_MAX_BYTES {
+        return None;
+    }
+    let bytes = fs::read(path).ok()?;
+    let cache: SelfUpdateReleaseCache = serde_json::from_slice(&bytes).ok()?;
+    if cache.schema_version != SELF_UPDATE_CACHE_SCHEMA_VERSION
+        || cache.tool != config.tool_name
+        || cache.repository != config.repo_slug
+        || cache.checked_at_unix_secs > now_secs
+    {
+        return None;
+    }
+    let age = now_secs.saturating_sub(cache.checked_at_unix_secs);
+    if age > SELF_UPDATE_CACHE_TTL_SECS {
+        return None;
+    }
+    let mut release = cache.release;
+    release.release_assets = cache
+        .release_assets
+        .into_iter()
+        .map(|asset| updatable_cli::ReleaseAssetInfo {
+            name: asset.name,
+            id: asset.id,
+            browser_download_url: asset.browser_download_url,
+        })
+        .collect();
+    if release.version == config.current_version {
+        release.newer_than_current = false;
+    } else if cache.current_version != config.current_version {
+        return None;
+    }
+    Some((release, age))
+}
+
+fn write_self_update_cache(
+    config: &updatable_cli::UpdaterConfig,
+    now_secs: u64,
+    release: &updatable_cli::LatestReleaseInfo,
+    started: Instant,
+) -> Result<(), AppError> {
+    let path = self_update_cache_path(config)?;
+    let cache = SelfUpdateReleaseCache {
+        schema_version: SELF_UPDATE_CACHE_SCHEMA_VERSION,
+        tool: config.tool_name.clone(),
+        repository: config.repo_slug.clone(),
+        current_version: config.current_version.clone(),
+        checked_at_unix_secs: now_secs,
+        release: release.clone(),
+        release_assets: release
+            .release_assets
+            .iter()
+            .map(|asset| SelfUpdateReleaseAssetCache {
+                name: asset.name.clone(),
+                id: asset.id,
+                browser_download_url: asset.browser_download_url.clone(),
+            })
+            .collect(),
+    };
+    let bytes = serde_json::to_vec(&cache).map_err(|error| {
+        self_update_deferred("metadata_cache", error.to_string(), started, false)
+    })?;
+    let parent = path.parent().expect("release cache has install parent");
+    fs::create_dir_all(parent).map_err(|error| {
+        self_update_deferred("metadata_cache", error.to_string(), started, false)
+    })?;
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    fs::write(&temporary, bytes).map_err(|error| {
+        self_update_deferred("metadata_cache", error.to_string(), started, false)
+    })?;
+    if let Err(error) = fs::rename(&temporary, &path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(self_update_deferred(
+            "metadata_cache",
+            error.to_string(),
+            started,
+            false,
+        ));
+    }
+    Ok(())
+}
+
+fn self_update_deferred(
+    phase: &str,
+    diagnostic: impl Into<String>,
+    started: Instant,
+    cache_hit: bool,
+) -> AppError {
+    AppError::structured(
+        ErrorCategory::ExecutionFailure,
+        "self_update_deferred",
+        format!("self-update deferred during {phase}"),
+        Some(serde_json::json!({
+            "phase": phase,
+            "diagnostic": diagnostic.into(),
+            "elapsed_ms": self_update_elapsed_ms(started),
+            "max_duration_ms": SELF_UPDATE_MAX_DURATION_SECS * 1000,
+            "cache_hit": cache_hit,
+            "retryable": true,
+            "sync_started": false,
+            "installed_binary_retained_or_atomically_promoted": true,
+            "safe_next_action": "keep the existing installed binary and retry self-update on a later cron tick; do not spend the repository sync budget on update recovery",
+        })),
+    )
+}
+
+fn self_update_run_with_config(
+    config: &updatable_cli::UpdaterConfig,
+    now_secs: u64,
+) -> Result<SelfUpdateRunOutput, AppError> {
+    let started = Instant::now();
+    let updater = updatable_cli::Updater::new(config.clone());
+    let (latest, cache_hit, cache_age, release_checked) =
+        if let Some((release, age)) = read_self_update_cache(config, now_secs) {
+            (release, true, age, false)
+        } else {
+            let release = updater
+                .check_latest()
+                .map_err(updatable_cli::UpdateError::from)
+                .map_err(|error| {
+                    self_update_deferred("release_check", error.to_string(), started, false)
+                })?;
+            write_self_update_cache(config, now_secs, &release, started)?;
+            (release, false, 0, true)
+        };
+    let status = updater
+        .current_status()
+        .map_err(updatable_cli::UpdateError::from)
+        .map_err(|error| {
+            self_update_deferred("local_status", error.to_string(), started, cache_hit)
+        })?;
+    let mut outcome = updatable_cli::UpdateOutcome {
+        current_version: config.current_version.clone(),
+        latest_version: latest.version.clone(),
+        staged: false,
+        promoted: false,
+        next_path: status.next_path,
+        installed_path: status.installed_path,
+        note: Some(format!(
+            "no update needed; latest is {} and current is {}",
+            latest.version, config.current_version
+        )),
+    };
+    if latest.newer_than_current {
+        updater
+            .stage_next(&latest)
+            .map_err(updatable_cli::UpdateError::from)
+            .map_err(|error| {
+                self_update_deferred(
+                    "stage_verified_release",
+                    error.to_string(),
+                    started,
+                    cache_hit,
+                )
+            })?;
+        let promoted = updater
+            .promote_next()
+            .map_err(updatable_cli::UpdateError::from)
+            .map_err(|error| {
+                self_update_deferred("atomic_promotion", error.to_string(), started, cache_hit)
+            })?;
+        outcome.staged = true;
+        outcome.promoted = promoted.is_some();
+        outcome.note = None;
+    } else if cache_hit {
+        outcome.note = Some(format!(
+            "no update needed; fresh {}s metadata cache reports latest {} equals current {}",
+            SELF_UPDATE_CACHE_TTL_SECS, latest.version, config.current_version
+        ));
+    }
+    Ok(SelfUpdateRunOutput {
+        outcome,
+        cache: SelfUpdateCacheEvidence {
+            hit: cache_hit,
+            age_secs: cache_age,
+            ttl_secs: SELF_UPDATE_CACHE_TTL_SECS,
+            release_checked,
+        },
+        timing: SelfUpdateTimingEvidence {
+            elapsed_ms: self_update_elapsed_ms(started),
+            max_duration_ms: SELF_UPDATE_MAX_DURATION_SECS * 1000,
+        },
+    })
+}
+
+fn parse_self_update_worker_output(
+    output: &crate::command::CommandOutput,
+    started: Instant,
+) -> Result<SelfUpdateRunOutput, AppError> {
+    let envelope: Value = serde_json::from_str(&output.stdout).map_err(|error| {
+        self_update_deferred(
+            "worker_response",
+            format!("worker returned invalid JSON: {error}"),
+            started,
+            false,
+        )
+    })?;
+    if output.is_success() && envelope["status"] == "success" {
+        return serde_json::from_value(envelope["data"].clone()).map_err(|error| {
+            self_update_deferred(
+                "worker_response",
+                format!("worker returned invalid update evidence: {error}"),
+                started,
+                false,
+            )
+        });
+    }
+    let error = &envelope["error"];
+    Err(AppError::structured(
+        ErrorCategory::ExecutionFailure,
+        error["code"].as_str().unwrap_or("self_update_deferred"),
+        error["message"]
+            .as_str()
+            .unwrap_or("bounded self-update worker failed"),
+        error.get("details").cloned().or_else(|| {
+            Some(serde_json::json!({
+                "phase": "worker_response",
+                "worker_exit": output.code,
+                "retryable": true,
+                "sync_started": false,
+            }))
+        }),
+    ))
+}
+
 /// Return active-install self-update status.
 pub fn self_update_status() -> Result<updatable_cli::UpdateStatus, AppError> {
     updatable_cli::Updater::new(active_updater_config()?)
@@ -2090,18 +2401,45 @@ pub fn self_update_status() -> Result<updatable_cli::UpdateStatus, AppError> {
 
 /// Check releases using the active-install contract.
 pub fn self_update_check() -> Result<updatable_cli::LatestReleaseInfo, AppError> {
-    updatable_cli::Updater::new(active_updater_config()?)
+    let config = active_updater_config()?;
+    let started = Instant::now();
+    let release = updatable_cli::Updater::new(config.clone())
         .check_latest()
         .map_err(updatable_cli::UpdateError::from)
-        .map_err(|error| update_error(&error))
+        .map_err(|error| update_error(&error))?;
+    write_self_update_cache(&config, self_update_now_secs(), &release, started)?;
+    Ok(release)
 }
 
-/// Update the exact active PATH-visible stable user installation.
-pub fn self_update_run() -> Result<updatable_cli::UpdateOutcome, AppError> {
-    updatable_cli::Updater::new(active_updater_config()?)
-        .run_update()
-        .map_err(updatable_cli::UpdateError::from)
-        .map_err(|error| update_error(&error))
+/// Update the exact active PATH-visible stable user installation inside one
+/// independently bounded child process. Killing the child cannot leave a
+/// partially written installed binary: staging and promotion remain owned by
+/// `updatable-cli`'s verified atomic paths.
+pub fn self_update_run() -> Result<SelfUpdateRunOutput, AppError> {
+    let started = Instant::now();
+    let executable = std::env::current_exe()
+        .map_err(|error| self_update_deferred("worker_spawn", error.to_string(), started, false))?;
+    let command = crate::command::CommandSpec::new(executable.to_string_lossy())
+        .args(["--json", "self-update", "run-worker"])
+        .env(SELF_UPDATE_WORKER_ENV, "1");
+    let runner = crate::command::ProcessRunner::new()
+        .with_timeout(Duration::from_secs(SELF_UPDATE_MAX_DURATION_SECS));
+    let output = runner.run(&command).map_err(|error| {
+        self_update_deferred("outer_deadline", error.to_string(), started, false)
+    })?;
+    parse_self_update_worker_output(&output, started)
+}
+
+/// Internal half of the bounded self-update subprocess. The hidden CLI command
+/// refuses direct use unless its parent supplied the exact worker marker.
+pub fn self_update_run_worker() -> Result<SelfUpdateRunOutput, AppError> {
+    if std::env::var(SELF_UPDATE_WORKER_ENV).as_deref() != Ok("1") {
+        return Err(AppError::validation(
+            "self_update_worker_refused",
+            "the internal self-update worker may only be started by the bounded parent command",
+        ));
+    }
+    self_update_run_with_config(&active_updater_config()?, self_update_now_secs())
 }
 
 /// Feedback configuration using the shared ecosystem environment convention.
@@ -2536,10 +2874,178 @@ mod tests {
         );
     }
 
+    fn self_update_test_config(directory: &Path, api_base: String) -> updatable_cli::UpdaterConfig {
+        let mut config = updatable_cli::UpdaterConfig::new("cara", "1.0.0", "owner/repository");
+        config.install_dir = Some(directory.to_path_buf());
+        config.api_base = Some(api_base.clone());
+        config.download_base = Some(api_base);
+        config.http_timeout = Some(Duration::from_millis(50));
+        config
+    }
+
+    fn serve_http_responses(responses: Vec<Vec<u8>>) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            for body in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 4096];
+                let _ = stream.read(&mut request);
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                stream.write_all(&body).unwrap();
+            }
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    fn release_json(version: &str, assets: &[&str]) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "tag_name": format!("v{version}"),
+            "html_url": format!("https://example.invalid/v{version}"),
+            "assets": assets.iter().map(|name| serde_json::json!({"name": name})).collect::<Vec<_>>(),
+        }))
+        .unwrap()
+    }
+
+    fn release_archive(contents: &[u8]) -> Vec<u8> {
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_path("payload/cara").unwrap();
+        header.set_size(u64::try_from(contents.len()).unwrap());
+        header.set_mode(0o755);
+        header.set_cksum();
+        archive.append(&header, contents).unwrap();
+        archive.into_inner().unwrap().finish().unwrap()
+    }
+
+    #[test]
+    fn self_update_current_release_uses_fresh_metadata_cache_without_provider_io() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (api_base, server) = serve_http_responses(vec![release_json("1.0.0", &[])]);
+        let config = self_update_test_config(temporary.path(), api_base);
+
+        let first = self_update_run_with_config(&config, 1_000).unwrap();
+        server.join().unwrap();
+        assert!(!first.cache.hit);
+        assert!(first.cache.release_checked);
+        assert!(!first.outcome.promoted);
+
+        // The one-shot server is gone. A second run can succeed only by using
+        // the exact fresh cache rather than reaching the provider again.
+        let second = self_update_run_with_config(&config, 1_001).unwrap();
+        assert!(second.cache.hit);
+        assert_eq!(second.cache.age_secs, 1);
+        assert!(!second.cache.release_checked);
+        assert!(!second.outcome.promoted);
+    }
+
+    #[test]
+    fn self_update_cache_expiry_is_explicit_and_fail_closed() {
+        let temporary = tempfile::tempdir().unwrap();
+        let config = self_update_test_config(temporary.path(), "http://127.0.0.1:9".to_owned());
+        let release = updatable_cli::LatestReleaseInfo {
+            tag: "v1.0.0".to_owned(),
+            version: "1.0.0".to_owned(),
+            html_url: None,
+            assets: vec!["cara.tgz".to_owned()],
+            release_assets: vec![updatable_cli::ReleaseAssetInfo {
+                name: "cara.tgz".to_owned(),
+                id: Some(42),
+                browser_download_url: Some("https://example.invalid/cara.tgz".to_owned()),
+            }],
+            newer_than_current: false,
+        };
+        write_self_update_cache(&config, 1_000, &release, Instant::now()).unwrap();
+        let (cached, _) =
+            read_self_update_cache(&config, 1_000 + SELF_UPDATE_CACHE_TTL_SECS).unwrap();
+        assert_eq!(cached.release_assets, release.release_assets);
+        assert!(read_self_update_cache(&config, 1_001 + SELF_UPDATE_CACHE_TTL_SECS).is_none());
+    }
+
+    #[test]
+    fn self_update_promotes_a_verified_new_release_atomically() {
+        use sha2::{Digest as _, Sha256};
+        let temporary = tempfile::tempdir().unwrap();
+        let installed = temporary.path().join("cara");
+        fs::write(&installed, b"old-binary").unwrap();
+        let archive = release_archive(b"new-binary");
+        let checksum = format!("{:x}  cara.tgz\n", Sha256::digest(&archive)).into_bytes();
+        let (api_base, server) = serve_http_responses(vec![
+            release_json("2.0.0", &["cara.tgz", "cara.sha256"]),
+            archive,
+            checksum,
+        ]);
+        let mut config = self_update_test_config(temporary.path(), api_base);
+        config.asset_strategy =
+            updatable_cli::AssetStrategy::Custom(std::sync::Arc::new(|_, _, _| {
+                Ok(updatable_cli::AssetNames {
+                    archive: "cara.tgz".to_owned(),
+                    checksum: "cara.sha256".to_owned(),
+                    binary_in_archive: "payload/cara".to_owned(),
+                })
+            }));
+
+        let output = self_update_run_with_config(&config, 2_000).unwrap();
+        server.join().unwrap();
+        assert!(output.outcome.staged);
+        assert!(output.outcome.promoted);
+        assert_eq!(fs::read(installed).unwrap(), b"new-binary");
+    }
+
+    #[test]
+    fn self_update_provider_timeout_is_typed_and_retains_installed_binary() {
+        use std::io::Read as _;
+        let temporary = tempfile::tempdir().unwrap();
+        let installed = temporary.path().join("cara");
+        fs::write(&installed, b"old-binary").unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        let mut config = self_update_test_config(temporary.path(), format!("http://{address}"));
+        config.http_timeout = Some(Duration::from_millis(20));
+
+        let error = self_update_run_with_config(&config, 3_000).unwrap_err();
+        server.join().unwrap();
+        assert_eq!(error.code(), "self_update_deferred");
+        assert_eq!(error.details().unwrap()["phase"], "release_check");
+        assert_eq!(fs::read(installed).unwrap(), b"old-binary");
+    }
+
+    #[test]
+    fn self_update_failure_before_stage_retains_installed_binary() {
+        let temporary = tempfile::tempdir().unwrap();
+        let installed = temporary.path().join("cara");
+        fs::write(&installed, b"old-binary").unwrap();
+        let (api_base, server) = serve_http_responses(vec![release_json("2.0.0", &[])]);
+        let config = self_update_test_config(temporary.path(), api_base);
+
+        let error = self_update_run_with_config(&config, 4_000).unwrap_err();
+        server.join().unwrap();
+        assert_eq!(error.code(), "self_update_deferred");
+        assert_eq!(error.details().unwrap()["phase"], "stage_verified_release");
+        assert_eq!(fs::read(installed).unwrap(), b"old-binary");
+    }
+
     #[test]
     fn updater_targets_caravan_release_assets() {
         let config = updater_config();
         assert_eq!(config.tool_name, "cara");
         assert_eq!(config.repo_slug, "harryaskham/caravan");
+        assert_eq!(
+            config.http_timeout,
+            Some(Duration::from_secs(SELF_UPDATE_HTTP_TIMEOUT_SECS))
+        );
     }
 }

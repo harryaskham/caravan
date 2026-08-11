@@ -21,7 +21,7 @@ use caravan::{
         RepairRevokeGrantInput, RepairStartInput, RepairStatusInput,
     },
     restore_parked::RestoreParkedInput,
-    self_update_check, self_update_run, self_update_status,
+    self_update_check, self_update_run, self_update_run_worker, self_update_status,
     stack_recovery::{NativeStackRecoveryApplyInput, NativeStackRecoveryPreviewInput},
     unpark::UnparkInput,
 };
@@ -347,6 +347,9 @@ enum SelfUpdateCommand {
     Check,
     /// Download, verify, stage, and promote the latest release.
     Run,
+    /// Internal bounded child; direct invocation is refused.
+    #[command(hide = true)]
+    RunWorker,
 }
 
 #[derive(Debug, Subcommand)]
@@ -3860,6 +3863,7 @@ fn run_self_update(json: bool, command: &SelfUpdateCommand) -> Result<(), i32> {
         SelfUpdateCommand::Status => emit_result(json, self_update_status()),
         SelfUpdateCommand::Check => emit_result(json, self_update_check()),
         SelfUpdateCommand::Run => emit_result(json, self_update_run()),
+        SelfUpdateCommand::RunWorker => emit_result(json, self_update_run_worker()),
     }
 }
 
