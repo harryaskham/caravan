@@ -269,6 +269,14 @@ sync.
 
 - `cara status` — repository overview: current PR, all caravans, the canonical priority-then-FIFO admission list with per-PR reasons, invalid graph fragments, and pending decision points.
 
+`candidate_count` measures provider PR snapshots in the current read; it never
+counts Caco board beads. Human status deliberately retains open PRs, recently
+merged Caravan snapshots, and closed active/parked/terminal lifecycle rows, so
+it may greatly exceed GitHub's open-PR count. Mutating `sync`/`plan sync` use a
+separate hot discovery snapshot: all open PRs plus lightweight merged generation
+facts, with merged/closed lifecycle snapshots deferred to later human/cold
+cleanup. Stale historical rows remain unavailable for mutation authority.
+
 The CLI status read owns a dedicated 58-second wall-clock budget with a
 2-second serialization reserve and a 5-second post-compatibility reserve; it
 never borrows `sync.max_duration_secs`, mutation capacity, or post-rewrite

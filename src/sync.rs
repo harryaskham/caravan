@@ -3518,7 +3518,7 @@ fn sync_with_lock(
         // explicitly, so provider discovery does not depend on the temporary
         // authoritative worktree's detached HEAD. The invocation identity is
         // rebound below for targeted (non-`--all`) selection only.
-        read::fleet_status(context, operation_deadline, Some(&github_budget))?;
+        read::fleet_status_for_sync(context, operation_deadline, Some(&github_budget))?;
     if let Some(authority) = authority {
         authority.bind_invocation(&mut status)?;
     }

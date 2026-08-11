@@ -1031,6 +1031,15 @@ label, comment, and auto-merge mutation identity, so queued→running progress
 does not invalidate an otherwise exact sync/join retry. CI diagnostics and
 rerun operations retain strict check/run/head identity.
 
+`candidate_count` is the number of provider PR snapshots retained by that read,
+not a Caco board-bead count. Human `status` intentionally includes open PRs,
+recently merged Caravan rows, and closed active/parked/terminal lifecycle rows;
+three closed-label scans can therefore make this number far larger than GitHub's
+open-PR count. Mutating `sync` and `plan sync` now use a hot discovery mode:
+they retain all open PRs and lightweight merged generation facts, but defer
+merged/closed lifecycle snapshots and their expensive check-rollup scans to
+human status and cold cleanup.
+
 Status propagates one absolute deadline through discovery, label inventory,
 compatibility, and provider identity; every child receives only the remaining
 budget. The 58-second read-only surface reserves 2 seconds for serialization and
