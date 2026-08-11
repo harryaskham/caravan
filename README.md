@@ -646,6 +646,23 @@ ecosystem repositories are also pinned as `flake = false` source inputs and
 patched into Cargo, so sandbox builds neither evaluate their independent flakes
 nor fetch Git dependencies at build time.
 
+## Agentic repair responder bundle
+
+`agentic/cara-responder.md` is a reusable trusted instruction bundle for a
+GitHub Agentic Workflow that analyzes Cara state without exposing credentials or
+creating a second merge actor. `agentic/cara-responder-policy.json` defaults to
+report-only, binds one writer/concurrency group, caps operations and safe outputs,
+and enumerates denied writes and idempotency keys. Runtime pins and machine run
+artifacts must conform to `cara-runtime-pin.schema.json` and
+`cara-run-report.schema.json` respectively.
+
+Report-only canaries may coexist with the deterministic scheduler because they
+have zero mutation authority. A single-writer cutover is valid only when the old
+writer is disabled in the same reviewed change. PR text/code/comments/check logs
+and Cara JSON are untrusted evidence; checked-in instructions and pinned Cara
+help are the only authority. The model never sees GitHub App, GitHub token,
+feedback-hook, or Caco board credentials.
+
 ## Configuration
 
 Repository policy and hooks live at `.caravan/config.yaml`. `stack_type` defaults

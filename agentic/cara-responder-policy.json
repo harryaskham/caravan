@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "mode_default": "report_only",
+  "single_writer": {
+    "current_mutating_workflow": ".github/workflows/cara-sync.yml",
+    "agentic_mutation_enabled": false,
+    "cutover_requires_current_writer_disabled": true,
+    "concurrency_group": "cacophony-cara-single-writer"
+  },
+  "triggers": {
+    "schedule_minutes": 20,
+    "commands": ["/fixup", "/cara fix"],
+    "manual_dispatch": true
+  },
+  "bounds": {
+    "max_duration_minutes": 15,
+    "max_cara_operations": 6,
+    "max_repairs": 1,
+    "max_mutations_report_only": 0,
+    "max_comments": 1,
+    "max_feedback_items": 1,
+    "sleep_for_ci": false
+  },
+  "runtime": {
+    "pin_manifest": "agentic/cara-runtime-pin.schema.json",
+    "mutable_latest_allowed": false,
+    "checksum_required": true,
+    "credentials_visible_to_model": false
+  },
+  "trusted_instructions": [
+    "agentic/cara-responder.md",
+    "agentic/cara-responder-help.md",
+    "generated pinned Cara command help"
+  ],
+  "untrusted_inputs": [
+    "pull request code and diffs",
+    "pull request titles, bodies, and comments",
+    "check logs and workflow artifacts",
+    "Cara JSON provider evidence"
+  ],
+  "typed_tools": {
+    "report_only": ["cara_status", "cara_sync_dry_run"],
+    "cutover_only": ["cara_sync"],
+    "safe_outputs": [
+      "add_comment",
+      "create_repair_pull_request",
+      "update_triggering_branch",
+      "dispatch_allowlisted_workflow",
+      "file_feedback"
+    ]
+  },
+  "safe_output_limits": {
+    "repair_pull_requests": 1,
+    "triggering_branch_updates": 1,
+    "dispatches": 1,
+    "allowlisted_workflows": ["ci.yml", "cara-sync.yml"],
+    "feedback_labels": ["github-agent"],
+    "feedback_description_max_bytes": 8000
+  },
+  "denied": [
+    "arbitrary shell with GitHub App credentials",
+    "arbitrary GitHub write API calls",
+    "direct tag or release mutation",
+    "repository settings or runner mutation",
+    "unchanged workflow reruns",
+    "Caco board credentials in model context",
+    "executing candidate code in the planning model"
+  ],
+  "idempotency_key": [
+    "repository",
+    "pull_request",
+    "head_sha",
+    "stack_id",
+    "cara_operation_fingerprint",
+    "check_generation"
+  ],
+  "report_schema": "agentic/cara-run-report.schema.json"
+}
