@@ -3231,7 +3231,8 @@ fn encode_path_segment(value: &str) -> String {
 }
 
 fn normalize_check_state(provider_state: Option<&str>) -> CheckState {
-    match provider_state {
+    let normalized = provider_state.map(str::to_ascii_uppercase);
+    match normalized.as_deref() {
         Some("EXPECTED") => CheckState::Expected,
         Some("QUEUED" | "REQUESTED" | "WAITING") => CheckState::Queued,
         Some("IN_PROGRESS" | "PENDING") => CheckState::InProgress,
