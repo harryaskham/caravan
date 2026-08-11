@@ -1295,9 +1295,14 @@ previous tail head. The observed head is retained in the receipt and an exact
 retry performs zero writes. A provider rewrite of any existing member is drift.
 A closed Stack whose complete membership is freshly merged is terminal audit
 history, not an orphan/base-drift blocker even when provider base refs collapse.
-Missing merge commits, non-ancestor or wrong-base evidence, unmerged/partial prefixes,
-cross/orphan mappings, head/base/state drift, multiple intersections, truncated
-inventory, and capability/read uncertainty refuse before a landing mutation
+A partial ready prefix with exactly one blocked final member returns a
+hash-sealed, zero-write `top_eviction_plan` containing the full provider
+generation, immutable source heads, selected tail, exact surviving prefix and
+Cara label/base postconditions; multiple blocked members do not receive that
+single-tail remedy. Missing merge commits, non-ancestor or wrong-base evidence,
+unmerged/partial prefixes, cross/orphan mappings, head/base/state drift,
+multiple intersections, truncated inventory, and capability/read uncertainty
+refuse before a landing mutation
 with `retryable: false` and scheduler `external_decision`. Multi-member
 zero-intersection topology also refuses. If native membership races into
 existence after an exact singleton absence read, GitHub's Stack-specific direct-

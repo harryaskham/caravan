@@ -9387,6 +9387,38 @@ fn native_sync_waits_before_lock_when_the_ready_prefix_is_empty() {
     );
 }
 
+#[test]
+fn top_eviction_recovery_is_exactly_one_blocked_final_member() {
+    let pulls = vec![
+        caravan_member(1, "root", "main"),
+        caravan_member(2, "child", "root"),
+        caravan_member(3, "tail", "child"),
+    ];
+    let status = caravan_status(pulls, Some(PrNumber(3)), true);
+    let generation = native_generation(&status, 42, &[PrNumber(1), PrNumber(2), PrNumber(3)]);
+    assert!(
+        top_eviction_recovery_plan(
+            &status.repository,
+            &OperationId("sync-test".to_owned()),
+            "operator",
+            &generation,
+            1,
+        )
+        .is_none()
+    );
+    let plan = top_eviction_recovery_plan(
+        &status.repository,
+        &OperationId("sync-test".to_owned()),
+        "operator",
+        &generation,
+        2,
+    )
+    .expect("one blocked final member yields a sealed top-eviction plan");
+    assert!(plan.verify());
+    assert_eq!(plan.selected_pr, PrNumber(3));
+    assert_eq!(plan.replacement_chains[0].entries.len(), 2);
+}
+
 /// bd-48d662: GitHub's partial Stack merge updates an unselected tail branch
 /// after landing the ready prefix. That turns an immutable source generation
 /// into a GitHub-authored merge commit and starts CI again. Cara must stop
@@ -9523,6 +9555,31 @@ fn native_sync_refuses_partial_prefix_without_touching_source_heads() {
     assert_eq!(details["mutated"], false);
     assert_eq!(details["selected_ready_prefix"], serde_json::json!([1]));
     assert_eq!(details["blocked_suffix"], serde_json::json!([2]));
+    assert_eq!(details["resumable"], true);
+    let recovery: crate::github::GitHubStackReshapePlan =
+        serde_json::from_value(details["top_eviction_plan"].clone()).unwrap();
+    assert!(recovery.verify());
+    assert_eq!(
+        recovery.operation,
+        crate::github::GitHubStackReshapeOperation::Evict
+    );
+    assert_eq!(recovery.selected_pr, PrNumber(2));
+    assert_eq!(recovery.before.topology.entries.len(), 2);
+    assert_eq!(recovery.replacement_chains.len(), 1);
+    assert_eq!(
+        recovery.replacement_chains[0].entries,
+        recovery.before.topology.entries[..1]
+    );
+    assert_eq!(
+        recovery.pr_postconditions[1].head,
+        recovery.before.topology.entries[1].head
+    );
+    assert!(
+        recovery.pr_postconditions[1]
+            .required_labels
+            .contains("caravan-evicted")
+    );
+    assert!(!recovery.plan_hash.is_empty());
     let scheduler = scheduler_failure_status(&error);
     assert_eq!(
         scheduler.disposition,
