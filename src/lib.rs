@@ -304,8 +304,10 @@ GITHUB NATIVE STACKS (EXPLICIT OPT-IN)
   success additionally requires every selected PR's exact provider squash
   commit plus final-main truth. A closed Stack whose complete membership is
   freshly merged is retained as terminal audit history, not reported as orphan
-  or base drift merely because GitHub collapsed historical bases. Lost lock,
-  missing member commit, or lower-head drift is `indeterminate`, never
+  or base drift merely because GitHub collapsed historical bases. Any open
+  Stack problem makes status unhealthy and blocks plan/sync before a landing
+  action or provider write. Lost lock, missing member commit, or lower-head
+  drift is `indeterminate`, never
   permission to retry unlocked.
 - The ruleset path requires explicit GitHub Administration(write), which is not
   part of the baseline App policy. Grant it only to a reviewed native-Stack

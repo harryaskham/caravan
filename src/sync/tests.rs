@@ -10329,6 +10329,43 @@ fn native_singleton_tail_without_stack_lands_and_retries_idempotently() {
     );
 }
 
+#[test]
+fn open_native_stack_drift_refuses_before_any_merge_plan_or_write() {
+    let pulls = vec![
+        caravan_member(1, "root", "main"),
+        caravan_member(2, "child", "root"),
+        caravan_member(3, "missing-tail", "child"),
+    ];
+    let mut status = caravan_status(pulls.clone(), Some(PrNumber(1)), true);
+    enable_native_backend(&mut status);
+    status.stack_backend.problems = vec![crate::read::StackBackendProblem {
+        code: "github_stack_member_order_drift".to_owned(),
+        message: "Stack #42 current open members [1,2] do not equal caravan [1,2,3]".to_owned(),
+    }];
+    let provider = FakeProvider::with_pull_requests(pulls);
+    let (_directory, config, native) = github_native_fixture();
+
+    let error = execute_bounded_with_native(
+        &status,
+        &provider,
+        true,
+        false,
+        false,
+        64,
+        &BTreeMap::new(),
+        RequiredRunsPolicy::from_config(&config.sync),
+        Some(native),
+    )
+    .expect_err("native Stack drift must refuse before root or Stack landing");
+
+    assert_eq!(error.code(), "github_stack_backend_unhealthy");
+    assert_eq!(error.details().unwrap()["mutated"], false);
+    assert_eq!(error.details().unwrap()["provider_mutations"], 0);
+    assert!(provider.calls.borrow().is_empty());
+    assert_eq!(*provider.native_stack_intersection_reads.borrow(), 0);
+    assert_eq!(*provider.native_stack_reads.borrow(), 0);
+}
+
 /// bd-ef8e3b: one complete fresh intersection read chooses the lock-fenced
 /// native backend for both a provider-represented singleton and a normal
 /// multi-entry Stack. Neither shape may reach ordinary synchronous squash.
