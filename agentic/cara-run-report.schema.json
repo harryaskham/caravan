@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/harryaskham/caravan/agentic/cara-run-report.schema.json",
+  "title": "Cara responder run report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "mode",
+    "repository",
+    "runtime_pin",
+    "input_heads",
+    "cara_receipts",
+    "repairs",
+    "feedback_receipts",
+    "mutation_count",
+    "idempotency_fingerprint",
+    "next_cursor"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "mode": {"enum": ["report_only", "single_writer"]},
+    "repository": {"type": "string", "pattern": "^[^/]+/[^/]+$"},
+    "runtime_pin": {
+      "type": "object",
+      "required": ["version", "sha256", "source_commit"],
+      "properties": {
+        "version": {"type": "string"},
+        "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "source_commit": {"type": "string", "pattern": "^[a-f0-9]{40}$"}
+      }
+    },
+    "input_heads": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["pr", "head", "base"],
+        "properties": {
+          "pr": {"type": "integer", "minimum": 1},
+          "head": {"type": "string", "pattern": "^[a-f0-9]{40}$"},
+          "base": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "cara_receipts": {"type": "array", "items": {"type": "object"}},
+    "repairs": {"type": "array", "maxItems": 1, "items": {"type": "object"}},
+    "feedback_receipts": {"type": "array", "maxItems": 1, "items": {"type": "object"}},
+    "mutation_count": {"type": "integer", "minimum": 0},
+    "idempotency_fingerprint": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+    "next_cursor": {"type": ["string", "null"]}
+  }
+}

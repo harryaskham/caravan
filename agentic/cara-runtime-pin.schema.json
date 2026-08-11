@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/harryaskham/caravan/agentic/cara-runtime-pin.schema.json",
+  "title": "Pinned Cara runtime",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "version", "asset", "url", "sha256", "source_commit", "provenance"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+    "asset": {"type": "string", "minLength": 1},
+    "url": {"type": "string", "pattern": "^https://"},
+    "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "source_commit": {"type": "string", "pattern": "^[a-f0-9]{40}$"},
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "tag", "workflow_run"],
+      "properties": {
+        "repository": {"type": "string", "pattern": "^[^/]+/[^/]+$"},
+        "tag": {"type": "string", "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+$"},
+        "workflow_run": {"type": "integer", "minimum": 1}
+      }
+    }
+  }
+}

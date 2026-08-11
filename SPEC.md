@@ -1509,6 +1509,32 @@ change GitHub's merge ref and rerun CI. Caravan does not claim instant no-rerun
 landing without ancestry-preserving merges or an audited exact-tree/check
 receipt policy.
 
+### Agentic repair workflow boundary
+
+The repository-owned bundle under `agentic/` defines the only supported model
+boundary for a GitHub Agentic Workflow. Its default mode is report-only and has
+zero mutation authority while the deterministic scheduler remains active. A
+single-writer cutover must disable every prior Cara writer in the same reviewed
+change and retain one concurrency group. The model receives no GitHub App,
+GitHub token, feedback-hook, or Caco board credentials; short-lived credentials
+stay inside typed server-side tools and post-agent safe-output jobs.
+
+Runtime assets require exact version, HTTPS URL, SHA-256, source commit and
+release provenance. Mutable `latest` is invalid. Checked-in instructions and
+pinned generated Cara help are authority; PR content, code, comments, logs,
+artifacts and provider JSON are untrusted evidence. Report-only tools are status
+and sync dry-run. Single-writer Cara merge is available only after cutover.
+Other outputs are bounded to one comment, repair PR/triggering-branch update,
+allowlisted dispatch and feedback item. Direct tags, releases, settings,
+runners, arbitrary authenticated shell/API calls, unchanged reruns and direct
+board writes are forbidden.
+
+Every run is time/operation/mutation bounded, never sleeps for CI, deduplicates
+by repository/PR/head/Stack/operation/check generation, and emits one machine
+report conforming to `agentic/cara-run-report.schema.json`. Canary adoption
+requires repeated zero-mutation reports matching deterministic scheduler
+proposals before mutation is reviewed.
+
 ## 10. Concurrency and idempotency
 
 One local process at a time may mutate a repository, enforced by an operation lock under Git metadata. Read-only commands may run concurrently. The owner file remains below 16 KiB even for large fleets: sync checkpoints store schema-versioned counts, complete deterministic hashes, and bounded first/last samples of affected PRs, steps, plans, receipts, and events rather than embedding unbounded histories. The latest provider preconditions remain in the tail sample; GitHub rediscovery is still recovery authority and hashes bind omitted evidence.
