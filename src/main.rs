@@ -2846,6 +2846,16 @@ fn render_sync(output: &caravan::sync::SyncOutput) -> String {
         output.auto_admission.github_request_limit,
         output.auto_admission.remaining_candidates.len(),
     );
+    for skip in &output.auto_admission.skips {
+        let _ = writeln!(
+            text,
+            "    candidate #{} admission skipped ({}) at {}; tick continued; evidence {}",
+            skip.candidate_pr,
+            skip.refusal_kind.code(),
+            skip.candidate_head.oid,
+            skip.evidence_hash,
+        );
+    }
     if !output.scheduler_status.waiting_prs.is_empty() {
         let waiting = output
             .scheduler_status
