@@ -58,6 +58,10 @@ pub struct DiscoveryOptions {
     /// Exact admission must not pay for full check-rollup discovery across an
     /// unrelated open-PR fleet (bd-b915a6).
     pub focus_pr: Option<PrNumber>,
+    /// Include merged/closed lifecycle snapshots in the returned graph. Human
+    /// status and cleanup reads need them; a mutating sync hot pass defers them
+    /// so historical rows cannot starve known active work (bd-488224).
+    pub include_historical_pull_requests: bool,
     /// Exact `owner/name` from configuration. Managed checkouts point at a local
     /// daemon mirror, so git-remote inference cannot name the repository and
     /// `gh` has no other input (bd-ff639b).
@@ -75,6 +79,7 @@ impl Default for DiscoveryOptions {
             // fleet-level read keeps the precise historical diagnostics.
             require_current_pr_resolution: true,
             focus_pr: None,
+            include_historical_pull_requests: true,
             repository: None,
         }
     }
@@ -1880,66 +1885,76 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
         // `--state closed` also returns merged rows; retaining terminal-labelled
         // merged rows lets sync remove an invalid `caravan-closed` label without
         // ever treating landed work as closed-unmerged.
-        let closed_lifecycle_prs = if self.options.focus_pr.is_some() {
-            // Exact candidate admission never converges closed lifecycle rows.
-            // Keep those three provider scans on fleet status/sync only; the
-            // lightweight open+merged generation facts above retain every
-            // supersession/lineage proof the candidate guard consumes.
-            Vec::new()
-        } else {
-            let (closed_active_prs, _closed_active_generation_facts) = self
-                .pull_requests_with_generation(
-                    labeled_pr_command(
-                        &repository.slug(),
-                        "closed",
-                        &self.options.label,
-                        self.options.merged_limit,
-                        true,
-                    ),
-                    &repository,
-                )?;
-            let (closed_parked_prs, _closed_parked_generation_facts) = self
-                .pull_requests_with_generation(
-                    labeled_pr_command(
-                        &repository.slug(),
-                        "closed",
-                        PARKED_LABEL,
-                        self.options.merged_limit,
-                        true,
-                    ),
-                    &repository,
-                )?;
-            let (closed_terminal_prs, _closed_terminal_generation_facts) = self
-                .pull_requests_with_generation(
-                    labeled_pr_command(
-                        &repository.slug(),
-                        "closed",
-                        CLOSED_LABEL,
-                        self.options.merged_limit,
-                        true,
-                    ),
-                    &repository,
-                )?;
-            closed_active_prs
-                .into_iter()
-                .chain(closed_parked_prs)
-                .chain(closed_terminal_prs)
-                .filter(|pull_request| {
-                    pull_request.is_closed_unmerged() || pull_request.has_label(CLOSED_LABEL)
-                })
-                .collect::<Vec<_>>()
-        };
+        let closed_lifecycle_prs =
+            if self.options.focus_pr.is_some() || !self.options.include_historical_pull_requests {
+                // Exact candidate admission never converges closed lifecycle rows.
+                // Keep those three provider scans on fleet status/sync only; the
+                // lightweight open+merged generation facts above retain every
+                // supersession/lineage proof the candidate guard consumes.
+                Vec::new()
+            } else {
+                let (closed_active_prs, _closed_active_generation_facts) = self
+                    .pull_requests_with_generation(
+                        labeled_pr_command(
+                            &repository.slug(),
+                            "closed",
+                            &self.options.label,
+                            self.options.merged_limit,
+                            true,
+                        ),
+                        &repository,
+                    )?;
+                let (closed_parked_prs, _closed_parked_generation_facts) = self
+                    .pull_requests_with_generation(
+                        labeled_pr_command(
+                            &repository.slug(),
+                            "closed",
+                            PARKED_LABEL,
+                            self.options.merged_limit,
+                            true,
+                        ),
+                        &repository,
+                    )?;
+                let (closed_terminal_prs, _closed_terminal_generation_facts) = self
+                    .pull_requests_with_generation(
+                        labeled_pr_command(
+                            &repository.slug(),
+                            "closed",
+                            CLOSED_LABEL,
+                            self.options.merged_limit,
+                            true,
+                        ),
+                        &repository,
+                    )?;
+                closed_active_prs
+                    .into_iter()
+                    .chain(closed_parked_prs)
+                    .chain(closed_terminal_prs)
+                    .filter(|pull_request| {
+                        pull_request.is_closed_unmerged() || pull_request.has_label(CLOSED_LABEL)
+                    })
+                    .collect::<Vec<_>>()
+            };
         let generation_facts = generation_facts
             .into_iter()
             .chain(merged_generation_facts)
             .collect::<Vec<_>>();
 
+        let historical_pull_requests = self
+            .options
+            .include_historical_pull_requests
+            .then(|| {
+                recently_merged_labeled_prs
+                    .into_iter()
+                    .chain(closed_lifecycle_prs)
+            })
+            .into_iter()
+            .flatten();
         let mut pull_requests = BTreeMap::new();
         for pull_request in all_open_prs
             .into_iter()
             .chain(open_labeled_prs)
-            .chain(recently_merged_labeled_prs)
-            .chain(closed_lifecycle_prs)
+            .chain(historical_pull_requests)
             .chain(current_pr.clone())
         {
             pull_requests
@@ -3385,6 +3400,38 @@ mod tests {
                 CommandOutput::success("[]"),
             ),
         ]
+    }
+
+    #[test]
+    fn sync_hot_discovery_defers_closed_and_merged_snapshots() {
+        let open = pr_list_json(1, "feature/widget", "acme/widgets", false);
+        let mut calls = successful_discovery_calls(&open);
+        calls.truncate(calls.len().saturating_sub(3));
+        let discovery =
+            GitHubDiscovery::new(FakeRunner::new(calls)).with_options(DiscoveryOptions {
+                include_historical_pull_requests: false,
+                require_current_pr_resolution: false,
+                ..DiscoveryOptions::default()
+            });
+
+        let snapshot = discovery.discover().expect("hot discovery");
+
+        assert_eq!(
+            snapshot
+                .pull_requests
+                .iter()
+                .map(|pull_request| pull_request.number)
+                .collect::<Vec<_>>(),
+            vec![PrNumber(1)]
+        );
+        assert!(
+            snapshot
+                .generation_facts
+                .iter()
+                .any(|fact| fact.pr == PrNumber(9)),
+            "lightweight merged generation facts remain available"
+        );
+        discovery.runner.assert_exhausted();
     }
 
     #[test]

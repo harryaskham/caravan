@@ -350,7 +350,11 @@ Thus every child contains the exact planned parent generation. After the serial
 branch rebuild, GitHub can run fresh CI for all rewritten PR heads in parallel;
 old check runs are invalidated and never treated as proof for the new generation.
 
-For membership, Cara prepares one candidate. For `sync --all`, Cara:
+For membership, Cara prepares one candidate. A mutating `sync --all` starts
+from a hot provider snapshot: all open PRs plus lightweight merged-generation
+facts. It deliberately defers recently merged and closed lifecycle snapshots
+that human status retains for audit/cleanup; `candidate_count` is therefore a
+provider-row count, never a Caco bead count. For `sync --all`, Cara:
 1. selects non-paused caravans and plans each chain head-to-tail;
 2. materializes every rebase exactly once in retained isolated worktrees;
 3. feeds each planned parent OID into its child without pretending that

@@ -56,7 +56,8 @@ fn plan_sync_inner(
     let operation_deadline = started + sync_operation_budget(context);
     let github_budget =
         crate::command::GithubRequestBudget::new(context.config.sync.max_github_requests_per_tick);
-    let mut status = read::fleet_status(context, operation_deadline, Some(&github_budget))?;
+    let mut status =
+        read::fleet_status_for_sync(context, operation_deadline, Some(&github_budget))?;
     if let Some(authority) = authority {
         authority.bind_invocation(&mut status)?;
     }

@@ -1723,6 +1723,7 @@ fn status_with_resilient_deadline(
         true,
         None,
         None,
+        DiscoverySnapshotScope::FullLifecycle,
         true,
     )
 }
@@ -1741,6 +1742,7 @@ pub(crate) fn status_with_deadline_and_budget(
         true,
         None,
         None,
+        DiscoverySnapshotScope::FullLifecycle,
         false,
     )
 }
@@ -1765,6 +1767,28 @@ pub(crate) fn fleet_status(
         false,
         None,
         None,
+        DiscoverySnapshotScope::FullLifecycle,
+        false,
+    )
+}
+
+/// Mutating sync hot discovery excludes merged/closed lifecycle snapshots.
+/// Their cleanup remains a later cold phase; active open PRs and lightweight
+/// merged generation facts retain every mutation precondition needed now.
+pub(crate) fn fleet_status_for_sync(
+    context: &AppContext,
+    operation_deadline: std::time::Instant,
+    github_budget: Option<&crate::command::GithubRequestBudget>,
+) -> Result<StatusOutput, AppError> {
+    status_with_discovery_options(
+        context,
+        operation_deadline,
+        github_budget,
+        false,
+        false,
+        None,
+        None,
+        DiscoverySnapshotScope::ActiveOnly,
         false,
     )
 }
@@ -1785,8 +1809,21 @@ pub(crate) fn status_for_pr_creation(
         true,
         None,
         None,
+        DiscoverySnapshotScope::FullLifecycle,
         false,
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscoverySnapshotScope {
+    FullLifecycle,
+    ActiveOnly,
+}
+
+impl DiscoverySnapshotScope {
+    const fn includes_historical_pull_requests(self) -> bool {
+        matches!(self, Self::FullLifecycle)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1858,6 +1895,7 @@ fn status_with_discovery_options(
     require_current_pr_resolution: bool,
     expected_candidate_head: Option<&ExpectedCandidateHead>,
     focus_pr: Option<PrNumber>,
+    snapshot_scope: DiscoverySnapshotScope,
     bounded_compatibility: bool,
 ) -> Result<StatusOutput, AppError> {
     // Sharing one absolute deadline prevents a large repository from
@@ -1876,6 +1914,7 @@ fn status_with_discovery_options(
             allow_unlabelled_historical_pr_creation,
             require_current_pr_resolution,
             focus_pr,
+            include_historical_pull_requests: snapshot_scope.includes_historical_pull_requests(),
             repository: context.config.repository.clone(),
             ..crate::github::DiscoveryOptions::default()
         },
@@ -2760,6 +2799,7 @@ pub(crate) fn status_after_branch_rewrite_with_deadline(
         true,
         Some(&expected),
         Some(number),
+        DiscoverySnapshotScope::ActiveOnly,
         false,
     )?;
     Ok(BoundRemoteCandidateStatus {
@@ -2793,6 +2833,7 @@ pub(crate) fn status_for_remote_candidate_with_deadline(
         false,
         None,
         Some(number),
+        DiscoverySnapshotScope::ActiveOnly,
         false,
     )?;
     bind_remote_candidate_from_status(context, status, number, github_budget)
