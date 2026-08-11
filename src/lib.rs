@@ -278,7 +278,11 @@ GITHUB NATIVE STACKS (EXPLICIT OPT-IN)
   ordinary base/label membership completed but provider representation did not,
   do not rerun admission: use `native-stack recovery-preview`, review its exact
   immutable membership/head/base/green-check/mapping plan hash, then pass that
-  hash to `recovery-apply`. GitHub may rebase exactly the newly joined tail while
+  hash to `recovery-apply`. If a zero-write checkpoint becomes stale after an
+  owner refresh, `recovery-clear` can remove only that local continuation after
+  complete inventory proves zero provider Stack intersections; any provider-
+  visible, truncated, or unavailable state refuses, and a fresh preview is
+  mandatory. GitHub may rebase exactly the newly joined tail while
   committing membership; Cara accepts that converged result only when every
   existing entry is byte-exact, the tail keeps its PR/branch identity, and its
   base is the sealed predecessor head. The observed tail head is receipted and
@@ -1391,6 +1395,13 @@ pub fn build_router() -> ToolRouter<AppContext> {
         "Independently rediscover and apply one exact reviewed recovery plan, creating one missing Stack or completing one checkpointed append with an idempotent sealed receipt while never rewriting source heads or changing PR bases, labels, comments, or merge state.",
         |context: &AppContext, input: stack_recovery::NativeStackRecoveryApplyInput| {
             stack_recovery::apply(context, &input)
+        },
+    );
+    router.add_typed_tool_with_output_schema(
+        "native_stack_recovery_clear",
+        "Clear only one stale local formation checkpoint after complete provider discovery proves that no native Stack intersects any planned member; provider/source mutation is impossible and provider-visible state always refuses clearance.",
+        |context: &AppContext, input: stack_recovery::NativeStackRecoveryClearInput| {
+            stack_recovery::clear_checkpoint(context, &input)
         },
     );
     router.add_typed_tool_with_output_schema(
