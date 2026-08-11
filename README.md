@@ -551,10 +551,18 @@ hash, and whether it came from a store path, so a shadowing install is provable
 rather than inferred.
 
 The archive contains `cara-<version>-<target>/cara`, matching
-`updatable-cli`'s default asset strategy. The release workflow tests the tagged
-source, packages each binary, verifies native archives by executing `--version`,
-and uploads both assets to the GitHub Release. Public ecosystem source inputs
-are fetched anonymously over HTTPS; the workflow needs no SSH deploy secret.
+`updatable-cli`'s default asset strategy. `cara self-update run` keeps release
+polling outside the queue scheduler's budget: one bounded child owns the entire
+operation (30 seconds), each network request is capped at eight seconds, and an
+atomically written 30-minute metadata cache makes the unchanged-release path a
+provider-free fast no-op. Its JSON/MCP result preserves the historical flattened
+update fields and adds cache/timing evidence; a timeout or update failure returns
+`self_update_deferred` with `sync_started: false` while the old binary remains
+installed or a fully verified replacement has already been atomically promoted.
+The release workflow tests the tagged source, packages each binary, verifies
+native archives by executing `--version`, and uploads both assets to the GitHub
+Release. Public ecosystem source inputs are fetched anonymously over HTTPS; the
+workflow needs no SSH deploy secret.
 
 Use the bounded helper to keep `Cargo.toml`, `Cargo.lock`, and `flake.nix`
 aligned and create the tag:
