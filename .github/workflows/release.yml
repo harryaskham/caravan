@@ -23,6 +23,7 @@ on:
         options:
           - all
           - x86_64-linux
+          - aarch64-linux
           - aarch64-darwin
 
 concurrency:
@@ -90,10 +91,13 @@ jobs:
           }
           case "$target" in
             all)
-              matrix='{"include":[{"target":"x86_64-linux","runner":["self-hosted","nix","x86_64-linux"],"timeout_minutes":120},{"target":"aarch64-darwin","runner":["self-hosted","nix","aarch64-darwin"],"timeout_minutes":90}]}'
+              matrix='{"include":[{"target":"x86_64-linux","runner":["self-hosted","nix","x86_64-linux"],"timeout_minutes":120},{"target":"aarch64-linux","runner":"ubuntu-24.04-arm","timeout_minutes":180},{"target":"aarch64-darwin","runner":["self-hosted","nix","aarch64-darwin"],"timeout_minutes":90}]}'
               ;;
             x86_64-linux)
               matrix='{"include":[{"target":"x86_64-linux","runner":["self-hosted","nix","x86_64-linux"],"timeout_minutes":120}]}'
+              ;;
+            aarch64-linux)
+              matrix='{"include":[{"target":"aarch64-linux","runner":"ubuntu-24.04-arm","timeout_minutes":180}]}'
               ;;
             aarch64-darwin)
               matrix='{"include":[{"target":"aarch64-darwin","runner":["self-hosted","nix","aarch64-darwin"],"timeout_minutes":90}]}'
@@ -186,6 +190,13 @@ jobs:
           ref: ${{ needs.resolve.outputs.tag }}
           fetch-depth: 0
 
+      - name: Install Nix on the GitHub-hosted ARM runner
+        if: matrix.target == 'aarch64-linux'
+        uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
       - name: Surface system toolchains
         shell: bash
         run: |
@@ -246,7 +257,6 @@ jobs:
           echo "$TARGET release binary is statically linked"
 
       - name: Smoke packaged native binary
-        if: matrix.target != 'aarch64-linux'
         shell: bash
         env:
           VERSION: ${{ needs.resolve.outputs.version }}

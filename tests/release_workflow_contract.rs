@@ -14,6 +14,38 @@ fn between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
         .0
 }
 
+fn assert_hosted_arm_release_lane(build: &str) {
+    let all = between(RELEASE_WORKFLOW, "            all)\n", "              ;;\n");
+    assert!(all.contains("\"target\":\"x86_64-linux\""));
+    assert!(all.contains("\"target\":\"aarch64-linux\""));
+    assert!(all.contains("\"target\":\"aarch64-darwin\""));
+
+    let arm_linux = between(
+        RELEASE_WORKFLOW,
+        "            aarch64-linux)\n",
+        "              ;;\n",
+    );
+    assert!(arm_linux.contains("\"target\":\"aarch64-linux\""));
+    assert!(arm_linux.contains("\"runner\":\"ubuntu-24.04-arm\""));
+    assert!(!arm_linux.contains("\"target\":\"x86_64-linux\""));
+    assert!(!arm_linux.contains("\"target\":\"aarch64-darwin\""));
+
+    for required in [
+        "if: matrix.target == 'aarch64-linux'",
+        "uses: cachix/install-nix-action@v31",
+        "experimental-features = nix-command flakes",
+    ] {
+        assert!(
+            build.contains(required),
+            "GitHub-hosted ARM build must retain `{required}`"
+        );
+    }
+    assert!(
+        !build.contains("if: matrix.target != 'aarch64-linux'"),
+        "the native GitHub ARM runner must smoke the packaged ARM binary"
+    );
+}
+
 /// bd-9715a4: persistent runners must never share operator-global Git config,
 /// and an existing immutable tag must be able to select only Darwin without
 /// scheduling or overwriting the already-published Linux asset.
@@ -87,10 +119,6 @@ fn release_workflow_isolates_git_and_selects_exact_backfill_target() {
         );
     }
 
-    let all = between(RELEASE_WORKFLOW, "            all)\n", "              ;;\n");
-    assert!(all.contains("\"target\":\"x86_64-linux\""));
-    assert!(all.contains("\"target\":\"aarch64-darwin\""));
-
     let linux = between(
         RELEASE_WORKFLOW,
         "            x86_64-linux)\n",
@@ -109,6 +137,8 @@ fn release_workflow_isolates_git_and_selects_exact_backfill_target() {
         !darwin.contains("\"target\":\"x86_64-linux\""),
         "Darwin-only backfill must not schedule Linux"
     );
+
+    assert_hosted_arm_release_lane(build);
 
     let backfill = between(
         JUSTFILE,
