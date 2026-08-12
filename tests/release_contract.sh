@@ -148,12 +148,10 @@ tar -xzf "$archive" -C "$workspace"
 [ "$("$workspace/$asset_root/cara")" = "cara fixture" ]
 
 # The CI matrix carries exactly the targets a runner can actually pick up.
-# A leg no runner can accept, or one pinned to a permanently busy host, sits
-# queued and leaves the whole release non-terminal: that is bd-8b6d28 for darwin
-# and bd-893ff0 for aarch64-linux. Darwin is back because caravan-ms-mac now
-# advertises the label; aarch64-linux is out until ms-dev-2 has spare capacity
-# or a second aarch64-capable runner exists.
-for target in x86_64-linux aarch64-darwin; do
+# Persistent x86/Darwin hosts retain their typed labels; public repositories
+# get a durable native Linux ARM pool from GitHub rather than depending on one
+# intermittently connected personal ARM node.
+for target in x86_64-linux aarch64-linux aarch64-darwin; do
   grep -q -- "\"target\":\"$target\"" .github/workflows/release.yml
 done
 # shellcheck disable=SC2016 # workflow expressions are matched literally.
@@ -165,11 +163,14 @@ if grep -Fq 'git config --global --unset-all' .github/workflows/release.yml; the
   echo "release workflow must not mutate persistent-runner global Git config" >&2
   exit 1
 fi
-if grep -q -- '"target":"aarch64-linux"' .github/workflows/release.yml; then
-  echo "release.yml schedules aarch64-linux; it is starved on ms-dev-2, so keep it backfilled until another aarch64 runner exists" >&2
+grep -q -- '"runner":"ubuntu-24.04-arm"' .github/workflows/release.yml
+grep -q -- "if: matrix.target == 'aarch64-linux'" .github/workflows/release.yml
+grep -q -- 'cachix/install-nix-action@v31' .github/workflows/release.yml
+if grep -q -- "if: matrix.target != 'aarch64-linux'" .github/workflows/release.yml; then
+  echo "native GitHub ARM builds must smoke their packaged binary" >&2
   exit 1
 fi
-# The backfill path is the contract for that target, so it must stay available.
+# The local backfill path remains available for bounded incident recovery.
 grep -q 'release-backfill-target' justfile
 grep -q 'softprops/action-gh-release@v2' .github/workflows/release.yml
 grep -q 'scripts/package-release.sh' .github/workflows/release.yml

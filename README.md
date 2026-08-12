@@ -530,14 +530,16 @@ cara-<version>-<target>.sha256
 ```
 
 The tagged release workflow builds `x86_64-linux` and `aarch64-darwin` on the
-matching registered runners. Every job uses a unique `RUNNER_TEMP`-scoped Git
-configuration, so anonymous HTTPS rewrites never mutate operator-global state
-on persistent runners. After a terminal platform failure and a reviewed workflow
-fix on green `main`, `workflow_dispatch` accepts the immutable existing `tag`
-plus an exact `target`; the generated matrix contains only that target, so a
-Darwin backfill cannot rebuild or overwrite an already-published Linux asset.
-`aarch64-linux` remains on the bounded `just release-backfill-target` path until
-more than one suitable runner can accept it.
+matching registered runners, and `aarch64-linux` on GitHub's native
+`ubuntu-24.04-arm` public-repository pool. The hosted ARM leg installs the pinned
+Nix action before evaluating the same flake and smoke-runs the packaged binary;
+it does not depend on an intermittently connected personal ARM node. Every job
+uses a unique `RUNNER_TEMP`-scoped Git configuration, so anonymous HTTPS rewrites
+never mutate operator-global state on persistent runners. After a terminal
+platform failure and a reviewed workflow fix on green `main`,
+`workflow_dispatch` accepts the immutable existing `tag` plus an exact `target`;
+the generated matrix contains only that target, so an ARM Linux backfill cannot
+rebuild or overwrite already-published x86 Linux or Darwin assets.
 
 When a repository pins Cara through a flake, `flake.lock` is the upgrade path
 of record and `nix flake update` is the normal way to move versions. Self-update
