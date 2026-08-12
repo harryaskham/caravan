@@ -1647,6 +1647,18 @@ never to reset an arbitrary invocation branch. A missing/ambiguous default ref,
 fetch failure, materialization failure, or generation race likewise returns a
 typed local-preparation error before provider mutation.
 
+Mutating sync discovery is active-only: human status retains full merged and
+closed lifecycle audit rows, while sync rereads only evidence required for the
+current open fleet, generation, and admission decision. After any provider or
+branch mutation, sync must perform a fresh active-only rediscovery before it can
+report completion or authorize later work. A zero-write convergence pass reuses
+its exact initial graph instead of repeating every generation, comment, check,
+and native-Stack proof; later admission mutations remain independently fenced
+by exact provider precondition reads and trigger their own fresh rediscovery.
+This asymmetry is required work reduction, not relaxed consistency: a no-op has
+no post-mutation state to prove, while every write still has an authoritative
+provider postcondition.
+
 Configuration validation is two-tier. Structure, version, `min_cara_version`,
 label syntax, command timeouts, journal bounds, and hook policy are always
 enforced at load. Per-tick budgets — `sync.max_candidates_per_tick`,
