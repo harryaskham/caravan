@@ -2995,10 +2995,11 @@ const fn admission_selection(remote: bool) -> crate::admission::AdmissionSelecti
 
 /// Pure/injectable recommendation policy used by `cara check` and fixture tests.
 ///
-/// With no explicit target, a check may recommend joining the one visible,
-/// unheld caravan when that exact attachment is eligible. Mutation preflights
-/// use [`check_requested_action_analysis`] instead: an explicit `cara new`
-/// must continue to prove `new`, never inherit the check command's recommendation.
+/// With no explicit target, a check may recommend joining the canonical first
+/// active, unparked, unheld caravan when that exact attachment is eligible.
+/// Mutation preflights use [`check_requested_action_analysis`] instead: an
+/// explicit `cara new` must continue to prove `new`, never inherit the check
+/// command's recommendation.
 #[allow(clippy::too_many_lines)]
 pub fn check_analysis(
     status: &StatusOutput,
@@ -3138,37 +3139,25 @@ fn check_analysis_with_recommendation(
 
     let explicit_join = input.tail_pr.is_some() || input.head_pr.is_some();
     // A targetless check is a recommendation request, not an explicit `new`.
-    // Recommend a join only when the downstream targetless `cara join --pr N`
-    // can resolve the same target unambiguously. The targeted recursive pass
-    // disables recommendation, so it evaluates the existing coherent join path
-    // exactly once. An ineligible join is evidence to try `new`, not the final
-    // receipt; every other error still fails closed.
-    if recommend_implicit_join && !explicit_join {
-        let active_caravans = status
-            .analysis
-            .fleet
-            .caravans
-            .iter()
-            .filter(|caravan| !caravan.parked)
-            .collect::<Vec<_>>();
-        if let [target_caravan] = active_caravans.as_slice() {
-            let held = status.pauses.iter().any(|pause| {
-                pause.state.is_effective() && pause.record.caravan_head == target_caravan.id
-            });
-            if !held {
-                let tail = target_caravan.tail().expect("caravans are non-empty");
-                let targeted = CheckInput {
-                    pr: input.pr,
-                    tail_pr: Some(tail.0),
-                    head_pr: None,
-                };
-                match check_analysis_with_recommendation(status, &targeted, checker, false) {
-                    Ok(output) if output.eligible => return Ok(output),
-                    Ok(_) => {}
-                    Err(error) if error.code() == "check_failed" => {}
-                    Err(error) => return Err(error),
-                }
-            }
+    // It evaluates the same deterministic first available caravan that a
+    // downstream targetless `cara join --pr N` will select. The fleet is
+    // canonically root-PR ordered; never hunt for a later compatible caravan
+    // after the first target fails its exact preflight.
+    if recommend_implicit_join
+        && !explicit_join
+        && let Some(target_caravan) = first_available_join_caravan(status)
+    {
+        let tail = target_caravan.tail().expect("caravans are non-empty");
+        let targeted = CheckInput {
+            pr: input.pr,
+            tail_pr: Some(tail.0),
+            head_pr: None,
+        };
+        match check_analysis_with_recommendation(status, &targeted, checker, false) {
+            Ok(output) if output.eligible => return Ok(output),
+            Ok(_) => {}
+            Err(error) if error.code() == "check_failed" => {}
+            Err(error) => return Err(error),
         }
     }
 
@@ -3594,6 +3583,21 @@ fn check_new(
         )?;
     }
     Ok(())
+}
+
+/// First target for an opinionated targetless join.
+///
+/// Graph analysis sorts caravans by root PR, so this is stable across provider
+/// discovery order. Parked and effectively held caravans remain visible repair
+/// evidence but cannot be selected by an implicit mutation.
+pub(crate) fn first_available_join_caravan(status: &StatusOutput) -> Option<&Caravan> {
+    status.analysis.fleet.caravans.iter().find(|caravan| {
+        !caravan.parked
+            && !status
+                .pauses
+                .iter()
+                .any(|pause| pause.state.is_effective() && pause.record.caravan_head == caravan.id)
+    })
 }
 
 fn resolve_target_caravan<'a>(
@@ -4352,6 +4356,42 @@ mod tests {
         }
     }
 
+    /// bd-1925d2: recommendation and mutation share one deterministic target
+    /// even when the repository deliberately permits more than one caravan.
+    #[test]
+    fn targetless_check_recommends_the_first_of_multiple_caravans() {
+        let candidate = pr(9, "nine", "main", false);
+        let status = status(
+            candidate.clone(),
+            vec![
+                pr(2, "two", "main", true),
+                pr(1, "one", "main", true),
+                candidate,
+            ],
+        );
+
+        let output = check_analysis(
+            &status,
+            &CheckInput {
+                pr: Some(9),
+                ..CheckInput::default()
+            },
+            &clean_checker,
+        )
+        .expect("the canonical first caravan is recommended");
+
+        assert_eq!(output.next_action, CandidateNextAction::Join);
+        assert_eq!(output.caravan_id, Some(PrNumber(1)));
+        assert_eq!(output.target_pr, Some(PrNumber(1)));
+        assert_eq!(
+            output
+                .admission_intent
+                .expect("typed join intent")
+                .target_caravan,
+            Some(PrNumber(1))
+        );
+    }
+
     /// The recommendation is not mutation intent. `cara new` uses this strict
     /// path and must keep proving a new caravan even when check would recommend
     /// the one visible tail.
@@ -4417,6 +4457,58 @@ mod tests {
         assert_eq!(output.target_pr, None);
     }
 
+    #[test]
+    fn targetless_check_skips_held_and_parked_caravans_in_root_order() {
+        let candidate = pr(9, "nine", "main", false);
+        let mut parked = pr(1, "one", "main", true);
+        parked.labels.insert("caravan-parked".to_owned());
+        parked.auto_merge = AutoMergeState::disabled();
+        let mut status = status(
+            candidate.clone(),
+            vec![
+                parked,
+                pr(2, "two", "main", true),
+                pr(3, "three", "main", true),
+                candidate,
+            ],
+        );
+        let held_head = status.analysis.pull_requests[&PrNumber(2)].clone();
+        status.pauses.push(crate::pause::PauseStatus {
+            record: crate::pause::PauseRecord {
+                version: 1,
+                caravan_head: PrNumber(2),
+                members: vec![PrNumber(2)],
+                expected_head: crate::model::PullRequestPrecondition::from(&held_head),
+                expected_checks: held_head.checks,
+                actor: "operator".to_owned(),
+                reason: "incident".to_owned(),
+                paused_unix_secs: 1,
+                expires_unix_secs: None,
+                external_reference: None,
+                resume_authorized_by: None,
+                recovery: None,
+            },
+            state: crate::pause::PauseState::Active,
+            auto_merge_suspended: true,
+            retired_state: None,
+            safe_next_action: "resume explicitly".to_owned(),
+        });
+
+        let output = check_analysis(
+            &status,
+            &CheckInput {
+                pr: Some(9),
+                ..CheckInput::default()
+            },
+            &clean_checker,
+        )
+        .expect("the first active unheld caravan is recommended");
+
+        assert_eq!(output.next_action, CandidateNextAction::Join);
+        assert_eq!(output.caravan_id, Some(PrNumber(3)));
+        assert_eq!(output.target_pr, Some(PrNumber(3)));
+    }
+
     /// An incompatible inferred join is not returned as the final answer. The
     /// ordinary new-caravan evaluation still owns the fallback receipt.
     #[test]
@@ -4471,8 +4563,9 @@ mod tests {
     fn new_check_proves_both_cross_caravan_attachment_orders() {
         let candidate = pr(9, "nine", "main", false);
         let status = status(candidate, vec![pr(1, "one", "main", true)]);
-        // Explicitly avoid unique-tail inference: with >1 caravans default check
-        // is new; add a second caravan to exercise all ordered directions.
+        // Explicit new preflight exercises both ordered directions against all
+        // caravans; targetless recommendation now deliberately selects the
+        // canonical first target even when several caravans exist.
         let mut status = status;
         status
             .analysis
@@ -4491,7 +4584,8 @@ mod tests {
                 .push((candidate.name.clone(), target.name.clone()));
             clean_checker(candidate, target)
         };
-        let output = check_analysis(&status, &CheckInput::default(), &checker).unwrap();
+        let output =
+            check_requested_action_analysis(&status, &CheckInput::default(), &checker).unwrap();
         assert_eq!(output.mode, CheckMode::NewCaravan);
         let calls = calls.into_inner();
         assert!(calls.contains(&("nine".to_owned(), "one".to_owned())));
