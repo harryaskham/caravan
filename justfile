@@ -178,7 +178,10 @@ release-backfill-target tag target:
         --command ./scripts/build-darwin-release.sh
       binary="target/release/cara"
     else
-      nix build ".#packages.$TARGET.caravan" --out-link "result-$TARGET"
+      # Published Linux assets are statically linked against musl (bd-0629ce),
+      # including native-host backfills. The dynamic `caravan` package runs the
+      # full host test suite and is not the artifact release.yml publishes.
+      nix build ".#packages.$TARGET.caravan-static" --out-link "result-$TARGET"
       binary="result-$TARGET/bin/cara"
     fi
 

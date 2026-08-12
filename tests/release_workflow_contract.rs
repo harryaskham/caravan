@@ -1,6 +1,7 @@
 //! Source-light policy checks for immutable release and target-only backfill.
 
 const RELEASE_WORKFLOW: &str = include_str!("../.github/workflows/release.yml");
+const JUSTFILE: &str = include_str!("../justfile");
 
 fn between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     let after = source
@@ -107,5 +108,19 @@ fn release_workflow_isolates_git_and_selects_exact_backfill_target() {
     assert!(
         !darwin.contains("\"target\":\"x86_64-linux\""),
         "Darwin-only backfill must not schedule Linux"
+    );
+
+    let backfill = between(
+        JUSTFILE,
+        "release-backfill-target tag target:",
+        "# Emit exact downstream Cara runtime pin rows",
+    );
+    assert!(
+        backfill.contains(".#packages.$TARGET.caravan-static"),
+        "Linux backfills must package the same static-musl artifact class as release.yml"
+    );
+    assert!(
+        !backfill.contains(".#packages.$TARGET.caravan\""),
+        "Linux backfills must never publish the dynamic native test package"
     );
 }
