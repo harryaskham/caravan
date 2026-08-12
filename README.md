@@ -149,7 +149,8 @@ cargo test
 cargo run -- help
 cargo run -- mcp tools
 cargo run -- mcp stdio
-cargo run -- self-update status
+cargo run -- update             # direct bounded self-update
+cargo run -- self-update status # explicit read-only inspection
 cargo run -- feedback status
 # Explicit only: runs the process/load-sensitive hook contract.
 cargo test --features environmental-hook-acceptance --test hook_example
@@ -216,7 +217,7 @@ cara split [--pr N]
 cara van list | cara van next | cara van prev
 cara lock status | cara lock recover --token TOKEN --confirm
 cara mcp tools | cara mcp stdio
-cara self-update status | check | run
+cara update | cara self-update status | check | run
 cara feedback status | report
 ```
 
@@ -551,7 +552,9 @@ hash, and whether it came from a store path, so a shadowing install is provable
 rather than inferred.
 
 The archive contains `cara-<version>-<target>/cara`, matching
-`updatable-cli`'s default asset strategy. `cara self-update run` keeps release
+`updatable-cli`'s default asset strategy. `cara update` is the direct update
+command; `cara self-update run` remains its explicit/backward-compatible
+spelling, and both dispatch the identical implementation. They keep release
 polling outside the queue scheduler's budget: one bounded child owns the entire
 operation (30 seconds), each network request is capped at eight seconds, and an
 atomically written 30-minute metadata cache makes the unchanged-release path a

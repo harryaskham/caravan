@@ -247,6 +247,38 @@ fn self_update_refuses_the_cargo_target_development_binary() {
     assert_eq!(envelope["error"]["code"], "self_update_development_binary");
 }
 
+/// `update` is the common action, not an alias that still demands another
+/// subcommand. It must dispatch through the exact bounded `self-update run`
+/// path and retain its active-binary refusal (bd-093dec).
+#[test]
+fn update_is_a_visible_direct_self_update_run_command() {
+    let help = cara(&["--help"]);
+    assert!(help.status.success());
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(help.contains("update"));
+    assert!(help.contains("Download, verify, and atomically install"));
+
+    let binary = std::path::Path::new(env!("CARGO_BIN_EXE_cara"));
+    let direct = cara_command()
+        .env("PATH", binary.parent().unwrap())
+        .args(["--json", "update"])
+        .output()
+        .expect("run direct update command");
+    let explicit = cara_command()
+        .env("PATH", binary.parent().unwrap())
+        .args(["--json", "self-update", "run"])
+        .output()
+        .expect("run explicit self-update command");
+
+    assert!(!direct.status.success());
+    assert_eq!(direct.status.code(), explicit.status.code());
+    let direct: serde_json::Value = serde_json::from_slice(&direct.stdout).unwrap();
+    let explicit: serde_json::Value = serde_json::from_slice(&explicit.stdout).unwrap();
+    assert_eq!(direct["error"]["code"], "self_update_development_binary");
+    assert_eq!(direct["error"]["code"], explicit["error"]["code"]);
+    assert_eq!(direct["error"]["category"], explicit["error"]["category"]);
+}
+
 /// bd-3119d9: a dry-run nobody can find is a dry-run nobody uses. The preview
 /// must be reachable from the mutating command itself, and must never mutate.
 #[test]
