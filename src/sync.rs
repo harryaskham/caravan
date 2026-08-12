@@ -966,7 +966,8 @@ pub struct SyncOutput {
     /// Bounded status for configured hooks which consumed `events`.
     #[serde(default)]
     pub hook_deliveries: Vec<HookDelivery>,
-    /// Fresh post-mutation discovery rather than a locally predicted graph.
+    /// Fresh provider discovery after any mutation; a zero-write tick retains
+    /// the same exact initial graph rather than paying for a redundant reread.
     pub status: StatusOutput,
 }
 
@@ -3777,11 +3778,7 @@ fn sync_with_lock(
     )
     .unwrap_or(u32::MAX);
     if parking.changed {
-        status = read::status_with_deadline_and_budget(
-            context,
-            operation_deadline,
-            Some(&github_budget),
-        )?;
+        status = read::fleet_status_for_sync(context, operation_deadline, Some(&github_budget))?;
     }
     let convergence_started = Instant::now();
     let mut physical_rebuild = PhysicalRebuildOutcome::default();
@@ -3861,12 +3858,9 @@ fn sync_with_lock(
             "midpoint_rediscovery",
             "revalidating every pushed generation before provider convergence",
         );
-        let mut midpoint = read::status_with_deadline_and_budget(
-            context,
-            operation_deadline,
-            Some(&github_budget),
-        )
-        .map_err(|error| attach_physical_rebuild(error, &physical_rebuild))?;
+        let mut midpoint =
+            read::fleet_status_for_sync(context, operation_deadline, Some(&github_budget))
+                .map_err(|error| attach_physical_rebuild(error, &physical_rebuild))?;
         // One bounded re-read absorbs provider list-view lag behind an exact
         // proven push; a persistent mismatch still fails closed below.
         if physical_rebuild.receipts.iter().any(|receipt| {
@@ -3877,12 +3871,9 @@ fn sync_with_lock(
                 .is_none_or(|observed| observed.head.oid != receipt.new_head_oid)
         }) {
             std::thread::sleep(PROVIDER_HEAD_CONVERGENCE_DELAY);
-            midpoint = read::status_with_deadline_and_budget(
-                context,
-                operation_deadline,
-                Some(&github_budget),
-            )
-            .map_err(|error| attach_physical_rebuild(error, &physical_rebuild))?;
+            midpoint =
+                read::fleet_status_for_sync(context, operation_deadline, Some(&github_budget))
+                    .map_err(|error| attach_physical_rebuild(error, &physical_rebuild))?;
         }
         for receipt in &physical_rebuild.receipts {
             let observed = midpoint
@@ -4036,40 +4027,50 @@ fn sync_with_lock(
         false,
     )?;
 
-    // A fresh graph is the authoritative completion receipt. It detects a
-    // default-branch or fleet change that raced after the preflight proof.
+    // A fresh graph is the authoritative completion receipt after any provider
+    // or branch write. A zero-write pass already owns one exact provider graph,
+    // and every later admission write has its own exact precondition refetch.
+    // Re-reading the whole graph after a no-op duplicated every generation,
+    // comment, check, and native-Stack proof; Pi-Daemon's one parked caravan and
+    // six unqueued PRs therefore exhausted 256 GitHub requests before it could
+    // report the no-op (bd-12c23c).
     let final_status_started = Instant::now();
-    progress::emit(
-        "final_rediscovery",
-        "reading the authoritative post-mutation graph",
-    );
-    let mut final_status = read::status_with_deadline_and_budget(
-        context,
-        operation_deadline,
-        Some(&github_budget),
-    )
-    .map_err(|error| {
-        AppError::structured(
-            error.category(),
-            if error.category() == ErrorCategory::Timeout {
-                "sync_operation_timeout"
-            } else {
-                "sync_rediscovery_failed"
+    let mut final_status = if requires_post_mutation_rediscovery(&progress) {
+        progress::emit(
+            "final_rediscovery",
+            "reading the authoritative post-mutation graph",
+        );
+        read::fleet_status_for_sync(context, operation_deadline, Some(&github_budget)).map_err(
+            |error| {
+                AppError::structured(
+                    error.category(),
+                    if error.category() == ErrorCategory::Timeout {
+                        "sync_operation_timeout"
+                    } else {
+                        "sync_rediscovery_failed"
+                    },
+                    error.to_string(),
+                    Some(json!({
+                        "operation_receipt": progress.operation_receipt(),
+                        "provider_receipts": progress.provider_receipts,
+                        "events": progress.events,
+                        "phase": "final_status",
+                        "elapsed_ms": duration_millis(started.elapsed()),
+                        "deadline_ms": duration_millis(operation_deadline.saturating_duration_since(started)),
+                        "source": error.details(),
+                        "resumable": true,
+                        "next": "rerun `cara sync` to rediscover GitHub state",
+                    })),
+                )
             },
-            error.to_string(),
-            Some(json!({
-                "operation_receipt": progress.operation_receipt(),
-                "provider_receipts": progress.provider_receipts,
-                "events": progress.events,
-                "phase": "final_status",
-                "elapsed_ms": duration_millis(started.elapsed()),
-                "deadline_ms": duration_millis(operation_deadline.saturating_duration_since(started)),
-                "source": error.details(),
-                "resumable": true,
-                "next": "rerun `cara sync` to rediscover GitHub state",
-            })),
-        )
-    })?;
+        )?
+    } else {
+        progress::emit(
+            "final_rediscovery",
+            "reusing the exact initial graph because the tick performed no provider or branch mutation",
+        );
+        status.clone()
+    };
     if let Some(problem) =
         first_blocking_completion_problem(&final_status, &progress, context.config.force_merge)
     {
@@ -4143,11 +4144,8 @@ fn sync_with_lock(
                 attach_auto_admission_progress(&error, context, &progress, &github_budget)
             })?;
             merge_sync_progress(&mut progress, post_admission);
-            final_status = read::status_with_deadline_and_budget(
-                context,
-                operation_deadline,
-                Some(&github_budget),
-            )?;
+            final_status =
+                read::fleet_status_for_sync(context, operation_deadline, Some(&github_budget))?;
             if let Some(problem) = first_blocking_completion_problem(
                 &final_status,
                 &progress,
@@ -4267,6 +4265,20 @@ fn completed_mutation_count(progress: &SyncProgress) -> u32 {
             .count(),
     )
     .unwrap_or(u32::MAX)
+}
+
+/// Whether completion must discard the initial graph and prove fresh provider
+/// state. Receipts are included as a fail-safe in case a future write path ever
+/// forgets to append its completed mutation step.
+fn requires_post_mutation_rediscovery(progress: &SyncProgress) -> bool {
+    completed_mutation_count(progress) > 0
+        || !progress.provider_receipts.is_empty()
+        || progress
+            .rebase_receipts
+            .iter()
+            .any(|receipt| !receipt.already_satisfied)
+        || !progress.root_merge.is_empty()
+        || !progress.native_stack_land.is_empty()
 }
 
 /// Keep one hook notification per distinct exact-generation problem.
@@ -4516,11 +4528,7 @@ fn run_auto_admission(
             removed,
             "removed stale generation-bound automatic admission skip",
         );
-        status = read::status_with_deadline_and_budget(
-            context,
-            operation_deadline,
-            Some(github_budget),
-        )?;
+        status = read::fleet_status_for_sync(context, operation_deadline, Some(github_budget))?;
         progress.current = status.analysis.pull_requests.clone();
         progress.merge_candidates = status
             .merge_candidates
@@ -4559,11 +4567,7 @@ fn run_auto_admission(
             });
         if needs_native_candidate_refresh && refreshed_stale_native_candidates.insert(next_pr) {
             read::invalidate_status_cache(context);
-            status = read::status_with_deadline_and_budget(
-                context,
-                operation_deadline,
-                Some(github_budget),
-            )?;
+            status = read::fleet_status_for_sync(context, operation_deadline, Some(github_budget))?;
             progress.current = status.analysis.pull_requests.clone();
             progress.merge_candidates = status
                 .merge_candidates
@@ -4726,8 +4730,7 @@ fn run_auto_admission(
         } else {
             operation_deadline
         };
-        status =
-            read::status_with_deadline_and_budget(context, refresh_deadline, Some(github_budget))?;
+        status = read::fleet_status_for_sync(context, refresh_deadline, Some(github_budget))?;
         progress.current = status.analysis.pull_requests.clone();
         progress.merge_candidates = status
             .merge_candidates
