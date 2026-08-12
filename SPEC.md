@@ -1632,8 +1632,8 @@ rewritten. The remote-tracking generation is revalidated after provider
 discovery and before the first possible provider mutation; movement refuses
 with `sync_default_branch_moved` and zero provider writes. Network Git commands
 retain `command_timeout_secs`; local identity/ref reads use
-`max(command timeout, 30s)` and detached worktree creation uses
-`max(command timeout, 60s)`. Both local bounds are capped at 120 seconds and by
+`max(command timeout, 30s)` and detached worktree creation uses the full
+120-second local cap. Both local bounds remain bounded by
 the whole `sync.max_duration_secs` budget. Cleanup removes only the Cara-owned
 detached worktree on both success and failure. `CARA_ALLOW_FETCH` is the strict
 per-invocation override. An explicit `--config` remains explicit authority and

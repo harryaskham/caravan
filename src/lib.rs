@@ -239,8 +239,8 @@ the exact pinned binary. It performs strict parsing and no repository/provider a
    from a detached temporary worktree without resetting, checking out, stashing,
    or changing the caller's branch/index/worktree. Provider/network commands
    retain the configured timeout; local identity/ref reads have a 30-second
-   floor and detached-worktree creation a 60-second floor, both capped at 120
-   seconds and by the whole sync budget. The fetched
+   floor and detached-worktree creation uses the full 120-second local cap;
+   both remain bounded by the whole sync budget. The fetched
    ref is fenced again before provider mutation. Use `CARA_ALLOW_FETCH=false`
    only as a
    deliberate per-invocation opt-out; an explicit `--config` remains explicit.
