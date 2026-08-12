@@ -204,11 +204,11 @@ the exact pinned binary. It performs strict parsing and no repository/provider a
    repository setting, protection, label, permission, or config mismatch.
 3. Inspect `cara next-candidate`. Use `cara check --pr N` to validate the exact
    remote PR without checkout or mutation. A targetless check recommends joining
-   the one visible unheld, unparked caravan when that attachment is clean,
-   otherwise it falls back to `new`; zero or multiple active caravans retain
-   `new` because a later targetless join would be ambiguous. Add `--tail-pr T`
-   (or `--head-pr H`) for
-   an exact join target. Follow the typed `new`, `join`, `repair`, `wait`, or
+   the first active, unparked, unheld caravan in canonical ascending root-PR
+   order when that attachment is clean, otherwise it falls back to `new`.
+   Targetless join selects that same first target and never searches a later
+   caravan after incompatibility. Add `--tail-pr T` (or `--head-pr H`) for an
+   exact join target. Follow the typed `new`, `join`, `repair`, `wait`, or
    `reject` action and its coherent target from the returned receipt.
 4. Use `cara new --pr N`, `renew --pr N`, `join --pr N`, or `rejoin --pr N`
    for checkout-free Saloon actions; omit `--pr` only when the checkout resolves
@@ -968,8 +968,9 @@ pub struct TargetInput {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Args)]
 pub struct CheckInput {
     /// Exact remote candidate PR. When omitted, use the current checkout's PR.
-    /// Without a target, check may recommend the one unambiguous clean live
-    /// caravan; mutation commands retain their explicitly requested operation.
+    /// Without a target, check may recommend the canonical first active,
+    /// unparked, unheld caravan; mutation commands retain their explicitly
+    /// requested operation.
     #[arg(long, value_name = "PR")]
     #[serde(default)]
     pub pr: Option<u64>,
@@ -1273,7 +1274,7 @@ pub fn build_router() -> ToolRouter<AppContext> {
     );
     router.add_typed_tool_with_output_schema(
         "check",
-        "Preflight an exact remote candidate with --pr, or the current PR when omitted, without checkout or provider mutation. A targetless check recommends the one visible unheld caravan when its exact attachment is eligible, otherwise it falls back to new; zero or multiple caravans retain new because targetless join would be ambiguous. Optionally test an exact --tail-pr or resolved --head-pr. Returns exact facts, a coherent typed admission-intent decision/target, and one mechanical next action without changing explicit new mutation preflight.",
+        "Preflight an exact remote candidate with --pr, or the current PR when omitted, without checkout or provider mutation. A targetless check evaluates the first active, unparked, unheld caravan in canonical ascending root-PR order, matching targetless join; an ineligible first attachment falls back to new without searching later caravans. Optionally test an exact --tail-pr or resolved --head-pr. Returns exact facts, a coherent typed admission-intent decision/target, and one mechanical next action without changing explicit new mutation preflight.",
         |context: &AppContext, input: CheckInput| read::check(context, &input),
     );
     router.add_typed_tool_with_output_schema(

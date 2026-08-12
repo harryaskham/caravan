@@ -1,7 +1,7 @@
 //! Membership shape, target resolution, repository preflight, and audit policy.
 
 use super::{
-    ACTIVE_LABEL, AppError, BTreeSet, Caravan, CheckInput, CheckOutput, CompatibilityChecker,
+    ACTIVE_LABEL, AppError, BTreeSet, CheckInput, CheckOutput, CompatibilityChecker,
     ControlLabelAudit, EVICTED_LABEL, ErrorCategory, ExecutionState, FORCE_LABEL, JoinTarget,
     MembershipOperation, MembershipProvider, MembershipRequest, PrNumber, PullRequestSnapshot,
     PullRequestState, REQUIRED_LABELS, RepositoryId, SKIPPED_LABEL, StatusOutput,
@@ -98,25 +98,25 @@ pub(super) fn resolve_join_target(
                 )
             })?
     } else {
-        match status.analysis.fleet.caravans.as_slice() {
-            [caravan] => caravan.clone(),
-            [] => {
-                return Err(AppError::validation(
-                    "caravan_tail_not_found",
-                    "there is no caravan to join; use `cara new`",
-                ));
-            }
-            caravans => {
-                return Err(AppError::structured(
+        read::first_available_join_caravan(status)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::structured(
                     ErrorCategory::Validation,
-                    "ambiguous_caravan_tail",
-                    "multiple caravan tails exist; pass --tail-pr or --head-pr",
+                    "caravan_tail_not_found",
+                    "there is no active unheld caravan to join; use `cara new` or resume an existing caravan",
                     Some(json!({
-                        "candidate_tails": caravans.iter().filter_map(Caravan::tail).collect::<Vec<_>>(),
+                        "selection_policy": "first active, unparked, unheld caravan in ascending root PR order",
+                        "visible_caravans": status.analysis.fleet.caravans.iter().map(|caravan| json!({
+                            "root_pr": caravan.id,
+                            "tail_pr": caravan.tail(),
+                            "parked": caravan.parked,
+                            "held": status.pauses.iter().any(|pause| pause.state.is_effective() && pause.record.caravan_head == caravan.id),
+                        })).collect::<Vec<_>>(),
+                        "mutated": false,
                     })),
-                ));
-            }
-        }
+                )
+            })?
     };
     let tail_number = caravan.tail().expect("caravans are non-empty");
     let tail = status
@@ -392,7 +392,7 @@ pub(super) fn membership_audit(
                 if request.tail_pr.is_some() || request.head_pr.is_some() {
                     "admitted after the explicitly selected caravan target"
                 } else {
-                    "admitted to the only mechanically inferred caravan tail"
+                    "admitted to the first active, unparked, unheld caravan in canonical root PR order"
                 }
             } else if request.operation.is_renewal() {
                 "evicted PR passed renewed queue eligibility"

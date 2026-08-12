@@ -1795,20 +1795,22 @@ fn explicit_new_membership_admits_ahead_of_an_older_unjoined_row() {
     assert!(!intent.idempotent);
 }
 
-/// An ambiguous join target fails closed and never reaches ordering.
+/// bd-1925d2: a targetless integration join is deliberately opinionated.
+/// Fleet order is canonical root-PR order, and selecting the first target must
+/// not depend on provider discovery order or silently create another caravan.
 #[test]
-fn ambiguous_join_target_fails_closed_before_any_bypass() {
+fn targetless_join_selects_the_first_caravan() {
     let first_root = pull_request(1, "one", "main", &[ACTIVE_LABEL]);
     let second_root = pull_request(2, "two", "main", &[ACTIVE_LABEL]);
     let candidate = pull_request(3, "three", "main", &[]);
     let provider = FakeProvider::with_pull_requests(vec![
-        first_root.clone(),
         second_root.clone(),
+        first_root.clone(),
         candidate.clone(),
     ]);
 
-    let error = execute(
-        status(candidate, vec![first_root, second_root]),
+    let output = execute(
+        status(candidate, vec![second_root, first_root]),
         &clean,
         &provider,
         MembershipRequest {
@@ -1821,9 +1823,13 @@ fn ambiguous_join_target_fails_closed_before_any_bypass() {
             agent_priority_labels: Vec::new(),
         },
     )
-    .expect_err("an ambiguous target is never guessed");
+    .expect("targetless join selects the canonical first caravan");
 
-    assert_eq!(error.code(), "ambiguous_caravan_tail");
+    assert_eq!(output.caravan_id, PrNumber(1));
+    assert_eq!(output.pull_request.base.name, "one");
+    let intent = output.admission_intent.expect("typed join intent");
+    assert_eq!(intent.target_caravan, Some(PrNumber(1)));
+    assert_eq!(intent.target_tail, Some(PrNumber(1)));
 }
 
 /// A provider failure during an intent-permitted join is never a silent bypass.
