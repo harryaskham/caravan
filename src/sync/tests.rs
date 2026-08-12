@@ -2568,6 +2568,64 @@ fn a_plan_counts_its_provider_writes_rather_than_asserting_none() {
     );
 }
 
+/// Pi-Daemon's canonical tick had one parked caravan and six unqueued PRs. The
+/// convergence pass performed no writes, but an unconditional second status
+/// repeated every generation/comment/Stack proof and exhausted all 256 GitHub
+/// requests before it could report the no-op (bd-12c23c).
+#[test]
+fn one_parked_six_unqueued_noop_reuses_the_initial_graph() {
+    let mut parked = pull_request(
+        87,
+        "parked",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    parked.labels.insert("caravan-parked".to_owned());
+    let mut pulls = vec![parked];
+    pulls.extend((1..=6).map(|index| {
+        let mut candidate = pull_request(
+            100 + index,
+            &format!("candidate-{index}"),
+            "main",
+            PullRequestState::Open,
+            AutoMergeState::disabled(),
+        );
+        candidate.labels.clear();
+        candidate
+    }));
+    let observed = status(pulls, None, &clean);
+    assert_eq!(observed.analysis.fleet.caravans.len(), 1);
+    assert_eq!(observed.analysis.fleet.unqueued.len(), 6);
+
+    let mut progress = SyncProgress::new(&observed, vec![PrNumber(87)], 64);
+    assert!(
+        !requires_post_mutation_rediscovery(&progress),
+        "a zero-write tick already has one exact graph and must not spend a second provider pass"
+    );
+
+    progress.already(
+        MutationKind::RemoveLabel,
+        PrNumber(87),
+        "parked postcondition was already satisfied",
+    );
+    assert!(
+        !requires_post_mutation_rediscovery(&progress),
+        "an already-satisfied step is not a provider mutation"
+    );
+
+    progress.steps.push(crate::model::MutationStep {
+        kind: MutationKind::AddLabel,
+        state: MutationStepState::Completed,
+        pr: Some(PrNumber(87)),
+        summary: "simulated exact provider write".to_owned(),
+    });
+    assert!(
+        requires_post_mutation_rediscovery(&progress),
+        "every completed provider write must retain authoritative rediscovery"
+    );
+}
+
 /// An operator holding a large pull request for review applies
 /// `caravan-join-skipped` by hand. There is no Cara receipt, because Cara did
 /// not write the label.
