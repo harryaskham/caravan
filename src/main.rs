@@ -22,7 +22,10 @@ use caravan::{
     },
     restore_parked::RestoreParkedInput,
     self_update_check, self_update_run, self_update_run_worker, self_update_status,
-    stack_recovery::{NativeStackRecoveryApplyInput, NativeStackRecoveryPreviewInput},
+    stack_recovery::{
+        NativeStackRecoveryApplyInput, NativeStackRecoveryClearInput,
+        NativeStackRecoveryPreviewInput,
+    },
     unpark::UnparkInput,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -228,9 +231,14 @@ enum ForceSubcommand {
 #[derive(Debug, Subcommand)]
 enum NativeStackCommand {
     /// Build a no-write exact-generation recovery plan and hash.
-    RecoveryPreview(NativeStackRecoveryPreviewInput),
+    #[command(name = "recovery-preview")]
+    Preview(NativeStackRecoveryPreviewInput),
     /// Apply one independently revalidated preview hash.
-    RecoveryApply(NativeStackRecoveryApplyInput),
+    #[command(name = "recovery-apply")]
+    Apply(NativeStackRecoveryApplyInput),
+    /// Clear only a stale local checkpoint after proving zero provider intersection.
+    #[command(name = "recovery-clear")]
+    Clear(NativeStackRecoveryClearInput),
 }
 
 #[derive(Debug, Subcommand)]
@@ -1846,11 +1854,28 @@ fn run_restore_parked(cli: &Cli, input: &RestoreParkedInput) -> Result<(), i32> 
 
 fn run_native_stack(cli: &Cli, command: &NativeStackCommand) -> Result<(), i32> {
     let context = load_context(cli)?;
-    let result = match command {
-        NativeStackCommand::RecoveryPreview(input) => {
-            caravan::stack_recovery::preview(&context, input)
+    if let NativeStackCommand::Clear(input) = command {
+        let result = caravan::stack_recovery::clear_checkpoint(&context, input);
+        if cli.json {
+            return emit_result(true, result);
         }
-        NativeStackCommand::RecoveryApply(input) => caravan::stack_recovery::apply(&context, input),
+        return match result {
+            Ok(output) => {
+                println!(
+                    "native-stack #{}: checkpoint {} — {}",
+                    output.caravan_id,
+                    if output.cleared { "cleared" } else { "absent" },
+                    output.next
+                );
+                Ok(())
+            }
+            Err(error) => emit_human_error(error),
+        };
+    }
+    let result = match command {
+        NativeStackCommand::Preview(input) => caravan::stack_recovery::preview(&context, input),
+        NativeStackCommand::Apply(input) => caravan::stack_recovery::apply(&context, input),
+        NativeStackCommand::Clear(_) => unreachable!("handled above"),
     };
     if cli.json {
         return emit_result(true, result);
@@ -4390,6 +4415,28 @@ provider.wait()
         ])
         .expect("config check parses");
         assert!(matches!(cli.command, Command::Config(ConfigCommand::Check)));
+    }
+
+    #[test]
+    fn native_stack_recovery_clear_parses_exact_audit_input() {
+        let cli = Cli::try_parse_from([
+            "cara",
+            "native-stack",
+            "recovery-clear",
+            "--root",
+            "53",
+            "--actor",
+            "operator",
+            "--reason",
+            "owners refreshed the zero-write chain",
+        ])
+        .expect("typed checkpoint clear parses");
+        let Command::NativeStack(NativeStackCommand::Clear(input)) = cli.command else {
+            panic!("expected native recovery clear");
+        };
+        assert_eq!(input.root, 53);
+        assert_eq!(input.actor, "operator");
+        assert_eq!(input.reason, "owners refreshed the zero-write chain");
     }
 
     #[test]

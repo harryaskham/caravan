@@ -70,6 +70,36 @@ pub struct NativeStackRecoveryApplyInput {
     pub plan_hash: String,
 }
 
+/// Local-only clearance input for a stale zero-write formation checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Args)]
+pub struct NativeStackRecoveryClearInput {
+    /// Exact root whose pending formation checkpoint may be cleared.
+    #[arg(long)]
+    pub root: u64,
+    /// Audited operator or scheduler identity.
+    #[arg(long)]
+    pub actor: String,
+    /// Bounded rationale for discarding stale local continuation evidence.
+    #[arg(long)]
+    pub reason: String,
+}
+
+/// Durable evidence that checkpoint clearance was local-only and provider-safe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct NativeStackRecoveryClearOutput {
+    pub schema_version: u32,
+    pub caravan_id: PrNumber,
+    pub actor: String,
+    pub reason: String,
+    pub cleared: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_evidence_hash: Option<String>,
+    #[serde(default)]
+    pub planned_members: Vec<PrNumber>,
+    pub provider_mutated: bool,
+    pub next: String,
+}
+
 /// One exact member generation authorized by the recovery plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct NativeStackRecoveryMember {
@@ -172,7 +202,11 @@ impl<'a> RecoveryFacts<'a> {
     fn from_status(status: &'a StatusOutput) -> Self {
         Self {
             repository: &status.repository,
-            healthy: status.healthy,
+            // Missing native Stack representation intentionally makes overall
+            // status unhealthy; recovery instead requires healthy graph and
+            // compatibility analysis, then admits only the expected backend
+            // `github_stack_absent` problem below.
+            healthy: status.analysis.healthy(),
             default_branch: &status.analysis.fleet.default_branch,
             caravans: &status.analysis.fleet.caravans,
             pulls: &status.analysis.pull_requests,
@@ -254,6 +288,169 @@ pub fn preview(
         provider_receipt: None,
         next: "review the exact plan hash, then run `cara native-stack recovery-apply` with the same root/actor/reason and --plan-hash; preview never mutates provider state".to_owned(),
     })
+}
+
+/// Clear only a stale local zero-write checkpoint after proving complete provider absence.
+pub fn clear_checkpoint(
+    context: &AppContext,
+    input: &NativeStackRecoveryClearInput,
+) -> Result<NativeStackRecoveryClearOutput, AppError> {
+    validate_input(input.root, &input.actor, &input.reason)?;
+    let _lock = context.acquire_writer_operation("native-stack-recovery-clear")?;
+    let root = PrNumber(input.root);
+    let pending = crate::stack_membership::load_pending(&context.repository_path, root)?;
+    let Some(pending) = pending else {
+        return Ok(NativeStackRecoveryClearOutput {
+            schema_version: 1,
+            caravan_id: root,
+            actor: input.actor.clone(),
+            reason: input.reason.clone(),
+            cleared: false,
+            checkpoint_evidence_hash: None,
+            planned_members: Vec::new(),
+            provider_mutated: false,
+            next: "no pending formation checkpoint exists; review a fresh recovery-preview receipt"
+                .to_owned(),
+        });
+    };
+    let deadline = Instant::now() + Duration::from_secs(context.config.sync.max_duration_secs);
+    let status = crate::read::fleet_status(context, deadline, None)?;
+    crate::initialization::require_ready(&status.initialization)?;
+    require_clear_rollout(&context.config, &status.stack_backend)?;
+    clear_checkpoint_with_backend(context, input, pending, &status.stack_backend)
+}
+
+fn require_clear_rollout(
+    config: &CaravanConfig,
+    backend: &StackBackendStatus,
+) -> Result<(), AppError> {
+    if config.stack_type != StackType::Github
+        || !config.stack_rollout.mutations_opt_in
+        || config.stack_rollout.reviewed_by.trim().is_empty()
+        || config.physical_branch_rewrites_enabled()
+    {
+        return Err(refusal(
+            "github_stack_recovery_clear_rollout_not_authorized",
+            "checkpoint clearance requires reviewed immutable-head native Stack rollout",
+            json!({"mutated": false}),
+        ));
+    }
+    let unexpected_problems = backend
+        .problems
+        .iter()
+        .filter(|problem| problem.code != "github_stack_absent")
+        .collect::<Vec<_>>();
+    if backend.provider_stacks_truncated
+        || backend.capability != StackCapability::Available
+        || backend.mutation_support != StackMutationSupport::NativeStack
+        || !unexpected_problems.is_empty()
+    {
+        return Err(refusal(
+            "github_stack_recovery_clear_inventory_unproven",
+            "complete executable native Stack inventory with only the expected missing-Stack problem is required before local checkpoint clearance",
+            json!({
+                "provider_stacks_truncated": backend.provider_stacks_truncated,
+                "capability": backend.capability,
+                "mutation_support": backend.mutation_support,
+                "unexpected_problems": unexpected_problems,
+                "mutated": false,
+            }),
+        ));
+    }
+    Ok(())
+}
+
+fn clear_checkpoint_with_backend(
+    context: &AppContext,
+    input: &NativeStackRecoveryClearInput,
+    pending: NativeMembershipCheckpoint,
+    backend: &StackBackendStatus,
+) -> Result<NativeStackRecoveryClearOutput, AppError> {
+    if !pending.verify() || pending.caravan_id != PrNumber(input.root) {
+        return Err(refusal(
+            "github_stack_recovery_clear_checkpoint_invalid",
+            "pending formation checkpoint does not match the requested exact root",
+            json!({
+                "root": input.root,
+                "checkpoint_root": pending.caravan_id,
+                "mutated": false,
+            }),
+        ));
+    }
+    if backend.provider_stacks_truncated
+        || backend.capability != StackCapability::Available
+        || backend.mutation_support != StackMutationSupport::NativeStack
+    {
+        return Err(refusal(
+            "github_stack_recovery_clear_inventory_unproven",
+            "complete executable native Stack inventory is required before local checkpoint clearance",
+            json!({
+                "root": input.root,
+                "provider_stacks_truncated": backend.provider_stacks_truncated,
+                "capability": backend.capability,
+                "mutation_support": backend.mutation_support,
+                "mutated": false,
+            }),
+        ));
+    }
+    let members = membership_plan_members(&pending.plan);
+    let intersecting = backend
+        .native_stacks
+        .iter()
+        .filter(|native| {
+            native
+                .stack
+                .pull_requests
+                .iter()
+                .any(|pull| members.contains(&PrNumber(pull.number)))
+        })
+        .map(|native| native.stack.number)
+        .collect::<Vec<_>>();
+    if !intersecting.is_empty() {
+        return Err(refusal(
+            "github_stack_recovery_clear_provider_state_present",
+            "provider Stack state intersects the pending formation checkpoint; clearance could discard resumable provider mutation evidence",
+            json!({
+                "root": input.root,
+                "checkpoint_evidence_hash": pending.evidence_hash,
+                "planned_members": members,
+                "intersecting_stacks": intersecting,
+                "mutated": false,
+                "safe_next_action": "use recovery-apply to rediscover and resume the exact provider state; never clear a checkpoint after provider mutation may have begun",
+            }),
+        ));
+    }
+    crate::stack_membership::clear_pending(&context.repository_path, pending.caravan_id)?;
+    Ok(NativeStackRecoveryClearOutput {
+        schema_version: 1,
+        caravan_id: pending.caravan_id,
+        actor: input.actor.clone(),
+        reason: input.reason.clone(),
+        cleared: true,
+        checkpoint_evidence_hash: Some(pending.evidence_hash),
+        planned_members: members,
+        provider_mutated: false,
+        next: "checkpoint cleared after complete zero-intersection provider proof; run a fresh recovery-preview and review its new exact plan hash"
+            .to_owned(),
+    })
+}
+
+fn membership_plan_members(plan: &NativeMembershipPlan) -> Vec<PrNumber> {
+    match plan {
+        NativeMembershipPlan::AbsentSingleton { member, .. } => vec![*member],
+        NativeMembershipPlan::Create { plan } => {
+            plan.desired.entries.iter().map(|entry| entry.pr).collect()
+        }
+        NativeMembershipPlan::Add {
+            expected_members,
+            candidate,
+            ..
+        } => expected_members
+            .iter()
+            .copied()
+            .chain(std::iter::once(candidate.number))
+            .collect(),
+    }
 }
 
 /// Apply one independently revalidated recovery plan.
@@ -564,7 +761,7 @@ fn require_rollout(config: &CaravanConfig, facts: &RecoveryFacts<'_>) -> Result<
     if !facts.healthy {
         return Err(refusal(
             "github_stack_recovery_status_unhealthy",
-            "repository status is unhealthy; provider absence is not mutation authority",
+            "repository graph or compatibility analysis is unhealthy; provider absence is not mutation authority",
             json!({"mutated": false}),
         ));
     }
@@ -583,6 +780,19 @@ fn require_rollout(config: &CaravanConfig, facts: &RecoveryFacts<'_>) -> Result<
             "github_stack_recovery_rebase_on_join_forbidden",
             "native Stack recovery requires immutable source heads with rebase_on_join=false",
             json!({"mutated": false}),
+        ));
+    }
+    let unexpected_problems = facts
+        .backend
+        .problems
+        .iter()
+        .filter(|problem| problem.code != "github_stack_absent")
+        .collect::<Vec<_>>();
+    if !unexpected_problems.is_empty() {
+        return Err(refusal(
+            "github_stack_recovery_backend_unhealthy",
+            "native Stack recovery permits only the expected missing-Stack backend problem",
+            json!({"problems": unexpected_problems, "mutated": false}),
         ));
     }
     if facts.backend.provider_stacks_truncated {
@@ -856,10 +1066,16 @@ fn validate_input(root: u64, actor: &str, reason: &str) -> Result<(), AppError> 
 }
 
 fn validate_plan_hash(plan_hash: &str) -> Result<(), AppError> {
-    if plan_hash.len() != 16 || !plan_hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    let Some(hex) = plan_hash.strip_prefix("fnv1a64:") else {
         return Err(AppError::validation(
             "github_stack_recovery_plan_hash_invalid",
-            "plan hash must be the exact 16-character hexadecimal preview hash",
+            "plan hash must be copied byte-for-byte from recovery-preview, including its fnv1a64: prefix",
+        ));
+    };
+    if hex.len() != 16 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(AppError::validation(
+            "github_stack_recovery_plan_hash_invalid",
+            "plan hash must be copied byte-for-byte from recovery-preview, including its fnv1a64: prefix",
         ));
     }
     Ok(())
@@ -1368,6 +1584,162 @@ mod tests {
 
         assert_eq!(error.code(), "github_stack_recovery_generation_changed");
         assert_eq!(provider.creates.get(), 0);
+    }
+
+    fn pending_create_fixture(
+        directory: &std::path::Path,
+    ) -> (NativeMembershipCheckpoint, NativeStackRecoveryClearInput) {
+        let main = branch("main", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let root = pull(101, main);
+        let child = pull(102, root.head.clone());
+        let desired =
+            crate::stack_membership::topology_from_members(&root.base, [&root, &child]).unwrap();
+        let plan = NativeMembershipPlan::Create {
+            plan: Box::new(GitHubStackCreatePlan {
+                operation_id: "stale-zero-write-preview".to_owned(),
+                actor: "operator".to_owned(),
+                desired,
+            }),
+        };
+        let checkpoint = crate::stack_membership::persist_pending(directory, &plan)
+            .unwrap()
+            .unwrap();
+        let input = NativeStackRecoveryClearInput {
+            root: 101,
+            actor: "operator".to_owned(),
+            reason: "owners refreshed the exact zero-write chain".to_owned(),
+        };
+        (checkpoint, input)
+    }
+
+    fn exact_native_stack(number: u64, members: &[u64]) -> NativeStackStatus {
+        NativeStackStatus {
+            stack: GitHubStackSnapshot {
+                id: number,
+                number,
+                node_id: format!("S_{number}"),
+                base: GitHubStackBase {
+                    ref_name: "main".to_owned(),
+                },
+                open: true,
+                created_at: String::new(),
+                pull_requests: members
+                    .iter()
+                    .map(|member| crate::github::GitHubStackPullRequest {
+                        number: *member,
+                        state: "OPEN".to_owned(),
+                        draft: false,
+                        merged_at: None,
+                        head: crate::github::GitHubStackPullRequestHead {
+                            ref_name: format!("head-{member}"),
+                            sha: CommitOid(format!("{member:040x}")),
+                        },
+                    })
+                    .collect(),
+            },
+            caravan_id: Some(PrNumber(101)),
+            consistency: StackConsistency::Exact,
+            problems: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn clear_removes_only_local_checkpoint_after_zero_provider_intersection() {
+        let directory = tempfile::tempdir().unwrap();
+        let context = test_context(directory.path());
+        let (checkpoint, input) = pending_create_fixture(directory.path());
+        let backend = stack_backend_fixture(Vec::new());
+
+        let output =
+            clear_checkpoint_with_backend(&context, &input, checkpoint.clone(), &backend).unwrap();
+
+        assert!(output.cleared);
+        assert!(!output.provider_mutated);
+        assert_eq!(
+            output.checkpoint_evidence_hash.as_deref(),
+            Some(checkpoint.evidence_hash.as_str())
+        );
+        assert_eq!(output.planned_members, vec![PrNumber(101), PrNumber(102)]);
+        assert!(
+            crate::stack_membership::load_pending(directory.path(), PrNumber(101))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn clear_refuses_provider_visible_state_and_preserves_checkpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let context = test_context(directory.path());
+        let (checkpoint, input) = pending_create_fixture(directory.path());
+        let backend = stack_backend_fixture(vec![exact_native_stack(7, &[101, 102])]);
+
+        let error =
+            clear_checkpoint_with_backend(&context, &input, checkpoint, &backend).unwrap_err();
+
+        assert_eq!(
+            error.code(),
+            "github_stack_recovery_clear_provider_state_present"
+        );
+        assert!(
+            crate::stack_membership::load_pending(directory.path(), PrNumber(101))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn clear_refuses_unproven_inventory_and_invalid_audit_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let context = test_context(directory.path());
+        let (checkpoint, input) = pending_create_fixture(directory.path());
+        let mut backend = stack_backend_fixture(Vec::new());
+        backend.provider_stacks_truncated = true;
+        let error =
+            clear_checkpoint_with_backend(&context, &input, checkpoint, &backend).unwrap_err();
+        assert_eq!(
+            error.code(),
+            "github_stack_recovery_clear_inventory_unproven"
+        );
+        assert_eq!(
+            validate_input(101, "", "reason").unwrap_err().code(),
+            "github_stack_recovery_text_invalid"
+        );
+        assert_eq!(
+            validate_input(0, "operator", "reason").unwrap_err().code(),
+            "github_stack_recovery_root_invalid"
+        );
+        assert_eq!(
+            require_clear_rollout(
+                &CaravanConfig::default(),
+                &stack_backend_fixture(Vec::new())
+            )
+            .unwrap_err()
+            .code(),
+            "github_stack_recovery_clear_rollout_not_authorized"
+        );
+        assert!(validate_plan_hash("fnv1a64:36bf4dbe62cbdf33").is_ok());
+        assert_eq!(
+            validate_plan_hash("36bf4dbe62cbdf33").unwrap_err().code(),
+            "github_stack_recovery_plan_hash_invalid"
+        );
+    }
+
+    #[test]
+    fn clear_refuses_checkpoint_root_or_hash_mismatch() {
+        let directory = tempfile::tempdir().unwrap();
+        let context = test_context(directory.path());
+        let (mut checkpoint, input) = pending_create_fixture(directory.path());
+        checkpoint.caravan_id = PrNumber(999);
+        let backend = stack_backend_fixture(Vec::new());
+
+        let error =
+            clear_checkpoint_with_backend(&context, &input, checkpoint, &backend).unwrap_err();
+
+        assert_eq!(
+            error.code(),
+            "github_stack_recovery_clear_checkpoint_invalid"
+        );
     }
 
     #[test]

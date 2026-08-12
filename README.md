@@ -691,7 +691,13 @@ mapping truth. A legacy first-child gap permits zero mappings; a checkpointed
 append permits only its exact provider prefix; a response-loss retry permits one
 exact desired mapping. Apply then issues at most one idempotent Stack create/add.
 It never changes a source head, base, label, comment, or merge state;
-multiple/partial mappings and singleton inputs fail closed. The installed
+multiple/partial mappings and singleton inputs fail closed. If a zero-write
+preview checkpoint later becomes stale because owners legitimately refresh the
+member chain, `cara native-stack recovery-clear` may remove only that local
+checkpoint after complete provider discovery proves that no Stack intersects any
+planned member. The typed clear requires root/actor/reason evidence, never calls
+the provider, and refuses whenever provider mutation may have begun; a new
+preview is mandatory afterward. The installed
 `gh stack` CLI does not merge Stacks; GitHub's web merge uses the top-SHA-only
 async REST endpoint. A disposable sandbox proved an unlocked lower rewind can
 merge at a changed generation. A follow-up sandbox proved that an exact-ref

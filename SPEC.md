@@ -1294,7 +1294,14 @@ then calls the existing exact Stack create/add adapter. Truncated inventory,
 singleton input, pauses/parking, non-green
 or changed generations, missing capability/opt-in, and multiple/partial/drifted
 mappings refuse before mutation. Its postcondition rereads every source PR and
-proves no head, base, state, label, or auto-merge identity changed.
+proves no head, base, state, label, or auto-merge identity changed. A stale
+zero-write continuation is removable only through `native-stack recovery-clear`
+with bounded root/actor/reason evidence. Clear independently reads complete
+provider inventory and refuses if any Stack intersects any member recorded by
+the checkpoint, if capability is unavailable, or if inventory is truncated;
+therefore provider-visible or indeterminate mutation can never be discarded.
+An absent checkpoint is idempotent, a successful clear mutates only the local
+checkpoint registry, and callers must review a fresh preview/hash afterward.
 
 GitHub exposes no arbitrary Stack remove or reorder, so reshape is a
 sealed `preflighted` → `unstacked` → `reshape_applied` → `rebuilding` →
