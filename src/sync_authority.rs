@@ -23,7 +23,7 @@ const FETCH_TIMEOUT_SECS: u64 = 120;
 // readers even when provider commands should retain a short timeout. Keep this
 // floor separate from network/API command tuning (bd-4dae44).
 const LOCAL_GIT_TIMEOUT_FLOOR_SECS: u64 = 30;
-const MATERIALIZATION_TIMEOUT_FLOOR_SECS: u64 = 60;
+const MATERIALIZATION_TIMEOUT_FLOOR_SECS: u64 = 120;
 const WORKTREE_PREFIX: &str = "cara-authoritative-sync";
 
 /// One exact fetched default-branch generation. Revalidate immediately before
@@ -634,11 +634,11 @@ mod tests {
         );
         assert_eq!(
             authoritative_worktree_timeout(Duration::from_secs(30), Duration::from_secs(480)),
-            Duration::from_secs(60)
+            Duration::from_secs(120)
         );
         assert_eq!(
             authoritative_worktree_timeout(Duration::from_secs(90), Duration::from_secs(480)),
-            Duration::from_secs(90)
+            Duration::from_secs(120)
         );
         assert_eq!(
             authoritative_worktree_timeout(Duration::from_secs(300), Duration::from_secs(480)),
