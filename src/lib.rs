@@ -615,8 +615,10 @@ RECOVERY, LOCKS, AND OBSERVABILITY
   acquisition. Every write revalidates or single-flight renews; checkpoints bind
   the latest secret-free fence. This enables the core, not a hosted service or
   automatic failover.
-- `cara self-update status|check|run` updates only the exact running first-PATH
-  stable user binary (`~/.cargo/bin`, `~/.local/bin`, or an exact explicit
+- `cara update` directly invokes the same bounded implementation as
+  `cara self-update run`; `self-update status|check|run` remains the explicit
+  inspection/backward-compatible surface. Updates target only the exact running
+  first-PATH stable user binary (`~/.cargo/bin`, `~/.local/bin`, or an exact explicit
   `CARA_SELF_UPDATE_INSTALL_DIR`). Shadowed, renamed/test, Cargo target, and
   package-manager binaries fail closed. A tagged patch release is required
   before release-only deployments can observe newly landed main behavior.

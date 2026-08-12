@@ -158,6 +158,8 @@ enum Command {
     /// Model Context Protocol surfaces.
     #[command(subcommand)]
     Mcp(McpCommand),
+    /// Download, verify, and atomically install the latest GitHub release.
+    Update,
     /// Inspect, check, or apply a GitHub release update.
     #[command(subcommand)]
     SelfUpdate(SelfUpdateCommand),
@@ -504,6 +506,7 @@ fn run(cli: &Cli) -> Result<(), i32> {
         },
         Command::Help => run_help(cli.json),
         Command::Mcp(command) => run_mcp(command, cli.config.as_deref()),
+        Command::Update => run_self_update(cli.json, &SelfUpdateCommand::Run),
         Command::SelfUpdate(command) => run_self_update(cli.json, command),
         Command::Feedback(command) => run_feedback(cli.json, command),
     }
