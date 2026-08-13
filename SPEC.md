@@ -679,29 +679,40 @@ repositories that declare none, so a repository whose provider read has not yet
 succeeded is still routable rather than silently webhook-deaf.
 
 `cara web --hosted` is the optional deployment contract for pre-provisioned
-checkouts. It requires a signed webhook secret, one exact installation,
-`--webhook-sync`, no `--read-only`, and for every served repository
-`github_auth.mode: app_installation` pinned to that same installation,
-`writer.mode: remote_fenced`, and an exact slug; mixed installations, ambient
-auth, `local_only`, a missing slug, two worktrees declaring one slug, or missing
-broker/host/writer identity all fail closed at startup. Before serving or responding to signed `installation` /
+checkouts or exact `--hosted-repository OWNER/NAME` inputs materialized beneath
+one private `--hosted-clone-cache-root`. It requires a signed webhook secret,
+one exact installation, `--webhook-sync`, no `--read-only`, and for every served
+repository `github_auth.mode: app_installation` pinned to that same
+installation, `writer.mode: remote_fenced`, and an exact slug; mixed
+installations, ambient auth, `local_only`, a missing slug, duplicate slug, or
+missing broker/host/writer identity all fail closed at startup. Hosted clone
+cache identity binds provider host, owner/name, installation, object format, and
+default branch. Before repository config is available, clone bootstrap requires
+environment-selected `app_installation`, App slug, and the same installation ID.
+One locked, bounded bare cache is only an object hint: each job performs an
+App-authenticated exact remote probe/fetch into a unique dissociated clone, then
+proves origin, default ref, object format, expected HEAD, path containment, no
+mutable alternates, and no persisted credential transport. Byte, age, entry,
+and concurrent-job bounds are explicit; holderless/partial paths are cleaned or
+quarantined while active OS-locked jobs are never evicted. `WebState.hosted_clones`
+retains secret-free materialization evidence.
+
+Before serving or responding to signed `installation` /
 `installation_repositories` lifecycle hints, hosted mode completely pages the
 authoritative installation repository inventory under one shared request and
-wall-clock budget. It intersects that evidence with the explicit configured
-repository allowlist and atomically persists only installation ID, repository
-slugs, provider-generation digest, observation time, and active/quarantined
-reasons. Payload repository claims never broaden tenancy. Missing, removed,
-suspended/deleted, mixed-installation, malformed, duplicate, truncated, or
-provider-unknown evidence quarantines every affected allowlisted repository
-before provider I/O completes and is checked again after action locks immediately
-before the domain mutation. Queued work therefore fails with `mutated=false`;
+wall-clock budget. It intersects that evidence with the complete configured and
+materialized repository allowlist, then atomically persists only installation
+ID, allowlisted slugs, provider-generation digest, observation time, and
+active/quarantined transition reasons. Payload repository claims never broaden
+tenancy. Missing, removed, suspended/deleted, mixed-installation, malformed,
+duplicate, truncated, or provider-unknown evidence quarantines every affected
+repository before provider I/O completes and is checked again after action locks
+immediately before domain mutation. Queued work fails with `mutated=false`;
 `remote_fenced` remains the sole writer authority even for active tenancy.
 Interactive mutating actions remain refused because the same-origin CSRF token
-is cross-site protection rather than authentication, so reachability through an
-operator proxy is never authority to force, merge, or reshape. Non-mutating
-check/plan actions remain available. `--hosted-tenancy-state` selects the durable
-projection path, otherwise common Git state under the first checkout is used.
-Hosted mode provisions no clones and performs no automatic failover.
+is not authentication. Non-mutating check/plan actions remain available.
+`--hosted-tenancy-state` selects the projection path, otherwise common Git state
+under the first checkout is used. Hosted mode performs no automatic failover.
 
 `GET /api/v1/health` is secret-free and monitorable: `ok` means this process is
 serving, while `degraded` is the actionable signal, true when any served

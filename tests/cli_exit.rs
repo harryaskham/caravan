@@ -337,8 +337,9 @@ fn repo_is_a_global_argument_not_a_web_privilege() {
 
 /// A global option must not collide with a subcommand's own long name.
 ///
-/// `web` declares a REPEATABLE, required `--repo`. Adding a global `--repo`
-/// made clap reject the command tree at construction, so `cara web` could not
+/// `web` declares a REPEATABLE local `--repo` beside explicit hosted
+/// repository inputs. Adding a global `--repo` made clap reject the command
+/// tree at construction, so `cara web` could not
 /// be built at all and the release contract job failed. Local `--lib` and
 /// `--test cli_exit` runs were both green because the failing assertions live
 /// in the `--bin cara` test target (bd-99b842).
@@ -357,6 +358,10 @@ fn the_single_repository_global_does_not_collide_with_the_web_multi_repository_f
     assert!(
         web_help.contains("--repo "),
         "web keeps its own repeatable --repo"
+    );
+    assert!(
+        web_help.contains("--hosted-repository") && web_help.contains("--hosted-clone-cache-root"),
+        "hosted clone inputs and their private cache boundary are discoverable"
     );
     assert!(
         web_help.contains("HTTP address to listen on"),

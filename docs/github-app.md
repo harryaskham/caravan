@@ -155,14 +155,21 @@ explicit and audited. Automatic failover remains unavailable by design.
 ## Hosted worker mode (`cara web --hosted`)
 
 `cara web --hosted` runs the existing dashboard/webhook receiver under a strict
-deployment contract over **pre-provisioned** repository checkouts. It adds no
-second receiver: HMAC verification, delivery dedup, per-repository serialized
+deployment contract over either **pre-provisioned** repository checkouts or
+exact provider repositories materialized into isolated job worktrees. It adds
+no second receiver: HMAC verification, delivery dedup, per-repository serialized
 action queues, fallback polling, authoritative provider reread, operation
 budgets, and remote lease fencing are the same code paths local mode uses.
 
 Startup refuses unless all of the following hold:
 
-- every `--repo` is an existing Git worktree the operator already provisioned;
+- at least one existing `--repo` worktree or exact
+  `--hosted-repository OWNER/NAME` is supplied;
+- hosted repository slugs have one private `--hosted-clone-cache-root` and
+  nonzero byte/age/entry/job/duration bounds;
+- clone bootstrap explicitly sets `CARA_GITHUB_AUTH_MODE=app_installation`,
+  `CARA_GITHUB_APP_SLUG`, and `CARA_GITHUB_INSTALLATION_ID` equal to the CLI
+  installation; mismatches fail before network access;
 - a signed webhook secret env and the exact `--github-installation-id` are set;
 - `--webhook-sync` is on and `--read-only` is off;
 - each repository sets `github_auth.mode: app_installation` pinned to that same
@@ -188,6 +195,22 @@ Webhook payloads never add access. Unknown/truncated reads quarantine before
 queued actions can reach the existing remote writer lease, and that lease
 remains mandatory after tenancy becomes active.
 
+For `--hosted-repository`, Cara uses the existing repository-scoped App broker
+and temporary HTTPS credential helper to probe and clone without storing tokens.
+Cache identity includes provider host, owner/name, installation, object format,
+and default branch. A bare cache is an immutable object hint only. Every job gets
+a unique `--dissociate` clone, verifies exact remote HEAD/origin/default/object
+format, rejects symlink escapes and local credential helpers/alternates, and
+holds an OS file lease until the dashboard releases it. Byte, age, cache-entry,
+and concurrent-job quotas are hard bounds; startup reaps only holderless crash
+paths, preserves active leases, and quarantines corrupt/partial clones. Cache
+preparation grants no writer authority: the existing `remote_fenced` lease is
+still mandatory immediately before every provider or branch mutation. The
+secret-free `WebState.hosted_clones` receipts report cache identity/hit/bytes,
+job ID, exact expected ref/default/object format, elapsed materialization,
+cleanup count, and successful ref/credential-transport checks; failures remain
+typed and are never converted into repository actions.
+
 Hosted workers mutate **only** from HMAC-verified webhook deliveries. The
 interactive `POST /api/action` endpoint refuses every mutating action with
 `web_hosted_interactive_mutation_refused`; non-mutating check/plan actions stay
@@ -198,7 +221,6 @@ force, merge, or reshape. Operators who want an interactive console should run
 ordinary local `cara web` over a tunnel instead of exposing hosted mode.
 
 Automatic installation onboarding beyond the deployment allowlist remains
-excluded: operators still pre-provision repository policy and worktrees. Also
-excluded are clone/checkout provisioning or garbage collection and automatic
-failover. Exactly one worker may be the configured writer per repository; a
-second host may read and plan.
+excluded: operators still declare repository policy or exact hosted repository
+slugs. Automatic writer failover is also excluded. Exactly one worker may be
+the configured writer per repository; a second host may read and plan.

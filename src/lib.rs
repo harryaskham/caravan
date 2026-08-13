@@ -19,6 +19,7 @@ pub mod generation;
 pub mod github;
 pub mod graph;
 pub mod hooks;
+pub mod hosted_clone_cache;
 pub mod hosted_tenancy;
 pub mod initialization;
 pub mod journal;
@@ -526,21 +527,28 @@ RESHAPING AND EXPLICIT INTENT
 
 BUILT-IN WEB OPERATIONS
 - `cara web --repo PATH [--repo PATH ...]` serves a responsive dashboard from
-  assets embedded in the Cara binary. Repository arguments are filesystem
-  paths, never slugs, and are the complete trust boundary for the process.
+  assets embedded in the Cara binary. Local repository arguments are canonical
+  filesystem paths. Hosted mode may instead accept exact
+  `--hosted-repository OWNER/NAME` inputs with a private bounded clone-cache
+  root; each becomes a unique, exact-head-verified, dissociated job worktree.
 - The listener defaults to `127.0.0.1:4774`; `--listen ADDRESS` may select any
   bindable socket address. Status snapshots refresh on a bounded cadence and
   show active caravan trails, exact PR generations and CI, open
   unqueued/rejected PRs with reasons, decisions, pauses, and scheduler health.
 - Use `--read-only` to disable mutation endpoints. `--hosted` is the optional
-  deployment contract for pre-provisioned checkouts: it requires signed
-  webhooks, one exact installation, `--webhook-sync`, and per-repository
-  `app_installation` auth plus `remote_fenced` writer with an exact slug, and it
-  refuses interactive mutations so a hosted worker acts only on HMAC-verified
-  deliveries. Startup and signed installation-lifecycle hints page authoritative
-  App repository access, intersect it with configured slugs, and persist a
-  secret-free tenancy generation; removed, suspended, truncated, or unknown
-  evidence quarantines queued writes before the remote lease. Accepted actions bind the
+  deployment contract for pre-provisioned checkouts or explicit hosted
+  repository slugs: it requires signed webhooks, one exact installation,
+  `--webhook-sync`, and per-repository `app_installation` auth plus
+  `remote_fenced` writer with an exact slug. Hosted clone inputs additionally
+  require bounded private storage; cache identity binds repository,
+  installation, object format, and default branch, while each job receives a
+  unique dissociated clone with exact remote proof and no persisted credential
+  helper or object alternate. Startup and signed installation-lifecycle hints
+  page authoritative App repository access, intersect it with configured slugs,
+  and persist a secret-free tenancy generation; removed, suspended, truncated,
+  or unknown evidence quarantines queued writes before the remote lease. Hosted
+  mode refuses interactive mutations so a worker acts only on HMAC-verified
+  deliveries. Accepted actions bind the
   reviewed refresh sequence and a deterministic mutation-authority fingerprint.
   Poll/webhook refreshes coalesce behind active jobs; identical provider/config
   facts tolerate sequence-only drift, while changed fingerprints fail before
@@ -551,8 +559,8 @@ BUILT-IN WEB OPERATIONS
   lock across browser disconnects, and expose bounded durable checkpoint phases,
   terminal receipts, and the newest Cara event/hook journal records.
 - Static HTML, CSS, and JavaScript ship inside `cara`; no CDN or separate web
-  deployment is required. Future opt-in repository discovery must remain
-  explicit and is not performed by the initial path-scoped release.
+  deployment is required. Hosted clone slugs remain an explicit deployment
+  allowlist; provider installation events cannot silently expand tenancy.
 - Optional GitHub App webhooks require an HMAC secret environment variable and
   exact installation ID. Signed explicit-repository deliveries are durably
   deduped and coalesced into refresh or bounded sync-all wakes; they are never
