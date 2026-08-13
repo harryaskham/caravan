@@ -100,6 +100,36 @@ fn json_config_error_keeps_the_machine_envelope() {
 }
 
 #[test]
+fn sync_json_error_exposes_a_top_level_tts_summary() {
+    let temp = tempfile::tempdir().expect("temp directory");
+    let config = temp.path().join("invalid.yaml");
+    std::fs::write(&config, "unknown: true\n").expect("write invalid config");
+
+    let output = cara_in(
+        temp.path(),
+        &[
+            "--json",
+            "--config",
+            config.to_str().expect("UTF-8 path"),
+            "sync",
+            "--all",
+        ],
+    );
+
+    assert!(!output.status.success());
+    assert!(output.stderr.is_empty());
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("JSON sync error envelope");
+    let summary = envelope["summary"]
+        .as_str()
+        .expect("sync envelopes expose a top-level summary");
+    assert!(summary.starts_with("Cara sync failed: "));
+    assert!(!summary.contains('\n'));
+    assert_eq!(envelope["status"], "error");
+    assert_eq!(envelope["error"]["code"], "config_parse_failed");
+}
+
+#[test]
 fn feedback_status_uses_the_typed_mcp_shape() {
     let output = cara(&["--json", "feedback", "status"]);
 

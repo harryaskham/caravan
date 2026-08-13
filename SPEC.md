@@ -1192,7 +1192,17 @@ Core decision kinds include:
 - `missing_required_runs` / `cancelled_superseded_required_runs` /
   `unknown_required_runs_provider_state`.
 
-Human output is concise; `--json` uses stable `mcp-cli` envelopes. Exit status is non-zero for every unresolved decision point.
+Human output is concise; `--json` uses stable `mcp-cli` envelopes. A real
+`cara sync --json` envelope additionally carries one top-level `summary` string
+for scheduler/TTS consumers while preserving the existing `status`, `meta`,
+`data`, and `error` shapes. Success text is derived only from typed receipts and
+scheduler disposition: it leads with non-zero material outcomes (merged,
+joined, evicted, closed, reopened, or rebased PRs), says `no changes` once for a
+healthy no-op, and appends a terse wait/hold/retry/decision continuation only
+when applicable. Error text is a bounded, newline-free projection of the
+structured error message at the same `.summary` path; consumers never parse
+human output or structured evidence to speak it. Exit status is non-zero for
+every unresolved decision point.
 
 ## 9. Hooks
 
