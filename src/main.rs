@@ -4618,6 +4618,29 @@ provider.wait()
         assert!(input.read_only);
         assert!(Cli::try_parse_from(["cara", "web"]).is_err());
 
+        let cli = Cli::try_parse_from(["cara", "web", "--hosted-repository", "owner/repo"])
+            .expect("one hosted repository satisfies the input union");
+        let Command::Web(input) = cli.command else {
+            panic!("expected web command");
+        };
+        assert!(input.repositories.is_empty());
+        assert_eq!(input.hosted_repositories, vec!["owner/repo"]);
+
+        let cli = Cli::try_parse_from([
+            "cara",
+            "web",
+            "--hosted-repository",
+            "owner/repo",
+            "--repo",
+            "/tmp/one",
+        ])
+        .expect("local and hosted repository inputs may coexist");
+        let Command::Web(input) = cli.command else {
+            panic!("expected web command");
+        };
+        assert_eq!(input.repositories, vec![PathBuf::from("/tmp/one")]);
+        assert_eq!(input.hosted_repositories, vec!["owner/repo"]);
+
         let cli = Cli::try_parse_from([
             "cara",
             "web",
