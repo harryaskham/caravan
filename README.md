@@ -1117,18 +1117,25 @@ the child process group and return stable `github_discovery_timeout` evidence
 with the exact phase, operation `elapsed_ms`/`deadline_ms`, retryability, bounded
 output, and a mutation-free safe next action.
 
-Discovery performs one bounded all-open PR query containing current check
-rollups, derives the current PR and caravan-labelled members from that snapshot,
-and uses a separate bounded branch-history query that deliberately omits check
-rollups. If the bounded open rollup omitted a reused branch, one unique exact
-OPEN same-repository PR may take precedence over older unlabelled history only
-when its local, remote-ref, and provider head OIDs all match. Multiple open
-reuses, forks, OID mismatch, or older `caravan`/`caravan-evicted` membership
-history still fail closed. Provider command count therefore remains constant as open PR count
-grows; compatibility subprocesses share the same whole-status deadline. Explicit
-remote `check/new/join/rejoin --pr` first completes that bounded fleet discovery,
-then re-reads and binds only the selected PR under a fresh
-`command_timeout_secs` deadline. Its status timing adds
+Discovery reads open PRs in deterministic 20-row GraphQL pages instead of one
+all-fields/all-rows projection. Every page is a separate read-only command, so
+the existing GitHub request counter and absolute wall-clock deadline account for
+it; one transient provider 502/503/504 may retry once within those same budgets.
+Each PR's labels and check contexts are independently capped at 100, and a
+missing cursor, page, row, or nested continuation fails closed before mutation
+instead of treating partial discovery as complete. Current-PR resolution,
+caravan-labelled members, and admission order are derived only after the final
+page. Branch-history queries remain separately bounded and omit check rollups.
+If the bounded open rollup omitted a reused branch, one unique exact OPEN
+same-repository PR may take precedence over older unlabelled history only when
+its local, remote-ref, and provider head OIDs all match. Multiple open reuses,
+forks, OID mismatch, or older `caravan`/`caravan-evicted` membership history
+still fail closed. Compatibility subprocesses share the same whole-status
+deadline. Explicit remote `check/new/join/rejoin --pr` re-read and bind only the
+selected PR after discovery under a fresh `command_timeout_secs` deadline;
+default-branch `repair start --pr` uses that focused active-topology path rather
+than rediscovering every unrelated unlabelled PR. Repairs naming a second target
+retain full-fleet discovery because both generations are mutation authority. Its status timing adds
 `exact_candidate_provider_refetch` and `exact_candidate_merge_identity`; later
 compatibility, physical Git, provider mutation, and post-rewrite rediscovery use
 the independently reserved exact deadline and still refuse any head/base drift.
