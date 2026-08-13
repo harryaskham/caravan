@@ -430,6 +430,20 @@ pub(super) fn membership_audit(
             .collect::<Vec<_>>()
             .join("; ")
     };
+    let compatibility = eligibility
+        .admission_compatibility_authorization
+        .as_ref()
+        .map_or(compatibility.clone(), |authorization| {
+            let authority = match authorization {
+                crate::read::AdmissionCompatibilityAuthorization::ProviderIdentity { .. } => {
+                    "provider_identity"
+                }
+                crate::read::AdmissionCompatibilityAuthorization::ExactGitProof { .. } => {
+                    "exact_git_proof"
+                }
+            };
+            format!("authority={authority}; {compatibility}")
+        });
     ControlLabelAudit {
         operation: request.operation.name().to_owned(),
         marker: control_label_marker(

@@ -3186,17 +3186,11 @@ fn check_analysis_with_recommendation(
     // parent here can deadlock the rewrite which would refresh that ref. Virtual
     // mode retains strict provider-candidate freshness.
     let mut candidate_stale_blocks_admission = candidate_stale && !status.rebase_on_join.enabled;
-    // A stale immutable native-join base gets one narrower decision after the
-    // candidate-to-tail Git proof is available below. New-caravan admission,
-    // physical membership, stale heads, and every other incomplete identity
-    // retain the existing fail-closed behavior here.
-    if candidate_stale_blocks_admission && !explicit_join {
-        problems.push(GraphProblem {
-            kind: GraphProblemKind::Unknown,
-            prs: vec![current_pr],
-            message: "provider merge-candidate identity is stale or incomplete; wait for the current generation".to_owned(),
-        });
-    }
+    // Native immutable admissions get one narrower decision after their exact
+    // Git proof is available below. A join targets its real tail; an empty-fleet
+    // new admission treats the exact current default as a virtual tail. Stale
+    // heads and every incomplete/foreign/conflicting identity still fall back
+    // to the same fail-closed problem before returning.
     if let Some(rejected) = admission_rejection {
         problems.push(GraphProblem {
             kind: GraphProblemKind::Unknown,
@@ -3262,6 +3256,17 @@ fn check_analysis_with_recommendation(
                 &mut reconciliations,
             )?;
         }
+        let admission_compatibility_authorization =
+            native_new_authorization(status, pull_request, merge_candidate.as_ref(), &reports);
+        if candidate_stale_blocks_admission && admission_compatibility_authorization.is_none() {
+            problems.push(GraphProblem {
+                kind: GraphProblemKind::Unknown,
+                prs: vec![current_pr],
+                message: "provider merge-candidate identity is stale or incomplete; wait for the current generation".to_owned(),
+            });
+        } else if admission_compatibility_authorization.is_some() {
+            candidate_stale_blocks_admission = false;
+        }
         let eligible = problems.is_empty();
         admission_intent.record_preflight(
             reports
@@ -3305,7 +3310,7 @@ fn check_analysis_with_recommendation(
                 candidate: pull_request.clone(),
                 head_repository_owner: pull_request.head.repository.owner.clone(),
                 merge_candidate,
-                admission_compatibility_authorization: None,
+                admission_compatibility_authorization,
                 enrolled: false,
                 canonical_candidate,
                 admission_note: ordering_note.clone(),
@@ -3446,10 +3451,44 @@ fn check_analysis_with_recommendation(
     )
 }
 
+fn native_new_authorization(
+    status: &StatusOutput,
+    candidate: &PullRequestSnapshot,
+    identity: Option<&crate::model::MergeCandidateIdentity>,
+    reports: &[CompatibilityReport],
+) -> Option<AdmissionCompatibilityAuthorization> {
+    // A live tail always uses ordinary join authorization. Only a truly empty
+    // native fleet may project current main as the virtual tail for root
+    // admission; this cannot silently create an additional caravan.
+    if !status.analysis.fleet.caravans.is_empty() {
+        return None;
+    }
+    native_admission_authorization(
+        status,
+        candidate,
+        &status.analysis.fleet.default_branch,
+        identity,
+        reports,
+    )
+}
+
 fn native_join_authorization(
     status: &StatusOutput,
     candidate: &PullRequestSnapshot,
     tail: &PullRequestSnapshot,
+    identity: Option<&crate::model::MergeCandidateIdentity>,
+    reports: &[CompatibilityReport],
+) -> Option<AdmissionCompatibilityAuthorization> {
+    if tail.head.repository != status.repository || tail.base.repository != status.repository {
+        return None;
+    }
+    native_admission_authorization(status, candidate, &tail.head, identity, reports)
+}
+
+fn native_admission_authorization(
+    status: &StatusOutput,
+    candidate: &PullRequestSnapshot,
+    target: &crate::model::BranchSnapshot,
     identity: Option<&crate::model::MergeCandidateIdentity>,
     reports: &[CompatibilityReport],
 ) -> Option<AdmissionCompatibilityAuthorization> {
@@ -3467,8 +3506,7 @@ fn native_join_authorization(
         && compared_base == &status.analysis.fleet.default_branch
         && candidate.head.repository == status.repository
         && candidate.base.repository == status.repository
-        && tail.head.repository == status.repository
-        && tail.base.repository == status.repository
+        && target.repository == status.repository
         && synthetic.parents.len() == 2
         && synthetic.parents[1] == candidate.head.oid;
     if !exact_generation {
@@ -3488,7 +3526,7 @@ fn native_join_authorization(
     // Native GitHub Stack mode is the only immutable-head lane. The fallback
     // accepts exactly one provider defect: an old synthetic first parent. It
     // cannot mask a stale head, missing lineage, a different repository, or a
-    // moved candidate/default/tail generation.
+    // moved candidate/default/target generation.
     if identity.freshness != crate::model::MergeCandidateFreshness::StaleBase
         || !identity.stale_base
         || identity.stale_head
@@ -3499,7 +3537,7 @@ fn native_join_authorization(
 
     let proof = reports.iter().find(|report| {
         report.candidate == candidate.head
-            && report.target == tail.head
+            && report.target == *target
             && report.outcome == CompatibilityOutcome::Clean
             && report
                 .diagnostic
@@ -6267,6 +6305,68 @@ mod tests {
         assert!(matches!(
             output.admission_compatibility_authorization,
             Some(AdmissionCompatibilityAuthorization::ExactGitProof { .. })
+        ));
+    }
+
+    #[test]
+    fn native_empty_fleet_stale_base_uses_current_default_as_virtual_tail() {
+        let candidate = pr(60, "candidate", "main", false);
+        let original_head = candidate.head.clone();
+        let mut status = status(candidate.clone(), Vec::new());
+        status.stack_backend.configured = crate::config::StackType::Github;
+        status.merge_candidates.push(native_candidate_identity(
+            &candidate,
+            crate::model::MergeCandidateFreshness::StaleBase,
+        ));
+
+        let output = check_analysis(
+            &status,
+            &CheckInput {
+                pr: Some(60),
+                tail_pr: None,
+                head_pr: None,
+            },
+            &exact_native_checker,
+        )
+        .expect("exact current main is the empty fleet's virtual native tail");
+
+        assert!(output.eligible, "problems: {:?}", output.problems);
+        assert_eq!(output.mode, CheckMode::NewCaravan);
+        assert_eq!(output.next_action, CandidateNextAction::New);
+        assert_eq!(output.candidate.head, original_head, "head stays immutable");
+        assert!(matches!(
+            output.admission_compatibility_authorization,
+            Some(AdmissionCompatibilityAuthorization::ExactGitProof {
+                compatibility,
+                ..
+            }) if compatibility.target == status.analysis.fleet.default_branch
+        ));
+    }
+
+    #[test]
+    fn native_empty_fleet_current_provider_identity_is_distinct_authority() {
+        let candidate = pr(60, "candidate", "main", false);
+        let mut status = status(candidate.clone(), Vec::new());
+        status.stack_backend.configured = crate::config::StackType::Github;
+        status.merge_candidates.push(native_candidate_identity(
+            &candidate,
+            crate::model::MergeCandidateFreshness::Fresh,
+        ));
+
+        let output = check_analysis(
+            &status,
+            &CheckInput {
+                pr: Some(60),
+                tail_pr: None,
+                head_pr: None,
+            },
+            &exact_native_checker,
+        )
+        .expect("current provider identity authorizes the native root");
+
+        assert!(matches!(
+            output.admission_compatibility_authorization,
+            Some(AdmissionCompatibilityAuthorization::ProviderIdentity { .. })
         ));
     }
 
