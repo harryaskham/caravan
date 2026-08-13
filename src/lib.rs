@@ -19,6 +19,7 @@ pub mod generation;
 pub mod github;
 pub mod graph;
 pub mod hooks;
+pub mod hosted_tenancy;
 pub mod initialization;
 pub mod journal;
 pub mod loop_runner;
@@ -536,7 +537,10 @@ BUILT-IN WEB OPERATIONS
   webhooks, one exact installation, `--webhook-sync`, and per-repository
   `app_installation` auth plus `remote_fenced` writer with an exact slug, and it
   refuses interactive mutations so a hosted worker acts only on HMAC-verified
-  deliveries. Accepted actions bind the
+  deliveries. Startup and signed installation-lifecycle hints page authoritative
+  App repository access, intersect it with configured slugs, and persist a
+  secret-free tenancy generation; removed, suspended, truncated, or unknown
+  evidence quarantines queued writes before the remote lease. Accepted actions bind the
   reviewed refresh sequence and a deterministic mutation-authority fingerprint.
   Poll/webhook refreshes coalesce behind active jobs; identical provider/config
   facts tolerate sequence-only drift, while changed fingerprints fail before

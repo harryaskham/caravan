@@ -127,8 +127,10 @@ installation and explicit repository, durably deduplicates
 `X-GitHub-Delivery`, coalesces bursts, and keeps fallback polling. Events are
 wake hints only; every job re-reads provider state. Current wake subscriptions
 are `push`, `pull_request`, `pull_request_review`, `check_run`, `check_suite`,
-`workflow_run`, and `status`. Future hosted tenancy also needs `installation`
-and `installation_repositories` lifecycle events.
+`workflow_run`, `status`, `installation`, and `installation_repositories`.
+Installation lifecycle deliveries remain wake hints: hosted mode always rereads
+the complete authoritative installation repository inventory before changing
+tenancy.
 
 ## Attribution
 
@@ -174,7 +176,17 @@ traffic, and supply the webhook secret from a secret manager as an environment
 variable name, never a literal.
 
 Dashboard state reports `hosted` plus each repository's non-secret auth/writer
-policy, so a misconfigured member is visible rather than silently ambient.
+policy and authoritative tenancy row, so a misconfigured, removed, suspended, or
+provider-unknown member is visible rather than silently ambient. At startup and
+on signed installation lifecycle hints Cara pages `/installation/repositories`
+under one bounded request/deadline budget, intersects it with configured
+`repository: owner/name` rows, and atomically stores a secret-free projection.
+Use `--hosted-tenancy-state PATH` for an operator-owned location; otherwise Cara
+uses common Git state under the first checkout. The projection stores only the
+installation ID, slugs, counts, timestamps, reasons, and a generation digest.
+Webhook payloads never add access. Unknown/truncated reads quarantine before
+queued actions can reach the existing remote writer lease, and that lease
+remains mandatory after tenancy becomes active.
 
 Hosted workers mutate **only** from HMAC-verified webhook deliveries. The
 interactive `POST /api/action` endpoint refuses every mutating action with
@@ -185,7 +197,8 @@ Caravan does not treat reachability through the operator proxy as authority to
 force, merge, or reshape. Operators who want an interactive console should run
 ordinary local `cara web` over a tunnel instead of exposing hosted mode.
 
-Explicitly **not** included: automatic installation onboarding, tenancy
-management, clone/checkout provisioning or garbage collection, and automatic
+Automatic installation onboarding beyond the deployment allowlist remains
+excluded: operators still pre-provision repository policy and worktrees. Also
+excluded are clone/checkout provisioning or garbage collection and automatic
 failover. Exactly one worker may be the configured writer per repository; a
-second host may read and plan. Those remain separate, later work.
+second host may read and plan.

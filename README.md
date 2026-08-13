@@ -340,17 +340,29 @@ CARA_GITHUB_WEBHOOK_SECRET=... cara web --repo . \
   --github-installation-id 12345 --webhook-sync
 CARA_GITHUB_WEBHOOK_SECRET=... cara web --repo /srv/a --repo /srv/b \
   --github-webhook-secret-env CARA_GITHUB_WEBHOOK_SECRET \
-  --github-installation-id 12345 --webhook-sync --hosted
+  --github-installation-id 12345 --webhook-sync --hosted \
+  --hosted-tenancy-state /var/lib/cara/tenancy.json
 ```
 
 `--hosted` is the optional deployment contract for pre-provisioned checkouts: it
 requires signed webhooks, one exact installation, `--webhook-sync`, and per-repo
 `app_installation` auth plus `remote_fenced` writer with an exact slug. Ambient
 auth, `local_only`, mixed installations, or `--read-only` fail closed at startup.
-Hosted workers mutate only from verified webhook deliveries; interactive
-dashboard mutations are refused, because the same-origin CSRF token is not
-authentication. It provisions no clones and performs no failover; see
-[`docs/github-app.md`](docs/github-app.md). Default `cara web` is unchanged.
+Before serving, Cara pages the authoritative installation repository inventory
+under one request/deadline budget, intersects it with the explicit `--repo`
+allowlist, and atomically persists a secret-free generation projection. Missing,
+removed, suspended, truncated, ambiguous, or unreadable installation evidence
+quarantines affected repositories before any queued writer can run. Signed
+`installation` and `installation_repositories` events are deduplicated wake hints
+for the same authoritative reread; they never add tenancy from payload claims.
+`--hosted-tenancy-state` selects the projection path, otherwise it defaults under
+the first checkout's common Git `caravan/hosted` state. Dashboard state and
+health expose active/quarantined reasons and provider-generation digests without
+tokens. Hosted workers mutate only from verified webhook deliveries with active
+tenancy; interactive dashboard mutations are refused, because the same-origin
+CSRF token is not authentication. It provisions no clones and performs no
+automatic failover; see [`docs/github-app.md`](docs/github-app.md). Default
+`cara web` is unchanged.
 
 Repository inputs are explicit filesystem paths rather than slugs because every
 read and mutation remains bound to that exact worktree, config, operation lock,
@@ -407,7 +419,8 @@ TLS reverse proxy or private tunnel in front of the listener when exposing it,
 and never store the webhook secret in `.caravan/config.yaml`. Configure the
 GitHub App for JSON delivery and
 subscribe to **Push**, **Pull request**, **Pull request review**, **Check run**,
-**Check suite**, **Status**, and **Workflow run** events; read-only Metadata,
+**Check suite**, **Status**, **Workflow run**, **Installation**, and
+**Installation repositories** events; read-only Metadata,
 Contents, Pull requests, Checks, Commit statuses, and Actions permissions are
 sufficient for delivery. The ordinary Cara/GitHub credential—not the webhook
 payload—still authorizes any `--webhook-sync` provider mutation.

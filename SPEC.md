@@ -684,18 +684,31 @@ checkouts. It requires a signed webhook secret, one exact installation,
 `github_auth.mode: app_installation` pinned to that same installation,
 `writer.mode: remote_fenced`, and an exact slug; mixed installations, ambient
 auth, `local_only`, a missing slug, two worktrees declaring one slug, or missing
-broker/host/writer identity all fail closed at startup. Hosted workers mutate
-only from HMAC-verified deliveries: interactive mutating actions are refused,
-because the same-origin CSRF token is cross-site protection rather than
-authentication, so reachability through an operator proxy is never authority to
-force, merge, or reshape. Non-mutating check/plan actions remain available.
-Hosted mode provisions no clones, manages no tenancy, and performs no failover.
+broker/host/writer identity all fail closed at startup. Before serving or responding to signed `installation` /
+`installation_repositories` lifecycle hints, hosted mode completely pages the
+authoritative installation repository inventory under one shared request and
+wall-clock budget. It intersects that evidence with the explicit configured
+repository allowlist and atomically persists only installation ID, repository
+slugs, provider-generation digest, observation time, and active/quarantined
+reasons. Payload repository claims never broaden tenancy. Missing, removed,
+suspended/deleted, mixed-installation, malformed, duplicate, truncated, or
+provider-unknown evidence quarantines every affected allowlisted repository
+before provider I/O completes and is checked again after action locks immediately
+before the domain mutation. Queued work therefore fails with `mutated=false`;
+`remote_fenced` remains the sole writer authority even for active tenancy.
+Interactive mutating actions remain refused because the same-origin CSRF token
+is cross-site protection rather than authentication, so reachability through an
+operator proxy is never authority to force, merge, or reshape. Non-mutating
+check/plan actions remain available. `--hosted-tenancy-state` selects the durable
+projection path, otherwise common Git state under the first checkout is used.
+Hosted mode provisions no clones and performs no automatic failover.
 
 `GET /api/v1/health` is secret-free and monitorable: `ok` means this process is
 serving, while `degraded` is the actionable signal, true when any served
-repository has never refreshed successfully or is currently carrying a refresh
-error. It also reports the hosted/read-only flags, repository counts including
-never-refreshed and erroring, the oldest successful refresh, and webhook
+repository has never refreshed successfully, is currently carrying a refresh
+error, or has quarantined hosted tenancy. It also reports the hosted/read-only
+flags, repository counts including never-refreshed, erroring, and quarantined,
+the oldest successful refresh, and webhook
 counters with the last received timestamp, so a worker that is answering but
 idle -- because deliveries stopped or a repository read keeps failing -- is
 distinguishable from a healthy one.

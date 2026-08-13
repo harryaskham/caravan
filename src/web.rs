@@ -26,6 +26,10 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 use crate::config::{CaravanConfig, DEFAULT_CONFIG_PATH};
 use crate::graph::{CompatibilityChecker, GitCompatibilityChecker};
+use crate::hosted_tenancy::{
+    CommandHostedTenancyProvider, HostedTenancyProjection, HostedTenancyProvider,
+    HostedTenancyRecord, HostedTenancyState,
+};
 use crate::model::{BranchSnapshot, CompatibilityOutcome, PrNumber, PullRequestPrecondition};
 use crate::read::StatusOutput;
 use crate::repair::{
@@ -40,7 +44,7 @@ use crate::{
 const INDEX_HTML: &str = include_str!("web_assets/index.html");
 const APP_CSS: &str = include_str!("web_assets/app.css");
 const APP_JS: &str = include_str!("web_assets/app.js");
-const WEB_SCHEMA_VERSION: u32 = 7;
+const WEB_SCHEMA_VERSION: u32 = 8;
 const MIN_POLL_SECONDS: u64 = 2;
 const MAX_POLL_SECONDS: u64 = 3_600;
 const DEFAULT_POLL_SECONDS: u64 = 15;
@@ -98,6 +102,10 @@ pub struct WebInput {
     /// Hosted worker contract over explicit pre-provisioned repositories.
     #[arg(long, requires = "github_webhook_secret_env")]
     pub hosted: bool,
+
+    /// Durable secret-free hosted tenancy projection path.
+    #[arg(long, value_name = "PATH", requires = "hosted")]
+    pub hosted_tenancy_state: Option<PathBuf>,
 }
 
 /// Secret-free error projection retained beside the most recent snapshot.
@@ -181,6 +189,9 @@ pub struct WebRepositorySnapshot {
     /// Admission candidates omitted by the bounded web compatibility projection.
     #[serde(default)]
     pub candidate_compatibility_truncated: usize,
+    /// Authoritative hosted installation access; absent in local mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosted_tenancy: Option<HostedTenancyRecord>,
     /// Most recent bounded typed action result, retained for operational evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_action: Option<WebActionRecord>,
@@ -375,6 +386,7 @@ struct RepositoryEntry {
     actions: Mutex<VecDeque<WebActionJob>>,
     webhook_deliveries: Mutex<VecDeque<String>>,
     webhook_delivery_path: PathBuf,
+    tenancy_projection: Option<Arc<Mutex<Option<HostedTenancyProjection>>>>,
     webhook_sync_pending: AtomicBool,
 }
 
@@ -390,6 +402,9 @@ struct Dashboard {
     webhook_installation_id: Option<u64>,
     webhook_sync: bool,
     webhook_status: Mutex<WebhookStatus>,
+    tenancy_state_path: Option<PathBuf>,
+    tenancy_projection: Arc<Mutex<Option<HostedTenancyProjection>>>,
+    tenancy_reconcile_lock: Mutex<()>,
     stopping: AtomicBool,
     active_requests: AtomicUsize,
 }
@@ -441,6 +456,9 @@ impl Dashboard {
     }
 
     fn refresh_all(&self) {
+        if self.hosted {
+            let _ = reconcile_hosted_tenancy(self);
+        }
         for repository in &self.repositories {
             refresh_repository(repository);
             if self.stopping.load(Ordering::Relaxed) {
@@ -460,8 +478,31 @@ fn build_dashboard(input: &WebInput) -> Result<Arc<Dashboard>, AppError> {
     } else {
         input.poll_seconds
     };
-    let repositories = load_repositories(&input.repositories)?;
+    let tenancy_projection = Arc::new(Mutex::new(None));
+    let tenancy_entry = input.hosted.then(|| Arc::clone(&tenancy_projection));
+    let repositories = load_repositories_with_tenancy(&input.repositories, tenancy_entry.as_ref())?;
     validate_hosted_repositories(input, &repositories)?;
+    let tenancy_state_path = if input.hosted {
+        let installation_id = input.github_installation_id.ok_or_else(|| {
+            AppError::validation(
+                "web_hosted_installation_required",
+                "--hosted requires an installation identity",
+            )
+        })?;
+        let allowlist = hosted_repository_allowlist(&repositories);
+        let path = input
+            .hosted_tenancy_state
+            .clone()
+            .unwrap_or_else(|| default_tenancy_state_path(&repositories));
+        let projection = crate::hosted_tenancy::load_tenancy(&path, installation_id, &allowlist);
+        apply_tenancy_projection(&repositories, &projection);
+        *tenancy_projection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(projection.clone());
+        Some(path)
+    } else {
+        None
+    };
     Ok(Arc::new(Dashboard {
         listen: input.listen,
         poll_seconds,
@@ -478,6 +519,9 @@ fn build_dashboard(input: &WebInput) -> Result<Arc<Dashboard>, AppError> {
             sync_enabled: input.webhook_sync,
             ..WebhookStatus::default()
         }),
+        tenancy_state_path,
+        tenancy_projection,
+        tenancy_reconcile_lock: Mutex::new(()),
         stopping: AtomicBool::new(false),
         active_requests: AtomicUsize::new(0),
     }))
@@ -686,6 +730,7 @@ fn health_payload(dashboard: &Dashboard) -> serde_json::Value {
     let mut never_refreshed = 0_u64;
     let mut erroring = 0_u64;
     let mut oldest_refresh_unix_ms: Option<u64> = None;
+    let mut tenancy_quarantined = 0_u64;
     for repository in &dashboard.repositories {
         let snapshot = repository
             .snapshot
@@ -703,6 +748,13 @@ fn health_payload(dashboard: &Dashboard) -> serde_json::Value {
         if snapshot.error.is_some() {
             erroring += 1;
         }
+        if snapshot
+            .hosted_tenancy
+            .as_ref()
+            .is_some_and(|record| record.state != HostedTenancyState::Active)
+        {
+            tenancy_quarantined += 1;
+        }
     }
     let webhook = dashboard
         .webhook_status
@@ -711,13 +763,14 @@ fn health_payload(dashboard: &Dashboard) -> serde_json::Value {
         .clone();
     json!({
         "ok": true,
-        "degraded": never_refreshed > 0 || erroring > 0,
+        "degraded": never_refreshed > 0 || erroring > 0 || tenancy_quarantined > 0,
         "schema_version": WEB_SCHEMA_VERSION,
         "hosted": dashboard.hosted,
         "read_only": dashboard.read_only,
         "repositories": dashboard.repositories.len(),
         "repositories_never_refreshed": never_refreshed,
         "repositories_erroring": erroring,
+        "tenancy_quarantined": tenancy_quarantined,
         "oldest_refresh_unix_ms": oldest_refresh_unix_ms,
         "started_unix_ms": dashboard.started_unix_ms,
         "webhook": {
@@ -816,7 +869,164 @@ fn validate_hosted_repositories(
     Ok(())
 }
 
+fn hosted_repository_allowlist(repositories: &[Arc<RepositoryEntry>]) -> BTreeSet<String> {
+    repositories
+        .iter()
+        .filter_map(|repository| repository.context.config.repository.clone())
+        .collect()
+}
+
+fn default_tenancy_state_path(repositories: &[Arc<RepositoryEntry>]) -> PathBuf {
+    repositories
+        .first()
+        .and_then(|repository| repository.webhook_delivery_path.parent())
+        .and_then(Path::parent)
+        .map_or_else(
+            || PathBuf::from(".caravan/hosted/tenancy.json"),
+            |caravan| caravan.join("hosted/tenancy.json"),
+        )
+}
+
+fn apply_tenancy_projection(
+    repositories: &[Arc<RepositoryEntry>],
+    projection: &HostedTenancyProjection,
+) {
+    for repository in repositories {
+        let slug = repository
+            .context
+            .config
+            .repository
+            .as_deref()
+            .unwrap_or_default();
+        let mut snapshot = repository
+            .snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        snapshot.hosted_tenancy = projection.repositories.get(slug).cloned();
+    }
+}
+
+fn repository_tenancy_active(repository: &RepositoryEntry) -> bool {
+    if let Some(projection) = &repository.tenancy_projection {
+        let projection = projection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let slug = repository
+            .context
+            .config
+            .repository
+            .as_deref()
+            .unwrap_or_default();
+        return projection
+            .as_ref()
+            .is_some_and(|projection| projection.active(slug));
+    }
+    repository
+        .snapshot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .hosted_tenancy
+        .as_ref()
+        .is_none_or(|record| record.state == HostedTenancyState::Active)
+}
+
+fn validate_repository_tenancy(
+    repository: &RepositoryEntry,
+    mutates: bool,
+) -> Result<(), AppError> {
+    if !mutates || repository_tenancy_active(repository) {
+        return Ok(());
+    }
+    Err(AppError::structured(
+        ErrorCategory::Validation,
+        "web_hosted_tenancy_quarantined",
+        "authoritative GitHub App tenancy does not permit this repository mutation",
+        Some(json!({
+            "repository": repository.context.config.repository,
+            "mutated": false,
+            "safe_next_action": "reconcile the exact installation repository projection before retrying",
+        })),
+    ))
+}
+
+fn reconcile_hosted_tenancy(dashboard: &Dashboard) -> Result<(), AppError> {
+    let context = &dashboard
+        .repositories
+        .first()
+        .ok_or_else(|| {
+            AppError::validation(
+                "web_repository_required",
+                "hosted tenancy has no repository",
+            )
+        })?
+        .context;
+    let provider = CommandHostedTenancyProvider::new(context);
+    reconcile_hosted_tenancy_with_provider(dashboard, &provider)
+}
+
+fn reconcile_hosted_tenancy_with_provider(
+    dashboard: &Dashboard,
+    provider: &impl HostedTenancyProvider,
+) -> Result<(), AppError> {
+    let _reconcile = dashboard
+        .tenancy_reconcile_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let installation_id = dashboard.webhook_installation_id.ok_or_else(|| {
+        AppError::validation(
+            "web_hosted_installation_required",
+            "hosted tenancy requires one exact installation",
+        )
+    })?;
+    let allowlist = hosted_repository_allowlist(&dashboard.repositories);
+    let path = dashboard.tenancy_state_path.as_ref().ok_or_else(|| {
+        AppError::validation(
+            "web_hosted_tenancy_state_required",
+            "hosted tenancy state path is unavailable",
+        )
+    })?;
+    let previous = dashboard
+        .tenancy_projection
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    // Quarantine before the provider call: lifecycle hints and slow/failed
+    // reads can never leave a previously active queued writer authorized.
+    let pending = HostedTenancyProjection::quarantine(
+        installation_id,
+        &allowlist,
+        "authoritative_reconciliation_in_progress",
+    );
+    *dashboard
+        .tenancy_projection
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(pending.clone());
+    apply_tenancy_projection(&dashboard.repositories, &pending);
+
+    let mut projection = crate::hosted_tenancy::reconcile_tenancy(
+        installation_id,
+        &allowlist,
+        provider.observe(installation_id),
+    );
+    crate::hosted_tenancy::classify_tenancy_transitions(previous.as_ref(), &mut projection);
+    crate::hosted_tenancy::persist_tenancy(path, &projection)?;
+    apply_tenancy_projection(&dashboard.repositories, &projection);
+    *dashboard
+        .tenancy_projection
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(projection);
+    Ok(())
+}
+
+#[cfg(test)]
 fn load_repositories(paths: &[PathBuf]) -> Result<Vec<Arc<RepositoryEntry>>, AppError> {
+    load_repositories_with_tenancy(paths, None)
+}
+
+fn load_repositories_with_tenancy(
+    paths: &[PathBuf],
+    tenancy_projection: Option<&Arc<Mutex<Option<HostedTenancyProjection>>>>,
+) -> Result<Vec<Arc<RepositoryEntry>>, AppError> {
     let mut seen = BTreeSet::new();
     paths
         .iter()
@@ -897,6 +1107,7 @@ fn load_repositories(paths: &[PathBuf]) -> Result<Vec<Arc<RepositoryEntry>>, App
                     error: None,
                     candidate_compatibility: Vec::new(),
                     candidate_compatibility_truncated: 0,
+                    hosted_tenancy: None,
                     last_action: None,
                     journal: None,
                     actions: Vec::new(),
@@ -906,6 +1117,7 @@ fn load_repositories(paths: &[PathBuf]) -> Result<Vec<Arc<RepositoryEntry>>, App
                 actions: Mutex::new(VecDeque::new()),
                 webhook_deliveries: Mutex::new(webhook_deliveries),
                 webhook_delivery_path,
+                tenancy_projection: tenancy_projection.cloned(),
                 webhook_sync_pending: AtomicBool::new(false),
             }))
         })
@@ -1645,6 +1857,9 @@ fn handle_github_webhook(
             "webhook installation does not match the configured GitHub App installation",
         );
     }
+    if dashboard.hosted && webhook_event_is_installation_lifecycle(&event, &payload) {
+        return handle_installation_lifecycle_webhook(dashboard, &event, &delivery);
+    }
     let repository_slug = payload
         .get("repository")
         .and_then(|value| value.get("full_name"))
@@ -1687,7 +1902,8 @@ fn handle_github_webhook(
         .as_ref()
         .map(|status| status.default_branch.clone())
         .unwrap_or_default();
-    let wake = webhook_event_is_wake(&event, &payload, &default_branch);
+    let tenancy_active = repository_tenancy_active(repository);
+    let wake = tenancy_active && webhook_event_is_wake(&event, &payload, &default_branch);
     let mut coalesced = false;
     if wake {
         if dashboard.webhook_sync {
@@ -1718,6 +1934,102 @@ fn handle_github_webhook(
             "event": event,
             "delivery": delivery,
             "repository": repository_slug,
+            "tenancy_active": tenancy_active,
+        }),
+    )
+}
+
+fn webhook_event_is_installation_lifecycle(event: &str, payload: &serde_json::Value) -> bool {
+    let action = payload
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    match event {
+        "installation" => matches!(
+            action,
+            "created" | "deleted" | "suspend" | "unsuspend" | "new_permissions_accepted"
+        ),
+        "installation_repositories" => matches!(action, "added" | "removed"),
+        _ => false,
+    }
+}
+
+fn handle_installation_lifecycle_webhook(
+    dashboard: &Dashboard,
+    event: &str,
+    delivery: &str,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    let Some(repository) = dashboard.repositories.first() else {
+        record_webhook_rejection(dashboard);
+        return error_response(
+            StatusCode(500),
+            "webhook_repository_unavailable",
+            "hosted installation has no deployment-allowlisted repository",
+        );
+    };
+    let provider = CommandHostedTenancyProvider::new(&repository.context);
+    handle_installation_lifecycle_webhook_with_provider(dashboard, event, delivery, &provider)
+}
+
+fn handle_installation_lifecycle_webhook_with_provider(
+    dashboard: &Dashboard,
+    event: &str,
+    delivery: &str,
+    provider: &impl HostedTenancyProvider,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    let Some(repository) = dashboard.repositories.first() else {
+        record_webhook_rejection(dashboard);
+        return error_response(
+            StatusCode(500),
+            "webhook_repository_unavailable",
+            "hosted installation has no deployment-allowlisted repository",
+        );
+    };
+    let duplicate = match record_webhook_delivery(repository, delivery) {
+        Ok(duplicate) => duplicate,
+        Err(error) => {
+            return error_response(StatusCode(500), error.code().as_str(), &error.message());
+        }
+    };
+    if duplicate {
+        let mut status = dashboard
+            .webhook_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        status.deduplicated = status.deduplicated.saturating_add(1);
+        return json_response(
+            StatusCode(200),
+            &json!({"ok": true, "accepted": false, "deduplicated": true, "delivery": delivery}),
+        );
+    }
+    if let Err(error) = reconcile_hosted_tenancy_with_provider(dashboard, provider) {
+        record_webhook_rejection(dashboard);
+        return error_response(StatusCode(500), error.code().as_str(), &error.message());
+    }
+    let projection = dashboard
+        .tenancy_projection
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    {
+        let mut status = dashboard
+            .webhook_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        status.accepted = status.accepted.saturating_add(1);
+        status.last_event = Some(event.to_owned());
+        status.last_delivery = Some(delivery.to_owned());
+        status.last_received_unix_ms = Some(unix_ms());
+    }
+    json_response(
+        StatusCode(202),
+        &json!({
+            "ok": true,
+            "accepted": true,
+            "wake": "authoritative_installation_reconciliation",
+            "event": event,
+            "delivery": delivery,
+            "tenancy": projection,
         }),
     )
 }
@@ -1794,6 +2106,9 @@ fn record_webhook_rejection(dashboard: &Dashboard) {
 }
 
 fn enqueue_webhook_sync(repository: &Arc<RepositoryEntry>) -> bool {
+    if !repository_tenancy_active(repository) {
+        return false;
+    }
     let (expected_refresh_sequence, expected_mutation_fingerprint) = action_authority(repository);
     let Some(expected_mutation_fingerprint) = expected_mutation_fingerprint else {
         repository
@@ -2001,6 +2316,19 @@ fn handle_action(
     )
 }
 
+fn run_tenancy_guarded_action(
+    repository: &RepositoryEntry,
+    action: WebAction,
+    tenancy: Result<(), AppError>,
+    id: &str,
+) -> Result<serde_json::Value, AppError> {
+    tenancy?;
+    update_action_job(repository, id, |job| {
+        "domain_operation_in_flight".clone_into(&mut job.phase);
+    });
+    run_action(&repository.context, action)
+}
+
 fn execute_action_job(repository: &Arc<RepositoryEntry>, id: &str, accepted: AcceptedWebAction) {
     let AcceptedWebAction {
         request,
@@ -2027,6 +2355,7 @@ fn execute_action_job(repository: &Arc<RepositoryEntry>, id: &str, accepted: Acc
         job.actual_mutation_fingerprint
             .clone_from(&actual_mutation_fingerprint);
     });
+    let tenancy = validate_repository_tenancy(repository, request.action.mutates());
     let result = match validate_action_authority(
         request.expected_refresh_sequence,
         &expected_mutation_fingerprint,
@@ -2034,10 +2363,7 @@ fn execute_action_job(repository: &Arc<RepositoryEntry>, id: &str, accepted: Acc
         actual_mutation_fingerprint,
     ) {
         Ok(_actual_fingerprint) => {
-            update_action_job(repository, id, |job| {
-                "domain_operation_in_flight".clone_into(&mut job.phase);
-            });
-            run_action(&repository.context, request.action)
+            run_tenancy_guarded_action(repository, request.action, tenancy, id)
         }
         Err(error) => Err(error),
     };
@@ -2293,6 +2619,7 @@ mod tests {
             github_installation_id: None,
             webhook_sync: false,
             hosted: false,
+            hosted_tenancy_state: None,
         };
         validate_input(&input).expect("explicit non-loopback listen addresses are supported");
         input.poll_seconds = 1;
@@ -2314,6 +2641,7 @@ mod tests {
             github_installation_id: None,
             webhook_sync: false,
             hosted: false,
+            hosted_tenancy_state: None,
         };
         assert_eq!(
             validate_input(&input).unwrap_err().code(),
@@ -2445,6 +2773,7 @@ mod tests {
                 error: None,
                 candidate_compatibility: Vec::new(),
                 candidate_compatibility_truncated: 0,
+                hosted_tenancy: None,
                 last_action: None,
                 journal: None,
                 actions: Vec::new(),
@@ -2454,6 +2783,7 @@ mod tests {
             actions: Mutex::new(VecDeque::new()),
             webhook_deliveries: Mutex::new(VecDeque::new()),
             webhook_delivery_path: path.join("deliveries.json"),
+            tenancy_projection: None,
             webhook_sync_pending: AtomicBool::new(false),
         })
     }
@@ -2486,6 +2816,7 @@ mod tests {
             github_installation_id: installation_id,
             webhook_sync: true,
             hosted,
+            hosted_tenancy_state: None,
         }
     }
 
@@ -2589,6 +2920,183 @@ mod tests {
         assert_eq!(policy["repository"], "owner/repo");
     }
 
+    struct FakeTenancyProvider {
+        repository_must_be_quarantined: Option<Arc<RepositoryEntry>>,
+        observation: Mutex<
+            Result<
+                crate::hosted_tenancy::HostedTenancyObservation,
+                crate::hosted_tenancy::HostedTenancyProviderError,
+            >,
+        >,
+    }
+
+    impl HostedTenancyProvider for FakeTenancyProvider {
+        fn observe(
+            &self,
+            _installation_id: u64,
+        ) -> Result<
+            crate::hosted_tenancy::HostedTenancyObservation,
+            crate::hosted_tenancy::HostedTenancyProviderError,
+        > {
+            if let Some(repository) = &self.repository_must_be_quarantined {
+                assert!(
+                    !repository_tenancy_active(repository),
+                    "reconciliation must quarantine before provider I/O"
+                );
+            }
+            self.observation.lock().unwrap().clone()
+        }
+    }
+
+    #[test]
+    fn hosted_reconciliation_activates_then_quarantines_before_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut repository = hosted_entry(hosted_config(
+            crate::config::GithubAuthMode::AppInstallation,
+            Some(42),
+            crate::config::WriterMode::RemoteFenced,
+            Some("owner/repo"),
+        ));
+        let shared_projection = Arc::new(Mutex::new(None));
+        Arc::get_mut(&mut repository).unwrap().tenancy_projection =
+            Some(Arc::clone(&shared_projection));
+        let mut dashboard = test_dashboard(true, false);
+        dashboard.webhook_installation_id = Some(42);
+        dashboard.tenancy_projection = shared_projection;
+        dashboard.repositories = vec![Arc::clone(&repository)];
+        dashboard.tenancy_state_path = Some(directory.path().join("tenancy.json"));
+        let provider = FakeTenancyProvider {
+            repository_must_be_quarantined: Some(Arc::clone(&repository)),
+            observation: Mutex::new(Ok(crate::hosted_tenancy::HostedTenancyObservation {
+                installation_id: 42,
+                provider_generation: "sha256:current".to_owned(),
+                provider_total_count: 1,
+                observed_unix_ms: 1,
+                repositories: BTreeSet::from(["owner/repo".to_owned()]),
+            })),
+        };
+
+        reconcile_hosted_tenancy_with_provider(&dashboard, &provider).unwrap();
+        assert!(repository_tenancy_active(&repository));
+        assert!(dashboard.tenancy_state_path.as_ref().unwrap().exists());
+
+        *provider.observation.lock().unwrap() =
+            Err(crate::hosted_tenancy::HostedTenancyProviderError::new(
+                "installation_suspended_or_deleted",
+            ));
+        reconcile_hosted_tenancy_with_provider(&dashboard, &provider).unwrap();
+        assert!(!repository_tenancy_active(&repository));
+        assert_eq!(
+            validate_repository_tenancy(&repository, true)
+                .unwrap_err()
+                .code(),
+            "web_hosted_tenancy_quarantined"
+        );
+    }
+
+    #[test]
+    fn installation_lifecycle_delivery_reconciles_once_and_deduplicates() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut repository = hosted_entry(hosted_config(
+            crate::config::GithubAuthMode::AppInstallation,
+            Some(42),
+            crate::config::WriterMode::RemoteFenced,
+            Some("owner/repo"),
+        ));
+        let shared_projection = Arc::new(Mutex::new(None));
+        let entry = Arc::get_mut(&mut repository).unwrap();
+        entry.tenancy_projection = Some(Arc::clone(&shared_projection));
+        entry.webhook_delivery_path = directory.path().join("deliveries.log");
+        let mut dashboard = test_dashboard(true, false);
+        dashboard.webhook_installation_id = Some(42);
+        dashboard.tenancy_projection = shared_projection;
+        dashboard.tenancy_state_path = Some(directory.path().join("tenancy.json"));
+        dashboard.repositories = vec![Arc::clone(&repository)];
+        let provider = FakeTenancyProvider {
+            repository_must_be_quarantined: Some(Arc::clone(&repository)),
+            observation: Mutex::new(Ok(crate::hosted_tenancy::HostedTenancyObservation {
+                installation_id: 42,
+                provider_generation: "sha256:lifecycle".to_owned(),
+                provider_total_count: 1,
+                observed_unix_ms: 1,
+                repositories: BTreeSet::from(["owner/repo".to_owned()]),
+            })),
+        };
+
+        let first = handle_installation_lifecycle_webhook_with_provider(
+            &dashboard,
+            "installation_repositories",
+            "delivery-1",
+            &provider,
+        );
+        assert_eq!(first.status_code(), StatusCode(202));
+        assert!(repository_tenancy_active(&repository));
+        let duplicate = handle_installation_lifecycle_webhook_with_provider(
+            &dashboard,
+            "installation_repositories",
+            "delivery-1",
+            &provider,
+        );
+        assert_eq!(duplicate.status_code(), StatusCode(200));
+        let status = dashboard.webhook_status.lock().unwrap();
+        assert_eq!(status.accepted, 1);
+        assert_eq!(status.deduplicated, 1);
+    }
+
+    #[test]
+    fn hosted_tenancy_quarantine_blocks_queued_mutation_but_not_reads() {
+        let repository = hosted_entry(hosted_config(
+            crate::config::GithubAuthMode::AppInstallation,
+            Some(42),
+            crate::config::WriterMode::RemoteFenced,
+            Some("owner/repo"),
+        ));
+        repository.snapshot.lock().unwrap().hosted_tenancy = Some(HostedTenancyRecord {
+            repository: "owner/repo".to_owned(),
+            installation_id: 42,
+            state: HostedTenancyState::Quarantined,
+            reason: "repository_absent_from_installation".to_owned(),
+            provider_generation: "sha256:generation".to_owned(),
+            observed_unix_ms: 1,
+        });
+
+        assert_eq!(
+            validate_repository_tenancy(&repository, true)
+                .unwrap_err()
+                .code(),
+            "web_hosted_tenancy_quarantined"
+        );
+        validate_repository_tenancy(&repository, false)
+            .expect("read-only observability remains available");
+        assert!(!enqueue_webhook_sync(&repository));
+        assert!(repository.actions.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn installation_lifecycle_events_are_narrow_and_action_typed() {
+        for (event, action) in [
+            ("installation", "created"),
+            ("installation", "deleted"),
+            ("installation", "suspend"),
+            ("installation", "unsuspend"),
+            ("installation_repositories", "added"),
+            ("installation_repositories", "removed"),
+        ] {
+            assert!(webhook_event_is_installation_lifecycle(
+                event,
+                &json!({"action": action})
+            ));
+        }
+        assert!(!webhook_event_is_installation_lifecycle(
+            "installation",
+            &json!({"action": "unexpected"})
+        ));
+        assert!(!webhook_event_is_installation_lifecycle(
+            "pull_request",
+            &json!({"action": "opened"})
+        ));
+    }
+
     #[test]
     fn local_dashboard_mode_accepts_ambient_local_only_repositories() {
         let ambient = hosted_config(
@@ -2617,6 +3125,9 @@ mod tests {
             webhook_installation_id: None,
             webhook_sync: hosted,
             webhook_status: Mutex::new(WebhookStatus::default()),
+            tenancy_state_path: None,
+            tenancy_projection: Arc::new(Mutex::new(None)),
+            tenancy_reconcile_lock: Mutex::new(()),
             stopping: AtomicBool::new(false),
             active_requests: AtomicUsize::new(0),
         }
@@ -2839,6 +3350,19 @@ mod tests {
         assert_eq!(payload["webhook"]["rejected"], 2);
         assert_eq!(payload["webhook"]["deduplicated"], 3);
         assert_eq!(payload["webhook"]["last_received_unix_ms"], 12_345);
+
+        healthy.snapshot.lock().unwrap().hosted_tenancy = Some(HostedTenancyRecord {
+            repository: "owner/healthy".to_owned(),
+            installation_id: 42,
+            state: HostedTenancyState::Quarantined,
+            reason: "quarantined_provider_unknown".to_owned(),
+            provider_generation: "unavailable".to_owned(),
+            observed_unix_ms: 12_346,
+        });
+        dashboard.repositories = vec![healthy];
+        let payload = health_payload(&dashboard);
+        assert_eq!(payload["degraded"], true);
+        assert_eq!(payload["tenancy_quarantined"], 1);
         let encoded = serde_json::to_string(&payload).unwrap();
         assert!(!encoded.contains("secret"));
         assert!(!encoded.contains("token"));
