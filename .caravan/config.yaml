@@ -30,7 +30,7 @@ agent_priority_labels:
   - caravan-priority:high
   - caravan-priority:normal
   - caravan-priority:low
-command_timeout_secs: 30
+command_timeout_secs: 60
 # Automatic growth is sync-all-only and starts only after the existing fleet
 # converges. Every candidate, provider call, mutation, and wall-clock phase is
 # bounded; incompatible generations receive exact advisory skip receipts.

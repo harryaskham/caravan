@@ -164,10 +164,26 @@ if grep -Fq 'git config --global --unset-all' .github/workflows/release.yml; the
   exit 1
 fi
 grep -q -- '"runner":"ubuntu-24.04-arm"' .github/workflows/release.yml
-grep -q -- "if: matrix.target == 'aarch64-linux'" .github/workflows/release.yml
+grep -q -- '"runner":"macos-14"' .github/workflows/release.yml
+if grep -q -- '"runner":\["self-hosted","nix","aarch64-darwin"\]' .github/workflows/release.yml; then
+  echo "Darwin releases must use the durable GitHub-hosted native runner pool" >&2
+  exit 1
+fi
+grep -q -- "if: matrix.target == 'aarch64-linux' || matrix.target == 'aarch64-darwin'" .github/workflows/release.yml
 grep -q -- 'cachix/install-nix-action@v31' .github/workflows/release.yml
+grep -q -- 'name: Verify native runner architecture' .github/workflows/release.yml
+grep -Fq -- 'aarch64-darwin) test "$(uname -m)" = "arm64"' .github/workflows/release.yml
 if grep -q -- "if: matrix.target != 'aarch64-linux'" .github/workflows/release.yml; then
   echo "native GitHub ARM builds must smoke their packaged binary" >&2
+  exit 1
+fi
+smoke_block="$(awk '
+  /- name: Smoke packaged native binary/ { in_smoke=1 }
+  /- name: Upload assets to the GitHub release/ { in_smoke=0 }
+  in_smoke { print }
+' .github/workflows/release.yml)"
+if grep -q -- "if: matrix.target != 'aarch64-darwin'" <<<"$smoke_block"; then
+  echo "native GitHub macOS builds must smoke their packaged binary" >&2
   exit 1
 fi
 # The local backfill path remains available for bounded incident recovery.

@@ -578,11 +578,13 @@ cara-<version>-<target>.tar.gz
 cara-<version>-<target>.sha256
 ```
 
-The tagged release workflow builds `x86_64-linux` and `aarch64-darwin` on the
-matching registered runners, and `aarch64-linux` on GitHub's native
-`ubuntu-24.04-arm` public-repository pool. The hosted ARM leg installs the pinned
-Nix action before evaluating the same flake and smoke-runs the packaged binary;
-it does not depend on an intermittently connected personal ARM node. Every job
+The tagged release workflow builds `x86_64-linux` on its matching registered
+runner, `aarch64-linux` on GitHub's native `ubuntu-24.04-arm` pool, and
+`aarch64-darwin` on GitHub's native `macos-14` pool. Both hosted native legs
+install the pinned Nix action before evaluating the same flake and smoke-run the
+packaged binary. Linux ARM no longer depends on an intermittently connected
+personal ARM node, and Darwin releases no longer become globally non-terminal
+when the operator-owned Mac is offline. Every job
 uses a unique `RUNNER_TEMP`-scoped Git configuration, so anonymous HTTPS rewrites
 never mutate operator-global state on persistent runners. After a terminal
 platform failure and a reviewed workflow fix on green `main`,
