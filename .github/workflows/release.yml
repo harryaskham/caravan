@@ -91,7 +91,7 @@ jobs:
           }
           case "$target" in
             all)
-              matrix='{"include":[{"target":"x86_64-linux","runner":["self-hosted","nix","x86_64-linux"],"timeout_minutes":120},{"target":"aarch64-linux","runner":"ubuntu-24.04-arm","timeout_minutes":180},{"target":"aarch64-darwin","runner":["self-hosted","nix","aarch64-darwin"],"timeout_minutes":90}]}'
+              matrix='{"include":[{"target":"x86_64-linux","runner":["self-hosted","nix","x86_64-linux"],"timeout_minutes":120},{"target":"aarch64-linux","runner":"ubuntu-24.04-arm","timeout_minutes":180},{"target":"aarch64-darwin","runner":"macos-14","timeout_minutes":90}]}'
               ;;
             x86_64-linux)
               matrix='{"include":[{"target":"x86_64-linux","runner":["self-hosted","nix","x86_64-linux"],"timeout_minutes":120}]}'
@@ -100,7 +100,7 @@ jobs:
               matrix='{"include":[{"target":"aarch64-linux","runner":"ubuntu-24.04-arm","timeout_minutes":180}]}'
               ;;
             aarch64-darwin)
-              matrix='{"include":[{"target":"aarch64-darwin","runner":["self-hosted","nix","aarch64-darwin"],"timeout_minutes":90}]}'
+              matrix='{"include":[{"target":"aarch64-darwin","runner":"macos-14","timeout_minutes":90}]}'
               ;;
             *)
               echo "unsupported release target: $target" >&2
@@ -190,8 +190,8 @@ jobs:
           ref: ${{ needs.resolve.outputs.tag }}
           fetch-depth: 0
 
-      - name: Install Nix on the GitHub-hosted ARM runner
-        if: matrix.target == 'aarch64-linux'
+      - name: Install Nix on GitHub-hosted native runners
+        if: matrix.target == 'aarch64-linux' || matrix.target == 'aarch64-darwin'
         uses: cachix/install-nix-action@v31
         with:
           extra_nix_config: |
@@ -204,6 +204,19 @@ jobs:
             if [ -d "$directory" ]; then echo "$directory" >> "$GITHUB_PATH"; fi
           done
           exit 0
+
+      - name: Verify native runner architecture
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          case "$TARGET" in
+            aarch64-linux) test "$(uname -m)" = "aarch64" ;;
+            aarch64-darwin) test "$(uname -m)" = "arm64" ;;
+            x86_64-linux) test "$(uname -m)" = "x86_64" ;;
+            *) echo "unsupported native target: $TARGET" >&2; exit 1 ;;
+          esac
 
       - name: Build release binary
         shell: bash
@@ -267,8 +280,8 @@ jobs:
           rm -rf smoke
           mkdir smoke
           nix develop --command tar -xzf "dist/$root.tar.gz" -C smoke
-          # The self-hosted Linux runners are NixOS, so this exercises the exact
-          # loader path that crashed the previously published dynamic asset.
+          # Linux release runners exercise the exact loader path that crashed
+          # the previously published dynamic asset; hosted Darwin smokes natively.
           "smoke/$root/cara" --version
           "smoke/$root/cara" --json status >/dev/null 2>&1 || true
 

@@ -14,11 +14,13 @@ fn between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
         .0
 }
 
-fn assert_hosted_arm_release_lane(build: &str) {
+fn assert_hosted_native_release_lanes(build: &str) {
     let all = between(RELEASE_WORKFLOW, "            all)\n", "              ;;\n");
     assert!(all.contains("\"target\":\"x86_64-linux\""));
     assert!(all.contains("\"target\":\"aarch64-linux\""));
     assert!(all.contains("\"target\":\"aarch64-darwin\""));
+    assert!(all.contains("\"runner\":\"ubuntu-24.04-arm\""));
+    assert!(all.contains("\"runner\":\"macos-14\""));
 
     let arm_linux = between(
         RELEASE_WORKFLOW,
@@ -31,18 +33,30 @@ fn assert_hosted_arm_release_lane(build: &str) {
     assert!(!arm_linux.contains("\"target\":\"aarch64-darwin\""));
 
     for required in [
-        "if: matrix.target == 'aarch64-linux'",
+        "if: matrix.target == 'aarch64-linux' || matrix.target == 'aarch64-darwin'",
         "uses: cachix/install-nix-action@v31",
         "experimental-features = nix-command flakes",
+        "name: Verify native runner architecture",
+        "aarch64-darwin) test \"$(uname -m)\" = \"arm64\"",
+        "aarch64-linux) test \"$(uname -m)\" = \"aarch64\"",
     ] {
         assert!(
             build.contains(required),
-            "GitHub-hosted ARM build must retain `{required}`"
+            "GitHub-hosted native builds must retain `{required}`"
         );
     }
     assert!(
         !build.contains("if: matrix.target != 'aarch64-linux'"),
         "the native GitHub ARM runner must smoke the packaged ARM binary"
+    );
+    let smoke = between(
+        build,
+        "      - name: Smoke packaged native binary\n",
+        "      - name: Upload assets to the GitHub release\n",
+    );
+    assert!(
+        !smoke.contains("if: matrix.target != 'aarch64-darwin'"),
+        "the native GitHub macOS runner must smoke the packaged Darwin binary"
     );
 }
 
@@ -133,12 +147,14 @@ fn release_workflow_isolates_git_and_selects_exact_backfill_target() {
         "              ;;\n",
     );
     assert!(darwin.contains("\"target\":\"aarch64-darwin\""));
+    assert!(darwin.contains("\"runner\":\"macos-14\""));
+    assert!(!darwin.contains("self-hosted"));
     assert!(
         !darwin.contains("\"target\":\"x86_64-linux\""),
         "Darwin-only backfill must not schedule Linux"
     );
 
-    assert_hosted_arm_release_lane(build);
+    assert_hosted_native_release_lanes(build);
 
     let backfill = between(
         JUSTFILE,
