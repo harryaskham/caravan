@@ -654,7 +654,7 @@ API exposes the same five operations. No provisional aliases exist.
 
 ### Ecosystem surfaces
 
-- `cara help` — agent operating instructions and recovery examples.
+- `cara help` — self-contained from-scratch installation/initialization/operating/recovery instructions. In a resolved worktree it adds non-provider effective config facts and ordered mode-specific advice (stack backend/rollout, virtual or physical rewrites, writer fence, merge actor, automatic admission, terminal-red action, and command budget). Outside a worktree it remains a complete static manual. JSON CLI and MCP expose the same typed `repository` plus `advice` fields.
 - `cara init` / MCP `init` — bounded explicit repository initialization with typed receipts.
 - `cara log [--limit N] [--kind KIND] [--pr N] [--since MS] [--until MS]` — bounded canonical event and hook-delivery journal snapshot.
 - `cara log -f` — foreground existing-tail-then-follow stream; signal-aware and CLI-only.

@@ -11,9 +11,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use caravan::{
-    AGENT_HELP, AppContext, AppError, CheckInput, CreateInput, EvictInput, JoinInput,
-    LockRecoverInput, LockStatusInput, LoopInput, PauseInput, ResumeInput, SplitInput, SyncInput,
-    TOOL_NAME, active_updater_config, build_router,
+    AppContext, AppError, CheckInput, CreateInput, EvictInput, JoinInput, LockRecoverInput,
+    LockStatusInput, LoopInput, PauseInput, ResumeInput, SplitInput, SyncInput, TOOL_NAME,
+    active_updater_config, build_router,
     concat::{ConcatExecuteInput, ConcatInput},
     feedback_config, feedback_configuration_error, feedback_panic_config,
     repair::{
@@ -504,7 +504,7 @@ fn run(cli: &Cli) -> Result<(), i32> {
                 caravan::navigation::Direction::Previous,
             ),
         },
-        Command::Help => run_help(cli.json),
+        Command::Help => run_help(cli),
         Command::Mcp(command) => run_mcp(command, cli.config.as_deref()),
         Command::Update => run_self_update(cli.json, &SelfUpdateCommand::Run),
         Command::SelfUpdate(command) => run_self_update(cli.json, command),
@@ -3850,11 +3850,38 @@ fn run_van_list(cli: &Cli) -> Result<(), i32> {
     }
 }
 
-fn run_help(json: bool) -> Result<(), i32> {
-    if json {
-        return emit_result::<_, AppError>(json, Ok(caravan::help()));
+fn run_help(cli: &Cli) -> Result<(), i32> {
+    let loaded = match cli.repo.as_deref() {
+        Some(repository) => AppContext::load_from_directory(repository, cli.config.as_deref()),
+        None => AppContext::load(cli.config.as_deref()),
+    };
+    let output = match loaded {
+        Ok(context) => caravan::help_for_context(&context),
+        Err(_) if cli.repo.is_none() && cli.config.is_none() => caravan::help(),
+        Err(error) => {
+            return if cli.json {
+                emit_result::<serde_json::Value, _>(true, Err(error))
+            } else {
+                eprintln!("cara: {error}");
+                Err(2)
+            };
+        }
+    };
+    if cli.json {
+        return emit_result::<_, AppError>(true, Ok(output));
     }
-    println!("{AGENT_HELP}");
+    println!("{}", output.instructions);
+    if let Some(repository) = output.repository {
+        println!("\nCURRENT REPOSITORY CONFIGURATION");
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&repository).map_err(|_| 1)?
+        );
+    }
+    println!("\nCONFIG-AWARE NEXT ACTIONS");
+    for (index, advice) in output.advice.iter().enumerate() {
+        println!("{}. {advice}", index + 1);
+    }
     Ok(())
 }
 

@@ -78,6 +78,25 @@ source of truth: every operation rediscovers exact PR, ref, check, label, and
 auto-merge facts; local files are locks, bounded receipts, or disposable
 workspaces, never queue authority.
 
+BOOTSTRAP FROM SCRATCH
+1. Install one immutable Cara release asset for the host platform and verify its
+   published SHA-256 before execution. Record the version/pin in repository
+   policy; never automate mutable `latest`.
+2. Run inside the target Git worktree. `cara help` outside a worktree remains a
+   complete static manual; inside a worktree it appends effective config and
+   mode-specific next actions without contacting GitHub or mutating anything.
+3. Run `cara config check --config .caravan/config.yaml` for an existing file.
+   If no config exists, review the stable defaults and run idempotent `cara init`
+   to create version-1 config plus required labels/settings. Never hand-create
+   only part of initialization.
+4. Run `cara status --json`, then `cara plan sync --all`. Resolve every typed
+   initialization, permission, protection, graph, CI, compatibility, or native
+   Stack problem before `cara sync --all`.
+5. Choose one writer model deliberately. Default virtual Caravan mode does not
+   rewrite source branches. Physical rebasing, native GitHub Stacks, hosted App
+   credentials, remote-fenced writes, auto-admission, parking, and Caravan-owned
+   merging are explicit independent opt-ins described below.
+
 CORE MODEL AND INVARIANTS
 - A caravan is a linear ordered PR chain. Its first member is the head and its
   PR number is the caravan ID.
@@ -1230,14 +1249,116 @@ pub struct HelpOutput {
     pub instructions: String,
     /// Stable contract-source marker; all instructions are embedded.
     pub spec: String,
+    /// Effective local repository/config facts when help runs in a worktree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository: Option<HelpRepositoryContext>,
+    /// Ordered mode-specific next actions derived without provider access.
+    pub advice: Vec<String>,
 }
 
-/// Return agent operating instructions.
+/// Non-secret effective configuration shown by config-aware help.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[allow(clippy::struct_excessive_bools)] // These are independent effective config facts, not state flags.
+pub struct HelpRepositoryContext {
+    pub repository_root: String,
+    pub config_path: String,
+    pub config_existed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository_slug: Option<String>,
+    pub stack_type: config::StackType,
+    pub stack_mutations_opt_in: bool,
+    pub rebase_on_join: bool,
+    pub writer_mode: WriterMode,
+    pub head_merge_actor: model::HeadMergeActor,
+    pub auto_admission: bool,
+    pub terminal_red_action: config::TerminalRedAction,
+    pub command_timeout_secs: u64,
+}
+
+/// Return self-contained baseline instructions outside repository context.
 #[must_use]
 pub fn help() -> HelpOutput {
     HelpOutput {
         instructions: AGENT_HELP.to_owned(),
         spec: SPEC_PATH.to_owned(),
+        repository: None,
+        advice: vec![
+            "Run `cara help` inside the target Git worktree for config-aware guidance; no provider read or mutation is performed.".to_owned(),
+            "From scratch: verify an immutable release checksum, run `cara init`, then `cara status --json` and `cara plan sync --all` before mutation.".to_owned(),
+        ],
+    }
+}
+
+/// Return baseline instructions plus deterministic advice from the loaded local
+/// repository configuration. This performs no provider access.
+#[must_use]
+pub fn help_for_context(context: &AppContext) -> HelpOutput {
+    let config = &context.config;
+    let head_merge_actor = config.sync.head_merge_actor.unwrap_or_default();
+    let mut advice = Vec::new();
+    if context.config_existed {
+        advice.push(format!(
+            "Validated config is `{}`; run `cara status --json` then `cara plan sync --all` before the next write.",
+            context.config_path.display()
+        ));
+    } else {
+        advice.push(format!(
+            "No config exists at `{}`. Review defaults and run idempotent `cara init` before sync.",
+            context.config_path.display()
+        ));
+    }
+    match config.stack_type {
+        config::StackType::Caravan => advice.push(
+            "Effective stack_type=caravan: use virtual/physical Caravan chains; no native Stack API mutation is authorized.".to_owned(),
+        ),
+        config::StackType::Github if !config.stack_rollout.mutations_opt_in => advice.push(
+            "Effective stack_type=github but mutations_opt_in=false: native Stack status is diagnostic only; review rollout and reviewer identity before enabling writes.".to_owned(),
+        ),
+        config::StackType::Github => advice.push(
+            "Native GitHub Stack mutations are opted in: preserve immutable source heads, require complete provider inventory/locks, and use typed recovery/evict/reshape commands rather than raw branch surgery.".to_owned(),
+        ),
+    }
+    advice.push(if config.rebase_on_join {
+        "rebase_on_join=true authorizes exact-leased owned-branch rewrites; inspect patch/tree receipts and never force-push without the typed lease.".to_owned()
+    } else {
+        "rebase_on_join=false keeps source history immutable; resolve incompatibility by owner repair, explicit eviction/reshape, or a reviewed config change.".to_owned()
+    });
+    advice.push(match config.writer.mode {
+        WriterMode::ReadOnly => "writer.mode=read_only: all provider mutations are refused; use status/plan evidence or switch only through reviewed repository policy.".to_owned(),
+        WriterMode::LocalOnly => "writer.mode=local_only: run one trusted local writer; hosted remote mutation is refused.".to_owned(),
+        WriterMode::RemoteFenced => "writer.mode=remote_fenced: every hosted mutation still requires the exact host/writer lease and active App tenancy.".to_owned(),
+    });
+    advice.push(format!(
+        "head_merge_actor={:?}; {}",
+        head_merge_actor,
+        if config.sync.actions.join_unlabelled_prs {
+            "sync --all may admit canonical unlabelled candidates after existing caravans converge."
+        } else {
+            "automatic admission is disabled; use check plus explicit new/join membership."
+        }
+    ));
+    advice.push(format!(
+        "terminal_red.action={:?}; command_timeout_secs={} is one absolute bounded command budget, not permission to bypass a failed check.",
+        config.sync.terminal_red.action, config.command_timeout_secs
+    ));
+    HelpOutput {
+        instructions: AGENT_HELP.to_owned(),
+        spec: SPEC_PATH.to_owned(),
+        repository: Some(HelpRepositoryContext {
+            repository_root: context.repository_path.display().to_string(),
+            config_path: context.config_path.display().to_string(),
+            config_existed: context.config_existed,
+            repository_slug: config.repository.clone(),
+            stack_type: config.stack_type,
+            stack_mutations_opt_in: config.stack_rollout.mutations_opt_in,
+            rebase_on_join: config.rebase_on_join,
+            writer_mode: config.writer.mode,
+            head_merge_actor,
+            auto_admission: config.sync.actions.join_unlabelled_prs,
+            terminal_red_action: config.sync.terminal_red.action,
+            command_timeout_secs: config.command_timeout_secs,
+        }),
+        advice,
     }
 }
 
@@ -1263,8 +1384,10 @@ pub fn build_router() -> ToolRouter<AppContext> {
 
     router.add_typed_tool_with_output_schema(
         "help",
-        "Return concise agent instructions for operating Caravan and recovering from sync decision points.",
-        |_context: &AppContext, _input: EmptyInput| Ok::<_, AppError>(help()),
+        "Return self-contained from-scratch Caravan instructions plus effective repository config and mode-specific next actions without provider access.",
+        |context: &AppContext, _input: EmptyInput| {
+            Ok::<_, AppError>(help_for_context(context))
+        },
     );
     router.add_typed_tool_with_output_schema(
         "init",
@@ -2590,6 +2713,7 @@ mod tests {
     #[test]
     fn help_describes_the_resumable_sync_loop() {
         let output = help();
+        assert!(output.instructions.contains("BOOTSTRAP FROM SCRATCH"));
         assert!(output.instructions.contains("typed decision"));
         assert!(
             output
@@ -2630,6 +2754,65 @@ mod tests {
         );
         assert!(!output.instructions.contains("See SPEC.md"));
         assert_eq!(output.spec, "embedded");
+        assert!(output.repository.is_none());
+        assert!(output.advice.iter().any(|line| line.contains("cara init")));
+    }
+
+    #[test]
+    fn help_adapts_to_effective_repository_configuration_without_provider_io() {
+        let mut context = AppContext {
+            repository_path: PathBuf::from("/srv/example"),
+            config_path: PathBuf::from("/srv/example/.caravan/config.yaml"),
+            config_existed: true,
+            ..AppContext::default()
+        };
+        context.config.repository = Some("owner/example".to_owned());
+        context.config.stack_type = config::StackType::Github;
+        context.config.stack_rollout.mutations_opt_in = true;
+        context.config.stack_rollout.reviewed_by = "operator".to_owned();
+        context.config.rebase_on_join = false;
+        context.config.writer.mode = WriterMode::RemoteFenced;
+        context.config.sync.head_merge_actor = Some(model::HeadMergeActor::Caravan);
+        context.config.sync.actions.join_unlabelled_prs = true;
+        context.config.sync.terminal_red.action = config::TerminalRedAction::Park;
+        context.config.command_timeout_secs = 60;
+
+        let output = help_for_context(&context);
+        let repository = output.repository.expect("config-aware help context");
+        assert_eq!(repository.repository_slug.as_deref(), Some("owner/example"));
+        assert_eq!(repository.stack_type, config::StackType::Github);
+        assert!(repository.stack_mutations_opt_in);
+        assert_eq!(repository.writer_mode, WriterMode::RemoteFenced);
+        assert_eq!(repository.head_merge_actor, model::HeadMergeActor::Caravan);
+        assert!(repository.auto_admission);
+        assert_eq!(
+            repository.terminal_red_action,
+            config::TerminalRedAction::Park
+        );
+        assert!(
+            output
+                .advice
+                .iter()
+                .any(|line| line.contains("Native GitHub Stack mutations are opted in"))
+        );
+        assert!(
+            output
+                .advice
+                .iter()
+                .any(|line| line.contains("remote_fenced"))
+        );
+        assert!(
+            output
+                .advice
+                .iter()
+                .any(|line| line.contains("sync --all may admit"))
+        );
+        assert!(
+            output
+                .advice
+                .iter()
+                .any(|line| line.contains("command_timeout_secs=60"))
+        );
     }
 
     #[test]
