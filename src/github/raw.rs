@@ -531,6 +531,36 @@ pub(super) struct PullRequestJson {
     pub(super) merge_state_status: Option<String>,
 }
 
+/// One bounded GraphQL page after the `gh api --jq` projection has flattened
+/// connection wrappers into the same provider row used by ordinary exact PR
+/// reads. Truncation flags remain outside [`PullRequestJson`] so a partial
+/// labels/checks connection can never masquerade as complete evidence.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct PullRequestPageJson {
+    pub(super) rows: Vec<PagedPullRequestJson>,
+    pub(super) page_info: PullRequestPageInfoJson,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct PagedPullRequestJson {
+    #[serde(flatten)]
+    pub(super) pull_request: PullRequestJson,
+    #[serde(default)]
+    pub(super) labels_truncated: bool,
+    #[serde(default)]
+    pub(super) checks_truncated: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct PullRequestPageInfoJson {
+    pub(super) has_next_page: bool,
+    pub(super) end_cursor: Option<String>,
+    pub(super) total_count: usize,
+}
+
 impl PullRequestJson {
     pub(super) fn generation_fact(&self) -> model::PullRequestGenerationFact {
         crate::generation::parse_generation_fact(

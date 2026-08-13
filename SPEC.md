@@ -279,10 +279,19 @@ sync.
 `candidate_count` measures provider PR snapshots in the current read; it never
 counts Caco board beads. Human status deliberately retains open PRs, recently
 merged Caravan snapshots, and closed active/parked/terminal lifecycle rows, so
-it may greatly exceed GitHub's open-PR count. Mutating `sync`/`plan sync` use a
-separate hot discovery snapshot: all open PRs plus lightweight merged generation
-facts, with merged/closed lifecycle snapshots deferred to later human/cold
-cleanup. Stale historical rows remain unavailable for mutation authority.
+it may greatly exceed GitHub's open-PR count. Open-PR discovery uses complete,
+deterministically ordered GraphQL pages of at most 20 rows; each page consumes
+one ordinary authenticated request/deadline unit. One transient read-only
+502/503/504 may retry once, while writes are never retried. Missing rows or
+cursors, an unfinished page after `open_limit`, more than 100 labels, or more
+than 100 check contexts is typed incomplete provider evidence and refuses before
+mutation. Mutating `sync`/`plan sync` use a separate hot discovery snapshot: all
+open PRs plus lightweight merged generation facts, with merged/closed lifecycle
+snapshots deferred to later human/cold cleanup. Stale historical rows remain
+unavailable for mutation authority. Default-target repair of one exact PR uses
+focused active-topology discovery and an exact candidate reread; a repair naming
+a second target retains full-fleet discovery because both PR generations are
+authoritative.
 
 The CLI status read owns a dedicated 58-second wall-clock budget with a
 2-second serialization reserve and a 5-second post-compatibility reserve; it

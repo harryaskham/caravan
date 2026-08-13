@@ -421,9 +421,17 @@ pub fn start(
         json!({"pr": input.pr, "target_pr": input.target_pr}),
         false,
     )?;
-    let status = crate::read::status(context)?;
-    crate::initialization::require_ready(&status.initialization)?;
     let pr = PrNumber(input.pr);
+    // An ordinary default-branch repair needs the exact candidate plus active
+    // caravan topology, not every unrelated unlabelled PR and its full check
+    // rollup. Preserve full-fleet discovery only when an explicit target PR is
+    // also part of the repair generation (bd-986140).
+    let status = if input.target_pr.is_none() {
+        crate::read::status_for_remote_candidate(context, pr)?
+    } else {
+        crate::read::status(context)?
+    };
+    crate::initialization::require_ready(&status.initialization)?;
     let candidate = status
         .analysis
         .pull_requests

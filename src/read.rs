@@ -3995,7 +3995,9 @@ fn discovery_error(error: &DiscoveryError) -> AppError {
         | DiscoveryError::MissingHeadRepository { .. } => ErrorCategory::Validation,
         DiscoveryError::Runner(_)
         | DiscoveryError::CommandFailed { .. }
-        | DiscoveryError::InvalidJson { .. } => ErrorCategory::ExecutionFailure,
+        | DiscoveryError::InvalidJson { .. }
+        | DiscoveryError::OpenPullRequestsTruncated { .. }
+        | DiscoveryError::ProviderProjectionTruncated { .. } => ErrorCategory::ExecutionFailure,
     };
     AppError::structured(
         category,
@@ -4011,6 +4013,12 @@ fn discovery_phase(command: &crate::command::CommandSpec) -> &'static str {
         "current_branch"
     } else if args.starts_with(&["repo", "view"]) {
         "repository_identity"
+    } else if args.starts_with(&["api", "graphql"])
+        && args
+            .iter()
+            .any(|argument| argument.contains("pullRequests(states:OPEN"))
+    {
+        "open_pull_requests_and_checks"
     } else if args.starts_with(&["api"]) {
         "default_branch_revision"
     } else if args.contains(&"--head") {

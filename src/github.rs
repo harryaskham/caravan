@@ -22,6 +22,11 @@ const PR_HISTORY_JSON_FIELDS: &str = "number,title,state,isDraft,headRefName,hea
 const GENERATION_PR_JSON_FIELDS: &str = "number,body,headRefName,headRefOid,createdAt";
 const WORKFLOW_RUN_JSON_FIELDS: &str =
     "databaseId,headSha,status,conclusion,event,name,workflowName,url";
+/// Open-PR pages stay deliberately small: the former one-shot projection was
+/// observed returning 459 KiB for 53 rows before GitHub intermittently 504ed.
+const OPEN_PR_PAGE_SIZE: usize = 20;
+const OPEN_PR_PAGE_QUERY: &str = r"query($owner:String!,$name:String!,$cursor:String,$pageSize:Int!){repository(owner:$owner,name:$name){pullRequests(states:OPEN,first:$pageSize,after:$cursor,orderBy:{field:CREATED_AT,direction:ASC}){nodes{number title body state isDraft mergeStateStatus headRefName headRefOid headRepository{name nameWithOwner} headRepositoryOwner{login} isCrossRepository baseRefName baseRefOid labels(first:100){nodes{name} pageInfo{hasNextPage}} autoMergeRequest{mergeMethod enabledBy{login}} statusCheckRollup{contexts(first:100){nodes{__typename ... on CheckRun{name status conclusion detailsUrl startedAt completedAt checkSuite{workflowRun{workflow{name}}}} ... on StatusContext{context state targetUrl createdAt}} pageInfo{hasNextPage}}} createdAt mergedAt url updatedAt} totalCount pageInfo{hasNextPage endCursor}}}}";
+const OPEN_PR_PAGE_JQ: &str = r".data.repository.pullRequests as $prs | {rows:[$prs.nodes[] | {number,title,body,state,isDraft,mergeStateStatus,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository,baseRefName,baseRefOid,labels:(.labels.nodes // []),labelsTruncated:(.labels.pageInfo.hasNextPage // false),autoMergeRequest,statusCheckRollup:((.statusCheckRollup.contexts.nodes // []) | map(. + {workflowName:(.checkSuite.workflowRun.workflow.name // null)} | del(.checkSuite))),checksTruncated:(.statusCheckRollup.contexts.pageInfo.hasNextPage // false),createdAt,mergedAt,url,updatedAt}],pageInfo:($prs.pageInfo + {totalCount:$prs.totalCount})}";
 /// Keeps JSON/MCP output and GraphQL cost bounded on pathological repositories.
 const MERGE_CANDIDATE_LIMIT: usize = 100;
 const PARKED_LABEL: &str = "caravan-parked";
@@ -240,6 +245,10 @@ pub enum DiscoveryError {
     },
     /// A query limit was zero.
     InvalidLimit(&'static str),
+    /// The caller's open-PR cap was reached before the provider's final page.
+    OpenPullRequestsTruncated { limit: usize },
+    /// A nested GraphQL connection exceeded the bounded per-PR projection.
+    ProviderProjectionTruncated { pr: u64, field: &'static str },
 }
 
 impl std::fmt::Display for DiscoveryError {
@@ -293,6 +302,14 @@ impl std::fmt::Display for DiscoveryError {
             Self::InvalidLimit(name) => {
                 write!(formatter, "discovery limit `{name}` must be positive")
             }
+            Self::OpenPullRequestsTruncated { limit } => write!(
+                formatter,
+                "open pull request discovery exceeded its complete {limit}-row bound"
+            ),
+            Self::ProviderProjectionTruncated { pr, field } => write!(
+                formatter,
+                "open PR #{pr} exceeded the bounded `{field}` provider projection"
+            ),
         }
     }
 }
@@ -1818,10 +1835,7 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
                 .collect();
             (active, generation_facts)
         } else {
-            self.pull_requests_with_generation(
-                open_pr_command(&repository.slug(), self.options.open_limit),
-                &repository,
-            )?
+            self.open_pull_requests_with_generation(&repository)?
         };
         let current_pr = match &current_branch {
             Some(branch) => {
@@ -2422,6 +2436,109 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
         }
     }
 
+    /// Read every open PR through small provider pages. Each page is a separate
+    /// command so the shared GitHub request budget observes every request; a
+    /// cursor or nested connection that cannot prove completeness fails before
+    /// any downstream mutation can be considered.
+    fn open_pull_requests_with_generation(
+        &self,
+        repository: &RepositoryId,
+    ) -> Result<
+        (
+            Vec<model::PullRequestSnapshot>,
+            Vec<model::PullRequestGenerationFact>,
+        ),
+        DiscoveryError,
+    > {
+        let mut cursor = None;
+        let mut pulls = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut expected_total = None;
+        loop {
+            let remaining = self.options.open_limit.saturating_sub(pulls.len());
+            if remaining == 0 {
+                return Err(DiscoveryError::OpenPullRequestsTruncated {
+                    limit: self.options.open_limit,
+                });
+            }
+            let page_size = remaining.min(OPEN_PR_PAGE_SIZE);
+            let command = open_pr_page_command(repository, cursor.as_deref(), page_size);
+            let page: PullRequestPageJson = self.json_with_transient_read_retry(command.clone())?;
+            if page.page_info.total_count > self.options.open_limit {
+                return Err(DiscoveryError::OpenPullRequestsTruncated {
+                    limit: self.options.open_limit,
+                });
+            }
+            if expected_total
+                .replace(page.page_info.total_count)
+                .is_some_and(|total| total != page.page_info.total_count)
+            {
+                return Err(invalid_open_page(
+                    &command,
+                    "open-PR total changed between provider pages",
+                ));
+            }
+            if page.rows.is_empty() && page.page_info.has_next_page {
+                return Err(invalid_open_page(
+                    &command,
+                    "open-PR page advertised a successor without any rows",
+                ));
+            }
+            for row in page.rows {
+                if !seen.insert(row.pull_request.number) {
+                    return Err(invalid_open_page(
+                        &command,
+                        format!("open-PR page repeated PR #{}", row.pull_request.number),
+                    ));
+                }
+                if row.labels_truncated {
+                    return Err(DiscoveryError::ProviderProjectionTruncated {
+                        pr: row.pull_request.number,
+                        field: "labels",
+                    });
+                }
+                if row.checks_truncated {
+                    return Err(DiscoveryError::ProviderProjectionTruncated {
+                        pr: row.pull_request.number,
+                        field: "statusCheckRollup",
+                    });
+                }
+                pulls.push(row.pull_request);
+            }
+            if !page.page_info.has_next_page {
+                if pulls.len() != page.page_info.total_count {
+                    return Err(invalid_open_page(
+                        &command,
+                        format!(
+                            "open-PR pages returned {} unique rows for provider total {}",
+                            pulls.len(),
+                            page.page_info.total_count
+                        ),
+                    ));
+                }
+                break;
+            }
+            cursor = Some(
+                page.page_info
+                    .end_cursor
+                    .filter(|cursor| !cursor.is_empty())
+                    .ok_or_else(|| {
+                        invalid_open_page(
+                            &command,
+                            "open-PR page omitted its required successor cursor",
+                        )
+                    })?,
+            );
+        }
+
+        let generation_facts = pulls.iter().map(PullRequestJson::generation_fact).collect();
+        let snapshots = pulls
+            .into_iter()
+            .map(|pull_request| pull_request.into_snapshot(repository))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((snapshots, generation_facts))
+    }
+
     fn pull_requests(
         &self,
         command: CommandSpec,
@@ -2493,22 +2610,70 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
 
     fn json<T: DeserializeOwned>(&self, command: CommandSpec) -> Result<T, DiscoveryError> {
         let output = self.runner.run(&command)?;
-        if !output.is_success() {
-            return Err(DiscoveryError::CommandFailed {
-                command,
-                code: output.code,
-                stderr: output.stderr.trim().to_owned(),
-            });
-        }
-        serde_json::from_str(&output.stdout).map_err(|error| DiscoveryError::InvalidJson {
-            command,
-            message: error.to_string(),
-            evidence: Box::new(JsonDecodeEvidence {
-                stdout: diagnostic_excerpt(&output.stdout),
-                stderr: diagnostic_excerpt(&output.stderr),
-            }),
-        })
+        decode_json_output(command, &output)
     }
+
+    /// Retry one transient provider-gateway failure for read-only paginated
+    /// discovery. The command runner accounts for both attempts against the
+    /// existing request/deadline budgets; writes never call this helper.
+    fn json_with_transient_read_retry<T: DeserializeOwned>(
+        &self,
+        command: CommandSpec,
+    ) -> Result<T, DiscoveryError> {
+        debug_assert!(!command.intent().is_write());
+        let first = self.runner.run(&command)?;
+        if first.is_success() || !transient_provider_read_failure(&first.stderr) {
+            return decode_json_output(command, &first);
+        }
+        let second = self.runner.run(&command)?;
+        decode_json_output(command, &second)
+    }
+}
+
+fn decode_json_output<T: DeserializeOwned>(
+    command: CommandSpec,
+    output: &CommandOutput,
+) -> Result<T, DiscoveryError> {
+    if !output.is_success() {
+        return Err(DiscoveryError::CommandFailed {
+            command,
+            code: output.code,
+            stderr: output.stderr.trim().to_owned(),
+        });
+    }
+    serde_json::from_str(&output.stdout).map_err(|error| DiscoveryError::InvalidJson {
+        command,
+        message: error.to_string(),
+        evidence: Box::new(JsonDecodeEvidence {
+            stdout: diagnostic_excerpt(&output.stdout),
+            stderr: diagnostic_excerpt(&output.stderr),
+        }),
+    })
+}
+
+fn invalid_open_page(command: &CommandSpec, message: impl Into<String>) -> DiscoveryError {
+    DiscoveryError::InvalidJson {
+        command: command.clone(),
+        message: message.into(),
+        evidence: Box::new(JsonDecodeEvidence {
+            stdout: String::new(),
+            stderr: String::new(),
+        }),
+    }
+}
+
+fn transient_provider_read_failure(stderr: &str) -> bool {
+    let diagnostic = stderr.to_ascii_lowercase();
+    [
+        "http 502",
+        "http 503",
+        "http 504",
+        "status code: 502",
+        "status code: 503",
+        "status code: 504",
+    ]
+    .iter()
+    .any(|marker| diagnostic.contains(marker))
 }
 
 /// Name one skipped provider record by PR number where the payload supplied one.
@@ -2723,19 +2888,27 @@ fn default_branch_command(repository: &str, branch: &str) -> CommandSpec {
     ])
 }
 
-fn open_pr_command(repository: &str, limit: usize) -> CommandSpec {
-    CommandSpec::new("gh").args([
-        "pr".to_owned(),
-        "list".to_owned(),
-        "--repo".to_owned(),
-        repository.to_owned(),
-        "--state".to_owned(),
-        "open".to_owned(),
-        "--limit".to_owned(),
-        limit.to_string(),
-        "--json".to_owned(),
-        PR_JSON_FIELDS.to_owned(),
-    ])
+fn open_pr_page_command(
+    repository: &RepositoryId,
+    cursor: Option<&str>,
+    page_size: usize,
+) -> CommandSpec {
+    let mut command = CommandSpec::new("gh").args([
+        "api".to_owned(),
+        "graphql".to_owned(),
+        "-f".to_owned(),
+        format!("query={OPEN_PR_PAGE_QUERY}"),
+        "-F".to_owned(),
+        format!("owner={}", repository.owner),
+        "-F".to_owned(),
+        format!("name={}", repository.name),
+        "-F".to_owned(),
+        format!("pageSize={page_size}"),
+    ]);
+    if let Some(cursor) = cursor {
+        command = command.args(["-F".to_owned(), format!("cursor={cursor}")]);
+    }
+    command.args(["--jq".to_owned(), OPEN_PR_PAGE_JQ.to_owned()])
 }
 
 fn pull_request_command(repository: &RepositoryId, selector: &str) -> CommandSpec {
@@ -3372,8 +3545,8 @@ mod tests {
                 CommandOutput::success(r#"{"object":{"sha":"default-sha"}}"#),
             ),
             (
-                open_pr_command("acme/widgets", 1_000),
-                CommandOutput::success(open_prs),
+                open_pr_page_command(&repository(), None, OPEN_PR_PAGE_SIZE),
+                CommandOutput::success(open_pr_page_json(open_prs, false, None, pulls.len())),
             ),
             (
                 merge_candidates_command(&repository(), &pulls),
@@ -3496,6 +3669,111 @@ mod tests {
                 .iter()
                 .all(|pull_request| pull_request.number != PrNumber(99))
         );
+        discovery.runner.assert_exhausted();
+    }
+
+    fn open_pr_page_json(
+        rows: &str,
+        has_next_page: bool,
+        end_cursor: Option<&str>,
+        total_count: usize,
+    ) -> String {
+        let mut rows: Vec<serde_json::Value> = serde_json::from_str(rows).unwrap();
+        for row in &mut rows {
+            row["labelsTruncated"] = serde_json::Value::Bool(false);
+            row["checksTruncated"] = serde_json::Value::Bool(false);
+        }
+        serde_json::json!({
+            "rows": rows,
+            "pageInfo": {
+                "hasNextPage": has_next_page,
+                "endCursor": end_cursor,
+                "totalCount": total_count,
+            }
+        })
+        .to_string()
+    }
+
+    fn pr_rows_json(numbers: std::ops::RangeInclusive<u64>) -> String {
+        let rows = numbers
+            .map(|number| {
+                let row = pr_list_json(number, &format!("feature/{number}"), "acme/widgets", false);
+                row[1..row.len() - 1].to_owned()
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("[{rows}]")
+    }
+
+    #[test]
+    fn open_discovery_pages_fifty_three_rows_and_retries_one_transient_504() {
+        let page_1 = pr_rows_json(1..=20);
+        let page_2 = pr_rows_json(21..=40);
+        let page_3 = pr_rows_json(41..=53);
+        let first = open_pr_page_command(&repository(), None, OPEN_PR_PAGE_SIZE);
+        let runner = FakeRunner::new(vec![
+            (
+                first.clone(),
+                CommandOutput::failure(1, "HTTP 504 Gateway Timeout"),
+            ),
+            (
+                first,
+                CommandOutput::success(open_pr_page_json(&page_1, true, Some("cursor-20"), 53)),
+            ),
+            (
+                open_pr_page_command(&repository(), Some("cursor-20"), OPEN_PR_PAGE_SIZE),
+                CommandOutput::success(open_pr_page_json(&page_2, true, Some("cursor-40"), 53)),
+            ),
+            (
+                open_pr_page_command(&repository(), Some("cursor-40"), OPEN_PR_PAGE_SIZE),
+                CommandOutput::success(open_pr_page_json(&page_3, false, None, 53)),
+            ),
+        ]);
+        let discovery = GitHubDiscovery::new(runner);
+
+        let (pulls, generations) = discovery
+            .open_pull_requests_with_generation(&repository())
+            .expect("bounded pages converge after one transient read failure");
+
+        assert_eq!(pulls.len(), 53);
+        assert_eq!(generations.len(), 53);
+        assert_eq!(pulls.first().unwrap().number, PrNumber(1));
+        assert_eq!(pulls.last().unwrap().number, PrNumber(53));
+        discovery.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn incomplete_open_page_fails_closed_without_a_provider_write() {
+        let first = open_pr_page_command(&repository(), None, OPEN_PR_PAGE_SIZE);
+        assert!(!first.intent().is_write());
+        let second = open_pr_page_command(&repository(), Some("cursor-20"), OPEN_PR_PAGE_SIZE);
+        assert!(!second.intent().is_write());
+        let runner = FakeRunner::new(vec![
+            (
+                first,
+                CommandOutput::success(open_pr_page_json(
+                    &pr_rows_json(1..=20),
+                    true,
+                    Some("cursor-20"),
+                    40,
+                )),
+            ),
+            (
+                second.clone(),
+                CommandOutput::failure(1, "HTTP 504 Gateway Timeout"),
+            ),
+            (
+                second,
+                CommandOutput::failure(1, "HTTP 504 Gateway Timeout"),
+            ),
+        ]);
+        let discovery = GitHubDiscovery::new(runner);
+
+        let error = discovery
+            .open_pull_requests_with_generation(&repository())
+            .expect_err("a missing page is provider uncertainty, never partial discovery");
+
+        assert!(matches!(error, DiscoveryError::CommandFailed { .. }));
         discovery.runner.assert_exhausted();
     }
 
@@ -4143,8 +4421,8 @@ mod tests {
                 CommandOutput::success(r#"{"object":{"sha":"default-sha"}}"#),
             ),
             (
-                open_pr_command("acme/widgets", 1_000),
-                CommandOutput::success(open_json.clone()),
+                open_pr_page_command(&repository, None, OPEN_PR_PAGE_SIZE),
+                CommandOutput::success(open_pr_page_json(&open_json, false, None, 1)),
             ),
             (
                 merge_candidates_command(&repository, &open_pulls),
@@ -4185,19 +4463,40 @@ mod tests {
     }
 
     #[test]
-    fn large_repository_uses_one_open_rollup_and_minimal_history_query() {
+    fn large_repository_pages_open_rollups_and_keeps_history_minimal() {
         let open_prs = large_open_pr_fixture();
+        let mut rows: Vec<serde_json::Value> = serde_json::from_str(&open_prs).unwrap();
+        let second_page = serde_json::to_string(&rows.split_off(20)).unwrap();
+        let first_page = serde_json::to_string(&rows).unwrap();
         let mut calls = successful_discovery_calls(&open_prs);
+        calls.splice(
+            4..5,
+            [
+                (
+                    open_pr_page_command(&repository(), None, OPEN_PR_PAGE_SIZE),
+                    CommandOutput::success(open_pr_page_json(
+                        &first_page,
+                        true,
+                        Some("cursor-20"),
+                        30,
+                    )),
+                ),
+                (
+                    open_pr_page_command(&repository(), Some("cursor-20"), OPEN_PR_PAGE_SIZE),
+                    CommandOutput::success(open_pr_page_json(&second_page, false, None, 30)),
+                ),
+            ],
+        );
         calls.push((
             branch_pr_history_command("acme/widgets", "feature/widget", 100),
             CommandOutput::success("[]"),
         ));
         assert_eq!(
             calls.len(),
-            11,
-            "non-PR branches add only one bounded history lookup beyond lifecycle discovery"
+            12,
+            "non-PR branches add one history lookup after two bounded open pages"
         );
-        let merged_command = &calls[6].0;
+        let merged_command = &calls[7].0;
         let projection = merged_command.args.last().unwrap();
         assert!(!projection.contains("statusCheckRollup"));
 
@@ -4444,8 +4743,8 @@ mod tests {
                 CommandOutput::success(r#"{"object":{"sha":"default-sha"}}"#),
             ),
             (
-                open_pr_command("acme/widgets", 1_000),
-                CommandOutput::success("[]"),
+                open_pr_page_command(&repository(), None, OPEN_PR_PAGE_SIZE),
+                CommandOutput::success(open_pr_page_json("[]", false, None, 0)),
             ),
             (
                 merge_candidates_command(&repository(), &[]),
