@@ -1291,9 +1291,18 @@ MCP tools are `pause_recovery_prepare`, `pause_recovery_checkpoint_base`,
 `data` envelope. See `SPEC.md` for the complete contract.
 
 ```sh
-cara loop --once --json     # one bounded sync --all tick for agents/schedulers
-cara loop                   # foreground human stream until SIGINT/SIGTERM
+cara sync --all --json | jq -r '.summary'  # one terse success/error sentence for cron/TTS
+cara loop --once --json                    # one bounded sync --all tick for agents/schedulers
+cara loop                                  # foreground human stream until SIGINT/SIGTERM
 ```
+
+A real `sync --json` envelope adds the top-level string `summary` without
+changing the standard `status`, `meta`, `data`, or `error` fields. Successful
+summaries lead with material typed receipts—PRs merged, joined, evicted, closed,
+reopened, or rebased—and omit zero counts. A no-op says so once and a
+non-healthy scheduler disposition adds only its terse continuation. Failed
+syncs use the same `.summary` path with one bounded, newline-free error sentence,
+so cron wrappers never parse Cara's human renderer or unbounded error evidence.
 
 The unbounded loop is deliberately not an MCP tool. Every tick starts from fresh
 GitHub state, and a decision-point/error tick fires its configured hook and stops

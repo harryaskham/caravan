@@ -545,14 +545,17 @@ fn load_context(cli: &Cli) -> Result<AppContext, i32> {
     emit_context_error(cli, loaded)
 }
 
-fn load_sync_context(cli: &Cli) -> Result<AppContext, i32> {
-    let loaded = match cli.repo.as_deref() {
+fn resolve_sync_context(cli: &Cli) -> Result<AppContext, caravan::config::ConfigError> {
+    match cli.repo.as_deref() {
         Some(repository) => {
             AppContext::load_for_sync_from_directory(repository, cli.config.as_deref())
         }
         None => AppContext::load_for_sync(cli.config.as_deref()),
-    };
-    emit_context_error(cli, loaded)
+    }
+}
+
+fn load_sync_context(cli: &Cli) -> Result<AppContext, i32> {
+    emit_context_error(cli, resolve_sync_context(cli))
 }
 
 fn emit_context_error(
@@ -1923,7 +1926,15 @@ fn run_pause_recovery(cli: &Cli, command: &PauseRecoveryCommand) -> Result<(), i
 }
 
 fn run_sync(cli: &Cli, input: &SyncInput) -> Result<(), i32> {
-    let context = load_sync_context(cli)?;
+    let context = match resolve_sync_context(cli) {
+        Ok(context) => context,
+        Err(error) if cli.json && !input.dry_run => {
+            return emit_sync_json_result::<serde_json::Value, _>(Err(error), |_| {
+                unreachable!("an absent sync context cannot produce a success value")
+            });
+        }
+        Err(error) => return emit_context_error(cli, Err(error)).map(|_| unreachable!()),
+    };
     // A dry-run must be reachable from the mutating command itself. Routing it
     // here keeps exactly one planner rather than a second, drift-prone preview.
     if input.dry_run {
@@ -1950,7 +1961,7 @@ fn run_sync(cli: &Cli, input: &SyncInput) -> Result<(), i32> {
         })
     };
     if cli.json {
-        return emit_result(true, result);
+        return emit_sync_json_result(result, sync_summary);
     }
     match result {
         Ok(output) => {
@@ -2800,6 +2811,206 @@ fn render_sync_plan(output: &caravan::sync::SyncPlanOutput) -> String {
         );
     }
     text
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SyncSummaryFacts {
+    merged: usize,
+    joined: usize,
+    evicted: usize,
+    closed: usize,
+    reopened: usize,
+    rebased: usize,
+    changed: bool,
+    disposition: caravan::sync::SchedulerDisposition,
+    waiting: usize,
+    held: usize,
+}
+
+impl SyncSummaryFacts {
+    fn from_output(output: &caravan::sync::SyncOutput) -> Self {
+        use caravan::model::{EventKind, MutationKind, MutationStepState};
+        use caravan::sync::ClosedLifecycleDisposition;
+
+        let mut merged = output
+            .receipt
+            .completed_steps
+            .iter()
+            .filter(|step| {
+                step.kind == MutationKind::SquashMerge && step.state == MutationStepState::Completed
+            })
+            .filter_map(|step| step.pr)
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut closed = std::collections::BTreeSet::new();
+        let mut reopened = std::collections::BTreeSet::new();
+        for transition in &output.closed_lifecycle_transitions {
+            match transition.disposition {
+                ClosedLifecycleDisposition::Merged => {
+                    merged.insert(transition.pr);
+                }
+                ClosedLifecycleDisposition::ClosedUnmerged => {
+                    closed.insert(transition.pr);
+                }
+                ClosedLifecycleDisposition::Reopened => {
+                    reopened.insert(transition.pr);
+                }
+            }
+        }
+        let evicted = output
+            .events
+            .iter()
+            .filter(|event| event.kind == EventKind::Evicted)
+            .flat_map(|event| event.prs.iter().copied())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        let rebased = output
+            .rebase_receipts
+            .iter()
+            .map(|receipt| receipt.pr)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        Self {
+            merged: merged.len(),
+            joined: output.tick.joins,
+            evicted,
+            closed: closed.len(),
+            reopened: reopened.len(),
+            rebased,
+            changed: output.receipt.changed,
+            disposition: output.scheduler_status.disposition,
+            waiting: output.scheduler_status.waiting_prs.len(),
+            held: output.scheduler_status.held_caravans.len(),
+        }
+    }
+
+    fn render(self) -> String {
+        use caravan::sync::SchedulerDisposition;
+
+        let mut outcomes = Vec::new();
+        push_pr_outcome(&mut outcomes, "merged", self.merged);
+        push_pr_outcome(&mut outcomes, "joined", self.joined);
+        push_pr_outcome(&mut outcomes, "evicted", self.evicted);
+        push_pr_outcome(&mut outcomes, "closed", self.closed);
+        push_pr_outcome(&mut outcomes, "reopened", self.reopened);
+        push_pr_outcome(&mut outcomes, "rebased", self.rebased);
+        if outcomes.is_empty() {
+            outcomes.push(if self.changed {
+                "updated queue state".to_owned()
+            } else {
+                "no changes".to_owned()
+            });
+        }
+        match self.disposition {
+            SchedulerDisposition::Healthy => {}
+            SchedulerDisposition::WaitingCi => outcomes.push(if self.waiting == 0 {
+                "waiting on CI".to_owned()
+            } else {
+                format!(
+                    "waiting on CI for {} {}",
+                    self.waiting,
+                    pr_word(self.waiting)
+                )
+            }),
+            SchedulerDisposition::Held => outcomes.push(if self.held == 0 {
+                "queue held".to_owned()
+            } else {
+                format!(
+                    "{} {} held",
+                    self.held,
+                    if self.held == 1 {
+                        "caravan"
+                    } else {
+                        "caravans"
+                    }
+                )
+            }),
+            SchedulerDisposition::RetryTick => outcomes.push("another tick required".to_owned()),
+            SchedulerDisposition::ExternalDecision => {
+                outcomes.push("external decision required".to_owned());
+            }
+            SchedulerDisposition::OperatorAction => {
+                outcomes.push("operator action required".to_owned());
+            }
+        }
+        format!("Cara sync succeeded: {}.", outcomes.join(", "))
+    }
+}
+
+fn pr_word(count: usize) -> &'static str {
+    if count == 1 { "PR" } else { "PRs" }
+}
+
+fn push_pr_outcome(outcomes: &mut Vec<String>, action: &str, count: usize) {
+    if count > 0 {
+        outcomes.push(format!("{action} {count} {}", pr_word(count)));
+    }
+}
+
+fn sync_summary(output: &caravan::sync::SyncOutput) -> String {
+    SyncSummaryFacts::from_output(output).render()
+}
+
+fn one_line_summary_message(message: &str) -> String {
+    const MAX_CHARS: usize = 240;
+    let normalized = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut characters = normalized.chars();
+    let mut bounded = characters.by_ref().take(MAX_CHARS).collect::<String>();
+    if characters.next().is_some() {
+        bounded.push('…');
+    }
+    bounded
+}
+
+fn sync_error_summary(error: &impl StructuredError) -> String {
+    let message = one_line_summary_message(&error.message());
+    if message.is_empty() {
+        "Cara sync failed.".to_owned()
+    } else if message.ends_with(['.', '!', '?', '…']) {
+        format!("Cara sync failed: {message}")
+    } else {
+        format!("Cara sync failed: {message}.")
+    }
+}
+
+/// Emit the normal mcp-cli envelope plus one additive scheduler-facing field.
+///
+/// Keeping `summary` at the top level lets a cron use only `jq -r .summary`
+/// for both success and failure. The existing status/meta/data/error contract
+/// remains shaped as before, and the sentence comes only from typed
+/// output/error facts rather than rendered terminal text.
+fn sync_json_envelope<T, E>(
+    result: Result<T, E>,
+    success_summary: impl FnOnce(&T) -> String,
+) -> Result<(serde_json::Value, bool), serde_json::Error>
+where
+    T: Serialize,
+    E: StructuredError,
+{
+    let failed = result.is_err();
+    let summary = match &result {
+        Ok(output) => success_summary(output),
+        Err(error) => sync_error_summary(error),
+    };
+    let mut envelope = serde_json::to_value(mcp_cli::envelope_from_result(result))?;
+    envelope
+        .as_object_mut()
+        .expect("mcp-cli envelopes serialize as JSON objects")
+        .insert("summary".to_owned(), serde_json::Value::String(summary));
+    Ok((envelope, failed))
+}
+
+fn emit_sync_json_result<T, E>(
+    result: Result<T, E>,
+    success_summary: impl FnOnce(&T) -> String,
+) -> Result<(), i32>
+where
+    T: Serialize,
+    E: StructuredError,
+{
+    let (envelope, failed) = sync_json_envelope(result, success_summary).map_err(|_| 1)?;
+    serde_json::to_writer(io::stdout().lock(), &envelope).map_err(|_| 1)?;
+    println!();
+    if failed { Err(1) } else { Ok(()) }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -4303,6 +4514,73 @@ provider.wait()
             session_pids(descendant_session).is_empty(),
             "watchdog session {descendant_session} retained a process after envelope-safe cleanup"
         );
+    }
+
+    fn summary_facts(disposition: caravan::sync::SchedulerDisposition) -> SyncSummaryFacts {
+        SyncSummaryFacts {
+            merged: 0,
+            joined: 0,
+            evicted: 0,
+            closed: 0,
+            reopened: 0,
+            rebased: 0,
+            changed: false,
+            disposition,
+            waiting: 0,
+            held: 0,
+        }
+    }
+
+    #[test]
+    fn sync_summary_is_terse_for_a_healthy_noop() {
+        assert_eq!(
+            summary_facts(caravan::sync::SchedulerDisposition::Healthy).render(),
+            "Cara sync succeeded: no changes."
+        );
+    }
+
+    #[test]
+    fn sync_summary_leads_with_material_outcomes_and_omits_zeroes() {
+        let summary = SyncSummaryFacts {
+            merged: 2,
+            joined: 1,
+            evicted: 0,
+            rebased: 3,
+            waiting: 4,
+            ..summary_facts(caravan::sync::SchedulerDisposition::WaitingCi)
+        }
+        .render();
+
+        assert_eq!(
+            summary,
+            "Cara sync succeeded: merged 2 PRs, joined 1 PR, rebased 3 PRs, waiting on CI for 4 PRs."
+        );
+        assert!(!summary.contains('0'));
+    }
+
+    #[test]
+    fn sync_json_success_keeps_the_envelope_and_adds_top_level_summary() {
+        let result: Result<serde_json::Value, AppError> =
+            Ok(serde_json::json!({"receipt": "typed"}));
+        let (envelope, failed) =
+            sync_json_envelope(result, |_| "Cara sync succeeded: merged 1 PR.".to_owned()).unwrap();
+
+        assert!(!failed);
+        assert_eq!(envelope["status"], "success");
+        assert_eq!(envelope["data"]["receipt"], "typed");
+        assert_eq!(envelope["summary"], "Cara sync succeeded: merged 1 PR.");
+    }
+
+    #[test]
+    fn sync_error_summary_is_one_line_and_bounded() {
+        let message = format!("provider\nfailed   after {}", "x".repeat(300));
+        let error = AppError::execution("provider_failed", message, None);
+        let summary = sync_error_summary(&error);
+
+        assert!(summary.starts_with("Cara sync failed: provider failed after "));
+        assert!(!summary.contains('\n'));
+        assert!(summary.ends_with('…'));
+        assert!(summary.chars().count() <= 259);
     }
 
     #[test]
