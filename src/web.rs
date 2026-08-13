@@ -74,11 +74,19 @@ type WebhookHmac = Hmac<Sha256>;
 #[allow(clippy::struct_excessive_bools)]
 pub struct WebInput {
     /// Pre-provisioned repository/worktree path to manage. Repeatable.
-    #[arg(long = "repo", value_name = "PATH")]
+    #[arg(
+        long = "repo",
+        value_name = "PATH",
+        required_unless_present = "hosted_repositories"
+    )]
     pub repositories: Vec<PathBuf>,
 
     /// Exact GitHub OWNER/NAME to materialize into one isolated hosted job clone.
-    #[arg(long = "hosted-repository", value_name = "OWNER/NAME")]
+    #[arg(
+        long = "hosted-repository",
+        value_name = "OWNER/NAME",
+        required_unless_present = "repositories"
+    )]
     pub hosted_repositories: Vec<String>,
 
     /// Private root for bounded hosted object reuse and job-owned worktrees.
