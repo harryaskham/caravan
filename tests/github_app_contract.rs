@@ -72,6 +72,13 @@ fn github_app_contract_keeps_ambient_default_and_names_unfinished_proofs() {
         // bd-a79679: the conditional Stack-lock upgrade must stay explicitly
         // documented as opt-in, never a baseline permission.
         "Administration: write",
+        // bd-cf12b2: hosted clone bootstrap stays explicit, isolated, and
+        // subordinate to the existing mutation lease.
+        "--hosted-repository OWNER/NAME",
+        "--dissociate",
+        "holderless",
+        "remote_fenced",
+        "CARA_GITHUB_INSTALLATION_ID",
     ] {
         assert!(GUIDE.contains(required), "guide omitted `{required}`");
     }

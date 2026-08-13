@@ -341,21 +341,45 @@ CARA_GITHUB_WEBHOOK_SECRET=... cara web --repo . \
 CARA_GITHUB_WEBHOOK_SECRET=... cara web --repo /srv/a --repo /srv/b \
   --github-webhook-secret-env CARA_GITHUB_WEBHOOK_SECRET \
   --github-installation-id 12345 --webhook-sync --hosted
+CARA_GITHUB_AUTH_MODE=app_installation \
+CARA_GITHUB_APP_SLUG=cara-app \
+CARA_GITHUB_INSTALLATION_ID=12345 \
+CARA_GITHUB_WEBHOOK_SECRET=... cara web --hosted \
+  --hosted-repository owner/a --hosted-repository owner/b \
+  --hosted-clone-cache-root /srv/cara/clones \
+  --github-webhook-secret-env CARA_GITHUB_WEBHOOK_SECRET \
+  --github-installation-id 12345 --webhook-sync
 ```
 
-`--hosted` is the optional deployment contract for pre-provisioned checkouts: it
-requires signed webhooks, one exact installation, `--webhook-sync`, and per-repo
-`app_installation` auth plus `remote_fenced` writer with an exact slug. Ambient
-auth, `local_only`, mixed installations, or `--read-only` fail closed at startup.
-Hosted workers mutate only from verified webhook deliveries; interactive
-dashboard mutations are refused, because the same-origin CSRF token is not
-authentication. It provisions no clones and performs no failover; see
-[`docs/github-app.md`](docs/github-app.md). Default `cara web` is unchanged.
+`--hosted` is the optional deployment contract for pre-provisioned checkouts or
+explicit `OWNER/NAME` repositories materialized through a bounded private clone
+cache. Both require signed webhooks, one exact installation, `--webhook-sync`,
+and per-repo `app_installation` auth plus `remote_fenced` writer with an exact
+slug. Ambient auth, `local_only`, mixed installations, or `--read-only` fail
+closed at startup. Hosted clone inputs additionally require
+`--hosted-clone-cache-root`; cache bytes, age, entries, and concurrent jobs have
+explicit bounds. Because this occurs before repository config is readable, the
+bootstrap environment must explicitly select `app_installation`, App slug, and
+the same installation ID; missing/mismatched values fail before network access.
+Cara then probes the exact remote default generation through its
+repository-scoped App credential broker, reuses only an identity-bound bare
+object hint, and gives each job a unique dissociated clone with no persisted
+credential helper or object alternate. Holderless crash paths are reaped under
+OS locks; active jobs are preserved. Hosted workers still mutate only from
+verified webhook deliveries under the existing remote-fenced writer lease;
+interactive dashboard mutations are refused. It performs no automatic writer
+failover; see [`docs/github-app.md`](docs/github-app.md). Default and
+pre-provisioned `cara web` behavior is unchanged.
 
-Repository inputs are explicit filesystem paths rather than slugs because every
-read and mutation remains bound to that exact worktree, config, operation lock,
-and provider identity. The server defaults to `127.0.0.1:4774` and accepts an
-explicit bind address through `--listen ADDRESS`; it canonicalizes and
+Local repository inputs remain explicit filesystem paths. Hosted clone inputs
+are exact provider slugs, but every read and mutation is still bound to the
+resulting canonical job-owned worktree, config, operation lock, provider
+identity, and remote writer fence. Dashboard state exposes one secret-free
+`hosted_clones` receipt per materialized repository: cache hit/miss and bytes,
+job/cache identity, exact expected head/default/object format, elapsed time,
+cleanup count, and successful ref/credential-transport assertions. The server
+defaults to `127.0.0.1:4774` and accepts an explicit bind address through
+`--listen ADDRESS`; it canonicalizes and
 deduplicates paths and periodically returns the same typed status
 used by CLI/JSON/MCP, and applies strict CSP/anti-frame/no-store headers. The
 responsive one-page dashboard renders trail-linked caravans, linked GitHub PRs,
