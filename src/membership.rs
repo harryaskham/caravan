@@ -629,6 +629,72 @@ fn require_current_join_root(status: &StatusOutput, target: &JoinTarget) -> Resu
     ))
 }
 
+fn revalidate_native_admission_generation(
+    status: &StatusOutput,
+    candidate: &PullRequestSnapshot,
+    eligibility: &CheckOutput,
+    provider: &impl MembershipProvider,
+) -> Result<(), AppError> {
+    if eligibility.admission_compatibility_authorization.is_none() {
+        return Ok(());
+    }
+    let fresh = provider
+        .refetch_pull_request(&status.repository, candidate.number)
+        .map_err(|error| {
+            AppError::structured(
+                ErrorCategory::ExecutionFailure,
+                "native_admission_candidate_revalidation_failed",
+                "could not re-read the native admission candidate immediately before mutation",
+                Some(json!({
+                    "pr": candidate.number,
+                    "error": error.to_string(),
+                    "mutated": false,
+                })),
+            )
+        })?;
+    let candidate_changed = fresh.number != candidate.number
+        || fresh.state != candidate.state
+        || fresh.draft != candidate.draft
+        || fresh.head != candidate.head
+        || fresh.base != candidate.base
+        || fresh.cross_repository != candidate.cross_repository
+        || fresh.labels != candidate.labels
+        || fresh.auto_merge != candidate.auto_merge;
+    if candidate_changed {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "native_admission_candidate_generation_changed",
+            "native admission candidate changed after its exact provider/Git proof",
+            Some(json!({
+                "pr": candidate.number,
+                "expected": candidate,
+                "observed": fresh,
+                "mutated": false,
+                "safe_next_action": "rediscover the exact candidate/default generation and rerun without rewriting the candidate head",
+            })),
+        ));
+    }
+    provider
+        .verify_branch_head(
+            &status.repository,
+            &status.analysis.fleet.default_branch.name,
+            &status.analysis.fleet.default_branch.oid,
+        )
+        .map_err(|error| {
+            AppError::structured(
+                ErrorCategory::Validation,
+                "native_admission_default_generation_changed",
+                "default branch changed after the native admission proof",
+                Some(json!({
+                    "expected_default": status.analysis.fleet.default_branch,
+                    "error": error.to_string(),
+                    "mutated": false,
+                    "safe_next_action": "rediscover current default and rerun the same immutable-head admission",
+                })),
+            )
+        })
+}
+
 fn revalidate_generation_before_membership(
     status: &StatusOutput,
     candidate: PrNumber,
@@ -1758,13 +1824,14 @@ fn execute_locked(
     } else {
         None
     };
-    let execution = execute_with_rebase_guard(
+    let execution = execute_with_rebase_guard_and_config(
         status,
         &checker,
         &provider,
         request.clone(),
         rebase_receipt.as_ref(),
         context.config.sync.actions.join_unlabelled_prs,
+        Some(context),
     )
     .map_err(|error| attach_rebase_receipt(error, rebase_receipt.as_ref()));
     let mut output = match execution {
@@ -1912,6 +1979,10 @@ fn execute_locked(
         BTreeMap::from([
             ("receipt".to_owned(), json!(output.receipt)),
             ("join_receipt".to_owned(), json!(output.join_receipt)),
+            (
+                "admission_compatibility_authorization".to_owned(),
+                json!(output.admission_compatibility_authorization),
+            ),
         ]),
     );
     output.events.push(event);
@@ -2024,15 +2095,63 @@ pub(crate) fn fnv1a64(bytes: &[u8]) -> String {
 }
 
 fn membership_config_fingerprint(context: &AppContext) -> String {
+    membership_config_fingerprint_for(&context.config)
+}
+
+fn membership_config_fingerprint_for(config: &crate::config::CaravanConfig) -> String {
     let contract = serde_json::to_vec(&json!({
-        "version": context.config.version,
-        "rebase_on_join": context.config.rebase_on_join,
-        "force_merge": context.config.force_merge,
-        "agent_priority_labels": &context.config.agent_priority_labels,
-        "sync": &context.config.sync,
+        "version": config.version,
+        "stack_type": config.stack_type,
+        "stack_rollout": &config.stack_rollout,
+        "max_caravan_length": config.max_caravan_length,
+        "rebase_on_join": config.rebase_on_join,
+        "force_merge": config.force_merge,
+        "agent_priority_labels": &config.agent_priority_labels,
+        "sync": &config.sync,
     }))
     .expect("validated config serializes");
     fnv1a64(&contract)
+}
+
+fn revalidate_membership_config(context: &AppContext) -> Result<(), AppError> {
+    let path = if context.config_path.is_absolute() {
+        context.config_path.clone()
+    } else {
+        context.repository_path.join(&context.config_path)
+    };
+    let observed = if path.exists() {
+        crate::config::CaravanConfig::load(&path).map_err(|error| {
+            AppError::structured(
+                ErrorCategory::Validation,
+                "membership_config_revalidation_failed",
+                "could not re-read membership configuration before mutation",
+                Some(json!({
+                    "config_path": path,
+                    "error": error.to_string(),
+                    "mutated": false,
+                })),
+            )
+        })?
+    } else {
+        crate::config::CaravanConfig::default()
+    };
+    let expected = membership_config_fingerprint(context);
+    let actual = membership_config_fingerprint_for(&observed);
+    if expected == actual {
+        return Ok(());
+    }
+    Err(AppError::structured(
+        ErrorCategory::Validation,
+        "membership_config_generation_changed",
+        "membership configuration changed after admission preflight",
+        Some(json!({
+            "config_path": path,
+            "expected_config_fingerprint": expected,
+            "observed_config_fingerprint": actual,
+            "mutated": false,
+            "safe_next_action": "rediscover candidate/default/config generations and rerun the same admission",
+        })),
+    ))
 }
 
 fn attach_rebase_receipt(
@@ -2121,14 +2240,35 @@ fn execute(
     execute_with_rebase_guard(status, checker, provider, request, None, false)
 }
 
-#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
+#[cfg(test)]
 fn execute_with_rebase_guard(
+    status: StatusOutput,
+    checker: &impl CompatibilityChecker,
+    provider: &impl MembershipProvider,
+    request: MembershipRequest,
+    expected_rebase: Option<&crate::physical_rebase::RebaseReceipt>,
+    require_auto_admission_skip: bool,
+) -> Result<MembershipOutput, AppError> {
+    execute_with_rebase_guard_and_config(
+        status,
+        checker,
+        provider,
+        request,
+        expected_rebase,
+        require_auto_admission_skip,
+        None,
+    )
+}
+
+#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
+fn execute_with_rebase_guard_and_config(
     mut status: StatusOutput,
     checker: &impl CompatibilityChecker,
     provider: &impl MembershipProvider,
     request: MembershipRequest,
     expected_rebase: Option<&crate::physical_rebase::RebaseReceipt>,
     require_auto_admission_skip: bool,
+    context: Option<&AppContext>,
 ) -> Result<MembershipOutput, AppError> {
     if request
         .reason
@@ -2238,6 +2378,13 @@ fn execute_with_rebase_guard(
     let eligibility =
         preflight_eligibility(&status, &candidate, &request, target.as_ref(), checker)?;
     revalidate_generation_before_membership(&status, candidate.number, provider)?;
+    revalidate_native_admission_generation(&status, &candidate, &eligibility, provider)?;
+    if eligibility.admission_compatibility_authorization.is_some()
+        && let Some(context) = context
+        && context.config_existed
+    {
+        revalidate_membership_config(context)?;
+    }
     let before_labels = candidate.labels.clone();
     let admission_priority_basis = desired_priority_label.map_or_else(
         || {

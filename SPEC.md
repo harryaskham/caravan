@@ -349,6 +349,25 @@ when the list is empty, states explicitly that this is not a lifetime claim.
 - `cara check --pr N` — re-read and preflight exact remote PR `N` without changing checkout, branch, base, labels, or auto-merge. The receipt consumes the canonical provider candidate identity/freshness schema and includes exact head/base repositories and OIDs, draft/labels/auto-merge state, enrollment and canonical-order state, compatibility/conflicting paths, and one mechanical next action: `new`, `join`, `repair`, `wait`, or `reject`. When targetless check recommends the unique visible caravan, `mode`, `caravan_id`, `target_pr`, compatibility, and typed admission intent all describe that same join; it never flips only `next_action` on a new-caravan receipt. A provider head/ref race fails closed with exact old/new evidence.
 
 Candidate freshness is always measured against a live provider generation, never against the pull request's own recorded base. GitHub keeps serving the base a PR was opened or last synced against, so a default-based candidate is compared to the current default tip; every identity records that `compared_base` generation so a consumer can verify the claim instead of trusting it. A recorded base superseded by the current tip is `stale_base` with an explicit reason, including when the synthetic merge ref is missing or has unexpected topology.
+
+Native immutable-Stack admission has one exact stale-base recovery. An empty
+fleet models the exact current default branch as the new root's virtual tail;
+an ordinary join uses its selected live tail. Either path may accept only a
+two-parent synthetic candidate whose second parent is the exact immutable source
+head, whose compared base is the exact current default, and whose same-repository
+candidate/base/target identities are complete. A stale first parent then
+requires complete unfiltered exact-remote Git objects and one independently
+clean merge-tree report from candidate to the real/virtual tail, with the
+report's merge base equal to that observed stale first parent. Immediately
+before mutation Cara re-reads the candidate, verifies the exact current default
+ref, and verifies the loaded native membership configuration fingerprint;
+movement or configuration drift invalidates the proof. Stale heads, missing or
+partial objects, forks, conflicts, moved candidate/default generations,
+non-empty-fleet `new`, or native Stack mapping drift never gain this authority.
+The typed receipt emits `provider_identity` for current provider lineage and
+`exact_git_proof` for stale-base recovery, preserving the stale identity and
+independent compatibility evidence. Candidate source heads are never rewritten.
+
 - `cara check [--pr N] --tail-pr T` — check whether the selected remote/current PR can join after exact tail `T`.
 - `cara check [--pr N] --head-pr H` — resolve caravan `H`, then check against its current tail.
 

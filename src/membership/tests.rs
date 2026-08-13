@@ -17,6 +17,8 @@ struct FakeProvider {
     generation_facts: RefCell<Vec<crate::model::PullRequestGenerationFact>>,
     generation_relations:
         RefCell<BTreeMap<(CommitOid, CommitOid), crate::generation::CommitRelation>>,
+    branch_heads: RefCell<BTreeMap<String, CommitOid>>,
+    audits: RefCell<Vec<ControlLabelAudit>>,
     fail_kind: RefCell<Option<MutationKind>>,
 }
 
@@ -34,6 +36,8 @@ impl FakeProvider {
             ),
             generation_facts: RefCell::new(Vec::new()),
             generation_relations: RefCell::new(BTreeMap::new()),
+            branch_heads: RefCell::new(BTreeMap::new()),
+            audits: RefCell::new(Vec::new()),
             fail_kind: RefCell::new(None),
         }
     }
@@ -101,9 +105,18 @@ impl MembershipProvider for FakeProvider {
     fn verify_branch_head(
         &self,
         _repository: &RepositoryId,
-        _branch: &str,
-        _expected: &CommitOid,
+        branch: &str,
+        expected: &CommitOid,
     ) -> Result<(), MutationError> {
+        if let Some(actual) = self.branch_heads.borrow().get(branch)
+            && actual != expected
+        {
+            return Err(MutationError::BranchHeadMismatch {
+                branch: branch.to_owned(),
+                expected: expected.clone(),
+                actual: actual.clone(),
+            });
+        }
         Ok(())
     }
 
@@ -183,8 +196,9 @@ impl MembershipProvider for FakeProvider {
         &self,
         _repository: &RepositoryId,
         expected: &PullRequestPrecondition,
-        _audit: &ControlLabelAudit,
+        audit: &ControlLabelAudit,
     ) -> Result<GitHubMutationReceipt, MutationError> {
+        self.audits.borrow_mut().push(audit.clone());
         self.mutate(expected, MutationKind::Comment, |_| {})
     }
 
@@ -339,6 +353,202 @@ fn status(current: PullRequestSnapshot, others: Vec<PullRequestSnapshot>) -> Sta
         pauses: Vec::new(),
         sync_budget: crate::sync::SyncBudgetStatus::default(),
     }
+}
+
+fn authorized_eligibility(candidate: &PullRequestSnapshot) -> CheckOutput {
+    let identity = crate::model::MergeCandidateIdentity {
+        pr: candidate.number,
+        provider_updated_at: "2026-01-01T00:00:00Z".to_owned(),
+        observed_at: "2026-01-01T00:00:01Z".to_owned(),
+        base: candidate.base.clone(),
+        head: candidate.head.clone(),
+        synthetic: None,
+        auto_merge: crate::model::NativeAutoMergeState {
+            enabled: false,
+            merge_method: None,
+            actor: None,
+        },
+        freshness: crate::model::MergeCandidateFreshness::Fresh,
+        compared_base: Some(branch("main")),
+        stale_base: false,
+        stale_head: false,
+        stale_reasons: Vec::new(),
+    };
+    CheckOutput {
+        provider_api: crate::model::GitHubApiTelemetry::default(),
+        rebase_on_join: crate::read::RebaseOnJoinStatus::default(),
+        mode: crate::read::CheckMode::NewCaravan,
+        current_pr: candidate.number,
+        candidate: candidate.clone(),
+        head_repository_owner: candidate.head.repository.owner.clone(),
+        merge_candidate: Some(identity.clone()),
+        admission_compatibility_authorization: Some(
+            crate::read::AdmissionCompatibilityAuthorization::ProviderIdentity {
+                identity: Box::new(identity),
+            },
+        ),
+        enrolled: false,
+        canonical_candidate: true,
+        admission_note: None,
+        admission_intent: None,
+        next_action: crate::read::CandidateNextAction::New,
+        caravan_id: Some(candidate.number),
+        target_pr: None,
+        eligible: true,
+        compatibility: Vec::new(),
+        squash_reconciliations: Vec::new(),
+        problems: Vec::new(),
+        initialization: crate::initialization::InitializationStatus::default(),
+    }
+}
+
+fn stale_native_identity(candidate: &PullRequestSnapshot) -> crate::model::MergeCandidateIdentity {
+    crate::model::MergeCandidateIdentity {
+        pr: candidate.number,
+        provider_updated_at: "2026-01-01T00:00:00Z".to_owned(),
+        observed_at: "2026-01-01T00:00:01Z".to_owned(),
+        base: candidate.base.clone(),
+        head: candidate.head.clone(),
+        synthetic: Some(crate::model::SyntheticMergeCandidate {
+            git_ref: format!("refs/pull/{}/merge", candidate.number),
+            oid: CommitOid("synthetic".to_owned()),
+            tree_oid: CommitOid("synthetic-tree".to_owned()),
+            parents: vec![branch("old-main").oid, candidate.head.oid.clone()],
+        }),
+        auto_merge: crate::model::NativeAutoMergeState {
+            enabled: false,
+            merge_method: None,
+            actor: None,
+        },
+        freshness: crate::model::MergeCandidateFreshness::StaleBase,
+        compared_base: Some(branch("main")),
+        stale_base: true,
+        stale_head: false,
+        stale_reasons: vec!["synthetic first parent is stale".to_owned()],
+    }
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn exact_native_clean(
+    candidate: &BranchSnapshot,
+    target: &BranchSnapshot,
+) -> Result<CompatibilityReport, AppError> {
+    Ok(CompatibilityReport {
+        candidate: candidate.clone(),
+        target: target.clone(),
+        outcome: CompatibilityOutcome::Clean,
+        conflicting_paths: Vec::new(),
+        diagnostic: Some(format!(
+            "repository=acme/widgets object_source=exact_remote_refs objects_present=true shallow=false filter=none merge_base={} merge_tree=clean",
+            branch("old-main").oid
+        )),
+    })
+}
+
+#[test]
+fn native_admission_revalidates_candidate_and_default_before_mutation() {
+    let candidate = pull_request(60, "candidate", "main", &[]);
+    let status = status(candidate.clone(), Vec::new());
+    let provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
+    let eligibility = authorized_eligibility(&candidate);
+
+    revalidate_native_admission_generation(&status, &candidate, &eligibility, &provider)
+        .expect("unchanged candidate and default retain authorization");
+
+    provider
+        .pull_requests
+        .borrow_mut()
+        .get_mut(&candidate.number)
+        .unwrap()
+        .head
+        .oid = CommitOid("moved-candidate".to_owned());
+    let error =
+        revalidate_native_admission_generation(&status, &candidate, &eligibility, &provider)
+            .expect_err("candidate movement invalidates the proof");
+    assert_eq!(
+        error.code(),
+        "native_admission_candidate_generation_changed"
+    );
+
+    provider
+        .pull_requests
+        .borrow_mut()
+        .insert(candidate.number, candidate.clone());
+    provider
+        .branch_heads
+        .borrow_mut()
+        .insert("main".to_owned(), CommitOid("moved-default".to_owned()));
+    let error =
+        revalidate_native_admission_generation(&status, &candidate, &eligibility, &provider)
+            .expect_err("default movement invalidates the proof");
+    assert_eq!(error.code(), "native_admission_default_generation_changed");
+}
+
+#[test]
+fn membership_config_generation_is_fenced_before_native_mutation() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join(".caravan/config.yaml");
+    std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    let config = crate::config::CaravanConfig::default();
+    std::fs::write(&config_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+    let context = AppContext {
+        repository_path: directory.path().to_path_buf(),
+        config_path: std::path::PathBuf::from(".caravan/config.yaml"),
+        config_existed: true,
+        config: config.clone(),
+    };
+    revalidate_membership_config(&context).expect("unchanged config retains its generation");
+
+    let mut moved = config;
+    moved.force_merge = !moved.force_merge;
+    std::fs::write(&config_path, serde_yaml::to_string(&moved).unwrap()).unwrap();
+    let error = revalidate_membership_config(&context)
+        .expect_err("config movement invalidates admission authority");
+    assert_eq!(error.code(), "membership_config_generation_changed");
+}
+
+#[test]
+fn empty_native_fleet_admits_stale_base_without_rewriting_head() {
+    let candidate = pull_request(60, "candidate", "main", &[]);
+    let source_head = candidate.head.oid.clone();
+    let mut before = status(candidate.clone(), Vec::new());
+    before.stack_backend.configured = crate::config::StackType::Github;
+    before.merge_candidates = vec![stale_native_identity(&candidate)];
+    let provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
+
+    let output = execute_with_rebase_guard(
+        before,
+        &exact_native_clean,
+        &provider,
+        MembershipRequest {
+            operation: MembershipOperation::New,
+            create_pr: false,
+            tail_pr: None,
+            head_pr: None,
+            reason: Some("empty native fleet virtual-main admission".to_owned()),
+            priority_label: None,
+            agent_priority_labels: Vec::new(),
+        },
+        None,
+        false,
+    )
+    .expect("exact stale-base proof creates the native root");
+
+    assert_eq!(output.pull_request.head.oid, source_head);
+    assert!(output.pull_request.has_label(ACTIVE_LABEL));
+    assert!(
+        provider.audits.borrow()[0]
+            .compatibility_evidence
+            .starts_with("authority=exact_git_proof;"),
+        "durable provider audit distinguishes stale-base recovery"
+    );
+    assert!(matches!(
+        output.admission_compatibility_authorization,
+        Some(crate::read::AdmissionCompatibilityAuthorization::ExactGitProof {
+            compatibility,
+            ..
+        }) if compatibility.target == branch("main")
+    ));
 }
 
 fn rebase_receipt(
