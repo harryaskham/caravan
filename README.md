@@ -319,8 +319,14 @@ rediscovery and another tick. Nonzero exits preserve evidence and stop. Manual
 mode is refused for JSON/MCP/non-TTY use; production hooks remain noninteractive
 machine orchestration.
 
-Use `cara help` for the agent operating loop and recovery rules. Use `--json`
-for stable `mcp-cli` envelopes. Operation-lock owner files stay below 16 KiB:
+Use `cara help` as the self-contained bootstrap and operating manual. Outside a
+worktree it explains immutable installation, initialization, status/plan/sync,
+and recovery from scratch. Inside a worktree it performs no provider access but
+adds the effective config path/modes plus ordered advice for virtual versus
+physical chains, native Stack rollout, writer fencing, merge actor,
+auto-admission, terminal-red policy, and command budget. `cara help --json` and
+the MCP `help` tool expose the same typed `repository` and `advice` fields for
+stable automation envelopes. Operation-lock owner files stay below 16 KiB:
 large syncs retain schema-versioned counts, deterministic hashes, and bounded
 first/last samples instead of copying full plan/receipt/event histories into the
 lock; GitHub rediscovery remains recovery authority.
