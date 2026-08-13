@@ -679,17 +679,34 @@ repositories that declare none, so a repository whose provider read has not yet
 succeeded is still routable rather than silently webhook-deaf.
 
 `cara web --hosted` is the optional deployment contract for pre-provisioned
-checkouts. It requires a signed webhook secret, one exact installation,
-`--webhook-sync`, no `--read-only`, and for every served repository
-`github_auth.mode: app_installation` pinned to that same installation,
-`writer.mode: remote_fenced`, and an exact slug; mixed installations, ambient
-auth, `local_only`, a missing slug, two worktrees declaring one slug, or missing
-broker/host/writer identity all fail closed at startup. Hosted workers mutate
-only from HMAC-verified deliveries: interactive mutating actions are refused,
-because the same-origin CSRF token is cross-site protection rather than
-authentication, so reachability through an operator proxy is never authority to
-force, merge, or reshape. Non-mutating check/plan actions remain available.
-Hosted mode provisions no clones, manages no tenancy, and performs no failover.
+checkouts or exact `--hosted-repository OWNER/NAME` inputs materialized beneath
+one private `--hosted-clone-cache-root`. It requires a signed webhook secret,
+one exact installation, `--webhook-sync`, no `--read-only`, and for every served
+repository `github_auth.mode: app_installation` pinned to that same
+installation, `writer.mode: remote_fenced`, and an exact slug; mixed
+installations, ambient auth, `local_only`, a missing slug, two worktrees
+declaring one slug, or missing broker/host/writer identity all fail closed at
+startup. Hosted clone cache identity binds provider host, owner/name,
+installation, object format, and default branch. Before repository config is
+available, hosted clone bootstrap requires environment-selected
+`app_installation`, App slug, and the same installation ID; missing/mismatched
+identity fails before network access. One locked, bounded bare cache is only an
+object hint: each job performs an App-authenticated exact remote
+probe/fetch into a unique dissociated clone, then proves origin, default ref,
+object format, expected HEAD, path containment, no mutable alternates, and no
+persisted credential transport before ordinary repository loading. Byte, age,
+entry, and concurrent-job bounds are explicit. Holderless job paths and partial
+cache builds are deterministically cleaned/quarantined; active OS-locked jobs
+are never evicted. Hosted workers mutate only from HMAC-verified deliveries:
+interactive mutating actions are refused, because the same-origin CSRF token is
+cross-site protection rather than authentication. The existing remote-fenced
+writer lease remains the only mutation authority. `WebState.hosted_clones`
+provides secret-free per-job evidence for cache identity/hit/bytes, expected
+ref/default/object format, materialization latency, cleanup count, and successful
+exact-ref/credential-transport verification; preparation failures remain typed
+errors and never grant a repository action. Non-mutating check/plan actions
+remain available. Hosted mode still manages no provider tenancy and performs no
+automatic failover.
 
 `GET /api/v1/health` is secret-free and monitorable: `ok` means this process is
 serving, while `degraded` is the actionable signal, true when any served

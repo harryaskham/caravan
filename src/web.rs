@@ -26,6 +26,12 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 use crate::config::{CaravanConfig, DEFAULT_CONFIG_PATH};
 use crate::graph::{CompatibilityChecker, GitCompatibilityChecker};
+use crate::hosted_clone_cache::{
+    DEFAULT_HOSTED_CLONE_CACHE_MAX_AGE_SECS, DEFAULT_HOSTED_CLONE_CACHE_MAX_BYTES,
+    DEFAULT_HOSTED_CLONE_CACHE_MAX_ENTRIES, DEFAULT_HOSTED_CLONE_CACHE_MAX_JOBS,
+    DEFAULT_HOSTED_CLONE_MAX_DURATION_SECS, HostedCloneCacheConfig, HostedCloneStatus,
+    HostedCloneWorktree, materialize_hosted_repositories,
+};
 use crate::model::{BranchSnapshot, CompatibilityOutcome, PrNumber, PullRequestPrecondition};
 use crate::read::StatusOutput;
 use crate::repair::{
@@ -40,7 +46,7 @@ use crate::{
 const INDEX_HTML: &str = include_str!("web_assets/index.html");
 const APP_CSS: &str = include_str!("web_assets/app.css");
 const APP_JS: &str = include_str!("web_assets/app.js");
-const WEB_SCHEMA_VERSION: u32 = 7;
+const WEB_SCHEMA_VERSION: u32 = 8;
 const MIN_POLL_SECONDS: u64 = 2;
 const MAX_POLL_SECONDS: u64 = 3_600;
 const DEFAULT_POLL_SECONDS: u64 = 15;
@@ -63,9 +69,45 @@ type WebhookHmac = Hmac<Sha256>;
 #[derive(Debug, Clone, Args)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct WebInput {
-    /// Repository/worktree path to manage. Repeat for a multi-repository view.
-    #[arg(long = "repo", value_name = "PATH", required = true)]
+    /// Pre-provisioned repository/worktree path to manage. Repeatable.
+    #[arg(
+        long = "repo",
+        value_name = "PATH",
+        required_unless_present = "hosted_repositories"
+    )]
     pub repositories: Vec<PathBuf>,
+
+    /// Exact GitHub OWNER/NAME to materialize into one isolated hosted job clone.
+    #[arg(
+        long = "hosted-repository",
+        value_name = "OWNER/NAME",
+        required_unless_present = "repositories"
+    )]
+    pub hosted_repositories: Vec<String>,
+
+    /// Private root for bounded hosted object reuse and job-owned worktrees.
+    #[arg(long, value_name = "PATH")]
+    pub hosted_clone_cache_root: Option<PathBuf>,
+
+    /// Maximum bytes across hosted cache entries and active job clones.
+    #[arg(long, default_value_t = DEFAULT_HOSTED_CLONE_CACHE_MAX_BYTES)]
+    pub hosted_clone_cache_max_bytes: u64,
+
+    /// Maximum age of one reusable hosted object cache entry.
+    #[arg(long, default_value_t = DEFAULT_HOSTED_CLONE_CACHE_MAX_AGE_SECS)]
+    pub hosted_clone_cache_max_age_secs: u64,
+
+    /// Maximum reusable repository cache entries.
+    #[arg(long, default_value_t = DEFAULT_HOSTED_CLONE_CACHE_MAX_ENTRIES)]
+    pub hosted_clone_cache_max_entries: usize,
+
+    /// Maximum concurrent locked hosted job worktrees.
+    #[arg(long, default_value_t = DEFAULT_HOSTED_CLONE_CACHE_MAX_JOBS)]
+    pub hosted_clone_cache_max_jobs: usize,
+
+    /// Whole hosted materialization deadline across all requested repositories.
+    #[arg(long, default_value_t = DEFAULT_HOSTED_CLONE_MAX_DURATION_SECS)]
+    pub hosted_clone_max_duration_secs: u64,
 
     /// HTTP address to listen on.
     #[arg(long, default_value = "127.0.0.1:4774", value_name = "ADDRESS")]
@@ -273,6 +315,9 @@ pub struct WebState {
     /// Same-origin token required as `X-Cara-CSRF` on POST requests.
     pub csrf_token: String,
     pub repositories: Vec<WebRepositorySnapshot>,
+    /// Secret-free hosted clone/cache receipts; absent in local/pre-provisioned mode.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosted_clones: Vec<HostedCloneStatus>,
 }
 
 /// Exact-snapshot action request accepted by the same-origin web API.
@@ -390,6 +435,8 @@ struct Dashboard {
     webhook_installation_id: Option<u64>,
     webhook_sync: bool,
     webhook_status: Mutex<WebhookStatus>,
+    /// Keep job leases alive for exactly the dashboard lifetime.
+    hosted_worktrees: Vec<HostedCloneWorktree>,
     stopping: AtomicBool,
     active_requests: AtomicUsize,
 }
@@ -431,6 +478,11 @@ impl Dashboard {
                     snapshot
                 })
                 .collect(),
+            hosted_clones: self
+                .hosted_worktrees
+                .iter()
+                .map(|worktree| worktree.status().clone())
+                .collect(),
         }
     }
 
@@ -460,7 +512,14 @@ fn build_dashboard(input: &WebInput) -> Result<Arc<Dashboard>, AppError> {
     } else {
         input.poll_seconds
     };
-    let repositories = load_repositories(&input.repositories)?;
+    let hosted_worktrees = materialize_hosted_inputs(input)?;
+    let mut repository_paths = input.repositories.clone();
+    repository_paths.extend(
+        hosted_worktrees
+            .iter()
+            .map(|worktree| worktree.path().to_path_buf()),
+    );
+    let repositories = load_repositories(&repository_paths)?;
     validate_hosted_repositories(input, &repositories)?;
     Ok(Arc::new(Dashboard {
         listen: input.listen,
@@ -478,6 +537,7 @@ fn build_dashboard(input: &WebInput) -> Result<Arc<Dashboard>, AppError> {
             sync_enabled: input.webhook_sync,
             ..WebhookStatus::default()
         }),
+        hosted_worktrees,
         stopping: AtomicBool::new(false),
         active_requests: AtomicUsize::new(0),
     }))
@@ -619,13 +679,59 @@ fn validate_input(input: &WebInput) -> Result<(), AppError> {
             "webhook secret environment variable name must be non-empty",
         ));
     }
-    if input.repositories.is_empty() {
+    if input.repositories.is_empty() && input.hosted_repositories.is_empty() {
         return Err(AppError::validation(
             "web_repository_required",
-            "pass at least one explicit --repo PATH",
+            "pass at least one explicit --repo PATH or --hosted-repository OWNER/NAME",
+        ));
+    }
+    if !input.hosted_repositories.is_empty() && !input.hosted {
+        return Err(AppError::validation(
+            "web_hosted_clone_requires_hosted",
+            "--hosted-repository is available only with --hosted",
+        ));
+    }
+    if input.hosted_repositories.is_empty() && input.hosted_clone_cache_root.is_some() {
+        return Err(AppError::validation(
+            "web_hosted_clone_cache_unused",
+            "--hosted-clone-cache-root requires at least one --hosted-repository",
+        ));
+    }
+    if !input.hosted_repositories.is_empty() && input.hosted_clone_cache_root.is_none() {
+        return Err(AppError::validation(
+            "web_hosted_clone_cache_required",
+            "--hosted-repository requires --hosted-clone-cache-root",
         ));
     }
     Ok(())
+}
+
+fn materialize_hosted_inputs(input: &WebInput) -> Result<Vec<HostedCloneWorktree>, AppError> {
+    if input.hosted_repositories.is_empty() {
+        return Ok(Vec::new());
+    }
+    let root = input.hosted_clone_cache_root.clone().ok_or_else(|| {
+        AppError::validation(
+            "web_hosted_clone_cache_required",
+            "--hosted-repository requires --hosted-clone-cache-root",
+        )
+    })?;
+    let installation_id = input.github_installation_id.ok_or_else(|| {
+        AppError::validation(
+            "web_hosted_installation_required",
+            "hosted clone materialization requires --github-installation-id",
+        )
+    })?;
+    let config = HostedCloneCacheConfig {
+        root,
+        installation_id,
+        max_bytes: input.hosted_clone_cache_max_bytes,
+        max_age: Duration::from_secs(input.hosted_clone_cache_max_age_secs),
+        max_entries: input.hosted_clone_cache_max_entries,
+        max_jobs: input.hosted_clone_cache_max_jobs,
+        max_duration: Duration::from_secs(input.hosted_clone_max_duration_secs),
+    };
+    materialize_hosted_repositories(&config, &input.hosted_repositories)
 }
 
 /// Decide whether one interactive same-origin action may mutate.
@@ -2285,6 +2391,13 @@ mod tests {
     fn accepts_non_loopback_and_rejects_unbounded_polling() {
         let mut input = WebInput {
             repositories: vec![PathBuf::from(".")],
+            hosted_repositories: Vec::new(),
+            hosted_clone_cache_root: None,
+            hosted_clone_cache_max_bytes: DEFAULT_HOSTED_CLONE_CACHE_MAX_BYTES,
+            hosted_clone_cache_max_age_secs: DEFAULT_HOSTED_CLONE_CACHE_MAX_AGE_SECS,
+            hosted_clone_cache_max_entries: DEFAULT_HOSTED_CLONE_CACHE_MAX_ENTRIES,
+            hosted_clone_cache_max_jobs: DEFAULT_HOSTED_CLONE_CACHE_MAX_JOBS,
+            hosted_clone_max_duration_secs: DEFAULT_HOSTED_CLONE_MAX_DURATION_SECS,
             listen: "0.0.0.0:4774".parse().unwrap(),
             poll_seconds: 15,
             read_only: true,
@@ -2306,6 +2419,13 @@ mod tests {
     fn webhook_configuration_requires_installation_and_mutation_mode() {
         let mut input = WebInput {
             repositories: vec![PathBuf::from(".")],
+            hosted_repositories: Vec::new(),
+            hosted_clone_cache_root: None,
+            hosted_clone_cache_max_bytes: DEFAULT_HOSTED_CLONE_CACHE_MAX_BYTES,
+            hosted_clone_cache_max_age_secs: DEFAULT_HOSTED_CLONE_CACHE_MAX_AGE_SECS,
+            hosted_clone_cache_max_entries: DEFAULT_HOSTED_CLONE_CACHE_MAX_ENTRIES,
+            hosted_clone_cache_max_jobs: DEFAULT_HOSTED_CLONE_CACHE_MAX_JOBS,
+            hosted_clone_max_duration_secs: DEFAULT_HOSTED_CLONE_MAX_DURATION_SECS,
             listen: "127.0.0.1:4774".parse().unwrap(),
             poll_seconds: 15,
             read_only: false,
@@ -2326,6 +2446,35 @@ mod tests {
             validate_input(&input).unwrap_err().code(),
             "webhook_sync_read_only_conflict"
         );
+    }
+
+    #[test]
+    fn hosted_clone_inputs_are_explicit_and_leave_local_mode_unchanged() {
+        let mut input = hosted_input(true, Some(42));
+        input.repositories.clear();
+        input.hosted_repositories = vec!["owner/repo".to_owned()];
+        assert_eq!(
+            validate_input(&input).unwrap_err().code(),
+            "web_hosted_clone_cache_required"
+        );
+        input.hosted_clone_cache_root = Some(PathBuf::from("/private/cache"));
+        validate_input(&input).expect("one explicit hosted repository and cache root are accepted");
+
+        input.hosted = false;
+        assert_eq!(
+            validate_input(&input).unwrap_err().code(),
+            "web_hosted_clone_requires_hosted"
+        );
+        input.hosted_repositories.clear();
+        assert_eq!(
+            validate_input(&input).unwrap_err().code(),
+            "web_repository_required"
+        );
+
+        let mut local = hosted_input(false, None);
+        local.github_webhook_secret_env = None;
+        local.webhook_sync = false;
+        validate_input(&local).expect("pre-provisioned local mode remains unchanged");
     }
 
     #[test]
@@ -2478,6 +2627,13 @@ mod tests {
     fn hosted_input(hosted: bool, installation_id: Option<u64>) -> WebInput {
         WebInput {
             repositories: vec![PathBuf::from(".")],
+            hosted_repositories: Vec::new(),
+            hosted_clone_cache_root: None,
+            hosted_clone_cache_max_bytes: DEFAULT_HOSTED_CLONE_CACHE_MAX_BYTES,
+            hosted_clone_cache_max_age_secs: DEFAULT_HOSTED_CLONE_CACHE_MAX_AGE_SECS,
+            hosted_clone_cache_max_entries: DEFAULT_HOSTED_CLONE_CACHE_MAX_ENTRIES,
+            hosted_clone_cache_max_jobs: DEFAULT_HOSTED_CLONE_CACHE_MAX_JOBS,
+            hosted_clone_max_duration_secs: DEFAULT_HOSTED_CLONE_MAX_DURATION_SECS,
             listen: "127.0.0.1:4774".parse().unwrap(),
             poll_seconds: 15,
             read_only: false,
@@ -2617,6 +2773,7 @@ mod tests {
             webhook_installation_id: None,
             webhook_sync: hosted,
             webhook_status: Mutex::new(WebhookStatus::default()),
+            hosted_worktrees: Vec::new(),
             stopping: AtomicBool::new(false),
             active_requests: AtomicUsize::new(0),
         }
