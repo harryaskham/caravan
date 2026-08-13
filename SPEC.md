@@ -684,35 +684,42 @@ one private `--hosted-clone-cache-root`. It requires a signed webhook secret,
 one exact installation, `--webhook-sync`, no `--read-only`, and for every served
 repository `github_auth.mode: app_installation` pinned to that same
 installation, `writer.mode: remote_fenced`, and an exact slug; mixed
-installations, ambient auth, `local_only`, a missing slug, two worktrees
-declaring one slug, or missing broker/host/writer identity all fail closed at
-startup. Hosted clone cache identity binds provider host, owner/name,
-installation, object format, and default branch. Before repository config is
-available, hosted clone bootstrap requires environment-selected
-`app_installation`, App slug, and the same installation ID; missing/mismatched
-identity fails before network access. One locked, bounded bare cache is only an
-object hint: each job performs an App-authenticated exact remote
-probe/fetch into a unique dissociated clone, then proves origin, default ref,
-object format, expected HEAD, path containment, no mutable alternates, and no
-persisted credential transport before ordinary repository loading. Byte, age,
-entry, and concurrent-job bounds are explicit. Holderless job paths and partial
-cache builds are deterministically cleaned/quarantined; active OS-locked jobs
-are never evicted. Hosted workers mutate only from HMAC-verified deliveries:
-interactive mutating actions are refused, because the same-origin CSRF token is
-cross-site protection rather than authentication. The existing remote-fenced
-writer lease remains the only mutation authority. `WebState.hosted_clones`
-provides secret-free per-job evidence for cache identity/hit/bytes, expected
-ref/default/object format, materialization latency, cleanup count, and successful
-exact-ref/credential-transport verification; preparation failures remain typed
-errors and never grant a repository action. Non-mutating check/plan actions
-remain available. Hosted mode still manages no provider tenancy and performs no
-automatic failover.
+installations, ambient auth, `local_only`, a missing slug, duplicate slug, or
+missing broker/host/writer identity all fail closed at startup. Hosted clone
+cache identity binds provider host, owner/name, installation, object format, and
+default branch. Before repository config is available, clone bootstrap requires
+environment-selected `app_installation`, App slug, and the same installation ID.
+One locked, bounded bare cache is only an object hint: each job performs an
+App-authenticated exact remote probe/fetch into a unique dissociated clone, then
+proves origin, default ref, object format, expected HEAD, path containment, no
+mutable alternates, and no persisted credential transport. Byte, age, entry,
+and concurrent-job bounds are explicit; holderless/partial paths are cleaned or
+quarantined while active OS-locked jobs are never evicted. `WebState.hosted_clones`
+retains secret-free materialization evidence.
+
+Before serving or responding to signed `installation` /
+`installation_repositories` lifecycle hints, hosted mode completely pages the
+authoritative installation repository inventory under one shared request and
+wall-clock budget. It intersects that evidence with the complete configured and
+materialized repository allowlist, then atomically persists only installation
+ID, allowlisted slugs, provider-generation digest, observation time, and
+active/quarantined transition reasons. Payload repository claims never broaden
+tenancy. Missing, removed, suspended/deleted, mixed-installation, malformed,
+duplicate, truncated, or provider-unknown evidence quarantines every affected
+repository before provider I/O completes and is checked again after action locks
+immediately before domain mutation. Queued work fails with `mutated=false`;
+`remote_fenced` remains the sole writer authority even for active tenancy.
+Interactive mutating actions remain refused because the same-origin CSRF token
+is not authentication. Non-mutating check/plan actions remain available.
+`--hosted-tenancy-state` selects the projection path, otherwise common Git state
+under the first checkout is used. Hosted mode performs no automatic failover.
 
 `GET /api/v1/health` is secret-free and monitorable: `ok` means this process is
 serving, while `degraded` is the actionable signal, true when any served
-repository has never refreshed successfully or is currently carrying a refresh
-error. It also reports the hosted/read-only flags, repository counts including
-never-refreshed and erroring, the oldest successful refresh, and webhook
+repository has never refreshed successfully, is currently carrying a refresh
+error, or has quarantined hosted tenancy. It also reports the hosted/read-only
+flags, repository counts including never-refreshed, erroring, and quarantined,
+the oldest successful refresh, and webhook
 counters with the last received timestamp, so a worker that is answering but
 idle -- because deliveries stopped or a repository read keeps failing -- is
 distinguishable from a healthy one.

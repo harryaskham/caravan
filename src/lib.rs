@@ -20,6 +20,7 @@ pub mod github;
 pub mod graph;
 pub mod hooks;
 pub mod hosted_clone_cache;
+pub mod hosted_tenancy;
 pub mod initialization;
 pub mod journal;
 pub mod loop_runner;
@@ -542,8 +543,12 @@ BUILT-IN WEB OPERATIONS
   require bounded private storage; cache identity binds repository,
   installation, object format, and default branch, while each job receives a
   unique dissociated clone with exact remote proof and no persisted credential
-  helper or object alternate. Hosted mode refuses interactive mutations so a
-  worker acts only on HMAC-verified deliveries. Accepted actions bind the
+  helper or object alternate. Startup and signed installation-lifecycle hints
+  page authoritative App repository access, intersect it with configured slugs,
+  and persist a secret-free tenancy generation; removed, suspended, truncated,
+  or unknown evidence quarantines queued writes before the remote lease. Hosted
+  mode refuses interactive mutations so a worker acts only on HMAC-verified
+  deliveries. Accepted actions bind the
   reviewed refresh sequence and a deterministic mutation-authority fingerprint.
   Poll/webhook refreshes coalesce behind active jobs; identical provider/config
   facts tolerate sequence-only drift, while changed fingerprints fail before
