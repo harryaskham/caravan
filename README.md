@@ -947,6 +947,23 @@ check suite plus an admission-owned exact-suite rerequest after membership;
 heavy CI must not subscribe to broad `labeled`/`unlabeled` events, because
 priority/force/park/unpark labels would create unrelated newer CI generations.
 
+The trusted code-event workflow calls `cara ci-admission-gate --event
+"$GITHUB_EVENT_PATH" --github-output "$GITHUB_OUTPUT"` from a pinned Cara
+runtime. Before any deferral it source-fetches and materializes the exact
+provider default-branch policy without updating caller refs; explicit config or
+`sync.allow_fetch=false` safely emits `run_unproven`. The command accepts only `opened`,
+`synchronize`, and `reopened`, binds event repository/PR/head/base to complete
+live provider membership, and emits `run_member`, `deferred_unjoined`, or safe
+`run_unproven`. Unknown/malformed/wrong-repository/wrong-generation/wake-versus-
+selected mismatch always sets `run_ci=true`; it can never create a false
+exemption. A valid deferred receipt exits the command successfully but emits
+`workflow_exit_code=78`; the canonical workflow explicitly turns only that
+exact decision into its required failing sentinel after recording outputs. The
+separate admission-only writer rerequests the selected PR's existing suite; it
+never runs heavy jobs for its own wake PR. JSON/MCP output includes exact policy,
+config, provider, head/base/default, membership/label, and receipt fingerprints
+without event payload or secrets.
+
 If the same immutable parked head later becomes green but no normal sync tick can
 release it, use the reviewed `cara unpark` surface—not `resume`, `rejoin`, or a
 raw label edit. It requires exact repository/PR/head/base, current Caravan
