@@ -3,7 +3,8 @@
 //! `cara sync` is a repository service. The branch from which an operator
 //! invokes it is not policy authority and must never be reset merely so sync can
 //! read `.caravan/config.yaml` or execute a repository-relative hook. This
-//! module performs one bounded fetch, pins the exact remote-default commit, and
+//! module performs one bounded object-only fetch without mutating caller-owned
+//! tracking refs or `FETCH_HEAD`, pins the exact remote-default commit, and
 //! creates a detached temporary Git worktree sharing the original common Git
 //! directory. Provider/Git reads and hooks then run from that immutable source
 //! snapshot while locks, journals, and checkpoints remain shared.
@@ -36,7 +37,7 @@ pub(crate) struct DefaultBranchAuthority {
     oid: String,
     invocation_branch: Option<String>,
     invocation_head: String,
-    local_timeout: Duration,
+    remote_timeout: Duration,
 }
 
 impl DefaultBranchAuthority {
@@ -84,16 +85,20 @@ impl DefaultBranchAuthority {
     }
 
     pub(crate) fn revalidate(&self) -> Result<(), AppError> {
-        let observed = git_value(
+        let branch = self.default_ref.strip_prefix("origin/").ok_or_else(|| {
+            authority_error(
+                "sync_default_branch_ref_invalid",
+                "the recorded default branch is not an origin remote-tracking ref",
+                json!({"default_branch_ref": self.default_ref, "mutated": false}),
+            )
+        })?;
+        let remote_ref = format!("refs/heads/{branch}");
+        let observed = remote_branch_oid(
             &self.repository,
-            &[
-                "rev-parse",
-                "--verify",
-                &format!("{}^{{commit}}", self.default_ref),
-            ],
-            self.local_timeout,
+            &remote_ref,
+            self.remote_timeout,
             "sync_default_branch_revalidation_failed",
-            "could not re-read the fetched default-branch generation",
+            "could not re-read the remote default-branch generation",
         )?;
         if observed != self.oid {
             return Err(AppError::structured(
@@ -112,11 +117,6 @@ impl DefaultBranchAuthority {
             ));
         }
         Ok(())
-    }
-
-    #[cfg(test)]
-    fn default_ref(&self) -> &str {
-        &self.default_ref
     }
 }
 
@@ -248,28 +248,44 @@ fn materialize_fetched_default(
         )
     })?;
     require_branch_name(&repository, branch, local_timeout)?;
-    let refspec = format!("refs/heads/{branch}:refs/remotes/origin/{branch}");
+    let remote_ref = format!("refs/heads/{branch}");
     crate::sync::progress::emit(
         "policy_fetch",
-        format!("fetching exact authoritative {default_ref} without changing the invoking branch"),
+        format!("fetching exact authoritative {default_ref} without changing caller-owned refs"),
     );
+    // An agent checkout may share its common Git directory with daemon or peer
+    // worktrees. Updating `origin/<branch>` or `FETCH_HEAD` here therefore
+    // enters a caller-owned lock domain and lets one stale/concurrent lock stop
+    // every Cara tick. Fetch only the remote branch's objects; `--refmap=` is
+    // required because Git otherwise applies `remote.origin.fetch` even when a
+    // source-only refspec is supplied.
     git_success(
         &repository,
-        &["fetch", "--no-tags", "origin", &refspec],
+        &[
+            "fetch",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--refmap=",
+            "origin",
+            &remote_ref,
+        ],
         timeout,
         "sync_default_branch_fetch_failed",
         "could not fetch the exact remote default branch for sync",
     )?;
-    let oid = git_value(
+    let oid = remote_branch_oid(
         &repository,
-        &[
-            "rev-parse",
-            "--verify",
-            &format!("{default_ref}^{{commit}}"),
-        ],
+        &remote_ref,
+        timeout,
+        "sync_default_branch_oid_missing",
+        "the fetched default branch does not resolve to one remote commit",
+    )?;
+    git_value(
+        &repository,
+        &["rev-parse", "--verify", &format!("{oid}^{{commit}}")],
         local_timeout,
         "sync_default_branch_oid_missing",
-        "the fetched default branch does not resolve to a commit",
+        "the fetched default branch commit is not available locally",
     )?;
 
     let path = std::env::temp_dir().join(format!(
@@ -307,7 +323,7 @@ fn materialize_fetched_default(
             oid,
             invocation_branch,
             invocation_head,
-            local_timeout,
+            remote_timeout: timeout,
         }),
         materialized: Some(materialized),
     })
@@ -360,6 +376,51 @@ fn resolve_default_ref(
             )
         })?;
     Ok(format!("origin/{branch}"))
+}
+
+fn remote_branch_oid(
+    repository: &Path,
+    remote_ref: &str,
+    timeout: Duration,
+    code: &str,
+    message: &str,
+) -> Result<String, AppError> {
+    let output = git_output(
+        repository,
+        &["ls-remote", "--refs", "origin", remote_ref],
+        timeout,
+    )?;
+    if !output.is_success() {
+        return Err(command_failure(
+            code,
+            message,
+            &output,
+            json!({"remote_ref": remote_ref, "mutated": false, "provider_mutations": 0}),
+        ));
+    }
+    let matches = output
+        .stdout
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let oid = fields.next()?;
+            let reference = fields.next()?;
+            (reference == remote_ref && fields.next().is_none()).then(|| oid.to_owned())
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [oid] => Ok(oid.clone()),
+        _ => Err(authority_error(
+            code,
+            message,
+            json!({
+                "remote_ref": remote_ref,
+                "matching_refs": matches.len(),
+                "mutated": false,
+                "provider_mutations": 0,
+            }),
+        )),
+    }
 }
 
 fn local_default_policy(
@@ -799,27 +860,74 @@ mod tests {
     }
 
     #[test]
+    fn stale_remote_tracking_lock_does_not_block_authoritative_fetch() {
+        let (root, checkout) = fixture();
+        let publisher = root.path().join("publisher");
+        git(
+            root.path(),
+            &[
+                "clone",
+                root.path().join("remote.git").to_str().unwrap(),
+                publisher.to_str().unwrap(),
+            ],
+        );
+        git(&publisher, &["config", "user.name", "Cara Publisher"]);
+        git(
+            &publisher,
+            &["config", "user.email", "publisher@example.test"],
+        );
+        git(&publisher, &["checkout", "main"]);
+        write_policy(&publisher, 3, true);
+        git(&publisher, &["add", ".caravan/config.yaml"]);
+        git(&publisher, &["commit", "-m", "new remote policy"]);
+        git(&publisher, &["push", "origin", "main"]);
+
+        let tracking_before = output(&checkout, &["rev-parse", "origin/main"]);
+        let tracking_path = PathBuf::from(output(
+            &checkout,
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "refs/remotes/origin/main",
+            ],
+        ));
+        let lock_path = tracking_path.with_file_name("main.lock");
+        fs::write(&lock_path, "").unwrap();
+
+        let context = AppContext::load_from_directory(&checkout, None).unwrap();
+        let prepared = prepare(&context).unwrap();
+
+        assert_eq!(prepared.context().config.sync.max_caravans, 3);
+        assert_eq!(
+            output(&checkout, &["rev-parse", "origin/main"]),
+            tracking_before
+        );
+        assert!(
+            lock_path.exists(),
+            "Cara never removes a caller-owned ref lock"
+        );
+        drop(prepared);
+        fs::remove_file(lock_path).unwrap();
+    }
+
+    #[test]
     fn default_movement_after_materialization_refuses() {
         let (_root, checkout) = fixture();
         let context = AppContext::load_from_directory(&checkout, None).unwrap();
         let prepared = prepare(&context).unwrap();
         let authority = prepared.authority().unwrap();
-        let original = output(&checkout, &["rev-parse", authority.default_ref()]);
         git(
             &checkout,
             &["commit", "--allow-empty", "-m", "concurrent movement"],
         );
-        git(&checkout, &["update-ref", authority.default_ref(), "HEAD"]);
+        git(&checkout, &["push", "origin", "main"]);
 
         let error = authority.revalidate().unwrap_err();
 
         assert_eq!(
             mcp_cli::StructuredError::code(&error),
             "sync_default_branch_moved"
-        );
-        git(
-            &checkout,
-            &["update-ref", authority.default_ref(), &original],
         );
     }
 }
