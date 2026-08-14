@@ -249,7 +249,19 @@ pub fn plan_native_membership(
                     "the singleton root facts are absent",
                 )
             })?;
-        let topology = topology_from_members(facts.default_branch, [root, &output.pull_request])?;
+        if root.base.repository != facts.default_branch.repository
+            || root.base.name != facts.default_branch.name
+        {
+            return Err(invalid_plan(
+                "github_stack_membership_root_base_ref_invalid",
+                "the singleton root must target the configured default branch ref",
+            ));
+        }
+        // The Stack represents immutable PR generations, including the root's
+        // exact provider-recorded base OID. Main may advance after the root was
+        // admitted; using the newer fleet-default OID makes an otherwise exact
+        // desired topology self-contradictory before provider access.
+        let topology = topology_from_members(&root.base, [root, &output.pull_request])?;
         return Ok(NativeMembershipPlan::Create {
             plan: Box::new(GitHubStackCreatePlan {
                 operation_id,
@@ -611,6 +623,45 @@ mod tests {
         );
         assert_eq!(plan.desired.entries[1].base, root.head);
         assert_eq!(plan.desired.entries[1].head, child.head);
+    }
+
+    #[test]
+    fn joining_a_stale_default_oid_preserves_the_exact_root_generation() {
+        let current_main = branch("main", "main-current");
+        let stale_main = branch("main", "main-at-root-admission");
+        let root = pull(101, stale_main.clone());
+        let child = pull(102, root.head.clone());
+        let caravans = vec![Caravan::new(vec![PrNumber(101)]).unwrap()];
+        let pulls = BTreeMap::from([(PrNumber(101), root.clone())]);
+        let output = output("join", child.clone(), PrNumber(101));
+
+        let plan = plan_native_membership(
+            &facts(&current_main, &caravans, &pulls, &[]),
+            &output,
+            "cara",
+        )
+        .expect("main movement does not rewrite an immutable root generation");
+        let NativeMembershipPlan::Create { plan } = plan else {
+            panic!("expected create")
+        };
+        assert_eq!(plan.desired.base, stale_main);
+        assert_eq!(plan.desired.entries[0].base, root.base);
+        assert_eq!(plan.desired.entries[1].base, root.head);
+
+        let mut wrong_ref_root = root;
+        wrong_ref_root.base = branch("release", "release-current");
+        let wrong_pulls = BTreeMap::from([(PrNumber(101), wrong_ref_root)]);
+        let error = plan_native_membership(
+            &facts(&current_main, &caravans, &wrong_pulls, &[]),
+            &output,
+            "cara",
+        )
+        .expect_err("a different root base ref still fails closed");
+        assert!(matches!(
+            error,
+            NativeMembershipError::InvalidPlan { ref code, .. }
+                if code == "github_stack_membership_root_base_ref_invalid"
+        ));
     }
 
     #[test]

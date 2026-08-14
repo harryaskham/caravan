@@ -304,8 +304,11 @@ GITHUB NATIVE STACKS (EXPLICIT OPT-IN)
   enables exact Stack membership, reshape, and lock-fenced landing; capability,
   mapping, generation, hold, compatibility, CI, and force gates still fail
   closed before provider mutation.
-- Native membership persists an exact continuation before Stack create/add. If
-  ordinary base/label membership completed but provider representation did not,
+- Native membership persists an exact continuation before Stack create/add. A
+  create plan preserves the root PR's exact provider base OID when it still
+  names the configured default-branch ref; a later default commit is
+  compatibility/landing evidence, never authority to rewrite that immutable
+  root generation. If ordinary base/label membership completed but provider representation did not,
   do not rerun admission: use `native-stack recovery-preview`, review its exact
   immutable membership/head/base/green-check/mapping plan hash, then pass that
   hash to `recovery-apply`. If a zero-write checkpoint becomes stale after an

@@ -1362,8 +1362,12 @@ Exact REST create/add/unstack, asynchronous direct-merge planning, submission,
 UUID-polling, receipt primitives, and the phased evict/split unstack/rebuild
 transaction remain policy-free adapters composed by membership, reshape, and
 sync. Before membership invokes native create/add it persists a sealed,
-repository-local continuation keyed by the exact caravan root. A successful
-provider receipt clears the continuation; failure returns it alongside ordinary
+repository-local continuation keyed by the exact caravan root. The desired
+Stack base is the root PR's exact provider base generation, even when a later
+commit advanced the same configured default ref; current default remains
+compatibility and landing evidence, never authority to rewrite that immutable
+root generation. Repository/ref drift still refuses. A successful provider
+receipt clears the continuation; failure returns it alongside ordinary
 membership receipts. Recovery never asks automatic admission to select the now-
 labelled member again. `native-stack recovery-preview` instead seals current
 repository, ordered membership, immutable head/base generations, CLEAN/current-
