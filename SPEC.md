@@ -812,6 +812,26 @@ after adding membership. Broad heavy-workflow `labeled`/`unlabeled` triggers are
 invalid because queue/priority/force/parking labels would manufacture unrelated
 newer CI generations.
 
+`ci-admission-gate --event PATH [--selected-pr N] [--github-output PATH]` is the
+read-only trusted-policy decision surface for that code-generation suite. It
+first source-fetches/materializes the exact provider default-branch policy
+without updating caller refs; explicit config, disabled policy fetch, or failed
+materialization emits safe `run_unproven`. It accepts only bounded `opened`, `synchronize`, or `reopened` pull-request events,
+then binds event repository/wake PR/head/base and separately named selected PR
+to complete live provider membership plus the loaded default policy/config
+fingerprint. Exact member+label emits `run_member`; exact unjoined+unlabelled
+emits `deferred_unjoined`; disabled policy, malformed/unsupported event,
+wake-selected mismatch, wrong repository/generation, provider uncertainty, or
+membership-label disagreement emits safe `run_unproven`. Both run decisions set
+`run_ci=true`. The command itself returns successfully for all typed decisions;
+only the exact deferred receipt emits `workflow_exit_code=78`, which the
+canonical workflow later turns into its required failing sentinel. This avoids
+mistaking command/schema/provider failures for a valid admission exemption.
+Secret-free JSON/MCP and GitHub scalar outputs include policy, config, provider,
+head/base/default, label/membership and receipt fingerprints; they never echo the
+event payload. The admission-only default-branch writer may rerequest only the
+selected PR's exact existing suite and cannot run heavy jobs for its own wake PR.
+
 The reviewed `unpark` transition is the first-party recovery path when a parked
 immutable generation becomes green outside a normal sync tick. Its CLI, JSON,
 and MCP inputs bind the exact repository, PR, 40-character head and base,

@@ -91,6 +91,8 @@ enum Command {
     Queue(caravan::NextInput),
     /// Decide whether existing CI evidence still applies to one exact PR.
     CiGate(caravan::CiGateInput),
+    /// Emit trusted live-membership evidence for the required admission gate.
+    CiAdmissionGate(caravan::CiAdmissionGateInput),
     /// Validate current or proposed caravan state without mutation.
     Check(CheckInput),
     /// Create a one-PR caravan from the current branch.
@@ -461,6 +463,7 @@ fn run(cli: &Cli) -> Result<(), i32> {
         Command::Log(command) => run_log(cli, command),
         Command::Queue(input) => run_queue(cli, input),
         Command::CiGate(input) => run_ci_gate(cli, input),
+        Command::CiAdmissionGate(input) => run_ci_admission_gate(cli, input),
         Command::Check(input) => run_check(cli, input),
         Command::New(input) => run_create_membership(cli, input),
         Command::Renew(input) => {
@@ -1387,6 +1390,67 @@ fn run_ci_gate(cli: &Cli, input: &caravan::CiGateInput) -> Result<(), i32> {
         }
         Err(error) => emit_human_error(error),
     }
+}
+
+fn run_ci_admission_gate(cli: &Cli, input: &caravan::CiAdmissionGateInput) -> Result<(), i32> {
+    let context = load_context(cli)?;
+    let output = caravan::ci_admission_gate::evaluate(&context, input);
+    if let Some(path) = &input.github_output
+        && let Err(error) = write_ci_admission_gate_outputs(path, &output)
+    {
+        eprintln!("cara: could not write GitHub Actions admission-gate output: {error}");
+        return Err(2);
+    }
+    if cli.json {
+        return emit_result::<_, AppError>(true, Ok(output));
+    }
+    println!(
+        "{} run_ci={} deferred_unjoined={} workflow_exit_code={}",
+        output.decision_code, output.run_ci, output.deferred_unjoined, output.workflow_exit_code
+    );
+    println!("  {}", output.reason);
+    println!("  receipt={}", output.receipt_fingerprint);
+    Ok(())
+}
+
+fn write_ci_admission_gate_outputs(
+    path: &std::path::Path,
+    output: &caravan::CiAdmissionGateOutput,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    for (key, value) in [
+        ("decision", output.decision_code.clone()),
+        ("run_ci", output.run_ci.to_string()),
+        ("deferred_unjoined", output.deferred_unjoined.to_string()),
+        ("workflow_exit_code", output.workflow_exit_code.to_string()),
+        (
+            "wake_pr",
+            output
+                .wake_pr
+                .map_or_else(String::new, |pr| pr.0.to_string()),
+        ),
+        (
+            "selected_pr",
+            output
+                .selected_pr
+                .map_or_else(String::new, |pr| pr.0.to_string()),
+        ),
+        (
+            "head",
+            output
+                .head
+                .as_ref()
+                .map_or_else(String::new, |oid| oid.0.clone()),
+        ),
+        ("receipt_fingerprint", output.receipt_fingerprint.clone()),
+    ] {
+        writeln!(file, "{key}={value}")?;
+    }
+    Ok(())
 }
 
 fn run_check(cli: &Cli, input: &CheckInput) -> Result<(), i32> {
@@ -5239,6 +5303,41 @@ provider.wait()
             &AppError::validation("manual-test", "decision"),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn admission_gate_github_outputs_are_secret_free_and_scalar() {
+        let directory = tempfile::tempdir().unwrap();
+        let event = directory.path().join("event.json");
+        std::fs::write(&event, "not-json ghs_secret_sentinel").unwrap();
+        let context = caravan::AppContext {
+            config_path: directory.path().join("trusted-config-fixture.yaml"),
+            ..caravan::AppContext::default()
+        };
+        let output = caravan::ci_admission_gate::evaluate(
+            &context,
+            &caravan::CiAdmissionGateInput {
+                event,
+                selected_pr: None,
+                github_output: None,
+            },
+        );
+        let path = directory.path().join("github-output");
+
+        write_ci_admission_gate_outputs(&path, &output).unwrap();
+
+        let rendered = std::fs::read_to_string(path).unwrap();
+        for required in [
+            "decision=run_unproven",
+            "run_ci=true",
+            "deferred_unjoined=false",
+            "workflow_exit_code=0",
+            "receipt_fingerprint=sha256:",
+        ] {
+            assert!(rendered.contains(required), "missing `{required}`");
+        }
+        assert!(!rendered.contains("ghs_secret_sentinel"));
+        assert!(rendered.lines().all(|line| line.contains('=')));
     }
 
     #[test]

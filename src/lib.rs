@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub mod admission;
 pub mod ci;
+pub mod ci_admission_gate;
 pub mod ci_gate;
 pub mod command;
 pub mod compatibility;
@@ -161,7 +162,12 @@ CORE MODEL AND INVARIANTS
   ordinary member CI policy applies without exemption. Heavy workflows must not
   trigger on `labeled`/`unlabeled`; the admission writer rerequests the exact
   existing check suite after membership so priority/force/park/unpark labels do
-  not create newer CI generations.
+  not create newer CI generations. The trusted code-event suite runs
+  `cara ci-admission-gate --event $GITHUB_EVENT_PATH`; it first materializes
+  exact default-branch policy without changing caller refs. Exact unjoined evidence
+  emits `deferred_unjoined` plus workflow exit 78 for the required sentinel,
+  while malformed, unsupported, drifted, provider-unknown, or selected/wake-PR
+  mismatch emits `run_unproven` and must run expensive CI.
 - Terminal-red queue behavior is configurable. `sync.terminal_red.action: block`
   is the backward-compatible default. Explicit `park` preserves the complete
   caravan topology under a `caravan-parked` head label, disables head
@@ -1361,7 +1367,7 @@ pub fn help_for_context(context: &AppContext) -> HelpOutput {
     ));
     if let Some(gate) = &config.ci.admission_gate {
         advice.push(format!(
-            "ci.admission_gate={} uses required context `{}` and exact member label `{}`: pre-membership exemption is limited to that failing gate; heavy CI must not use labeled/unlabeled triggers.",
+            "ci.admission_gate={} uses required context `{}` and exact member label `{}`: pre-membership exemption is limited to that failing gate. The code-event suite uses `cara ci-admission-gate`; run_unproven always runs expensive CI, and heavy CI must not use labeled/unlabeled triggers.",
             match gate.mode {
                 config::CiAdmissionGateMode::CaravanLabel => "caravan_label",
             },
@@ -1440,6 +1446,13 @@ pub fn build_router() -> ToolRouter<AppContext> {
         "status",
         "Discover the current repository, current PR, every caravan, invalid graph fragments, and unresolved decision points. Read-only. Slow compatibility yields a successful typed partial from current bounded evidence; mutation-capable tools never consume it.",
         |context: &AppContext, _input: EmptyInput| read::status_resilient(context),
+    );
+    router.add_typed_tool_with_output_schema(
+        "ci_admission_gate",
+        "Read one bounded pull_request event under trusted default policy, bind it to complete live provider membership, and emit run_member, deferred_unjoined, or safe run_unproven evidence. Read-only; workflow output writing is CLI-only.",
+        |context: &AppContext, input: CiAdmissionGateInput| {
+            Ok::<_, AppError>(ci_admission_gate::evaluate(context, &input))
+        },
     );
     router.add_typed_tool_with_output_schema(
         "queue",
@@ -2062,6 +2075,89 @@ pub struct CiGateOutput {
     pub reason: String,
     /// Exact facts the decision rests on, so a skipped run is auditable.
     pub evidence: serde_json::Value,
+}
+
+/// Inputs for the trusted default-policy admission gate (bd-efc8ba).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, clap::Args)]
+pub struct CiAdmissionGateInput {
+    /// GitHub `pull_request` event JSON from the code-generation workflow.
+    #[arg(long, value_name = "PATH")]
+    pub event: PathBuf,
+    /// Exact PR selected by an admission-only writer. It must equal the event PR.
+    #[arg(long, value_name = "PR")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_pr: Option<u64>,
+    /// Optional GitHub Actions output file. Only secret-free scalar outputs are written.
+    #[arg(long, value_name = "PATH")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_output: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CiAdmissionGateDecision {
+    RunMember,
+    DeferredUnjoined,
+    /// Evidence is unsupported/incomplete; expensive CI is the safe default.
+    RunUnproven,
+}
+
+impl CiAdmissionGateDecision {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::RunMember => "run_member",
+            Self::DeferredUnjoined => "deferred_unjoined",
+            Self::RunUnproven => "run_unproven",
+        }
+    }
+
+    #[must_use]
+    pub const fn runs_ci(self) -> bool {
+        !matches!(self, Self::DeferredUnjoined)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CiAdmissionGatePolicyEvidence {
+    pub mode: config::CiAdmissionGateMode,
+    pub context: String,
+    pub member_label: String,
+}
+
+/// Secret-free decision/receipt consumed by the code-generation workflow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[allow(clippy::struct_excessive_bools)] // Independent receipt facts for workflow routing.
+pub struct CiAdmissionGateOutput {
+    pub schema_version: u32,
+    pub decision: CiAdmissionGateDecision,
+    pub decision_code: String,
+    pub run_ci: bool,
+    pub deferred_unjoined: bool,
+    pub workflow_exit_code: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository: Option<crate::model::RepositoryId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wake_pr: Option<crate::model::PrNumber>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_pr: Option<crate::model::PrNumber>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head: Option<crate::model::CommitOid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base: Option<crate::model::CommitOid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_head: Option<crate::model::CommitOid>,
+    pub enrolled: bool,
+    pub member_label_present: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy: Option<CiAdmissionGatePolicyEvidence>,
+    pub config_fingerprint: String,
+    pub reason: String,
+    pub receipt_fingerprint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_api: Option<crate::model::GitHubApiTelemetry>,
 }
 
 /// Optional explicit directory for one stable PATH-visible Cara installation.
