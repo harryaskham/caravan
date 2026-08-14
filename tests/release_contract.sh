@@ -172,6 +172,7 @@ fi
 grep -q -- "if: matrix.target == 'aarch64-linux' || matrix.target == 'aarch64-darwin'" .github/workflows/release.yml
 grep -q -- 'cachix/install-nix-action@v31' .github/workflows/release.yml
 grep -q -- 'name: Verify native runner architecture' .github/workflows/release.yml
+# shellcheck disable=SC2016 # Intentional literal workflow source; never execute uname here.
 grep -Fq -- 'aarch64-darwin) test "$(uname -m)" = "arm64"' .github/workflows/release.yml
 if grep -q -- "if: matrix.target != 'aarch64-linux'" .github/workflows/release.yml; then
   echo "native GitHub ARM builds must smoke their packaged binary" >&2

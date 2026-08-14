@@ -29,6 +29,11 @@ printf '%s\n' "$@" > "$FAKE_CARA_LOG"
 SH
 chmod 0755 "$fake"
 
+mapfile -t minimum_policy_lines < <(grep -E '^min_cara_version:' .caravan/config.yaml)
+[[ ${#minimum_policy_lines[@]} -eq 1 ]]
+[[ "${minimum_policy_lines[0]}" =~ ^min_cara_version:\ \"([0-9]+\.[0-9]+\.[0-9]+)\"$ ]]
+expected_minimum="${BASH_REMATCH[1]}"
+
 receipt="$workspace/receipt.json"
 resolved="$(
   CACO_CARA_BIN="$fake" \
@@ -41,7 +46,7 @@ expected_resolved="$(cd "$(dirname "$fake")" && pwd -P)/$(basename "$fake")"
 grep -q '"source":"system"' "$receipt"
 grep -q '"selection":"explicit_binding"' "$receipt"
 grep -q '"version":"0.0.82"' "$receipt"
-grep -q '"min_cara_version":"0.0.0"' "$receipt"
+grep -q "\"min_cara_version\":\"${expected_minimum}\"" "$receipt"
 grep -Eq '"fingerprint":"sha256:[0-9a-f]{64}"' "$receipt"
 grep -q '"candidates":\[{"path":' "$receipt"
 grep -q '"state":"launchable","probe_exit":0' "$receipt"
@@ -93,7 +98,7 @@ timeout_rc=$?
 set -e
 [[ $timeout_rc -eq 124 ]]
 grep -q '"code":"cara_runtime_timeout"' "$workspace/timeout.err"
-/bin/sleep 2
+sleep 2
 [[ ! -e "$workspace/orphan-marker" ]] || {
   echo 'timed-out Cara descendant outlived the runtime wrapper' >&2
   exit 1
