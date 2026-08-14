@@ -659,15 +659,32 @@ fn build_plan(
     }
 
     let (pulls, members) = collect_member_evidence(facts, caravan)?;
-    let desired =
-        crate::stack_membership::topology_from_members(facts.default_branch, pulls.iter().copied())
-            .map_err(|error| {
-                refusal(
-                    "github_stack_recovery_topology_invalid",
-                    &error.to_string(),
-                    json!({"root": root, "mutated": false}),
-                )
-            })?;
+    let root_base = &pulls.first().expect("multi-member caravan has a root").base;
+    if root_base.repository != facts.default_branch.repository
+        || root_base.name != facts.default_branch.name
+    {
+        return Err(refusal(
+            "github_stack_recovery_root_base_ref_invalid",
+            "the exact root does not target the configured default branch ref",
+            json!({
+                "root": root,
+                "observed_root_base": root_base,
+                "required_default": facts.default_branch,
+                "mutated": false,
+            }),
+        ));
+    }
+    // Recovery recreates the exact immutable PR generation. A later main OID
+    // is compatibility/landing evidence, not permission to rewrite the Stack's
+    // recorded root base before provider creation.
+    let desired = crate::stack_membership::topology_from_members(root_base, pulls.iter().copied())
+        .map_err(|error| {
+            refusal(
+                "github_stack_recovery_topology_invalid",
+                &error.to_string(),
+                json!({"root": root, "mutated": false}),
+            )
+        })?;
     let config_fingerprint = recovery_config_fingerprint(config);
     let topology_hash = crate::membership::fnv1a64(
         &serde_json::to_vec(&desired).expect("native topology serializes"),
@@ -719,7 +736,25 @@ fn collect_member_evidence<'a>(
         })?;
         require_member_green(pull)?;
         let expected_base = if position == 0 {
-            facts.default_branch
+            if pull.base.repository != facts.default_branch.repository
+                || pull.base.name != facts.default_branch.name
+            {
+                return Err(refusal(
+                    "github_stack_recovery_root_base_ref_invalid",
+                    "the exact root does not target the configured default branch ref",
+                    json!({
+                        "root": caravan.id,
+                        "member": number,
+                        "observed_root_base": pull.base,
+                        "required_default": facts.default_branch,
+                        "mutated": false,
+                    }),
+                ));
+            }
+            // The root's immutable provider generation may predate a later
+            // default-branch OID. Recovery preserves that exact base while
+            // later members must still target exact predecessor heads.
+            &pull.base
         } else {
             &pulls[position - 1].head
         };
@@ -1549,6 +1584,45 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn recovery_preserves_stale_root_oid_but_rejects_a_different_base_ref() {
+        let directory = tempfile::tempdir().unwrap();
+        let context = test_context(directory.path());
+        let current_main = branch("main", "cccccccccccccccccccccccccccccccccccccccc");
+        let stale_main = branch("main", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let root = pull(101, stale_main.clone());
+        let child = pull(102, root.head.clone());
+        let caravans = vec![Caravan::new(vec![PrNumber(101), PrNumber(102)]).unwrap()];
+        let pulls = BTreeMap::from([(root.number, root.clone()), (child.number, child)]);
+        let backend = stack_backend_fixture(Vec::new());
+
+        let (plan, _) = build_plan(
+            &context.config,
+            &facts(&current_main, &caravans, &pulls, &backend),
+            PrNumber(101),
+            "operator",
+            "recover exact stale-root generation",
+            None,
+        )
+        .expect("default movement does not rewrite recovery topology");
+        assert_eq!(plan.desired.base, stale_main);
+        assert_eq!(plan.desired.entries[0].base, root.base);
+
+        let mut wrong_ref = pulls;
+        wrong_ref.get_mut(&PrNumber(101)).unwrap().base =
+            branch("release", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let error = build_plan(
+            &context.config,
+            &facts(&current_main, &caravans, &wrong_ref, &backend),
+            PrNumber(101),
+            "operator",
+            "reject wrong root ref",
+            None,
+        )
+        .expect_err("a different root base ref is not stale-main recovery");
+        assert_eq!(error.code(), "github_stack_recovery_root_base_ref_invalid");
     }
 
     #[test]
