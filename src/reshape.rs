@@ -234,9 +234,13 @@ fn execute_live(
     };
     let native = if context.config.stack_type == crate::config::StackType::Github {
         let prepared = prepare_reshape(&status, &checker, &provider, operation, selected)?;
-        Some(native_reshape_unstack(
-            context, &provider, &status, &prepared, operation,
-        )?)
+        if native_reshape_required(&status, &prepared, operation)? {
+            Some(native_reshape_unstack(
+                context, &provider, &status, &prepared, operation,
+            )?)
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -570,6 +574,51 @@ fn execute(
         events: Vec::new(),
         hook_deliveries: Vec::new(),
     })
+}
+
+/// A one-member caravan intentionally has no provider Stack: GitHub Stacks
+/// begin at two PRs. Evicting that exact singleton opens no topology edge and
+/// therefore needs only the ordinary receipt-gated membership transition. Any
+/// provider uncertainty or open Stack intersection retains the full reshape
+/// fence; absence is never inferred from a partial inventory.
+fn native_reshape_required(
+    status: &StatusOutput,
+    prepared: &PreparedReshape,
+    operation: ReshapeOperation,
+) -> Result<bool, AppError> {
+    if operation != ReshapeOperation::Evict {
+        return Ok(true);
+    }
+    let caravan = status
+        .analysis
+        .fleet
+        .containing(prepared.number)
+        .ok_or_else(|| {
+            AppError::validation(
+                "github_stack_reshape_caravan_missing",
+                "selected reshape member has no exact pre-reshape caravan",
+            )
+        })?;
+    if caravan.members.as_slice() != [prepared.number] {
+        return Ok(true);
+    }
+    if status.stack_backend.capability != crate::read::StackCapability::Available
+        || status.stack_backend.provider_stacks_truncated
+    {
+        return Err(AppError::validation(
+            "github_stack_singleton_inventory_unproven",
+            "native singleton eviction requires one complete provider Stack inventory",
+        ));
+    }
+    let intersects_open_stack = status.stack_backend.native_stacks.iter().any(|native| {
+        native.stack.open
+            && native
+                .stack
+                .pull_requests
+                .iter()
+                .any(|pull| PrNumber(pull.number) == prepared.number)
+    });
+    Ok(intersects_open_stack)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1745,6 +1794,73 @@ mod tests {
         assert_eq!(event.fleet, Some(status.analysis.fleet));
         assert_eq!(event.metadata["error_code"], "eviction_rejected");
         assert_eq!(event.metadata["requested_reason"], "known breakage");
+    }
+
+    #[test]
+    fn native_stackless_singleton_evicts_without_inventing_a_provider_stack() {
+        let pulls = vec![pull_request(71, "main")];
+        let provider = FakeProvider::new(&pulls);
+        let mut observed = status(pulls);
+        observed.stack_backend = crate::read::StackBackendStatus {
+            configured: crate::config::StackType::Github,
+            capability: crate::read::StackCapability::Available,
+            mutation_support: crate::read::StackMutationSupport::NativeStack,
+            native_stacks: Vec::new(),
+            provider_stacks_truncated: false,
+            missing_caravans: Vec::new(),
+            problems: Vec::new(),
+        };
+        let prepared = prepare_reshape(
+            &observed,
+            &Clean,
+            &provider,
+            ReshapeOperation::Evict,
+            Some(PrNumber(71)),
+        )
+        .unwrap();
+
+        assert!(
+            !native_reshape_required(&observed, &prepared, ReshapeOperation::Evict).unwrap(),
+            "GitHub represents a singleton by ordinary membership, not a fake Stack"
+        );
+        let output = execute(
+            observed,
+            &Clean,
+            &provider,
+            ReshapeOperation::Evict,
+            Some(PrNumber(71)),
+            Some("intentional red canary".to_owned()),
+            None,
+        )
+        .unwrap();
+
+        let evicted = &provider.pull_requests.borrow()[&PrNumber(71)];
+        assert!(!evicted.has_label(ACTIVE_LABEL));
+        assert!(evicted.has_label(EVICTED_LABEL));
+        assert_eq!(output.affected_prs, [PrNumber(71)]);
+        assert!(output.native_stack_checkpoint.is_none());
+    }
+
+    #[test]
+    fn native_stackless_singleton_refuses_when_inventory_is_unproven() {
+        let pulls = vec![pull_request(71, "main")];
+        let provider = FakeProvider::new(&pulls);
+        let mut observed = status(pulls);
+        observed.stack_backend.configured = crate::config::StackType::Github;
+        observed.stack_backend.capability = crate::read::StackCapability::Unknown;
+        let prepared = prepare_reshape(
+            &observed,
+            &Clean,
+            &provider,
+            ReshapeOperation::Evict,
+            Some(PrNumber(71)),
+        )
+        .unwrap();
+
+        let error = native_reshape_required(&observed, &prepared, ReshapeOperation::Evict)
+            .expect_err("provider uncertainty never authorizes a label-only reshape");
+
+        assert_eq!(error.code(), "github_stack_singleton_inventory_unproven");
     }
 
     #[test]
