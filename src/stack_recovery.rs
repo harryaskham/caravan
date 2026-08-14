@@ -1552,6 +1552,7 @@ mod tests {
             },
             caravan_id: Some(PrNumber(101)),
             consistency: StackConsistency::Drifted,
+            ancestry: Vec::new(),
             problems: Vec::new(),
         };
         let backend = stack_backend_fixture(vec![native]);
@@ -1713,6 +1714,7 @@ mod tests {
             },
             caravan_id: Some(PrNumber(101)),
             consistency: StackConsistency::Exact,
+            ancestry: Vec::new(),
             problems: Vec::new(),
         }
     }
@@ -1844,6 +1846,7 @@ mod tests {
             },
             caravan_id: Some(PrNumber(101)),
             consistency: StackConsistency::Exact,
+            ancestry: Vec::new(),
             problems: Vec::new(),
         };
         let main = branch("main", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");

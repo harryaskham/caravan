@@ -722,6 +722,7 @@ mod tests {
             },
             caravan_id: Some(PrNumber(101)),
             consistency: StackConsistency::Exact,
+            ancestry: Vec::new(),
             problems: Vec::new(),
         };
         let output = output("join", tail.clone(), PrNumber(101));
@@ -766,6 +767,7 @@ mod tests {
             },
             caravan_id: Some(PrNumber(101)),
             consistency: StackConsistency::Drifted,
+            ancestry: Vec::new(),
             problems: Vec::new(),
         };
 

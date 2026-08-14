@@ -173,11 +173,23 @@ pub struct StackBackendProblem {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct NativeStackAncestryEdge {
+    pub parent_pr: PrNumber,
+    pub parent_head: crate::model::CommitOid,
+    pub child_pr: PrNumber,
+    pub child_head: crate::model::CommitOid,
+    pub relation: crate::generation::CommitRelation,
+    pub linear: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct NativeStackStatus {
     pub stack: crate::github::GitHubStackSnapshot,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caravan_id: Option<PrNumber>,
     pub consistency: StackConsistency,
+    #[serde(default)]
+    pub ancestry: Vec<NativeStackAncestryEdge>,
     #[serde(default)]
     pub problems: Vec<StackBackendProblem>,
 }
@@ -219,6 +231,15 @@ trait NativeStackInventoryProvider {
         &self,
         repository: &RepositoryId,
     ) -> Result<crate::github::GitHubStackInventory, crate::github::GitHubStackReadError>;
+
+    fn compare_stack_commits(
+        &self,
+        _repository: &RepositoryId,
+        _parent: &crate::model::CommitOid,
+        _child: &crate::model::CommitOid,
+    ) -> Result<crate::generation::CommitRelation, String> {
+        Ok(crate::generation::CommitRelation::Ahead)
+    }
 }
 
 impl<R: crate::command::CommandRunner> NativeStackInventoryProvider
@@ -229,6 +250,16 @@ impl<R: crate::command::CommandRunner> NativeStackInventoryProvider
         repository: &RepositoryId,
     ) -> Result<crate::github::GitHubStackInventory, crate::github::GitHubStackReadError> {
         self.native_stack_inventory(repository)
+    }
+
+    fn compare_stack_commits(
+        &self,
+        repository: &RepositoryId,
+        parent: &crate::model::CommitOid,
+        child: &crate::model::CommitOid,
+    ) -> Result<crate::generation::CommitRelation, String> {
+        self.compare_commits(repository, parent, child)
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -376,6 +407,8 @@ fn validate_native_stack_entries(
 
 fn native_stack_status(
     stack: crate::github::GitHubStackSnapshot,
+    provider: &impl NativeStackInventoryProvider,
+    repository: &RepositoryId,
     analysis: &GraphAnalysis,
     represented: &mut BTreeSet<PrNumber>,
 ) -> NativeStackStatus {
@@ -449,12 +482,84 @@ fn native_stack_status(
         &mut problems,
         &mut consistency,
     );
+    let ancestry = assess_native_stack_ancestry(
+        provider,
+        repository,
+        &stack,
+        &mut problems,
+        &mut consistency,
+    );
     NativeStackStatus {
         stack,
         caravan_id,
         consistency,
+        ancestry,
         problems,
     }
+}
+
+fn assess_native_stack_ancestry(
+    provider: &impl NativeStackInventoryProvider,
+    repository: &RepositoryId,
+    stack: &crate::github::GitHubStackSnapshot,
+    problems: &mut Vec<StackBackendProblem>,
+    consistency: &mut StackConsistency,
+) -> Vec<NativeStackAncestryEdge> {
+    let open_members = stack
+        .pull_requests
+        .iter()
+        .filter(|entry| entry.state.eq_ignore_ascii_case("open"))
+        .collect::<Vec<_>>();
+    let mut ancestry = Vec::new();
+    for pair in open_members.windows(2) {
+        let parent = pair[0];
+        let child = pair[1];
+        let relation =
+            provider.compare_stack_commits(repository, &parent.head.sha, &child.head.sha);
+        let (relation, linear) = match relation {
+            Ok(relation) => {
+                let linear = matches!(
+                    relation,
+                    crate::generation::CommitRelation::Ahead
+                        | crate::generation::CommitRelation::Identical
+                );
+                (relation, linear)
+            }
+            Err(reason) => (crate::generation::CommitRelation::Unknown { reason }, false),
+        };
+        if !linear {
+            let unknown = matches!(relation, crate::generation::CommitRelation::Unknown { .. });
+            problems.push(StackBackendProblem {
+                code: if unknown {
+                    "github_stack_ancestry_unknown".to_owned()
+                } else {
+                    "native_stack_rebase_required".to_owned()
+                },
+                message: format!(
+                    "Stack #{} PR #{} head {} does not contain predecessor PR #{} head {} ({relation:?})",
+                    stack.number,
+                    child.number,
+                    child.head.sha,
+                    parent.number,
+                    parent.head.sha,
+                ),
+            });
+            *consistency = if unknown {
+                StackConsistency::Unknown
+            } else {
+                StackConsistency::Drifted
+            };
+        }
+        ancestry.push(NativeStackAncestryEdge {
+            parent_pr: PrNumber(parent.number),
+            parent_head: parent.head.sha.clone(),
+            child_pr: PrNumber(child.number),
+            child_head: child.head.sha.clone(),
+            relation,
+            linear,
+        });
+    }
+    ancestry
 }
 
 fn stack_backend_status(
@@ -499,7 +604,7 @@ fn stack_backend_status(
     let native_stacks = inventory
         .stacks
         .into_iter()
-        .map(|stack| native_stack_status(stack, analysis, &mut represented))
+        .map(|stack| native_stack_status(stack, provider, repository, analysis, &mut represented))
         .collect::<Vec<_>>();
 
     let missing_caravans = if inventory.truncated {
@@ -4189,7 +4294,8 @@ fn discovery_timeout_error(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::cell::RefCell;
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -4224,6 +4330,33 @@ mod tests {
         ) -> Result<crate::github::GitHubStackInventory, crate::github::GitHubStackReadError>
         {
             self.0.clone()
+        }
+    }
+
+    struct FixedAncestryProvider {
+        inventory: Result<crate::github::GitHubStackInventory, crate::github::GitHubStackReadError>,
+        relations: RefCell<VecDeque<crate::generation::CommitRelation>>,
+    }
+
+    impl NativeStackInventoryProvider for FixedAncestryProvider {
+        fn native_stack_inventory(
+            &self,
+            _repository: &RepositoryId,
+        ) -> Result<crate::github::GitHubStackInventory, crate::github::GitHubStackReadError>
+        {
+            self.inventory.clone()
+        }
+
+        fn compare_stack_commits(
+            &self,
+            _repository: &RepositoryId,
+            _parent: &crate::model::CommitOid,
+            _child: &crate::model::CommitOid,
+        ) -> Result<crate::generation::CommitRelation, String> {
+            self.relations
+                .borrow_mut()
+                .pop_front()
+                .ok_or_else(|| "missing scripted ancestry relation".to_owned())
         }
     }
 
@@ -7292,6 +7425,84 @@ mod tests {
             StackConsistency::Exact
         );
         assert!(backend.problems.is_empty());
+    }
+
+    #[test]
+    fn native_stack_adjacent_ancestry_names_only_diverged_edges() {
+        let root = pr(2738, "root", "main", true);
+        let child = pr(2814, "child", "root", true);
+        let third = pr(2817, "third", "child", true);
+        let fourth = pr(2819, "fourth", "third", true);
+        let status = status(
+            fourth.clone(),
+            vec![root.clone(), child.clone(), third.clone(), fourth.clone()],
+        );
+        let entries = [&root, &child, &third, &fourth]
+            .into_iter()
+            .map(|pull| crate::github::GitHubStackPullRequest {
+                number: pull.number.0,
+                state: "open".to_owned(),
+                draft: false,
+                merged_at: None,
+                head: crate::github::GitHubStackPullRequestHead {
+                    ref_name: pull.head.name.clone(),
+                    sha: pull.head.oid.clone(),
+                },
+            })
+            .collect();
+        let provider = FixedAncestryProvider {
+            inventory: Ok(crate::github::GitHubStackInventory {
+                truncated: false,
+                stacks: vec![crate::github::GitHubStackSnapshot {
+                    id: 369_067,
+                    number: 2818,
+                    node_id: "S_live_diverged".to_owned(),
+                    base: crate::github::GitHubStackBase {
+                        ref_name: "main".to_owned(),
+                    },
+                    open: true,
+                    created_at: "2026-08-14T13:26:06Z".to_owned(),
+                    pull_requests: entries,
+                }],
+            }),
+            relations: RefCell::new(VecDeque::from([
+                crate::generation::CommitRelation::Ahead,
+                crate::generation::CommitRelation::Diverged,
+                crate::generation::CommitRelation::Diverged,
+            ])),
+        };
+
+        let backend = stack_backend_status(
+            crate::config::StackType::Github,
+            &provider,
+            &status.repository,
+            &status.analysis,
+        );
+
+        let native = &backend.native_stacks[0];
+        assert_eq!(native.consistency, StackConsistency::Drifted);
+        assert_eq!(native.ancestry.len(), 3);
+        assert!(native.ancestry[0].linear);
+        assert!(!native.ancestry[1].linear);
+        assert!(!native.ancestry[2].linear);
+        assert_eq!(native.ancestry[1].parent_pr, PrNumber(2814));
+        assert_eq!(native.ancestry[1].child_pr, PrNumber(2817));
+        assert_eq!(native.ancestry[2].parent_pr, PrNumber(2817));
+        assert_eq!(native.ancestry[2].child_pr, PrNumber(2819));
+        assert_eq!(
+            native
+                .problems
+                .iter()
+                .filter(|problem| problem.code == "native_stack_rebase_required")
+                .count(),
+            2
+        );
+        assert!(
+            backend
+                .problems
+                .iter()
+                .any(|problem| problem.code == "native_stack_rebase_required")
+        );
     }
 
     #[test]

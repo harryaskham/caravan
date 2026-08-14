@@ -778,7 +778,10 @@ ruleset fences external writers, but also exposed GitHub's dangerous partial
 merge postcondition: the provider rebases an unselected suffix and thereby
 replaces its source head and starts CI again. Cara therefore locks every source
 ref in the complete Stack generation, never only the ready prefix. Native sync
-submits only a fully ready Stack; a ready prefix with a blocked suffix returns
+submits only a fully ready Stack; PR base edges alone are insufficient. Status
+also compares each predecessor head to its child head and reports
+`native_stack_rebase_required` for every child that does not contain its parent.
+Unknown ancestry fails closed. A ready prefix with a blocked suffix returns
 `github_stack_partial_prefix_requires_tail_eviction` before lock/submission and
 requires typed evict/split first. Readiness binds each immutable source head to
 its exact fresh two-parent synthetic merge candidate (current main for the root,
