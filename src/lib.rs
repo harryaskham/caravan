@@ -34,6 +34,7 @@ pub mod pause;
 pub mod physical_rebase;
 pub mod priority;
 pub mod read;
+pub mod recovery_ledger;
 pub mod remote_lease;
 pub mod repair;
 pub mod required_runs;
@@ -635,6 +636,16 @@ RECOVERY, LOCKS, AND OBSERVABILITY
   a complete fast cron-driven setup: a bounded `cara loop --once` tick plus an
   idempotent hook that files exactly one deduplicated Cacophony bead per
   canonical event, which normal controller dispatch then routes to an agent.
+- External Pi/dormant-agent recovery uses a local secret-free ledger, not an
+  in-process model. Capture one canonical Cara JSON error, then run
+  `cara recovery-request --error ERROR.json --ledger recovery-ledger.json`; Cara rereads
+  provider/main and records exact PR/head/base/Stack/check/config/policy/decision
+  generations plus only typed allowed actions. `recovery-attempt` records one
+  exact external receipt; `recovery-ledger` reads state. Retry/backoff applies
+  only to transient dispositions, stale/wrong-generation receipts and
+  unverified success refuse, and exhaustion emits one deduplicated escalation or
+  exact-plan owner request. These commands write only atomic local state and can
+  never invoke a model, mutate GitHub, execute a plan, or become a second writer.
 - `cara show`, `next`, `prev`, and `van list|next|prev` are navigation surfaces;
   they never authorize skipping admission or mutation preflight. If a clean,
   non-current destination lags a Cara physical rewrite, navigation reverifies
@@ -1452,6 +1463,27 @@ pub fn build_router() -> ToolRouter<AppContext> {
         "Read one bounded pull_request event under trusted default policy, bind it to complete live provider membership, and emit run_member, deferred_unjoined, or safe run_unproven evidence. Read-only; workflow output writing is CLI-only.",
         |context: &AppContext, input: CiAdmissionGateInput| {
             Ok::<_, AppError>(ci_admission_gate::evaluate(context, &input))
+        },
+    );
+    router.add_typed_tool_with_output_schema(
+        "recovery_request",
+        "Build and atomically persist one secret-free exact-generation RecoveryRequest from a captured Cara JSON error plus fresh provider/main status. Read-only provider access; no model invocation or provider mutation.",
+        |context: &AppContext, input: recovery_ledger::RecoveryRequestInput| {
+            recovery_ledger::record_request(context, &input)
+        },
+    );
+    router.add_typed_tool_with_output_schema(
+        "recovery_attempt",
+        "Record one exact external-agent attempt receipt in the local bounded recovery ledger. Rejects stale generations, secrets, and unverified success; never mutates provider state.",
+        |context: &AppContext, input: recovery_ledger::RecoveryAttemptInput| {
+            recovery_ledger::record_attempt(Some(context), &input)
+        },
+    );
+    router.add_typed_tool_with_output_schema(
+        "recovery_ledger",
+        "Read the local secret-free recovery request/attempt ledger without provider access or mutation.",
+        |_context: &AppContext, input: recovery_ledger::RecoveryLedgerInput| {
+            recovery_ledger::show(&input)
         },
     );
     router.add_typed_tool_with_output_schema(

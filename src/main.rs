@@ -150,6 +150,12 @@ enum Command {
     Split(SplitInput),
     /// Repeatedly run lightweight sync-all ticks in the foreground.
     Loop(LoopInput),
+    /// Build and persist a secret-free recovery handoff from one Cara error.
+    RecoveryRequest(caravan::recovery_ledger::RecoveryRequestInput),
+    /// Record one exact external-agent recovery attempt receipt.
+    RecoveryAttempt(caravan::recovery_ledger::RecoveryAttemptInput),
+    /// Show the local recovery ledger without provider mutation.
+    RecoveryLedger(caravan::recovery_ledger::RecoveryLedgerInput),
     /// Inspect or recover the repository operation lock.
     #[command(subcommand)]
     Lock(LockCommand),
@@ -500,6 +506,9 @@ fn run(cli: &Cli) -> Result<(), i32> {
         Command::Evict(input) => run_evict(cli, input),
         Command::Split(input) => run_split(cli, input),
         Command::Loop(input) => run_loop(cli, input),
+        Command::RecoveryRequest(input) => run_recovery_request(cli, input),
+        Command::RecoveryAttempt(input) => run_recovery_attempt(cli, input),
+        Command::RecoveryLedger(input) => run_recovery_ledger(cli, input),
         Command::Lock(command) => run_lock(cli, command),
         Command::Van(command) => match command {
             VanCommand::List => run_van_list(cli),
@@ -2392,6 +2401,38 @@ fn run_lock(cli: &Cli, command: &LockCommand) -> Result<(), i32> {
             emit_result(cli.json, result)
         }
     }
+}
+
+fn run_recovery_request(
+    cli: &Cli,
+    input: &caravan::recovery_ledger::RecoveryRequestInput,
+) -> Result<(), i32> {
+    let context = load_context(cli)?;
+    emit_result(
+        cli.json,
+        caravan::recovery_ledger::record_request(&context, input),
+    )
+}
+
+fn run_recovery_attempt(
+    cli: &Cli,
+    input: &caravan::recovery_ledger::RecoveryAttemptInput,
+) -> Result<(), i32> {
+    let context = match cli.repo.as_deref() {
+        Some(repository) => AppContext::load_from_directory(repository, cli.config.as_deref()).ok(),
+        None => AppContext::load(cli.config.as_deref()).ok(),
+    };
+    emit_result(
+        cli.json,
+        caravan::recovery_ledger::record_attempt(context.as_ref(), input),
+    )
+}
+
+fn run_recovery_ledger(
+    cli: &Cli,
+    input: &caravan::recovery_ledger::RecoveryLedgerInput,
+) -> Result<(), i32> {
+    emit_result(cli.json, caravan::recovery_ledger::show(input))
 }
 
 fn run_loop(cli: &Cli, input: &LoopInput) -> Result<(), i32> {
