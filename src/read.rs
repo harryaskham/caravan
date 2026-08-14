@@ -323,6 +323,17 @@ fn validate_native_stack_entries(
     for (index, entry) in stack.pull_requests.iter().enumerate() {
         let number = PrNumber(entry.number);
         let Some(pull) = analysis.pull_requests.get(&number) else {
+            // Hot mutating discovery deliberately omits most closed rows. The
+            // provider Stack itself is authoritative for a leading retained
+            // merged prefix when each entry has terminal merge provenance.
+            // Once the open suffix begins, every member must still exist in
+            // Cara discovery and bind its exact live PR generation.
+            let retained_merged_prefix = previous_open_head.is_none()
+                && entry.state.eq_ignore_ascii_case("closed")
+                && entry.merged_at.is_some();
+            if retained_merged_prefix {
+                continue;
+            }
             problems.push(StackBackendProblem {
                 code: "github_stack_pr_missing".to_owned(),
                 message: format!(
@@ -7580,7 +7591,9 @@ mod tests {
         predecessor.state = crate::model::PullRequestState::Merged;
         predecessor.merged_at = Some("2026-08-09T09:00:00Z".to_owned());
         let current = pr(2, "child", "main", true);
-        let status = status(current.clone(), vec![predecessor.clone(), current.clone()]);
+        // Hot sync discovery intentionally omits the closed merged prefix; the
+        // open Stack resource retains its exact terminal history.
+        let status = status(current.clone(), vec![current.clone()]);
         assert_eq!(status.analysis.fleet.caravans[0].members, vec![PrNumber(2)]);
         let provider = FixedStackProvider(Ok(crate::github::GitHubStackInventory {
             truncated: false,
@@ -7596,7 +7609,7 @@ mod tests {
                 pull_requests: vec![
                     crate::github::GitHubStackPullRequest {
                         number: 1,
-                        state: "merged".to_owned(),
+                        state: "closed".to_owned(),
                         draft: false,
                         merged_at: predecessor.merged_at.clone(),
                         head: crate::github::GitHubStackPullRequestHead {
