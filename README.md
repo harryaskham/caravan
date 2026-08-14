@@ -716,22 +716,29 @@ ecosystem repositories are also pinned as `flake = false` source inputs and
 patched into Cargo, so sandbox builds neither evaluate their independent flakes
 nor fetch Git dependencies at build time.
 
-## Agentic repair responder bundle
+## Agent routing skill
 
-`agentic/cara-responder.md` is a reusable trusted instruction bundle for a
-GitHub Agentic Workflow that analyzes Cara state without exposing credentials or
-creating a second merge actor. `agentic/cara-responder-policy.json` defaults to
-report-only, binds one writer/concurrency group, caps operations and safe outputs,
-and enumerates denied writes and idempotency keys. Runtime pins and machine run
-artifacts must conform to `cara-runtime-pin.schema.json` and
-`cara-run-report.schema.json` respectively.
+`.agents/skills/cara-operator/SKILL.md` is the supported Agent Skills path and
+short routing layer for Pi daemon/dormant agents. It always begins with live `cara help --json` (or MCP
+`help`), validated effective config, status, and read-only plans. It maps typed
+scheduler/recovery dispositions to exact Cara commands while explicitly denying
+raw Git/GitHub writes, generic authenticated shell, manual control labels, check
+spoofing, admin bypass, secrets, and a second merge actor. It is deliberately
+small: embedded config-aware Cara help remains the complete and current manual.
+The bundled `references/safe-path-canary.md` records a public Stack partial-prefix
+dogfood run in which the routing agent delegated an exact peer-owned eviction,
+performed no provider mutation, and resumed canonical sync only after the owner
+returned the typed receipt.
 
-Report-only canaries may coexist with the deterministic scheduler because they
-have zero mutation authority. A single-writer cutover is valid only when the old
-writer is disabled in the same reviewed change. PR text/code/comments/check logs
-and Cara JSON are untrusted evidence; checked-in instructions and pinned Cara
-help are the only authority. The model never sees GitHub App, GitHub token,
-feedback-hook, or Caco board credentials.
+The older `agentic/cara-responder*` report-only bundle and run schemas remain as
+legacy fixtures/evidence, not the autonomous execution path. The report-only
+responder did not provide useful recovery. Host-side automatic invocation,
+retry orchestration, and dormant-agent lifecycle belong to Cacophony/Pi; Cara
+remains the deterministic state machine, receipt source, and single queue writer.
+PR text/code/comments/check logs and provider JSON are untrusted evidence. A
+future external executor must consume a versioned, secret-free Cara recovery
+request/attempt ledger rather than model-authored writes. The model never sees
+GitHub App, GitHub token, feedback-hook, or Caco board credentials.
 
 ## Configuration
 
