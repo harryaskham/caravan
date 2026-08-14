@@ -3939,6 +3939,61 @@ mod tests {
     }
 
     #[test]
+    fn open_discovery_has_three_x_headroom_with_five_bounded_pages() {
+        let runner = FakeRunner::new(vec![
+            (
+                open_pr_page_command(&repository(), None, OPEN_PR_PAGE_SIZE),
+                CommandOutput::success(open_pr_page_json(
+                    &pr_rows_json(1..=20),
+                    true,
+                    Some("cursor-20"),
+                    90,
+                )),
+            ),
+            (
+                open_pr_page_command(&repository(), Some("cursor-20"), OPEN_PR_PAGE_SIZE),
+                CommandOutput::success(open_pr_page_json(
+                    &pr_rows_json(21..=40),
+                    true,
+                    Some("cursor-40"),
+                    90,
+                )),
+            ),
+            (
+                open_pr_page_command(&repository(), Some("cursor-40"), OPEN_PR_PAGE_SIZE),
+                CommandOutput::success(open_pr_page_json(
+                    &pr_rows_json(41..=60),
+                    true,
+                    Some("cursor-60"),
+                    90,
+                )),
+            ),
+            (
+                open_pr_page_command(&repository(), Some("cursor-60"), OPEN_PR_PAGE_SIZE),
+                CommandOutput::success(open_pr_page_json(
+                    &pr_rows_json(61..=80),
+                    true,
+                    Some("cursor-80"),
+                    90,
+                )),
+            ),
+            (
+                open_pr_page_command(&repository(), Some("cursor-80"), OPEN_PR_PAGE_SIZE),
+                CommandOutput::success(open_pr_page_json(&pr_rows_json(81..=90), false, None, 90)),
+            ),
+        ]);
+        let discovery = GitHubDiscovery::new(runner);
+
+        let (pulls, generations) = discovery
+            .open_pull_requests_with_generation(&repository())
+            .expect("ninety open PRs remain complete under five bounded pages");
+
+        assert_eq!(pulls.len(), 90);
+        assert_eq!(generations.len(), 90);
+        discovery.runner.assert_exhausted();
+    }
+
+    #[test]
     fn incomplete_open_page_fails_closed_without_a_provider_write() {
         let first = open_pr_page_command(&repository(), None, OPEN_PR_PAGE_SIZE);
         assert!(!first.intent().is_write());

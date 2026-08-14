@@ -1205,8 +1205,15 @@ If the bounded open rollup omitted a reused branch, one unique exact OPEN
 same-repository PR may take precedence over older unlabelled history only when
 its local, remote-ref, and provider head OIDs all match. Multiple open reuses,
 forks, OID mismatch, or older `caravan`/`caravan-evicted` membership history
-still fail closed. Compatibility subprocesses share the same whole-status
-deadline. Explicit remote `check/new/join/rejoin --pr` re-read and bind only the
+still fail closed. Generation integrity analyzes only current open provider
+facts; merged/closed lifecycle rows remain visible for audit but do not trigger
+historical compare/comment N+1 fan-out. At 30 or more lifecycle candidates the
+human `status` surface explicitly defers exact Git compatibility and returns
+current provider/structural evidence before its process watchdog; mutation-capable
+`plan sync`/`sync` retain complete exact proofs and their full operation budget.
+Compatibility and local ancestry subprocesses share the same absolute deadline,
+and local ancestry uses at most two `merge-base --is-ancestor` calls instead of
+separate object probes plus two ancestry processes. Explicit remote `check/new/join/rejoin --pr` re-read and bind only the
 selected PR after discovery under a fresh `command_timeout_secs` deadline;
 default-branch `repair start --pr` uses that focused active-topology path rather
 than rediscovering every unrelated unlabelled PR. Repairs naming a second target

@@ -1193,39 +1193,58 @@ impl RuntimeProvenance {
 /// been deleted or is otherwise unreachable, the same commits are frequently
 /// still in the local object database, and an exact local proof is strictly
 /// better than declaring an entire same-stream component unprovable.
+fn open_generation_facts(
+    pull_requests: &[crate::model::PullRequestSnapshot],
+    generation_facts: &[crate::model::PullRequestGenerationFact],
+) -> Vec<crate::model::PullRequestGenerationFact> {
+    let open_prs = pull_requests
+        .iter()
+        .filter(|pull| pull.state == crate::model::PullRequestState::Open)
+        .map(|pull| pull.number)
+        .collect::<std::collections::BTreeSet<_>>();
+    generation_facts
+        .iter()
+        .filter(|fact| open_prs.contains(&fact.pr))
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
 fn local_commit_relation(
     repository_path: &std::path::Path,
     base: &crate::model::CommitOid,
     head: &crate::model::CommitOid,
 ) -> Option<crate::generation::CommitRelation> {
-    use crate::command::{CommandRunner, CommandSpec, ProcessRunner};
-    let runner = ProcessRunner::in_directory(repository_path);
-    let known = |oid: &crate::model::CommitOid| {
-        runner
-            .run(&CommandSpec::new("git").args([
-                "cat-file",
-                "-e",
-                &format!("{}^{{commit}}", oid.0),
-            ]))
-            .is_ok_and(|output| output.is_success())
-    };
-    if !known(base) || !known(head) {
-        return None;
-    }
-    if base == head {
-        return Some(crate::generation::CommitRelation::Identical);
-    }
+    let runner = crate::command::ProcessRunner::in_directory(repository_path);
+    local_commit_relation_with_runner(&runner, base, head)
+}
+
+fn local_commit_relation_with_runner(
+    runner: &impl crate::command::CommandRunner,
+    base: &crate::model::CommitOid,
+    head: &crate::model::CommitOid,
+) -> Option<crate::generation::CommitRelation> {
     let ancestor = |first: &crate::model::CommitOid, second: &crate::model::CommitOid| {
-        runner
-            .run(&CommandSpec::new("git").args([
+        let output = runner
+            .run(&crate::command::CommandSpec::new("git").args([
                 "merge-base",
                 "--is-ancestor",
                 first.0.as_str(),
                 second.0.as_str(),
             ]))
-            .is_ok_and(|output| output.is_success())
+            .ok()?;
+        match output.code {
+            Some(0) => Some(true),
+            Some(1) => Some(false),
+            _ => None,
+        }
     };
-    match (ancestor(base, head), ancestor(head, base)) {
+    let base_is_ancestor = ancestor(base, head)?;
+    if base == head {
+        return base_is_ancestor.then_some(crate::generation::CommitRelation::Identical);
+    }
+    let head_is_ancestor = ancestor(head, base)?;
+    match (base_is_ancestor, head_is_ancestor) {
         (true, true) => Some(crate::generation::CommitRelation::Identical),
         (true, false) => Some(crate::generation::CommitRelation::Ahead),
         (false, true) => Some(crate::generation::CommitRelation::Behind),
@@ -1252,6 +1271,21 @@ pub const STATUS_COMMAND_WATCHDOG: Duration = Duration::from_secs(59);
 /// in-operation reserve for provider-backed stack projection and final status
 /// assembly instead of letting the final merge-tree consume the whole window.
 const STATUS_POST_ANALYSIS_RESERVE: Duration = Duration::from_secs(5);
+/// Human status may defer exact compatibility, but must return well before its
+/// outer process-tree watchdog even when Git transport cancellation/reaping is
+/// slow on large repositories. Mutation-capable sync keeps its full deadline.
+const STATUS_COMPATIBILITY_BUDGET: Duration = Duration::from_secs(10);
+/// At Cacophony-scale lifecycle snapshots, exact Git preparation can outlive a
+/// killed child transport even after its logical deadline. Human status defers
+/// that work explicitly; mutation-capable sync still performs it in full.
+const STATUS_COMPATIBILITY_DEFER_CANDIDATE_BOUND: usize = 30;
+
+const fn defer_status_compatibility_for_scale(
+    bounded_compatibility: bool,
+    candidate_count: usize,
+) -> bool {
+    bounded_compatibility && candidate_count >= STATUS_COMPATIBILITY_DEFER_CANDIDATE_BOUND
+}
 const STATUS_LAST_GOOD_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const STATUS_LAST_GOOD_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const STATUS_LAST_GOOD_SCHEMA_VERSION: u32 = 1;
@@ -2034,11 +2068,22 @@ fn status_with_discovery_options(
         );
         write_watchdog_checkpoint(Path::new(&path), context, &receipt);
     }
+    let compatibility_deferred_for_scale =
+        defer_status_compatibility_for_scale(bounded_compatibility, snapshot.pull_requests.len());
     let compatibility_deadline = if bounded_compatibility {
-        operation_deadline
-            .checked_sub(STATUS_POST_ANALYSIS_RESERVE)
-            .unwrap_or(started)
-            .max(started)
+        let now = std::time::Instant::now();
+        if compatibility_deferred_for_scale {
+            now
+        } else {
+            let completion_deadline = operation_deadline
+                .checked_sub(STATUS_POST_ANALYSIS_RESERVE)
+                .unwrap_or(started)
+                .max(started);
+            completion_deadline.min(
+                now.checked_add(STATUS_COMPATIBILITY_BUDGET)
+                    .unwrap_or(completion_deadline),
+            )
+        }
     } else {
         operation_deadline
     };
@@ -2090,7 +2135,12 @@ fn status_with_discovery_options(
     // Compatibility preparation fetches exact objects used by the preferred
     // local ancestry proof. Keep generation analysis after that fetch while the
     // earlier label read still guarantees a provider attempt before local work.
-    let mut generation_facts = snapshot.generation_facts.clone();
+    // Generation integrity governs current admission. Historical lifecycle rows
+    // stay in human status, but comparing every closed Cacophony generation is
+    // an unrelated N+1 fan-out that can exhaust the command watchdog at 30+
+    // open PRs. Keep only fresh open provider generations here.
+    let mut generation_facts =
+        open_generation_facts(&snapshot.pull_requests, &snapshot.generation_facts);
     for pr in crate::generation::duplicate_stream_prs(&generation_facts)
         .into_iter()
         .take(32)
@@ -2103,27 +2153,29 @@ fn status_with_discovery_options(
             );
         }
     }
+    let local_generation_runner =
+        crate::command::ProcessRunner::in_directory(&context.repository_path)
+            .with_timeout(child_timeout)
+            .with_operation_deadline(operation_deadline);
     let generation_integrity = crate::generation::analyze(&generation_facts, |base, head| {
         // bd-7546ea: exact local objects are an authoritative ancestry proof.
-        // A provider comparison can be unreachable (deleted ref, 404) or simply
-        // wrong/stale, and reporting a direct parent/child pair as `diverged`
-        // dead-ends the owner. Prefer a local proof of ancestry whenever both
-        // commits are present; otherwise keep the provider's answer.
-        let provider_relation = label_provider.compare_commits(&snapshot.repository, base, head);
-        let local = local_commit_relation(&context.repository_path, base, head);
-        match (provider_relation, local) {
-            // A local ancestry proof is authoritative and overrides an
-            // unreachable or contradictory provider answer.
-            (
-                _,
-                Some(
-                    relation @ (crate::generation::CommitRelation::Ahead
+        // Try that bounded proof first so locally present cumulative generations
+        // avoid one provider compare plus four subprocesses per pair. Provider
+        // comparison remains the fallback for absent or locally diverged facts.
+        let local = local_commit_relation_with_runner(&local_generation_runner, base, head);
+        if matches!(
+            local,
+            Some(
+                crate::generation::CommitRelation::Ahead
                     | crate::generation::CommitRelation::Behind
-                    | crate::generation::CommitRelation::Identical),
-                ),
+                    | crate::generation::CommitRelation::Identical
             )
-            | (Err(_), Some(relation))
-            | (Ok(relation), _) => relation,
+        ) {
+            return local.expect("matched local relation");
+        }
+        let provider_relation = label_provider.compare_commits(&snapshot.repository, base, head);
+        match (provider_relation, local) {
+            (Err(_), Some(relation)) | (Ok(relation), _) => relation,
             (Err(error), None) => crate::generation::CommitRelation::Unknown {
                 reason: error.to_string(),
             },
@@ -2241,7 +2293,14 @@ fn status_with_discovery_options(
         compatibility_budget_ms: millis(
             operation_budget
                 .saturating_sub(label_inventory_elapsed)
-                .saturating_sub(post_analysis_reserve),
+                .saturating_sub(post_analysis_reserve)
+                .min(if compatibility_deferred_for_scale {
+                    Duration::ZERO
+                } else if bounded_compatibility {
+                    STATUS_COMPATIBILITY_BUDGET
+                } else {
+                    operation_budget
+                }),
         ),
         compatibility_analysis: compatibility_progress,
         phases_ms: std::collections::BTreeMap::from([
@@ -5936,6 +5995,33 @@ mod tests {
     /// bd-7546ea live pair: PR2228 head ccc3af5c is the direct parent of
     /// PR2235 head f0bae700, so an exact local proof must classify it as
     /// strict-prefix ancestry, never as divergence.
+    #[test]
+    fn large_human_status_defers_git_compatibility_but_sync_does_not() {
+        assert!(!defer_status_compatibility_for_scale(true, 29));
+        assert!(defer_status_compatibility_for_scale(true, 30));
+        assert!(!defer_status_compatibility_for_scale(false, 90));
+    }
+
+    #[test]
+    fn generation_integrity_excludes_historical_lifecycle_rows() {
+        let open = pr(1, "open", "main", false);
+        let mut merged = pr(2, "merged", "main", false);
+        merged.state = crate::model::PullRequestState::Merged;
+        let fact = |number| crate::model::PullRequestGenerationFact {
+            pr: PrNumber(number),
+            provider_head: crate::model::CommitOid(format!("{number:040x}")),
+            created_at: None,
+            provenance: None,
+            metadata_error: None,
+            supersedes: std::collections::BTreeSet::new(),
+        };
+
+        let facts = open_generation_facts(&[open, merged], &[fact(1), fact(2)]);
+
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].pr, PrNumber(1));
+    }
+
     #[test]
     fn local_ancestry_proves_direct_parent_child_instead_of_divergence() {
         let directory = tempfile::tempdir().unwrap();
