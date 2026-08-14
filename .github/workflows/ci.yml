@@ -3,27 +3,48 @@ name: CI
 on:
   push:
     branches: [main]
-  # Physical Caravan children target predecessor branches, so this trigger must
-  # remain unfiltered and include every event that can refresh stacked CI.
+  # Code-generation events create one exact-head suite. Caravan membership is
+  # NOT a workflow trigger: sync rerequests this same suite after admission, so
+  # priority/force/park/unpark label churn cannot invalidate green CI.
   pull_request:
-    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
 
 concurrency:
   group: caravan-ci-${{ github.ref }}
   cancel-in-progress: true
 
-# Main run 31349811279 proved host-default 16-way Cargo fan-out can exhaust the
-# 32-GiB generic runner. PR run 31352989063 proved two-way cold Clippy exceeds
-# the controller's external 60-minute execution ceiling. Four workers keep a
-# 4x memory bound while separate required jobs keep each cold gate below that
-# ceiling. Incremental state stays disabled to bound memory/disk (bd-480dbc).
 env:
   CARGO_BUILD_JOBS: "4"
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  admission-gate:
+    runs-on: [self-hosted, nix, x86_64-linux]
+    timeout-minutes: 15
+    outputs:
+      run-ci: ${{ steps.gate.outputs.run_ci }}
+      deferred-unjoined: ${{ steps.gate.outputs.deferred_unjoined }}
+      decision: ${{ steps.gate.outputs.decision }}
+    steps:
+      # Gate policy/executable come from the trusted base generation, never PR
+      # code. The command then fetches/verifies current default policy itself.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+      - id: gate
+        name: Evaluate live Caravan membership
+        shell: bash
+        run: |
+          set -euo pipefail
+          nix develop --command cargo run --quiet -- \
+            --json ci-admission-gate \
+            --event "$GITHUB_EVENT_PATH" \
+            --github-output "$GITHUB_OUTPUT" >/dev/null
+
   format:
+    needs: admission-gate
+    if: needs.admission-gate.outputs.run-ci == 'true'
     runs-on: [self-hosted, nix, x86_64-linux]
     timeout-minutes: 10
     steps:
@@ -35,6 +56,8 @@ jobs:
         run: nix develop --command cargo fmt --all --check
 
   clippy:
+    needs: admission-gate
+    if: needs.admission-gate.outputs.run-ci == 'true'
     runs-on: [self-hosted, nix, x86_64-linux]
     timeout-minutes: 55
     steps:
@@ -46,6 +69,8 @@ jobs:
         run: nix develop --command cargo clippy --all-targets -- -D warnings
 
   tests:
+    needs: admission-gate
+    if: needs.admission-gate.outputs.run-ci == 'true'
     runs-on: [self-hosted, nix, x86_64-linux]
     timeout-minutes: 55
     steps:
@@ -54,11 +79,11 @@ jobs:
         shell: bash
         run: git config --global --unset-all url."ssh://git@github.com/".insteadOf 2>/dev/null || true
       - name: Run complete test suite
-        # tests/hook_example.rs requires environmental-hook-acceptance and is
-        # owned by the schedule/manual lane, not blocking PR CI.
         run: nix develop --command cargo test --all
 
   agent-surface:
+    needs: admission-gate
+    if: needs.admission-gate.outputs.run-ci == 'true'
     runs-on: [self-hosted, nix, x86_64-linux]
     timeout-minutes: 55
     steps:
@@ -69,31 +94,37 @@ jobs:
       - name: Verify help and MCP surfaces
         shell: bash
         run: |
-          # Not a login shell: `-l` would replace the Nix devShell PATH with
-          # runner profile state (bd-07a962).
           nix develop --command bash -c '
             set -euo pipefail
             cargo run -- help
             cargo run -- mcp tools >/dev/null
           '
 
-  # Preserve the existing required check name while failing closed if any
-  # parallel gate fails, times out, or is cancelled.
+  # Preserve the existing required context. Unjoined PRs deliberately fail only
+  # this configured sentinel; Cara may still admit them. After membership, sync
+  # rerequests the exact suite and every heavy job must pass.
   build-test:
     if: ${{ always() }}
-    needs: [format, clippy, tests, agent-surface]
+    needs: [admission-gate, format, clippy, tests, agent-surface]
     runs-on: [self-hosted, nix, x86_64-linux]
     timeout-minutes: 5
     steps:
-      - name: Require every pinned gate
+      - name: Defer unjoined PR or require every pinned gate
         shell: bash
         env:
+          RUN_CI: ${{ needs.admission-gate.outputs.run-ci }}
+          DEFERRED_UNJOINED: ${{ needs.admission-gate.outputs.deferred-unjoined }}
           FORMAT_RESULT: ${{ needs.format.result }}
           CLIPPY_RESULT: ${{ needs.clippy.result }}
           TESTS_RESULT: ${{ needs.tests.result }}
           AGENT_SURFACE_RESULT: ${{ needs.agent-surface.result }}
         run: |
           set -euo pipefail
+          if [ "$DEFERRED_UNJOINED" = true ]; then
+            echo "Caravan admission deferred: heavy CI starts after membership"
+            exit 78
+          fi
+          test "$RUN_CI" = true
           test "$FORMAT_RESULT" = success
           test "$CLIPPY_RESULT" = success
           test "$TESTS_RESULT" = success

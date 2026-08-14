@@ -4784,15 +4784,21 @@ where
             candidate.number,
             context.config.ci.admission_gate.as_ref(),
         )?;
-        if local_refusal.is_none()
-            && let Some(gate) = context.config.ci.admission_gate.as_ref()
-            && candidate_has_exact_deferred_gate(
-                progress,
-                candidate.number,
-                gate,
-                &candidate.checks,
-            )
-        {
+        let deferred_gate = context.config.ci.admission_gate.as_ref().filter(|gate| {
+            local_refusal.is_none()
+                && candidate_has_exact_deferred_gate(
+                    progress,
+                    candidate.number,
+                    gate,
+                    &candidate.checks,
+                )
+        });
+        let deferred_gate_suite = deferred_gate
+            .map(|gate| {
+                admission_gate_rerequest_suite(provider, &status.repository, &candidate, gate)
+            })
+            .transpose()?;
+        if let Some(gate) = deferred_gate {
             output.gate_deferrals.push(AdmissionGateDeferral {
                 schema_version: 1,
                 candidate_pr: candidate.number,
@@ -4907,6 +4913,22 @@ where
                 writer_guard,
             )?;
             append_membership_progress(progress, &membership);
+            if let Some(check_suite_id) = deferred_gate_suite {
+                progress.ensure_mutation_capacity(1)?;
+                let receipt = provider
+                    .rerequest_check_suite(
+                        &status.repository,
+                        &progress.precondition(candidate.number),
+                        check_suite_id,
+                    )
+                    .map_err(|error| mutation_error(&error, progress, Some(candidate.number)))?;
+                progress.record(
+                    receipt,
+                    &format!(
+                        "rerequested admission-gate check suite {check_suite_id} after membership"
+                    ),
+                );
+            }
             admitted_this_iteration = true;
             output.joins.push(AutoAdmissionJoinReceipt {
                 candidate_pr: candidate.number,
@@ -5359,6 +5381,84 @@ fn gate_deferral_allows_required_runs(
                     | crate::required_runs::RequiredContextState::Unknown
             )
     }) && required_runs.status != RequiredRunsStatus::UnknownProviderState)
+}
+
+fn admission_gate_rerequest_suite(
+    provider: &impl SyncProvider,
+    repository: &RepositoryId,
+    candidate: &PullRequestSnapshot,
+    gate: &crate::config::CiAdmissionGateConfig,
+) -> Result<u64, AppError> {
+    let gate_run_ids = crate::model::latest_checks_per_identity(&candidate.checks)
+        .0
+        .into_iter()
+        .filter(|check| check.name == gate.context && check.state == CheckState::Failure)
+        .filter_map(|check| check.details_url.as_deref().and_then(workflow_run_id))
+        .collect::<Vec<_>>();
+    let [gate_run_id] = gate_run_ids.as_slice() else {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "auto_admission_gate_run_ambiguous",
+            "deferred admission gate must identify one exact workflow run",
+            Some(json!({
+                "pr": candidate.number,
+                "head": candidate.head,
+                "context": gate.context,
+                "run_ids": gate_run_ids,
+                "mutated": false,
+            })),
+        ));
+    };
+    let expected = PullRequestPrecondition::from(candidate);
+    let lineage = provider
+        .head_run_lineage(repository, &expected)
+        .map_err(|error| {
+            AppError::structured(
+                ErrorCategory::ExecutionFailure,
+                "auto_admission_gate_lineage_failed",
+                error.to_string(),
+                Some(json!({"pr": candidate.number, "head": candidate.head, "mutated": false})),
+            )
+        })?;
+    if !lineage.complete || lineage.head_sha != candidate.head.oid.0 {
+        return Err(AppError::structured(
+            ErrorCategory::ExecutionFailure,
+            "auto_admission_gate_lineage_incomplete",
+            "admission gate check-suite lineage is incomplete or belongs to another head",
+            Some(
+                json!({"pr": candidate.number, "head": candidate.head, "lineage": lineage, "mutated": false}),
+            ),
+        ));
+    }
+    let suite_ids = lineage
+        .workflow_runs
+        .iter()
+        .filter(|run| run.run_id == *gate_run_id && run.head_sha == candidate.head.oid.0)
+        .map(|run| run.check_suite_id)
+        .filter(|suite_id| {
+            lineage.check_suites.iter().any(|suite| {
+                suite.id == *suite_id
+                    && suite.head_sha == candidate.head.oid.0
+                    && suite.rerequestable
+            })
+        })
+        .collect::<BTreeSet<_>>();
+    let suite_ids = suite_ids.iter().copied().collect::<Vec<_>>();
+    let [suite_id] = suite_ids.as_slice() else {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "auto_admission_gate_suite_ambiguous",
+            "admission gate workflow must map to one exact rerequestable check suite",
+            Some(json!({
+                "pr": candidate.number,
+                "head": candidate.head,
+                "run_id": gate_run_id,
+                "suite_ids": suite_ids,
+                "mutated": false,
+            })),
+        ));
+    };
+    Ok(*suite_id)
 }
 
 fn candidate_has_exact_deferred_gate(

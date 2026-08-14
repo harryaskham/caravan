@@ -968,7 +968,8 @@ exact decision into its required failing sentinel after recording outputs. The
 separate admission-only writer rerequests the selected PR's existing suite; it
 never runs heavy jobs for its own wake PR. JSON/MCP output includes exact policy,
 config, provider, head/base/default, membership/label, and receipt fingerprints
-without event payload or secrets.
+without event payload or secrets. See [`docs/gated-ci.md`](docs/gated-ci.md) for
+the canonical workflow and Cacophony/Pi-Daemon adoption sequence.
 
 If the same immutable parked head later becomes green but no normal sync tick can
 release it, use the reviewed `cara unpark` surface—not `resume`, `rejoin`, or a

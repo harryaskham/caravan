@@ -3155,6 +3155,55 @@ fn exact_unjoined_admission_gate_defers_heavy_ci_without_hiding_other_failures()
 }
 
 #[test]
+fn deferred_gate_maps_to_one_exact_rerequestable_suite() {
+    let gate = crate::config::CiAdmissionGateConfig {
+        mode: crate::config::CiAdmissionGateMode::CaravanLabel,
+        context: "Caravan admission".to_owned(),
+        member_label: "caravan".to_owned(),
+    };
+    let mut candidate = pull_request(
+        41,
+        "candidate",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    candidate.labels.clear();
+    candidate.checks = vec![check(&gate.context, CheckState::Failure, Some(10))];
+    let provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
+    provider.serve_lineage(
+        candidate.number,
+        HeadRunLineage {
+            head_sha: candidate.head.oid.0.clone(),
+            check_suites: vec![CheckSuiteLineage {
+                id: 77,
+                head_sha: candidate.head.oid.0.clone(),
+                status: "completed".to_owned(),
+                conclusion: "failure".to_owned(),
+                app_slug: "github-actions".to_owned(),
+                rerequestable: true,
+            }],
+            workflow_runs: vec![WorkflowRunLineage {
+                run_id: 10,
+                check_suite_id: 77,
+                workflow_name: "Caravan Gate".to_owned(),
+                head_sha: candidate.head.oid.0.clone(),
+                status: "completed".to_owned(),
+                conclusion: "failure".to_owned(),
+                event: "pull_request".to_owned(),
+            }],
+            head_committed_at: Some(PUBLISHED_AT.to_owned()),
+            complete: true,
+        },
+    );
+
+    assert_eq!(
+        admission_gate_rerequest_suite(&provider, &repository(), &candidate, &gate).unwrap(),
+        77
+    );
+}
+
+#[test]
 fn same_head_green_rerun_invalidates_terminal_ci_skip() {
     let mut candidate = pull_request(
         9,
