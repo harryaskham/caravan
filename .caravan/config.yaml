@@ -38,6 +38,10 @@ sync:
   # GitHub native Stack entries do not support provider auto-merge; cara must
   # own the head merge under stack_type: github.
   head_merge_actor: caravan
+  # Source-red roots are parked with Cara-owned labels/provenance so they stop
+  # consuming active capacity without manual relabel/close/merge intervention.
+  terminal_red:
+    action: park
   actions:
     join_unlabelled_prs: true
   max_candidates_per_tick: 8
