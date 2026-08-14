@@ -673,6 +673,8 @@ pub struct StatusTiming {
 pub struct AutoAdmissionStatus {
     pub enabled: bool,
     pub heuristic_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_gate: Option<crate::config::CiAdmissionGateConfig>,
     /// Admission fence for simultaneously active, non-parked caravans.
     #[serde(default = "default_max_caravans")]
     #[schemars(default = "default_max_caravans")]
@@ -720,6 +722,7 @@ impl Default for AutoAdmissionStatus {
         Self {
             enabled: false,
             heuristic_version: crate::sync::AUTO_ADMISSION_HEURISTIC_VERSION.to_owned(),
+            admission_gate: None,
             max_caravans: 1,
             active_caravans: 0,
             active_caravan_ids: Vec::new(),
@@ -741,7 +744,7 @@ impl Default for AutoAdmissionStatus {
 impl AutoAdmissionStatus {
     #[must_use]
     pub(crate) fn from_config(
-        config: &crate::config::SyncConfig,
+        config: &crate::config::CaravanConfig,
         analysis: &GraphAnalysis,
         first_candidate: Option<PrNumber>,
     ) -> Self {
@@ -768,11 +771,12 @@ impl AutoAdmissionStatus {
             .map(|pull_request| pull_request.number)
             .collect::<Vec<_>>();
         let terminal_closed_prs = terminal_closed_pr_ids.len();
-        let max_caravans = usize::try_from(config.max_caravans).unwrap_or(usize::MAX);
+        let max_caravans = usize::try_from(config.sync.max_caravans).unwrap_or(usize::MAX);
         Self {
-            enabled: config.actions.join_unlabelled_prs,
+            enabled: config.sync.actions.join_unlabelled_prs,
             heuristic_version: crate::sync::AUTO_ADMISSION_HEURISTIC_VERSION.to_owned(),
-            max_caravans: config.max_caravans,
+            admission_gate: config.ci.admission_gate.clone(),
+            max_caravans: config.sync.max_caravans,
             active_caravans,
             active_caravan_ids,
             parked_caravans,
@@ -784,10 +788,10 @@ impl AutoAdmissionStatus {
             first_blocked_root_candidate: (active_caravans >= max_caravans)
                 .then_some(first_candidate)
                 .flatten(),
-            max_candidates_per_tick: config.max_candidates_per_tick,
-            max_mutations_per_tick: config.max_mutations_per_tick,
-            max_github_requests_per_tick: config.max_github_requests_per_tick,
-            max_duration_secs: config.max_duration_secs,
+            max_candidates_per_tick: config.sync.max_candidates_per_tick,
+            max_mutations_per_tick: config.sync.max_mutations_per_tick,
+            max_github_requests_per_tick: config.sync.max_github_requests_per_tick,
+            max_duration_secs: config.sync.max_duration_secs,
         }
     }
 }
@@ -1488,7 +1492,7 @@ fn current_checkpoint_status(
         stack_backend,
         head_merge: HeadMergeStatus::from_config(&context.config.sync),
         auto_admission: AutoAdmissionStatus::from_config(
-            &context.config.sync,
+            &context.config,
             &analysis,
             admission.next_candidate,
         ),
@@ -2180,7 +2184,7 @@ fn status_with_discovery_options(
         rebase_on_join: rebase_on_join_status(context),
         stack_backend,
         auto_admission: AutoAdmissionStatus::from_config(
-            &context.config.sync,
+            &context.config,
             &analysis,
             admission.next_candidate,
         ),

@@ -476,6 +476,62 @@ impl Default for RepairConfig {
     }
 }
 
+/// Explicit CI admission-gate mode. This is opt-in because changing candidate
+/// CI semantics during an upgrade would otherwise admit work a repository had
+/// historically configured Cara to reject.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CiAdmissionGateMode {
+    CaravanLabel,
+}
+
+/// Exact required-check identity that deliberately defers heavy CI until
+/// Caravan membership exists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CiAdmissionGateConfig {
+    pub mode: CiAdmissionGateMode,
+    pub context: String,
+    pub member_label: String,
+}
+
+/// Repository CI policy. Absent configuration preserves historical candidate
+/// CI admission behavior byte-for-byte.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct CiConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_gate: Option<CiAdmissionGateConfig>,
+}
+
+impl CiConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        let Some(gate) = &self.admission_gate else {
+            return Ok(());
+        };
+        if gate.context.is_empty()
+            || gate.context.len() > 256
+            || gate.context.trim() != gate.context
+            || gate.context.chars().any(char::is_control)
+        {
+            return Err(ConfigError::Validation(
+                "ci.admission_gate.context must be a trimmed 1-256 character required-check name"
+                    .to_owned(),
+            ));
+        }
+        if gate.member_label != "caravan" {
+            return Err(ConfigError::Validation(
+                "ci.admission_gate.member_label must be exactly `caravan`".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Explicit sync-owned provider actions. Every action is disabled by default.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(default, deny_unknown_fields)]
@@ -715,6 +771,8 @@ pub struct CaravanConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository: Option<String>,
     pub repair: RepairConfig,
+    #[serde(default, skip_serializing_if = "CiConfig::is_default")]
+    pub ci: CiConfig,
     pub sync: SyncConfig,
     #[serde(rename = "loop")]
     pub loop_config: LoopConfig,
@@ -766,6 +824,7 @@ impl Default for CaravanConfig {
             command_timeout_secs: default_command_timeout_secs(),
             repository: None,
             repair: RepairConfig::default(),
+            ci: CiConfig::default(),
             sync: SyncConfig::default(),
             loop_config: LoopConfig::default(),
             journal: JournalConfig::default(),
@@ -994,6 +1053,7 @@ impl CaravanConfig {
         }
         self.github_auth.validate()?;
         self.writer.validate()?;
+        self.ci.validate()?;
         if self.writer.mode == WriterMode::RemoteFenced {
             let valid_repository = self.repository.as_deref().is_some_and(|slug| {
                 slug.split_once('/').is_some_and(|(owner, repository)| {
@@ -1375,6 +1435,31 @@ mod tests {
         let rendered = serde_yaml::to_string(&CaravanConfig::default()).expect("config serializes");
         assert!(!rendered.contains("head_merge_actor"), "{rendered}");
         assert!(!rendered.contains("auto_merge_head"), "{rendered}");
+    }
+
+    #[test]
+    fn admission_gate_is_strict_explicit_and_default_off() {
+        let default = CaravanConfig::default();
+        assert!(default.ci.admission_gate.is_none());
+        let rendered = serde_yaml::to_string(&default).expect("config serializes");
+        assert!(!rendered.contains("admission_gate"), "{rendered}");
+
+        let configured = CaravanConfig::parse(
+            "version: 1\nci:\n  admission_gate:\n    mode: caravan_label\n    context: Caravan admission\n    member_label: caravan\n",
+        )
+        .expect("typed gate parses");
+        let gate = configured.ci.admission_gate.expect("gate configured");
+        assert_eq!(gate.mode, CiAdmissionGateMode::CaravanLabel);
+        assert_eq!(gate.context, "Caravan admission");
+        assert_eq!(gate.member_label, "caravan");
+
+        for invalid in [
+            "version: 1\nci:\n  admission_gate:\n    mode: caravan_label\n    context: ''\n    member_label: caravan\n",
+            "version: 1\nci:\n  admission_gate:\n    mode: caravan_label\n    context: Caravan admission\n    member_label: other\n",
+            "version: 1\nci:\n  admission_gate:\n    mode: caravan_label\n    context: Caravan admission\n    member_label: caravan\n    guessed: true\n",
+        ] {
+            assert!(CaravanConfig::parse(invalid).is_err(), "{invalid}");
+        }
     }
 
     #[test]
