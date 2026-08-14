@@ -360,8 +360,11 @@ GITHUB NATIVE STACKS (EXPLICIT OPT-IN)
   defaults to 8 only under `stack_type: github`. A full batch is never extended:
   admission deterministically uses another compatible caravan or opens a new
   one. Native readiness requires each immutable source generation's exact fresh
-  two-parent synthetic candidate. Sync lands a fully ready Stack; a blocked
-  suffix must be reshaped first, never refreshed by a scheduler force-push.
+  two-parent synthetic candidate and proves that every open child commit
+  contains its predecessor head; base-ref linkage without commit ancestry is
+  `native_stack_rebase_required`, never a mergeable Stack. Sync lands a fully
+  ready Stack; a blocked suffix must be reshaped first, never refreshed by a
+  scheduler force-push.
 - GitHub cannot represent a one-member Stack. Complete zero-mapping inventory
   plus an authoritative one-member caravan selects the explicit singleton
   Caravan-owned route, which reuses exact head/base/check/tree validation and

@@ -1368,7 +1368,12 @@ CI, and unsupported force intent all fail closed before provider mutation.
 Exact REST create/add/unstack, asynchronous direct-merge planning, submission,
 UUID-polling, receipt primitives, and the phased evict/split unstack/rebuild
 transaction remain policy-free adapters composed by membership, reshape, and
-sync. Before membership invokes native create/add it persists a sealed,
+sync. A provider Stack is exact only when both its PR base edges and adjacent
+commit ancestry are exact: every open child head must contain its predecessor
+head. Status records each comparison and emits `native_stack_rebase_required`
+for divergence or an unknown-ancestry blocker for incomplete provider evidence;
+landing and successful membership/recovery convergence remain unreachable.
+Before membership invokes native create/add it persists a sealed,
 repository-local continuation keyed by the exact caravan root. The desired
 Stack base is the root PR's exact provider base generation, even when a later
 commit advanced the same configured default ref; current default remains
