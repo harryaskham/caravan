@@ -366,8 +366,10 @@ GITHUB NATIVE STACKS (EXPLICIT OPT-IN)
   `native_stack_rebase_required`, never a mergeable Stack. Use reviewed
   `native-stack rebase-preview` then `rebase-apply` to prepare the complete
   suffix and atomically publish exact leased heads; every changed generation
-  must pass fresh CI. Sync lands a fully ready Stack; a blocked suffix must be reshaped first, never refreshed by a
-  scheduler force-push.
+  must pass fresh CI. Sync lands the longest contiguous ready prefix under a
+  complete-Stack lock, receipts any provider-rewritten suffix generations, and
+  requires fresh CI before continuing; it never uses a scheduler force-push to
+  manufacture readiness.
 - GitHub cannot represent a one-member Stack. Complete zero-mapping inventory
   plus an authoritative one-member caravan selects the explicit singleton
   Caravan-owned route, which reuses exact head/base/check/tree validation and

@@ -1495,10 +1495,11 @@ replaces an immutable source head and starts CI again. Cara now creates one
 active repository ruleset with no bypass actors over every source ref in the
 complete exact Stack generation, with exactly `update` plus `deletion`
 restrictions. Exact readback must report `current_user_can_bypass: never`.
-Native sync submits only when every entry is ready. A ready prefix with a blocked
-suffix returns `github_stack_partial_prefix_requires_tail_eviction` with zero
-provider writes and requires typed evict/split before retrying; it never asks
-GitHub to rebase the suffix. Each readiness verdict also requires an exact fresh
+Native sync submits the longest contiguous ready prefix. With a blocked suffix,
+the complete Stack ref set remains locked while GitHub atomically lands the
+selected prefix; Cara seals the entire pre-submit suffix and accepts rewritten
+suffix generations only when order, PR/branch identity, base chain, and provider
+merge receipts match. Rewritten heads require fresh CI before later landing. Each readiness verdict also requires an exact fresh
 two-parent synthetic merge candidate whose parents are the entry's current base
 (current main for the root, predecessor source head for a child) and immutable
 source head. Candidate regeneration, not scheduler force-push, is the only

@@ -1284,43 +1284,6 @@ fn native_prefix_waits_for_provider_regeneration(
         })
 }
 
-fn top_eviction_recovery_plan(
-    repository: &RepositoryId,
-    operation_id: &OperationId,
-    actor: &str,
-    stack: &crate::github::GitHubStackGeneration,
-    selected_open: usize,
-) -> Option<crate::github::GitHubStackReshapePlan> {
-    let current_open = stack
-        .topology
-        .entries
-        .iter()
-        .filter(|entry| entry.pull_request_state == PullRequestState::Open)
-        .collect::<Vec<_>>();
-    if current_open.len() <= selected_open
-        || stack.topology.entries.last().map(|entry| entry.pr)
-            != current_open.last().map(|entry| entry.pr)
-    {
-        return None;
-    }
-    let selected_pr = current_open.last()?.pr;
-    let mut replacement = stack.topology.clone();
-    replacement.entries.pop()?;
-    crate::github::GitHubStackReshapePlan::new(
-        repository.clone(),
-        format!(
-            "{}:stack:{}:evict:{selected_pr}",
-            operation_id, stack.number
-        ),
-        actor.to_owned(),
-        crate::github::GitHubStackReshapeOperation::Evict,
-        selected_pr,
-        stack.clone(),
-        vec![replacement],
-    )
-    .ok()
-}
-
 pub(crate) fn require_native_stack_backend_healthy(status: &StatusOutput) -> Result<(), AppError> {
     if status.stack_backend.configured != crate::config::StackType::Github
         || status.stack_backend.problems.is_empty()
@@ -9159,49 +9122,11 @@ impl SyncProgress {
                 );
                 return Ok(());
             }
-            if prefix.selected.len() != current_open.len() {
-                let selected = prefix
-                    .selected
-                    .iter()
-                    .map(|entry| entry.pr)
-                    .collect::<Vec<_>>();
-                let blocked_suffix = current_open[prefix.selected.len()..]
-                    .iter()
-                    .map(|entry| entry.pr)
-                    .collect::<Vec<_>>();
-                let immutable_heads = stack
-                    .topology
-                    .entries
-                    .iter()
-                    .map(|entry| (entry.pr, entry.head.clone()))
-                    .collect::<BTreeMap<_, _>>();
-                let top_eviction_plan = top_eviction_recovery_plan(
-                    repository,
-                    &self.operation_id,
-                    &native.config.stack_rollout.reviewed_by,
-                    &stack,
-                    prefix.selected.len(),
-                );
-                let top_eviction_resumable = top_eviction_plan.is_some();
-                return Err(AppError::structured(
-                    ErrorCategory::Validation,
-                    "github_stack_partial_prefix_requires_tail_eviction",
-                    "native Stack partial-prefix merge would let GitHub rewrite an unselected tail source branch",
-                    Some(json!({
-                        "repository": repository,
-                        "caravan_id": caravan.id,
-                        "stack_number": stack_number,
-                        "selected_ready_prefix": selected,
-                        "blocked_suffix": blocked_suffix,
-                        "first_blocked": prefix.first_blocked,
-                        "immutable_source_heads": immutable_heads,
-                        "top_eviction_plan": top_eviction_plan,
-                        "mutated": false,
-                        "resumable": top_eviction_resumable,
-                        "safe_next_action": "review and apply the exact top_eviction_plan through the typed native Stack reshape path, then rerun sync against the remaining exact Stack; never update or force-push a source branch to refresh CI",
-                    })),
-                ));
-            }
+            // GitHub can atomically land the longest ready prefix and then
+            // rewrite the open suffix. The locked merge adapter seals the
+            // complete pre-submit Stack, verifies ordered selected commits,
+            // and receipts every rewritten suffix generation before release;
+            // fresh CI on those heads is required by the next tick.
             let plan = prefix
                 .direct_squash_plan(
                     format!("{}:stack:{stack_number}", self.operation_id),
