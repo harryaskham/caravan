@@ -1250,6 +1250,19 @@ fn native_sync_error(error: impl std::fmt::Display) -> AppError {
     )
 }
 
+fn native_prefix_waits_for_provider_regeneration(
+    prefix: &crate::github::GitHubStackReadyPrefix,
+    current_open: usize,
+) -> bool {
+    prefix.selected.len() != current_open
+        && prefix.first_blocked.as_ref().is_some_and(|blocked| {
+            !blocked.blockers.is_empty()
+                && blocked.blockers.iter().all(|blocker| {
+                    *blocker == crate::github::GitHubStackMergeBlocker::SyntheticCandidateStale
+                })
+        })
+}
+
 fn top_eviction_recovery_plan(
     repository: &RepositoryId,
     operation_id: &OperationId,
@@ -1263,7 +1276,7 @@ fn top_eviction_recovery_plan(
         .iter()
         .filter(|entry| entry.pull_request_state == PullRequestState::Open)
         .collect::<Vec<_>>();
-    if current_open.len() != selected_open.saturating_add(1)
+    if current_open.len() <= selected_open
         || stack.topology.entries.last().map(|entry| entry.pr)
             != current_open.last().map(|entry| entry.pr)
     {
@@ -4354,8 +4367,29 @@ fn reserved_candidate_budget(context: &AppContext) -> Duration {
     )
 }
 
-#[allow(clippy::too_many_lines)]
 fn run_auto_admission(
+    context: &AppContext,
+    status: StatusOutput,
+    provider: &impl SyncProvider,
+    progress: &mut SyncProgress,
+    operation_deadline: Instant,
+    github_budget: &crate::command::GithubRequestBudget,
+    writer_guard: &WriterOperationGuard,
+) -> Result<(StatusOutput, AutoAdmissionOutput), AppError> {
+    run_auto_admission_with_refresh(
+        context,
+        status,
+        provider,
+        progress,
+        operation_deadline,
+        github_budget,
+        writer_guard,
+        |deadline| read::fleet_status_for_sync(context, deadline, Some(github_budget)),
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn run_auto_admission_with_refresh<F>(
     context: &AppContext,
     mut status: StatusOutput,
     provider: &impl SyncProvider,
@@ -4363,7 +4397,11 @@ fn run_auto_admission(
     operation_deadline: Instant,
     github_budget: &crate::command::GithubRequestBudget,
     writer_guard: &WriterOperationGuard,
-) -> Result<(StatusOutput, AutoAdmissionOutput), AppError> {
+    mut refresh_status: F,
+) -> Result<(StatusOutput, AutoAdmissionOutput), AppError>
+where
+    F: FnMut(Instant) -> Result<StatusOutput, AppError>,
+{
     let mut output = AutoAdmissionOutput {
         enabled: true,
         heuristic_version: AUTO_ADMISSION_HEURISTIC_VERSION.to_owned(),
@@ -4528,7 +4566,12 @@ fn run_auto_admission(
             removed,
             "removed stale generation-bound automatic admission skip",
         );
-        status = read::fleet_status_for_sync(context, operation_deadline, Some(github_budget))?;
+        // GitHub list projections are eventually consistent after a label write.
+        // A fresh read can therefore repeat the exact stale row for seconds. Bound
+        // cleanup by immutable PR generation within this tick; the next tick has
+        // a new provider cursor if the successful mutation did not converge.
+        validated_skips.insert(skipped.pr);
+        status = refresh_status(operation_deadline)?;
         progress.current = status.analysis.pull_requests.clone();
         progress.merge_candidates = status
             .merge_candidates
@@ -4567,7 +4610,7 @@ fn run_auto_admission(
             });
         if needs_native_candidate_refresh && refreshed_stale_native_candidates.insert(next_pr) {
             read::invalidate_status_cache(context);
-            status = read::fleet_status_for_sync(context, operation_deadline, Some(github_budget))?;
+            status = refresh_status(operation_deadline)?;
             progress.current = status.analysis.pull_requests.clone();
             progress.merge_candidates = status
                 .merge_candidates
@@ -4730,7 +4773,7 @@ fn run_auto_admission(
         } else {
             operation_deadline
         };
-        status = read::fleet_status_for_sync(context, refresh_deadline, Some(github_budget))?;
+        status = refresh_status(refresh_deadline)?;
         progress.current = status.analysis.pull_requests.clone();
         progress.merge_candidates = status
             .merge_candidates
@@ -5689,7 +5732,15 @@ fn execute_root_first(
         if disposition != CiDisposition::Passing {
             continue;
         }
-        if progress.merge_root(provider, status, caravan.id, root, &caravan.members, None)? {
+        if progress.merge_root(
+            provider,
+            status,
+            caravan.id,
+            root,
+            &caravan.members,
+            None,
+            false,
+        )? {
             return Ok(Some(progress));
         }
     }
@@ -5779,15 +5830,22 @@ fn native_route_context(error: &AppError, status: &StatusOutput, caravan: &Carav
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeCaravanRoute {
+    CaravanOwned,
+    SingletonCaravanOwned,
+    NativeStack(u64),
+}
+
 #[allow(clippy::too_many_arguments)]
-fn native_stack_number_for_caravan(
+fn native_route_for_caravan(
     status: &StatusOutput,
     provider: &impl SyncProvider,
     caravan: &Caravan,
     native: Option<&NativeSyncContext>,
-) -> Result<Option<u64>, AppError> {
+) -> Result<NativeCaravanRoute, AppError> {
     let Some(native) = native else {
-        return Ok(None);
+        return Ok(NativeCaravanRoute::CaravanOwned);
     };
     let intersections = provider
         .native_stack_intersections_for_sync(&status.repository, &caravan.members)
@@ -5802,10 +5860,12 @@ fn native_stack_number_for_caravan(
     .map_err(|error| native_route_context(&error, status, caravan))?;
     Ok(match route {
         crate::stack_policy::StackLandingRoute::NativeStack { stack_number, .. } => {
-            Some(stack_number)
+            NativeCaravanRoute::NativeStack(stack_number)
         }
-        crate::stack_policy::StackLandingRoute::CaravanOwned
-        | crate::stack_policy::StackLandingRoute::SingletonCaravanOwned => None,
+        crate::stack_policy::StackLandingRoute::CaravanOwned => NativeCaravanRoute::CaravanOwned,
+        crate::stack_policy::StackLandingRoute::SingletonCaravanOwned => {
+            NativeCaravanRoute::SingletonCaravanOwned
+        }
     })
 }
 
@@ -5825,8 +5885,8 @@ fn reconcile_caravan(
     // discovery-time projection. It runs before promotion, auto-merge disarm,
     // force handling, or any landing write, so an intersecting provider Stack
     // can never fall through to synchronous `gh pr merge`.
-    let native_stack_number =
-        native_stack_number_for_caravan(status, provider, caravan, progress.native_stack.as_ref())?;
+    let native_route =
+        native_route_for_caravan(status, provider, caravan, progress.native_stack.as_ref())?;
 
     // Step 1 of the fenced transaction. Promotion always precedes any merge
     // mechanism: a root whose base is still an already-merged predecessor
@@ -5859,7 +5919,7 @@ fn reconcile_caravan(
     // one check generation. Once that PR is the root, skip every CI and
     // required-run read for the caravan and attempt the fresh mechanical/admin
     // force transaction immediately (bd-91e96a).
-    if native_stack_number.is_none()
+    if !matches!(native_route, NativeCaravanRoute::NativeStack(_))
         && progress
             .current
             .get(&head)
@@ -5911,7 +5971,7 @@ fn reconcile_caravan(
         }
     }
 
-    if let Some(stack_number) = native_stack_number {
+    if let NativeCaravanRoute::NativeStack(stack_number) = native_route {
         let native = progress
             .native_stack
             .clone()
@@ -5944,7 +6004,12 @@ fn reconcile_caravan(
     // Steps 3-5. Cara is the merge actor: re-read exact facts, prove the
     // already-validated tree is what lands, squash once, prove it reached the
     // default branch, then promote the successor and try again.
-    progress.drain_caravan_roots(provider, status, caravan)
+    progress.drain_caravan_roots(
+        provider,
+        status,
+        caravan,
+        native_route == NativeCaravanRoute::SingletonCaravanOwned,
+    )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -8742,6 +8807,18 @@ impl SyncProgress {
                 .iter()
                 .filter(|entry| entry.pull_request_state == PullRequestState::Open)
                 .collect::<Vec<_>>();
+            if native_prefix_waits_for_provider_regeneration(&prefix, current_open.len()) {
+                let blocked = prefix.first_blocked.as_ref().expect("checked as present");
+                self.record_merge_wait(
+                    caravan.head().expect("caravan has a head"),
+                    RootMergeBlock::ChecksNotPassing,
+                    Some(format!(
+                        "native Stack awaits provider regeneration of the exact merge candidate for PR #{}",
+                        blocked.pr
+                    )),
+                );
+                return Ok(());
+            }
             if prefix.selected.len() != current_open.len() {
                 let selected = prefix
                     .selected
@@ -8916,6 +8993,7 @@ impl SyncProgress {
         provider: &impl SyncProvider,
         status: &StatusOutput,
         caravan: &Caravan,
+        stackless_native_singleton: bool,
     ) -> Result<(), AppError> {
         let mut remaining = caravan.members.clone();
         let mut merged = 0_u32;
@@ -8936,6 +9014,7 @@ impl SyncProgress {
                 root,
                 &remaining,
                 landed_default.as_ref(),
+                stackless_native_singleton,
             )?;
             if !landed {
                 return Ok(());
@@ -8969,7 +9048,7 @@ impl SyncProgress {
     ///
     /// Returns whether the root landed, so the drain loop stops at the first
     /// bounded wait instead of guessing about the rest of the chain.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn merge_root(
         &mut self,
         provider: &impl SyncProvider,
@@ -8978,6 +9057,7 @@ impl SyncProgress {
         number: PrNumber,
         remaining: &[PrNumber],
         landed_default: Option<&crate::model::CommitOid>,
+        stackless_native_singleton: bool,
     ) -> Result<bool, AppError> {
         let repository = status.repository.clone();
         let default_branch = status.default_branch.clone();
@@ -9059,17 +9139,18 @@ impl SyncProgress {
             RootMergeGate::Eligible => {}
         }
 
-        // The cumulative-tree proof is what makes retarget-only promotion sound.
-        // Members are physically rebased before CI runs, so the exact head SHA
-        // already carries the reviewed cumulative content and its checks survive
-        // a retarget. The squash may only land while its result tree is exactly
-        // that validated tree; a changed tree means the default branch gained
-        // content this generation never saw and the chain must revalidate.
+        // Physical Caravan members already carry cumulative content, so their
+        // exact head tree must equal the proved merge-result tree. A Stackless
+        // native singleton is deliberately different: GitHub preserves its
+        // immutable logical-diff head after a predecessor lands. Its complete
+        // clean cumulative proof authorizes the ordinary squash result without
+        // requiring or disguising a source rewrite; provider/CI/head/default
+        // preconditions below remain exact.
         let Some(tree_proof) = tree_proof else {
             self.record_merge_wait(number, RootMergeBlock::CumulativeTreeUnproven, None);
             return Ok(false);
         };
-        if !tree_proof.identical {
+        if !tree_proof.identical && !stackless_native_singleton {
             self.record_merge_wait(
                 number,
                 RootMergeBlock::CumulativeTreeChanged,
@@ -9084,10 +9165,12 @@ impl SyncProgress {
         // successor's own tree. Containment is what separates that from the
         // ordinary case, and it is refused rather than waited on because only
         // proving or rescoping the caravan's content can resolve it.
-        if !root_merge::retained_patch_set_holds(
-            tree_proof.target_reachable_from_candidate,
-            landed_default.is_some_and(|oid| oid == &observed_default),
-        ) {
+        if !stackless_native_singleton
+            && !root_merge::retained_patch_set_holds(
+                tree_proof.target_reachable_from_candidate,
+                landed_default.is_some_and(|oid| oid == &observed_default),
+            )
+        {
             return Err(self.root_merge_failure(
                 caravan_id,
                 number,

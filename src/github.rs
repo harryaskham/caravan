@@ -25,6 +25,7 @@ const WORKFLOW_RUN_JSON_FIELDS: &str =
 /// Open-PR pages stay deliberately small: the former one-shot projection was
 /// observed returning 459 KiB for 53 rows before GitHub intermittently 504ed.
 const OPEN_PR_PAGE_SIZE: usize = 20;
+const OPEN_PR_SNAPSHOT_ATTEMPTS: usize = 2;
 const OPEN_PR_PAGE_QUERY: &str = r"query($owner:String!,$name:String!,$cursor:String,$pageSize:Int!){repository(owner:$owner,name:$name){pullRequests(states:OPEN,first:$pageSize,after:$cursor,orderBy:{field:CREATED_AT,direction:ASC}){nodes{number title body state isDraft mergeStateStatus headRefName headRefOid headRepository{name nameWithOwner} headRepositoryOwner{login} isCrossRepository baseRefName baseRefOid labels(first:100){nodes{name} pageInfo{hasNextPage}} autoMergeRequest{mergeMethod enabledBy{login}} statusCheckRollup{contexts(first:100){nodes{__typename ... on CheckRun{name status conclusion detailsUrl startedAt completedAt checkSuite{workflowRun{workflow{name}}}} ... on StatusContext{context state targetUrl createdAt}} pageInfo{hasNextPage}}} createdAt mergedAt url updatedAt} totalCount pageInfo{hasNextPage endCursor}}}}";
 const OPEN_PR_PAGE_JQ: &str = r".data.repository.pullRequests as $prs | {rows:[$prs.nodes[] | {number,title,body,state,isDraft,mergeStateStatus,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository,baseRefName,baseRefOid,labels:(.labels.nodes // []),labelsTruncated:(.labels.pageInfo.hasNextPage // false),autoMergeRequest,statusCheckRollup:((.statusCheckRollup.contexts.nodes // []) | map(. + {workflowName:(.checkSuite.workflowRun.workflow.name // null)} | del(.checkSuite))),checksTruncated:(.statusCheckRollup.contexts.pageInfo.hasNextPage // false),createdAt,mergedAt,url,updatedAt}],pageInfo:($prs.pageInfo + {totalCount:$prs.totalCount})}";
 /// Keeps JSON/MCP output and GraphQL cost bounded on pathological repositories.
@@ -2450,93 +2451,105 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
         ),
         DiscoveryError,
     > {
-        let mut cursor = None;
-        let mut pulls = Vec::new();
-        let mut seen = BTreeSet::new();
-        let mut expected_total = None;
-        loop {
-            let remaining = self.options.open_limit.saturating_sub(pulls.len());
-            if remaining == 0 {
-                return Err(DiscoveryError::OpenPullRequestsTruncated {
-                    limit: self.options.open_limit,
-                });
-            }
-            let page_size = remaining.min(OPEN_PR_PAGE_SIZE);
-            let command = open_pr_page_command(repository, cursor.as_deref(), page_size);
-            let page: PullRequestPageJson = self.json_with_transient_read_retry(command.clone())?;
-            if page.page_info.total_count > self.options.open_limit {
-                return Err(DiscoveryError::OpenPullRequestsTruncated {
-                    limit: self.options.open_limit,
-                });
-            }
-            if expected_total
-                .replace(page.page_info.total_count)
-                .is_some_and(|total| total != page.page_info.total_count)
-            {
-                return Err(invalid_open_page(
-                    &command,
-                    "open-PR total changed between provider pages",
-                ));
-            }
-            if page.rows.is_empty() && page.page_info.has_next_page {
-                return Err(invalid_open_page(
-                    &command,
-                    "open-PR page advertised a successor without any rows",
-                ));
-            }
-            for row in page.rows {
-                if !seen.insert(row.pull_request.number) {
-                    return Err(invalid_open_page(
-                        &command,
-                        format!("open-PR page repeated PR #{}", row.pull_request.number),
-                    ));
-                }
-                if row.labels_truncated {
-                    return Err(DiscoveryError::ProviderProjectionTruncated {
-                        pr: row.pull_request.number,
-                        field: "labels",
+        for snapshot_attempt in 0..OPEN_PR_SNAPSHOT_ATTEMPTS {
+            let mut cursor = None;
+            let mut pulls = Vec::new();
+            let mut seen = BTreeSet::new();
+            let mut expected_total = None;
+            let mut retry_snapshot = false;
+            loop {
+                let remaining = self.options.open_limit.saturating_sub(pulls.len());
+                if remaining == 0 {
+                    return Err(DiscoveryError::OpenPullRequestsTruncated {
+                        limit: self.options.open_limit,
                     });
                 }
-                if row.checks_truncated {
-                    return Err(DiscoveryError::ProviderProjectionTruncated {
-                        pr: row.pull_request.number,
-                        field: "statusCheckRollup",
+                let page_size = remaining.min(OPEN_PR_PAGE_SIZE);
+                let command = open_pr_page_command(repository, cursor.as_deref(), page_size);
+                let page: PullRequestPageJson =
+                    self.json_with_transient_read_retry(command.clone())?;
+                if page.page_info.total_count > self.options.open_limit {
+                    return Err(DiscoveryError::OpenPullRequestsTruncated {
+                        limit: self.options.open_limit,
                     });
                 }
-                pulls.push(row.pull_request);
-            }
-            if !page.page_info.has_next_page {
-                if pulls.len() != page.page_info.total_count {
+                if expected_total
+                    .replace(page.page_info.total_count)
+                    .is_some_and(|total| total != page.page_info.total_count)
+                {
+                    if snapshot_attempt + 1 < OPEN_PR_SNAPSHOT_ATTEMPTS {
+                        retry_snapshot = true;
+                        break;
+                    }
                     return Err(invalid_open_page(
                         &command,
-                        format!(
-                            "open-PR pages returned {} unique rows for provider total {}",
-                            pulls.len(),
-                            page.page_info.total_count
-                        ),
+                        "open-PR total changed between provider pages after one full snapshot retry",
                     ));
                 }
-                break;
-            }
-            cursor = Some(
-                page.page_info
-                    .end_cursor
-                    .filter(|cursor| !cursor.is_empty())
-                    .ok_or_else(|| {
-                        invalid_open_page(
+                if page.rows.is_empty() && page.page_info.has_next_page {
+                    return Err(invalid_open_page(
+                        &command,
+                        "open-PR page advertised a successor without any rows",
+                    ));
+                }
+                for row in page.rows {
+                    if !seen.insert(row.pull_request.number) {
+                        return Err(invalid_open_page(
                             &command,
-                            "open-PR page omitted its required successor cursor",
-                        )
-                    })?,
-            );
-        }
+                            format!("open-PR page repeated PR #{}", row.pull_request.number),
+                        ));
+                    }
+                    if row.labels_truncated {
+                        return Err(DiscoveryError::ProviderProjectionTruncated {
+                            pr: row.pull_request.number,
+                            field: "labels",
+                        });
+                    }
+                    if row.checks_truncated {
+                        return Err(DiscoveryError::ProviderProjectionTruncated {
+                            pr: row.pull_request.number,
+                            field: "statusCheckRollup",
+                        });
+                    }
+                    pulls.push(row.pull_request);
+                }
+                if !page.page_info.has_next_page {
+                    if pulls.len() != page.page_info.total_count {
+                        return Err(invalid_open_page(
+                            &command,
+                            format!(
+                                "open-PR pages returned {} unique rows for provider total {}",
+                                pulls.len(),
+                                page.page_info.total_count
+                            ),
+                        ));
+                    }
+                    break;
+                }
+                cursor = Some(
+                    page.page_info
+                        .end_cursor
+                        .filter(|cursor| !cursor.is_empty())
+                        .ok_or_else(|| {
+                            invalid_open_page(
+                                &command,
+                                "open-PR page omitted its required successor cursor",
+                            )
+                        })?,
+                );
+            }
+            if retry_snapshot {
+                continue;
+            }
 
-        let generation_facts = pulls.iter().map(PullRequestJson::generation_fact).collect();
-        let snapshots = pulls
-            .into_iter()
-            .map(|pull_request| pull_request.into_snapshot(repository))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok((snapshots, generation_facts))
+            let generation_facts = pulls.iter().map(PullRequestJson::generation_fact).collect();
+            let snapshots = pulls
+                .into_iter()
+                .map(|pull_request| pull_request.into_snapshot(repository))
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok((snapshots, generation_facts));
+        }
+        unreachable!("bounded open-PR snapshot attempts either return or report the final error")
     }
 
     fn pull_requests(
@@ -3739,6 +3752,51 @@ mod tests {
         assert_eq!(generations.len(), 53);
         assert_eq!(pulls.first().unwrap().number, PrNumber(1));
         assert_eq!(pulls.last().unwrap().number, PrNumber(53));
+        discovery.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn open_discovery_restarts_once_when_total_changes_between_pages() {
+        let first = open_pr_page_command(&repository(), None, OPEN_PR_PAGE_SIZE);
+        let second = open_pr_page_command(&repository(), Some("cursor-20"), OPEN_PR_PAGE_SIZE);
+        let runner = FakeRunner::new(vec![
+            (
+                first.clone(),
+                CommandOutput::success(open_pr_page_json(
+                    &pr_rows_json(1..=20),
+                    true,
+                    Some("cursor-20"),
+                    30,
+                )),
+            ),
+            (
+                second.clone(),
+                CommandOutput::success(open_pr_page_json(&pr_rows_json(21..=30), false, None, 31)),
+            ),
+            (
+                first,
+                CommandOutput::success(open_pr_page_json(
+                    &pr_rows_json(1..=20),
+                    true,
+                    Some("cursor-20"),
+                    31,
+                )),
+            ),
+            (
+                second,
+                CommandOutput::success(open_pr_page_json(&pr_rows_json(21..=31), false, None, 31)),
+            ),
+        ]);
+        let discovery = GitHubDiscovery::new(runner);
+
+        let (pulls, generations) = discovery
+            .open_pull_requests_with_generation(&repository())
+            .expect("one bounded full-snapshot retry absorbs ordinary page churn");
+
+        assert_eq!(pulls.len(), 31);
+        assert_eq!(generations.len(), 31);
+        assert_eq!(pulls.first().unwrap().number, PrNumber(1));
+        assert_eq!(pulls.last().unwrap().number, PrNumber(31));
         discovery.runner.assert_exhausted();
     }
 
