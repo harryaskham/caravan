@@ -16,7 +16,7 @@ fn ci_gate_has_portable_resource_and_time_bounds_without_weaker_commands() {
         .collect::<Vec<_>>();
     assert_eq!(
         timeout_minutes,
-        vec![10, 55, 55, 55, 5],
+        vec![15, 10, 55, 55, 55, 5],
         "every split job must stay below the external 60-minute ceiling"
     );
     for required in ["CARGO_BUILD_JOBS: \"4\"", "CARGO_INCREMENTAL: \"0\""] {
@@ -41,7 +41,7 @@ fn ci_gate_has_portable_resource_and_time_bounds_without_weaker_commands() {
     }
     for required in [
         "if: ${{ always() }}",
-        "needs: [format, clippy, tests, agent-surface]",
+        "needs: [admission-gate, format, clippy, tests, agent-surface]",
         "FORMAT_RESULT: ${{ needs.format.result }}",
         "CLIPPY_RESULT: ${{ needs.clippy.result }}",
         "TESTS_RESULT: ${{ needs.tests.result }}",
@@ -56,4 +56,25 @@ fn ci_gate_has_portable_resource_and_time_bounds_without_weaker_commands() {
             "build-test must aggregate fail-closed contract `{required}`"
         );
     }
+    for required in [
+        "types: [opened, synchronize, reopened]",
+        "--json ci-admission-gate",
+        "--github-output \"$GITHUB_OUTPUT\"",
+        "if: needs.admission-gate.outputs.run-ci == 'true'",
+        "DEFERRED_UNJOINED: ${{ needs.admission-gate.outputs.deferred-unjoined }}",
+        "exit 78",
+    ] {
+        assert!(
+            CI_WORKFLOW.contains(required),
+            "label-gated workflow must retain `{required}`"
+        );
+    }
+    assert!(!CI_WORKFLOW.contains("labeled, unlabeled"));
+    assert_eq!(
+        CI_WORKFLOW
+            .matches("if: needs.admission-gate.outputs.run-ci == 'true'")
+            .count(),
+        4,
+        "only the four heavy jobs are gated"
+    );
 }

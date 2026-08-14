@@ -31,6 +31,13 @@ agent_priority_labels:
   - caravan-priority:normal
   - caravan-priority:low
 command_timeout_secs: 60
+# Unjoined PRs run only the required build-test sentinel. After membership,
+# sync rerequests that exact suite and heavy jobs evaluate live membership.
+ci:
+  admission_gate:
+    mode: caravan_label
+    context: build-test
+    member_label: caravan
 # Automatic growth is sync-all-only and starts only after the existing fleet
 # converges. Every candidate, provider call, mutation, and wall-clock phase is
 # bounded; incompatible generations receive exact advisory skip receipts.
