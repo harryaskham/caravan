@@ -5273,7 +5273,11 @@ fn candidate_local_admission_refusal(
         ));
     }
     let gate_deferred = admission_gate.is_some_and(|gate| {
-        candidate_has_exact_deferred_gate(progress, candidate_pr, gate, &ci.checks)
+        // Gate policy must consume the same exact-head generation reducer that
+        // classified CI. Raw provider rows may contain both a CheckRun and its
+        // synthetic WorkflowRunLineage vote for one run; counting those as two
+        // gates deadlocks admission despite one unambiguous failed sentinel.
+        candidate_has_exact_deferred_gate(progress, candidate_pr, gate, &ci.effective_checks)
     });
     if gate_deferred {
         let gate = admission_gate.expect("checked as present");

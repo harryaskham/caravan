@@ -3155,6 +3155,77 @@ fn exact_unjoined_admission_gate_defers_heavy_ci_without_hiding_other_failures()
 }
 
 #[test]
+fn deferred_gate_uses_canonical_exact_head_generation_vote() {
+    let gate = crate::config::CiAdmissionGateConfig {
+        mode: crate::config::CiAdmissionGateMode::CaravanLabel,
+        context: "Caravan admission".to_owned(),
+        member_label: "caravan".to_owned(),
+    };
+    let mut candidate = pull_request(
+        9,
+        "candidate",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    candidate.labels.clear();
+    candidate.checks = vec![
+        check(&gate.context, CheckState::Failure, Some(10)),
+        CheckSnapshot {
+            name: gate.context.clone(),
+            state: CheckState::Failure,
+            provider_state: Some("run=completed/failure suite=completed/failure".to_owned()),
+            details_url: Some("/actions/runs/10".to_owned()),
+            provider_kind: Some("WorkflowRunLineage".to_owned()),
+            workflow_name: Some("CI".to_owned()),
+            ..CheckSnapshot::default()
+        },
+    ];
+    let gate_status = status(vec![candidate.clone()], Some(candidate.number), &clean);
+    let provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
+    provider.require_contexts("main", &[&gate.context, "heavy-ci"]);
+    provider.serve_lineage(
+        candidate.number,
+        HeadRunLineage {
+            head_sha: candidate.head.oid.0.clone(),
+            check_suites: vec![CheckSuiteLineage {
+                id: 77,
+                head_sha: candidate.head.oid.0.clone(),
+                status: "completed".to_owned(),
+                conclusion: "failure".to_owned(),
+                app_slug: "github-actions".to_owned(),
+                rerequestable: true,
+            }],
+            workflow_runs: vec![WorkflowRunLineage {
+                run_id: 10,
+                check_suite_id: 77,
+                workflow_name: "CI".to_owned(),
+                head_sha: candidate.head.oid.0.clone(),
+                status: "completed".to_owned(),
+                conclusion: "failure".to_owned(),
+                event: "pull_request".to_owned(),
+            }],
+            head_committed_at: Some(PUBLISHED_AT.to_owned()),
+            complete: true,
+        },
+    );
+    let mut progress = SyncProgress::new(&gate_status, Vec::new(), u32::MAX);
+
+    assert!(
+        candidate_local_admission_refusal(
+            &provider,
+            &mut progress,
+            &gate_status.repository,
+            candidate.number,
+            Some(&gate),
+        )
+        .expect("duplicate rows have complete exact-head lineage")
+        .is_none(),
+        "one CheckRun plus its WorkflowRunLineage vote is one logical deferred gate"
+    );
+}
+
+#[test]
 fn deferred_gate_maps_to_one_exact_rerequestable_suite() {
     let gate = crate::config::CiAdmissionGateConfig {
         mode: crate::config::CiAdmissionGateMode::CaravanLabel,
