@@ -1635,31 +1635,36 @@ change GitHub's merge ref and rerun CI. Caravan does not claim instant no-rerun
 landing without ancestry-preserving merges or an audited exact-tree/check
 receipt policy.
 
-### Agentic repair workflow boundary
+### Agent routing and external recovery boundary
 
-The repository-owned bundle under `agentic/` defines the only supported model
-boundary for a GitHub Agentic Workflow. Its default mode is report-only and has
-zero mutation authority while the deterministic scheduler remains active. A
-single-writer cutover must disable every prior Cara writer in the same reviewed
-change and retain one concurrency group. The model receives no GitHub App,
-GitHub token, feedback-hook, or Caco board credentials; short-lived credentials
-stay inside typed server-side tools and post-agent safe-output jobs.
+`.agents/skills/cara-operator/SKILL.md` is the supported repository-owned Agent
+Skills model routing layer. It is short and always defers authority to the installed binary's live
+`cara help --json`/MCP help, validated effective config, `status`, and read-only
+plans. It maps typed dispositions to exact Cara commands and emits bounded
+handoffs; it is not an autonomous queue writer or a second handbook.
 
-Runtime assets require exact version, HTTPS URL, SHA-256, source commit and
-release provenance. Mutable `latest` is invalid. Checked-in instructions and
-pinned generated Cara help are authority; PR content, code, comments, logs,
-artifacts and provider JSON are untrusted evidence. Report-only tools are status
-and sync dry-run. Single-writer Cara merge is available only after cutover.
-Other outputs are bounded to one comment, repair PR/triggering-branch update,
-allowlisted dispatch and feedback item. Direct tags, releases, settings,
-runners, arbitrary authenticated shell/API calls, unchanged reruns and direct
-board writes are forbidden.
+Cara remains the deterministic state machine, receipt source, and sole provider
+topology writer. Host-side automatic model invocation, retry orchestration,
+dormant-agent lifecycle, and operator UI belong to Cacophony/Pi. A model receives
+no GitHub App, GitHub token, feedback-hook, or Caco board credentials. Raw Git or
+GitHub writes, generic authenticated shell/API calls, manual control labels,
+check spoofing, admin bypass, settings/runners/releases, and a second merge actor
+are forbidden. Short-lived credentials stay inside typed server-side tools.
 
-Every run is time/operation/mutation bounded, never sleeps for CI, deduplicates
-by repository/PR/head/Stack/operation/check generation, and emits one machine
-report conforming to `agentic/cara-run-report.schema.json`. Canary adoption
-requires repeated zero-mutation reports matching deterministic scheduler
-proposals before mutation is reviewed.
+The older `agentic/cara-responder*` report-only instructions, policy, runtime pin,
+and run-report schemas are legacy evidence/fixtures, not the execution path; the
+report-only responder did not provide useful recovery. Mutable `latest` remains
+invalid, and any pinned runtime asset still requires exact version, HTTPS URL,
+SHA-256, source commit, and release provenance. PR content, code, comments, logs,
+artifacts, provider JSON, and model narrative are untrusted evidence.
+
+Future external recovery execution consumes a versioned, secret-free Cara
+RecoveryRequest and durable attempt ledger keyed by exact repository/PR/head/
+Stack/check/config/policy/decision generations. Retries are bounded to typed
+transient dispositions; deterministic decisions do not hot-loop. Exhaustion
+emits one deduplicated escalation/ejection request, never an automatic
+label/merge/eviction. Completion requires exact receipt and provider/main reread.
+The repo-owned skill routes that handshake but never performs hidden writes.
 
 ## 10. Concurrency and idempotency
 
