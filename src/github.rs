@@ -250,6 +250,8 @@ pub enum DiscoveryError {
     OpenPullRequestsTruncated { limit: usize },
     /// A nested GraphQL connection exceeded the bounded per-PR projection.
     ProviderProjectionTruncated { pr: u64, field: &'static str },
+    /// Programming guard: mutation commands can never enter read retry.
+    ReadRetryRefused { command: CommandSpec },
 }
 
 impl std::fmt::Display for DiscoveryError {
@@ -310,6 +312,11 @@ impl std::fmt::Display for DiscoveryError {
             Self::ProviderProjectionTruncated { pr, field } => write!(
                 formatter,
                 "open PR #{pr} exceeded the bounded `{field}` provider projection"
+            ),
+            Self::ReadRetryRefused { command } => write!(
+                formatter,
+                "read-only retry refused mutation command `{}`",
+                command.display()
             ),
         }
     }
@@ -2593,7 +2600,8 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
         &self,
         command: CommandSpec,
     ) -> Result<Vec<PullRequestJson>, DiscoveryError> {
-        let rows = self.json::<Vec<serde_json::Value>>(command.clone())?;
+        let rows =
+            self.json_with_transient_read_retry::<Vec<serde_json::Value>>(command.clone())?;
         let mut records = Vec::with_capacity(rows.len());
         let mut skipped = Vec::new();
         for row in rows {
@@ -2626,14 +2634,16 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
         decode_json_output(command, &output)
     }
 
-    /// Retry one transient provider-gateway failure for read-only paginated
-    /// discovery. The command runner accounts for both attempts against the
-    /// existing request/deadline budgets; writes never call this helper.
+    /// Retry one narrowly classified transient provider transport failure for
+    /// read-only discovery. The command runner accounts for both attempts in
+    /// existing request/deadline telemetry; writes are refused before running.
     fn json_with_transient_read_retry<T: DeserializeOwned>(
         &self,
         command: CommandSpec,
     ) -> Result<T, DiscoveryError> {
-        debug_assert!(!command.intent().is_write());
+        if command.intent().is_write() {
+            return Err(DiscoveryError::ReadRetryRefused { command });
+        }
         let first = self.runner.run(&command)?;
         if first.is_success() || !transient_provider_read_failure(&first.stderr) {
             return decode_json_output(command, &first);
@@ -2677,7 +2687,7 @@ fn invalid_open_page(command: &CommandSpec, message: impl Into<String>) -> Disco
 
 fn transient_provider_read_failure(stderr: &str) -> bool {
     let diagnostic = stderr.to_ascii_lowercase();
-    [
+    let gateway = [
         "http 502",
         "http 503",
         "http 504",
@@ -2686,7 +2696,14 @@ fn transient_provider_read_failure(stderr: &str) -> bool {
         "status code: 504",
     ]
     .iter()
-    .any(|marker| diagnostic.contains(marker))
+    .any(|marker| diagnostic.contains(marker));
+    let http2_cancel = diagnostic.contains("stream error:")
+        && diagnostic.contains("cancel")
+        && diagnostic.contains("received from peer");
+    let reset_before_response = diagnostic.contains("connection reset by peer")
+        || diagnostic.contains("connection reset before response")
+        || diagnostic.contains("connection was reset before a response");
+    gateway || http2_cancel || reset_before_response
 }
 
 /// Name one skipped provider record by PR number where the payload supplied one.
@@ -3752,6 +3769,127 @@ mod tests {
         assert_eq!(generations.len(), 53);
         assert_eq!(pulls.first().unwrap().number, PrNumber(1));
         assert_eq!(pulls.last().unwrap().number, PrNumber(53));
+        discovery.runner.assert_exhausted();
+    }
+
+    fn closed_list_command() -> CommandSpec {
+        CommandSpec::new("gh").args([
+            "pr".to_owned(),
+            "list".to_owned(),
+            "--repo".to_owned(),
+            "acme/widgets".to_owned(),
+            "--state".to_owned(),
+            "closed".to_owned(),
+            "--label".to_owned(),
+            "caravan".to_owned(),
+            "--json".to_owned(),
+            PR_HISTORY_JSON_FIELDS.to_owned(),
+        ])
+    }
+
+    #[test]
+    fn transient_read_classifier_is_narrow() {
+        assert!(transient_provider_read_failure(
+            "stream error: stream ID 1; CANCEL; received from peer"
+        ));
+        assert!(transient_provider_read_failure(
+            "read tcp: connection reset by peer"
+        ));
+        assert!(transient_provider_read_failure(
+            "connection reset before response"
+        ));
+        assert!(!transient_provider_read_failure(
+            "HTTP 403: Resource not accessible by integration"
+        ));
+        assert!(!transient_provider_read_failure(
+            "HTTP 429: secondary rate limit"
+        ));
+        assert!(!transient_provider_read_failure(
+            "workflow cancelled by operator"
+        ));
+    }
+
+    #[test]
+    fn closed_list_retries_one_http2_cancel_and_accounts_both_calls() {
+        let command = closed_list_command();
+        assert!(!command.intent().is_write());
+        let runner = FakeRunner::new(vec![
+            (
+                command.clone(),
+                CommandOutput::failure(1, "stream error: stream ID 1; CANCEL; received from peer"),
+            ),
+            (
+                command,
+                CommandOutput::success(pr_list_json(41, "feature/closed", "acme/widgets", false)),
+            ),
+        ]);
+        let discovery = GitHubDiscovery::new(runner);
+
+        let records = discovery
+            .pull_request_records(closed_list_command())
+            .expect("one transient reset receives one bounded retry");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].number, 41);
+        discovery.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn closed_list_returns_second_cancel_and_nontransient_errors_do_not_retry() {
+        let command = closed_list_command();
+        let runner = FakeRunner::new(vec![
+            (
+                command.clone(),
+                CommandOutput::failure(1, "stream error: stream ID 1; CANCEL; received from peer"),
+            ),
+            (
+                command,
+                CommandOutput::failure(1, "stream error: stream ID 3; CANCEL; received from peer"),
+            ),
+        ]);
+        let discovery = GitHubDiscovery::new(runner);
+        let error = discovery
+            .pull_request_records(closed_list_command())
+            .expect_err("a second reset is the final exact error");
+        assert!(matches!(
+            error,
+            DiscoveryError::CommandFailed { stderr, .. }
+                if stderr.contains("stream ID 3")
+        ));
+        discovery.runner.assert_exhausted();
+
+        let command = closed_list_command();
+        let runner = FakeRunner::new(vec![(
+            command,
+            CommandOutput::failure(1, "HTTP 403: Resource not accessible by integration"),
+        )]);
+        let discovery = GitHubDiscovery::new(runner);
+        let error = discovery
+            .pull_request_records(closed_list_command())
+            .expect_err("deterministic permission errors execute once");
+        assert!(matches!(error, DiscoveryError::CommandFailed { .. }));
+        discovery.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn read_retry_refuses_mutation_before_runner_execution() {
+        let command = CommandSpec::new("gh")
+            .args([
+                "pr".to_owned(),
+                "edit".to_owned(),
+                "41".to_owned(),
+                "--add-label".to_owned(),
+                "caravan".to_owned(),
+            ])
+            .provider_write();
+        assert!(command.intent().is_write());
+        let discovery = GitHubDiscovery::new(FakeRunner::new(Vec::new()));
+
+        let error = discovery
+            .json_with_transient_read_retry::<serde_json::Value>(command)
+            .expect_err("mutation commands cannot enter read retry");
+
+        assert!(matches!(error, DiscoveryError::ReadRetryRefused { .. }));
         discovery.runner.assert_exhausted();
     }
 

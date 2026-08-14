@@ -4035,7 +4035,8 @@ fn discovery_error(error: &DiscoveryError) -> AppError {
         | DiscoveryError::CommandFailed { .. }
         | DiscoveryError::InvalidJson { .. }
         | DiscoveryError::OpenPullRequestsTruncated { .. }
-        | DiscoveryError::ProviderProjectionTruncated { .. } => ErrorCategory::ExecutionFailure,
+        | DiscoveryError::ProviderProjectionTruncated { .. }
+        | DiscoveryError::ReadRetryRefused { .. } => ErrorCategory::ExecutionFailure,
     };
     AppError::structured(
         category,

@@ -1185,7 +1185,11 @@ output, and a mutation-free safe next action.
 Discovery reads open PRs in deterministic 20-row GraphQL pages instead of one
 all-fields/all-rows projection. Every page is a separate read-only command, so
 the existing GitHub request counter and absolute wall-clock deadline account for
-it; one transient provider 502/503/504 may retry once within those same budgets.
+it. Every authenticated read-only PR list uses the same one-retry boundary for
+502/503/504, HTTP/2 stream `CANCEL ... received from peer`, or a connection reset
+before response; both attempts consume those same request/deadline counters.
+Auth, permission, rate-limit, schema, truncation, and deterministic provider
+errors execute once, and mutation commands are refused before entering retry.
 Each PR's labels and check contexts are independently capped at 100, and a
 missing cursor, page, row, or nested continuation fails closed before mutation
 instead of treating partial discovery as complete. Current-PR resolution,

@@ -281,9 +281,13 @@ counts Caco board beads. Human status deliberately retains open PRs, recently
 merged Caravan snapshots, and closed active/parked/terminal lifecycle rows, so
 it may greatly exceed GitHub's open-PR count. Open-PR discovery uses complete,
 deterministically ordered GraphQL pages of at most 20 rows; each page consumes
-one ordinary authenticated request/deadline unit. One transient read-only
-502/503/504 may retry once, while writes are never retried. Missing rows or
-cursors, an unfinished page after `open_limit`, more than 100 labels, or more
+one ordinary authenticated request/deadline unit. Every authenticated read-only
+PR-list discovery command may retry once for only proven transient transport
+failure: 502/503/504, HTTP/2 stream `CANCEL ... received from peer`, or a
+connection reset before response. Both attempts consume the same existing
+request and absolute deadline counters; writes are refused before this helper,
+and auth/permission/rate-limit/schema/truncation/deterministic failures run
+once. Missing rows or cursors, an unfinished page after `open_limit`, more than 100 labels, or more
 than 100 check contexts is typed incomplete provider evidence and refuses before
 mutation. Mutating `sync`/`plan sync` use a separate hot discovery snapshot: all
 open PRs plus lightweight merged generation facts, with merged/closed lifecycle
