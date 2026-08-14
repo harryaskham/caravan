@@ -4354,8 +4354,29 @@ fn reserved_candidate_budget(context: &AppContext) -> Duration {
     )
 }
 
-#[allow(clippy::too_many_lines)]
 fn run_auto_admission(
+    context: &AppContext,
+    status: StatusOutput,
+    provider: &impl SyncProvider,
+    progress: &mut SyncProgress,
+    operation_deadline: Instant,
+    github_budget: &crate::command::GithubRequestBudget,
+    writer_guard: &WriterOperationGuard,
+) -> Result<(StatusOutput, AutoAdmissionOutput), AppError> {
+    run_auto_admission_with_refresh(
+        context,
+        status,
+        provider,
+        progress,
+        operation_deadline,
+        github_budget,
+        writer_guard,
+        |deadline| read::fleet_status_for_sync(context, deadline, Some(github_budget)),
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn run_auto_admission_with_refresh<F>(
     context: &AppContext,
     mut status: StatusOutput,
     provider: &impl SyncProvider,
@@ -4363,7 +4384,11 @@ fn run_auto_admission(
     operation_deadline: Instant,
     github_budget: &crate::command::GithubRequestBudget,
     writer_guard: &WriterOperationGuard,
-) -> Result<(StatusOutput, AutoAdmissionOutput), AppError> {
+    mut refresh_status: F,
+) -> Result<(StatusOutput, AutoAdmissionOutput), AppError>
+where
+    F: FnMut(Instant) -> Result<StatusOutput, AppError>,
+{
     let mut output = AutoAdmissionOutput {
         enabled: true,
         heuristic_version: AUTO_ADMISSION_HEURISTIC_VERSION.to_owned(),
@@ -4528,7 +4553,12 @@ fn run_auto_admission(
             removed,
             "removed stale generation-bound automatic admission skip",
         );
-        status = read::fleet_status_for_sync(context, operation_deadline, Some(github_budget))?;
+        // GitHub list projections are eventually consistent after a label write.
+        // A fresh read can therefore repeat the exact stale row for seconds. Bound
+        // cleanup by immutable PR generation within this tick; the next tick has
+        // a new provider cursor if the successful mutation did not converge.
+        validated_skips.insert(skipped.pr);
+        status = refresh_status(operation_deadline)?;
         progress.current = status.analysis.pull_requests.clone();
         progress.merge_candidates = status
             .merge_candidates
@@ -4567,7 +4597,7 @@ fn run_auto_admission(
             });
         if needs_native_candidate_refresh && refreshed_stale_native_candidates.insert(next_pr) {
             read::invalidate_status_cache(context);
-            status = read::fleet_status_for_sync(context, operation_deadline, Some(github_budget))?;
+            status = refresh_status(operation_deadline)?;
             progress.current = status.analysis.pull_requests.clone();
             progress.merge_candidates = status
                 .merge_candidates
@@ -4730,7 +4760,7 @@ fn run_auto_admission(
         } else {
             operation_deadline
         };
-        status = read::fleet_status_for_sync(context, refresh_deadline, Some(github_budget))?;
+        status = refresh_status(refresh_deadline)?;
         progress.current = status.analysis.pull_requests.clone();
         progress.merge_candidates = status
             .merge_candidates

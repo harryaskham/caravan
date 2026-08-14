@@ -2685,6 +2685,106 @@ fn a_human_applied_join_skip_is_not_stripped_for_lacking_a_cara_receipt() {
     );
 }
 
+/// GitHub can keep returning a just-removed label for several seconds. The
+/// Cacophony 31-PR dogfood tick reused that stale projection and removed the
+/// same skip from #2738 sixteen times, spending nearly its whole request budget
+/// before compatibility analysis began (bd-efda32).
+#[test]
+fn stale_skip_cleanup_is_attempted_once_per_tick_despite_stale_refresh() {
+    let mut candidate = pull_request(
+        2738,
+        "stale-skip",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    candidate.labels.clear();
+    candidate
+        .labels
+        .insert(AUTO_ADMISSION_SKIP_LABEL.to_owned());
+    let observed = status(vec![candidate.clone()], None, &clean);
+    assert_eq!(observed.admission.skipped.len(), 1);
+
+    let stale_context = AppContext::default();
+    let receipt = AutoJoinSkipReceipt {
+        schema_version: 1,
+        repository: observed.repository.clone(),
+        candidate_pr: candidate.number,
+        candidate_head: candidate.head.clone(),
+        candidate_base: candidate.base.clone(),
+        default_branch: observed.analysis.fleet.default_branch.clone(),
+        tested_tails: Vec::new(),
+        config_fingerprint: auto_admission_config_fingerprint(&stale_context),
+        heuristic_version: AUTO_ADMISSION_HEURISTIC_VERSION.to_owned(),
+        refusal_kind: AutoAdmissionRefusalKind::Compatibility,
+        candidate_ci: None,
+        required_runs: None,
+        compatibility_reasons: vec!["stale generation".to_owned()],
+        actor: "cara sync automatic admission".to_owned(),
+        observed_unix_secs: 1,
+        evidence_hash: String::new(),
+    }
+    .finalize_hash();
+    let provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
+    provider
+        .comments
+        .borrow_mut()
+        .insert(candidate.number, vec![receipt.comment_body()]);
+
+    let mut context = stale_context;
+    context.config.sync.actions.join_unlabelled_prs = true;
+    context.config.sync.max_candidates_per_tick += 1;
+    assert!(!skip_receipt_matches(&context, &observed, &receipt));
+    let repository = tempfile::tempdir().unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(repository.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    context.repository_path = repository.path().to_path_buf();
+    let writer_guard = context
+        .acquire_writer_operation("test-auto-admission")
+        .unwrap();
+    let mut progress = SyncProgress::new(&observed, Vec::new(), u32::MAX);
+    let github_budget = crate::command::GithubRequestBudget::new(100);
+    let stale_snapshot = observed.clone();
+    let mut refreshes = 0;
+
+    run_auto_admission_with_refresh(
+        &context,
+        observed,
+        &provider,
+        &mut progress,
+        Instant::now() + Duration::from_secs(30),
+        &github_budget,
+        &writer_guard,
+        |_| {
+            refreshes += 1;
+            Ok(stale_snapshot.clone())
+        },
+    )
+    .expect("one successful cleanup tolerates an eventually-consistent refresh");
+
+    assert_eq!(refreshes, 1, "the stale row is not refreshed in a loop");
+    assert_eq!(
+        provider
+            .calls
+            .borrow()
+            .iter()
+            .filter(|kind| **kind == MutationKind::RemoveLabel)
+            .count(),
+        1,
+        "one immutable PR generation receives at most one cleanup attempt per tick"
+    );
+    assert!(
+        !provider.pulls.borrow()[&candidate.number].has_label(AUTO_ADMISSION_SKIP_LABEL),
+        "the first cleanup still performs the intended provider transition"
+    );
+}
+
 #[test]
 fn forty_candidate_auto_admission_preserves_nonzero_exact_git_budget() {
     let mut candidates = (1..=40)
