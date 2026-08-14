@@ -10169,7 +10169,7 @@ fn native_sync_waits_before_lock_when_the_ready_prefix_is_empty() {
 }
 
 #[test]
-fn top_eviction_recovery_is_exactly_one_blocked_final_member() {
+fn stale_native_merge_candidate_waits_for_provider_regeneration() {
     let pulls = vec![
         caravan_member(1, "root", "main"),
         caravan_member(2, "child", "root"),
@@ -10177,27 +10177,68 @@ fn top_eviction_recovery_is_exactly_one_blocked_final_member() {
     ];
     let status = caravan_status(pulls, Some(PrNumber(3)), true);
     let generation = native_generation(&status, 42, &[PrNumber(1), PrNumber(2), PrNumber(3)]);
+    let mut prefix = crate::github::GitHubStackReadyPrefix {
+        stack: generation.clone(),
+        selected: vec![generation.topology.entries[0].clone()],
+        first_blocked: Some(crate::github::GitHubStackBlockedEntry {
+            pr: PrNumber(2),
+            position: 1,
+            blockers: vec![crate::github::GitHubStackMergeBlocker::SyntheticCandidateStale],
+        }),
+    };
+
+    assert!(native_prefix_waits_for_provider_regeneration(&prefix, 3));
+    prefix
+        .first_blocked
+        .as_mut()
+        .unwrap()
+        .blockers
+        .push(crate::github::GitHubStackMergeBlocker::MechanicallyBlocked);
+    assert!(
+        !native_prefix_waits_for_provider_regeneration(&prefix, 3),
+        "a real source/topology blocker remains an external decision"
+    );
+    prefix.selected = generation.topology.entries;
+    prefix.first_blocked = None;
+    assert!(
+        !native_prefix_waits_for_provider_regeneration(&prefix, 3),
+        "a fully selected Stack proceeds to landing"
+    );
+}
+
+#[test]
+fn top_eviction_recovery_always_names_one_blocked_final_member() {
+    let pulls = vec![
+        caravan_member(1, "root", "main"),
+        caravan_member(2, "child", "root"),
+        caravan_member(3, "tail", "child"),
+    ];
+    let status = caravan_status(pulls, Some(PrNumber(3)), true);
+    let generation = native_generation(&status, 42, &[PrNumber(1), PrNumber(2), PrNumber(3)]);
+    for selected_ready in [1, 2] {
+        let plan = top_eviction_recovery_plan(
+            &status.repository,
+            &OperationId("sync-test".to_owned()),
+            "operator",
+            &generation,
+            selected_ready,
+        )
+        .expect("every blocked suffix has one exact top member that can be evicted safely");
+        assert!(plan.verify());
+        assert_eq!(plan.selected_pr, PrNumber(3));
+        assert_eq!(plan.replacement_chains[0].entries.len(), 2);
+    }
     assert!(
         top_eviction_recovery_plan(
             &status.repository,
             &OperationId("sync-test".to_owned()),
             "operator",
             &generation,
-            1,
+            3,
         )
-        .is_none()
+        .is_none(),
+        "a fully selected Stack needs no recovery plan"
     );
-    let plan = top_eviction_recovery_plan(
-        &status.repository,
-        &OperationId("sync-test".to_owned()),
-        "operator",
-        &generation,
-        2,
-    )
-    .expect("one blocked final member yields a sealed top-eviction plan");
-    assert!(plan.verify());
-    assert_eq!(plan.selected_pr, PrNumber(3));
-    assert_eq!(plan.replacement_chains[0].entries.len(), 2);
 }
 
 /// bd-48d662: GitHub's partial Stack merge updates an unselected tail branch
@@ -10422,6 +10463,14 @@ fn native_singleton_tail_without_stack_lands_and_retries_idempotently() {
     };
     assert_eq!(status.analysis.fleet.caravans.len(), 1);
     assert_eq!(status.analysis.fleet.caravans[0].members, vec![tail.number]);
+    let proof = status
+        .analysis
+        .cumulative_trees
+        .first_mut()
+        .expect("singleton has complete cumulative proof");
+    proof.merge_result_tree = crate::model::CommitOid("merged-with-prefix".to_owned());
+    proof.identical = false;
+    proof.target_reachable_from_candidate = false;
 
     let provider =
         FakeProvider::with_pull_requests(status.analysis.pull_requests.values().cloned().collect());
