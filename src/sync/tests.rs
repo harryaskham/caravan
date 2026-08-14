@@ -3097,6 +3097,11 @@ fn exact_unjoined_admission_gate_defers_heavy_ci_without_hiding_other_failures()
         .is_none(),
         "the configured deferred gate plus absent heavy CI is admissible before membership"
     );
+    assert!(
+        progress
+            .deferred_admission_gates
+            .contains(&candidate.number)
+    );
 
     let invalid_provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
     invalid_provider.require_contexts("main", &["heavy-ci"]);
@@ -3222,6 +3227,11 @@ fn deferred_gate_uses_canonical_exact_head_generation_vote() {
         .expect("duplicate rows have complete exact-head lineage")
         .is_none(),
         "one CheckRun plus its WorkflowRunLineage vote is one logical deferred gate"
+    );
+    assert!(
+        progress
+            .deferred_admission_gates
+            .contains(&candidate.number)
     );
 }
 
