@@ -597,6 +597,21 @@ pub struct AutoAdmissionJoinReceipt {
     pub membership: crate::membership::MembershipOutput,
 }
 
+/// Exact pre-membership CI exemption used for one candidate. This is evidence,
+/// not admission authority: ordering, generation, compatibility, capacity, and
+/// every unrelated failure still gate the membership transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AdmissionGateDeferral {
+    pub schema_version: u32,
+    pub candidate_pr: PrNumber,
+    pub head: crate::model::BranchSnapshot,
+    pub base: crate::model::BranchSnapshot,
+    pub context: String,
+    pub member_label: String,
+    pub config_fingerprint: String,
+    pub state: String,
+}
+
 /// Stable bounded result of the opt-in greedy auto-admission phase.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AutoAdmissionOutput {
@@ -616,6 +631,8 @@ pub struct AutoAdmissionOutput {
     pub joins: Vec<AutoAdmissionJoinReceipt>,
     #[serde(default)]
     pub skips: Vec<AutoJoinSkipReceipt>,
+    #[serde(default)]
+    pub gate_deferrals: Vec<AdmissionGateDeferral>,
     #[serde(default)]
     pub remaining_candidates: Vec<PrNumber>,
     /// Exact capacity refusal evidence when the configured deadline can no
@@ -684,6 +701,7 @@ impl Default for AutoAdmissionOutput {
             candidate_budget_remaining_ms: 0,
             joins: Vec::new(),
             skips: Vec::new(),
+            gate_deferrals: Vec::new(),
             remaining_candidates: Vec::new(),
             capacity_refusal: None,
             fleet_capacity_refusal: None,
@@ -711,6 +729,7 @@ impl AutoAdmissionOutput {
             candidate_budget_remaining_ms: 0,
             joins: Vec::new(),
             skips: Vec::new(),
+            gate_deferrals: Vec::new(),
             remaining_candidates: Vec::new(),
             capacity_refusal: None,
             fleet_capacity_refusal: None,
@@ -4563,6 +4582,7 @@ where
         ),
         joins: Vec::new(),
         skips: Vec::new(),
+        gate_deferrals: Vec::new(),
         remaining_candidates: Vec::new(),
         capacity_refusal: None,
         fleet_capacity_refusal: None,
@@ -4799,7 +4819,28 @@ where
             progress,
             &status.repository,
             candidate.number,
+            context.config.ci.admission_gate.as_ref(),
         )?;
+        if local_refusal.is_none()
+            && let Some(gate) = context.config.ci.admission_gate.as_ref()
+            && candidate_has_exact_deferred_gate(
+                progress,
+                candidate.number,
+                gate,
+                &candidate.checks,
+            )
+        {
+            output.gate_deferrals.push(AdmissionGateDeferral {
+                schema_version: 1,
+                candidate_pr: candidate.number,
+                head: candidate.head.clone(),
+                base: candidate.base.clone(),
+                context: gate.context.clone(),
+                member_label: gate.member_label.clone(),
+                config_fingerprint: auto_admission_config_fingerprint(context),
+                state: "deferred_unjoined".to_owned(),
+            });
+        }
         let evaluation = if let Some(refusal) = &local_refusal {
             AutoCandidateEvaluation {
                 target: AutoCandidateTarget::Skip,
@@ -5219,6 +5260,7 @@ fn candidate_local_admission_refusal(
     progress: &mut SyncProgress,
     repository: &RepositoryId,
     candidate_pr: PrNumber,
+    admission_gate: Option<&crate::config::CiAdmissionGateConfig>,
 ) -> Result<Option<AutoCandidateAdmissionRefusal>, AppError> {
     let mut ci = progress.observe_ci(provider, repository, candidate_pr)?;
     // `caravan-force` is member repair authority, not authority to enrol a
@@ -5245,6 +5287,19 @@ fn candidate_local_admission_refusal(
             })),
         ));
     }
+    let gate_deferred = admission_gate.is_some_and(|gate| {
+        candidate_has_exact_deferred_gate(progress, candidate_pr, gate, &ci.checks)
+    });
+    if gate_deferred {
+        let gate = admission_gate.expect("checked as present");
+        let non_gate_checks = ci
+            .checks
+            .iter()
+            .filter(|check| check.name != gate.context)
+            .cloned()
+            .collect::<Vec<_>>();
+        ci.disposition = classify_checks(&non_gate_checks, false);
+    }
     if ci.disposition == CiDisposition::Failed {
         let failed_checks = crate::model::latest_checks_per_identity(&ci.checks)
             .0
@@ -5264,6 +5319,16 @@ fn candidate_local_admission_refusal(
     }
 
     let required_runs = progress.observe_required_runs(provider, repository, candidate_pr)?;
+    if gate_deferred
+        && gate_deferral_allows_required_runs(
+            candidate_pr,
+            admission_gate.expect("checked as present"),
+            &required_runs,
+        )?
+    {
+        return Ok(None);
+    }
+
     let refusal_kind = match required_runs.status {
         RequiredRunsStatus::Failing => Some(AutoAdmissionRefusalKind::TerminalCi),
         RequiredRunsStatus::CancelledSuperseded | RequiredRunsStatus::MissingRequiredRuns => {
@@ -5290,6 +5355,67 @@ fn candidate_local_admission_refusal(
         )],
         required_runs: Some(required_runs),
     }))
+}
+
+fn gate_deferral_allows_required_runs(
+    candidate_pr: PrNumber,
+    gate: &crate::config::CiAdmissionGateConfig,
+    required_runs: &crate::required_runs::RequiredRunsAssessment,
+) -> Result<bool, AppError> {
+    let gate_coverage = required_runs
+        .coverage
+        .iter()
+        .filter(|coverage| coverage.context == gate.context)
+        .collect::<Vec<_>>();
+    if gate_coverage.len() != 1
+        || gate_coverage[0].state != crate::required_runs::RequiredContextState::Failing
+        || !required_runs
+            .required_contexts
+            .iter()
+            .any(|context| context == &gate.context)
+    {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "auto_admission_gate_evidence_invalid",
+            "configured admission gate is not one exact required failing context on the candidate head",
+            Some(json!({
+                "candidate_pr": candidate_pr,
+                "gate": gate,
+                "required_runs": required_runs,
+                "mutated": false,
+                "safe_next_action": "repair the canonical admission-gate workflow/protection contract; do not guess from missing or unrelated CI",
+            })),
+        ));
+    }
+    Ok(required_runs.coverage.iter().all(|coverage| {
+        coverage.context == gate.context
+            || !matches!(
+                coverage.state,
+                crate::required_runs::RequiredContextState::Failing
+                    | crate::required_runs::RequiredContextState::CancelledSuperseded
+                    | crate::required_runs::RequiredContextState::Unknown
+            )
+    }) && required_runs.status != RequiredRunsStatus::UnknownProviderState)
+}
+
+fn candidate_has_exact_deferred_gate(
+    progress: &SyncProgress,
+    candidate_pr: PrNumber,
+    gate: &crate::config::CiAdmissionGateConfig,
+    checks: &[CheckSnapshot],
+) -> bool {
+    let Some(candidate) = progress.current.get(&candidate_pr) else {
+        return false;
+    };
+    if candidate.has_label(&gate.member_label) {
+        return false;
+    }
+    let current = crate::model::latest_checks_per_identity(checks).0;
+    let matching = current
+        .into_iter()
+        .filter(|check| check.name == gate.context)
+        .collect::<Vec<_>>();
+    matching.len() == 1 && matching[0].state == CheckState::Failure
 }
 
 fn auto_admission_provider_state_unknown(
@@ -5527,6 +5653,7 @@ fn auto_admission_config_fingerprint(context: &AppContext) -> String {
         "rebase_on_join": context.config.rebase_on_join,
         "max_caravan_length": context.config.effective_max_caravan_length(),
         "agent_priority_labels": &context.config.agent_priority_labels,
+        "ci": &context.config.ci,
         "sync": &context.config.sync,
     }))
     .expect("validated config serializes");

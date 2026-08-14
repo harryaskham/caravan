@@ -152,6 +152,15 @@ CORE MODEL AND INVARIANTS
   only by exactly one auditable check-suite rerequest against the unchanged
   head. Empty commits, close/reopen loops, force pushes, and broad reruns are
   never implicit workarounds.
+- Explicit `ci.admission_gate` policy may defer heavy CI until Caravan
+  membership. Only one exact configured required context failing on an
+  unjoined exact head is exempt from candidate-local terminal/missing-run
+  refusal; eligibility, priority/FIFO, generation, compatibility, and every
+  unrelated terminal context remain enforced. Once `caravan` is present,
+  ordinary member CI policy applies without exemption. Heavy workflows must not
+  trigger on `labeled`/`unlabeled`; the admission writer rerequests the exact
+  existing check suite after membership so priority/force/park/unpark labels do
+  not create newer CI generations.
 - Terminal-red queue behavior is configurable. `sync.terminal_red.action: block`
   is the backward-compatible default. Explicit `park` preserves the complete
   caravan topology under a `caravan-parked` head label, disables head
@@ -1271,6 +1280,8 @@ pub struct HelpRepositoryContext {
     pub writer_mode: WriterMode,
     pub head_merge_actor: model::HeadMergeActor,
     pub auto_admission: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ci_admission_gate_context: Option<String>,
     pub terminal_red_action: config::TerminalRedAction,
     pub command_timeout_secs: u64,
 }
@@ -1337,6 +1348,16 @@ pub fn help_for_context(context: &AppContext) -> HelpOutput {
             "automatic admission is disabled; use check plus explicit new/join membership."
         }
     ));
+    if let Some(gate) = &config.ci.admission_gate {
+        advice.push(format!(
+            "ci.admission_gate={} uses required context `{}` and exact member label `{}`: pre-membership exemption is limited to that failing gate; heavy CI must not use labeled/unlabeled triggers.",
+            match gate.mode {
+                config::CiAdmissionGateMode::CaravanLabel => "caravan_label",
+            },
+            gate.context,
+            gate.member_label,
+        ));
+    }
     advice.push(format!(
         "terminal_red.action={:?}; command_timeout_secs={} is one absolute bounded command budget, not permission to bypass a failed check.",
         config.sync.terminal_red.action, config.command_timeout_secs
@@ -1355,6 +1376,11 @@ pub fn help_for_context(context: &AppContext) -> HelpOutput {
             writer_mode: config.writer.mode,
             head_merge_actor,
             auto_admission: config.sync.actions.join_unlabelled_prs,
+            ci_admission_gate_context: config
+                .ci
+                .admission_gate
+                .as_ref()
+                .map(|gate| gate.context.clone()),
             terminal_red_action: config.sync.terminal_red.action,
             command_timeout_secs: config.command_timeout_secs,
         }),
@@ -2774,6 +2800,11 @@ mod tests {
         context.config.writer.mode = WriterMode::RemoteFenced;
         context.config.sync.head_merge_actor = Some(model::HeadMergeActor::Caravan);
         context.config.sync.actions.join_unlabelled_prs = true;
+        context.config.ci.admission_gate = Some(config::CiAdmissionGateConfig {
+            mode: config::CiAdmissionGateMode::CaravanLabel,
+            context: "Caravan admission".to_owned(),
+            member_label: "caravan".to_owned(),
+        });
         context.config.sync.terminal_red.action = config::TerminalRedAction::Park;
         context.config.command_timeout_secs = 60;
 
@@ -2785,6 +2816,10 @@ mod tests {
         assert_eq!(repository.writer_mode, WriterMode::RemoteFenced);
         assert_eq!(repository.head_merge_actor, model::HeadMergeActor::Caravan);
         assert!(repository.auto_admission);
+        assert_eq!(
+            repository.ci_admission_gate_context.as_deref(),
+            Some("Caravan admission")
+        );
         assert_eq!(
             repository.terminal_red_action,
             config::TerminalRedAction::Park
@@ -2806,6 +2841,12 @@ mod tests {
                 .advice
                 .iter()
                 .any(|line| line.contains("sync --all may admit"))
+        );
+        assert!(
+            output
+                .advice
+                .iter()
+                .any(|line| line.contains("ci.admission_gate=caravan_label"))
         );
         assert!(
             output

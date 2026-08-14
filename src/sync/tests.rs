@@ -1070,7 +1070,7 @@ fn status(
         rebase_on_join: crate::read::RebaseOnJoinStatus::default(),
         stack_backend: crate::read::StackBackendStatus::default(),
         auto_admission: crate::read::AutoAdmissionStatus::from_config(
-            &crate::config::SyncConfig::default(),
+            &crate::config::CaravanConfig::default(),
             &analysis,
             None,
         ),
@@ -2918,6 +2918,7 @@ fn failing_unjoined_candidate_is_skipped_after_existing_caravan_progress() {
         &mut progress,
         &status.repository,
         candidate.number,
+        None,
     )
     .expect("candidate health is readable")
     .expect("terminal CI is candidate-local");
@@ -2971,6 +2972,7 @@ fn failing_unjoined_candidate_is_skipped_after_existing_caravan_progress() {
             &mut progress,
             &status.repository,
             later_candidate.number,
+            None,
         )
         .expect("later candidate health is readable")
         .is_none(),
@@ -3008,6 +3010,7 @@ fn candidate_health_distinguishes_pending_missing_and_unknown_provider_state() {
             &mut progress,
             &pending_status.repository,
             candidate.number,
+            None,
         )
         .expect("pending evidence is complete")
         .is_none(),
@@ -3024,6 +3027,7 @@ fn candidate_health_distinguishes_pending_missing_and_unknown_provider_state() {
         &mut missing_progress,
         &missing_status.repository,
         candidate.number,
+        None,
     )
     .expect("complete missing evidence is readable")
     .expect("missing required runs refuse admission");
@@ -3054,9 +3058,100 @@ fn candidate_health_distinguishes_pending_missing_and_unknown_provider_state() {
         &mut partial_progress,
         &missing_status.repository,
         candidate.number,
+        None,
     )
     .expect_err("provider-global uncertainty must remain fail-closed");
     assert_eq!(error.code(), "auto_admission_provider_state_unknown");
+}
+
+#[test]
+fn exact_unjoined_admission_gate_defers_heavy_ci_without_hiding_other_failures() {
+    let gate = crate::config::CiAdmissionGateConfig {
+        mode: crate::config::CiAdmissionGateMode::CaravanLabel,
+        context: "Caravan admission".to_owned(),
+        member_label: "caravan".to_owned(),
+    };
+    let mut candidate = pull_request(
+        9,
+        "candidate",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    candidate.labels.clear();
+    candidate.checks = vec![check(&gate.context, CheckState::Failure, Some(10))];
+    let gate_status = status(vec![candidate.clone()], Some(candidate.number), &clean);
+    let provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
+    provider.require_contexts("main", &[&gate.context, "heavy-ci"]);
+    let mut progress = SyncProgress::new(&gate_status, Vec::new(), u32::MAX);
+
+    assert!(
+        candidate_local_admission_refusal(
+            &provider,
+            &mut progress,
+            &gate_status.repository,
+            candidate.number,
+            Some(&gate),
+        )
+        .expect("exact gate evidence is complete")
+        .is_none(),
+        "the configured deferred gate plus absent heavy CI is admissible before membership"
+    );
+
+    let invalid_provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
+    invalid_provider.require_contexts("main", &["heavy-ci"]);
+    let mut invalid_progress = SyncProgress::new(&gate_status, Vec::new(), u32::MAX);
+    let error = candidate_local_admission_refusal(
+        &invalid_provider,
+        &mut invalid_progress,
+        &gate_status.repository,
+        candidate.number,
+        Some(&gate),
+    )
+    .expect_err("a non-required sentinel is not a valid admission gate");
+    assert_eq!(error.code(), "auto_admission_gate_evidence_invalid");
+
+    let mut unrelated_red = candidate.clone();
+    unrelated_red
+        .checks
+        .push(check("source-test", CheckState::Failure, Some(11)));
+    let red_status = status(
+        vec![unrelated_red.clone()],
+        Some(unrelated_red.number),
+        &clean,
+    );
+    let red_provider = FakeProvider::with_pull_requests(vec![unrelated_red.clone()]);
+    red_provider.require_contexts("main", &[&gate.context, "source-test"]);
+    let mut red_progress = SyncProgress::new(&red_status, Vec::new(), u32::MAX);
+    let refusal = candidate_local_admission_refusal(
+        &red_provider,
+        &mut red_progress,
+        &red_status.repository,
+        unrelated_red.number,
+        Some(&gate),
+    )
+    .expect("unrelated red evidence is complete")
+    .expect("only the exact gate is exempt");
+    assert_eq!(refusal.kind, AutoAdmissionRefusalKind::TerminalCi);
+
+    let mut member = candidate;
+    member.labels.insert("caravan".to_owned());
+    let member_status = status(vec![member.clone()], Some(member.number), &clean);
+    let member_provider = FakeProvider::with_pull_requests(vec![member.clone()]);
+    member_provider.require_contexts("main", &[&gate.context]);
+    let mut member_progress = SyncProgress::new(&member_status, Vec::new(), u32::MAX);
+    assert!(
+        candidate_local_admission_refusal(
+            &member_provider,
+            &mut member_progress,
+            &member_status.repository,
+            member.number,
+            Some(&gate),
+        )
+        .unwrap()
+        .is_some(),
+        "membership restores ordinary terminal-CI policy"
+    );
 }
 
 #[test]
@@ -3078,6 +3173,7 @@ fn same_head_green_rerun_invalidates_terminal_ci_skip() {
         &mut progress,
         &status.repository,
         candidate.number,
+        None,
     )
     .unwrap()
     .unwrap();

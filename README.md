@@ -923,6 +923,16 @@ refuses before mutation. Hooks may repair parked work but are never required for
 unrelated throughput.
 Run `cara init` after enabling park so the fixed label exists.
 
+An explicit `ci.admission_gate` can defer heavy CI until membership without
+making an unjoined PR permanently inadmissible. Only the configured required
+context may fail as the exact `deferred_unjoined` sentinel; Cara still enforces
+priority/FIFO, generation integrity, capacity, holds, compatibility, and every
+unrelated terminal context. The exemption disappears as soon as the exact
+`caravan` member label exists. The canonical delivery model uses a code-event
+check suite plus an admission-owned exact-suite rerequest after membership;
+heavy CI must not subscribe to broad `labeled`/`unlabeled` events, because
+priority/force/park/unpark labels would create unrelated newer CI generations.
+
 If the same immutable parked head later becomes green but no normal sync tick can
 release it, use the reviewed `cara unpark` surface—not `resume`, `rejoin`, or a
 raw label edit. It requires exact repository/PR/head/base, current Caravan
@@ -1185,11 +1195,7 @@ output, and a mutation-free safe next action.
 Discovery reads open PRs in deterministic 20-row GraphQL pages instead of one
 all-fields/all-rows projection. Every page is a separate read-only command, so
 the existing GitHub request counter and absolute wall-clock deadline account for
-it. Every authenticated read-only PR list uses the same one-retry boundary for
-502/503/504, HTTP/2 stream `CANCEL ... received from peer`, or a connection reset
-before response; both attempts consume those same request/deadline counters.
-Auth, permission, rate-limit, schema, truncation, and deterministic provider
-errors execute once, and mutation commands are refused before entering retry.
+it; one transient provider 502/503/504 may retry once within those same budgets.
 Each PR's labels and check contexts are independently capped at 100, and a
 missing cursor, page, row, or nested continuation fails closed before mutation
 instead of treating partial discovery as complete. Current-PR resolution,
