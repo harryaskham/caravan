@@ -868,11 +868,28 @@ impl CaravanConfig {
     /// Resolve an override or the repository default. An absent default file
     /// means default policy; an explicitly supplied missing path is an error.
     pub fn load_or_default(path: Option<&Path>) -> Result<LoadedConfig, ConfigError> {
-        let resolved = path.map_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH), Path::to_path_buf);
-        if !resolved.exists() {
+        Self::load_or_default_from(path, None)
+    }
+
+    /// Resolve the implicit default relative to an explicit test/caller root
+    /// without changing process-global CWD. Explicit overrides retain their
+    /// ordinary path semantics and the public `LoadedConfig.path` remains the
+    /// logical configured/default path.
+    fn load_or_default_from(
+        path: Option<&Path>,
+        default_root: Option<&Path>,
+    ) -> Result<LoadedConfig, ConfigError> {
+        let logical_path =
+            path.map_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH), Path::to_path_buf);
+        let read_path = if path.is_none() {
+            default_root.map_or_else(|| logical_path.clone(), |root| root.join(&logical_path))
+        } else {
+            logical_path.clone()
+        };
+        if !read_path.exists() {
             if path.is_some() {
                 return Err(ConfigError::Read {
-                    path: resolved,
+                    path: logical_path,
                     message: "configured path does not exist".to_owned(),
                 });
             }
@@ -882,14 +899,14 @@ impl CaravanConfig {
             let mut config = Self::default();
             config.apply_environment_overrides();
             return Ok(LoadedConfig {
-                path: resolved,
+                path: logical_path,
                 existed: false,
                 config,
             });
         }
         Ok(LoadedConfig {
-            config: Self::load(&resolved)?,
-            path: resolved,
+            config: Self::load(&read_path)?,
+            path: logical_path,
             existed: true,
         })
     }
@@ -1679,16 +1696,31 @@ hooks:
     #[test]
     fn absent_default_is_safe_but_missing_override_is_an_error() {
         let temp = tempfile::tempdir().unwrap();
-        let previous = std::env::current_dir().unwrap();
-        std::env::set_current_dir(temp.path()).unwrap();
-        let loaded = CaravanConfig::load_or_default(None).expect("missing default is safe");
-        std::env::set_current_dir(previous).unwrap();
+        let loaded = CaravanConfig::load_or_default_from(None, Some(temp.path()))
+            .expect("missing default is safe without process-global chdir");
         assert!(!loaded.existed);
         assert_eq!(loaded.path, PathBuf::from(DEFAULT_CONFIG_PATH));
 
         let error =
             CaravanConfig::load_or_default(Some(&temp.path().join("missing.yaml"))).unwrap_err();
         assert_eq!(error.code(), "config_read_failed");
+    }
+
+    #[test]
+    fn explicit_default_root_loads_existing_policy_without_global_chdir() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(DEFAULT_CONFIG_PATH);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "version: 1\nrepository: owner/example\n").unwrap();
+        let cwd = std::env::current_dir().unwrap();
+
+        let loaded = CaravanConfig::load_or_default_from(None, Some(temp.path()))
+            .expect("explicit root resolves an existing implicit default");
+
+        assert!(loaded.existed);
+        assert_eq!(loaded.path, PathBuf::from(DEFAULT_CONFIG_PATH));
+        assert_eq!(loaded.config.repository.as_deref(), Some("owner/example"));
+        assert_eq!(std::env::current_dir().unwrap(), cwd);
     }
 
     #[test]
