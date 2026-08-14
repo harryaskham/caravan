@@ -225,12 +225,13 @@ merges a prefix it may retain those merged entries while retargeting the first
 open entry to the Stack base; Cara accepts that
 `merged_predecessor_base_collapsed` frontier only after proving exact provider
 order/state, predecessor merge-commit and recorded-base ancestry in current
-main, and an exact current open suffix. The executable sync path submits only
-when the selected prefix is the complete remaining open frontier. If a blocked
-open suffix remains, sync returns
-`github_stack_partial_prefix_requires_tail_eviction` before lock/submission and
-requires typed evict/split; GitHub's partial merge would otherwise replace the
-unselected tail source head. Every submitted entry is:
+main, and an exact current open suffix. The executable sync path submits the
+maximal contiguous ready prefix. When a blocked open suffix remains, Cara keeps
+the complete Stack ref set locked, seals every suffix generation before submit,
+and accepts GitHub's suffix rewrite only when exact PR/branch order and the
+post-merge base/head chain match; every rewritten suffix head then requires fresh
+CI. Drift or an unprovable rewrite remains indeterminate with the lock/checkpoint
+preserved. Every submitted entry is:
 
 - open and non-draft;
 - exact and unheld;

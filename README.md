@@ -786,9 +786,10 @@ ref in the complete Stack generation, never only the ready prefix. Native sync
 submits only a fully ready Stack; PR base edges alone are insufficient. Status
 also compares each predecessor head to its child head and reports
 `native_stack_rebase_required` for every child that does not contain its parent.
-Unknown ancestry fails closed. A ready prefix with a blocked suffix returns
-`github_stack_partial_prefix_requires_tail_eviction` before lock/submission and
-requires typed evict/split first. Readiness binds each immutable source head to
+Unknown ancestry fails closed. A ready prefix with a blocked suffix is submitted
+as one atomic provider merge under a complete-Stack ref lock; Cara seals the
+entire suffix before submission, receipts GitHub's rewritten suffix heads/bases,
+and requires fresh CI before the next landing. Readiness binds each immutable source head to
 its exact fresh two-parent synthetic merge candidate (current main for the root,
 predecessor candidate base for descendants), so provider candidate regeneration
 rather than scheduler force-pushes drives CI. The adapter acquires, verifies,

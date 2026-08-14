@@ -10404,41 +10404,6 @@ fn stale_native_merge_candidate_waits_for_provider_regeneration() {
 }
 
 #[test]
-fn top_eviction_recovery_always_names_one_blocked_final_member() {
-    let pulls = vec![
-        caravan_member(1, "root", "main"),
-        caravan_member(2, "child", "root"),
-        caravan_member(3, "tail", "child"),
-    ];
-    let status = caravan_status(pulls, Some(PrNumber(3)), true);
-    let generation = native_generation(&status, 42, &[PrNumber(1), PrNumber(2), PrNumber(3)]);
-    for selected_ready in [1, 2] {
-        let plan = top_eviction_recovery_plan(
-            &status.repository,
-            &OperationId("sync-test".to_owned()),
-            "operator",
-            &generation,
-            selected_ready,
-        )
-        .expect("every blocked suffix has one exact top member that can be evicted safely");
-        assert!(plan.verify());
-        assert_eq!(plan.selected_pr, PrNumber(3));
-        assert_eq!(plan.replacement_chains[0].entries.len(), 2);
-    }
-    assert!(
-        top_eviction_recovery_plan(
-            &status.repository,
-            &OperationId("sync-test".to_owned()),
-            "operator",
-            &generation,
-            3,
-        )
-        .is_none(),
-        "a fully selected Stack needs no recovery plan"
-    );
-}
-
-#[test]
 fn native_stack_merge_audit_is_exact_generation_bound_and_deterministic() {
     let pulls = vec![
         caravan_member(1, "root", "main"),
@@ -10489,18 +10454,14 @@ fn native_stack_merge_audit_is_exact_generation_bound_and_deterministic() {
     );
 }
 
-/// bd-48d662: GitHub's partial Stack merge updates an unselected tail branch
-/// after landing the ready prefix. That turns an immutable source generation
-/// into a GitHub-authored merge commit and starts CI again. Cara must stop
-/// before lock/submission and demand typed suffix reshape instead.
-///
-/// The intentionally complete incident fixture retains Stack topology,
-/// candidate lineage, CI state, source OIDs, provider calls, scheduler routing,
-/// and checkpoint absence in one test so its zero-write claim cannot become a
-/// collection of independently passing partial assertions.
+/// GitHub can atomically land a ready prefix and retarget/rebase its open
+/// suffix. Sync must route that exact selection into the lock-fenced native
+/// transaction instead of requiring manual tail eviction. This fake provider
+/// stops at the unimplemented lock seam so the test can inspect the durable
+/// selected-prefix checkpoint without any source/provider mutation.
 #[test]
 #[allow(clippy::too_many_lines)]
-fn native_sync_refuses_partial_prefix_without_touching_source_heads() {
+fn native_sync_checkpoints_partial_prefix_before_lock_or_source_write() {
     let pulls = linear_chain(2);
     let mut status = status(pulls.clone(), None, &clean);
     let caravan = status.analysis.fleet.caravans[0].clone();
@@ -10623,48 +10584,9 @@ fn native_sync_refuses_partial_prefix_without_touching_source_heads() {
 
     let error = progress
         .drain_native_stack(&provider, &status, &caravan, 42, &native)
-        .expect_err("a partial prefix must require explicit tail reshape");
+        .expect_err("fake provider stops at native lock acquisition");
 
-    assert_eq!(
-        error.code(),
-        "github_stack_partial_prefix_requires_tail_eviction"
-    );
-    let details = error.details().expect("typed immutable-head receipt");
-    assert_eq!(details["mutated"], false);
-    assert_eq!(details["selected_ready_prefix"], serde_json::json!([1]));
-    assert_eq!(details["blocked_suffix"], serde_json::json!([2]));
-    assert_eq!(details["resumable"], true);
-    let recovery: crate::github::GitHubStackReshapePlan =
-        serde_json::from_value(details["top_eviction_plan"].clone()).unwrap();
-    assert!(recovery.verify());
-    assert_eq!(
-        recovery.operation,
-        crate::github::GitHubStackReshapeOperation::Evict
-    );
-    assert_eq!(recovery.selected_pr, PrNumber(2));
-    assert_eq!(recovery.before.topology.entries.len(), 2);
-    assert_eq!(recovery.replacement_chains.len(), 1);
-    assert_eq!(
-        recovery.replacement_chains[0].entries,
-        recovery.before.topology.entries[..1]
-    );
-    assert_eq!(
-        recovery.pr_postconditions[1].head,
-        recovery.before.topology.entries[1].head
-    );
-    assert!(
-        recovery.pr_postconditions[1]
-            .required_labels
-            .contains("caravan-evicted")
-    );
-    assert!(!recovery.plan_hash.is_empty());
-    let scheduler = scheduler_failure_status(&error);
-    assert_eq!(
-        scheduler.disposition,
-        SchedulerDisposition::ExternalDecision
-    );
-    assert_eq!(scheduler.wake_class, SchedulerWakeClass::ExternalDecision);
-    assert!(!scheduler.retryable);
+    assert_eq!(error.code(), "github_stack_sync_provider_unavailable");
     assert_eq!(*provider.native_stack_reads.borrow(), 1);
     assert!(provider.calls.borrow().is_empty());
     assert_eq!(
@@ -10677,15 +10599,26 @@ fn native_sync_refuses_partial_prefix_without_touching_source_heads() {
         original_heads,
         "neither scheduler nor provider path may replace a source head"
     );
-    assert!(
-        crate::stack_checkpoint::load::<crate::github::GitHubStackLandCheckpoint>(
-            directory.path(),
-            "land-42",
-        )
-        .unwrap()
-        .is_none(),
-        "the refusal occurs before any lock or durable submit intent"
+    let checkpoint = crate::stack_checkpoint::load::<crate::github::GitHubStackLandCheckpoint>(
+        directory.path(),
+        "land-42",
+    )
+    .unwrap()
+    .expect("selected prefix is durable before the first provider write");
+    assert_eq!(
+        checkpoint.phase,
+        crate::github::GitHubStackLandPhase::Planned
     );
+    assert_eq!(
+        checkpoint
+            .plan
+            .selected
+            .iter()
+            .map(|entry| entry.pr)
+            .collect::<Vec<_>>(),
+        vec![PrNumber(1)]
+    );
+    assert_eq!(checkpoint.plan.before.topology.entries.len(), 2);
 }
 
 /// bd-c712af: after a native prefix lands, GitHub removes the Stack resource and
