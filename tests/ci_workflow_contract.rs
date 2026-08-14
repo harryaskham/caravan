@@ -70,6 +70,22 @@ fn ci_gate_has_portable_resource_and_time_bounds_without_weaker_commands() {
         );
     }
     assert!(!CI_WORKFLOW.contains("labeled, unlabeled"));
+    for permission in [
+        "actions: read",
+        "checks: read",
+        "contents: read",
+        "pull-requests: read",
+    ] {
+        assert!(
+            CI_WORKFLOW.contains(permission),
+            "trusted live-provider gate requires minimum permission `{permission}`"
+        );
+    }
+    assert_eq!(
+        CI_WORKFLOW.matches("GH_TOKEN: ${{ github.token }}").count(),
+        1,
+        "the ephemeral read token must be scoped to the trusted gate only"
+    );
     assert_eq!(
         CI_WORKFLOW
             .matches("if: needs.admission-gate.outputs.run-ci == 'true'")

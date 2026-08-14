@@ -20,6 +20,13 @@ env:
 
 jobs:
   admission-gate:
+    # Only trusted default-branch gate code receives the ephemeral read token.
+    # PR code and every heavy job remain token-free.
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+      pull-requests: read
     runs-on: [self-hosted, nix, x86_64-linux]
     timeout-minutes: 15
     outputs:
@@ -35,6 +42,8 @@ jobs:
       - id: gate
         name: Evaluate live Caravan membership
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           nix develop --command cargo run --quiet -- \
