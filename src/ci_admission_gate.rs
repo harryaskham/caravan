@@ -70,11 +70,19 @@ pub fn evaluate(context: &AppContext, input: &CiAdmissionGateInput) -> CiAdmissi
             );
         }
     };
-    evaluate_trusted(prepared.context(), input)
+    // `prepare` has already fetched and sealed the provider default generation.
+    // Its materialized config path is necessarily absolute, so downstream
+    // provenance will describe that path as `Explicit`; carry the authority
+    // proof instead of asking path syntax to rediscover it.
+    evaluate_trusted(prepared.context(), input, true)
 }
 
 #[allow(clippy::too_many_lines)] // Linear fail-safe validation keeps every safe default explicit.
-fn evaluate_trusted(context: &AppContext, input: &CiAdmissionGateInput) -> CiAdmissionGateOutput {
+fn evaluate_trusted(
+    context: &AppContext,
+    input: &CiAdmissionGateInput,
+    authority_materialized: bool,
+) -> CiAdmissionGateOutput {
     let config_fingerprint = config_fingerprint(context);
     let selected_pr = input.selected_pr.map(PrNumber);
     let event = match read_event(&input.event) {
@@ -179,6 +187,7 @@ fn evaluate_trusted(context: &AppContext, input: &CiAdmissionGateInput) -> CiAdm
         selected_pr,
         policy_evidence,
         config_fingerprint,
+        authority_materialized,
     )
 }
 
@@ -188,6 +197,7 @@ fn evaluate_live_provider(
     selected_pr: PrNumber,
     policy: CiAdmissionGatePolicyEvidence,
     config_fingerprint: String,
+    authority_materialized: bool,
 ) -> CiAdmissionGateOutput {
     let status = match crate::read::status_for_remote_candidate(context, selected_pr) {
         Ok(status) => status,
@@ -211,8 +221,7 @@ fn evaluate_live_provider(
         }
     };
     let telemetry = Some(status.provider_api.clone());
-    let trusted_default_policy = trusted_default_policy(status.config_provenance.as_ref());
-    if !trusted_default_policy {
+    if !effective_policy_trusted(authority_materialized, status.config_provenance.as_ref()) {
         return output(
             context,
             Some(event),
@@ -348,6 +357,13 @@ fn output(
         receipt_fingerprint,
         provider_api,
     }
+}
+
+fn effective_policy_trusted(
+    authority_materialized: bool,
+    provenance: Option<&crate::config_provenance::ConfigProvenance>,
+) -> bool {
+    authority_materialized || trusted_default_policy(provenance)
 }
 
 fn trusted_default_policy(provenance: Option<&crate::config_provenance::ConfigProvenance>) -> bool {
@@ -516,6 +532,7 @@ mod tests {
                 selected_pr: None,
                 github_output: None,
             },
+            false,
         );
         assert_eq!(output.decision, CiAdmissionGateDecision::RunUnproven);
         assert!(output.run_ci);
@@ -547,6 +564,13 @@ mod tests {
             assert!(!trusted_default_policy(Some(&provenance(relation))));
         }
         assert!(!trusted_default_policy(None));
+
+        let explicit = provenance(crate::config_provenance::ConfigRelation::Explicit);
+        assert!(!effective_policy_trusted(false, Some(&explicit)));
+        assert!(
+            effective_policy_trusted(true, Some(&explicit)),
+            "a successful authority materialization must survive its absolute config path"
+        );
     }
 
     #[test]
@@ -640,8 +664,8 @@ mod tests {
             selected_pr: Some(99),
             github_output: None,
         };
-        let first = evaluate_trusted(&context, &input);
-        let second = evaluate_trusted(&context, &input);
+        let first = evaluate_trusted(&context, &input, false);
+        let second = evaluate_trusted(&context, &input, false);
         assert_eq!(first.decision, CiAdmissionGateDecision::RunUnproven);
         assert!(first.run_ci);
         assert_eq!(first.wake_pr, Some(PrNumber(41)));
@@ -661,6 +685,7 @@ mod tests {
                 selected_pr: None,
                 github_output: None,
             },
+            false,
         );
         assert_eq!(labeled.decision, CiAdmissionGateDecision::RunUnproven);
         assert!(labeled.run_ci);
