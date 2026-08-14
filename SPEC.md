@@ -291,8 +291,15 @@ once. Missing rows or cursors, an unfinished page after `open_limit`, more than 
 than 100 check contexts is typed incomplete provider evidence and refuses before
 mutation. Mutating `sync`/`plan sync` use a separate hot discovery snapshot: all
 open PRs plus lightweight merged generation facts, with merged/closed lifecycle
-snapshots deferred to later human/cold cleanup. Stale historical rows remain
-unavailable for mutation authority. Default-target repair of one exact PR uses
+snapshots deferred to later human/cold cleanup. Stale historical rows remain unavailable for mutation authority and are excluded
+from current generation-integrity comparison/comment fan-out. Human `status`
+with 30 or more lifecycle candidates defers exact Git compatibility explicitly
+and returns current bounded provider/structural evidence before the outer
+watchdog. Mutation-capable `plan sync` and `sync` never consume that relaxation:
+they retain complete compatibility requirements and the full shared operation
+budget. Local generation ancestry is bounded by that deadline and uses no more
+than two exact `merge-base --is-ancestor` subprocesses per comparison.
+Default-target repair of one exact PR uses
 focused active-topology discovery and an exact candidate reread; a repair naming
 a second target retains full-fleet discovery because both PR generations are
 authoritative.
