@@ -197,7 +197,10 @@ refusal is typed `forge_refuses_merge`.
 
 An absent proof is never permission. Ordinary waits — pending checks, an
 unproven tree, a spent per-tick allowance — are visible no-op steps, not
-failures.
+failures. Once every proof holds, Cara posts one exact-generation,
+deterministically marked merge-authorization comment before the irreversible
+squash or native Stack submission. If the comment is not proven visible, the
+merge is not attempted; retries reuse the same marker.
 
 ### 3.2 Who merges
 

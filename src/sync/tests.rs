@@ -3333,6 +3333,16 @@ fn terminal_red_park_policy_frees_capacity_for_independent_green_candidate() {
     assert!(parking.changed);
     assert_eq!(parking.events.len(), 1);
     assert_eq!(parking.events[0].kind, EventKind::CaravanParked);
+    let parking_comments = provider
+        .comments
+        .borrow()
+        .get(&PrNumber(1))
+        .cloned()
+        .expect("parking posts one durable explanation");
+    assert_eq!(parking_comments.len(), 1);
+    assert!(parking_comments[0].contains("### Cara parked this caravan"));
+    assert!(parking_comments[0].contains("**Automatic recovery:**"));
+    assert!(parking_comments[0].contains(TERMINAL_RED_AUDIT_PREFIX));
 
     let parked_pulls = provider
         .pulls
@@ -3378,6 +3388,44 @@ fn terminal_red_park_policy_frees_capacity_for_independent_green_candidate() {
     assert!(!repeated.changed);
     assert!(repeated.provider_receipts.is_empty());
     assert!(repeated.events.is_empty());
+    assert_eq!(
+        provider.comments.borrow()[&PrNumber(1)].len(),
+        1,
+        "an exact repeated parked tick never duplicates the explanation"
+    );
+}
+
+#[test]
+fn parking_comment_failure_prevents_an_unaudited_label_and_retry_deduplicates() {
+    let mut pulls = healthy_chain();
+    pulls.truncate(1);
+    pulls[0].checks = vec![check("build-test", CheckState::Failure, Some(10))];
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    provider.fail_once(MutationKind::Comment);
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+    let mut context = AppContext::default();
+    context.config.sync.terminal_red.action = crate::config::TerminalRedAction::Park;
+
+    let Err(error) = reconcile_terminal_red_parking(&context, &status, &provider) else {
+        panic!("an indeterminate comment must stop before the parking label");
+    };
+    assert_eq!(error.code(), "terminal_red_transition_comment_failed");
+    assert!(!provider.pulls.borrow()[&PrNumber(1)].has_label(PARKED_LABEL));
+    assert_eq!(
+        provider.comments.borrow()[&PrNumber(1)].len(),
+        1,
+        "the fake models a comment accepted before its response failed"
+    );
+
+    let retry = reconcile_terminal_red_parking(&context, &status, &provider)
+        .expect("the same exact decision resumes by deterministic marker");
+    assert!(retry.changed);
+    assert!(provider.pulls.borrow()[&PrNumber(1)].has_label(PARKED_LABEL));
+    assert_eq!(
+        provider.comments.borrow()[&PrNumber(1)].len(),
+        1,
+        "the resumed transition must reuse the visible audit"
+    );
 }
 
 /// bd-bb3a4d recurrence fixture from cacophony #2384/#2385 and clean
@@ -3907,6 +3955,13 @@ fn green_rerun_unparks_without_changing_multi_member_topology() {
         result.events[0].metadata["verdicts"][0]["classification"],
         "green"
     );
+    let comments = provider.comments.borrow();
+    let unpark_comment = comments[&PrNumber(1)]
+        .last()
+        .expect("automatic unpark posts one durable explanation");
+    assert!(unpark_comment.contains("### Cara automatically reactivated this caravan"));
+    assert!(unpark_comment.contains(TERMINAL_RED_AUDIT_PREFIX));
+    drop(comments);
     assert!(
         result.events[0].metadata["required_runs"]
             .as_array()
@@ -8529,8 +8584,17 @@ fn a_promoted_green_root_is_squash_merged_by_cara_with_sealed_landing_proof() {
 
     let progress = execute(&status, &provider, false, false, false).expect("cara merges the root");
 
-    // Exactly one non-admin squash, and never the administrator bypass.
-    assert_eq!(*provider.calls.borrow(), vec![MutationKind::SquashMerge]);
+    // One durable exact-generation comment precedes the single non-admin
+    // squash, and the administrator bypass is never used.
+    assert_eq!(
+        *provider.calls.borrow(),
+        vec![MutationKind::Comment, MutationKind::SquashMerge]
+    );
+    let comments = provider.comments.borrow();
+    assert_eq!(comments[&PrNumber(1)].len(), 1);
+    assert!(comments[&PrNumber(1)][0].contains("### Cara authorized this merge"));
+    assert!(comments[&PrNumber(1)][0].contains(MERGE_AUDIT_PREFIX));
+    drop(comments);
     assert_eq!(
         provider.pulls.borrow()[&PrNumber(1)].state,
         PullRequestState::Merged
@@ -8567,6 +8631,37 @@ fn a_promoted_green_root_is_squash_merged_by_cara_with_sealed_landing_proof() {
     assert!(
         progress.root_auto_merge.is_empty(),
         "cara never arms provider auto-merge"
+    );
+}
+
+#[test]
+fn merge_comment_failure_prevents_merge_and_exact_retry_reuses_the_audit() {
+    let pulls = vec![caravan_member(1, "one", "main")];
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    provider.fail_once(MutationKind::Comment);
+    let status = caravan_status(pulls, Some(PrNumber(1)), true);
+
+    let error = execute(&status, &provider, false, false, false)
+        .expect_err("an indeterminate audit comment must stop before squash merge");
+    assert_eq!(error.code(), "github_operation_comment_failed");
+    assert_eq!(
+        provider.pulls.borrow()[&PrNumber(1)].state,
+        PullRequestState::Open
+    );
+    assert!(!provider.calls.borrow().contains(&MutationKind::SquashMerge));
+    assert_eq!(provider.comments.borrow()[&PrNumber(1)].len(), 1);
+
+    let progress = execute(&status, &provider, false, false, false)
+        .expect("the same exact merge resumes by deterministic marker");
+    assert_eq!(progress.root_merge.len(), 1);
+    assert_eq!(
+        provider.pulls.borrow()[&PrNumber(1)].state,
+        PullRequestState::Merged
+    );
+    assert_eq!(
+        provider.comments.borrow()[&PrNumber(1)].len(),
+        1,
+        "the resumed merge must reuse the visible authorization"
     );
 }
 
@@ -8648,7 +8743,7 @@ fn plan_and_sync_agree_that_newer_green_required_runs_make_the_root_eligible() {
     );
     assert_eq!(
         *sync_provider.calls.borrow(),
-        vec![MutationKind::SquashMerge]
+        vec![MutationKind::Comment, MutationKind::SquashMerge]
     );
     assert_eq!(progress.root_merge.len(), 1);
     assert_eq!(progress.root_merge[0].pr, PrNumber(2575));
@@ -10238,6 +10333,57 @@ fn top_eviction_recovery_always_names_one_blocked_final_member() {
         )
         .is_none(),
         "a fully selected Stack needs no recovery plan"
+    );
+}
+
+#[test]
+fn native_stack_merge_audit_is_exact_generation_bound_and_deterministic() {
+    let pulls = vec![
+        caravan_member(1, "root", "main"),
+        caravan_member(2, "child", "root"),
+    ];
+    let mut status = caravan_status(pulls, Some(PrNumber(1)), true);
+    enable_native_backend(&mut status);
+    let generation = native_generation(&status, 42, &[PrNumber(1), PrNumber(2)]);
+    let evidence = generation
+        .topology
+        .entries
+        .iter()
+        .cloned()
+        .map(|generation| crate::github::GitHubStackMergeEntryEvidence {
+            generation,
+            blockers: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    let prefix = crate::github::plan_github_stack_ready_prefix(&generation, &evidence)
+        .expect("complete exact-green Stack has a ready prefix");
+    let plan = prefix
+        .direct_squash_plan("operation-42", "operator")
+        .expect("exact prefix becomes one sealed landing plan");
+    let checkpoint =
+        GitHubMutationAdapter::<crate::command::ProcessRunner>::native_stack_land_begin(
+            &status.repository,
+            &plan,
+        );
+
+    for entry in &plan.selected {
+        let first = native_stack_merge_audit(&status.repository, &checkpoint, entry);
+        let retry = native_stack_merge_audit(&status.repository, &checkpoint, entry);
+        assert_eq!(first, retry, "exact retries reuse one marker/body");
+        assert!(first.0.contains(MERGE_AUDIT_PREFIX));
+        assert!(first.0.contains(&entry.head.oid.0));
+        assert!(
+            first
+                .1
+                .contains("### Cara authorized this native Stack merge")
+        );
+        assert!(first.1.contains("Stack:** #42"));
+        assert!(first.1.contains("posted before submission"));
+    }
+    assert_ne!(
+        native_stack_merge_audit(&status.repository, &checkpoint, &plan.selected[0]).0,
+        native_stack_merge_audit(&status.repository, &checkpoint, &plan.selected[1]).0,
+        "each selected PR generation receives its own audit"
     );
 }
 

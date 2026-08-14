@@ -787,7 +787,11 @@ Immediately before either label transition, a check-sensitive provider reread
 must still match the deciding observation; check drift refuses with zero writes.
 Park/unpark events bind exact ordering, member heads, current/superseded check
 evidence, required-context assessment, classification, fingerprint and provider
-receipt.
+receipt. Before either label transition, Cara must also make one deterministically
+marked exact-generation GitHub audit comment visible. It names the terminal
+finding or complete-green recovery, preserved topology/capacity semantics, and
+automatic recovery rule. Comment failure authorizes no label write; an exact
+retry deduplicates by transition/head/fingerprint and resumes.
 
 The reviewed `unpark` transition is the first-party recovery path when a parked
 immutable generation becomes green outside a normal sync tick. Its CLI, JSON,
@@ -843,6 +847,11 @@ Normal behavior:
 
 - Root: promoted to the exact default branch, then squash-merged by Cara itself.
 - Non-root: auto-merge disabled, even if it was enabled externally.
+- Audit: before an ordinary squash or native Stack submission becomes
+  irreversible, every selected exact PR generation receives one deterministic
+  merge-authorization comment containing target/tree or Stack-lock evidence.
+  Missing/indeterminate comment evidence prevents submission; retry reuses the
+  same marker and never duplicates the comment.
 - Pending CI: sync reports waiting and makes no speculative repair.
 - Failed CI without `caravan-force`: decision point.
 

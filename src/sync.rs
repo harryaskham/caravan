@@ -76,6 +76,8 @@ const MAX_SYNC_OPERATION_SECS: u64 = 3_600;
 const MAX_PARALLEL_REBASE_CHAINS: usize = 2;
 const PARKED_LABEL: &str = "caravan-parked";
 const CLOSED_LABEL: &str = "caravan-closed";
+const TERMINAL_RED_AUDIT_PREFIX: &str = "<!-- cara-terminal-red-transition:v1:";
+const MERGE_AUDIT_PREFIX: &str = "<!-- cara-merge-transition:v1:";
 /// Exact remote range/target verification plus one force-with-lease push.
 const PHYSICAL_APPLY_COMMAND_SLOTS_PER_PENDING_MEMBER: u64 = 3;
 /// A member whose exact cumulative ancestry already holds still revalidates
@@ -2122,7 +2124,14 @@ fn reconcile_terminal_red_parking(
             if head.auto_merge.enabled {
                 let receipt = provider
                     .disable_auto_merge(&status.repository, &PullRequestPrecondition::from(head))
-                    .map_err(|error| parking_mutation_error(&error, caravan, &failures))?;
+                    .map_err(|error| {
+                        parking_mutation_error(
+                            &error,
+                            caravan,
+                            &failures,
+                            &output.provider_receipts,
+                        )
+                    })?;
                 output.changed = true;
                 output.steps.push(MutationStep {
                     kind: MutationKind::DisableAutoMerge,
@@ -2142,16 +2151,81 @@ fn reconcile_terminal_red_parking(
         // additional one. `sync.max_caravans` is an admission fence only, so an
         // already-excess fleet must keep converging instead of being frozen at
         // the moment a parked generation becomes green.
+        let fingerprint = crate::membership::fnv1a64(
+            &serde_json::to_vec(&json!({
+                "caravan": caravan,
+                "failures": failures,
+                "verdicts": verdicts,
+                "required_runs": &green_required_runs,
+                "head": head.head,
+                "policy": "park",
+            }))
+            .expect("parking evidence serializes"),
+        );
+        let transition = if should_park { "park" } else { "auto_unpark" };
+        let marker = format!(
+            "{TERMINAL_RED_AUDIT_PREFIX}{transition}:{}:{}:{fingerprint} -->",
+            caravan.id, head.head.oid,
+        );
+        let comment = terminal_red_transition_comment(
+            &marker,
+            transition,
+            caravan,
+            head,
+            &failures,
+            green_required_runs.as_deref(),
+            &fingerprint,
+        );
         let expected = PullRequestPrecondition::from(head);
         provider
             .verify_pull_request_with_checks(&status.repository, &expected)
-            .map_err(|error| parking_mutation_error(&error, caravan, &failures))?;
+            .map_err(|error| {
+                parking_mutation_error(&error, caravan, &failures, &output.provider_receipts)
+            })?;
+
+        // Audit first: an unaudited label transition is worse than a visible,
+        // safely retryable intent comment whose exact label write has not yet
+        // completed. The deterministic marker makes a retry provider-idempotent.
+        let comment_receipt = provider
+            .ensure_marked_comment(&status.repository, &expected, &marker, &comment)
+            .map_err(|error| {
+                parking_comment_mutation_error(&error, caravan, &fingerprint, transition)
+            })?;
+        let comment_already_present = comment_receipt
+            .provider_output
+            .as_deref()
+            .is_some_and(|value| value.starts_with("existing GitHub comment"));
+        output.steps.push(MutationStep {
+            kind: MutationKind::Comment,
+            state: if comment_already_present {
+                MutationStepState::AlreadySatisfied
+            } else {
+                MutationStepState::Completed
+            },
+            pr: Some(caravan.id),
+            summary: if should_park {
+                "posted durable terminal-red parking audit".to_owned()
+            } else {
+                "posted durable automatic-unpark audit".to_owned()
+            },
+        });
+        output.provider_receipts.push(comment_receipt);
+
+        // A comment can trigger provider workflows. Re-prove the exact check
+        // generation observed by the parking decision before changing labels.
+        provider
+            .verify_pull_request_with_checks(&status.repository, &expected)
+            .map_err(|error| {
+                parking_mutation_error(&error, caravan, &failures, &output.provider_receipts)
+            })?;
         let receipt = if should_park {
             provider.add_label(&status.repository, &expected, PARKED_LABEL)
         } else {
             provider.remove_label(&status.repository, &expected, PARKED_LABEL)
         }
-        .map_err(|error| parking_mutation_error(&error, caravan, &failures))?;
+        .map_err(|error| {
+            parking_mutation_error(&error, caravan, &failures, &output.provider_receipts)
+        })?;
         output.changed = true;
         output.steps.push(MutationStep {
             kind: if should_park {
@@ -2168,32 +2242,24 @@ fn reconcile_terminal_red_parking(
                     .to_owned()
             },
         });
-        let after = receipt.after.clone();
+        let mut after = receipt.after.clone();
         output.provider_receipts.push(receipt);
         if should_park && after.auto_merge.enabled {
             let disable = provider
                 .disable_auto_merge(&status.repository, &PullRequestPrecondition::from(&after))
-                .map_err(|error| parking_mutation_error(&error, caravan, &failures))?;
+                .map_err(|error| {
+                    parking_mutation_error(&error, caravan, &failures, &output.provider_receipts)
+                })?;
             output.steps.push(MutationStep {
                 kind: MutationKind::DisableAutoMerge,
                 state: MutationStepState::Completed,
                 pr: Some(caravan.id),
                 summary: "disabled auto-merge on newly parked caravan head".to_owned(),
             });
+            after = disable.after.clone();
             output.provider_receipts.push(disable);
         }
-
-        let fingerprint = crate::membership::fnv1a64(
-            &serde_json::to_vec(&json!({
-                "caravan": caravan,
-                "failures": failures,
-                "verdicts": verdicts,
-                "required_runs": &green_required_runs,
-                "head": head.head,
-                "policy": "park",
-            }))
-            .expect("parking evidence serializes"),
-        );
+        debug_assert_eq!(after.has_label(PARKED_LABEL), should_park);
         output.events.push(hooks::event(
             if should_park {
                 EventKind::CaravanParked
@@ -2274,6 +2340,55 @@ fn parking_required_runs_green(
     Some(assessments)
 }
 
+fn terminal_red_transition_comment(
+    marker: &str,
+    transition: &str,
+    caravan: &Caravan,
+    head: &PullRequestSnapshot,
+    failures: &[Value],
+    required_runs: Option<&[crate::required_runs::RequiredRunsAssessment]>,
+    fingerprint: &str,
+) -> String {
+    if transition == "park" {
+        let mut findings = failures
+            .iter()
+            .flat_map(|failure| {
+                let pr = failure["pr"].as_u64().unwrap_or_default();
+                failure["checks"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(move |check| {
+                        Some(format!(
+                            "#{} `{}`=`{}`",
+                            pr,
+                            check["name"].as_str()?,
+                            check["state"].as_str()?,
+                        ))
+                    })
+            })
+            .take(12)
+            .collect::<Vec<_>>();
+        if findings.is_empty() {
+            findings
+                .push("current terminal check evidence (encoded in the fingerprint)".to_owned());
+        }
+        format!(
+            "{marker}\n### Cara parked this caravan\n\n- **Exact generation:** PR #{} at `{}`\n- **Why:** the newest current CI verdict is terminal: {}\n- **Effect:** Cara preserved every PR, branch, base, and membership edge; disabled root auto-merge; and removed this caravan from active queue capacity. Nothing was closed or evicted.\n- **Automatic recovery:** normal `cara sync` removes only `caravan-parked` after the newest current checks for every member are fully green and every protection-required context is satisfied. Pending or incomplete evidence leaves it parked with zero writes.\n- **Evidence fingerprint:** `{fingerprint}`\n",
+            caravan.id,
+            head.head.oid,
+            findings.join(", "),
+        )
+    } else {
+        format!(
+            "{marker}\n### Cara automatically reactivated this caravan\n\n- **Exact generation:** PR #{} at `{}`\n- **Why:** the newest current CI verdict is fully green for every member and all {} required-run assessment(s) are satisfied or not required.\n- **Effect:** Cara removed only `caravan-parked`; original membership, branches, bases, and FIFO age were preserved. Normal deterministic convergence may now merge the caravan.\n- **Evidence fingerprint:** `{fingerprint}`\n",
+            caravan.id,
+            head.head.oid,
+            required_runs.map_or(0, <[crate::required_runs::RequiredRunsAssessment]>::len),
+        )
+    }
+}
+
 fn parking_failure_classification(checks: &[&CheckSnapshot]) -> &'static str {
     if checks
         .iter()
@@ -2304,14 +2419,45 @@ fn parking_mutation_error(
     error: &MutationError,
     caravan: &Caravan,
     failures: &[Value],
+    provider_receipts: &[GitHubMutationReceipt],
 ) -> AppError {
     AppError::structured(
         ErrorCategory::ExecutionFailure,
         "terminal_red_parking_failed",
         format!("terminal-red parking transition failed: {error}"),
-        Some(
-            json!({"caravan": caravan, "failures": failures, "mutated": false, "resumable": true}),
+        Some(json!({
+            "caravan": caravan,
+            "failures": failures,
+            "provider_receipts": provider_receipts,
+            "mutated": !provider_receipts.is_empty(),
+            "resumable": true,
+            "safe_next_action": "rediscover and rerun the same sync; the deterministic transition comment deduplicates and no unaudited label transition is authorized",
+        })),
+    )
+}
+
+fn parking_comment_mutation_error(
+    error: &MutationError,
+    caravan: &Caravan,
+    fingerprint: &str,
+    transition: &str,
+) -> AppError {
+    AppError::structured(
+        ErrorCategory::ExecutionFailure,
+        "terminal_red_transition_comment_failed",
+        format!(
+            "terminal-red {transition} audit comment failed before the label transition: {error}"
         ),
+        Some(json!({
+            "caravan": caravan,
+            "transition": transition,
+            "fingerprint": fingerprint,
+            "label_mutated": false,
+            "comment_outcome": "indeterminate",
+            "resumable": true,
+            "dedupe": "deterministic GitHub-visible cara-terminal-red-transition marker",
+            "safe_next_action": "rediscover and rerun the same sync; never raw-edit the parking label",
+        })),
     )
 }
 
@@ -7831,6 +7977,38 @@ fn conflict_detected_events(
     events
 }
 
+fn native_stack_merge_audit(
+    repository: &RepositoryId,
+    checkpoint: &crate::github::GitHubStackLandCheckpoint,
+    entry: &crate::github::GitHubStackEntryGeneration,
+) -> (String, String) {
+    let merge_fingerprint = crate::membership::fnv1a64(
+        &serde_json::to_vec(&json!({
+            "operation": "native_stack_merge",
+            "repository": repository,
+            "stack": checkpoint.plan.before.number,
+            "plan_operation": &checkpoint.plan.operation_id,
+            "entry": entry,
+            "selected": &checkpoint.plan.selected,
+            "merge_method": &checkpoint.plan.merge_method,
+            "merge_action": &checkpoint.plan.merge_action,
+        }))
+        .expect("native Stack merge audit evidence serializes"),
+    );
+    let marker = format!(
+        "{MERGE_AUDIT_PREFIX}native_stack:{}:{}:{merge_fingerprint} -->",
+        entry.pr, entry.head.oid,
+    );
+    let body = format!(
+        "{marker}\n### Cara authorized this native Stack merge\n\n- **Exact generation:** PR #{} at `{}`\n- **Stack:** #{} at exact base `{}`\n- **Why:** the complete provider Stack generation is locked, the selected prefix is fully green, every required context is satisfied, and source refs match the sealed plan.\n- **Operation:** Cara will now submit one atomic squash landing for the exact selected prefix. This audit is posted before submission; exact retries reuse it without duplication.\n- **Evidence fingerprint:** `{merge_fingerprint}`\n",
+        entry.pr,
+        entry.head.oid,
+        checkpoint.plan.before.number,
+        checkpoint.plan.before.topology.base.oid,
+    );
+    (marker, body)
+}
+
 #[derive(Debug)]
 struct SyncProgress {
     operation_id: OperationId,
@@ -8506,6 +8684,41 @@ impl SyncProgress {
         Ok(())
     }
 
+    fn ensure_operation_comment(
+        &mut self,
+        provider: &impl SyncProvider,
+        repository: &RepositoryId,
+        number: PrNumber,
+        operation: &str,
+        marker: &str,
+        body: &str,
+    ) -> Result<(), AppError> {
+        self.ensure_mutation_capacity(1)?;
+        let receipt = provider
+            .ensure_marked_comment(repository, &self.precondition(number), marker, body)
+            .map_err(|error| {
+                operation_comment_mutation_error(&error, self, number, operation, marker)
+            })?;
+        let already = receipt
+            .provider_output
+            .as_deref()
+            .is_some_and(|output| output.starts_with("existing GitHub comment"));
+        if already {
+            self.already(
+                MutationKind::Comment,
+                number,
+                &format!("{operation} audit comment already present"),
+            );
+            self.current.insert(number, receipt.after);
+        } else {
+            self.record(
+                receipt,
+                &format!("posted durable {operation} audit comment"),
+            );
+        }
+        Ok(())
+    }
+
     fn ensure_auto_merge_disabled(
         &mut self,
         provider: &impl SyncProvider,
@@ -8889,6 +9102,23 @@ impl SyncProgress {
                     provider.native_stack_land_lock_for_sync(repository, &checkpoint)?
                 }
                 crate::github::GitHubStackLandPhase::Locked => {
+                    // Every selected immutable PR receives one durable audit
+                    // before the first irreversible Stack submission. A
+                    // comment failure leaves the exact lock/checkpoint at
+                    // `Locked`, so the next tick retries by marker instead of
+                    // submitting an unaudited merge.
+                    for entry in checkpoint.plan.selected.clone() {
+                        let (marker, body) =
+                            native_stack_merge_audit(repository, &checkpoint, &entry);
+                        self.ensure_operation_comment(
+                            provider,
+                            repository,
+                            entry.pr,
+                            "native Stack merge",
+                            &marker,
+                            &body,
+                        )?;
+                    }
                     submission_marked_now = true;
                     GitHubMutationAdapter::<crate::command::ProcessRunner>::native_stack_land_mark_submitting(
                         repository,
@@ -9222,6 +9452,50 @@ impl SyncProgress {
         let next_root_base_before = next_root
             .and_then(|next| self.current.get(&next))
             .map(|next| next.base.name.clone());
+
+        let merge_fingerprint = crate::membership::fnv1a64(
+            &serde_json::to_vec(&json!({
+                "operation": "squash_merge",
+                "repository": repository,
+                "caravan_id": caravan_id,
+                "pr": number,
+                "head": &observed.head,
+                "base": &observed.base,
+                "default_before": &default_before,
+                "tree_proof": &tree_proof,
+                "remaining": remaining,
+            }))
+            .expect("merge audit evidence serializes"),
+        );
+        let merge_marker = format!(
+            "{MERGE_AUDIT_PREFIX}squash:{number}:{}:{merge_fingerprint} -->",
+            observed.head.oid,
+        );
+        let merge_comment = format!(
+            "{merge_marker}\n### Cara authorized this merge\n\n- **Exact generation:** PR #{number} at `{}`\n- **Target:** `{}` at `{}`\n- **Why:** current checks and protection-required contexts are green, provider mergeability is clean, and {}.\n- **Operation:** Cara is the single merge actor and will now squash-merge this exact generation. This audit is posted before the irreversible provider write; exact retries reuse it without duplication.\n- **Evidence fingerprint:** `{merge_fingerprint}`\n",
+            observed.head.oid,
+            default_branch,
+            default_before.oid,
+            tree_proof.reason(),
+        );
+        self.ensure_operation_comment(
+            provider,
+            &repository,
+            number,
+            "squash merge",
+            &merge_marker,
+            &merge_comment,
+        )?;
+        // The comment is itself a provider write and may start workflows. No
+        // merge proceeds unless the exact deciding check/default generation is
+        // still current after that audit becomes durable.
+        provider
+            .verify_pull_request_with_checks(&repository, &PullRequestPrecondition::from(&observed))
+            .map_err(|error| mutation_error(&error, self, Some(number)))?;
+        provider
+            .verify_branch_head(&repository, &default_branch, &default_before.oid)
+            .map_err(|error| mutation_error(&error, self, Some(number)))?;
+
         self.ensure_mutation_capacity(1)?;
         let receipt = provider
             .squash_merge(&repository, &self.precondition(number))
@@ -9854,6 +10128,33 @@ impl SyncProgress {
             })),
         )
     }
+}
+
+fn operation_comment_mutation_error(
+    error: &MutationError,
+    progress: &SyncProgress,
+    affected_pr: PrNumber,
+    operation: &str,
+    marker: &str,
+) -> AppError {
+    AppError::structured(
+        ErrorCategory::ExecutionFailure,
+        "github_operation_comment_failed",
+        format!("{operation} audit comment failed before the irreversible transition: {error}"),
+        Some(json!({
+            "stage": "operation_audit_comment",
+            "operation": operation,
+            "affected_pr": affected_pr,
+            "marker": marker,
+            "operation_receipt": progress.operation_receipt(),
+            "provider_receipts": progress.provider_receipts,
+            "events": progress.events,
+            "irreversible_transition_attempted": false,
+            "resumable": true,
+            "dedupe": "deterministic GitHub-visible cara operation marker",
+            "next": "rediscover and rerun the same cara sync operation",
+        })),
+    )
 }
 
 fn comment_mutation_error(

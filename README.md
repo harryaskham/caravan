@@ -931,9 +931,13 @@ membership generation, the durable `caravan_parked` event fingerprint,
 open enrolled non-evicted parked head, no explicit pause/recovery fence, and the
 newest authoritative green check generation under the normal writer guard and
 provider lease. It removes only `caravan-parked`, reruns fleet analysis, and
-returns a durable idempotent receipt with old/new labels and evidence. Use
-`cara --json unpark --help` (or the MCP `unpark` tool) to construct the reviewed
-request.
+returns a durable idempotent receipt with old/new labels and evidence. Every
+automatic park and green unpark first posts one exact-generation GitHub audit
+comment naming the deciding checks, quarantine/capacity effect, automatic
+recovery condition, and sealed fingerprint. The label transition is forbidden
+if that comment cannot be proven visible; an exact retry finds its marker and
+continues without duplication. Use `cara --json unpark --help` (or the MCP
+`unpark` tool) to construct the reviewed request.
 
 If a stale closed-row cleanup stripped both `caravan` and `caravan-parked` from
 that same open generation, use `cara restore-parked` (or MCP `restore_parked`)
@@ -976,9 +980,13 @@ reconciliation, serialization, and hooks; there is no hidden deployment-specific
 binary ceiling. Configured hook timeouts may shorten their child lifetime but
 can never extend the remaining sync deadline. Before physical planning or
 whole-member CI analysis, a Cara-owned tick evaluates already-admitted exact-
-green roots and lands at most one; successful root landing
-returns `retry_tick` immediately and defers unrelated inventory to the next
-GitHub-cursor tick. `cara status` reports the required and retained reserve, the
+green roots and lands at most one; successful root landing returns `retry_tick`
+immediately and defers unrelated inventory to the next GitHub-cursor tick.
+Before an ordinary squash or native Stack submission becomes irreversible, Cara
+posts one deterministic exact-generation merge-authorization comment carrying
+the target/tree or Stack-lock evidence fingerprint. Comment failure prevents
+submission; exact retries reuse the visible marker rather than producing audit
+spam. `cara status` reports the required and retained reserve, the
 processable prefix, the deferred members, the maximum admissible chain size,
 and a safe next action for every caravan before any refusal, and
 `cara plan sync --all` reports the exact prefix a tick would admit without
