@@ -25,6 +25,7 @@ pub mod initialization;
 pub mod journal;
 pub mod loop_runner;
 pub mod membership;
+pub mod native_stack_rebase;
 pub mod navigation;
 pub mod next;
 pub mod operation_lock;
@@ -362,8 +363,10 @@ GITHUB NATIVE STACKS (EXPLICIT OPT-IN)
   one. Native readiness requires each immutable source generation's exact fresh
   two-parent synthetic candidate and proves that every open child commit
   contains its predecessor head; base-ref linkage without commit ancestry is
-  `native_stack_rebase_required`, never a mergeable Stack. Sync lands a fully
-  ready Stack; a blocked suffix must be reshaped first, never refreshed by a
+  `native_stack_rebase_required`, never a mergeable Stack. Use reviewed
+  `native-stack rebase-preview` then `rebase-apply` to prepare the complete
+  suffix and atomically publish exact leased heads; every changed generation
+  must pass fresh CI. Sync lands a fully ready Stack; a blocked suffix must be reshaped first, never refreshed by a
   scheduler force-push.
 - GitHub cannot represent a one-member Stack. Complete zero-mapping inventory
   plus an authoritative one-member caravan selects the explicit singleton
@@ -1572,6 +1575,20 @@ pub fn build_router() -> ToolRouter<AppContext> {
         "Clear only one stale local formation checkpoint after complete provider discovery proves that no native Stack intersects any planned member; provider/source mutation is impossible and provider-visible state always refuses clearance.",
         |context: &AppContext, input: stack_recovery::NativeStackRecoveryClearInput| {
             stack_recovery::clear_checkpoint(context, &input)
+        },
+    );
+    router.add_typed_tool_with_output_schema(
+        "native_stack_rebase_preview",
+        "Build a no-write exact-generation plan for the complete divergent native Stack suffix, binding adjacent ancestry, branches, heads, bases, actor, reason, rollout configuration, and a stable review hash.",
+        |context: &AppContext, input: native_stack_rebase::NativeStackRebasePreviewInput| {
+            native_stack_rebase::preview(context, &input)
+        },
+    );
+    router.add_typed_tool_with_output_schema(
+        "native_stack_rebase_apply",
+        "Independently rediscover one reviewed native Stack rebase plan, prepare every descendant before the first write, atomically publish all changed branches under exact leases, and require linear provider postconditions plus fresh CI.",
+        |context: &AppContext, input: native_stack_rebase::NativeStackRebaseApplyInput| {
+            native_stack_rebase::apply(context, &input)
         },
     );
     router.add_typed_tool_with_output_schema(

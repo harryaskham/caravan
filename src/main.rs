@@ -16,6 +16,7 @@ use caravan::{
     active_updater_config, build_router,
     concat::{ConcatExecuteInput, ConcatInput},
     feedback_config, feedback_configuration_error, feedback_panic_config,
+    native_stack_rebase::{NativeStackRebaseApplyInput, NativeStackRebasePreviewInput},
     repair::{
         RepairAbortInput, RepairAuthorizeAgentEditsInput, RepairContinueInput, RepairGrantInput,
         RepairRevokeGrantInput, RepairStartInput, RepairStatusInput,
@@ -241,6 +242,12 @@ enum NativeStackCommand {
     /// Clear only a stale local checkpoint after proving zero provider intersection.
     #[command(name = "recovery-clear")]
     Clear(NativeStackRecoveryClearInput),
+    /// Build a no-write exact native Stack cascading-rebase plan.
+    #[command(name = "rebase-preview")]
+    RebasePreview(NativeStackRebasePreviewInput),
+    /// Apply one reviewed native Stack rebase plan under exact leases.
+    #[command(name = "rebase-apply")]
+    RebaseApply(NativeStackRebaseApplyInput),
 }
 
 #[derive(Debug, Subcommand)]
@@ -1878,10 +1885,53 @@ fn run_native_stack(cli: &Cli, command: &NativeStackCommand) -> Result<(), i32> 
             Err(error) => emit_human_error(error),
         };
     }
+    if let NativeStackCommand::RebasePreview(input) = command {
+        let result = caravan::native_stack_rebase::preview(&context, input);
+        if cli.json {
+            return emit_result(true, result);
+        }
+        return match result {
+            Ok(plan) => {
+                println!(
+                    "native-stack #{}: rebase {} member(s), plan {}",
+                    plan.stack,
+                    plan.members.len(),
+                    plan.plan_hash
+                );
+                Ok(())
+            }
+            Err(error) => emit_human_error(error),
+        };
+    }
+    if let NativeStackCommand::RebaseApply(input) = command {
+        let result = caravan::native_stack_rebase::apply(&context, input);
+        if cli.json {
+            return emit_result(true, result);
+        }
+        return match result {
+            Ok(output) => {
+                println!(
+                    "native-stack #{}: {} — {}",
+                    output.plan.stack,
+                    if output.mutated {
+                        "branches atomically rebased"
+                    } else {
+                        "ancestry already satisfied"
+                    },
+                    output.next
+                );
+                Ok(())
+            }
+            Err(error) => emit_human_error(error),
+        };
+    }
     let result = match command {
         NativeStackCommand::Preview(input) => caravan::stack_recovery::preview(&context, input),
         NativeStackCommand::Apply(input) => caravan::stack_recovery::apply(&context, input),
         NativeStackCommand::Clear(_) => unreachable!("handled above"),
+        NativeStackCommand::RebasePreview(_) | NativeStackCommand::RebaseApply(_) => {
+            unreachable!("handled above")
+        }
     };
     if cli.json {
         return emit_result(true, result);

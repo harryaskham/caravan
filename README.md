@@ -758,7 +758,12 @@ exact checkpoint instead of telling a scheduler to re-admit an already-labelled
 PR. A legacy or checkpointed
 multi-member caravan with zero mappings is repaired only through
 `cara native-stack recovery-preview` followed by `recovery-apply` with the exact
-plan hash. Apply independently revalidates ordered membership, immutable
+plan hash. A provider Stack whose PR bases are linked but whose child commits do
+not contain their predecessors is recovered through `cara native-stack
+rebase-preview --stack N --actor A --reason R` followed by `rebase-apply` with
+the reviewed plan hash; the apply prepares the complete divergent suffix before
+one atomic exact-lease push and requires linear provider rediscovery plus fresh
+CI. Apply independently revalidates ordered membership, immutable
 heads/bases, current CLEAN/green evidence, rollout capability, and complete
 mapping truth. A legacy first-child gap permits zero mappings; a checkpointed
 append permits only its exact provider prefix; a response-loss retry permits one
