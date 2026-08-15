@@ -83,6 +83,14 @@ pub struct ReshapeOutput {
     pub affected_prs: Vec<PrNumber>,
     /// Fleet expected after every recorded provider step completes.
     pub resulting_fleet: CaravanFleet,
+    /// Exact problems which remain after an explicitly authorized head release.
+    /// Empty for an ordinarily healthy reshape. These are post-eviction repair
+    /// state, not a reason to pretend the selected head was retained.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remaining_problems: Vec<crate::model::GraphProblem>,
+    /// Typed continuation when a released head leaves surviving repair work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safe_next_action: Option<String>,
     /// Canonical events emitted after the complete reshape operation.
     #[serde(default)]
     pub events: Vec<CaravanEvent>,
@@ -324,11 +332,24 @@ fn execute_live_before(
         .provider_api
         .merge(provider_telemetry_runner.github_api_telemetry());
 
+    output
+        .events
+        .push(reshape_completed_event(operation, repository, &output));
+    output.hook_deliveries =
+        hooks::dispatch_events_before(context, &output.events, operation_deadline)?;
+    Ok(output)
+}
+
+fn reshape_completed_event(
+    operation: ReshapeOperation,
+    repository: crate::model::RepositoryId,
+    output: &ReshapeOutput,
+) -> CaravanEvent {
     let kind = match operation {
         ReshapeOperation::Evict => EventKind::Evicted,
         ReshapeOperation::Split => EventKind::Split,
     };
-    let event = hooks::event(
+    hooks::event(
         kind,
         output.receipt.operation_id.clone(),
         repository,
@@ -339,12 +360,18 @@ fn execute_live_before(
         output.affected_prs.clone(),
         Some(output.resulting_fleet.clone()),
         output.reason.clone(),
-        BTreeMap::from([("receipt".to_owned(), json!(output.receipt))]),
-    );
-    output.events.push(event);
-    output.hook_deliveries =
-        hooks::dispatch_events_before(context, &output.events, operation_deadline)?;
-    Ok(output)
+        BTreeMap::from([
+            ("receipt".to_owned(), json!(output.receipt)),
+            (
+                "remaining_problems".to_owned(),
+                json!(output.remaining_problems),
+            ),
+            (
+                "safe_next_action".to_owned(),
+                json!(output.safe_next_action),
+            ),
+        ]),
+    )
 }
 
 fn post_rewrite_comments<R: crate::command::CommandRunner>(
@@ -456,6 +483,7 @@ struct PreparedReshape {
     number: PrNumber,
     virtual_status: StatusOutput,
     plan: ReshapePlan,
+    remaining_problems: Vec<crate::model::GraphProblem>,
 }
 
 fn prepare_reshape(
@@ -484,18 +512,37 @@ fn prepare_reshape(
             format!("PR #{number} is not open"),
         ));
     }
-    let (virtual_status, plan) = match operation {
+    let (mut virtual_status, plan) = match operation {
         ReshapeOperation::Evict => plan_eviction(status, &target)?,
         ReshapeOperation::Split => plan_split(status, &target)?,
     };
-    preflight_result(status, &virtual_status, checker)?;
-    if plan.creates_head {
+    let mut remaining_problems =
+        preflight_result(status, &virtual_status, checker, plan.releases_head)?;
+    if plan.creates_head
+        && plan.releases_head
+        && !remaining_problems.is_empty()
+        && status.head_merge.actor.github()
+        && let Some(child) = plan.child
+    {
+        // A replacement head with unresolved repair state must never be armed.
+        // Reproject the exact post-write graph with auto-merge disabled so the
+        // receipt/event matches provider state and ordinary sync owns recovery.
+        let mut pulls = virtual_status.analysis.pull_requests.clone();
+        pulls
+            .get_mut(&child)
+            .expect("replacement child remains in projected status")
+            .auto_merge = AutoMergeState::disabled();
+        virtual_status = self::virtual_status(status, pulls);
+        remaining_problems = projected_problems(&virtual_status, checker)?;
+    }
+    if plan.creates_head && remaining_problems.is_empty() {
         preflight_new_head(provider, status)?;
     }
     Ok(PreparedReshape {
         number,
         virtual_status,
         plan,
+        remaining_problems,
     })
 }
 
@@ -513,6 +560,7 @@ fn execute(
         number,
         virtual_status,
         plan,
+        remaining_problems,
     } = prepare_reshape(&status, checker, provider, operation, selected)?;
 
     let mut state = ReshapeState::new(operation, status.analysis.pull_requests.clone());
@@ -529,7 +577,10 @@ fn execute(
                     .as_ref()
                     .expect("an eviction child has a desired base");
                 state.ensure_base(provider, &status.repository, child, desired)?;
-                if plan.creates_head && status.head_merge.actor.github() {
+                if plan.creates_head
+                    && remaining_problems.is_empty()
+                    && status.head_merge.actor.github()
+                {
                     state.ensure_squash_auto_merge(provider, &status.repository, child)?;
                 } else {
                     state.ensure_auto_merge_disabled(provider, &status.repository, child)?;
@@ -550,10 +601,20 @@ fn execute(
                 actor: "authenticated GitHub actor invoked through cara CLI/JSON/MCP".to_owned(),
                 reason: reason.clone().expect("eviction reason validated by caller"),
                 reason_source: "explicit --reason input".to_owned(),
-                compatibility_evidence: "complete resulting-fleet compatibility preflight passed"
-                    .to_owned(),
-                clean_squash_evidence: if plan.creates_head {
+                compatibility_evidence: if remaining_problems.is_empty() {
+                    "complete resulting-fleet compatibility preflight passed".to_owned()
+                } else {
+                    format!(
+                        "explicit head release completed with {} exact surviving repair problem(s)",
+                        remaining_problems.len()
+                    )
+                },
+                clean_squash_evidence: if plan.creates_head && !remaining_problems.is_empty() {
+                    "replacement head is retained with auto-merge disabled until the reported repair state is resolved".to_owned()
+                } else if plan.creates_head && status.head_merge.actor.github() {
                     "replacement head passed compatibility preflight and has squash auto-merge enabled".to_owned()
+                } else if plan.creates_head {
+                    "replacement head passed compatibility preflight; Cara remains the configured merge actor".to_owned()
                 } else {
                     "no replacement head required, or replacement remains a non-head with auto-merge disabled".to_owned()
                 },
@@ -590,13 +651,15 @@ fn execute(
     // bd-cef612: physically drop the evicted patch from each descendant, so a
     // descendant that later lands cannot reintroduce discarded content.
     let descendant_rewrites = match rewrite {
-        Some(rewrite) if rewrite.enabled && !descendants.is_empty() => unwind_descendants(
-            rewrite,
-            &status,
-            number,
-            &descendants,
-            plan.child_base.as_ref(),
-        )?,
+        Some(rewrite) if rewrite.enabled && !descendants.is_empty() && !plan.releases_head => {
+            unwind_descendants(
+                rewrite,
+                &status,
+                number,
+                &descendants,
+                plan.child_base.as_ref(),
+            )?
+        }
         _ => Vec::new(),
     };
     let descendants_inheriting_evicted_patch = if descendant_rewrites.is_empty() {
@@ -616,6 +679,10 @@ fn execute(
         native_stack_checkpoint: None,
         affected_prs: plan.affected_prs,
         resulting_fleet: virtual_status.analysis.fleet,
+        safe_next_action: (!remaining_problems.is_empty()).then(|| {
+            "the selected head is released; run `cara status` and follow the exact reported repair/reshape action before normal convergence".to_owned()
+        }),
+        remaining_problems,
         events: Vec::new(),
         hook_deliveries: Vec::new(),
     })
@@ -941,6 +1008,10 @@ struct ReshapePlan {
     child: Option<PrNumber>,
     child_base: Option<BranchSnapshot>,
     creates_head: bool,
+    /// Explicit head eviction is release authority even when surviving repair
+    /// evidence remains. Middle/tail reshapes retain strict introduced-edge
+    /// compatibility.
+    releases_head: bool,
     affected_prs: Vec<PrNumber>,
 }
 
@@ -1119,6 +1190,7 @@ fn plan_eviction(
             child,
             child_base,
             creates_head,
+            releases_head: parent.is_none(),
             affected_prs,
         },
     ))
@@ -1177,6 +1249,7 @@ fn plan_split(
             child: None,
             child_base: None,
             creates_head: true,
+            releases_head: false,
             affected_prs: vec![target.number],
         },
     ))
@@ -1266,7 +1339,8 @@ fn preflight_result(
     current: &StatusOutput,
     projected: &StatusOutput,
     checker: &impl CompatibilityChecker,
-) -> Result<(), AppError> {
+    releases_head: bool,
+) -> Result<Vec<crate::model::GraphProblem>, AppError> {
     let before = projected_problems(current, checker)?;
     let after = projected_problems(projected, checker)?;
     let introduced = after
@@ -1275,7 +1349,16 @@ fn preflight_result(
         .cloned()
         .collect::<Vec<_>>();
     if introduced.is_empty() {
-        return Ok(());
+        return Ok(after);
+    }
+    // An explicitly named head has no surviving predecessor edge. Retaining a
+    // bad head because its promoted child still needs repair traps the only
+    // owner-authorized release operation. Complete the release and expose the
+    // exact projected problem set; ordinary sync remains fail-closed until that
+    // repair state is resolved. Middle/tail eviction still refuses any newly
+    // introduced edge or topology problem before mutation.
+    if releases_head {
+        return Ok(after);
     }
     Err(AppError::structured(
         ErrorCategory::Validation,
@@ -2072,6 +2155,49 @@ mod tests {
         .expect("evicting the tail introduces no new problem");
 
         assert_eq!(output.affected_prs, vec![PrNumber(3)]);
+    }
+
+    /// Explicit head eviction is release authority. Promoting the child may
+    /// expose a new conflict against main, but retaining the rejected head would
+    /// wedge the only owner-authorized escape. The release succeeds, preserves
+    /// every source generation, and returns exact follow-up repair state.
+    #[test]
+    fn evict_head_succeeds_and_reports_surviving_repair_state() {
+        let pulls = vec![
+            pull_request(1, "main"),
+            pull_request(2, "pr-1"),
+            pull_request(3, "pr-2"),
+        ];
+        let mut provider = FakeProvider::new(&pulls);
+        provider.allows_auto_merge = false;
+
+        let output = execute(
+            status(pulls),
+            &AlwaysConflicts,
+            &provider,
+            ReshapeOperation::Evict,
+            Some(PrNumber(1)),
+            Some("release wedged head".to_owned()),
+            None,
+        )
+        .expect("an explicit head release must not be trapped by surviving repair state");
+
+        let state = provider.pull_requests.borrow();
+        assert!(!state[&PrNumber(1)].has_label(ACTIVE_LABEL));
+        assert!(state[&PrNumber(1)].has_label(EVICTED_LABEL));
+        assert_eq!(state[&PrNumber(2)].base.name, "main");
+        assert!(!output.remaining_problems.is_empty());
+        assert!(
+            output
+                .safe_next_action
+                .as_deref()
+                .is_some_and(|next| next.contains("cara status"))
+        );
+        assert_eq!(
+            output.descendants_inheriting_evicted_patch,
+            vec![PrNumber(2), PrNumber(3)],
+            "without physical rewrite authority, the receipt must retain exact inheritance risk"
+        );
     }
 
     /// The middle case still fails closed, because closing the gap creates a

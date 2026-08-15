@@ -230,6 +230,14 @@ cara update | cara self-update status | check | run
 cara feedback status | report
 ```
 
+Explicit `cara evict --pr <head>` is owner release authority: after exact target,
+provider, and membership proof it removes that head even when the promoted child
+still has repair work. The receipt/event names all remaining problems and any
+descendants which still inherit the released patch, keeps replacement auto-merge
+disabled when repair is pending, and directs ordinary typed repair before sync.
+Middle eviction remains strict because it creates a new surviving edge; unknown
+or stale target identity still refuses before mutation.
+
 `cara evict` and `cara split` use one validated reshape deadline across complete
 provider discovery, compatibility, provider writes, physical unwind,
 postconditions, and hooks. They never consume read-only status partials or the
