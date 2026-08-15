@@ -655,8 +655,16 @@ mod tests {
 
         let sync = include_str!("sync.rs");
         let sync = sync.split("\n#[cfg(test)]\nmod tests").next().unwrap();
-        assert_eq!(sync.matches("acquire_writer_operation(").count(), 1);
-        assert_eq!(sync.matches("lock.runner(").count(), 1);
+        assert_eq!(sync.matches("acquire_writer_operation(").count(), 2);
+        assert_eq!(sync.matches("lock.runner(").count(), 2);
+        for operation in ["sync", "admit"] {
+            assert_eq!(
+                sync.matches(&format!("acquire_writer_operation(\"{operation}\")"))
+                    .count(),
+                1,
+                "{operation} must retain exactly one guarded operation boundary"
+            );
+        }
         assert!(sync.contains("writer_guard: &WriterOperationGuard"));
         assert!(sync.contains("github_budget,\n                writer_guard,"));
     }

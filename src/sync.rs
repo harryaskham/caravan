@@ -45,7 +45,7 @@ use crate::root_merge::{
     RootMergeReceipt, RootPromotionFailureCause, RootPromotionReceipt, RootPromotionTrigger,
 };
 use crate::writer_guard::WriterOperationGuard;
-use crate::{AppContext, AppError, CheckInput, SyncInput};
+use crate::{AdmitInput, AppContext, AppError, CheckInput, SyncInput};
 
 mod budget;
 mod decision;
@@ -735,6 +735,43 @@ impl AutoAdmissionOutput {
             fleet_capacity_refusal: None,
         }
     }
+}
+
+/// Stable terminal state of one admission-only writer tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmitDisposition {
+    /// Exactly one canonical candidate membership transaction completed.
+    Admitted,
+    /// No current globally ordered admission attempt exists.
+    NoCandidate,
+    /// Existing fleet work must converge before admission can safely start.
+    WaitingForExistingConvergence,
+    /// Exact provider/policy evidence requires an owner or operator decision.
+    ExternalDecision,
+    /// A bounded provider race or budget fence refused the attempt without write.
+    RetryableProviderRace,
+}
+
+/// Receipt from the bounded admission-only writer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AdmitOutput {
+    pub schema_version: u32,
+    pub disposition: AdmitDisposition,
+    pub reason: String,
+    /// Stable hash of the exact default/fleet/order generation used by the tick.
+    pub cursor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_pr: Option<PrNumber>,
+    pub receipt: OperationReceipt,
+    pub auto_admission: AutoAdmissionOutput,
+    #[serde(default)]
+    pub provider_receipts: Vec<GitHubMutationReceipt>,
+    #[serde(default)]
+    pub events: Vec<CaravanEvent>,
+    #[serde(default)]
+    pub hook_deliveries: Vec<HookDelivery>,
+    pub status: StatusOutput,
 }
 
 /// Phase in which a no-write sync plan action would occur.
@@ -1620,6 +1657,489 @@ impl<R: crate::command::CommandRunner> SyncProvider for GitHubMutationAdapter<R>
     ) -> Result<GitHubMutationReceipt, MutationError> {
         self.admin_squash_merge(repository, expected)
     }
+}
+
+fn admit_cursor(status: &StatusOutput) -> String {
+    let material = serde_json::to_vec(&json!({
+        "schema_version": 1,
+        "repository": status.repository,
+        "default": status.analysis.fleet.default_branch,
+        "fleet": status.analysis.fleet.caravans,
+        "pauses": status.pauses,
+        "admission": status.admission,
+        "stack_backend": status.stack_backend,
+    }))
+    .expect("admission cursor material serializes");
+    crate::membership::fnv1a64(&material)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AdmitFleetReadiness {
+    Ready,
+    Waiting(String),
+    ExternalDecision(String),
+}
+
+fn admit_fleet_readiness(context: &AppContext, status: &StatusOutput) -> AdmitFleetReadiness {
+    if status
+        .analysis
+        .fleet
+        .problems
+        .iter()
+        .any(|problem| problem.kind.blocks_fleet())
+    {
+        return AdmitFleetReadiness::ExternalDecision(
+            "the existing fleet has a structural problem; admission-only execution cannot repair it"
+                .to_owned(),
+        );
+    }
+    if status.pauses.iter().any(|pause| pause.state.is_effective()) {
+        return AdmitFleetReadiness::Waiting(
+            "an existing caravan is explicitly held; ordinary sync/resume owns convergence"
+                .to_owned(),
+        );
+    }
+    if status
+        .analysis
+        .fleet
+        .caravans
+        .iter()
+        .any(|caravan| caravan.parked)
+    {
+        return AdmitFleetReadiness::Waiting(
+            "an existing caravan is parked; ordinary sync or reviewed recovery owns it".to_owned(),
+        );
+    }
+    if context.config.physical_branch_rewrites_enabled()
+        && !status.analysis.fleet.caravans.is_empty()
+    {
+        return AdmitFleetReadiness::Waiting(
+            "physical chain mode requires ordinary sync to prove the existing fleet before another admission"
+                .to_owned(),
+        );
+    }
+
+    for caravan in &status.analysis.fleet.caravans {
+        for number in &caravan.members {
+            let Some(member) = status.analysis.pull_requests.get(number) else {
+                return AdmitFleetReadiness::ExternalDecision(format!(
+                    "existing caravan #{} is missing provider facts for member #{number}",
+                    caravan.id
+                ));
+            };
+            let current = crate::model::latest_checks_per_identity(&member.checks).0;
+            if current.is_empty() {
+                return AdmitFleetReadiness::Waiting(format!(
+                    "existing member #{number} has no current CI evidence; ordinary sync owns required-run recovery"
+                ));
+            }
+            if current.iter().any(|check| {
+                matches!(
+                    check.state,
+                    CheckState::Failure
+                        | CheckState::Cancelled
+                        | CheckState::TimedOut
+                        | CheckState::ActionRequired
+                        | CheckState::Unknown
+                )
+            }) {
+                return AdmitFleetReadiness::ExternalDecision(format!(
+                    "existing member #{number} has terminal or unknown CI; admission-only execution cannot repair or park it"
+                ));
+            }
+        }
+        let root = caravan.head().expect("caravans are non-empty");
+        let root_checks = status
+            .analysis
+            .pull_requests
+            .get(&root)
+            .map(|member| crate::model::latest_checks_per_identity(&member.checks).0)
+            .unwrap_or_default();
+        if !root_checks.is_empty()
+            && root_checks.iter().all(|check| {
+                matches!(
+                    check.state,
+                    CheckState::Success | CheckState::Neutral | CheckState::Skipped
+                )
+            })
+        {
+            return AdmitFleetReadiness::Waiting(format!(
+                "existing root #{root} is green and may be promotable; ordinary sync must converge it before admission"
+            ));
+        }
+    }
+    AdmitFleetReadiness::Ready
+}
+
+fn admit_receipt(progress: &SyncProgress) -> OperationReceipt {
+    let mut receipt = progress.operation_receipt();
+    "admit".clone_into(&mut receipt.operation);
+    receipt
+}
+
+fn checkpoint_admit_result(
+    lock: &mut WriterOperationGuard,
+    disposition: AdmitDisposition,
+    selected_pr: Option<PrNumber>,
+    progress: &SyncProgress,
+    auto_admission: &AutoAdmissionOutput,
+) -> Result<(), AppError> {
+    lock.checkpoint(
+        "completed",
+        json!({
+            "disposition": disposition,
+            "selected_pr": selected_pr,
+            "receipt": admit_receipt(progress),
+            "auto_admission": checkpoint_auto_admission(auto_admission),
+        }),
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn admit_output(
+    status: StatusOutput,
+    progress: &SyncProgress,
+    auto_admission: AutoAdmissionOutput,
+    disposition: AdmitDisposition,
+    reason: impl Into<String>,
+    selected_pr: Option<PrNumber>,
+    hook_deliveries: Vec<HookDelivery>,
+) -> AdmitOutput {
+    AdmitOutput {
+        schema_version: 1,
+        disposition,
+        reason: reason.into(),
+        cursor: admit_cursor(&status),
+        selected_pr,
+        receipt: admit_receipt(progress),
+        auto_admission,
+        provider_receipts: progress.provider_receipts.clone(),
+        events: progress.events.clone(),
+        hook_deliveries,
+        status,
+    }
+}
+
+struct AdmitDecision {
+    disposition: AdmitDisposition,
+    reason: String,
+    selected_pr: Option<PrNumber>,
+    auto_admission: AutoAdmissionOutput,
+}
+
+fn admit_auto_receipt(
+    context: &AppContext,
+    github_budget: &crate::command::GithubRequestBudget,
+    continuation: AutoAdmissionContinuation,
+) -> AutoAdmissionOutput {
+    AutoAdmissionOutput {
+        enabled: context.config.sync.actions.join_unlabelled_prs,
+        continuation,
+        mutation_limit: context.config.sync.max_mutations_per_tick,
+        github_request_limit: github_budget.limit(),
+        github_requests_used: github_budget.used(),
+        ..AutoAdmissionOutput::default()
+    }
+}
+
+fn admit_preflight_decision(
+    context: &AppContext,
+    status: &StatusOutput,
+    github_budget: &crate::command::GithubRequestBudget,
+) -> Option<AdmitDecision> {
+    let selected_pr = status.admission.next_candidate;
+    if status.admission.candidates.is_empty()
+        && status.admission.rejected.is_empty()
+        && status.admission.skipped.is_empty()
+    {
+        return Some(AdmitDecision {
+            disposition: AdmitDisposition::NoCandidate,
+            reason: "no globally ordered admission attempt exists".to_owned(),
+            selected_pr: None,
+            auto_admission: admit_auto_receipt(
+                context,
+                github_budget,
+                AutoAdmissionContinuation::Complete,
+            ),
+        });
+    }
+    if !context.config.sync.actions.join_unlabelled_prs {
+        return Some(AdmitDecision {
+            disposition: AdmitDisposition::ExternalDecision,
+            reason: "automatic admission is disabled by repository policy".to_owned(),
+            selected_pr,
+            auto_admission: AutoAdmissionOutput::disabled(context, true),
+        });
+    }
+    match admit_fleet_readiness(context, status) {
+        AdmitFleetReadiness::Ready => None,
+        AdmitFleetReadiness::Waiting(reason) => Some(AdmitDecision {
+            disposition: AdmitDisposition::WaitingForExistingConvergence,
+            reason,
+            selected_pr,
+            auto_admission: admit_auto_receipt(
+                context,
+                github_budget,
+                AutoAdmissionContinuation::RequiresConvergedFleet,
+            ),
+        }),
+        AdmitFleetReadiness::ExternalDecision(reason) => Some(AdmitDecision {
+            disposition: AdmitDisposition::ExternalDecision,
+            reason,
+            selected_pr,
+            auto_admission: admit_auto_receipt(
+                context,
+                github_budget,
+                AutoAdmissionContinuation::RejectedCanonicalCandidate,
+            ),
+        }),
+    }
+}
+
+fn classify_admit_success(
+    status: &StatusOutput,
+    auto_admission: &AutoAdmissionOutput,
+    initial_candidate: Option<PrNumber>,
+) -> (AdmitDisposition, String, Option<PrNumber>) {
+    if let Some(join) = auto_admission.joins.first() {
+        return (
+            AdmitDisposition::Admitted,
+            format!("admitted canonical candidate #{}", join.candidate_pr),
+            Some(join.candidate_pr),
+        );
+    }
+    if !auto_admission.skips.is_empty()
+        || !status.admission.rejected.is_empty()
+        || auto_admission.continuation == AutoAdmissionContinuation::RejectedCanonicalCandidate
+    {
+        return (
+            AdmitDisposition::ExternalDecision,
+            "the canonical candidate was refused; no later candidate was considered".to_owned(),
+            initial_candidate,
+        );
+    }
+    if matches!(
+        auto_admission.continuation,
+        AutoAdmissionContinuation::CandidateBudgetExhausted
+            | AutoAdmissionContinuation::MutationBudgetExhausted
+            | AutoAdmissionContinuation::GithubRequestBudgetExhausted
+            | AutoAdmissionContinuation::DeadlineExhausted
+    ) {
+        return (
+            AdmitDisposition::RetryableProviderRace,
+            "the bounded admission cursor must continue in a later serialized invocation"
+                .to_owned(),
+            initial_candidate,
+        );
+    }
+    if matches!(
+        auto_admission.continuation,
+        AutoAdmissionContinuation::CaravanBudgetCapacityExhausted
+            | AutoAdmissionContinuation::CaravanBudgetCapacityDefect
+            | AutoAdmissionContinuation::MaxCaravansReached
+            | AutoAdmissionContinuation::RequiresConvergedFleet
+    ) {
+        return (
+            AdmitDisposition::WaitingForExistingConvergence,
+            "existing fleet capacity or convergence must change before admission".to_owned(),
+            initial_candidate,
+        );
+    }
+    (
+        AdmitDisposition::NoCandidate,
+        "no globally ordered admission attempt remains".to_owned(),
+        None,
+    )
+}
+
+fn finish_admit(
+    context: &AppContext,
+    lock: &mut WriterOperationGuard,
+    status: StatusOutput,
+    progress: &SyncProgress,
+    decision: AdmitDecision,
+    operation_deadline: Instant,
+) -> Result<AdmitOutput, AppError> {
+    let deliveries = hooks::dispatch_events_before(context, &progress.events, operation_deadline)?;
+    checkpoint_admit_result(
+        lock,
+        decision.disposition,
+        decision.selected_pr,
+        progress,
+        &decision.auto_admission,
+    )?;
+    Ok(admit_output(
+        status,
+        progress,
+        decision.auto_admission,
+        decision.disposition,
+        decision.reason,
+        decision.selected_pr,
+        deliveries,
+    ))
+}
+
+fn execute_admit_candidate(
+    context: &AppContext,
+    status: StatusOutput,
+    provider: &impl SyncProvider,
+    mut lock: WriterOperationGuard,
+    github_budget: &crate::command::GithubRequestBudget,
+    operation_deadline: Instant,
+) -> Result<AdmitOutput, AppError> {
+    let mut progress = SyncProgress::new(
+        &status,
+        Vec::new(),
+        context.config.sync.max_mutations_per_tick,
+    );
+    // Admission-only hooks describe only admission mutations from this command,
+    // never unrelated structural findings discovered while orienting.
+    progress.events.clear();
+    let initial_candidate = status.admission.next_candidate;
+    if let Some(decision) = admit_preflight_decision(context, &status, github_budget) {
+        return finish_admit(
+            context,
+            &mut lock,
+            status,
+            &progress,
+            decision,
+            operation_deadline,
+        );
+    }
+
+    let result = run_auto_admission_once(
+        context,
+        status.clone(),
+        provider,
+        &mut progress,
+        operation_deadline,
+        github_budget,
+        &lock,
+    );
+    let (status, auto_admission) = match result {
+        Ok(output) => output,
+        Err(error) if completed_mutation_count(&progress) == 0 => {
+            let scheduler = scheduler_failure_status(&error);
+            let disposition = if scheduler.retryable {
+                AdmitDisposition::RetryableProviderRace
+            } else {
+                AdmitDisposition::ExternalDecision
+            };
+            let continuation = if scheduler.retryable {
+                AutoAdmissionContinuation::Complete
+            } else {
+                AutoAdmissionContinuation::RejectedCanonicalCandidate
+            };
+            let decision = AdmitDecision {
+                disposition,
+                reason: format!("{}: {}", error.code(), error.message()),
+                selected_pr: initial_candidate,
+                auto_admission: admit_auto_receipt(context, github_budget, continuation),
+            };
+            return finish_admit(
+                context,
+                &mut lock,
+                status,
+                &progress,
+                decision,
+                operation_deadline,
+            );
+        }
+        Err(error) => {
+            return Err(attach_auto_admission_progress(
+                &error,
+                context,
+                &progress,
+                github_budget,
+            ));
+        }
+    };
+    let (disposition, reason, selected_pr) =
+        classify_admit_success(&status, &auto_admission, initial_candidate);
+    finish_admit(
+        context,
+        &mut lock,
+        status,
+        &progress,
+        AdmitDecision {
+            disposition,
+            reason,
+            selected_pr,
+            auto_admission,
+        },
+        operation_deadline,
+    )
+}
+
+fn admit_prepared(
+    context: &AppContext,
+    authority: Option<&crate::sync_authority::DefaultBranchAuthority>,
+) -> Result<AdmitOutput, AppError> {
+    let started = Instant::now();
+    let operation_deadline = started + sync_operation_budget(context);
+    let mut lock = context.acquire_writer_operation("admit")?;
+    lock.checkpoint(
+        "admission_only_discovery_in_flight",
+        json!({
+            "operation": "admit",
+            "candidate_limit": 1,
+            "deadline_ms": duration_millis(operation_deadline.saturating_duration_since(started)),
+        }),
+        false,
+    )?;
+
+    let github_budget =
+        crate::command::GithubRequestBudget::new(context.config.sync.max_github_requests_per_tick);
+    let mut status =
+        read::fleet_status_for_sync(context, operation_deadline, Some(&github_budget))?;
+    if let Some(authority) = authority {
+        authority.bind_invocation(&mut status)?;
+    }
+    crate::initialization::require_ready(&status.initialization)?;
+    require_native_stack_backend_healthy(&status)?;
+    require_current_policy(context, &status)?;
+    context.config.validate_tick_bounds().map_err(|error| {
+        AppError::structured(
+            ErrorCategory::Validation,
+            "invalid_tick_bounds",
+            error.to_string(),
+            Some(json!({
+                "mutated": false,
+                "next": "correct the named sync bound, then rerun the same admission tick",
+            })),
+        )
+    })?;
+    if let Some(authority) = authority {
+        authority.revalidate()?;
+    }
+
+    let timeout = Duration::from_secs(context.config.command_timeout_secs);
+    let runner = crate::command::ProcessRunner::in_directory(&context.repository_path)
+        .with_timeout(timeout)
+        .with_operation_deadline(operation_deadline)
+        .with_github_request_budget(github_budget.clone());
+    let runner = lock.runner(runner);
+    crate::navigation::ensure_safe_worktree(
+        &context.repository_path,
+        &context.config_path,
+        &runner,
+    )?;
+    let provider = GitHubMutationAdapter::new(runner);
+    execute_admit_candidate(
+        context,
+        status,
+        &provider,
+        lock,
+        &github_budget,
+        operation_deadline,
+    )
+}
+
+/// Admit at most one global canonical candidate without converging the fleet.
+pub fn admit(context: &AppContext, _input: &AdmitInput) -> Result<AdmitOutput, AppError> {
+    let prepared = crate::sync_authority::prepare(context)?;
+    admit_prepared(prepared.context(), prepared.authority())
 }
 
 /// Synchronize the current caravan or every caravan and dispatch its canonical events.
@@ -4521,7 +5041,7 @@ fn run_auto_admission(
     github_budget: &crate::command::GithubRequestBudget,
     writer_guard: &WriterOperationGuard,
 ) -> Result<(StatusOutput, AutoAdmissionOutput), AppError> {
-    run_auto_admission_with_refresh(
+    run_auto_admission_with_refresh_limit(
         context,
         status,
         provider,
@@ -4529,12 +5049,63 @@ fn run_auto_admission(
         operation_deadline,
         github_budget,
         writer_guard,
+        context.config.sync.max_candidates_per_tick,
         |deadline| read::fleet_status_for_sync(context, deadline, Some(github_budget)),
     )
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn run_auto_admission_once(
+    context: &AppContext,
+    status: StatusOutput,
+    provider: &impl SyncProvider,
+    progress: &mut SyncProgress,
+    operation_deadline: Instant,
+    github_budget: &crate::command::GithubRequestBudget,
+    writer_guard: &WriterOperationGuard,
+) -> Result<(StatusOutput, AutoAdmissionOutput), AppError> {
+    run_auto_admission_with_refresh_limit(
+        context,
+        status,
+        provider,
+        progress,
+        operation_deadline,
+        github_budget,
+        writer_guard,
+        1,
+        |deadline| read::fleet_status_for_sync(context, deadline, Some(github_budget)),
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn run_auto_admission_with_refresh<F>(
+    context: &AppContext,
+    status: StatusOutput,
+    provider: &impl SyncProvider,
+    progress: &mut SyncProgress,
+    operation_deadline: Instant,
+    github_budget: &crate::command::GithubRequestBudget,
+    writer_guard: &WriterOperationGuard,
+    refresh_status: F,
+) -> Result<(StatusOutput, AutoAdmissionOutput), AppError>
+where
+    F: FnMut(Instant) -> Result<StatusOutput, AppError>,
+{
+    run_auto_admission_with_refresh_limit(
+        context,
+        status,
+        provider,
+        progress,
+        operation_deadline,
+        github_budget,
+        writer_guard,
+        context.config.sync.max_candidates_per_tick,
+        refresh_status,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn run_auto_admission_with_refresh_limit<F>(
     context: &AppContext,
     mut status: StatusOutput,
     provider: &impl SyncProvider,
@@ -4542,6 +5113,7 @@ fn run_auto_admission_with_refresh<F>(
     operation_deadline: Instant,
     github_budget: &crate::command::GithubRequestBudget,
     writer_guard: &WriterOperationGuard,
+    candidate_limit: u32,
     mut refresh_status: F,
 ) -> Result<(StatusOutput, AutoAdmissionOutput), AppError>
 where
@@ -4736,7 +5308,7 @@ where
             output.continuation = AutoAdmissionContinuation::GithubRequestBudgetExhausted;
             break;
         }
-        if output.candidates_considered >= context.config.sync.max_candidates_per_tick {
+        if output.candidates_considered >= candidate_limit {
             if !status.admission.candidates.is_empty() || !status.admission.rejected.is_empty() {
                 output.continuation = AutoAdmissionContinuation::CandidateBudgetExhausted;
             }

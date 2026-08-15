@@ -1,0 +1,81 @@
+name: Cara admission
+
+# Trusted default-branch controller. It never checks out or executes pull-request
+# code: the wake event is only a hint to hot-discover the global canonical
+# priority/FIFO candidate.
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review, edited, labeled, unlabeled]
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  checks: write
+  contents: read
+  issues: write
+  pull-requests: write
+
+# Use this exact key in every Cara writer workflow. GitHub retains at most one
+# pending member of a concurrency group, so event bursts coalesce while a write
+# is running instead of racing or building an unbounded admission queue.
+concurrency:
+  group: cara-writer-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  # Replace both values in one reviewed change after publishing a release that
+  # contains `cara admit`. Never use latest, a branch URL, or an unverified file.
+  CARA_VERSION: "REPLACE_WITH_PINNED_VERSION"
+  CARA_TARGET: x86_64-linux
+  CARA_ARCHIVE_SHA256: "REPLACE_WITH_64_HEX_ARCHIVE_SHA256"
+
+jobs:
+  admit:
+    runs-on: [self-hosted, nix, x86_64-linux]
+    timeout-minutes: 10
+    steps:
+      - name: Check out trusted default branch only
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Install exact verified Cara release
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$CARA_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$CARA_ARCHIVE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          root="cara-$CARA_VERSION-$CARA_TARGET"
+          archive="$root.tar.gz"
+          url="https://github.com/harryaskham/caravan/releases/download/v$CARA_VERSION/$archive"
+          work="$(mktemp -d "$RUNNER_TEMP/cara-admit.XXXXXX")"
+          trap 'rm -rf "$work"' EXIT
+          curl --fail --silent --show-error --location \
+            --proto '=https' --tlsv1.2 "$url" --output "$work/$archive"
+          printf '%s  %s\n' "$CARA_ARCHIVE_SHA256" "$work/$archive" | sha256sum --check
+          tar -xzf "$work/$archive" -C "$work"
+          install -D -m 0755 "$work/$root/cara" "$RUNNER_TEMP/cara-bin/cara"
+          "$RUNNER_TEMP/cara-bin/cara" --version
+          printf '%s\n' "$RUNNER_TEMP/cara-bin" >>"$GITHUB_PATH"
+
+      - name: Admit at most one global canonical candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cara --json admit >cara-admit-receipt.json
+          jq -e '.status == "success" and .data.schema_version == 1' cara-admit-receipt.json >/dev/null
+
+      - name: Preserve exact admission receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cara-admit-${{ github.run_id }}-${{ github.run_attempt }}
+          path: cara-admit-receipt.json
+          if-no-files-found: error
+          retention-days: 14

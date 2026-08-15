@@ -351,6 +351,7 @@ the signature of labels stripped after the fact. A zero count beside a non-zero
 `unlabelled_merged_rows` means the history is UNPROVEN, never proven empty. Human `cara status` prints "N in flight now" and,
 when the list is empty, states explicitly that this is not a lifetime claim.
 - `cara next-candidate` — return the same canonical first ordered admission attempt and complete reasoning without mutation; it explicitly requires subsequent membership preflight and never authorizes leapfrogging a rejected first attempt.
+- `cara admit` — run one admission-only writer tick. It hot-discovers the complete global order and minimal active-fleet generation, uses the ordinary repository writer guard, policy authority, exact candidate preflight, capacity, compatibility, native Stack routing, membership transaction, and deferred-gate rerun, but considers at most one canonical candidate. It never merges, promotes, parks/unparks, evicts, repairs, reshapes, or broadly reruns fleet CI. Existing structural/terminal/parked/held/physical-convergence work returns `waiting_for_existing_convergence` or `external_decision`; bounded provider races retain a stable cursor. The wake PR is never selection authority.
 - `cara show` — print the current PR's whole caravan and highlight its position.
 - `cara check` — no-update validation. For an active member, check its whole caravan and fleet invariants. For an unenrolled candidate with no explicit target, evaluate attachment to the first active, unparked, unheld caravan in canonical ascending root-PR order. A clean attachment returns the complete coherent `join` receipt; an ineligible attachment falls back to the ordinary `new` evaluation. Targetless `cara join --pr N` selects that same first target and never searches later caravans after an incompatible preflight. Parked and held caravans remain exact repair evidence but are not implicit join targets; an explicit parked target returns `caravan_target_parked` with the head and responsible actor. An explicit `cara new` mutation continues to preflight `new`. No available target retains the independent `new` recommendation and makes targetless join return a typed refusal.
 - `cara check --pr N` — re-read and preflight exact remote PR `N` without changing checkout, branch, base, labels, or auto-merge. The receipt consumes the canonical provider candidate identity/freshness schema and includes exact head/base repositories and OIDs, draft/labels/auto-merge state, enrollment and canonical-order state, compatibility/conflicting paths, and one mechanical next action: `new`, `join`, `repair`, `wait`, or `reject`. When targetless check recommends the unique visible caravan, `mode`, `caravan_id`, `target_pr`, compatibility, and typed admission intent all describe that same join; it never flips only `next_action` on a new-caravan receipt. A provider head/ref race fails closed with exact old/new evidence.
@@ -768,6 +769,19 @@ A sync tick:
 13. Re-run normal convergence for admitted members and return exact joins,
     skips, remaining candidates, safety-budget usage, continuation, and the
     stable health snapshot or first decision point.
+
+The separate `cara admit` operation owns only step 12 and admits at most one
+canonical candidate. It shares the same local/remote writer fence, default-policy
+authority, provider/Git budgets, skip receipts, exact membership transaction,
+and post-membership gate retrigger. It refuses when the existing fleet has work
+that ordinary sync must perform: structural or terminal failure, parked/held
+state, physical-chain convergence, or a green promotable root. Pending CI on an
+otherwise structurally converged fleet is not a mutation and may coexist with
+one bounded admission. Its versioned output is one of `admitted`, `no_candidate`,
+`waiting_for_existing_convergence`, `external_decision`, or
+`retryable_provider_race` and carries an exact generation cursor. It never calls
+steps 3–11 or 13, so no workflow wake can accidentally merge, park, unpark,
+evict, repair, reshape, or converge unrelated fleet state.
 
 Already-correct steps are no-ops. Rerunning after interruption resumes from rediscovered GitHub state rather than a local cursor. Auto-admission is disabled by default and targeted `sync` never grows the fleet. Fleet scanning shares one operation lock, absolute wall-clock deadline, authenticated `gh` request counter, candidate limit, and mutation limit. A selected exact candidate receives an independent bounded `command_timeout_secs` deadline for provider refetch, merge identity, compatibility/physical Git, mutation, and post-mutation rediscovery; sync-owned admission reuses the already-fresh fleet snapshot instead of repeating unrelated cross-caravan analysis. Exact candidate receipts expose reserved and remaining milliseconds. Provider/head/base drift still fails closed, and a post-mutation refresh cannot inherit an exhausted pre-admission deadline. Budget exhaustion returns a resumable continuation rather than leapfrogging or guessing. `loop` and `loop --once` call this exact path. Hosted automation uses bounded once-ticks from PR/check/workflow/default-branch events and a schedule, not one unbounded hosted process.
 
@@ -1717,7 +1731,7 @@ Multi-step remote mutations are not atomic. Errors report completed steps. The g
 
 ## 11. MCP contract
 
-The CLI and MCP tools share typed inputs, outputs, and domain errors. MCP exposes bounded single operations (`status`, `log`, `check`, `new`, `join`, `plan_sync`, `sync`, `evict`, and peers), not the unbounded `loop` or `log --follow` processes. An agent implements a long-lived loop by scheduling repeated `sync --all` calls or by running `cara loop` externally.
+The CLI and MCP tools share typed inputs, outputs, and domain errors. MCP exposes bounded single operations (`status`, `log`, `check`, `new`, `join`, `admit`, `plan_sync`, `sync`, `evict`, and peers), not the unbounded `loop` or `log --follow` processes. An agent implements a long-lived loop by scheduling repeated `sync --all` calls or by running `cara loop` externally.
 
 Tool descriptions must explain preconditions, side effects, decision-point behavior, and safe recovery. Self-update and feedback registrars are included in the same router.
 

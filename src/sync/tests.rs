@@ -2904,6 +2904,54 @@ fn stale_skip_cleanup_is_attempted_once_per_tick_despite_stale_refresh() {
 }
 
 #[test]
+fn admission_only_readiness_allows_only_a_structurally_converged_waiting_fleet() {
+    let context = AppContext::default();
+
+    let empty = status(Vec::new(), None, &clean);
+    assert_eq!(
+        admit_fleet_readiness(&context, &empty),
+        AdmitFleetReadiness::Ready
+    );
+
+    let mut pending = pull_request(
+        41,
+        "pending-root",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::squash(),
+    );
+    pending.checks = vec![check_named("build-test", CheckState::InProgress)];
+    let waiting_fleet = status(vec![pending.clone()], None, &clean);
+    assert_eq!(
+        admit_fleet_readiness(&context, &waiting_fleet),
+        AdmitFleetReadiness::Ready,
+        "pending CI needs no convergence mutation and may accept one bounded admission"
+    );
+
+    pending.checks = vec![check_named("build-test", CheckState::Success)];
+    let promotable = status(vec![pending.clone()], None, &clean);
+    assert!(matches!(
+        admit_fleet_readiness(&context, &promotable),
+        AdmitFleetReadiness::Waiting(reason) if reason.contains("promotable")
+    ));
+
+    pending.checks = vec![check_named("build-test", CheckState::Failure)];
+    let terminal = status(vec![pending.clone()], None, &clean);
+    assert!(matches!(
+        admit_fleet_readiness(&context, &terminal),
+        AdmitFleetReadiness::ExternalDecision(reason) if reason.contains("terminal")
+    ));
+
+    pending.labels.insert(PARKED_LABEL.to_owned());
+    pending.auto_merge = AutoMergeState::disabled();
+    let parked = status(vec![pending], None, &clean);
+    assert!(matches!(
+        admit_fleet_readiness(&context, &parked),
+        AdmitFleetReadiness::Waiting(reason) if reason.contains("parked")
+    ));
+}
+
+#[test]
 fn forty_candidate_auto_admission_preserves_nonzero_exact_git_budget() {
     let mut candidates = (1..=40)
         .map(|number| {
