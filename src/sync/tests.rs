@@ -2294,6 +2294,49 @@ fn a_clean_candidate_joins_behind_a_single_member_caravan() {
 }
 
 #[test]
+fn proven_deferred_gate_suppresses_only_its_virtual_raw_red_problem() {
+    let mut candidate = pull_request(
+        9,
+        "candidate",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    candidate.labels.clear();
+    let mut fleet = status(vec![candidate.clone()], Some(candidate.number), &clean);
+    candidate.checks = vec![check("build-test", CheckState::Failure, Some(10))];
+    fleet
+        .analysis
+        .pull_requests
+        .get_mut(&candidate.number)
+        .unwrap()
+        .checks = candidate.checks.clone();
+
+    let raw = evaluate_auto_candidate_bounded(&fleet, &candidate, &clean, None, None)
+        .expect("raw red preflight is evidence");
+    assert_eq!(raw.target, AutoCandidateTarget::Skip);
+
+    let proven =
+        evaluate_auto_candidate_bounded(&fleet, &candidate, &clean, None, Some("build-test"))
+            .expect("proven gate preflight is evidence");
+    assert_eq!(proven.target, AutoCandidateTarget::New);
+
+    candidate
+        .checks
+        .push(check("source-test", CheckState::Failure, Some(10)));
+    fleet
+        .analysis
+        .pull_requests
+        .get_mut(&candidate.number)
+        .unwrap()
+        .checks = candidate.checks.clone();
+    let unrelated =
+        evaluate_auto_candidate_bounded(&fleet, &candidate, &clean, None, Some("build-test"))
+            .expect("unrelated red preflight is evidence");
+    assert_eq!(unrelated.target, AutoCandidateTarget::Skip);
+}
+
+#[test]
 fn greedy_planner_forms_empty_fleet_then_uses_first_compatible_tail() {
     let mut candidate = pull_request(
         9,
@@ -2980,7 +3023,7 @@ fn failing_unjoined_candidate_is_skipped_after_existing_caravan_progress() {
     );
     assert!(
         !matches!(
-            evaluate_auto_candidate_bounded(&status, &later_candidate, &clean, None)
+            evaluate_auto_candidate_bounded(&status, &later_candidate, &clean, None, None)
                 .expect("later candidate compatibility is evaluated")
                 .target,
             AutoCandidateTarget::Skip
@@ -10298,7 +10341,7 @@ fn a_full_batch_opens_another_caravan_instead_of_waiting() {
     let fleet = status(members, Some(candidate.number), &clean);
     assert_eq!(fleet.analysis.fleet.caravans[0].members.len(), 2);
 
-    let unbounded = evaluate_auto_candidate_bounded(&fleet, &candidate, &clean, None)
+    let unbounded = evaluate_auto_candidate_bounded(&fleet, &candidate, &clean, None, None)
         .expect("unbounded preflight");
     assert_eq!(
         unbounded.target,
@@ -10311,6 +10354,7 @@ fn a_full_batch_opens_another_caravan_instead_of_waiting() {
         &candidate,
         &clean,
         crate::sync::configured_batch_bound(&context),
+        None,
     )
     .expect("bounded preflight");
     assert_eq!(

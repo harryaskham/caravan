@@ -840,6 +840,7 @@ pub(super) fn plan_auto_admission_with_checker(
         candidate,
         checker,
         configured_batch_bound(context),
+        None,
     )?;
     output.candidate_pr = Some(candidate_pr);
     output.tested_tails.clone_from(&evaluation.tested_tails);
