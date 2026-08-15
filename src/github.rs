@@ -1412,6 +1412,52 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
         })
     }
 
+    /// Rerun one complete GitHub Actions workflow on the exact unchanged PR head.
+    ///
+    /// Admission-gate suites intentionally skip heavy jobs on attempt one, so
+    /// rerunning failed jobs would execute only the aggregate sentinel. The
+    /// full Actions rerun endpoint re-evaluates the trusted live-membership gate
+    /// and materializes heavy jobs without a label-triggered workflow.
+    pub fn rerun_workflow_run(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+        run_id: u64,
+    ) -> Result<GitHubMutationReceipt, MutationError> {
+        let run: WorkflowRunSnapshot = self
+            .json::<WorkflowRunDetailsJson>(workflow_run_command(repository, run_id))?
+            .into();
+        let before = self.verify_precondition_with_checks(repository, expected)?;
+        if !run.pull_requests.contains(&expected.number) {
+            return Err(MutationError::RunPullRequestMismatch {
+                run_id,
+                expected_pr: expected.number,
+                actual_prs: run.pull_requests,
+            });
+        }
+        if run.head_sha != before.head.oid.0 {
+            return Err(MutationError::RunHeadMismatch {
+                run_id,
+                expected_head: before.head.oid.0,
+                actual_head: run.head_sha,
+            });
+        }
+        if !run.conclusion.eq_ignore_ascii_case("failure") {
+            return Err(MutationError::RunNotFailed {
+                run_id,
+                conclusion: run.conclusion,
+            });
+        }
+        let output = self.checked(rerun_workflow_command(repository, run_id))?;
+        let after = self.refetch_pull_request(repository, expected.number)?;
+        Ok(GitHubMutationReceipt {
+            kind: MutationKind::RerunChecks,
+            before: Some(before),
+            after,
+            provider_output: trimmed_provider_output(&output),
+        })
+    }
+
     /// Exact protection-declared required contexts for one arbitrary branch.
     ///
     /// An unprotected branch deliberately returns an empty *complete* read: it
@@ -3159,6 +3205,17 @@ fn rerun_failed_command(repository: &RepositoryId, run_id: u64) -> CommandSpec {
             "--repo".to_owned(),
             repository.slug(),
             "--failed".to_owned(),
+        ])
+        .provider_write()
+}
+
+fn rerun_workflow_command(repository: &RepositoryId, run_id: u64) -> CommandSpec {
+    CommandSpec::new("gh")
+        .args([
+            "api".to_owned(),
+            "--method".to_owned(),
+            "POST".to_owned(),
+            format!("repos/{}/actions/runs/{run_id}/rerun", repository.slug()),
         ])
         .provider_write()
 }
@@ -5648,6 +5705,43 @@ mod tests {
         let receipt = adapter
             .rerun_failed_run(&repository, &expected, 99)
             .expect("failed run reruns");
+
+        assert_eq!(receipt.kind, MutationKind::RerunChecks);
+        assert_eq!(receipt.before.unwrap().number, PrNumber(12));
+        assert_eq!(receipt.after.number, PrNumber(12));
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn rerun_complete_workflow_uses_actions_endpoint_on_exact_pr_head() {
+        let repository = repository();
+        let expected = precondition(12);
+        let pull_request = pr_object_json(12, "feature/widget", "acme/widgets");
+        let runner = FakeRunner::new(vec![
+            (
+                workflow_run_command(&repository, 99),
+                CommandOutput::success(
+                    r#"{"id":99,"head_sha":"head-12","status":"completed","conclusion":"failure","event":"pull_request","name":"CI","html_url":"https://example.test/run/99","pull_requests":[{"number":12}]}"#,
+                ),
+            ),
+            (
+                pull_request_command(&repository, "12"),
+                CommandOutput::success(pull_request.clone()),
+            ),
+            (
+                rerun_workflow_command(&repository, 99),
+                CommandOutput::success(""),
+            ),
+            (
+                pull_request_command(&repository, "12"),
+                CommandOutput::success(pull_request),
+            ),
+        ]);
+        let adapter = GitHubMutationAdapter::new(runner);
+
+        let receipt = adapter
+            .rerun_workflow_run(&repository, &expected, 99)
+            .expect("complete Actions workflow reruns");
 
         assert_eq!(receipt.kind, MutationKind::RerunChecks);
         assert_eq!(receipt.before.unwrap().number, PrNumber(12));

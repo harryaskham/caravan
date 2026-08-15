@@ -1243,6 +1243,14 @@ pub trait SyncProvider {
         run_id: u64,
     ) -> Result<GitHubMutationReceipt, MutationError>;
 
+    /// Rerun one complete GitHub Actions workflow on the exact unchanged head.
+    fn rerun_workflow_run(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+        run_id: u64,
+    ) -> Result<GitHubMutationReceipt, MutationError>;
+
     fn viewer_permission(&self, repository: &RepositoryId) -> Result<String, MutationError>;
 
     fn ensure_control_label_comment(
@@ -1581,6 +1589,15 @@ impl<R: crate::command::CommandRunner> SyncProvider for GitHubMutationAdapter<R>
         run_id: u64,
     ) -> Result<GitHubMutationReceipt, MutationError> {
         self.rerun_failed_run(repository, expected, run_id)
+    }
+
+    fn rerun_workflow_run(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+        run_id: u64,
+    ) -> Result<GitHubMutationReceipt, MutationError> {
+        self.rerun_workflow_run(repository, expected, run_id)
     }
 
     fn viewer_permission(&self, repository: &RepositoryId) -> Result<String, MutationError> {
@@ -4790,10 +4807,8 @@ where
                     .deferred_admission_gates
                     .contains(&candidate.number)
         });
-        let deferred_gate_suite = deferred_gate
-            .map(|gate| {
-                admission_gate_rerequest_suite(provider, &status.repository, &candidate, gate)
-            })
+        let deferred_gate_retrigger = deferred_gate
+            .map(|gate| admission_gate_retrigger(provider, &status.repository, &candidate, gate))
             .transpose()?;
         if let Some(gate) = deferred_gate {
             output.gate_deferrals.push(AdmissionGateDeferral {
@@ -4912,21 +4927,14 @@ where
                 writer_guard,
             )?;
             append_membership_progress(progress, &membership);
-            if let Some(check_suite_id) = deferred_gate_suite {
-                progress.ensure_mutation_capacity(1)?;
-                let receipt = provider
-                    .rerequest_check_suite(
-                        &status.repository,
-                        &progress.precondition(candidate.number),
-                        check_suite_id,
-                    )
-                    .map_err(|error| mutation_error(&error, progress, Some(candidate.number)))?;
-                progress.record(
-                    receipt,
-                    &format!(
-                        "rerequested admission-gate check suite {check_suite_id} after membership"
-                    ),
-                );
+            if let Some(retrigger) = deferred_gate_retrigger {
+                perform_admission_gate_retrigger(
+                    provider,
+                    progress,
+                    &status.repository,
+                    candidate.number,
+                    retrigger,
+                )?;
             }
             admitted_this_iteration = true;
             output.joins.push(AutoAdmissionJoinReceipt {
@@ -5388,12 +5396,18 @@ fn gate_deferral_allows_required_runs(
     }) && required_runs.status != RequiredRunsStatus::UnknownProviderState)
 }
 
-fn admission_gate_rerequest_suite(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdmissionGateRetrigger {
+    CheckSuite { check_suite_id: u64 },
+    GitHubActionsRun { run_id: u64, check_suite_id: u64 },
+}
+
+fn admission_gate_retrigger(
     provider: &impl SyncProvider,
     repository: &RepositoryId,
     candidate: &PullRequestSnapshot,
     gate: &crate::config::CiAdmissionGateConfig,
-) -> Result<u64, AppError> {
+) -> Result<AdmissionGateRetrigger, AppError> {
     let gate_run_ids = crate::model::latest_checks_per_identity(&candidate.checks)
         .0
         .into_iter()
@@ -5440,13 +5454,6 @@ fn admission_gate_rerequest_suite(
         .iter()
         .filter(|run| run.run_id == *gate_run_id && run.head_sha == candidate.head.oid.0)
         .map(|run| run.check_suite_id)
-        .filter(|suite_id| {
-            lineage.check_suites.iter().any(|suite| {
-                suite.id == *suite_id
-                    && suite.head_sha == candidate.head.oid.0
-                    && suite.rerequestable
-            })
-        })
         .collect::<BTreeSet<_>>();
     let suite_ids = suite_ids.iter().copied().collect::<Vec<_>>();
     let [suite_id] = suite_ids.as_slice() else {
@@ -5463,7 +5470,149 @@ fn admission_gate_rerequest_suite(
             })),
         ));
     };
-    Ok(*suite_id)
+    let suites = lineage
+        .check_suites
+        .iter()
+        .filter(|suite| {
+            suite.id == *suite_id && suite.head_sha == candidate.head.oid.0 && suite.rerequestable
+        })
+        .collect::<Vec<_>>();
+    let [suite] = suites.as_slice() else {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "auto_admission_gate_suite_unavailable",
+            "admission gate workflow suite is absent, ambiguous, or not rerunnable",
+            Some(json!({
+                "pr": candidate.number,
+                "head": candidate.head,
+                "run_id": gate_run_id,
+                "suite_id": suite_id,
+                "matching_suites": suites.len(),
+                "mutated": false,
+            })),
+        ));
+    };
+    if suite.app_slug.eq_ignore_ascii_case("github-actions") {
+        Ok(AdmissionGateRetrigger::GitHubActionsRun {
+            run_id: *gate_run_id,
+            check_suite_id: *suite_id,
+        })
+    } else {
+        Ok(AdmissionGateRetrigger::CheckSuite {
+            check_suite_id: *suite_id,
+        })
+    }
+}
+
+fn checks_have_exact_deferred_gate(
+    gate: &crate::config::CiAdmissionGateConfig,
+    checks: &[CheckSnapshot],
+) -> bool {
+    let current = crate::model::latest_checks_per_identity(checks).0;
+    let matching = current
+        .into_iter()
+        .filter(|check| check.name == gate.context)
+        .collect::<Vec<_>>();
+    matching.len() == 1 && matching[0].state == CheckState::Failure
+}
+
+fn perform_admission_gate_retrigger(
+    provider: &impl SyncProvider,
+    progress: &mut SyncProgress,
+    repository: &RepositoryId,
+    candidate_pr: PrNumber,
+    retrigger: AdmissionGateRetrigger,
+) -> Result<(), AppError> {
+    progress.ensure_mutation_capacity(1)?;
+    let (receipt, summary) = match retrigger {
+        AdmissionGateRetrigger::CheckSuite { check_suite_id } => (
+            provider
+                .rerequest_check_suite(
+                    repository,
+                    &progress.precondition(candidate_pr),
+                    check_suite_id,
+                )
+                .map_err(|error| mutation_error(&error, progress, Some(candidate_pr)))?,
+            format!("rerequested admission-gate check suite {check_suite_id} after membership"),
+        ),
+        AdmissionGateRetrigger::GitHubActionsRun {
+            run_id,
+            check_suite_id,
+        } => (
+            provider
+                .rerun_workflow_run(repository, &progress.precondition(candidate_pr), run_id)
+                .map_err(|error| mutation_error(&error, progress, Some(candidate_pr)))?,
+            format!(
+                "reran GitHub Actions admission-gate workflow {run_id} (suite {check_suite_id}) after membership"
+            ),
+        ),
+    };
+    progress.record(receipt, &summary);
+    Ok(())
+}
+
+fn recover_enrolled_admission_gate(
+    provider: &impl SyncProvider,
+    progress: &mut SyncProgress,
+    status: &StatusOutput,
+    caravan_id: PrNumber,
+    candidate_pr: PrNumber,
+    observation: &CiObservation,
+) -> Result<bool, AppError> {
+    let Some(gate) = status.auto_admission.admission_gate.as_ref() else {
+        return Ok(false);
+    };
+    let Some(candidate) = progress.current.get(&candidate_pr).cloned() else {
+        return Ok(false);
+    };
+    if !candidate.has_label(&gate.member_label)
+        || !checks_have_exact_deferred_gate(gate, &observation.effective_checks)
+    {
+        return Ok(false);
+    }
+    let Some(required_runs) = progress
+        .required_runs
+        .iter()
+        .rev()
+        .find(|receipt| receipt.caravan_id == caravan_id && receipt.pr == candidate_pr)
+        .map(|receipt| &receipt.assessment)
+    else {
+        return Ok(false);
+    };
+    if !gate_deferral_allows_required_runs(candidate_pr, gate, required_runs)? {
+        return Ok(false);
+    }
+    let retrigger = admission_gate_retrigger(provider, &status.repository, &candidate, gate)?;
+    perform_admission_gate_retrigger(
+        provider,
+        progress,
+        &status.repository,
+        candidate_pr,
+        retrigger,
+    )?;
+    Ok(true)
+}
+
+fn verify_required_runs_and_recover_gate(
+    provider: &impl SyncProvider,
+    progress: &mut SyncProgress,
+    status: &StatusOutput,
+    caravan_id: PrNumber,
+    candidate_pr: PrNumber,
+    observation: &CiObservation,
+) -> Result<bool, AppError> {
+    progress.verify_required_runs(provider, &status.repository, caravan_id, candidate_pr)?;
+    if observation.disposition != CiDisposition::Failed {
+        return Ok(false);
+    }
+    recover_enrolled_admission_gate(
+        provider,
+        progress,
+        status,
+        caravan_id,
+        candidate_pr,
+        observation,
+    )
 }
 
 fn candidate_has_exact_deferred_gate(
@@ -5475,15 +5624,7 @@ fn candidate_has_exact_deferred_gate(
     let Some(candidate) = progress.current.get(&candidate_pr) else {
         return false;
     };
-    if candidate.has_label(&gate.member_label) {
-        return false;
-    }
-    let current = crate::model::latest_checks_per_identity(checks).0;
-    let matching = current
-        .into_iter()
-        .filter(|check| check.name == gate.context)
-        .collect::<Vec<_>>();
-    matching.len() == 1 && matching[0].state == CheckState::Failure
+    !candidate.has_label(&gate.member_label) && checks_have_exact_deferred_gate(gate, checks)
 }
 
 fn auto_admission_provider_state_unknown(
@@ -6221,6 +6362,23 @@ fn native_route_for_caravan(
     })
 }
 
+fn disarm_caravan_members(
+    provider: &impl SyncProvider,
+    status: &StatusOutput,
+    caravan: &Caravan,
+    progress: &mut SyncProgress,
+) -> Result<(), AppError> {
+    let members = if progress.head_merge_actor.caravan() {
+        caravan.members.as_slice()
+    } else {
+        &caravan.members[1..]
+    };
+    for number in members.iter().copied() {
+        progress.ensure_no_foreign_auto_merge(provider, &status.repository, caravan.id, number)?;
+    }
+    Ok(())
+}
+
 fn reconcile_caravan(
     status: &StatusOutput,
     provider: &impl SyncProvider,
@@ -6232,7 +6390,6 @@ fn reconcile_caravan(
 ) -> Result<(), AppError> {
     let head = caravan.head().expect("caravans are non-empty");
     let predecessor = merged_predecessor(status, caravan).map(|snapshot| snapshot.number);
-
     // Native routing is a fresh provider-intersection precondition, not a
     // discovery-time projection. It runs before promotion, auto-merge disarm,
     // force handling, or any landing write, so an intersecting provider Stack
@@ -6258,14 +6415,7 @@ fn reconcile_caravan(
     // Step 2. Exactly one merge actor. Under the caravan-owned policy that
     // includes the root itself: a foreign `autoMergeRequest` is either
     // converged away or refused, never raced.
-    let members_to_disarm: Vec<PrNumber> = if progress.head_merge_actor.caravan() {
-        caravan.members.clone()
-    } else {
-        caravan.members.iter().skip(1).copied().collect()
-    };
-    for number in members_to_disarm {
-        progress.ensure_no_foreign_auto_merge(provider, &status.repository, caravan.id, number)?;
-    }
+    disarm_caravan_members(provider, status, caravan, progress)?;
 
     // Durable force intent is a PR-level instruction, not a classification of
     // one check generation. Once that PR is the root, skip every CI and
@@ -6292,14 +6442,19 @@ fn reconcile_caravan(
         let observation = progress.observe_ci(provider, &status.repository, number)?;
         let disposition = observation.disposition;
         progress.upsert_ci_observation(observation.clone());
-        // Required-run coverage is verified per member before any CI stop, so a
-        // head whose required contexts never started a run is visible even when
-        // an earlier member is legitimately failing, and one stalled member
-        // never suppresses another member's evidence. Because promotion already
-        // retargeted the root, this is evaluated against the *new* merge
-        // identity: contexts required by the default branch, not by a
-        // predecessor branch.
-        progress.verify_required_runs(provider, &status.repository, caravan.id, number)?;
+        // Verify every member against its current promoted base before any CI
+        // stop, so one failed or stalled member never suppresses another.
+        if verify_required_runs_and_recover_gate(
+            provider,
+            progress,
+            status,
+            caravan.id,
+            number,
+            &observation,
+        )? {
+            // A fresh tick owns CI, parking, and merge after the exact rerun.
+            return Ok(());
+        }
         if disposition == CiDisposition::Failed {
             if rerun_failed {
                 progress.rerun_exact_failed_runs(
