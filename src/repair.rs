@@ -3099,7 +3099,10 @@ fn config_fingerprint(context: &AppContext) -> Result<String, AppError> {
     Ok(stable_fingerprint(&encoded))
 }
 
-fn provider_git_url(context: &AppContext, repository: &RepositoryId) -> Result<String, AppError> {
+pub(crate) fn provider_git_url(
+    context: &AppContext,
+    repository: &RepositoryId,
+) -> Result<String, AppError> {
     let runner = ProcessRunner::in_directory(&context.repository_path)
         .with_timeout(Duration::from_secs(context.config.command_timeout_secs));
     let slug = format!("{}/{}", repository.owner, repository.name);
