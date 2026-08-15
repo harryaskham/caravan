@@ -1,0 +1,74 @@
+name: Cara convergence
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  checks: write
+  contents: read
+  issues: write
+  pull-requests: write
+
+# Byte-identical to cara-admit.yml: admission and convergence are one writer.
+concurrency:
+  group: cara-writer-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  # Replace both values in one reviewed change. The version must contain the
+  # admission-only command used by the companion controller workflow.
+  CARA_VERSION: "REPLACE_WITH_PINNED_VERSION"
+  CARA_TARGET: x86_64-linux
+  CARA_ARCHIVE_SHA256: "REPLACE_WITH_64_HEX_ARCHIVE_SHA256"
+
+jobs:
+  sync:
+    runs-on: [self-hosted, nix, x86_64-linux]
+    timeout-minutes: 60
+    steps:
+      - name: Check out trusted default branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Install exact verified Cara release
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$CARA_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$CARA_ARCHIVE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          root="cara-$CARA_VERSION-$CARA_TARGET"
+          archive="$root.tar.gz"
+          url="https://github.com/harryaskham/caravan/releases/download/v$CARA_VERSION/$archive"
+          work="$(mktemp -d "$RUNNER_TEMP/cara-sync.XXXXXX")"
+          trap 'rm -rf "$work"' EXIT
+          curl --fail --silent --show-error --location \
+            --proto '=https' --tlsv1.2 "$url" --output "$work/$archive"
+          printf '%s  %s\n' "$CARA_ARCHIVE_SHA256" "$work/$archive" | sha256sum --check
+          tar -xzf "$work/$archive" -C "$work"
+          install -D -m 0755 "$work/$root/cara" "$RUNNER_TEMP/cara-bin/cara"
+          "$RUNNER_TEMP/cara-bin/cara" --version
+          printf '%s\n' "$RUNNER_TEMP/cara-bin" >>"$GITHUB_PATH"
+
+      - name: Converge active fleet
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cara --json sync --all >cara-sync-receipt.json
+          jq -e '.status == "success"' cara-sync-receipt.json >/dev/null
+
+      - name: Preserve exact convergence receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cara-sync-${{ github.run_id }}-${{ github.run_attempt }}
+          path: cara-sync-receipt.json
+          if-no-files-found: error
+          retention-days: 14

@@ -267,6 +267,11 @@ the exact pinned binary. It performs strict parsing and no repository/provider a
    durable PR-scoped `caravan-force` intent unchanged across base and history
    transitions. Membership operations are optimistic and resumable; rerun the same
    command after an indeterminate provider response rather than inventing state.
+   A trusted event controller may instead run `cara admit`: it selects the
+   global canonical candidate (never the wake PR), admits at most one under the
+   same writer/policy/Git/provider fences, and returns a typed disposition plus
+   exact cursor. It cannot converge, merge, park, evict, repair, or reshape the
+   fleet; those states wait for ordinary sync.
 5. Run `cara plan sync` (usually `--all`) to inspect the exact current
    physical/conflict/lease and first auto-admission plan with zero provider
    writes. Review ordered actions, no-ops, decisions, and rediscovery barriers.
@@ -1156,6 +1161,13 @@ pub struct ResumeInput {
     pub actor: String,
 }
 
+/// Input for the bounded admission-only writer.
+///
+/// The command intentionally has no candidate argument: the exact global
+/// priority/FIFO winner is provider state, never workflow-event authority.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Args)]
+pub struct AdmitInput {}
+
 /// Input for `cara sync`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Args)]
 pub struct SyncInput {
@@ -1679,6 +1691,11 @@ pub fn build_router() -> ToolRouter<AppContext> {
         |context: &AppContext, input: pause::PauseRecoveryInput| {
             pause::pause_recovery(context, pause::PauseRecoveryPhase::Rollback, &input)
         },
+    );
+    router.add_typed_tool_with_output_schema(
+        "admit",
+        "Run one bounded admission-only writer tick. It hot-discovers the global canonical priority/FIFO candidate, admits at most one exact generation under the ordinary writer/precondition/compatibility/native-Stack fences, and can never converge, merge, park, evict, rerun unrelated CI, repair, or reshape the existing fleet.",
+        |context: &AppContext, input: AdmitInput| sync::admit(context, &input),
     );
     router.add_typed_tool_with_output_schema(
         "sync",
@@ -3080,6 +3097,7 @@ mod tests {
             "next",
             "prev",
             "plan_sync",
+            "admit",
             "sync",
             "evict",
             "split",
@@ -3097,6 +3115,32 @@ mod tests {
             assert!(
                 names.iter().any(|name| name == expected),
                 "missing {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn admit_tool_schema_exposes_bounded_dispositions_and_cursor() {
+        let tools =
+            serde_json::to_value(build_router().tool_metadata()).expect("tool metadata serializes");
+        let admit = tools
+            .as_array()
+            .expect("metadata array")
+            .iter()
+            .find(|tool| tool["name"] == "admit")
+            .expect("admit tool");
+        let encoded = serde_json::to_string(admit).expect("admit metadata serializes");
+        for required in [
+            "admitted",
+            "no_candidate",
+            "waiting_for_existing_convergence",
+            "external_decision",
+            "retryable_provider_race",
+            "cursor",
+        ] {
+            assert!(
+                encoded.contains(required),
+                "missing `{required}` from admit schema"
             );
         }
     }

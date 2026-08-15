@@ -71,6 +71,33 @@ Caravan's checked-in `.github/workflows/ci.yml` is the canonical executable
 example and `tests/ci_workflow_contract.rs` prevents broad label triggers or
 loss of the fail-closed aggregate.
 
+## Admission and convergence controllers
+
+Copy the reviewed bundle under [`examples/workflows/`](../examples/workflows/):
+
+- `caravan-gate.yml` is the unprivileged exact-head PR suite above;
+- `cara-admit.yml` is a trusted default-branch `pull_request_target`, schedule,
+  and manual controller which runs exactly one `cara --json admit`;
+- `cara-sync.yml` owns ordinary convergence on schedule/manual wake.
+
+Admission never uses the wake PR as its candidate. It hot-discovers the global
+priority/FIFO order and returns one of `admitted`, `no_candidate`,
+`waiting_for_existing_convergence`, `external_decision`, or
+`retryable_provider_race` with an exact cursor. It admits at most one candidate
+and cannot merge, promote, park/unpark, evict, repair, reshape, or broadly rerun
+fleet CI. Existing fleet work stays with `cara-sync.yml`.
+
+Both writers use the exact `cara-writer-${{ github.repository }}` concurrency
+key with `cancel-in-progress: false`. GitHub permits only one running and one
+pending member of the group, coalescing event bursts without cancelling an
+indeterminate provider write. Both download a versioned x86_64 Linux Cara
+archive and verify a hard-pinned SHA-256 before execution. Replace the version
+and digest placeholders together after publishing the release containing
+`cara admit`; never point the templates at `latest`, a branch, or unverified PR
+content. The trusted controller checks out only the provider default branch,
+sets `persist-credentials: false`, and never interpolates pull-request fields
+into shell commands.
+
 ## Adoption sequence for Cacophony and Pi-Daemon
 
 1. Land/pin the required Cara release first; older readers reject the new config.

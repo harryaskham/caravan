@@ -11,9 +11,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use caravan::{
-    AppContext, AppError, CheckInput, CreateInput, EvictInput, JoinInput, LockRecoverInput,
-    LockStatusInput, LoopInput, PauseInput, ResumeInput, SelfUpdateRunInput, SplitInput, SyncInput,
-    TOOL_NAME, active_updater_config, build_router,
+    AdmitInput, AppContext, AppError, CheckInput, CreateInput, EvictInput, JoinInput,
+    LockRecoverInput, LockStatusInput, LoopInput, PauseInput, ResumeInput, SelfUpdateRunInput,
+    SplitInput, SyncInput, TOOL_NAME, active_updater_config, build_router,
     concat::{ConcatExecuteInput, ConcatInput},
     feedback_config, feedback_configuration_error, feedback_panic_config,
     native_stack_rebase::{NativeStackRebaseApplyInput, NativeStackRebasePreviewInput},
@@ -131,6 +131,8 @@ enum Command {
     /// Exact-owner checkpoint/finalize/rollback for an already-paused caravan.
     #[command(subcommand)]
     PauseRecovery(Box<PauseRecoveryCommand>),
+    /// Admit at most one globally canonical candidate without fleet convergence.
+    Admit(AdmitInput),
     /// Idempotently synchronize one or all caravans until a decision point.
     ///
     /// Pass `--dry-run` to preview the exact tick without any provider
@@ -499,6 +501,7 @@ fn run(cli: &Cli) -> Result<(), i32> {
         Command::RestoreParked(input) => run_restore_parked(cli, input),
         Command::NativeStack(command) => run_native_stack(cli, command),
         Command::PauseRecovery(command) => run_pause_recovery(cli, command),
+        Command::Admit(input) => run_admit(cli, input),
         Command::Sync(input) => run_sync(cli, input),
         Command::Plan(command) => run_plan(cli, command),
         Command::Concat(input) => run_concat(cli, input),
@@ -2041,6 +2044,27 @@ fn run_pause_recovery(cli: &Cli, command: &PauseRecoveryCommand) -> Result<(), i
             println!(
                 "pause-recovery {:?}: {:?}, fence {:?} — {}",
                 output.phase, output.status, output.fence_state, output.next_action
+            );
+            Ok(())
+        }
+        Err(error) => emit_human_error(error),
+    }
+}
+
+fn run_admit(cli: &Cli, input: &AdmitInput) -> Result<(), i32> {
+    let context = match resolve_sync_context(cli) {
+        Ok(context) => context,
+        Err(error) => return emit_context_error(cli, Err(error)).map(|_| unreachable!()),
+    };
+    let result = caravan::sync::admit(&context, input);
+    if cli.json {
+        return emit_result(true, result);
+    }
+    match result {
+        Ok(output) => {
+            println!(
+                "admit {:?}: {} (cursor {})",
+                output.disposition, output.reason, output.cursor
             );
             Ok(())
         }
