@@ -4784,14 +4784,11 @@ where
             candidate.number,
             context.config.ci.admission_gate.as_ref(),
         )?;
-        let deferred_gate = context.config.ci.admission_gate.as_ref().filter(|gate| {
+        let deferred_gate = context.config.ci.admission_gate.as_ref().filter(|_gate| {
             local_refusal.is_none()
-                && candidate_has_exact_deferred_gate(
-                    progress,
-                    candidate.number,
-                    gate,
-                    &candidate.checks,
-                )
+                && progress
+                    .deferred_admission_gates
+                    .contains(&candidate.number)
         });
         let deferred_gate_suite = deferred_gate
             .map(|gate| {
@@ -5247,6 +5244,7 @@ fn candidate_local_admission_refusal(
     candidate_pr: PrNumber,
     admission_gate: Option<&crate::config::CiAdmissionGateConfig>,
 ) -> Result<Option<AutoCandidateAdmissionRefusal>, AppError> {
+    progress.deferred_admission_gates.remove(&candidate_pr);
     let mut ci = progress.observe_ci(provider, repository, candidate_pr)?;
     // `caravan-force` is member repair authority, not authority to enrol a
     // known-red unjoined PR. Required CI is therefore never bypassed here.
@@ -5315,6 +5313,7 @@ fn candidate_local_admission_refusal(
             &required_runs,
         )?
     {
+        progress.deferred_admission_gates.insert(candidate_pr);
         return Ok(None);
     }
 
@@ -8241,6 +8240,9 @@ struct SyncProgress {
     paused_caravans: Vec<crate::pause::PauseStatus>,
     head_advancements: Vec<HeadAdvancement>,
     ci: Vec<CiObservation>,
+    /// Candidates whose configured deferred gate was proven from complete
+    /// candidate-local CI and required-run evidence in this exact tick.
+    deferred_admission_gates: BTreeSet<PrNumber>,
     events: Vec<CaravanEvent>,
     current: BTreeMap<PrNumber, PullRequestSnapshot>,
     merge_candidates: BTreeMap<PrNumber, MergeCandidateIdentity>,
@@ -8282,6 +8284,7 @@ impl SyncProgress {
             paused_caravans: Vec::new(),
             head_advancements: Vec::new(),
             ci: Vec::new(),
+            deferred_admission_gates: BTreeSet::new(),
             events,
             current: status.analysis.pull_requests.clone(),
             merge_candidates: status

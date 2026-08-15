@@ -2312,10 +2312,11 @@ fn status_with_discovery_options(
         stack_backend.mutation_support = StackMutationSupport::NativeStack;
     }
     apply_stack_backend_mutation_policy(&context.config, &stack_backend, &mut initialization);
-    let admission = resolve_admission_with_generation(
+    let admission = resolve_admission_with_generation_and_gate(
         &analysis,
         &context.config.agent_priority_labels,
         generation_integrity,
+        context.config.ci.admission_gate.as_ref(),
     );
     let projection_elapsed = started.elapsed();
     let mut provider_api = provider_runner.github_api_telemetry();
@@ -2581,6 +2582,21 @@ pub fn resolve_admission_with_generation(
     priority_labels: &[String],
     generation_integrity: crate::generation::GenerationIntegrityStatus,
 ) -> AdmissionStatus {
+    resolve_admission_with_generation_and_gate(
+        analysis,
+        priority_labels,
+        generation_integrity,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn resolve_admission_with_generation_and_gate(
+    analysis: &GraphAnalysis,
+    priority_labels: &[String],
+    generation_integrity: crate::generation::GenerationIntegrityStatus,
+    admission_gate: Option<&crate::config::CiAdmissionGateConfig>,
+) -> AdmissionStatus {
     let ranks: std::collections::BTreeMap<&str, usize> = priority_labels
         .iter()
         .enumerate()
@@ -2691,7 +2707,11 @@ pub fn resolve_admission_with_generation(
         // still elected the red PR as next_candidate while `cara check --pr N`
         // called it ineligible, and the two surfaces disagreed about the same PR
         // (observed on cacophony PR 2276).
-        if !pull_request.has_label("caravan-force") && has_failing_check(pull_request) {
+        if !pull_request.has_label("caravan-force")
+            && has_failing_check(pull_request)
+            && !admission_gate
+                .is_some_and(|gate| candidate_may_have_deferred_gate(pull_request, gate))
+        {
             skipped.push(SkippedAdmissionCandidate {
                 pr: *number,
                 priority_label: configured.first().map(|(label, _)| (*label).clone()),
@@ -3948,6 +3968,36 @@ fn validate_candidate(pull_request: &PullRequestSnapshot, problems: &mut Vec<Gra
 /// rollup retains every historical run on the same head, so without this a
 /// single old cancelled run blocks admission forever, even while the current
 /// run of that same check is green or still in progress.
+/// Cheap read-model exception that keeps a possible configured gate sentinel in
+/// canonical order until sync can perform its complete exact-head provider
+/// reread. This NEVER authorizes admission: malformed, ambiguous, wrong-head,
+/// or unrelated failures still fail in candidate-local mutation preflight.
+fn candidate_may_have_deferred_gate(
+    pull_request: &PullRequestSnapshot,
+    gate: &crate::config::CiAdmissionGateConfig,
+) -> bool {
+    if pull_request.has_label(&gate.member_label) {
+        return false;
+    }
+    let failures = crate::model::latest_checks_per_identity(&pull_request.checks)
+        .0
+        .into_iter()
+        .filter(|check| {
+            matches!(
+                check.state,
+                crate::model::CheckState::Failure
+                    | crate::model::CheckState::Cancelled
+                    | crate::model::CheckState::TimedOut
+                    | crate::model::CheckState::ActionRequired
+            )
+        })
+        .collect::<Vec<_>>();
+    !failures.is_empty()
+        && failures.iter().all(|check| {
+            check.name == gate.context && check.state == crate::model::CheckState::Failure
+        })
+}
+
 fn has_failing_check(pull_request: &PullRequestSnapshot) -> bool {
     let (current, _superseded) = crate::model::latest_checks_per_identity(&pull_request.checks);
     current.into_iter().any(|check| {
@@ -5623,6 +5673,64 @@ mod tests {
                 .any(|candidate| candidate.pr == PrNumber(10)),
             "the red candidate must be visibly skipped, not silently dropped: {:?}",
             admission.skipped
+        );
+    }
+
+    #[test]
+    fn configured_deferred_gate_reaches_candidate_local_provider_reread() {
+        let gate = crate::config::CiAdmissionGateConfig {
+            mode: crate::config::CiAdmissionGateMode::CaravanLabel,
+            context: "build-test".to_owned(),
+            member_label: "caravan".to_owned(),
+        };
+        let mut deferred = pr(10, "deferred", "main", false);
+        deferred.checks.push(crate::model::CheckSnapshot {
+            name: gate.context.clone(),
+            state: crate::model::CheckState::Failure,
+            provider_state: Some("FAILURE".to_owned()),
+            ..crate::model::CheckSnapshot::default()
+        });
+        let later = pr(20, "later", "main", false);
+        let labels = crate::config::CaravanConfig::default().agent_priority_labels;
+        let deferred_status = status(deferred.clone(), vec![later.clone()]);
+
+        let admission = resolve_admission_with_generation_and_gate(
+            &deferred_status.analysis,
+            &labels,
+            crate::generation::GenerationIntegrityStatus::default(),
+            Some(&gate),
+        );
+        assert_eq!(admission.next_candidate, Some(deferred.number));
+        assert!(
+            !admission
+                .skipped
+                .iter()
+                .any(|row| row.pr == deferred.number)
+        );
+
+        let disabled = resolve_admission(&deferred_status.analysis, &labels);
+        assert_eq!(disabled.next_candidate, Some(later.number));
+        assert!(disabled.skipped.iter().any(|row| row.pr == deferred.number));
+
+        deferred.checks.push(crate::model::CheckSnapshot {
+            name: "source-test".to_owned(),
+            state: crate::model::CheckState::Failure,
+            provider_state: Some("FAILURE".to_owned()),
+            ..crate::model::CheckSnapshot::default()
+        });
+        let unrelated_red = status(deferred.clone(), vec![later]);
+        let admission = resolve_admission_with_generation_and_gate(
+            &unrelated_red.analysis,
+            &labels,
+            crate::generation::GenerationIntegrityStatus::default(),
+            Some(&gate),
+        );
+        assert_eq!(admission.next_candidate, Some(PrNumber(20)));
+        assert!(
+            admission
+                .skipped
+                .iter()
+                .any(|row| row.pr == deferred.number)
         );
     }
 
