@@ -7699,6 +7699,27 @@ fn head_published_at(
     }
 }
 
+fn parked_caravan_may_need_gate_recovery(status: &StatusOutput, caravan: &Caravan) -> bool {
+    let Some(gate) = status.auto_admission.admission_gate.as_ref() else {
+        return false;
+    };
+    caravan.members.iter().copied().any(|number| {
+        let Some(candidate) = status.analysis.pull_requests.get(&number) else {
+            return false;
+        };
+        if !candidate.has_label(&gate.member_label)
+            || !checks_have_exact_deferred_gate(gate, &candidate.checks)
+        {
+            return false;
+        }
+        crate::model::latest_checks_per_identity(&candidate.checks)
+            .0
+            .into_iter()
+            .filter(|check| check_is_failure(check))
+            .all(|check| check.name == gate.context && check.state == CheckState::Failure)
+    })
+}
+
 fn select_caravans(status: &StatusOutput, all: bool) -> Result<Vec<Caravan>, AppError> {
     let mut caravans = if all {
         status
@@ -7706,7 +7727,9 @@ fn select_caravans(status: &StatusOutput, all: bool) -> Result<Vec<Caravan>, App
             .fleet
             .caravans
             .iter()
-            .filter(|caravan| !caravan.parked)
+            .filter(|caravan| {
+                !caravan.parked || parked_caravan_may_need_gate_recovery(status, caravan)
+            })
             .cloned()
             .collect()
     } else {
@@ -7742,7 +7765,7 @@ fn select_caravans(status: &StatusOutput, all: bool) -> Result<Vec<Caravan>, App
                     format!("PR #{current} is not an active caravan member"),
                 )
             })?;
-        if caravan.parked {
+        if caravan.parked && !parked_caravan_may_need_gate_recovery(status, &caravan) {
             return Err(AppError::structured(
                 ErrorCategory::Validation,
                 "caravan_parked_red",
