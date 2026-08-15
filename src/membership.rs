@@ -548,6 +548,7 @@ fn execute_live(
         None,
         None,
         None,
+        None,
         true,
         &lock,
     )
@@ -562,6 +563,7 @@ pub(crate) fn auto_admit_locked(
     candidate_pr: PrNumber,
     tail_pr: Option<PrNumber>,
     priority_label: Option<String>,
+    proven_deferred_gate_context: Option<&str>,
     operation_deadline: std::time::Instant,
     github_budget: &crate::command::GithubRequestBudget,
     writer_guard: &crate::writer_guard::WriterOperationGuard,
@@ -589,6 +591,7 @@ pub(crate) fn auto_admit_locked(
         Some(operation_deadline),
         Some(github_budget),
         Some(status),
+        proven_deferred_gate_context,
         false,
         writer_guard,
     )
@@ -1312,6 +1315,7 @@ fn execute_locked(
     operation_deadline: Option<std::time::Instant>,
     github_budget: Option<&crate::command::GithubRequestBudget>,
     preloaded_status: Option<StatusOutput>,
+    proven_deferred_gate_context: Option<&str>,
     dispatch_hooks: bool,
     writer_guard: &crate::writer_guard::WriterOperationGuard,
 ) -> Result<MembershipOutput, AppError> {
@@ -1655,7 +1659,14 @@ fn execute_locked(
             &preflight_state,
         )?;
         validate_operation_shape(&candidate, request, &desired_base)?;
-        preflight_eligibility(&status, &candidate, request, join_target.as_ref(), &checker)?;
+        preflight_eligibility(
+            &status,
+            &candidate,
+            request,
+            join_target.as_ref(),
+            &checker,
+            proven_deferred_gate_context,
+        )?;
         let rewrite_reason = join_target.as_ref().map_or(
             crate::physical_rebase::BranchRewriteReason::CurrentDefaultAdvanced,
             |target| crate::physical_rebase::BranchRewriteReason::JoinedCaravan {
@@ -1832,6 +1843,7 @@ fn execute_locked(
         rebase_receipt.as_ref(),
         context.config.sync.actions.join_unlabelled_prs,
         Some(context),
+        proven_deferred_gate_context,
     )
     .map_err(|error| attach_rebase_receipt(error, rebase_receipt.as_ref()));
     let mut output = match execution {
@@ -2257,10 +2269,15 @@ fn execute_with_rebase_guard(
         expected_rebase,
         require_auto_admission_skip,
         None,
+        None,
     )
 }
 
-#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
+#[allow(
+    clippy::needless_pass_by_value,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
 fn execute_with_rebase_guard_and_config(
     mut status: StatusOutput,
     checker: &impl CompatibilityChecker,
@@ -2269,6 +2286,7 @@ fn execute_with_rebase_guard_and_config(
     expected_rebase: Option<&crate::physical_rebase::RebaseReceipt>,
     require_auto_admission_skip: bool,
     context: Option<&AppContext>,
+    proven_deferred_gate_context: Option<&str>,
 ) -> Result<MembershipOutput, AppError> {
     if request
         .reason
@@ -2375,8 +2393,14 @@ fn execute_with_rebase_guard_and_config(
         })?;
 
     validate_operation_shape(&candidate, &request, &desired_base)?;
-    let eligibility =
-        preflight_eligibility(&status, &candidate, &request, target.as_ref(), checker)?;
+    let eligibility = preflight_eligibility(
+        &status,
+        &candidate,
+        &request,
+        target.as_ref(),
+        checker,
+        proven_deferred_gate_context,
+    )?;
     revalidate_generation_before_membership(&status, candidate.number, provider)?;
     revalidate_native_admission_generation(&status, &candidate, &eligibility, provider)?;
     if eligibility.admission_compatibility_authorization.is_some()

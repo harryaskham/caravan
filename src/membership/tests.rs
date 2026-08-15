@@ -446,6 +446,47 @@ fn exact_native_clean(
 }
 
 #[test]
+fn sync_proven_gate_capability_survives_membership_apply_preflight() {
+    let clean_candidate = pull_request(60, "candidate", "main", &[]);
+    let mut before = status(clean_candidate.clone(), Vec::new());
+    let mut candidate = clean_candidate;
+    candidate.checks.push(crate::model::CheckSnapshot {
+        name: "build-test".to_owned(),
+        state: crate::model::CheckState::Failure,
+        provider_state: Some("FAILURE".to_owned()),
+        ..crate::model::CheckSnapshot::default()
+    });
+    before
+        .analysis
+        .pull_requests
+        .insert(candidate.number, candidate.clone());
+    let request = MembershipRequest {
+        operation: MembershipOperation::New,
+        create_pr: false,
+        tail_pr: None,
+        head_pr: None,
+        reason: Some("sync-owned deferred gate".to_owned()),
+        priority_label: None,
+        agent_priority_labels: Vec::new(),
+    };
+
+    assert!(
+        preflight_eligibility(&before, &candidate, &request, None, &clean, None).is_err(),
+        "explicit membership without a sync proof must retain raw-red refusal"
+    );
+    let proven = preflight_eligibility(
+        &before,
+        &candidate,
+        &request,
+        None,
+        &clean,
+        Some("build-test"),
+    )
+    .expect("sync-owned exact deferred proof must survive membership apply preflight");
+    assert!(proven.eligible, "problems: {:?}", proven.problems);
+}
+
+#[test]
 fn native_admission_revalidates_candidate_and_default_before_mutation() {
     let candidate = pull_request(60, "candidate", "main", &[]);
     let status = status(candidate.clone(), Vec::new());
