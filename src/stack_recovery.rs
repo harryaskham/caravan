@@ -216,7 +216,7 @@ impl<'a> RecoveryFacts<'a> {
     }
 }
 
-trait NativeStackRecoveryProvider {
+pub(crate) trait NativeStackRecoveryProvider {
     fn verify_precondition_with_checks(
         &self,
         repository: &RepositoryId,
@@ -496,20 +496,106 @@ pub fn apply(
     apply_with_provider(context, plan, observation, &provider)
 }
 
+/// Reconstruct one missing provider Stack from complete API truth.
+///
+/// Local checkpoints are optional evidence only. Zero provider intersection
+/// plus one exact logical multi-member caravan is sufficient to converge under
+/// the same immutable leases used by reviewed recovery. A changed pass returns
+/// immediately so normal sync rediscovery starts from the provider cursor.
+pub(crate) fn auto_recover_missing(
+    context: &AppContext,
+    status: &StatusOutput,
+    provider: &impl NativeStackRecoveryProvider,
+) -> Result<Option<NativeStackRecoveryOutput>, AppError> {
+    if context.config.stack_type != StackType::Github
+        || !context.config.stack_rollout.mutations_opt_in
+        || status.stack_backend.provider_stacks_truncated
+        || status.stack_backend.capability != StackCapability::Available
+        || status.stack_backend.mutation_support != StackMutationSupport::NativeStack
+    {
+        return Ok(None);
+    }
+    let missing = status
+        .analysis
+        .fleet
+        .caravans
+        .iter()
+        .filter(|caravan| {
+            caravan.members.len() >= 2
+                && !status
+                    .stack_backend
+                    .native_stacks
+                    .iter()
+                    .any(|native| native.caravan_id == Some(caravan.id))
+        })
+        .collect::<Vec<_>>();
+    let [caravan] = missing.as_slice() else {
+        if missing.is_empty() {
+            return Ok(None);
+        }
+        return Err(refusal(
+            "github_stack_auto_recovery_ambiguous",
+            "multiple missing provider Stacks require independent fresh ticks",
+            json!({
+                "caravans": missing.iter().map(|caravan| caravan.id).collect::<Vec<_>>(),
+                "mutated": false,
+            }),
+        ));
+    };
+    let pending = crate::stack_membership::load_pending(&context.repository_path, caravan.id)?;
+    let actor = "caravan-scheduler";
+    let reason = "stateless sync recovery from complete provider Stack inventory";
+    let (plan, observation) = build_plan_with_policy(
+        &context.config,
+        &RecoveryFacts::from_status(status),
+        caravan.id,
+        actor,
+        reason,
+        pending.as_ref(),
+        false,
+    )?;
+    apply_plan_with_provider(context, plan, observation, provider, false).map(Some)
+}
+
 fn apply_with_provider(
     context: &AppContext,
     plan: NativeStackRecoveryPlan,
     observation: NativeStackRecoveryObservation,
     provider: &impl NativeStackRecoveryProvider,
 ) -> Result<NativeStackRecoveryOutput, AppError> {
-    let mut fresh = Vec::with_capacity(plan.members.len());
-    for member in &plan.members {
-        let pull = provider
-            .verify_precondition_with_checks(&plan.repository, &member.expected)
-            .map_err(|error| provider_refusal("fresh_member_preflight", &error, &plan))?;
-        require_member_green(&pull)?;
-        fresh.push(pull);
-    }
+    apply_plan_with_provider(context, plan, observation, provider, true)
+}
+
+fn fresh_members_for_plan(
+    plan: &NativeStackRecoveryPlan,
+    provider: &impl NativeStackRecoveryProvider,
+    require_green: bool,
+) -> Result<Vec<PullRequestSnapshot>, AppError> {
+    plan.members
+        .iter()
+        .map(|member| {
+            let pull = if require_green {
+                provider.verify_precondition_with_checks(&plan.repository, &member.expected)
+            } else {
+                provider.verify_precondition(&plan.repository, &member.expected)
+            }
+            .map_err(|error| provider_refusal("fresh_member_preflight", &error, plan))?;
+            if require_green {
+                require_member_green(&pull)?;
+            }
+            Ok(pull)
+        })
+        .collect()
+}
+
+fn apply_plan_with_provider(
+    context: &AppContext,
+    plan: NativeStackRecoveryPlan,
+    observation: NativeStackRecoveryObservation,
+    provider: &impl NativeStackRecoveryProvider,
+    require_green: bool,
+) -> Result<NativeStackRecoveryOutput, AppError> {
+    let fresh = fresh_members_for_plan(&plan, provider, require_green)?;
     let desired = crate::stack_membership::topology_from_members(&plan.desired.base, fresh.iter())
         .map_err(|error| {
             refusal(
@@ -615,6 +701,19 @@ fn build_plan(
     reason: &str,
     pending: Option<&NativeMembershipCheckpoint>,
 ) -> Result<(NativeStackRecoveryPlan, NativeStackRecoveryObservation), AppError> {
+    build_plan_with_policy(config, facts, root, actor, reason, pending, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_plan_with_policy(
+    config: &CaravanConfig,
+    facts: &RecoveryFacts<'_>,
+    root: PrNumber,
+    actor: &str,
+    reason: &str,
+    pending: Option<&NativeMembershipCheckpoint>,
+    require_green: bool,
+) -> Result<(NativeStackRecoveryPlan, NativeStackRecoveryObservation), AppError> {
     require_rollout(config, facts)?;
     let caravan = facts
         .caravans
@@ -658,7 +757,7 @@ fn build_plan(
         ));
     }
 
-    let (pulls, members) = collect_member_evidence(facts, caravan)?;
+    let (pulls, members) = collect_member_evidence(facts, caravan, require_green)?;
     let root_base = &pulls.first().expect("multi-member caravan has a root").base;
     if root_base.repository != facts.default_branch.repository
         || root_base.name != facts.default_branch.name
@@ -723,6 +822,7 @@ fn build_plan(
 fn collect_member_evidence<'a>(
     facts: &RecoveryFacts<'a>,
     caravan: &Caravan,
+    require_green: bool,
 ) -> Result<(Vec<&'a PullRequestSnapshot>, Vec<NativeStackRecoveryMember>), AppError> {
     let mut pulls: Vec<&PullRequestSnapshot> = Vec::with_capacity(caravan.members.len());
     let mut members = Vec::with_capacity(caravan.members.len());
@@ -734,7 +834,9 @@ fn collect_member_evidence<'a>(
                 json!({"root": caravan.id, "member": number, "mutated": false}),
             )
         })?;
-        require_member_green(pull)?;
+        if require_green {
+            require_member_green(pull)?;
+        }
         let expected_base = if position == 0 {
             if pull.base.repository != facts.default_branch.repository
                 || pull.base.name != facts.default_branch.name
@@ -1286,6 +1388,55 @@ mod tests {
         assert_eq!(plan.desired.entries[0].head, root.head);
         assert_eq!(plan.desired.entries[1].base, root.head);
         assert_eq!(plan.desired.entries[1].head, child.head);
+    }
+
+    #[test]
+    fn stateless_zero_mapping_reconstructs_without_checkpoint_or_green_ci() {
+        let directory = tempfile::tempdir().unwrap();
+        let context = test_context(directory.path());
+        let main = branch("main", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let root = pull(101, main.clone());
+        let mut child = pull(102, root.head.clone());
+        child.checks[0].state = CheckState::InProgress;
+        let caravans = vec![Caravan::new(vec![PrNumber(101), PrNumber(102)]).unwrap()];
+        let pulls = BTreeMap::from([(root.number, root.clone()), (child.number, child.clone())]);
+        let backend = stack_backend_fixture(Vec::new());
+        let (plan, observation) = build_plan_with_policy(
+            &context.config,
+            &facts(&main, &caravans, &pulls, &backend),
+            PrNumber(101),
+            "caravan-scheduler",
+            "stateless API recovery",
+            None,
+            false,
+        )
+        .expect("complete provider absence reconstructs exact membership without local state");
+        assert_eq!(observation, NativeStackRecoveryObservation::Absent);
+        assert!(plan.pending_membership_checkpoint_hash.is_none());
+        assert!(
+            crate::stack_membership::load_pending(directory.path(), PrNumber(101))
+                .unwrap()
+                .is_none()
+        );
+        let provider = FakeRecoveryProvider {
+            pulls,
+            disposition: GitHubStackMutationDisposition::Completed,
+            creates: std::cell::Cell::new(0),
+        };
+
+        let output = apply_plan_with_provider(&context, plan, observation, &provider, false)
+            .expect("provider API truth authorizes one exact create");
+
+        assert!(output.mutated);
+        assert!(output.provider_receipt.as_ref().unwrap().verify());
+        assert!(
+            crate::stack_membership::load_pending(directory.path(), PrNumber(101))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(provider.creates.get(), 1);
+        assert_eq!(provider.pulls[&PrNumber(101)].head, root.head);
+        assert_eq!(provider.pulls[&PrNumber(102)].head, child.head);
     }
 
     #[test]

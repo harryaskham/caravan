@@ -778,10 +778,14 @@ ref; a later default commit is compatibility/landing evidence, not authority to
 rewrite the immutable root generation. A different repository/ref fails closed.
 Successful create clears the continuation, while a provider failure returns the
 exact checkpoint instead of telling a scheduler to re-admit an already-labelled
-PR. A legacy or checkpointed
-multi-member caravan with zero mappings is repaired only through
-`cara native-stack recovery-preview` followed by `recovery-apply` with the exact
-plan hash. A provider Stack whose PR bases are linked but whose child commits do
+PR. For a multi-member caravan with zero provider intersections, normal sync
+reconstructs the exact desired Stack from complete API inventory and current
+immutable PR generations, then creates it once under provider leases. Local
+membership checkpoints are optional receipts/hints, never recovery authority;
+a clean checkout converges identically. `cara native-stack recovery-preview`
+followed by `recovery-apply` remains the explicit path for partial, ambiguous,
+or independently reviewed recovery shapes that cannot be proven from zero
+intersection alone. A provider Stack whose PR bases are linked but whose child commits do
 not contain their predecessors is recovered through `cara native-stack
 rebase-preview --stack N --actor A --reason R` followed by `rebase-apply` with
 the reviewed plan hash; the apply prepares the complete divergent suffix before

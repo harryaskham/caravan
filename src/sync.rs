@@ -993,6 +993,9 @@ pub struct SyncOutput {
     /// this tick. Absent on the stable Caravan backend.
     #[serde(default)]
     pub native_stack_land: Vec<crate::github::GitHubStackLandCheckpoint>,
+    /// Stateless provider-API reconstruction of missing native Stack membership.
+    #[serde(default)]
+    pub native_membership_recovery: Vec<crate::stack_recovery::NativeStackRecoveryOutput>,
     /// Durable per-member proof that every required context has reporting run
     /// lineage on the exact current head, or the typed reason it does not.
     #[serde(default)]
@@ -4063,6 +4066,7 @@ fn bounded_prefix_output(
         root_promotion: progress.root_promotion,
         root_merge: progress.root_merge,
         native_stack_land: progress.native_stack_land,
+        native_membership_recovery: Vec::new(),
         required_runs: progress.required_runs,
         rebase_plans: progress.rebase_plans,
         rebase_receipts: progress.rebase_receipts,
@@ -4142,6 +4146,7 @@ fn root_first_output(
         root_promotion: progress.root_promotion,
         root_merge: progress.root_merge,
         native_stack_land: progress.native_stack_land,
+        native_membership_recovery: Vec::new(),
         required_runs: progress.required_runs,
         rebase_plans: progress.rebase_plans,
         rebase_receipts: progress.rebase_receipts,
@@ -4228,6 +4233,7 @@ fn closed_lifecycle_output(
         root_promotion: Vec::new(),
         root_merge: Vec::new(),
         native_stack_land: Vec::new(),
+        native_membership_recovery: Vec::new(),
         required_runs: Vec::new(),
         rebase_plans: Vec::new(),
         rebase_receipts: Vec::new(),
@@ -4265,6 +4271,89 @@ fn sync_without_hooks(
         authority,
     )
     .map_err(|error| attach_lock_recovery(error, lock_recovery.as_ref()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn native_membership_recovery_output(
+    context: &AppContext,
+    input: &SyncInput,
+    started: Instant,
+    operation_deadline: Instant,
+    initial_status_elapsed: Duration,
+    recovery: crate::stack_recovery::NativeStackRecoveryOutput,
+    status: StatusOutput,
+    lock_recovery: Option<OperationLockRecovery>,
+    lock: &mut WriterOperationGuard,
+) -> Result<SyncOutput, AppError> {
+    lock.checkpoint(
+        "native_membership_recovery_complete",
+        json!({"recovery": &recovery, "status": &status.stack_backend}),
+        false,
+    )?;
+    let changed = recovery.mutated;
+    let root = recovery.plan.caravan_id;
+    let receipt = OperationReceipt {
+        operation_id: OperationId(recovery.plan.operation_id.clone()),
+        operation: "sync-native-membership-recovery".to_owned(),
+        completed_steps: vec![MutationStep {
+            kind: MutationKind::NativeStackLand,
+            state: if changed {
+                MutationStepState::Completed
+            } else {
+                MutationStepState::AlreadySatisfied
+            },
+            pr: Some(root),
+            summary: "reconstructed native Stack membership from complete provider API truth"
+                .to_owned(),
+        }],
+        changed,
+    };
+    let mut scheduler_status =
+        successful_scheduler_status(&status, &[], &[], context.config.rebase_on_join, &[], &[]);
+    scheduler_status.wake_class = SchedulerWakeClass::RetryTick;
+    scheduler_status.disposition = SchedulerDisposition::RetryTick;
+    "native Stack membership converged from provider truth; rerun from the fresh mapping"
+        .clone_into(&mut scheduler_status.reason);
+    Ok(SyncOutput {
+        tick: SyncTickReceipt {
+            schema_version: 1,
+            verb: "sync".to_owned(),
+            caravans: status.analysis.fleet.caravans.len(),
+            unqueued: status.analysis.fleet.unqueued.len(),
+            synchronized: 1,
+            joins: 0,
+            changed,
+        },
+        receipt,
+        auto_admission: AutoAdmissionOutput::disabled(context, input.all),
+        scheduler_status,
+        timing: Some(SyncTiming {
+            deadline_ms: duration_millis(operation_deadline.saturating_duration_since(started)),
+            total_ms: duration_millis(started.elapsed()),
+            initial_status_ms: duration_millis(initial_status_elapsed),
+            provider_convergence_ms: duration_millis(started.elapsed()),
+            final_status_ms: 0,
+        }),
+        lock_recovery,
+        provider_receipts: Vec::new(),
+        closed_lifecycle_transitions: Vec::new(),
+        root_auto_merge: Vec::new(),
+        root_promotion: Vec::new(),
+        root_merge: Vec::new(),
+        native_stack_land: Vec::new(),
+        native_membership_recovery: vec![recovery],
+        required_runs: Vec::new(),
+        rebase_plans: Vec::new(),
+        rebase_receipts: Vec::new(),
+        historical_predecessor: read::historical_predecessor(&status),
+        synchronized_caravans: vec![root],
+        paused_caravans: Vec::new(),
+        head_advancements: Vec::new(),
+        ci: Vec::new(),
+        events: Vec::new(),
+        hook_deliveries: Vec::new(),
+        status,
+    })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -4314,7 +4403,6 @@ fn sync_with_lock(
         ),
     );
     crate::initialization::require_ready(&status.initialization)?;
-    require_native_stack_backend_healthy(&status)?;
     require_current_policy(context, &status)?;
     if let Some(authority) = authority {
         // Provider discovery above is read-only. Fence the first possible
@@ -4352,6 +4440,31 @@ fn sync_with_lock(
         &runner,
     )?;
     let provider = GitHubMutationAdapter::new(runner);
+
+    // Complete provider inventory is authority for missing native membership.
+    // A local checkpoint may strengthen/replay the plan but is never required.
+    if let Some(recovery) =
+        crate::stack_recovery::auto_recover_missing(context, &status, &provider)?
+    {
+        let mut recovered_status =
+            read::fleet_status_for_sync(context, operation_deadline, Some(&github_budget))?;
+        if let Some(authority) = authority {
+            authority.bind_invocation(&mut recovered_status)?;
+        }
+        require_native_stack_backend_healthy(&recovered_status)?;
+        return native_membership_recovery_output(
+            context,
+            input,
+            started,
+            operation_deadline,
+            initial_status_elapsed,
+            recovery,
+            recovered_status,
+            lock_recovery,
+            &mut lock,
+        );
+    }
+    require_native_stack_backend_healthy(&status)?;
 
     // Terminal provider state is reconciled before root landing, repair,
     // physical rebase, capacity, or admission. A changed pass returns after an
@@ -4887,6 +5000,7 @@ fn sync_with_lock(
         root_promotion: progress.root_promotion,
         root_merge: progress.root_merge,
         native_stack_land: progress.native_stack_land,
+        native_membership_recovery: Vec::new(),
         required_runs: progress.required_runs,
         rebase_plans: progress.rebase_plans,
         rebase_receipts: progress.rebase_receipts,
