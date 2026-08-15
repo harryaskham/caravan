@@ -1740,7 +1740,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_preserves_stale_root_oid_but_rejects_a_different_base_ref() {
+    fn recovery_leases_current_stack_base_and_preserves_stale_root_entry() {
         let directory = tempfile::tempdir().unwrap();
         let context = test_context(directory.path());
         let current_main = branch("main", "cccccccccccccccccccccccccccccccccccccccc");
@@ -1760,7 +1760,7 @@ mod tests {
             None,
         )
         .expect("default movement does not rewrite recovery topology");
-        assert_eq!(plan.desired.base, stale_main);
+        assert_eq!(plan.desired.base, current_main);
         assert_eq!(plan.desired.entries[0].base, root.base);
 
         let mut wrong_ref = pulls;
