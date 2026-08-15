@@ -12,8 +12,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use caravan::{
     AppContext, AppError, CheckInput, CreateInput, EvictInput, JoinInput, LockRecoverInput,
-    LockStatusInput, LoopInput, PauseInput, ResumeInput, SplitInput, SyncInput, TOOL_NAME,
-    active_updater_config, build_router,
+    LockStatusInput, LoopInput, PauseInput, ResumeInput, SelfUpdateRunInput, SplitInput, SyncInput,
+    TOOL_NAME, active_updater_config, build_router,
     concat::{ConcatExecuteInput, ConcatInput},
     feedback_config, feedback_configuration_error, feedback_panic_config,
     native_stack_rebase::{NativeStackRebaseApplyInput, NativeStackRebasePreviewInput},
@@ -168,7 +168,7 @@ enum Command {
     #[command(subcommand)]
     Mcp(McpCommand),
     /// Download, verify, and atomically install the latest GitHub release.
-    Update,
+    Update(SelfUpdateRunInput),
     /// Inspect, check, or apply a GitHub release update.
     #[command(subcommand)]
     SelfUpdate(SelfUpdateCommand),
@@ -371,7 +371,7 @@ enum SelfUpdateCommand {
     /// Check GitHub releases for a newer version.
     Check,
     /// Download, verify, stage, and promote the latest release.
-    Run,
+    Run(SelfUpdateRunInput),
     /// Internal bounded child; direct invocation is refused.
     #[command(hide = true)]
     RunWorker,
@@ -525,7 +525,7 @@ fn run(cli: &Cli) -> Result<(), i32> {
         },
         Command::Help => run_help(cli),
         Command::Mcp(command) => run_mcp(command, cli.config.as_deref()),
-        Command::Update => run_self_update(cli.json, &SelfUpdateCommand::Run),
+        Command::Update(input) => run_self_update(cli.json, &SelfUpdateCommand::Run(input.clone())),
         Command::SelfUpdate(command) => run_self_update(cli.json, command),
         Command::Feedback(command) => run_feedback(cli.json, command),
     }
@@ -4283,7 +4283,7 @@ fn run_self_update(json: bool, command: &SelfUpdateCommand) -> Result<(), i32> {
     match command {
         SelfUpdateCommand::Status => emit_result(json, self_update_status()),
         SelfUpdateCommand::Check => emit_result(json, self_update_check()),
-        SelfUpdateCommand::Run => emit_result(json, self_update_run()),
+        SelfUpdateCommand::Run(input) => emit_result(json, self_update_run(input)),
         SelfUpdateCommand::RunWorker => emit_result(json, self_update_run_worker()),
     }
 }

@@ -617,8 +617,11 @@ spelling, and both dispatch the identical implementation. They keep release
 polling outside the queue scheduler's budget: one bounded child owns the entire
 operation (30 seconds), each network request is capped at eight seconds, and an
 atomically written 30-minute metadata cache makes the unchanged-release path a
-provider-free fast no-op. Its JSON/MCP result preserves the historical flattened
-update fields and adds cache/timing evidence; a timeout or update failure returns
+provider-free fast no-op. During an operator-reviewed rollout, `cara update
+--refresh` (or `cara self-update run --refresh`) bypasses only that metadata
+cache; asset/checksum verification, staging, and atomic promotion remain
+unchanged. Its JSON/MCP result preserves the historical flattened update fields
+and adds cache/timing evidence, including whether refresh bypassed the cache; a timeout or update failure returns
 `self_update_deferred` with `sync_started: false` while the old binary remains
 installed or a fully verified replacement has already been atomically promoted.
 The release workflow tests the tagged source, packages each binary, verifies

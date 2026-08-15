@@ -1825,7 +1825,7 @@ fn register_self_update_tools(router: &mut ToolRouter<AppContext>) {
     router.add_typed_tool_with_output_schema(
         "self_update_run",
         "Download, verify, stage, and atomically promote beside the exact active first-PATH stable user binary. Shadowed/development/unmanaged binaries fail closed and partial stages never count as success.",
-        |_context: &AppContext, _input: updatable_cli::EmptyArgs| self_update_run(),
+        |_context: &AppContext, input: SelfUpdateRunInput| self_update_run(&input),
     );
 }
 
@@ -2423,6 +2423,7 @@ const SELF_UPDATE_CACHE_TTL_SECS: u64 = 30 * 60;
 const SELF_UPDATE_HTTP_TIMEOUT_SECS: u64 = 8;
 const SELF_UPDATE_MAX_DURATION_SECS: u64 = 30;
 const SELF_UPDATE_WORKER_ENV: &str = "CARA_SELF_UPDATE_BOUNDED_WORKER";
+const SELF_UPDATE_REFRESH_ENV: &str = "CARA_SELF_UPDATE_REFRESH";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SelfUpdateReleaseCache {
@@ -2446,6 +2447,15 @@ struct SelfUpdateReleaseAssetCache {
     browser_download_url: Option<String>,
 }
 
+/// Inputs for one bounded self-update run.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, clap::Args)]
+pub struct SelfUpdateRunInput {
+    /// Bypass only fresh release-metadata cache and read the provider now.
+    #[arg(long)]
+    #[serde(default)]
+    pub refresh: bool,
+}
+
 /// Cache and provider-read facts for one bounded self-update run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SelfUpdateCacheEvidence {
@@ -2453,6 +2463,8 @@ pub struct SelfUpdateCacheEvidence {
     pub age_secs: u64,
     pub ttl_secs: u64,
     pub release_checked: bool,
+    /// Whether an explicit typed refresh bypassed an otherwise usable cache.
+    pub bypassed: bool,
 }
 
 /// Whole-process timing evidence for one bounded self-update run.
@@ -2602,25 +2614,36 @@ fn self_update_deferred(
     )
 }
 
+#[cfg(test)]
 fn self_update_run_with_config(
     config: &updatable_cli::UpdaterConfig,
     now_secs: u64,
 ) -> Result<SelfUpdateRunOutput, AppError> {
+    self_update_run_with_config_options(config, now_secs, false)
+}
+
+fn self_update_run_with_config_options(
+    config: &updatable_cli::UpdaterConfig,
+    now_secs: u64,
+    refresh: bool,
+) -> Result<SelfUpdateRunOutput, AppError> {
     let started = Instant::now();
     let updater = updatable_cli::Updater::new(config.clone());
-    let (latest, cache_hit, cache_age, release_checked) =
-        if let Some((release, age)) = read_self_update_cache(config, now_secs) {
-            (release, true, age, false)
-        } else {
-            let release = updater
-                .check_latest()
-                .map_err(updatable_cli::UpdateError::from)
-                .map_err(|error| {
-                    self_update_deferred("release_check", error.to_string(), started, false)
-                })?;
-            write_self_update_cache(config, now_secs, &release, started)?;
-            (release, false, 0, true)
-        };
+    let cached = (!refresh)
+        .then(|| read_self_update_cache(config, now_secs))
+        .flatten();
+    let (latest, cache_hit, cache_age, release_checked) = if let Some((release, age)) = cached {
+        (release, true, age, false)
+    } else {
+        let release = updater
+            .check_latest()
+            .map_err(updatable_cli::UpdateError::from)
+            .map_err(|error| {
+                self_update_deferred("release_check", error.to_string(), started, false)
+            })?;
+        write_self_update_cache(config, now_secs, &release, started)?;
+        (release, false, 0, true)
+    };
     let status = updater
         .current_status()
         .map_err(updatable_cli::UpdateError::from)
@@ -2673,6 +2696,7 @@ fn self_update_run_with_config(
             age_secs: cache_age,
             ttl_secs: SELF_UPDATE_CACHE_TTL_SECS,
             release_checked,
+            bypassed: refresh,
         },
         timing: SelfUpdateTimingEvidence {
             elapsed_ms: self_update_elapsed_ms(started),
@@ -2745,13 +2769,16 @@ pub fn self_update_check() -> Result<updatable_cli::LatestReleaseInfo, AppError>
 /// independently bounded child process. Killing the child cannot leave a
 /// partially written installed binary: staging and promotion remain owned by
 /// `updatable-cli`'s verified atomic paths.
-pub fn self_update_run() -> Result<SelfUpdateRunOutput, AppError> {
+pub fn self_update_run(input: &SelfUpdateRunInput) -> Result<SelfUpdateRunOutput, AppError> {
     let started = Instant::now();
     let executable = std::env::current_exe()
         .map_err(|error| self_update_deferred("worker_spawn", error.to_string(), started, false))?;
-    let command = crate::command::CommandSpec::new(executable.to_string_lossy())
+    let mut command = crate::command::CommandSpec::new(executable.to_string_lossy())
         .args(["--json", "self-update", "run-worker"])
         .env(SELF_UPDATE_WORKER_ENV, "1");
+    if input.refresh {
+        command = command.env(SELF_UPDATE_REFRESH_ENV, "1");
+    }
     let runner = crate::command::ProcessRunner::new()
         .with_timeout(Duration::from_secs(SELF_UPDATE_MAX_DURATION_SECS));
     let output = runner.run(&command).map_err(|error| {
@@ -2769,7 +2796,8 @@ pub fn self_update_run_worker() -> Result<SelfUpdateRunOutput, AppError> {
             "the internal self-update worker may only be started by the bounded parent command",
         ));
     }
-    self_update_run_with_config(&active_updater_config()?, self_update_now_secs())
+    let refresh = std::env::var(SELF_UPDATE_REFRESH_ENV).as_deref() == Ok("1");
+    self_update_run_with_config_options(&active_updater_config()?, self_update_now_secs(), refresh)
 }
 
 /// Feedback configuration using the shared ecosystem environment convention.
@@ -3340,6 +3368,7 @@ mod tests {
         server.join().unwrap();
         assert!(!first.cache.hit);
         assert!(first.cache.release_checked);
+        assert!(!first.cache.bypassed);
         assert!(!first.outcome.promoted);
 
         // The one-shot server is gone. A second run can succeed only by using
@@ -3348,7 +3377,27 @@ mod tests {
         assert!(second.cache.hit);
         assert_eq!(second.cache.age_secs, 1);
         assert!(!second.cache.release_checked);
+        assert!(!second.cache.bypassed);
         assert!(!second.outcome.promoted);
+    }
+
+    #[test]
+    fn self_update_refresh_bypasses_only_fresh_metadata_cache() {
+        let temporary = tempfile::tempdir().unwrap();
+        let response = release_json("1.0.0", &[]);
+        let (api_base, server) = serve_http_responses(vec![response.clone(), response]);
+        let config = self_update_test_config(temporary.path(), api_base);
+
+        let first = self_update_run_with_config(&config, 1_000).unwrap();
+        assert!(first.cache.release_checked);
+        let refreshed = self_update_run_with_config_options(&config, 1_001, true).unwrap();
+        server.join().unwrap();
+
+        assert!(!refreshed.cache.hit);
+        assert_eq!(refreshed.cache.age_secs, 0);
+        assert!(refreshed.cache.release_checked);
+        assert!(refreshed.cache.bypassed);
+        assert!(!refreshed.outcome.promoted);
     }
 
     #[test]
