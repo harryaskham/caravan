@@ -552,7 +552,14 @@ and each step is an ordinary audited eviction with its own receipts. A refusal
 stops the sequence and returns `eviction_cascade_interrupted`, naming the
 members already released and the one that failed, so an interrupted cascade is
 resumable rather than a silently half-dissolved chain. `--cascade` and `--all`
-are mutually exclusive.
+are mutually exclusive. Every reshape uses one absolute operation deadline from
+validated `sync.max_duration_secs` (capped at one hour) across complete
+full-lifecycle discovery, exact compatibility, provider mutations, physical
+unwind, postcondition comments, and hooks. The read-only status watchdog and
+its partial/last-good evidence are never mutation authority. A large repository
+may therefore spend more than the short human-status budget discovering a
+complete graph while every later Git/GitHub child remains bounded by the same
+operation deadline.
 
 `cara plan concat --source-head-pr S --target-tail-pr T --actor A --reason R`
 produces the immutable no-write recovery plan for appending one entire live

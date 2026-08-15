@@ -230,6 +230,12 @@ cara update | cara self-update status | check | run
 cara feedback status | report
 ```
 
+`cara evict` and `cara split` use one validated reshape deadline across complete
+provider discovery, compatibility, provider writes, physical unwind,
+postconditions, and hooks. They never consume read-only status partials or the
+58-second human-status watchdog as mutation authority, so large repositories
+retain full evidence without making first-party cleanup structurally unreachable.
+
 `cara concat` is the atomic recovery operation for appending one complete live caravan after another. Always run `cara plan concat` first and review its immutable plan hash, exact old/new ordering, complete source rewrite scope, and rollback heads. Execution atomically rewrites every source branch under exact leases, then commits one source-root base edge; it never sequences client-side evict+rejoin. A failed commit restores every original source head, final verification failure restores the membership edge and physical heads, and exact retry returns the durable original journal receipt. Cycles, forks, holds, incomplete topology, stale plan hashes, conflicts, and ambiguous rollback all fail closed.
 
 `cara next-candidate` selects the canonical priority/FIFO attempt. `cara admit` is the bounded writer counterpart for event-driven controllers: it hot-discovers that same global order, considers at most one candidate, and reuses normal automatic-admission membership plus exact deferred-gate rerun policy under the shared writer fence. The event PR is never selected merely because it woke the workflow. Existing repair, parking, promotion/merge, physical convergence, or external-decision work is reported without mutation; `cara admit` cannot perform it. Its JSON/MCP receipt returns `admitted`, `no_candidate`, `waiting_for_existing_convergence`, `external_decision`, or `retryable_provider_race` plus an exact cursor.

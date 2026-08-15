@@ -25,6 +25,18 @@ use crate::{AppContext, AppError, EvictInput, SplitInput};
 const ACTIVE_LABEL: &str = "caravan";
 const EVICTED_LABEL: &str = "caravan-evicted";
 const FORCE_LABEL: &str = "caravan-force";
+const MAX_RESHAPE_OPERATION_SECS: u64 = 3_600;
+
+fn reshape_operation_deadline(context: &AppContext) -> std::time::Instant {
+    std::time::Instant::now()
+        + std::time::Duration::from_secs(
+            context
+                .config
+                .sync
+                .max_duration_secs
+                .min(MAX_RESHAPE_OPERATION_SECS),
+        )
+}
 
 /// Reshape operation kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -114,7 +126,8 @@ pub fn evict(context: &AppContext, input: &EvictInput) -> Result<ReshapeOutput, 
 /// stops at the first refusal rather than leaving a half-dissolved chain
 /// unreported.
 fn evict_many(context: &AppContext, input: &EvictInput) -> Result<ReshapeOutput, AppError> {
-    let status = read::status(context)?;
+    let operation_deadline = reshape_operation_deadline(context);
+    let status = read::status_with_deadline(context, operation_deadline)?;
     let selected = input
         .pr
         .map(PrNumber)
@@ -151,11 +164,12 @@ fn evict_many(context: &AppContext, input: &EvictInput) -> Result<ReshapeOutput,
     let mut last = None;
     // Tail-first: the last member always has no child, so no gap is opened.
     for member in ordered.iter().rev().copied() {
-        match execute_live(
+        match execute_live_before(
             context,
             ReshapeOperation::Evict,
             Some(member),
             Some(input.reason.clone()),
+            operation_deadline,
         ) {
             Ok(output) => {
                 released.push(member);
@@ -214,21 +228,40 @@ fn execute_live(
     selected: Option<PrNumber>,
     reason: Option<String>,
 ) -> Result<ReshapeOutput, AppError> {
+    execute_live_before(
+        context,
+        operation,
+        selected,
+        reason,
+        reshape_operation_deadline(context),
+    )
+}
+
+fn execute_live_before(
+    context: &AppContext,
+    operation: ReshapeOperation,
+    selected: Option<PrNumber>,
+    reason: Option<String>,
+    operation_deadline: std::time::Instant,
+) -> Result<ReshapeOutput, AppError> {
     let lock = context.acquire_writer_operation(operation.name())?;
     let timeout = std::time::Duration::from_secs(context.config.command_timeout_secs);
-    let status = read::status(context)?;
+    let status = read::status_with_deadline(context, operation_deadline)?;
     let repository = status.repository.clone();
     let failure_status = status.clone();
-    let checker =
-        GitCompatibilityChecker::new(&context.repository_path, "origin").with_timeout(timeout);
-    let runner =
-        crate::command::ProcessRunner::in_directory(&context.repository_path).with_timeout(timeout);
+    let checker = GitCompatibilityChecker::new(&context.repository_path, "origin")
+        .with_timeout(timeout)
+        .with_operation_deadline(operation_deadline);
+    let runner = crate::command::ProcessRunner::in_directory(&context.repository_path)
+        .with_timeout(timeout)
+        .with_operation_deadline(operation_deadline);
     let provider_telemetry_runner = runner.clone();
     let provider = GitHubMutationAdapter::new(lock.runner(runner));
     let requested_reason = reason.clone();
     let rewrite = RewriteContext {
         repository_path: &context.repository_path,
         timeout,
+        operation_deadline,
         enabled: context.config.physical_branch_rewrites_enabled(),
         writer_fence: lock.remote_fence(),
     };
@@ -262,7 +295,11 @@ fn execute_live(
                 &error,
             );
             let error = hooks::attach_events(error, std::slice::from_ref(&event));
-            let deliveries = hooks::dispatch_events(context, std::slice::from_ref(&event))?;
+            let deliveries = hooks::dispatch_events_before(
+                context,
+                std::slice::from_ref(&event),
+                operation_deadline,
+            )?;
             return Err(hooks::attach_deliveries(error, &deliveries));
         }
         Err(error) => return Err(error),
@@ -299,7 +336,8 @@ fn execute_live(
         BTreeMap::from([("receipt".to_owned(), json!(output.receipt))]),
     );
     output.events.push(event);
-    output.hook_deliveries = hooks::dispatch_events(context, &output.events)?;
+    output.hook_deliveries =
+        hooks::dispatch_events_before(context, &output.events, operation_deadline)?;
     Ok(output)
 }
 
@@ -402,6 +440,7 @@ fn eviction_failed_event(
 struct RewriteContext<'a> {
     repository_path: &'a std::path::Path,
     timeout: std::time::Duration,
+    operation_deadline: std::time::Instant,
     enabled: bool,
     writer_fence: Option<std::sync::Arc<crate::remote_lease::RemoteLeaseGuard>>,
 }
@@ -943,6 +982,7 @@ fn unwind_descendants(
             target,
             default,
             crate::physical_rebase::RebaseExecutionBudget::new(rewrite.timeout)
+                .with_deadline(rewrite.operation_deadline)
                 .with_writer_fence(rewrite.writer_fence.clone())
                 .replaying_after(boundary.oid.clone())
                 .because(crate::physical_rebase::BranchRewriteReason::ParentEvicted {
@@ -2103,6 +2143,32 @@ mod tests {
         assert_eq!(state[&PrNumber(2)].base.name, "main");
         assert_eq!(state[&PrNumber(2)].auto_merge, AutoMergeState::squash());
         assert_eq!(output.resulting_fleet.caravans.len(), 2);
+    }
+
+    #[test]
+    fn reshape_uses_the_mutation_budget_across_discovery_and_every_write_boundary() {
+        let mut context = AppContext::default();
+        context.config.sync.max_duration_secs = 900;
+        let before = std::time::Instant::now();
+        let deadline = reshape_operation_deadline(&context);
+        let remaining = deadline.saturating_duration_since(before);
+        assert!(remaining >= std::time::Duration::from_secs(900));
+        assert!(remaining < std::time::Duration::from_secs(901));
+
+        let source = include_str!("reshape.rs")
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production source");
+        assert!(!source.contains("read::status(context)"));
+        assert_eq!(source.matches("read::status_with_deadline(").count(), 2);
+        assert_eq!(source.matches(".with_operation_deadline(").count(), 2);
+        assert_eq!(
+            source
+                .matches(".with_deadline(rewrite.operation_deadline)")
+                .count(),
+            1
+        );
+        assert_eq!(source.matches("hooks::dispatch_events_before(").count(), 2);
     }
 
     #[test]
