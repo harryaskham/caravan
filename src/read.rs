@@ -5708,6 +5708,10 @@ mod tests {
                 .any(|row| row.pr == deferred.number)
         );
 
+        let disabled = resolve_admission(&deferred_status.analysis, &labels);
+        assert_eq!(disabled.next_candidate, Some(later.number));
+        assert!(disabled.skipped.iter().any(|row| row.pr == deferred.number));
+
         deferred.checks.push(crate::model::CheckSnapshot {
             name: "source-test".to_owned(),
             state: crate::model::CheckState::Failure,
