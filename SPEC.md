@@ -595,7 +595,7 @@ when repository access or `rebase_on_join` is unavailable, the receipt instead
 names the descendants that still carry the evicted patch rather than implying a
 removal that did not happen.
 
-Eviction adds `caravan-evicted`, removes `caravan` and `caravan-force`, and disables auto-merge. If the evicted PR has a child, that child is retargeted to the evicted PR's predecessor (or the default branch when evicting the head), but only if the new edge and fleet are compatible. The command fails before mutation if it cannot safely close the gap. Evicting a tail needs no rejoin.
+Eviction adds `caravan-evicted`, removes `caravan` and `caravan-force`, and disables auto-merge. If the evicted PR has a child, that child is retargeted to the evicted PR's predecessor (or the default branch when evicting the head). Middle eviction still fails before mutation when closing the gap would introduce a new edge/topology problem. An explicitly selected head is different: it has no surviving predecessor edge and is always owner-release authority once exact target/provider/membership facts are proven. Cara releases the head even when the promoted child retains exact repair problems, disables replacement-head auto-merge, and returns those problems plus a typed `safe_next_action`; ordinary sync remains fail-closed until repair. Source heads and descendants are never discarded, and the receipt names descendants which still inherit the released patch. Evicting a tail needs no rejoin.
 
 Splitting retargets the selected non-head to the default branch, making it a new head. Both resulting caravans must satisfy all graph and fleet compatibility invariants.
 
