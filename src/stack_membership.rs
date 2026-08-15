@@ -257,11 +257,12 @@ pub fn plan_native_membership(
                 "the singleton root must target the configured default branch ref",
             ));
         }
-        // The Stack represents immutable PR generations, including the root's
-        // exact provider-recorded base OID. Main may advance after the root was
-        // admitted; using the newer fleet-default OID makes an otherwise exact
-        // desired topology self-contradictory before provider access.
-        let topology = topology_from_members(&root.base, [root, &output.pull_request])?;
+        // GitHub Stack creation accepts a base ref, not an historical OID, and
+        // resolves that ref at mutation time. Lease the Stack-level base to the
+        // exact current default generation while each PR entry preserves its
+        // provider-recorded immutable base/head identity. The validator allows
+        // only the root's same-repository/same-ref historical base edge.
+        let topology = topology_from_members(facts.default_branch, [root, &output.pull_request])?;
         return Ok(NativeMembershipPlan::Create {
             plan: Box::new(GitHubStackCreatePlan {
                 operation_id,
@@ -626,7 +627,7 @@ mod tests {
     }
 
     #[test]
-    fn joining_a_stale_default_oid_preserves_the_exact_root_generation() {
+    fn joining_a_stale_default_oid_leases_current_stack_base_and_preserves_root_entry() {
         let current_main = branch("main", "main-current");
         let stale_main = branch("main", "main-at-root-admission");
         let root = pull(101, stale_main.clone());
@@ -644,7 +645,7 @@ mod tests {
         let NativeMembershipPlan::Create { plan } = plan else {
             panic!("expected create")
         };
-        assert_eq!(plan.desired.base, stale_main);
+        assert_eq!(plan.desired.base, current_main);
         assert_eq!(plan.desired.entries[0].base, root.base);
         assert_eq!(plan.desired.entries[1].base, root.head);
 

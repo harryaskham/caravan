@@ -773,17 +773,18 @@ fn build_plan_with_policy(
             }),
         ));
     }
-    // Recovery recreates the exact immutable PR generation. A later main OID
-    // is compatibility/landing evidence, not permission to rewrite the Stack's
-    // recorded root base before provider creation.
-    let desired = crate::stack_membership::topology_from_members(root_base, pulls.iter().copied())
-        .map_err(|error| {
-            refusal(
-                "github_stack_recovery_topology_invalid",
-                &error.to_string(),
-                json!({"root": root, "mutated": false}),
-            )
-        })?;
+    // GitHub creates against the current Stack base ref generation. Preserve
+    // each PR entry's immutable base/head identity, including the historical
+    // root base OID, while leasing the Stack-level base to current default.
+    let desired =
+        crate::stack_membership::topology_from_members(facts.default_branch, pulls.iter().copied())
+            .map_err(|error| {
+                refusal(
+                    "github_stack_recovery_topology_invalid",
+                    &error.to_string(),
+                    json!({"root": root, "mutated": false}),
+                )
+            })?;
     let config_fingerprint = recovery_config_fingerprint(config);
     let topology_hash = crate::membership::fnv1a64(
         &serde_json::to_vec(&desired).expect("native topology serializes"),
@@ -1739,7 +1740,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_preserves_stale_root_oid_but_rejects_a_different_base_ref() {
+    fn recovery_leases_current_stack_base_and_preserves_stale_root_entry() {
         let directory = tempfile::tempdir().unwrap();
         let context = test_context(directory.path());
         let current_main = branch("main", "cccccccccccccccccccccccccccccccccccccccc");
@@ -1759,7 +1760,7 @@ mod tests {
             None,
         )
         .expect("default movement does not rewrite recovery topology");
-        assert_eq!(plan.desired.base, stale_main);
+        assert_eq!(plan.desired.base, current_main);
         assert_eq!(plan.desired.entries[0].base, root.base);
 
         let mut wrong_ref = pulls;
