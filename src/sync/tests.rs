@@ -3425,6 +3425,7 @@ fn enrolled_deferred_gate_resumes_with_exact_actions_workflow_rerun() {
         member_label: "caravan".to_owned(),
     };
     let mut member = caravan_member(1, "one", "main");
+    member.labels.insert("caravan-parked".to_owned());
     member.checks = vec![check(&gate.context, CheckState::Failure, Some(10))];
     let provider = FakeProvider::with_pull_requests(vec![member.clone()]);
     provider.require_contexts("main", &[&gate.context]);
@@ -3456,8 +3457,8 @@ fn enrolled_deferred_gate_resumes_with_exact_actions_workflow_rerun() {
     let mut status = caravan_status(vec![member.clone()], Some(member.number), true);
     status.auto_admission.admission_gate = Some(gate);
 
-    let progress = execute(&status, &provider, false, false, false)
-        .expect("an already-enrolled deferred gate resumes without parking");
+    let progress = execute(&status, &provider, true, false, false)
+        .expect("sync --all selects only the parked exact deferred-gate recovery");
 
     assert_eq!(
         provider.workflow_reruns.borrow().as_slice(),
@@ -3465,7 +3466,10 @@ fn enrolled_deferred_gate_resumes_with_exact_actions_workflow_rerun() {
     );
     assert!(provider.rerequests.borrow().is_empty());
     assert!(progress.root_merge.is_empty());
-    assert!(!provider.pulls.borrow()[&member.number].has_label("caravan-parked"));
+    assert!(
+        provider.pulls.borrow()[&member.number].has_label("caravan-parked"),
+        "retrigger recovery waits for fresh CI before ordinary unpark"
+    );
 }
 
 #[test]
