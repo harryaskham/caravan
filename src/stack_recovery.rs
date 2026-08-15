@@ -191,7 +191,7 @@ pub struct NativeStackRecoveryOutput {
 
 struct RecoveryFacts<'a> {
     repository: &'a RepositoryId,
-    healthy: bool,
+    graph_problems: &'a [crate::model::GraphProblem],
     default_branch: &'a BranchSnapshot,
     caravans: &'a [Caravan],
     pulls: &'a BTreeMap<PrNumber, PullRequestSnapshot>,
@@ -203,11 +203,7 @@ impl<'a> RecoveryFacts<'a> {
     fn from_status(status: &'a StatusOutput) -> Self {
         Self {
             repository: &status.repository,
-            // Missing native Stack representation intentionally makes overall
-            // status unhealthy; recovery instead requires healthy graph and
-            // compatibility analysis, then admits only the expected backend
-            // `github_stack_absent` problem below.
-            healthy: status.analysis.healthy(),
+            graph_problems: &status.analysis.fleet.problems,
             default_branch: &status.analysis.fleet.default_branch,
             caravans: &status.analysis.fleet.caravans,
             pulls: &status.analysis.pull_requests,
@@ -720,6 +716,18 @@ fn require_recovery_caravan<'a>(
                 json!({"root": root, "mutated": false}),
             )
         })?;
+    let blocking_problems = facts
+        .graph_problems
+        .iter()
+        .filter(|problem| problem.prs.iter().any(|pr| caravan.members.contains(pr)))
+        .collect::<Vec<_>>();
+    if !blocking_problems.is_empty() {
+        return Err(refusal(
+            "github_stack_recovery_target_unhealthy",
+            "target caravan has unresolved graph problems",
+            json!({"root": root, "problems": blocking_problems, "mutated": false}),
+        ));
+    }
     if caravan.members.len() < 2 {
         return Err(refusal(
             "github_stack_recovery_singleton_forbidden",
@@ -900,13 +908,6 @@ fn collect_member_evidence<'a>(
 }
 
 fn require_rollout(config: &CaravanConfig, facts: &RecoveryFacts<'_>) -> Result<(), AppError> {
-    if !facts.healthy {
-        return Err(refusal(
-            "github_stack_recovery_status_unhealthy",
-            "repository graph or compatibility analysis is unhealthy; provider absence is not mutation authority",
-            json!({"mutated": false}),
-        ));
-    }
     if config.stack_type != StackType::Github
         || !config.stack_rollout.mutations_opt_in
         || config.stack_rollout.reviewed_by.trim().is_empty()
@@ -928,7 +929,10 @@ fn require_rollout(config: &CaravanConfig, facts: &RecoveryFacts<'_>) -> Result<
         .backend
         .problems
         .iter()
-        .filter(|problem| problem.code != "github_stack_absent")
+        .filter(|problem| {
+            problem.code != "github_stack_absent"
+                && problem.code != "github_stack_member_order_drift"
+        })
         .collect::<Vec<_>>();
     if !unexpected_problems.is_empty() {
         return Err(refusal(
@@ -1415,7 +1419,7 @@ mod tests {
                 .values()
                 .next()
                 .map_or(&default.repository, |pull| &pull.head.repository),
-            healthy: true,
+            graph_problems: &[],
             default_branch: default,
             caravans,
             pulls,
@@ -1547,10 +1551,18 @@ mod tests {
         let mut exact_backend = backend.clone();
         exact_backend.native_stacks[0].consistency = StackConsistency::Exact;
         assert!(!needs_auto_recovery(&exact_backend, &caravans[0]));
+        let unrelated = [crate::model::GraphProblem {
+            kind: crate::model::GraphProblemKind::DissolvedMember,
+            prs: vec![PrNumber(999)],
+            message: "unrelated historical damage".to_owned(),
+        }];
+        let mut scoped_facts = facts(&main, &caravans, &pulls, &backend);
+        scoped_facts.graph_problems = &unrelated;
+        assert!(require_recovery_caravan(&scoped_facts, PrNumber(101)).is_ok());
 
         let (plan, observation) = build_plan_with_policy(
             &config(),
-            &facts(&main, &caravans, &pulls, &backend),
+            &scoped_facts,
             PrNumber(101),
             "caravan-scheduler",
             "stateless exact-prefix recovery",
