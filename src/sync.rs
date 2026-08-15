@@ -4906,6 +4906,7 @@ where
                 candidate.number,
                 target_tail,
                 candidate_order.priority_label,
+                deferred_gate.map(|gate| gate.context.as_str()),
                 operation_deadline,
                 github_budget,
                 writer_guard,
