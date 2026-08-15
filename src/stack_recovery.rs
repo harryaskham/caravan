@@ -704,17 +704,10 @@ fn build_plan(
     build_plan_with_policy(config, facts, root, actor, reason, pending, true)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_plan_with_policy(
-    config: &CaravanConfig,
-    facts: &RecoveryFacts<'_>,
+fn require_recovery_caravan<'a>(
+    facts: &'a RecoveryFacts<'_>,
     root: PrNumber,
-    actor: &str,
-    reason: &str,
-    pending: Option<&NativeMembershipCheckpoint>,
-    require_green: bool,
-) -> Result<(NativeStackRecoveryPlan, NativeStackRecoveryObservation), AppError> {
-    require_rollout(config, facts)?;
+) -> Result<&'a Caravan, AppError> {
     let caravan = facts
         .caravans
         .iter()
@@ -730,12 +723,7 @@ fn build_plan_with_policy(
         return Err(refusal(
             "github_stack_recovery_singleton_forbidden",
             "missing-Stack recovery is only for authoritative multi-member caravans",
-            json!({
-                "root": root,
-                "members": caravan.members,
-                "mutated": false,
-                "safe_next_action": "use the reviewed singleton landing route; never create a fake one-member provider Stack",
-            }),
+            json!({"root": root, "members": caravan.members, "mutated": false}),
         ));
     }
     if caravan.parked {
@@ -756,7 +744,21 @@ fn build_plan_with_policy(
             json!({"root": root, "mutated": false}),
         ));
     }
+    Ok(caravan)
+}
 
+#[allow(clippy::too_many_arguments)]
+fn build_plan_with_policy(
+    config: &CaravanConfig,
+    facts: &RecoveryFacts<'_>,
+    root: PrNumber,
+    actor: &str,
+    reason: &str,
+    pending: Option<&NativeMembershipCheckpoint>,
+    require_green: bool,
+) -> Result<(NativeStackRecoveryPlan, NativeStackRecoveryObservation), AppError> {
+    require_rollout(config, facts)?;
+    let caravan = require_recovery_caravan(facts, root)?;
     let (pulls, members) = collect_member_evidence(facts, caravan, require_green)?;
     let root_base = &pulls.first().expect("multi-member caravan has a root").base;
     if root_base.repository != facts.default_branch.repository
@@ -793,6 +795,7 @@ fn build_plan_with_policy(
     let (pending_hash, action) = recovery_action(
         pending,
         facts.repository,
+        facts.backend,
         caravan,
         &desired,
         &pulls,
@@ -997,9 +1000,55 @@ fn require_member_green(pull: &PullRequestSnapshot) -> Result<(), AppError> {
     Ok(())
 }
 
+fn stateless_prefix_action(
+    repository: &RepositoryId,
+    backend: &StackBackendStatus,
+    caravan: &Caravan,
+    desired: &GitHubStackTopology,
+    pulls: &[&PullRequestSnapshot],
+    operation_id: &str,
+    actor: &str,
+) -> Result<Option<NativeMembershipPlan>, AppError> {
+    let prefixes = backend
+        .native_stacks
+        .iter()
+        .filter_map(|native| {
+            let count = native.stack.pull_requests.len();
+            (count > 0 && count + 1 == caravan.members.len())
+                .then(|| &caravan.members[..count])
+                .filter(|members| {
+                    exact_prefix_mapping(native, native.stack.number, members, desired)
+                })
+                .map(|members| (native, members))
+        })
+        .collect::<Vec<_>>();
+    match prefixes.as_slice() {
+        [] => Ok(None),
+        [(native, members)] => Ok(Some(NativeMembershipPlan::Add {
+            repository: repository.clone(),
+            operation_id: operation_id.to_owned(),
+            actor: actor.to_owned(),
+            stack_number: native.stack.number,
+            expected_members: members.to_vec(),
+            candidate: Box::new((*pulls.last().expect("one exact missing tail candidate")).clone()),
+        })),
+        _ => Err(refusal(
+            "github_stack_recovery_prefix_ambiguous",
+            "multiple provider Stacks match the current logical prefix",
+            json!({
+                "root": caravan.id,
+                "matching_stacks": prefixes.iter().map(|(native, _)| native.stack.number).collect::<Vec<_>>(),
+                "mutated": false,
+            }),
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn recovery_action(
     pending: Option<&NativeMembershipCheckpoint>,
     repository: &RepositoryId,
+    backend: &StackBackendStatus,
     caravan: &Caravan,
     desired: &GitHubStackTopology,
     pulls: &[&PullRequestSnapshot],
@@ -1014,7 +1063,17 @@ fn recovery_action(
         }),
     };
     let Some(pending) = pending else {
-        return Ok((None, legacy_create()));
+        let action = stateless_prefix_action(
+            repository,
+            backend,
+            caravan,
+            desired,
+            pulls,
+            operation_id,
+            actor,
+        )?
+        .unwrap_or_else(legacy_create);
+        return Ok((None, action));
     };
     if !pending.verify() || pending.caravan_id != caravan.id {
         return Err(refusal(
@@ -1438,6 +1497,78 @@ mod tests {
         assert_eq!(provider.creates.get(), 1);
         assert_eq!(provider.pulls[&PrNumber(101)].head, root.head);
         assert_eq!(provider.pulls[&PrNumber(102)].head, child.head);
+    }
+
+    #[test]
+    fn stateless_exact_prefix_reconstructs_one_missing_tail_add() {
+        let main = branch("main", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let root = pull(101, main.clone());
+        let child = pull(102, root.head.clone());
+        let tail = pull(103, child.head.clone());
+        let caravans =
+            vec![Caravan::new(vec![PrNumber(101), PrNumber(102), PrNumber(103)]).unwrap()];
+        let pulls = BTreeMap::from([
+            (root.number, root.clone()),
+            (child.number, child.clone()),
+            (tail.number, tail.clone()),
+        ]);
+        let native = NativeStackStatus {
+            stack: GitHubStackSnapshot {
+                id: 7,
+                number: 7,
+                node_id: "S_prefix".to_owned(),
+                base: GitHubStackBase {
+                    ref_name: "main".to_owned(),
+                },
+                open: true,
+                created_at: String::new(),
+                pull_requests: [&root, &child]
+                    .into_iter()
+                    .map(|pull| crate::github::GitHubStackPullRequest {
+                        number: pull.number.0,
+                        state: "OPEN".to_owned(),
+                        draft: false,
+                        merged_at: None,
+                        head: crate::github::GitHubStackPullRequestHead {
+                            ref_name: pull.head.name.clone(),
+                            sha: pull.head.oid.clone(),
+                        },
+                    })
+                    .collect(),
+            },
+            caravan_id: Some(PrNumber(101)),
+            consistency: StackConsistency::Drifted,
+            ancestry: Vec::new(),
+            problems: Vec::new(),
+        };
+        let backend = stack_backend_fixture(vec![native]);
+
+        let (plan, observation) = build_plan_with_policy(
+            &config(),
+            &facts(&main, &caravans, &pulls, &backend),
+            PrNumber(101),
+            "caravan-scheduler",
+            "stateless exact-prefix recovery",
+            None,
+            false,
+        )
+        .expect("one exact provider prefix reconstructs one tail add without checkpoint");
+
+        assert_eq!(
+            observation,
+            NativeStackRecoveryObservation::ExactPrefixPendingAdd
+        );
+        assert!(plan.pending_membership_checkpoint_hash.is_none());
+        assert!(matches!(
+            plan.action,
+            NativeMembershipPlan::Add {
+                stack_number: 7,
+                ref expected_members,
+                ref candidate,
+                ..
+            } if expected_members == &[PrNumber(101), PrNumber(102)]
+                && candidate.number == tail.number
+        ));
     }
 
     #[test]
