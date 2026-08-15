@@ -9053,6 +9053,55 @@ fn root_first_lands_one_green_root_before_tail_analysis() {
 }
 
 #[test]
+fn root_first_refuses_tail_containing_evicted_unmerged_middle_bd_70f4d9() {
+    let mut landed_root = caravan_member(1, "landed-root", "main");
+    landed_root.state = PullRequestState::Merged;
+    landed_root.merged_at = Some("2026-08-15T10:00:00Z".to_owned());
+
+    let mut red_middle = caravan_member(2, "red-middle", "main");
+    red_middle.labels.remove("caravan");
+    red_middle.labels.insert("caravan-evicted".to_owned());
+    red_middle.checks = vec![check("ci", CheckState::Failure, None)];
+
+    // The provider already retargeted the physical tail to main, which erases
+    // the branch edge from graph membership while its Git history still
+    // contains the evicted middle generation.
+    let tail = caravan_member(3, "tail", "main");
+    let pulls = vec![landed_root, red_middle, tail];
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    let status = caravan_status(pulls, Some(PrNumber(3)), true);
+
+    let error = execute_root_first(
+        &status,
+        &provider,
+        false,
+        u32::MAX,
+        RequiredRunsPolicy::default(),
+    )
+    .expect_err("an evicted unmerged ancestor must block the retargeted tail");
+
+    assert_eq!(error.code(), "root_merge_refused");
+    assert_eq!(
+        error.details().and_then(|details| {
+            details
+                .get("cause_code")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        }),
+        Some("unmerged_ancestor_contained_by_root".to_owned())
+    );
+    assert_eq!(
+        provider.pulls.borrow()[&PrNumber(3)].state,
+        PullRequestState::Open,
+        "the tail remains open and no parent-only content reaches main"
+    );
+    assert!(
+        !provider.calls.borrow().contains(&MutationKind::SquashMerge),
+        "the refusal occurs before any merge write"
+    );
+}
+
+#[test]
 fn a_promoted_green_root_is_squash_merged_by_cara_with_sealed_landing_proof() {
     let pulls = vec![caravan_member(1, "one", "main")];
     let provider = FakeProvider::with_pull_requests(pulls.clone());

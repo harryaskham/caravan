@@ -33,6 +33,7 @@ use std::time::Duration;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::generation::CommitRelation;
 use crate::model::{
     AutoMergeState, BranchSnapshot, CommitOid, CumulativeTreeProof, MergeMethod, OperationId,
     PrNumber, PullRequestSnapshot, PullRequestState, RepositoryId,
@@ -241,6 +242,10 @@ pub enum RootMergeFailureCause {
     /// reintroduce content the default branch no longer carries, which is what
     /// an operator revert or discard of an already-landed ancestor looks like.
     DefaultBranchDivergedFromRetainedPatchSet,
+    /// The exact root contains an evicted or closed predecessor generation that
+    /// has not itself merged. Retargeting the child must never turn that hidden
+    /// parent patch into merge authority.
+    UnmergedAncestorContainedByRoot,
     /// The forge itself still refuses to merge this exact head.
     ///
     /// An independent cross-check, deliberately applied only here. By merge time
@@ -265,6 +270,7 @@ impl RootMergeFailureCause {
             Self::DefaultBranchDivergedFromRetainedPatchSet => {
                 "default_branch_diverged_from_retained_patch_set"
             }
+            Self::UnmergedAncestorContainedByRoot => "unmerged_ancestor_contained_by_root",
             Self::ForgeRefusesMerge => "forge_refuses_merge",
         }
     }
@@ -277,6 +283,7 @@ impl RootMergeFailureCause {
             Self::MergedIntoUnexpectedBase
                 | Self::MergeNotReachableFromDefault
                 | Self::DefaultBranchDivergedFromRetainedPatchSet
+                | Self::UnmergedAncestorContainedByRoot
         )
     }
 
@@ -307,6 +314,9 @@ impl RootMergeFailureCause {
             }
             Self::DefaultBranchDivergedFromRetainedPatchSet => {
                 "prove or rescope this caravan's content against the exact default branch before it may land: an already-landed ancestor was reverted or discarded, so this generation still carries content the default branch deliberately no longer has"
+            }
+            Self::UnmergedAncestorContainedByRoot => {
+                "retire, merge, or remove the unmerged ancestor patch from this root and obtain fresh CI before retrying; never land a descendant that silently carries an evicted parent"
             }
         }
     }
@@ -423,6 +433,17 @@ impl RootPromotionReceipt {
     }
 }
 
+/// One provider comparison proving whether an evicted/closed generation is
+/// embedded in the exact root considered for merge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RootAncestorContainmentEvidence {
+    pub pr: PrNumber,
+    pub state: PullRequestState,
+    pub head: BranchSnapshot,
+    pub relation_to_root: CommitRelation,
+    pub relation_to_default: CommitRelation,
+}
+
 /// Cumulative tree/ancestry evidence retained alongside one direct merge.
 ///
 /// The live incident showed why this must be explicit: an already-merged
@@ -441,6 +462,11 @@ pub struct RootMergeAncestry {
     /// Cumulative-tree proof that authorized this landing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cumulative_tree: Option<CumulativeTreeProof>,
+    /// Evicted/closed generations checked for hidden parent content before the
+    /// merge. A contained non-merged generation is refused and never reaches a
+    /// completed receipt.
+    #[serde(default)]
+    pub ancestor_containment: Vec<RootAncestorContainmentEvidence>,
     /// Merged predecessor whose content this root already carries cumulatively.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub predecessor: Option<PrNumber>,
@@ -871,6 +897,7 @@ mod tests {
                 next_root_base_after: Some("main".to_owned()),
                 merge_commit: Some(CommitOid("3da6addb".to_owned())),
                 cumulative_tree: None,
+                ancestor_containment: Vec::new(),
             },
             1,
             provenance(
