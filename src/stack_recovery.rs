@@ -1413,6 +1413,11 @@ mod tests {
         .expect("complete provider absence reconstructs exact membership without local state");
         assert_eq!(observation, NativeStackRecoveryObservation::Absent);
         assert!(plan.pending_membership_checkpoint_hash.is_none());
+        assert!(
+            crate::stack_membership::load_pending(directory.path(), PrNumber(101))
+                .unwrap()
+                .is_none()
+        );
         let provider = FakeRecoveryProvider {
             pulls,
             disposition: GitHubStackMutationDisposition::Completed,
@@ -1423,6 +1428,12 @@ mod tests {
             .expect("provider API truth authorizes one exact create");
 
         assert!(output.mutated);
+        assert!(output.provider_receipt.as_ref().unwrap().verify());
+        assert!(
+            crate::stack_membership::load_pending(directory.path(), PrNumber(101))
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(provider.creates.get(), 1);
         assert_eq!(provider.pulls[&PrNumber(101)].head, root.head);
         assert_eq!(provider.pulls[&PrNumber(102)].head, child.head);
