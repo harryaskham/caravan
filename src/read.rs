@@ -3738,10 +3738,9 @@ fn native_admission_authorization(
         report.candidate == candidate.head
             && report.target == *target
             && report.outcome == CompatibilityOutcome::Clean
-            && report
-                .diagnostic
-                .as_deref()
-                .is_some_and(|diagnostic| exact_git_diagnostic(diagnostic, &synthetic.parents[0]))
+            && report.diagnostic.as_deref().is_some_and(|diagnostic| {
+                exact_git_diagnostic(diagnostic, &candidate.head.repository)
+            })
     })?;
     Some(AdmissionCompatibilityAuthorization::ExactGitProof {
         stale_identity: Box::new(identity.clone()),
@@ -3749,15 +3748,22 @@ fn native_admission_authorization(
     })
 }
 
-fn exact_git_diagnostic(diagnostic: &str, stale_base: &crate::model::CommitOid) -> bool {
-    diagnostic.contains("object_source=exact_remote_refs")
+fn exact_git_diagnostic(diagnostic: &str, repository: &crate::model::RepositoryId) -> bool {
+    diagnostic.contains(&format!("repository={}", repository.slug()))
+        && diagnostic.contains("object_source=exact_remote_refs")
         && diagnostic.contains("objects_present=true")
         && diagnostic.contains("shallow=false")
         && diagnostic.contains("filter=none")
+        // An immutable branch may have diverged from main before the provider's
+        // stale synthetic first parent. Its real merge base is therefore a
+        // historical ancestor, not that advisory synthetic parent. Requiring
+        // both to match rejects the exact current-target proof the fallback is
+        // meant to authorize. We require a concrete merge base and tree while
+        // candidate/target/repository/head identity stays fenced above.
         && diagnostic
             .split_ascii_whitespace()
             .find_map(|field| field.strip_prefix("merge_base="))
-            == Some(stale_base.0.as_str())
+            .is_some_and(|base| !base.is_empty())
         && diagnostic
             .split_ascii_whitespace()
             .find_map(|field| field.strip_prefix("merge_tree="))
@@ -6684,6 +6690,37 @@ mod tests {
                 ..
             }) if compatibility.target == status.analysis.fleet.default_branch
         ));
+    }
+
+    #[test]
+    fn native_stale_synthetic_parent_accepts_historical_exact_merge_base() {
+        let candidate = pr(60, "candidate", "main", false);
+        let mut status = status(candidate.clone(), Vec::new());
+        status.stack_backend.configured = crate::config::StackType::Github;
+        let identity =
+            native_candidate_identity(&candidate, crate::model::MergeCandidateFreshness::StaleBase);
+        let mut proof =
+            exact_native_checker(&candidate.head, &status.analysis.fleet.default_branch).unwrap();
+        proof.diagnostic = proof.diagnostic.map(|diagnostic| {
+            diagnostic.replace(
+                &format!("merge_base={}", branch("oldbase").oid),
+                &format!("merge_base={}", branch("historical").oid),
+            )
+        });
+
+        assert!(matches!(
+            native_new_authorization(&status, &candidate, Some(&identity), &[proof.clone()]),
+            Some(AdmissionCompatibilityAuthorization::ExactGitProof { .. })
+        ));
+
+        let mut foreign = proof;
+        foreign.diagnostic = foreign.diagnostic.map(|diagnostic| {
+            diagnostic.replace("repository=harryaskham/caravan", "repository=fork/caravan")
+        });
+        assert!(
+            native_new_authorization(&status, &candidate, Some(&identity), &[foreign]).is_none(),
+            "an exact proof for another repository must never authorize admission"
+        );
     }
 
     #[test]

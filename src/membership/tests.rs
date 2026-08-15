@@ -439,7 +439,7 @@ fn exact_native_clean(
         outcome: CompatibilityOutcome::Clean,
         conflicting_paths: Vec::new(),
         diagnostic: Some(format!(
-            "repository=acme/widgets object_source=exact_remote_refs objects_present=true shallow=false filter=none merge_base={} merge_tree=clean",
+            "repository=harryaskham/caravan object_source=exact_remote_refs objects_present=true shallow=false filter=none merge_base={} merge_tree=clean",
             branch("old-main").oid
         )),
     })
