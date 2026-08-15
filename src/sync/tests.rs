@@ -59,6 +59,8 @@ struct FakeProvider {
     rerequestable_suites: RefCell<BTreeMap<u64, String>>,
     /// Check-suite rerequests observed, in order.
     rerequests: RefCell<Vec<(PrNumber, u64)>>,
+    /// Complete GitHub Actions workflow reruns observed, in order.
+    workflow_reruns: RefCell<Vec<(PrNumber, u64)>>,
     /// Optional exact native Stack generation for sync integration tests.
     native_stack: RefCell<Option<crate::github::GitHubStackGeneration>>,
     native_stack_reads: RefCell<u32>,
@@ -107,6 +109,7 @@ impl FakeProvider {
             lineage_reads: RefCell::new(Vec::new()),
             rerequestable_suites: RefCell::new(BTreeMap::new()),
             rerequests: RefCell::new(Vec::new()),
+            workflow_reruns: RefCell::new(Vec::new()),
             native_stack: RefCell::new(None),
             native_stack_reads: RefCell::new(0),
             native_stack_intersections: RefCell::new(None),
@@ -728,6 +731,56 @@ impl SyncProvider for FakeProvider {
                 actual_head: run.head_sha,
             });
         }
+        self.mutate(expected, MutationKind::RerunChecks, |pull_request| {
+            for check in &mut pull_request.checks {
+                if check.details_url.as_deref().and_then(workflow_run_id) == Some(run_id) {
+                    check.state = CheckState::Queued;
+                    check.provider_state = Some("QUEUED".to_owned());
+                }
+            }
+        })
+    }
+
+    fn rerun_workflow_run(
+        &self,
+        _repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+        run_id: u64,
+    ) -> Result<GitHubMutationReceipt, MutationError> {
+        let current = self
+            .pulls
+            .borrow()
+            .get(&expected.number)
+            .cloned()
+            .expect("fake PR");
+        let actual = PullRequestPrecondition::from(&current);
+        if !actual.mutation_identity_eq(expected) {
+            return Err(MutationError::StalePrecondition {
+                expected: Box::new(expected.clone()),
+                actual: Box::new(actual),
+                changed_fields: vec!["fake_race".to_owned()],
+            });
+        }
+        let found = self
+            .head_lineage
+            .borrow()
+            .get(&expected.number)
+            .and_then(|lineage| lineage.front())
+            .and_then(|lineage| {
+                lineage
+                    .workflow_runs
+                    .iter()
+                    .find(|run| run.run_id == run_id)
+            })
+            .is_some_and(|run| run.head_sha == current.head.oid.0);
+        if !found {
+            return Err(MutationError::MissingProviderResource {
+                resource: format!("workflow-run/{run_id}"),
+            });
+        }
+        self.workflow_reruns
+            .borrow_mut()
+            .push((expected.number, run_id));
         self.mutate(expected, MutationKind::RerunChecks, |pull_request| {
             for check in &mut pull_request.checks {
                 if check.details_url.as_deref().and_then(workflow_run_id) == Some(run_id) {
@@ -3322,9 +3375,75 @@ fn deferred_gate_maps_to_one_exact_rerequestable_suite() {
     );
 
     assert_eq!(
-        admission_gate_rerequest_suite(&provider, &repository(), &candidate, &gate).unwrap(),
-        77
+        admission_gate_retrigger(&provider, &repository(), &candidate, &gate).unwrap(),
+        AdmissionGateRetrigger::GitHubActionsRun {
+            run_id: 10,
+            check_suite_id: 77,
+        }
     );
+    provider
+        .rerun_workflow_run(
+            &repository(),
+            &PullRequestPrecondition::from(&candidate),
+            10,
+        )
+        .expect("the exact GitHub Actions workflow reruns on its unchanged head");
+    assert_eq!(
+        provider.workflow_reruns.borrow().as_slice(),
+        [(candidate.number, 10)]
+    );
+    assert!(provider.rerequests.borrow().is_empty());
+}
+
+#[test]
+fn enrolled_deferred_gate_resumes_with_exact_actions_workflow_rerun() {
+    let gate = crate::config::CiAdmissionGateConfig {
+        mode: crate::config::CiAdmissionGateMode::CaravanLabel,
+        context: "build-test".to_owned(),
+        member_label: "caravan".to_owned(),
+    };
+    let mut member = caravan_member(1, "one", "main");
+    member.checks = vec![check(&gate.context, CheckState::Failure, Some(10))];
+    let provider = FakeProvider::with_pull_requests(vec![member.clone()]);
+    provider.require_contexts("main", &[&gate.context]);
+    provider.serve_lineage(
+        member.number,
+        HeadRunLineage {
+            head_sha: member.head.oid.0.clone(),
+            check_suites: vec![CheckSuiteLineage {
+                id: 77,
+                head_sha: member.head.oid.0.clone(),
+                status: "completed".to_owned(),
+                conclusion: "failure".to_owned(),
+                app_slug: "github-actions".to_owned(),
+                rerequestable: true,
+            }],
+            workflow_runs: vec![WorkflowRunLineage {
+                run_id: 10,
+                check_suite_id: 77,
+                workflow_name: "CI".to_owned(),
+                head_sha: member.head.oid.0.clone(),
+                status: "completed".to_owned(),
+                conclusion: "failure".to_owned(),
+                event: "pull_request".to_owned(),
+            }],
+            head_committed_at: Some(PUBLISHED_AT.to_owned()),
+            complete: true,
+        },
+    );
+    let mut status = caravan_status(vec![member.clone()], Some(member.number), true);
+    status.auto_admission.admission_gate = Some(gate);
+
+    let progress = execute(&status, &provider, false, false, false)
+        .expect("an already-enrolled deferred gate resumes without parking");
+
+    assert_eq!(
+        provider.workflow_reruns.borrow().as_slice(),
+        [(member.number, 10)]
+    );
+    assert!(provider.rerequests.borrow().is_empty());
+    assert!(progress.root_merge.is_empty());
+    assert!(!provider.pulls.borrow()[&member.number].has_label("caravan-parked"));
 }
 
 #[test]
