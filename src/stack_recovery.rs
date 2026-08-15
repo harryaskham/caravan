@@ -29,7 +29,8 @@ use crate::model::{
 };
 use crate::pause::PauseStatus;
 use crate::read::{
-    NativeStackStatus, StackBackendStatus, StackCapability, StackMutationSupport, StatusOutput,
+    NativeStackStatus, StackBackendStatus, StackCapability, StackConsistency, StackMutationSupport,
+    StatusOutput,
 };
 use crate::stack_membership::{
     NativeMembershipCheckpoint, NativeMembershipError, NativeMembershipPlan,
@@ -502,6 +503,13 @@ pub fn apply(
 /// plus one exact logical multi-member caravan is sufficient to converge under
 /// the same immutable leases used by reviewed recovery. A changed pass returns
 /// immediately so normal sync rediscovery starts from the provider cursor.
+fn needs_auto_recovery(backend: &StackBackendStatus, caravan: &Caravan) -> bool {
+    caravan.members.len() >= 2
+        && !backend.native_stacks.iter().any(|native| {
+            native.caravan_id == Some(caravan.id) && native.consistency == StackConsistency::Exact
+        })
+}
+
 pub(crate) fn auto_recover_missing(
     context: &AppContext,
     status: &StatusOutput,
@@ -520,14 +528,7 @@ pub(crate) fn auto_recover_missing(
         .fleet
         .caravans
         .iter()
-        .filter(|caravan| {
-            caravan.members.len() >= 2
-                && !status
-                    .stack_backend
-                    .native_stacks
-                    .iter()
-                    .any(|native| native.caravan_id == Some(caravan.id))
-        })
+        .filter(|caravan| needs_auto_recovery(&status.stack_backend, caravan))
         .collect::<Vec<_>>();
     let [caravan] = missing.as_slice() else {
         if missing.is_empty() {
@@ -1542,6 +1543,10 @@ mod tests {
             problems: Vec::new(),
         };
         let backend = stack_backend_fixture(vec![native]);
+        assert!(needs_auto_recovery(&backend, &caravans[0]));
+        let mut exact_backend = backend.clone();
+        exact_backend.native_stacks[0].consistency = StackConsistency::Exact;
+        assert!(!needs_auto_recovery(&exact_backend, &caravans[0]));
 
         let (plan, observation) = build_plan_with_policy(
             &config(),
