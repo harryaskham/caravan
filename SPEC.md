@@ -1419,11 +1419,12 @@ Before membership invokes native create/add it may persist a sealed,
 repository-local continuation keyed by the exact caravan root. The continuation
 is optional crash evidence, never state authority: complete provider inventory,
 current logical membership, and exact PR generations must be sufficient for a
-clean checkout to reconstruct convergence. The desired
-Stack base is the root PR's exact provider base generation, even when a later
-commit advanced the same configured default ref; current default remains
-compatibility and landing evidence, never authority to rewrite that immutable
-root generation. Repository/ref drift still refuses. A successful provider receipt clears any continuation; failure returns it
+clean checkout to reconstruct convergence. The Stack-level base leases the
+exact current configured default-ref generation because provider creation
+resolves a ref at mutation time. The root PR entry separately retains its exact
+historical base generation; validation permits only this same-repository,
+same-ref stale root edge. Repository/ref drift or default movement after
+planning still refuses. A successful provider receipt clears any continuation; failure returns it
 alongside ordinary membership receipts. Recovery never asks automatic admission
 to select the now-labelled member again. When complete provider inventory proves
 zero Stack intersection for exactly one current multi-member caravan, ordinary

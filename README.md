@@ -772,10 +772,12 @@ native Stack API. The explicit `github` value plus a reviewed
 lock-fenced landing. Capability, complete inventory, unique mapping, exact
 generation, holds, compatibility, CI, and unsupported force intent all fail
 closed before provider mutation. Joining the second member writes a sealed local
-native-membership continuation before Stack creation. The desired Stack keeps
-the root PR's exact provider base OID when it still names the configured default
-ref; a later default commit is compatibility/landing evidence, not authority to
-rewrite the immutable root generation. A different repository/ref fails closed.
+native-membership continuation before Stack creation. The desired Stack-level
+base leases the exact current configured default-ref OID because GitHub's create
+API accepts a ref and resolves it at mutation time. The root PR entry separately
+preserves its exact historical provider base OID; only a same-repository,
+same-ref stale root edge is allowed. A different repository/ref fails closed,
+and default movement after planning invalidates the write lease.
 Successful create clears the continuation, while a provider failure returns the
 exact checkpoint instead of telling a scheduler to re-admit an already-labelled
 PR. For a multi-member caravan with zero provider intersections, normal sync

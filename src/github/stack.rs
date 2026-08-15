@@ -1164,6 +1164,26 @@ pub(super) fn validate_topology_allowing_stale_tail_base(
     )
 }
 
+fn same_ref_stale_root(
+    position: usize,
+    entry: &GitHubStackEntryGeneration,
+    topology: &GitHubStackTopology,
+) -> bool {
+    position == 0
+        && entry.base.repository == topology.base.repository
+        && entry.base.name == topology.base.name
+}
+
+fn same_ref_stale_tail(
+    allowed: Option<PrNumber>,
+    entry: &GitHubStackEntryGeneration,
+    expected_base: &BranchSnapshot,
+) -> bool {
+    allowed == Some(entry.pr)
+        && entry.base.repository == expected_base.repository
+        && entry.base.name == expected_base.name
+}
+
 fn validate_topology_with_collapsed_frontier(
     repository: &RepositoryId,
     topology: &GitHubStackTopology,
@@ -1222,9 +1242,8 @@ fn validate_topology_with_collapsed_frontier(
             // the Stack but rebases/retargets the first remaining open PR to
             // the Stack base. Subsequent open entries continue the live chain.
             let expected_base = previous_open_head.unwrap_or(&topology.base);
-            let allowed_same_ref_stale_tail = allowed_stale_tail_base == Some(entry.pr)
-                && entry.base.repository == expected_base.repository
-                && entry.base.name == expected_base.name;
+            let allowed_same_ref_stale = same_ref_stale_root(position, entry, topology)
+                || same_ref_stale_tail(allowed_stale_tail_base, entry, expected_base);
             let collapsed_shape = previous_open_head.is_none()
                 && !merged_predecessors.is_empty()
                 && entry.base.repository == topology.base.repository
@@ -1242,7 +1261,7 @@ fn validate_topology_with_collapsed_frontier(
             let allowed_collapsed_frontier =
                 collapsed_shape && (collapsed.is_none() || collapsed_proof_matches);
             if entry.base != *expected_base
-                && !allowed_same_ref_stale_tail
+                && !allowed_same_ref_stale
                 && !allowed_collapsed_frontier
             {
                 return Err(invalid_plan(
