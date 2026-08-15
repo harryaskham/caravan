@@ -41,8 +41,9 @@ use crate::root_auto_merge::{
 };
 use crate::root_merge::{
     self, ExternalAutoMergePolicy, ROOT_MERGE_CONFIRMATION_DELAY, ROOT_MERGE_CONFIRMATION_READS,
-    RootMergeAncestry, RootMergeBlock, RootMergeFacts, RootMergeFailureCause, RootMergeGate,
-    RootMergeReceipt, RootPromotionFailureCause, RootPromotionReceipt, RootPromotionTrigger,
+    RootAncestorContainmentEvidence, RootMergeAncestry, RootMergeBlock, RootMergeFacts,
+    RootMergeFailureCause, RootMergeGate, RootMergeReceipt, RootPromotionFailureCause,
+    RootPromotionReceipt, RootPromotionTrigger,
 };
 use crate::writer_guard::WriterOperationGuard;
 use crate::{AdmitInput, AppContext, AppError, CheckInput, SyncInput};
@@ -10355,6 +10356,56 @@ impl SyncProgress {
                     && proof.target.oid == observed_default
             })
             .cloned();
+
+        // bd-70f4d9: an evicted/closed physical parent disappears from active
+        // graph membership, and a later retarget can hide the branch edge while
+        // leaving that parent's commit embedded in the child. Re-prove commit
+        // ancestry immediately before merge; a contained non-merged generation
+        // is never inherited merge authority.
+        let mut ancestor_containment = Vec::new();
+        for candidate in status.analysis.pull_requests.values().filter(|candidate| {
+            candidate.number != number
+                && candidate.state != PullRequestState::Merged
+                && (candidate.has_label("caravan-evicted")
+                    || candidate.has_label("caravan-parked")
+                    || (candidate.state == PullRequestState::Closed
+                        && candidate.has_label("caravan")))
+        }) {
+            let relation_to_root = provider
+                .compare_commits(&repository, &candidate.head.oid, &observed.head.oid)
+                .map_err(|error| mutation_error(&error, self, Some(number)))?;
+            let relation_to_default = provider
+                .compare_commits(&repository, &candidate.head.oid, &observed_default)
+                .map_err(|error| mutation_error(&error, self, Some(number)))?;
+            let evidence = RootAncestorContainmentEvidence {
+                pr: candidate.number,
+                state: candidate.state,
+                head: candidate.head.clone(),
+                relation_to_root: relation_to_root.clone(),
+                relation_to_default,
+            };
+            if matches!(
+                relation_to_root,
+                crate::generation::CommitRelation::Ahead
+                    | crate::generation::CommitRelation::Identical
+            ) {
+                return Err(self.root_merge_failure(
+                    caravan_id,
+                    number,
+                    RootMergeFailureCause::UnmergedAncestorContainedByRoot,
+                    &observed,
+                    Some(&expected_head),
+                    &json!({
+                        "unmerged_ancestor": evidence,
+                        "default_branch": default_branch,
+                        "observed_default_oid": observed_default,
+                        "cumulative_tree": tree_proof,
+                        "explanation": "the root contains an evicted/closed generation that has not merged; retargeting cannot convert hidden parent content into descendant merge authority",
+                    }),
+                ));
+            }
+            ancestor_containment.push(evidence);
+        }
         let facts = RootMergeFacts {
             default_branch: &default_branch,
             checks_passing: self
@@ -10499,6 +10550,7 @@ impl SyncProgress {
                 "base": &observed.base,
                 "default_before": &default_before,
                 "tree_proof": &tree_proof,
+                "ancestor_containment": &ancestor_containment,
                 "remaining": remaining,
             }))
             .expect("merge audit evidence serializes"),
@@ -10641,6 +10693,7 @@ impl SyncProgress {
             },
             merge_commit,
             cumulative_tree: Some(tree_proof),
+            ancestor_containment,
             predecessor: self
                 .head_advancements
                 .iter()
