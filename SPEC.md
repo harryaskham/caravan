@@ -1415,18 +1415,26 @@ commit ancestry are exact: every open child head must contain its predecessor
 head. Status records each comparison and emits `native_stack_rebase_required`
 for divergence or an unknown-ancestry blocker for incomplete provider evidence;
 landing and successful membership/recovery convergence remain unreachable.
-Before membership invokes native create/add it persists a sealed,
-repository-local continuation keyed by the exact caravan root. The desired
+Before membership invokes native create/add it may persist a sealed,
+repository-local continuation keyed by the exact caravan root. The continuation
+is optional crash evidence, never state authority: complete provider inventory,
+current logical membership, and exact PR generations must be sufficient for a
+clean checkout to reconstruct convergence. The desired
 Stack base is the root PR's exact provider base generation, even when a later
 commit advanced the same configured default ref; current default remains
 compatibility and landing evidence, never authority to rewrite that immutable
-root generation. Repository/ref drift still refuses. A successful provider
-receipt clears the continuation; failure returns it alongside ordinary
-membership receipts. Recovery never asks automatic admission to select the now-
-labelled member again. `native-stack recovery-preview` instead seals current
-repository, ordered membership, immutable head/base generations, CLEAN/current-
-green checks, rollout configuration, complete provider inventory, and any
-continuation into a plan hash. `recovery-apply` requires that hash, independently
+root generation. Repository/ref drift still refuses. A successful provider receipt clears any continuation; failure returns it
+alongside ordinary membership receipts. Recovery never asks automatic admission
+to select the now-labelled member again. When complete provider inventory proves
+zero Stack intersection for exactly one current multi-member caravan, ordinary
+sync reconstructs and converges the exact Stack automatically under immutable
+leases, regardless of whether a local continuation exists; it then rediscovers
+provider mapping before normal convergence. Partial, multiple, conflicting, or
+truncated mappings remain fail-closed. `native-stack recovery-preview` seals
+current repository, ordered membership, immutable head/base generations,
+CLEAN/current-green checks, rollout configuration, complete provider inventory,
+and any continuation into a plan hash for the remaining explicitly reviewed
+recovery shapes. `recovery-apply` requires that hash, independently
 rediscovers the same evidence, and accepts only the mapping shape authorized by
 the action: zero for legacy create, the exact checkpointed provider prefix for
 append, or one exact desired mapping on an idempotent lost-response retry. It
