@@ -209,6 +209,7 @@ pub(super) fn preflight_eligibility(
     request: &MembershipRequest,
     target: Option<&JoinTarget>,
     checker: &impl CompatibilityChecker,
+    proven_deferred_gate_context: Option<&str>,
 ) -> Result<CheckOutput, AppError> {
     crate::generation::require_admissible(
         &status.admission.generation_integrity,
@@ -266,14 +267,23 @@ pub(super) fn preflight_eligibility(
     }
 
     let mut virtual_status = status.clone();
+    let virtual_candidate = virtual_status
+        .analysis
+        .pull_requests
+        .get_mut(&candidate.number)
+        .expect("current candidate is present");
     if request.operation.is_renewal() {
-        let virtual_candidate = virtual_status
-            .analysis
-            .pull_requests
-            .get_mut(&candidate.number)
-            .expect("current candidate is present");
         virtual_candidate.labels.remove(EVICTED_LABEL);
         virtual_candidate.labels.remove(FORCE_LABEL);
+    }
+    if let Some(context) = proven_deferred_gate_context {
+        // Sync may supply this capability only after complete exact-head CI and
+        // required-run proof. Explicit membership calls always pass None. The
+        // apply preflight therefore suppresses exactly the already-authorized
+        // gate vote without teaching generic check/new to accept red CI.
+        virtual_candidate
+            .checks
+            .retain(|check| check.name != context);
     }
     let check_input = target.map_or_else(CheckInput::default, |target| CheckInput {
         pr: None,
