@@ -735,10 +735,22 @@ legacy fixtures/evidence, not the autonomous execution path. The report-only
 responder did not provide useful recovery. Host-side automatic invocation,
 retry orchestration, and dormant-agent lifecycle belong to Cacophony/Pi; Cara
 remains the deterministic state machine, receipt source, and single queue writer.
-PR text/code/comments/check logs and provider JSON are untrusted evidence. A
-future external executor must consume a versioned, secret-free Cara recovery
-request/attempt ledger rather than model-authored writes. The model never sees
-GitHub App, GitHub token, feedback-hook, or Caco board credentials.
+PR text/code/comments/check logs and provider JSON are untrusted evidence. An
+external executor consumes a versioned, secret-free Cara recovery
+request/attempt ledger rather than model-authored writes. Capture a canonical
+Cara JSON error and run `cara recovery-request --error ERROR.json --ledger
+recovery-ledger.json`; the exact filename and non-symlink path are enforced to
+avoid turning local state output into an arbitrary-file write primitive. The
+command performs a fresh provider/main status read and persists exact
+repository/PR/head/base/Stack/check/config/policy/decision generations plus typed
+allowed actions. `cara recovery-attempt` accepts only exact generation receipts,
+and `cara recovery-ledger` is a local read surface. Transient backoff is bounded,
+deterministic decisions do not retry, and a success receipt triggers a fresh
+provider status read that must prove the exact PR merged at its claimed commit.
+Exhaustion emits one deduplicated escalation or exact-plan owner request.
+The ledger is atomic, private, restart-safe, and performs no provider mutation.
+The model never sees GitHub App, GitHub token, feedback-hook, or Caco board
+credentials.
 
 ## Configuration
 

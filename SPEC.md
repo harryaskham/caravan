@@ -1689,13 +1689,21 @@ invalid, and any pinned runtime asset still requires exact version, HTTPS URL,
 SHA-256, source commit, and release provenance. PR content, code, comments, logs,
 artifacts, provider JSON, and model narrative are untrusted evidence.
 
-Future external recovery execution consumes a versioned, secret-free Cara
-RecoveryRequest and durable attempt ledger keyed by exact repository/PR/head/
-Stack/check/config/policy/decision generations. Retries are bounded to typed
-transient dispositions; deterministic decisions do not hot-loop. Exhaustion
-emits one deduplicated escalation/ejection request, never an automatic
-label/merge/eviction. Completion requires exact receipt and provider/main reread.
-The repo-owned skill routes that handshake but never performs hidden writes.
+External recovery execution consumes a versioned, secret-free Cara
+`RecoveryRequest` and durable attempt ledger keyed by exact repository/PR/head/
+Stack/check/config/policy/decision generations. `recovery-request` builds the
+handoff from one captured canonical Cara error plus a fresh provider/main status
+read; `recovery-attempt` records exact external receipts; `recovery-ledger` reads
+local state. The ledger filename is exactly `recovery-ledger.json`, and the file
+and parent cannot be symlinks; this prevents arbitrary local-file overwrite. Retries/backoff are bounded to typed transient dispositions;
+deterministic decisions do not hot-loop. Stale generation/fingerprint, secret or
+prompt-injection sentinel, and unverified success receipts refuse. A success
+attempt always performs a fresh provider status read proving the exact PR merged
+at the claimed commit; an external boolean alone is never completion. Exhaustion
+emits one deduplicated escalation or exact sealed-plan owner request, never an
+automatic label/merge/eviction. Atomic private ledger operations have no provider
+mutation capability. The repo-owned skill routes that handshake but never
+performs hidden writes.
 
 ## 10. Concurrency and idempotency
 
