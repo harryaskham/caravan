@@ -4822,6 +4822,7 @@ where
                 &candidate,
                 &checker,
                 configured_batch_bound(context),
+                deferred_gate.map(|gate| gate.context.as_str()),
             )?
         };
         if matches!(evaluation.target, AutoCandidateTarget::New)
@@ -5531,7 +5532,7 @@ fn evaluate_auto_candidate(
     candidate: &PullRequestSnapshot,
     checker: &impl crate::graph::CompatibilityChecker,
 ) -> Result<AutoCandidateEvaluation, AppError> {
-    evaluate_auto_candidate_bounded(status, candidate, checker, None)
+    evaluate_auto_candidate_bounded(status, candidate, checker, None, None)
 }
 
 /// Deterministic target selection under an optional configured batch bound.
@@ -5544,6 +5545,7 @@ fn evaluate_auto_candidate_bounded(
     candidate: &PullRequestSnapshot,
     checker: &impl crate::graph::CompatibilityChecker,
     batch_bound: Option<u64>,
+    proven_deferred_gate_context: Option<&str>,
 ) -> Result<AutoCandidateEvaluation, AppError> {
     let mut virtual_status = status.clone();
     virtual_status.current_pr = Some(candidate.number);
@@ -5553,6 +5555,16 @@ fn evaluate_auto_candidate_bounded(
         .get_mut(&candidate.number)
     {
         virtual_candidate.labels.remove(AUTO_ADMISSION_SKIP_LABEL);
+        if let Some(context) = proven_deferred_gate_context {
+            // Candidate-local provider reread already proved this exact context
+            // is the configured deferred sentinel and every unrelated current
+            // failure is absent. Suppress only that raw read-model vote in the
+            // virtual auto-admission preflight; explicit check/new never enters
+            // this path and incomplete evidence never supplies the capability.
+            virtual_candidate
+                .checks
+                .retain(|check| check.name != context);
+        }
     }
     let tails = current_tail_generations_bounded(status, batch_bound);
     if tails.is_empty() {
