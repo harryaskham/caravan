@@ -4906,7 +4906,6 @@ where
                 candidate.number,
                 target_tail,
                 candidate_order.priority_label,
-                deferred_gate.map(|gate| gate.context.as_str()),
                 operation_deadline,
                 github_budget,
                 writer_guard,
@@ -9724,21 +9723,30 @@ impl SyncProgress {
         // contain never reached the default branch, which is exactly how the
         // live incident presented. Without this proof the root stays open and
         // recoverable and no successor is promoted.
-        let default_after = provider
-            .branch_head_oid(&repository, &default_branch)
-            .map_err(|error| mutation_error(&error, self, Some(number)))?;
         let merge_commit = provider
             .merge_commit_oid(&repository, number)
             .map_err(|error| mutation_error(&error, self, Some(number)))?;
-        if let Some(merge_commit) = merge_commit.as_ref() {
+        let mut reachability_reads = 0_u32;
+        let mut default_after;
+        loop {
+            default_after = provider
+                .branch_head_oid(&repository, &default_branch)
+                .map_err(|error| mutation_error(&error, self, Some(number)))?;
+            reachability_reads = reachability_reads.saturating_add(1);
+            let Some(merge_commit) = merge_commit.as_ref() else {
+                break;
+            };
             let comparison = provider
                 .compare_commits(&repository, merge_commit, &default_after)
                 .map_err(|error| mutation_error(&error, self, Some(number)))?;
-            if !matches!(
+            if matches!(
                 comparison,
                 crate::generation::CommitRelation::Ahead
                     | crate::generation::CommitRelation::Identical
             ) {
+                break;
+            }
+            if reachability_reads >= ROOT_MERGE_CONFIRMATION_READS {
                 return Err(self.root_merge_failure(
                     caravan_id,
                     number,
@@ -9750,10 +9758,14 @@ impl SyncProgress {
                         "claimed_merge_commit": merge_commit,
                         "observed_default_oid": default_after,
                         "comparison": comparison,
+                        "reachability_confirmation_reads": reachability_reads,
+                        "merge_provider_receipt_preserved": true,
                     }),
                 ));
             }
+            std::thread::sleep(ROOT_MERGE_CONFIRMATION_DELAY);
         }
+        reads = reads.saturating_add(reachability_reads);
 
         let ancestry = RootMergeAncestry {
             default_before,

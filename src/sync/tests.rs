@@ -29,6 +29,8 @@ struct FakeProvider {
     merge_commits: RefCell<BTreeMap<PrNumber, CommitOid>>,
     /// Merge commits the fetched default branch does *not* contain.
     unreachable_merges: RefCell<BTreeSet<CommitOid>>,
+    /// Temporary provider propagation lag before a merge becomes reachable.
+    transient_unreachable_merges: RefCell<BTreeMap<CommitOid, u32>>,
     /// Default-branch head observed after each caravan-owned merge.
     default_branch_head_after_merge: RefCell<Option<CommitOid>>,
     pulls: RefCell<BTreeMap<PrNumber, PullRequestSnapshot>>,
@@ -81,6 +83,7 @@ impl FakeProvider {
             unpersisted_merges: RefCell::new(BTreeMap::new()),
             merge_commits: RefCell::new(BTreeMap::new()),
             unreachable_merges: RefCell::new(BTreeSet::new()),
+            transient_unreachable_merges: RefCell::new(BTreeMap::new()),
             default_branch_head_after_merge: RefCell::new(None),
             pulls: RefCell::new(
                 pulls
@@ -194,6 +197,19 @@ impl FakeProvider {
         let oid = CommitOid(merge_commit.to_owned());
         self.merge_commits.borrow_mut().insert(number, oid.clone());
         self.unreachable_merges.borrow_mut().insert(oid);
+    }
+
+    fn serve_temporarily_unreachable_merge(
+        &self,
+        number: PrNumber,
+        merge_commit: &str,
+        reads: u32,
+    ) {
+        let oid = CommitOid(merge_commit.to_owned());
+        self.merge_commits.borrow_mut().insert(number, oid.clone());
+        self.transient_unreachable_merges
+            .borrow_mut()
+            .insert(oid, reads);
     }
 
     fn mutate(
@@ -429,6 +445,12 @@ impl SyncProvider for FakeProvider {
         base: &CommitOid,
         _head: &CommitOid,
     ) -> Result<crate::generation::CommitRelation, MutationError> {
+        if let Some(remaining) = self.transient_unreachable_merges.borrow_mut().get_mut(base)
+            && *remaining > 0
+        {
+            *remaining -= 1;
+            return Ok(crate::generation::CommitRelation::Diverged);
+        }
         if self.unreachable_merges.borrow().contains(base) {
             return Ok(crate::generation::CommitRelation::Diverged);
         }
@@ -9209,6 +9231,40 @@ fn a_merge_the_default_branch_does_not_contain_never_counts_as_delivered() {
     assert!(
         !provider.calls.borrow().contains(&MutationKind::SetBase),
         "no successor is promoted without landing proof"
+    );
+}
+
+#[test]
+fn a_successful_merge_waits_for_bounded_default_reachability_propagation() {
+    let pulls = vec![caravan_member(1, "one", "main")];
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    provider.serve_temporarily_unreachable_merge(
+        PrNumber(1),
+        "3da6addbf0b1334888658413a74ac91f18afb9ea",
+        2,
+    );
+    let status = caravan_status(pulls, Some(PrNumber(1)), true);
+
+    let progress = execute(&status, &provider, false, false, false)
+        .expect("bounded provider propagation lag converges without another merge");
+
+    assert_eq!(
+        provider
+            .calls
+            .borrow()
+            .iter()
+            .filter(|kind| **kind == MutationKind::SquashMerge)
+            .count(),
+        1,
+        "an accepted merge is never resubmitted while reachability converges"
+    );
+    assert_eq!(progress.root_merge.len(), 1);
+    assert!(progress.root_merge[0].confirmation_reads >= 3);
+    assert_eq!(
+        progress.root_merge[0].ancestry.merge_commit,
+        Some(CommitOid(
+            "3da6addbf0b1334888658413a74ac91f18afb9ea".to_owned()
+        ))
     );
 }
 
