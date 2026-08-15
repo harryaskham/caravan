@@ -554,12 +554,17 @@ members already released and the one that failed, so an interrupted cascade is
 resumable rather than a silently half-dissolved chain. `--cascade` and `--all`
 are mutually exclusive. Every reshape uses one absolute operation deadline from
 validated `sync.max_duration_secs` (capped at one hour) across complete
-full-lifecycle discovery, exact compatibility, provider mutations, physical
+active-generation discovery, exact compatibility, provider mutations, physical
 unwind, postcondition comments, and hooks. The read-only status watchdog and
 its partial/last-good evidence are never mutation authority. A large repository
 may therefore spend more than the short human-status budget discovering a
 complete graph while every later Git/GitHub child remains bounded by the same
-operation deadline.
+operation deadline. Compatibility preflight resolves the repository-bound,
+validated provider Git URL and verifies every advertised branch/OID there;
+an unrelated provider generation omitted from a daemon-local checkout mirror
+cannot block an explicit target. The requested target and every edge it would
+create remain exact and fail closed when provider identity, refs, or objects
+cannot be proven.
 
 `cara plan concat --source-head-pr S --target-tail-pr T --actor A --reason R`
 produces the immutable no-write recovery plan for appending one entire live

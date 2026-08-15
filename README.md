@@ -235,6 +235,9 @@ provider discovery, compatibility, provider writes, physical unwind,
 postconditions, and hooks. They never consume read-only status partials or the
 58-second human-status watchdog as mutation authority, so large repositories
 retain full evidence without making first-party cleanup structurally unreachable.
+Reshape compatibility fetches exact refs from the repository-bound provider URL,
+not a potentially incomplete daemon-local mirror; each advertised OID remains
+verified before use and a missing or moved requested target still fails closed.
 
 `cara concat` is the atomic recovery operation for appending one complete live caravan after another. Always run `cara plan concat` first and review its immutable plan hash, exact old/new ordering, complete source rewrite scope, and rollback heads. Execution atomically rewrites every source branch under exact leases, then commits one source-root base edge; it never sequences client-side evict+rejoin. A failed commit restores every original source head, final verification failure restores the membership edge and physical heads, and exact retry returns the durable original journal receipt. Cycles, forks, holds, incomplete topology, stale plan hashes, conflicts, and ambiguous rollback all fail closed.
 

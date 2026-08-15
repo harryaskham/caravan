@@ -127,7 +127,7 @@ pub fn evict(context: &AppContext, input: &EvictInput) -> Result<ReshapeOutput, 
 /// unreported.
 fn evict_many(context: &AppContext, input: &EvictInput) -> Result<ReshapeOutput, AppError> {
     let operation_deadline = reshape_operation_deadline(context);
-    let status = read::status_with_deadline(context, operation_deadline)?;
+    let status = read::fleet_status_for_sync(context, operation_deadline, None)?;
     let selected = input
         .pr
         .map(PrNumber)
@@ -246,10 +246,16 @@ fn execute_live_before(
 ) -> Result<ReshapeOutput, AppError> {
     let lock = context.acquire_writer_operation(operation.name())?;
     let timeout = std::time::Duration::from_secs(context.config.command_timeout_secs);
-    let status = read::status_with_deadline(context, operation_deadline)?;
+    let status = read::fleet_status_for_sync(context, operation_deadline, None)?;
     let repository = status.repository.clone();
     let failure_status = status.clone();
-    let checker = GitCompatibilityChecker::new(&context.repository_path, "origin")
+    // Mutation preflight must read exact provider refs, not a daemon-local
+    // checkout mirror which may intentionally omit another owner's generation.
+    // The provider URL is repository-bound and validated by the repair module;
+    // GitCompatibilityChecker still verifies every advertised branch/OID before
+    // using the fetched objects.
+    let provider_git_url = crate::repair::provider_git_url(context, &repository)?;
+    let checker = GitCompatibilityChecker::new(&context.repository_path, provider_git_url)
         .with_timeout(timeout)
         .with_operation_deadline(operation_deadline);
     let runner = crate::command::ProcessRunner::in_directory(&context.repository_path)
@@ -2160,7 +2166,17 @@ mod tests {
             .next()
             .expect("production source");
         assert!(!source.contains("read::status(context)"));
-        assert_eq!(source.matches("read::status_with_deadline(").count(), 2);
+        assert_eq!(source.matches("read::fleet_status_for_sync(").count(), 2);
+        assert_eq!(
+            source.matches("crate::repair::provider_git_url(").count(),
+            1,
+            "reshape compatibility must fetch exact provider refs rather than relying on a local mirror"
+        );
+        assert!(
+            source.contains(
+                "GitCompatibilityChecker::new(&context.repository_path, provider_git_url)"
+            )
+        );
         assert_eq!(source.matches(".with_operation_deadline(").count(), 2);
         assert_eq!(
             source
