@@ -81,15 +81,39 @@ pub fn stack_merge_evidence(
     stack: &GitHubStackGeneration,
     ci: &dyn Fn(PrNumber) -> StackEntryCi,
 ) -> Vec<GitHubStackMergeEntryEvidence> {
-    stack
-        .topology
-        .entries
-        .iter()
-        .map(|entry| GitHubStackMergeEntryEvidence {
+    let mut evidence = Vec::with_capacity(stack.topology.entries.len());
+    let mut previous_candidate = None;
+    for entry in &stack.topology.entries {
+        let blockers = entry_blockers(
+            facts,
+            stack,
+            entry,
+            ci(entry.pr),
+            previous_candidate.as_ref(),
+        );
+        let candidate_invalid = blockers.iter().any(|blocker| {
+            matches!(
+                blocker,
+                GitHubStackMergeBlocker::SyntheticCandidateMissing
+                    | GitHubStackMergeBlocker::SyntheticCandidateStale
+                    | GitHubStackMergeBlocker::SyntheticCandidateTopologyMismatch
+            )
+        });
+        previous_candidate = (!candidate_invalid)
+            .then(|| {
+                facts
+                    .merge_candidates
+                    .get(&entry.pr)
+                    .and_then(|candidate| candidate.synthetic.as_ref())
+                    .map(|synthetic| synthetic.oid.clone())
+            })
+            .flatten();
+        evidence.push(GitHubStackMergeEntryEvidence {
             generation: entry.clone(),
-            blockers: entry_blockers(facts, stack, entry, ci(entry.pr)),
-        })
-        .collect()
+            blockers,
+        });
+    }
+    evidence
 }
 
 fn entry_blockers(
@@ -97,6 +121,7 @@ fn entry_blockers(
     stack: &GitHubStackGeneration,
     entry: &GitHubStackEntryGeneration,
     ci: StackEntryCi,
+    previous_candidate: Option<&crate::model::CommitOid>,
 ) -> Vec<GitHubStackMergeBlocker> {
     let mut blockers = Vec::new();
     if !stack.open {
@@ -129,7 +154,7 @@ fn entry_blockers(
         }
     }
 
-    if let Some(blocker) = synthetic_candidate_blocker(facts, entry) {
+    if let Some(blocker) = synthetic_candidate_blocker(facts, entry, previous_candidate) {
         blockers.push(blocker);
     }
     if facts.held_members.contains(&entry.pr) {
@@ -165,6 +190,7 @@ fn mechanically_blocked(facts: StackPolicyFacts<'_>, entry: &GitHubStackEntryGen
 fn synthetic_candidate_blocker(
     facts: StackPolicyFacts<'_>,
     entry: &GitHubStackEntryGeneration,
+    previous_candidate: Option<&crate::model::CommitOid>,
 ) -> Option<GitHubStackMergeBlocker> {
     let Some(candidate) = facts.merge_candidates.get(&entry.pr) else {
         return Some(GitHubStackMergeBlocker::SyntheticCandidateMissing);
@@ -175,12 +201,19 @@ fn synthetic_candidate_blocker(
     let Some(synthetic) = candidate.synthetic.as_ref() else {
         return Some(GitHubStackMergeBlocker::SyntheticCandidateMissing);
     };
-    if candidate.freshness != MergeCandidateFreshness::Fresh
-        || candidate.compared_base.as_ref() != Some(&entry.base)
-    {
+    if candidate.stale_head || candidate.compared_base.as_ref() != Some(&entry.base) {
         return Some(GitHubStackMergeBlocker::SyntheticCandidateStale);
     }
-    if synthetic.parents.as_slice() != [entry.base.oid.clone(), entry.head.oid.clone()] {
+    let ordinary_parents =
+        synthetic.parents.as_slice() == [entry.base.oid.clone(), entry.head.oid.clone()];
+    if ordinary_parents && candidate.freshness != MergeCandidateFreshness::Fresh {
+        return Some(GitHubStackMergeBlocker::SyntheticCandidateStale);
+    }
+    let ordinary = ordinary_parents;
+    let cumulative = previous_candidate.is_some_and(|parent| {
+        synthetic.parents.as_slice() == [parent.clone(), entry.head.oid.clone()]
+    });
+    if !ordinary && !cumulative {
         return Some(GitHubStackMergeBlocker::SyntheticCandidateTopologyMismatch);
     }
     None
@@ -663,6 +696,24 @@ mod tests {
                 .contains(&GitHubStackMergeBlocker::SyntheticCandidateStale)
         );
 
+        let mut cumulative = merge_candidates(&stack);
+        let root_candidate = cumulative[&PrNumber(101)]
+            .synthetic
+            .as_ref()
+            .expect("root candidate")
+            .oid
+            .clone();
+        let child = cumulative.get_mut(&PrNumber(102)).expect("child");
+        child.freshness = MergeCandidateFreshness::StaleBase;
+        child.stale_base = true;
+        child.synthetic.as_mut().expect("candidate").parents =
+            vec![root_candidate, stack.topology.entries[1].head.oid.clone()];
+        let evidence = stack_merge_evidence(facts(&pulls, &cumulative, &[], &held), &stack, &ready);
+        assert!(
+            evidence.iter().all(|entry| entry.blockers.is_empty()),
+            "a child cumulatively parented by the exact selected predecessor candidate is ready: {evidence:?}"
+        );
+
         let mut malformed = merge_candidates(&stack);
         malformed
             .get_mut(&PrNumber(102))
@@ -677,6 +728,77 @@ mod tests {
             evidence[1]
                 .blockers
                 .contains(&GitHubStackMergeBlocker::SyntheticCandidateTopologyMismatch)
+        );
+    }
+
+    #[test]
+    fn cumulative_candidate_chain_advances_through_multiple_children() {
+        let mut stack = stack();
+        let second = stack.topology.entries[1].clone();
+        stack
+            .topology
+            .entries
+            .push(entry(2, 103, second.head.clone()));
+        let pulls = pull_requests(&stack);
+        let mut candidates = merge_candidates(&stack);
+        let root_oid = candidates[&PrNumber(101)]
+            .synthetic
+            .as_ref()
+            .unwrap()
+            .oid
+            .clone();
+        let child_oid = candidates[&PrNumber(102)]
+            .synthetic
+            .as_ref()
+            .unwrap()
+            .oid
+            .clone();
+        for (pr, parent) in [(PrNumber(102), root_oid), (PrNumber(103), child_oid)] {
+            let candidate = candidates.get_mut(&pr).unwrap();
+            candidate.freshness = MergeCandidateFreshness::StaleBase;
+            candidate.stale_base = true;
+            candidate.synthetic.as_mut().unwrap().parents = vec![
+                parent,
+                stack
+                    .topology
+                    .entries
+                    .iter()
+                    .find(|entry| entry.pr == pr)
+                    .unwrap()
+                    .head
+                    .oid
+                    .clone(),
+            ];
+        }
+        let evidence = stack_merge_evidence(
+            facts(&pulls, &candidates, &[], &BTreeSet::new()),
+            &stack,
+            &ready,
+        );
+        assert!(evidence.iter().all(|entry| entry.blockers.is_empty()));
+
+        candidates
+            .get_mut(&PrNumber(102))
+            .unwrap()
+            .synthetic
+            .as_mut()
+            .unwrap()
+            .parents[0] = CommitOid("arbitrary-parent".to_owned());
+        let refused = stack_merge_evidence(
+            facts(&pulls, &candidates, &[], &BTreeSet::new()),
+            &stack,
+            &ready,
+        );
+        assert!(
+            refused[1]
+                .blockers
+                .contains(&GitHubStackMergeBlocker::SyntheticCandidateTopologyMismatch)
+        );
+        assert!(
+            refused[2]
+                .blockers
+                .contains(&GitHubStackMergeBlocker::SyntheticCandidateTopologyMismatch),
+            "a child cannot inherit authority from a predecessor candidate whose own lineage was rejected"
         );
     }
 

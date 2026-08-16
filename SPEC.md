@@ -1435,10 +1435,22 @@ to select the now-labelled member again. When complete provider inventory proves
 zero Stack intersection for exactly one current multi-member caravan, ordinary
 sync reconstructs and converges the exact Stack automatically under immutable
 leases, regardless of whether a local continuation exists; it then rediscovers
-provider mapping before normal convergence. Partial, multiple, conflicting, or
-truncated mappings remain fail-closed. `native-stack recovery-preview` seals
+provider mapping before normal convergence. Partial, multiple, conflicting, or truncated mappings remain fail-closed. One
+crash boundary is treated separately: if a provider Stack contains exactly the
+logical member order plus one exact open canonical admission candidate, sync
+projects only that entry back to the proven prefix and reuses the ordinary
+membership transaction. Base, label, generation, priority/FIFO, compatibility,
+and native add postconditions are all revalidated; the provider add is an
+idempotent already-satisfied write. Multiple/foreign extras, moved heads,
+noncanonical candidates, unrelated backend problems, or incomplete inventory
+never gain this authority. The resulting membership receipt is returned as
+`native_append_membership_recovery`; any remaining physical ancestry repair is
+an explicit native-rebase decision before normal convergence.
+
+`native-stack recovery-preview` seals
 current repository, ordered membership, immutable head/base generations,
-CLEAN/current-green checks, rollout configuration, complete provider inventory,
+CLEAN-or-policy-BLOCKED current checks (Success, Neutral, and Skipped are
+non-failing), rollout configuration, complete provider inventory,
 and any continuation into a plan hash for the remaining explicitly reviewed
 recovery shapes. `recovery-apply` requires that hash, independently
 rediscovers the same evidence, and accepts only the mapping shape authorized by
@@ -1554,11 +1566,17 @@ Native sync submits the longest contiguous ready prefix. With a blocked suffix,
 the complete Stack ref set remains locked while GitHub atomically lands the
 selected prefix; Cara seals the entire pre-submit suffix and accepts rewritten
 suffix generations only when order, PR/branch identity, base chain, and provider
-merge receipts match. Rewritten heads require fresh CI before later landing. Each readiness verdict also requires an exact fresh
-two-parent synthetic merge candidate whose parents are the entry's current base
-(current main for the root, predecessor source head for a child) and immutable
-source head. Candidate regeneration, not scheduler force-push, is the only
-automatic CI refresh. The ruleset generation is checkpointed with the async
+merge receipts match. Rewritten heads require fresh CI before later landing. Each readiness verdict
+also requires an exact two-parent synthetic merge candidate. The root candidate
+uses current main as first parent. A native Stack child may use either its
+predecessor source head (ordinary provider shape) or the exact selected
+predecessor synthetic-candidate OID (GitHub's stable cumulative Stack shape);
+its second parent must always equal the child's immutable source head.
+Cumulative authority advances only through a predecessor candidate whose own
+lineage was accepted in the same ordered Stack generation. Arbitrary alternate
+parents, missing candidates, moved source heads, wrong order, and non-native
+caravans remain stale/fail-closed. Candidate regeneration, not scheduler
+force-push, is the only automatic CI refresh. The ruleset generation is checkpointed with the async
 UUID, revalidated before each submit/poll, and released only by exact ID and
 generation after terminal proof. Missing/drifted lock is `indeterminate`.
 Repository ruleset mutation requires an explicit Administration(write) upgrade,

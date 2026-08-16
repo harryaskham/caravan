@@ -795,10 +795,21 @@ PR. For a multi-member caravan with zero provider intersections, normal sync
 reconstructs the exact desired Stack from complete API inventory and current
 immutable PR generations, then creates it once under provider leases. Local
 membership checkpoints are optional receipts/hints, never recovery authority;
-a clean checkout converges identically. `cara native-stack recovery-preview`
-followed by `recovery-apply` remains the explicit path for partial, ambiguous,
-or independently reviewed recovery shapes that cannot be proven from zero
-intersection alone. A provider Stack whose PR bases are linked but whose child commits do
+a clean checkout converges identically. If an interrupted append leaves exactly
+one canonical candidate already visible as the provider Stack's extra tail,
+sync temporarily projects the proven provider prefix and reruns ordinary
+membership. Every candidate/base/label/compatibility lease remains intact and
+the Stack add resolves idempotently; foreign/multiple extras remain a decision.
+The receipt is exposed as `native_append_membership_recovery`, after which any
+reported ancestry repair uses the reviewed native-rebase path.
+
+`cara native-stack recovery-preview` followed by `recovery-apply` remains the
+explicit path for partial, ambiguous, or independently reviewed recovery shapes
+that cannot be proven from zero intersection alone. Reviewed recovery treats
+provider `BLOCKED` mergeability as policy state rather than a conflict when
+complete graph compatibility is healthy, and accepts Success/Neutral/Skipped
+terminal checks while still refusing pending or failing evidence. A provider
+Stack whose PR bases are linked but whose child commits do
 not contain their predecessors is recovered through `cara native-stack
 rebase-preview --stack N --actor A --reason R` followed by `rebase-apply` with
 the reviewed plan hash; the apply prepares the complete divergent suffix before
@@ -829,10 +840,14 @@ also compares each predecessor head to its child head and reports
 Unknown ancestry fails closed. A ready prefix with a blocked suffix is submitted
 as one atomic provider merge under a complete-Stack ref lock; Cara seals the
 entire suffix before submission, receipts GitHub's rewritten suffix heads/bases,
-and requires fresh CI before the next landing. Readiness binds each immutable source head to
-its exact fresh two-parent synthetic merge candidate (current main for the root,
-predecessor candidate base for descendants), so provider candidate regeneration
-rather than scheduler force-pushes drives CI. The adapter acquires, verifies,
+and requires fresh CI before the next landing. Readiness binds each immutable
+source head to an exact two-parent candidate. The root uses current main; each
+native child may use either its predecessor source head or the exact selected
+predecessor synthetic candidate as first parent, while the second parent remains
+the child's source head. The latter is GitHub's stable cumulative Stack shape,
+not stale-base drift. Authority advances only through an already-accepted prior
+candidate in the same Stack order; arbitrary parents and non-native lanes remain
+fail-closed. Provider regeneration rather than scheduler force-pushes drives CI. The adapter acquires, verifies,
 checkpoints, and exactly releases the complete lock. The ruleset path requires
 the explicit, conditional Administration(write) App permission documented
 below; default Caravan mode never needs it.
