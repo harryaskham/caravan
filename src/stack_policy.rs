@@ -81,13 +81,35 @@ pub fn stack_merge_evidence(
     stack: &GitHubStackGeneration,
     ci: &dyn Fn(PrNumber) -> StackEntryCi,
 ) -> Vec<GitHubStackMergeEntryEvidence> {
+    let mut previous_candidate = None;
     stack
         .topology
         .entries
         .iter()
-        .map(|entry| GitHubStackMergeEntryEvidence {
-            generation: entry.clone(),
-            blockers: entry_blockers(facts, stack, entry, ci(entry.pr)),
+        .enumerate()
+        .map(|(position, entry)| {
+            let expected_parent = if position == 0 {
+                Some(entry.base.oid.clone())
+            } else {
+                previous_candidate.clone()
+            };
+            let blockers = entry_blockers(
+                facts,
+                stack,
+                entry,
+                ci(entry.pr),
+                expected_parent.as_ref(),
+                position > 0,
+            );
+            previous_candidate = facts
+                .merge_candidates
+                .get(&entry.pr)
+                .and_then(|candidate| candidate.synthetic.as_ref())
+                .map(|synthetic| synthetic.oid.clone());
+            GitHubStackMergeEntryEvidence {
+                generation: entry.clone(),
+                blockers,
+            }
         })
         .collect()
 }
@@ -97,6 +119,8 @@ fn entry_blockers(
     stack: &GitHubStackGeneration,
     entry: &GitHubStackEntryGeneration,
     ci: StackEntryCi,
+    expected_synthetic_parent: Option<&crate::model::CommitOid>,
+    cumulative_child: bool,
 ) -> Vec<GitHubStackMergeBlocker> {
     let mut blockers = Vec::new();
     if !stack.open {
@@ -129,7 +153,9 @@ fn entry_blockers(
         }
     }
 
-    if let Some(blocker) = synthetic_candidate_blocker(facts, entry) {
+    if let Some(blocker) =
+        synthetic_candidate_blocker(facts, entry, expected_synthetic_parent, cumulative_child)
+    {
         blockers.push(blocker);
     }
     if facts.held_members.contains(&entry.pr) {
@@ -157,14 +183,17 @@ fn mechanically_blocked(facts: StackPolicyFacts<'_>, entry: &GitHubStackEntryGen
     })
 }
 
-/// Require the exact current two-parent provider candidate for this immutable
-/// source generation. The first parent is the Stack entry's exact base (current
-/// main for the root, predecessor source head for a child); the second is the
-/// immutable source head. This is the cumulative CI identity. A stale/missing
-/// candidate waits for provider regeneration and never authorizes a source push.
+/// Require one exact provider-native cumulative candidate chain. The root is
+/// the ordinary two-parent default-base + source-head merge candidate. Every
+/// child uses the predecessor's synthetic candidate as first parent and its own
+/// immutable source head as second parent. GitHub therefore reports children
+/// as `stale_base` when compared with the PR's source-base head; that one flag is
+/// expected only when the cumulative parent OID and every other lease are exact.
 fn synthetic_candidate_blocker(
     facts: StackPolicyFacts<'_>,
     entry: &GitHubStackEntryGeneration,
+    expected_parent: Option<&crate::model::CommitOid>,
+    cumulative_child: bool,
 ) -> Option<GitHubStackMergeBlocker> {
     let Some(candidate) = facts.merge_candidates.get(&entry.pr) else {
         return Some(GitHubStackMergeBlocker::SyntheticCandidateMissing);
@@ -175,13 +204,21 @@ fn synthetic_candidate_blocker(
     let Some(synthetic) = candidate.synthetic.as_ref() else {
         return Some(GitHubStackMergeBlocker::SyntheticCandidateMissing);
     };
-    if candidate.freshness != MergeCandidateFreshness::Fresh
-        || candidate.compared_base.as_ref() != Some(&entry.base)
-    {
+    let Some(expected_parent) = expected_parent else {
+        return Some(GitHubStackMergeBlocker::SyntheticCandidateMissing);
+    };
+    if synthetic.parents.as_slice() != [expected_parent.clone(), entry.head.oid.clone()] {
+        return Some(GitHubStackMergeBlocker::SyntheticCandidateTopologyMismatch);
+    }
+    if candidate.compared_base.as_ref() != Some(&entry.base) || candidate.stale_head {
         return Some(GitHubStackMergeBlocker::SyntheticCandidateStale);
     }
-    if synthetic.parents.as_slice() != [entry.base.oid.clone(), entry.head.oid.clone()] {
-        return Some(GitHubStackMergeBlocker::SyntheticCandidateTopologyMismatch);
+    if cumulative_child {
+        if candidate.freshness != MergeCandidateFreshness::StaleBase || !candidate.stale_base {
+            return Some(GitHubStackMergeBlocker::SyntheticCandidateStale);
+        }
+    } else if candidate.freshness != MergeCandidateFreshness::Fresh || candidate.stale_base {
+        return Some(GitHubStackMergeBlocker::SyntheticCandidateStale);
     }
     None
 }
@@ -544,11 +581,18 @@ mod tests {
     fn merge_candidates(
         stack: &GitHubStackGeneration,
     ) -> BTreeMap<PrNumber, MergeCandidateIdentity> {
+        let mut previous_candidate = None;
         stack
             .topology
             .entries
             .iter()
-            .map(|entry| {
+            .enumerate()
+            .map(|(position, entry)| {
+                let candidate_oid = CommitOid(format!("candidate-{}", entry.pr));
+                let parent = previous_candidate
+                    .clone()
+                    .unwrap_or_else(|| entry.base.oid.clone());
+                previous_candidate = Some(candidate_oid.clone());
                 (
                     entry.pr,
                     MergeCandidateIdentity {
@@ -559,18 +603,22 @@ mod tests {
                         head: entry.head.clone(),
                         synthetic: Some(SyntheticMergeCandidate {
                             git_ref: format!("refs/pull/{}/merge", entry.pr),
-                            oid: CommitOid(format!("candidate-{}", entry.pr)),
+                            oid: candidate_oid,
                             tree_oid: CommitOid(format!("tree-{}", entry.pr)),
-                            parents: vec![entry.base.oid.clone(), entry.head.oid.clone()],
+                            parents: vec![parent, entry.head.oid.clone()],
                         }),
                         auto_merge: crate::model::NativeAutoMergeState {
                             enabled: false,
                             merge_method: None,
                             actor: None,
                         },
-                        freshness: MergeCandidateFreshness::Fresh,
+                        freshness: if position == 0 {
+                            MergeCandidateFreshness::Fresh
+                        } else {
+                            MergeCandidateFreshness::StaleBase
+                        },
                         compared_base: Some(entry.base.clone()),
-                        stale_base: false,
+                        stale_base: position > 0,
                         stale_head: false,
                         stale_reasons: Vec::new(),
                     },
