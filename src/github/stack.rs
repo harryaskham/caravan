@@ -788,14 +788,11 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
                 "the merged Stack prefix does not originate from the exact Stack base ref",
             ));
         }
-        for pair in merged.windows(2) {
-            if pair[1].base != pair[0].head {
-                return Err(invalid_plan(
-                    "github_stack_collapsed_frontier_order_invalid",
-                    "the merged Stack prefix does not preserve the exact historical base/head chain",
-                ));
-            }
-        }
+        // GitHub may repeatedly promote the next frontier to the Stack base as
+        // each prefix entry merges. Retained merged entries therefore do not
+        // preserve their historical base=head chain. Their exact merged state
+        // and merge-commit ancestry below are the authoritative leases; only
+        // the current open suffix must preserve live base chaining.
         let current = &topology.entries[first_open];
         if current.base.repository != topology.base.repository
             || current.base.name != topology.base.name
@@ -1979,15 +1976,18 @@ mod tests {
         ));
         adapter.runner.assert_exhausted();
 
-        let mut wrong_order = collapsed_topology(2);
-        wrong_order.entries[1].base = branch("wrong-predecessor", "wrong-order");
-        let adapter =
-            GitHubMutationAdapter::new(FakeRunner::new(direct_generation_calls(&wrong_order)));
-        assert!(matches!(
-            adapter.native_stack_generation(&repository(), 42),
-            Err(GitHubStackMutationError::InvalidPlan { ref code, .. })
-                if code == "github_stack_collapsed_frontier_order_invalid"
+        let mut repeatedly_promoted = collapsed_topology(2);
+        repeatedly_promoted.entries[1].base = branch("main", "second-promotion-base");
+        let adapter = GitHubMutationAdapter::new(FakeRunner::new(
+            direct_collapsed_generation_calls(&repeatedly_promoted),
         ));
+        assert_eq!(
+            adapter
+                .native_stack_generation(&repository(), 42)
+                .expect("repeated frontier promotion is readable")
+                .expect("Stack exists"),
+            generation(repeatedly_promoted)
+        );
         adapter.runner.assert_exhausted();
 
         let stale = collapsed_topology(1);
