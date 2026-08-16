@@ -754,6 +754,41 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
         }
     }
 
+    fn prove_collapsed_merged_order(
+        &self,
+        repository: &RepositoryId,
+        topology: &GitHubStackTopology,
+        merged: &[GitHubStackEntryGeneration],
+    ) -> Result<(), GitHubStackMutationError> {
+        for pair in merged.windows(2) {
+            if pair[1].base == pair[0].head {
+                continue;
+            }
+            // GitHub may partially land a Stack more than once. At each advance
+            // it promotes the next root to the Stack base, while retaining all
+            // prior merged entries in provider history. This creates a new
+            // collapsed-base boundary inside the merged prefix rather than a
+            // source-head edge. Accept only the exact Stack base ref, monotonic
+            // merge order, and an historical base commit contained by the
+            // current Stack base generation.
+            let repeated_collapse = pair[1].base.repository == topology.base.repository
+                && pair[1].base.name == topology.base.name
+                && pair[0].merged_at <= pair[1].merged_at
+                && matches!(
+                    self.compare_commits(repository, &pair[1].base.oid, &topology.base.oid)?,
+                    crate::generation::CommitRelation::Ahead
+                        | crate::generation::CommitRelation::Identical
+                );
+            if !repeated_collapse {
+                return Err(invalid_plan(
+                    "github_stack_collapsed_frontier_order_invalid",
+                    "the merged Stack prefix preserves neither an exact source-head edge nor a proven repeated base collapse",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn prove_collapsed_frontier(
         &self,
         repository: &RepositoryId,
@@ -788,14 +823,7 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
                 "the merged Stack prefix does not originate from the exact Stack base ref",
             ));
         }
-        for pair in merged.windows(2) {
-            if pair[1].base != pair[0].head {
-                return Err(invalid_plan(
-                    "github_stack_collapsed_frontier_order_invalid",
-                    "the merged Stack prefix does not preserve the exact historical base/head chain",
-                ));
-            }
-        }
+        self.prove_collapsed_merged_order(repository, topology, merged)?;
         let current = &topology.entries[first_open];
         if current.base.repository != topology.base.repository
             || current.base.name != topology.base.name
@@ -1951,6 +1979,28 @@ mod tests {
             assert_eq!(observed, generation(expected));
             adapter.runner.assert_exhausted();
         }
+    }
+
+    #[test]
+    fn repeated_partial_landing_accepts_proven_base_collapse_boundaries() {
+        let mut repeated = collapsed_topology(2);
+        repeated.entries[1].base = branch("main", "main-at-second-collapse");
+        let mut calls = direct_generation_calls(&repeated);
+        calls.push(compare_call(
+            &repeated.entries[1].base.oid,
+            &repeated.base.oid,
+            "ahead",
+        ));
+        calls.extend(collapsed_proof_calls(&repeated));
+        let adapter = GitHubMutationAdapter::new(FakeRunner::new(calls));
+
+        let observed = adapter
+            .native_stack_generation(&repository(), 42)
+            .expect("repeated collapsed frontier is readable")
+            .expect("Stack exists");
+
+        assert_eq!(observed, generation(repeated));
+        adapter.runner.assert_exhausted();
     }
 
     #[test]
