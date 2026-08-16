@@ -39,6 +39,24 @@ use crate::stack_membership::{
 use crate::{AppContext, AppError};
 
 const MAX_TEXT: usize = 2_000;
+const PROVIDER_VISIBLE_APPEND_PROBLEMS: [&str; 3] = [
+    "github_stack_member_order_drift",
+    "github_stack_pr_base_drift",
+    "native_stack_rebase_required",
+];
+
+/// Exact provider-visible tail append which ordinary Cara membership has not
+/// yet finalized. The projected status removes only that one extra Stack entry
+/// so the normal membership transaction can revalidate candidacy, compatibility,
+/// base/label writes, and then idempotently observe the provider append.
+#[derive(Debug, Clone)]
+pub(crate) struct ProviderVisibleAppendRecovery {
+    pub status: StatusOutput,
+    pub tail: PrNumber,
+    pub candidate: PrNumber,
+    pub stack_number: u64,
+    pub priority_label: Option<String>,
+}
 
 /// Read-only recovery planning input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Args)]
@@ -499,6 +517,147 @@ pub fn apply(
 /// plus one exact logical multi-member caravan is sufficient to converge under
 /// the same immutable leases used by reviewed recovery. A changed pass returns
 /// immediately so normal sync rediscovery starts from the provider cursor.
+fn exact_provider_prefix_with_extra(
+    native: &NativeStackStatus,
+    caravan: &Caravan,
+    pulls: &BTreeMap<PrNumber, PullRequestSnapshot>,
+) -> Option<PrNumber> {
+    let entries = &native.stack.pull_requests;
+    if native.caravan_id != Some(caravan.id)
+        || entries.len() != caravan.members.len() + 1
+        || native.stack.base.ref_name
+            != pulls
+                .get(&caravan.id)
+                .map(|pull| pull.base.name.as_str())
+                .unwrap_or_default()
+    {
+        return None;
+    }
+    for (entry, member) in entries.iter().zip(&caravan.members) {
+        let pull = pulls.get(member)?;
+        if entry.number != member.0
+            || entry.head.ref_name != pull.head.name
+            || entry.head.sha != pull.head.oid
+        {
+            return None;
+        }
+    }
+    Some(PrNumber(entries.last()?.number))
+}
+
+fn provider_visible_append_candidate(
+    facts: &RecoveryFacts<'_>,
+    canonical_candidate: Option<PrNumber>,
+) -> Result<Option<(usize, PrNumber, PrNumber)>, AppError> {
+    if facts.backend.provider_stacks_truncated {
+        return Ok(None);
+    }
+    let mut matches = Vec::new();
+    for caravan in facts.caravans {
+        for (index, native) in facts.backend.native_stacks.iter().enumerate() {
+            let Some(candidate) = exact_provider_prefix_with_extra(native, caravan, facts.pulls)
+            else {
+                continue;
+            };
+            let Some(pull) = facts.pulls.get(&candidate) else {
+                continue;
+            };
+            let candidate_is_exact = canonical_candidate == Some(candidate)
+                && pull.state == PullRequestState::Open
+                && !pull.draft
+                && pull.merged_at.is_none()
+                && pull.head.repository == *facts.repository
+                && !pull.has_label("caravan")
+                && !pull.has_label("caravan-evicted")
+                && native.stack.pull_requests.last().is_some_and(|entry| {
+                    entry.state.eq_ignore_ascii_case("open")
+                        && !entry.draft
+                        && entry.merged_at.is_none()
+                        && entry.head.ref_name == pull.head.name
+                        && entry.head.sha == pull.head.oid
+                });
+            if candidate_is_exact {
+                matches.push((index, caravan.id, candidate));
+            }
+        }
+    }
+    match matches.as_slice() {
+        [] => Ok(None),
+        [item] => {
+            let unexpected = facts
+                .backend
+                .problems
+                .iter()
+                .chain(facts.backend.native_stacks[item.0].problems.iter())
+                .filter(|problem| {
+                    !PROVIDER_VISIBLE_APPEND_PROBLEMS.contains(&problem.code.as_str())
+                })
+                .collect::<Vec<_>>();
+            if unexpected.is_empty() {
+                Ok(Some(*item))
+            } else {
+                Err(refusal(
+                    "github_stack_append_recovery_backend_ambiguous",
+                    "provider-visible append recovery found unrelated Stack problems",
+                    json!({"problems": unexpected, "mutated": false}),
+                ))
+            }
+        }
+        _ => Err(refusal(
+            "github_stack_append_recovery_ambiguous",
+            "multiple provider-visible extra tails match logical caravans",
+            json!({"matches": matches, "mutated": false}),
+        )),
+    }
+}
+
+pub(crate) fn project_provider_visible_append(
+    status: &StatusOutput,
+) -> Result<Option<ProviderVisibleAppendRecovery>, AppError> {
+    let facts = RecoveryFacts::from_status(status);
+    let Some((native_index, caravan_id, candidate)) =
+        provider_visible_append_candidate(&facts, status.admission.next_candidate)?
+    else {
+        return Ok(None);
+    };
+    let caravan = status
+        .analysis
+        .fleet
+        .caravans
+        .iter()
+        .find(|caravan| caravan.id == caravan_id)
+        .expect("matched caravan remains present");
+    let tail = caravan.tail().expect("caravan is non-empty");
+    let priority_label = status
+        .admission
+        .candidates
+        .iter()
+        .find(|attempt| attempt.pr == candidate)
+        .and_then(|attempt| attempt.priority_label.clone());
+
+    let mut projected = status.clone();
+    let native = &mut projected.stack_backend.native_stacks[native_index];
+    native.stack.pull_requests.pop();
+    native.consistency = StackConsistency::Exact;
+    native.ancestry.retain(|edge| {
+        caravan.members.contains(&edge.parent_pr) && caravan.members.contains(&edge.child_pr)
+    });
+    native.problems.clear();
+    projected
+        .stack_backend
+        .problems
+        .retain(|problem| !PROVIDER_VISIBLE_APPEND_PROBLEMS.contains(&problem.code.as_str()));
+    Ok(Some(ProviderVisibleAppendRecovery {
+        status: projected,
+        tail,
+        candidate,
+        stack_number: status.stack_backend.native_stacks[native_index]
+            .stack
+            .number,
+        priority_label,
+    }))
+}
+
 fn needs_auto_recovery(backend: &StackBackendStatus, caravan: &Caravan) -> bool {
     caravan.members.len() >= 2
         && !backend.native_stacks.iter().any(|native| {
@@ -979,10 +1138,13 @@ fn require_member_green(pull: &PullRequestSnapshot) -> Result<(), AppError> {
             json!({"pr": pull.number, "mutated": false}),
         ));
     }
-    if pull.merge_state_status.as_deref() != Some("CLEAN") {
+    if !matches!(
+        pull.merge_state_status.as_deref(),
+        Some("CLEAN" | "BLOCKED")
+    ) {
         return Err(refusal(
             "github_stack_recovery_member_not_clean",
-            "every member must have exact CLEAN provider mergeability",
+            "every member must have exact CLEAN or policy-BLOCKED provider mergeability",
             json!({
                 "pr": pull.number,
                 "merge_state_status": pull.merge_state_status,
@@ -992,9 +1154,12 @@ fn require_member_green(pull: &PullRequestSnapshot) -> Result<(), AppError> {
     }
     let (current, _) = crate::model::latest_checks_per_identity(&pull.checks);
     if current.is_empty()
-        || current
-            .iter()
-            .any(|check| check.state != CheckState::Success)
+        || current.iter().any(|check| {
+            !matches!(
+                check.state,
+                CheckState::Success | CheckState::Neutral | CheckState::Skipped
+            )
+        })
     {
         return Err(refusal(
             "github_stack_recovery_checks_not_green",
@@ -1546,7 +1711,18 @@ mod tests {
             ancestry: Vec::new(),
             problems: Vec::new(),
         };
-        let backend = stack_backend_fixture(vec![native]);
+        let backend = StackBackendStatus {
+            configured: StackType::Github,
+            capability: StackCapability::Available,
+            mutation_support: StackMutationSupport::NativeStack,
+            native_stacks: vec![native],
+            provider_stacks_truncated: false,
+            missing_caravans: Vec::new(),
+            problems: vec![StackBackendProblem {
+                code: "github_stack_member_order_drift".to_owned(),
+                message: "provider Stack is one exact logical tail short".to_owned(),
+            }],
+        };
         assert!(needs_auto_recovery(&backend, &caravans[0]));
         let mut exact_backend = backend.clone();
         exact_backend.native_stacks[0].consistency = StackConsistency::Exact;
@@ -1586,6 +1762,124 @@ mod tests {
             } if expected_members == &[PrNumber(101), PrNumber(102)]
                 && candidate.number == tail.number
         ));
+    }
+
+    #[test]
+    fn provider_visible_extra_tail_is_projected_only_for_the_canonical_candidate() {
+        let main = branch("main", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let root = pull(101, main.clone());
+        let child = pull(102, root.head.clone());
+        let mut candidate = pull(103, main.clone());
+        candidate.labels.clear();
+        let caravans = vec![Caravan::new(vec![PrNumber(101), PrNumber(102)]).unwrap()];
+        let pulls = BTreeMap::from([
+            (root.number, root.clone()),
+            (child.number, child.clone()),
+            (candidate.number, candidate.clone()),
+        ]);
+        let native = NativeStackStatus {
+            stack: GitHubStackSnapshot {
+                id: 7,
+                number: 7,
+                node_id: "S_partial_append".to_owned(),
+                base: GitHubStackBase {
+                    ref_name: "main".to_owned(),
+                },
+                open: true,
+                created_at: String::new(),
+                pull_requests: [&root, &child, &candidate]
+                    .into_iter()
+                    .map(|pull| crate::github::GitHubStackPullRequest {
+                        number: pull.number.0,
+                        state: "OPEN".to_owned(),
+                        draft: false,
+                        merged_at: None,
+                        head: crate::github::GitHubStackPullRequestHead {
+                            ref_name: pull.head.name.clone(),
+                            sha: pull.head.oid.clone(),
+                        },
+                    })
+                    .collect(),
+            },
+            caravan_id: Some(PrNumber(101)),
+            consistency: StackConsistency::Drifted,
+            ancestry: Vec::new(),
+            problems: vec![StackBackendProblem {
+                code: "native_stack_rebase_required".to_owned(),
+                message: "tail lacks predecessor ancestry".to_owned(),
+            }],
+        };
+        let backend = StackBackendStatus {
+            configured: StackType::Github,
+            capability: StackCapability::Available,
+            mutation_support: StackMutationSupport::NativeStack,
+            native_stacks: vec![native],
+            provider_stacks_truncated: false,
+            missing_caravans: Vec::new(),
+            problems: vec![
+                StackBackendProblem {
+                    code: "github_stack_member_order_drift".to_owned(),
+                    message: "one extra provider tail".to_owned(),
+                },
+                StackBackendProblem {
+                    code: "github_stack_pr_base_drift".to_owned(),
+                    message: "candidate base is not predecessor".to_owned(),
+                },
+            ],
+        };
+        let recovery_facts = facts(&main, &caravans, &pulls, &backend);
+
+        assert_eq!(
+            provider_visible_append_candidate(&recovery_facts, Some(PrNumber(103))).unwrap(),
+            Some((0, PrNumber(101), PrNumber(103)))
+        );
+        assert!(
+            provider_visible_append_candidate(&recovery_facts, Some(PrNumber(999)))
+                .unwrap()
+                .is_none(),
+            "the wake/event PR never substitutes for global canonical order"
+        );
+
+        let mut foreign = backend.clone();
+        foreign.problems.push(StackBackendProblem {
+            code: "github_stack_inventory_truncated".to_owned(),
+            message: "unrelated uncertainty".to_owned(),
+        });
+        assert_eq!(
+            provider_visible_append_candidate(
+                &facts(&main, &caravans, &pulls, &foreign),
+                Some(PrNumber(103)),
+            )
+            .unwrap_err()
+            .code(),
+            "github_stack_append_recovery_backend_ambiguous"
+        );
+    }
+
+    #[test]
+    fn reviewed_recovery_accepts_successful_neutral_and_skipped_checks() {
+        let main = branch("main", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let mut member = pull(101, main);
+        member.checks = vec![
+            CheckSnapshot {
+                name: "required".to_owned(),
+                state: CheckState::Success,
+                ..CheckSnapshot::default()
+            },
+            CheckSnapshot {
+                name: "not-applicable".to_owned(),
+                state: CheckState::Skipped,
+                ..CheckSnapshot::default()
+            },
+            CheckSnapshot {
+                name: "advisory".to_owned(),
+                state: CheckState::Neutral,
+                ..CheckSnapshot::default()
+            },
+        ];
+        member.merge_state_status = Some("BLOCKED".to_owned());
+        require_member_green(&member)
+            .expect("policy-blocked mergeability with non-failing terminal checks is recoverable");
     }
 
     #[test]

@@ -997,6 +997,10 @@ pub struct SyncOutput {
     /// Stateless provider-API reconstruction of missing native Stack membership.
     #[serde(default)]
     pub native_membership_recovery: Vec<crate::stack_recovery::NativeStackRecoveryOutput>,
+    /// Ordinary membership finalized after one exact provider-visible Stack tail
+    /// append outlived its interrupted admission transaction.
+    #[serde(default)]
+    pub native_append_membership_recovery: Vec<crate::membership::MembershipOutput>,
     /// Durable per-member proof that every required context has reporting run
     /// lineage on the exact current head, or the typed reason it does not.
     #[serde(default)]
@@ -4068,6 +4072,7 @@ fn bounded_prefix_output(
         root_merge: progress.root_merge,
         native_stack_land: progress.native_stack_land,
         native_membership_recovery: Vec::new(),
+        native_append_membership_recovery: Vec::new(),
         required_runs: progress.required_runs,
         rebase_plans: progress.rebase_plans,
         rebase_receipts: progress.rebase_receipts,
@@ -4148,6 +4153,7 @@ fn root_first_output(
         root_merge: progress.root_merge,
         native_stack_land: progress.native_stack_land,
         native_membership_recovery: Vec::new(),
+        native_append_membership_recovery: Vec::new(),
         required_runs: progress.required_runs,
         rebase_plans: progress.rebase_plans,
         rebase_receipts: progress.rebase_receipts,
@@ -4235,6 +4241,7 @@ fn closed_lifecycle_output(
         root_merge: Vec::new(),
         native_stack_land: Vec::new(),
         native_membership_recovery: Vec::new(),
+        native_append_membership_recovery: Vec::new(),
         required_runs: Vec::new(),
         rebase_plans: Vec::new(),
         rebase_receipts: Vec::new(),
@@ -4343,6 +4350,7 @@ fn native_membership_recovery_output(
         root_merge: Vec::new(),
         native_stack_land: Vec::new(),
         native_membership_recovery: vec![recovery],
+        native_append_membership_recovery: Vec::new(),
         required_runs: Vec::new(),
         rebase_plans: Vec::new(),
         rebase_receipts: Vec::new(),
@@ -4353,6 +4361,83 @@ fn native_membership_recovery_output(
         ci: Vec::new(),
         events: Vec::new(),
         hook_deliveries: Vec::new(),
+        status,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn native_append_membership_recovery_output(
+    context: &AppContext,
+    input: &SyncInput,
+    started: Instant,
+    operation_deadline: Instant,
+    initial_status_elapsed: Duration,
+    recovery: &crate::membership::MembershipOutput,
+    stack_number: u64,
+    status: StatusOutput,
+    lock_recovery: Option<OperationLockRecovery>,
+    lock: &mut WriterOperationGuard,
+) -> Result<SyncOutput, AppError> {
+    lock.checkpoint(
+        "native_append_membership_recovery_complete",
+        json!({
+            "membership": &recovery,
+            "stack_number": stack_number,
+            "status": &status.stack_backend,
+        }),
+        false,
+    )?;
+    let root = recovery.caravan_id;
+    let changed = recovery.receipt.changed;
+    let mut receipt = recovery.receipt.clone();
+    "sync-native-append-membership-recovery".clone_into(&mut receipt.operation);
+    let mut scheduler_status =
+        successful_scheduler_status(&status, &[], &[], context.config.rebase_on_join, &[], &[]);
+    scheduler_status.wake_class = SchedulerWakeClass::ExternalDecision;
+    scheduler_status.disposition = SchedulerDisposition::ExternalDecision;
+    format!(
+        "provider-visible Stack #{stack_number} append finalized ordinary membership; follow exact native Stack rebase/repair evidence before normal convergence"
+    )
+    .clone_into(&mut scheduler_status.reason);
+    Ok(SyncOutput {
+        tick: SyncTickReceipt {
+            schema_version: 1,
+            verb: "sync".to_owned(),
+            caravans: status.analysis.fleet.caravans.len(),
+            unqueued: status.analysis.fleet.unqueued.len(),
+            synchronized: 1,
+            joins: 1,
+            changed,
+        },
+        receipt,
+        auto_admission: AutoAdmissionOutput::disabled(context, input.all),
+        scheduler_status,
+        timing: Some(SyncTiming {
+            deadline_ms: duration_millis(operation_deadline.saturating_duration_since(started)),
+            total_ms: duration_millis(started.elapsed()),
+            initial_status_ms: duration_millis(initial_status_elapsed),
+            provider_convergence_ms: duration_millis(started.elapsed()),
+            final_status_ms: 0,
+        }),
+        lock_recovery,
+        provider_receipts: recovery.provider_receipts.clone(),
+        closed_lifecycle_transitions: Vec::new(),
+        root_auto_merge: Vec::new(),
+        root_promotion: Vec::new(),
+        root_merge: Vec::new(),
+        native_stack_land: Vec::new(),
+        native_membership_recovery: Vec::new(),
+        native_append_membership_recovery: vec![recovery.clone()],
+        required_runs: Vec::new(),
+        rebase_plans: Vec::new(),
+        rebase_receipts: recovery.rebase_receipt.clone().into_iter().collect(),
+        historical_predecessor: read::historical_predecessor(&status),
+        synchronized_caravans: vec![root],
+        paused_caravans: Vec::new(),
+        head_advancements: Vec::new(),
+        ci: Vec::new(),
+        events: recovery.events.clone(),
+        hook_deliveries: recovery.hook_deliveries.clone(),
         status,
     })
 }
@@ -4441,6 +4526,42 @@ fn sync_with_lock(
         &runner,
     )?;
     let provider = GitHubMutationAdapter::new(runner);
+
+    // A provider Stack append may become visible before its ordinary membership
+    // transaction completes. Project only that one exact extra tail back to the
+    // proven logical prefix, then reuse the normal admission transaction. The
+    // native add is provider-idempotent; base/label/generation/compatibility
+    // remain fenced by membership and ambiguous drift never enters this path.
+    if let Some(recovery) = crate::stack_recovery::project_provider_visible_append(&status)? {
+        let membership = crate::membership::auto_admit_locked(
+            context,
+            recovery.status,
+            recovery.candidate,
+            Some(recovery.tail),
+            recovery.priority_label,
+            None,
+            operation_deadline,
+            &github_budget,
+            &lock,
+        )?;
+        let mut recovered_status =
+            read::fleet_status_for_sync(context, operation_deadline, Some(&github_budget))?;
+        if let Some(authority) = authority {
+            authority.bind_invocation(&mut recovered_status)?;
+        }
+        return native_append_membership_recovery_output(
+            context,
+            input,
+            started,
+            operation_deadline,
+            initial_status_elapsed,
+            &membership,
+            recovery.stack_number,
+            recovered_status,
+            lock_recovery,
+            &mut lock,
+        );
+    }
 
     // Complete provider inventory is authority for missing native membership.
     // A local checkpoint may strengthen/replay the plan but is never required.
@@ -5002,6 +5123,7 @@ fn sync_with_lock(
         root_merge: progress.root_merge,
         native_stack_land: progress.native_stack_land,
         native_membership_recovery: Vec::new(),
+        native_append_membership_recovery: Vec::new(),
         required_runs: progress.required_runs,
         rebase_plans: progress.rebase_plans,
         rebase_receipts: progress.rebase_receipts,
