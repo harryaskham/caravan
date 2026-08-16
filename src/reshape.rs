@@ -733,6 +733,19 @@ fn native_reshape_required(
     Ok(intersects_open_stack)
 }
 
+fn native_tail_ancestry_only(native: &crate::read::NativeStackStatus, selected: PrNumber) -> bool {
+    native.consistency == crate::read::StackConsistency::Drifted
+        && !native.problems.is_empty()
+        && native
+            .problems
+            .iter()
+            .all(|problem| problem.code == "native_stack_rebase_required")
+        && native
+            .ancestry
+            .iter()
+            .all(|edge| edge.linear || edge.child_pr == selected)
+}
+
 #[allow(clippy::too_many_lines)]
 fn native_reshape_unstack<R: crate::command::CommandRunner>(
     context: &AppContext,
@@ -793,15 +806,17 @@ fn native_reshape_unstack<R: crate::command::CommandRunner>(
             "native reshape requires exactly one provider Stack mapped to the selected caravan",
         ));
     };
-    if native.consistency != crate::read::StackConsistency::Exact {
+    let selected_tail_eviction = operation == ReshapeOperation::Evict
+        && caravan.members.last().copied() == Some(prepared.number);
+    let exact_tail_ancestry_only =
+        selected_tail_eviction && native_tail_ancestry_only(native, prepared.number);
+    if native.consistency != crate::read::StackConsistency::Exact && !exact_tail_ancestry_only {
         return Err(AppError::validation(
             "github_stack_reshape_generation_drifted",
-            "native reshape requires an exact provider Stack generation",
+            "native reshape requires an exact provider Stack generation, except for ancestry drift isolated to the selected eviction tail",
         ));
     }
-    let allowed_stale_tail_base = (operation == ReshapeOperation::Evict
-        && caravan.members.last().copied() == Some(prepared.number))
-    .then_some(prepared.number);
+    let allowed_stale_tail_base = selected_tail_eviction.then_some(prepared.number);
     let before = provider
         .native_stack_generation_allowing_stale_tail_base(
             &status.repository,
@@ -2311,6 +2326,45 @@ mod tests {
             1
         );
         assert_eq!(source.matches("hooks::dispatch_events_before(").count(), 2);
+    }
+
+    #[test]
+    fn native_tail_eviction_accepts_only_selected_tail_ancestry_drift() {
+        let mut native = crate::read::NativeStackStatus {
+            stack: crate::github::GitHubStackSnapshot {
+                id: 1,
+                number: 44,
+                node_id: "S_tail".to_owned(),
+                base: crate::github::GitHubStackBase {
+                    ref_name: "main".to_owned(),
+                },
+                open: true,
+                created_at: String::new(),
+                pull_requests: Vec::new(),
+            },
+            caravan_id: Some(PrNumber(1)),
+            consistency: crate::read::StackConsistency::Drifted,
+            ancestry: vec![crate::read::NativeStackAncestryEdge {
+                parent_pr: PrNumber(1),
+                parent_head: CommitOid("parent".to_owned()),
+                child_pr: PrNumber(2),
+                child_head: CommitOid("child".to_owned()),
+                relation: crate::generation::CommitRelation::Diverged,
+                linear: false,
+            }],
+            problems: vec![crate::read::StackBackendProblem {
+                code: "native_stack_rebase_required".to_owned(),
+                message: "tail ancestry".to_owned(),
+            }],
+        };
+        assert!(native_tail_ancestry_only(&native, PrNumber(2)));
+        assert!(!native_tail_ancestry_only(&native, PrNumber(1)));
+
+        native.problems.push(crate::read::StackBackendProblem {
+            code: "github_stack_pr_base_drift".to_owned(),
+            message: "not ancestry-only".to_owned(),
+        });
+        assert!(!native_tail_ancestry_only(&native, PrNumber(2)));
     }
 
     #[test]
