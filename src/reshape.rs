@@ -25,6 +25,7 @@ use crate::{AppContext, AppError, EvictInput, SplitInput};
 const ACTIVE_LABEL: &str = "caravan";
 const EVICTED_LABEL: &str = "caravan-evicted";
 const FORCE_LABEL: &str = "caravan-force";
+const PARKED_LABEL: &str = "caravan-parked";
 const MAX_RESHAPE_OPERATION_SECS: u64 = 3_600;
 
 fn reshape_operation_deadline(context: &AppContext) -> std::time::Instant {
@@ -569,6 +570,7 @@ fn execute(
             let before_labels = state.current(number).labels.clone();
             state.ensure_auto_merge_disabled(provider, &status.repository, number)?;
             state.ensure_label_absent(provider, &status.repository, number, FORCE_LABEL)?;
+            state.ensure_label_absent(provider, &status.repository, number, PARKED_LABEL)?;
             state.ensure_label_absent(provider, &status.repository, number, ACTIVE_LABEL)?;
             state.ensure_label_present(provider, &status.repository, number, EVICTED_LABEL)?;
             if let Some(child) = plan.child {
@@ -1184,6 +1186,7 @@ fn plan_eviction(
     virtual_target.auto_merge = AutoMergeState::disabled();
     virtual_target.labels.remove(ACTIVE_LABEL);
     virtual_target.labels.remove(FORCE_LABEL);
+    virtual_target.labels.remove(PARKED_LABEL);
     virtual_target.labels.insert(EVICTED_LABEL.to_owned());
     if let (Some(child), Some(base)) = (child, &child_base) {
         let virtual_child = pull_requests.get_mut(&child).expect("child is present");
@@ -1942,7 +1945,9 @@ mod tests {
 
     #[test]
     fn native_stackless_singleton_evicts_without_inventing_a_provider_stack() {
-        let pulls = vec![pull_request(71, "main")];
+        let mut canary = pull_request(71, "main");
+        canary.labels.insert(PARKED_LABEL.to_owned());
+        let pulls = vec![canary];
         let provider = FakeProvider::new(&pulls);
         let mut observed = status(pulls);
         observed.stack_backend = crate::read::StackBackendStatus {
@@ -1980,6 +1985,7 @@ mod tests {
 
         let evicted = &provider.pull_requests.borrow()[&PrNumber(71)];
         assert!(!evicted.has_label(ACTIVE_LABEL));
+        assert!(!evicted.has_label(PARKED_LABEL));
         assert!(evicted.has_label(EVICTED_LABEL));
         assert_eq!(output.affected_prs, [PrNumber(71)]);
         assert!(output.native_stack_checkpoint.is_none());
