@@ -283,10 +283,24 @@ pub fn plan_native_membership(
             "an existing multi-member caravan must map to exactly one provider Stack",
         ));
     };
-    if native.consistency != StackConsistency::Exact {
+    let provider_members = native
+        .stack
+        .pull_requests
+        .iter()
+        .filter(|entry| entry.state.eq_ignore_ascii_case("open"))
+        .map(|entry| PrNumber(entry.number))
+        .collect::<Vec<_>>();
+    let expected_full = caravan
+        .members
+        .iter()
+        .copied()
+        .chain(std::iter::once(output.pull_request.number))
+        .collect::<Vec<_>>();
+    let lost_append_response = provider_members == expected_full;
+    if native.consistency != StackConsistency::Exact && !lost_append_response {
         return Err(invalid_plan(
             "github_stack_membership_generation_drifted",
-            "the existing provider Stack must be exact before append",
+            "the existing provider Stack must be exact before append unless it already contains this exact candidate tail",
         ));
     }
     Ok(NativeMembershipPlan::Add {
@@ -537,6 +551,19 @@ mod tests {
         }
     }
 
+    fn stack_pull(pull: &PullRequestSnapshot) -> crate::github::GitHubStackPullRequest {
+        crate::github::GitHubStackPullRequest {
+            number: pull.number.0,
+            state: "OPEN".to_owned(),
+            draft: pull.draft,
+            merged_at: pull.merged_at.clone(),
+            head: crate::github::GitHubStackPullRequestHead {
+                ref_name: pull.head.name.clone(),
+                sha: pull.head.oid.clone(),
+            },
+        }
+    }
+
     fn output(
         operation: &str,
         candidate: PullRequestSnapshot,
@@ -743,6 +770,50 @@ mod tests {
         assert_eq!(stack_number, 42);
         assert_eq!(expected_members, vec![PrNumber(101), PrNumber(102)]);
         assert_eq!(*candidate, tail);
+    }
+
+    #[test]
+    fn provider_visible_exact_candidate_tail_resumes_lost_append_response() {
+        let main = branch("main", "main000");
+        let root = pull(101, main.clone());
+        let child = pull(102, root.head.clone());
+        let tail = pull(103, child.head.clone());
+        let caravans = vec![Caravan::new(vec![PrNumber(101), PrNumber(102)]).unwrap()];
+        let pulls = BTreeMap::from([
+            (PrNumber(101), root.clone()),
+            (PrNumber(102), child.clone()),
+        ]);
+        let native = NativeStackStatus {
+            stack: crate::github::GitHubStackSnapshot {
+                id: 1,
+                number: 42,
+                node_id: "S_lost_append".to_owned(),
+                base: crate::github::GitHubStackBase {
+                    ref_name: "main".to_owned(),
+                },
+                open: true,
+                created_at: String::new(),
+                pull_requests: [&root, &child, &tail].into_iter().map(stack_pull).collect(),
+            },
+            caravan_id: Some(PrNumber(101)),
+            consistency: StackConsistency::Drifted,
+            ancestry: Vec::new(),
+            problems: Vec::new(),
+        };
+        let output = output("join", tail.clone(), PrNumber(101));
+
+        let plan =
+            plan_native_membership(&facts(&main, &caravans, &pulls, &[native]), &output, "cara")
+                .expect("an exact provider-visible candidate tail reaches zero-write validation");
+        assert!(matches!(
+            plan,
+            NativeMembershipPlan::Add {
+                expected_members,
+                candidate,
+                ..
+            } if expected_members == vec![PrNumber(101), PrNumber(102)]
+                && *candidate == tail
+        ));
     }
 
     #[test]
