@@ -1573,9 +1573,14 @@ predecessor source head (ordinary provider shape) or the exact selected
 predecessor synthetic-candidate OID (GitHub's stable cumulative Stack shape);
 its second parent must always equal the child's immutable source head.
 Cumulative authority advances only through a predecessor candidate whose own
-lineage was accepted in the same ordered Stack generation. Arbitrary alternate
-parents, missing candidates, moved source heads, wrong order, and non-native
-caravans remain stale/fail-closed. Candidate regeneration, not scheduler
+lineage was accepted in the same ordered Stack generation. After provider
+landing, the Stack resource may retain a contiguous merged prefix while
+active-only Cara discovery contains only the exact open suffix. That merged
+prefix is authoritative historical provider evidence: its absence from the
+current pull map is expected, while every open suffix member remains mandatory
+and exact. Arbitrary alternate parents, missing open candidates, moved source
+heads, noncontiguous merged entries, wrong order, and non-native caravans remain
+stale/fail-closed. Candidate regeneration, not scheduler
 force-push, is the only automatic CI refresh. The ruleset generation is checkpointed with the async
 UUID, revalidated before each submit/poll, and released only by exact ID and
 generation after terminal proof. Missing/drifted lock is `indeterminate`.

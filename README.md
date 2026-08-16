@@ -845,9 +845,12 @@ source head to an exact two-parent candidate. The root uses current main; each
 native child may use either its predecessor source head or the exact selected
 predecessor synthetic candidate as first parent, while the second parent remains
 the child's source head. The latter is GitHub's stable cumulative Stack shape,
-not stale-base drift. Authority advances only through an already-accepted prior
-candidate in the same Stack order; arbitrary parents and non-native lanes remain
-fail-closed. Provider regeneration rather than scheduler force-pushes drives CI. The adapter acquires, verifies,
+not stale-base drift. Authority advances only through an already-accepted prior candidate in the same
+Stack order. A contiguous merged prefix retained in the provider Stack is valid
+historical evidence even though active-only discovery omits those merged PR
+rows; every open suffix member is still required and verified exactly.
+Arbitrary parents, missing open members, noncontiguous merged entries, and
+non-native lanes remain fail-closed. Provider regeneration rather than scheduler force-pushes drives CI. The adapter acquires, verifies,
 checkpoints, and exactly releases the complete lock. The ruleset path requires
 the explicit, conditional Administration(write) App permission documented
 below; default Caravan mode never needs it.
