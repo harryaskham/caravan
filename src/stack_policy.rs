@@ -398,8 +398,16 @@ fn generation_drift_fields(
     if !generation.open {
         changed.push("stack_open".to_owned());
     }
-    for entry in &generation.topology.entries {
+    for (position, entry) in generation.topology.entries.iter().enumerate() {
         let Some(current) = pull_requests.get(&entry.pr) else {
+            // Active-only discovery deliberately omits cold merged lifecycle
+            // rows. The complete provider Stack generation is authoritative for
+            // its contiguous merged prefix; absence from the current logical
+            // map is expected there, never generation drift. Every open suffix
+            // member remains mandatory and exact below.
+            if position < first_open {
+                continue;
+            }
             changed.push(format!("pr_{}_missing", entry.pr.0));
             continue;
         };
@@ -1018,7 +1026,10 @@ mod tests {
         for merged_count in [1, 2] {
             let generation = collapsed_stack(merged_count);
             let current = generation.topology.entries[merged_count].pr;
-            let pulls = pull_requests(&generation);
+            let mut pulls = pull_requests(&generation);
+            for merged in &generation.topology.entries[..merged_count] {
+                pulls.remove(&merged.pr);
+            }
             let route = route_landing(
                 &github_config(),
                 &backend(crate::read::StackCapability::Available),
