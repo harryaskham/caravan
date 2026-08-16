@@ -1444,8 +1444,13 @@ and native add postconditions are all revalidated; the provider add is an
 idempotent already-satisfied write. Multiple/foreign extras, moved heads,
 noncanonical candidates, unrelated backend problems, or incomplete inventory
 never gain this authority. The resulting membership receipt is returned as
-`native_append_membership_recovery`; any remaining physical ancestry repair is
-an explicit native-rebase decision before normal convergence.
+`native_append_membership_recovery`. When complete provider truth identifies
+exactly one Stack whose only remaining defect is known adjacent ancestry
+divergence, ordinary sync reuses the native-rebase planner: it prepares the
+complete divergent suffix, atomically publishes exact force-with-lease updates,
+records the sealed plan/receipts, and returns immediately for fresh CI. Multiple
+Stacks, mixed drift, unknown ancestry, or incomplete inventory remain an
+explicit native-rebase decision before normal convergence.
 
 `native-stack recovery-preview` seals
 current repository, ordered membership, immutable head/base generations,

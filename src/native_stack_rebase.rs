@@ -289,41 +289,28 @@ fn receipt_key(plan_hash: &str) -> Result<String, AppError> {
     Ok(format!("rebase-{}", plan_hash.replace(':', "-")))
 }
 
-#[allow(clippy::too_many_lines)]
-pub fn apply(
+fn read_postcondition(
     context: &AppContext,
-    input: &NativeStackRebaseApplyInput,
-) -> Result<NativeStackRebaseOutput, AppError> {
-    let key = receipt_key(&input.expected_plan_hash)?;
-    if let Some(output) =
-        crate::stack_checkpoint::load::<NativeStackRebaseOutput>(&context.repository_path, &key)?
-    {
-        if output.plan.plan_hash == input.expected_plan_hash {
-            return Ok(output);
-        }
-    }
-    let writer = context.acquire_writer_operation("native-stack-rebase-apply")?;
-    let deadline = std::time::Instant::now()
-        + std::time::Duration::from_secs(context.config.sync.max_duration_secs);
-    let status = read::status_with_deadline(context, deadline)?;
-    let intent = NativeStackRebasePreviewInput {
-        stack: input.stack,
-        actor: input.actor.clone(),
-        reason: input.reason.clone(),
-    };
-    let plan = plan_from_status(context, &status, &intent)?;
-    if plan.plan_hash != input.expected_plan_hash || !plan.verify() {
-        return Err(AppError::structured(
-            ErrorCategory::Validation,
-            "native_stack_rebase_plan_stale",
-            "native Stack rebase facts changed after preview",
-            Some(json!({
-                "expected_plan_hash": input.expected_plan_hash,
-                "actual_plan": plan,
-                "mutated": false,
-            })),
-        ));
-    }
+    deadline: std::time::Instant,
+    github_budget: Option<&crate::command::GithubRequestBudget>,
+) -> Result<StatusOutput, AppError> {
+    github_budget.map_or_else(
+        || read::status_with_deadline(context, deadline),
+        |budget| read::status_with_deadline_and_budget(context, deadline, Some(budget)),
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn apply_plan(
+    context: &AppContext,
+    status: &StatusOutput,
+    plan: NativeStackRebasePlan,
+    stack: u64,
+    key: &str,
+    writer: &crate::writer_guard::WriterOperationGuard,
+    deadline: std::time::Instant,
+    github_budget: Option<&crate::command::GithubRequestBudget>,
+) -> Result<(NativeStackRebaseOutput, StatusOutput), AppError> {
     let timeout = std::time::Duration::from_secs(context.config.command_timeout_secs);
     let mut prepared = Vec::with_capacity(plan.members.len());
     let mut target = crate::physical_rebase::PlannedBase::Remote(BranchSnapshot {
@@ -367,7 +354,7 @@ pub fn apply(
     }
     let prepared_refs = prepared.iter().collect::<Vec<_>>();
     let physical = crate::physical_rebase::apply_prepared_atomically(&prepared_refs)?;
-    let final_status = read::status_with_deadline(context, deadline).map_err(|error| {
+    let final_status = read_postcondition(context, deadline, github_budget).map_err(|error| {
         AppError::structured(
             ErrorCategory::ExecutionFailure,
             "native_stack_rebase_postcondition_read_failed",
@@ -385,7 +372,7 @@ pub fn apply(
         .stack_backend
         .native_stacks
         .iter()
-        .find(|native| native.stack.number == input.stack)
+        .find(|native| native.stack.number == stack)
         .ok_or_else(|| {
             AppError::structured(
                 ErrorCategory::ExecutionFailure,
@@ -417,8 +404,131 @@ pub fn apply(
         fresh_ci_required: true,
         next: "wait for fresh CI on every rewritten head, then rerun cara sync".to_owned(),
     };
-    crate::stack_checkpoint::write(&context.repository_path, &key, &output)?;
-    Ok(output)
+    crate::stack_checkpoint::write(&context.repository_path, key, &output)?;
+    Ok((output, final_status))
+}
+
+fn automatic_rebase_stack(
+    backend: &crate::read::StackBackendStatus,
+) -> Result<Option<u64>, AppError> {
+    if backend.provider_stacks_truncated
+        || backend.capability != crate::read::StackCapability::Available
+        || backend.mutation_support != crate::read::StackMutationSupport::NativeStack
+    {
+        return Ok(None);
+    }
+    if backend
+        .problems
+        .iter()
+        .any(|problem| problem.code != "native_stack_rebase_required")
+    {
+        return Ok(None);
+    }
+    let divergent = backend
+        .native_stacks
+        .iter()
+        .filter(|native| {
+            !native.problems.is_empty()
+                && native
+                    .problems
+                    .iter()
+                    .all(|problem| problem.code == "native_stack_rebase_required")
+        })
+        .map(|native| native.stack.number)
+        .collect::<Vec<_>>();
+    match divergent.as_slice() {
+        [] => Ok(None),
+        [stack] => Ok(Some(*stack)),
+        _ => Err(AppError::structured(
+            ErrorCategory::Validation,
+            "native_stack_auto_rebase_ambiguous",
+            "multiple divergent native Stacks cannot share one automatic rewrite tick",
+            Some(json!({"stacks": divergent, "mutated": false})),
+        )),
+    }
+}
+
+pub(crate) fn auto_apply_from_status(
+    context: &AppContext,
+    status: &StatusOutput,
+    writer: &crate::writer_guard::WriterOperationGuard,
+    deadline: std::time::Instant,
+    github_budget: &crate::command::GithubRequestBudget,
+) -> Result<Option<(NativeStackRebaseOutput, StatusOutput)>, AppError> {
+    let Some(stack) = automatic_rebase_stack(&status.stack_backend)? else {
+        return Ok(None);
+    };
+    let intent = NativeStackRebasePreviewInput {
+        stack,
+        actor: "caravan-scheduler".to_owned(),
+        reason: "automatic exact native Stack ancestry convergence".to_owned(),
+    };
+    let plan = plan_from_status(context, status, &intent)?;
+    let key = receipt_key(&plan.plan_hash)?;
+    if let Some(output) =
+        crate::stack_checkpoint::load::<NativeStackRebaseOutput>(&context.repository_path, &key)?
+    {
+        let final_status = read_postcondition(context, deadline, Some(github_budget))?;
+        return Ok(Some((output, final_status)));
+    }
+    apply_plan(
+        context,
+        status,
+        plan,
+        stack,
+        &key,
+        writer,
+        deadline,
+        Some(github_budget),
+    )
+    .map(Some)
+}
+
+pub fn apply(
+    context: &AppContext,
+    input: &NativeStackRebaseApplyInput,
+) -> Result<NativeStackRebaseOutput, AppError> {
+    let key = receipt_key(&input.expected_plan_hash)?;
+    if let Some(output) =
+        crate::stack_checkpoint::load::<NativeStackRebaseOutput>(&context.repository_path, &key)?
+    {
+        if output.plan.plan_hash == input.expected_plan_hash {
+            return Ok(output);
+        }
+    }
+    let writer = context.acquire_writer_operation("native-stack-rebase-apply")?;
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(context.config.sync.max_duration_secs);
+    let status = read::status_with_deadline(context, deadline)?;
+    let intent = NativeStackRebasePreviewInput {
+        stack: input.stack,
+        actor: input.actor.clone(),
+        reason: input.reason.clone(),
+    };
+    let plan = plan_from_status(context, &status, &intent)?;
+    if plan.plan_hash != input.expected_plan_hash || !plan.verify() {
+        return Err(AppError::structured(
+            ErrorCategory::Validation,
+            "native_stack_rebase_plan_stale",
+            "native Stack rebase facts changed after preview",
+            Some(json!({
+                "expected_plan_hash": input.expected_plan_hash,
+                "actual_plan": plan,
+                "mutated": false,
+            })),
+        ));
+    }
+    apply_plan(
+        context,
+        &status,
+        plan,
+        input.stack,
+        &key,
+        &writer,
+        deadline,
+        None,
+    )
+    .map(|(output, _)| output)
 }
 
 #[cfg(test)]
@@ -438,6 +548,68 @@ mod tests {
             name: name.to_owned(),
             oid: CommitOid(oid.to_owned()),
         }
+    }
+
+    fn divergent_stack(number: u64) -> NativeStackStatus {
+        NativeStackStatus {
+            stack: crate::github::GitHubStackSnapshot {
+                id: number,
+                number,
+                node_id: format!("S_{number}"),
+                base: crate::github::GitHubStackBase {
+                    ref_name: "main".to_owned(),
+                },
+                open: true,
+                created_at: String::new(),
+                pull_requests: Vec::new(),
+            },
+            caravan_id: Some(PrNumber(number)),
+            consistency: StackConsistency::Drifted,
+            ancestry: Vec::new(),
+            problems: vec![crate::read::StackBackendProblem {
+                code: "native_stack_rebase_required".to_owned(),
+                message: "diverged".to_owned(),
+            }],
+        }
+    }
+
+    fn backend(stacks: Vec<NativeStackStatus>) -> crate::read::StackBackendStatus {
+        crate::read::StackBackendStatus {
+            configured: crate::config::StackType::Github,
+            capability: crate::read::StackCapability::Available,
+            mutation_support: crate::read::StackMutationSupport::NativeStack,
+            native_stacks: stacks,
+            provider_stacks_truncated: false,
+            missing_caravans: Vec::new(),
+            problems: vec![crate::read::StackBackendProblem {
+                code: "native_stack_rebase_required".to_owned(),
+                message: "diverged".to_owned(),
+            }],
+        }
+    }
+
+    #[test]
+    fn automatic_rebase_selects_only_one_pure_ancestry_drift() {
+        assert_eq!(automatic_rebase_stack(&backend(Vec::new())).unwrap(), None);
+        assert_eq!(
+            automatic_rebase_stack(&backend(vec![divergent_stack(42)])).unwrap(),
+            Some(42)
+        );
+        assert_eq!(
+            automatic_rebase_stack(&backend(vec![divergent_stack(42), divergent_stack(43)]))
+                .unwrap_err()
+                .code(),
+            "native_stack_auto_rebase_ambiguous"
+        );
+        let mut unavailable = backend(vec![divergent_stack(42)]);
+        unavailable.provider_stacks_truncated = true;
+        assert_eq!(automatic_rebase_stack(&unavailable).unwrap(), None);
+        let mut mixed = backend(vec![divergent_stack(42)]);
+        mixed.problems.push(crate::read::StackBackendProblem {
+            code: "github_stack_member_order_drift".to_owned(),
+            message: "mixed".to_owned(),
+        });
+        assert_eq!(automatic_rebase_stack(&mixed).unwrap(), None);
     }
 
     #[test]
