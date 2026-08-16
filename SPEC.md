@@ -1575,10 +1575,13 @@ its second parent must always equal the child's immutable source head.
 Cumulative authority advances only through a predecessor candidate whose own
 lineage was accepted in the same ordered Stack generation. After provider
 landing, the Stack resource may retain a contiguous merged prefix while
-active-only Cara discovery contains only the exact open suffix. That merged
-prefix is authoritative historical provider evidence: its absence from the
-current pull map is expected, while every open suffix member remains mandatory
-and exact. Arbitrary alternate parents, missing open candidates, moved source
+active-only Cara discovery contains only the exact open suffix. That merged prefix is authoritative historical provider evidence: its absence
+from the current pull map is expected, while every open suffix member remains
+mandatory and exact. Repeated partial landing may add further base-collapse
+boundaries inside the retained merged prefix as each next root is promoted to
+the Stack base. Such a boundary is valid only when it uses the exact Stack base
+ref, preserves monotonic provider merge order, and its recorded base commit is
+contained by the current Stack base generation. Arbitrary alternate parents, missing open candidates, moved source
 heads, noncontiguous merged entries, wrong order, and non-native caravans remain
 stale/fail-closed. Candidate regeneration, not scheduler
 force-push, is the only automatic CI refresh. The ruleset generation is checkpointed with the async
