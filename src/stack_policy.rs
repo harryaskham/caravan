@@ -398,16 +398,11 @@ fn generation_drift_fields(
     if !generation.open {
         changed.push("stack_open".to_owned());
     }
-    for (position, entry) in generation.topology.entries.iter().enumerate() {
+    // Active-only sync discovery intentionally omits the retained merged prefix.
+    // Its state/head identity is already leased from the complete provider Stack
+    // generation above; only the current open suffix requires live PR snapshots.
+    for entry in &generation.topology.entries[first_open..] {
         let Some(current) = pull_requests.get(&entry.pr) else {
-            // Active-only discovery deliberately omits cold merged lifecycle
-            // rows. The complete provider Stack generation is authoritative for
-            // its contiguous merged prefix; absence from the current logical
-            // map is expected there, never generation drift. Every open suffix
-            // member remains mandatory and exact below.
-            if position < first_open {
-                continue;
-            }
             changed.push(format!("pr_{}_missing", entry.pr.0));
             continue;
         };
