@@ -659,10 +659,32 @@ pub(crate) fn project_provider_visible_append(
 }
 
 fn needs_auto_recovery(backend: &StackBackendStatus, caravan: &Caravan) -> bool {
-    caravan.members.len() >= 2
-        && !backend.native_stacks.iter().any(|native| {
-            native.caravan_id == Some(caravan.id) && native.consistency == StackConsistency::Exact
-        })
+    if caravan.members.len() < 2 {
+        return false;
+    }
+    let mapped = backend
+        .native_stacks
+        .iter()
+        .filter(|native| native.caravan_id == Some(caravan.id))
+        .collect::<Vec<_>>();
+    let [] = mapped.as_slice() else {
+        let [native] = mapped.as_slice() else {
+            return false;
+        };
+        if native.consistency == StackConsistency::Exact {
+            return false;
+        }
+        let open_members = native
+            .stack
+            .pull_requests
+            .iter()
+            .filter(|entry| entry.state.eq_ignore_ascii_case("open"))
+            .map(|entry| PrNumber(entry.number))
+            .collect::<Vec<_>>();
+        return open_members.len() + 1 == caravan.members.len()
+            && caravan.members.starts_with(&open_members);
+    };
+    true
 }
 
 pub(crate) fn auto_recover_missing(
@@ -1880,6 +1902,47 @@ mod tests {
         member.merge_state_status = Some("BLOCKED".to_owned());
         require_member_green(&member)
             .expect("policy-blocked mergeability with non-failing terminal checks is recoverable");
+    }
+
+    #[test]
+    fn full_member_ancestry_drift_is_not_membership_recovery() {
+        let members = [101, 102]
+            .into_iter()
+            .map(|number| crate::github::GitHubStackPullRequest {
+                number,
+                state: "OPEN".to_owned(),
+                draft: false,
+                merged_at: None,
+                head: crate::github::GitHubStackPullRequestHead {
+                    ref_name: format!("head-{number}"),
+                    sha: CommitOid(format!("oid-{number}")),
+                },
+            })
+            .collect();
+        let native = NativeStackStatus {
+            stack: GitHubStackSnapshot {
+                id: 9,
+                number: 9,
+                node_id: "S_ancestry".to_owned(),
+                base: GitHubStackBase {
+                    ref_name: "main".to_owned(),
+                },
+                open: true,
+                created_at: String::new(),
+                pull_requests: members,
+            },
+            caravan_id: Some(PrNumber(101)),
+            consistency: StackConsistency::Drifted,
+            ancestry: Vec::new(),
+            problems: vec![StackBackendProblem {
+                code: "native_stack_rebase_required".to_owned(),
+                message: "diverged".to_owned(),
+            }],
+        };
+        let backend = stack_backend_fixture(vec![native]);
+        let caravan = Caravan::new(vec![PrNumber(101), PrNumber(102)]).unwrap();
+
+        assert!(!needs_auto_recovery(&backend, &caravan));
     }
 
     #[test]
