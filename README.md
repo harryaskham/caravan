@@ -569,12 +569,15 @@ The same cached installation principal authenticates remote Git operations over
 an exact HTTPS repository. Cara installs a process-local Git credential helper
 through secret environment configuration: the helper program text contains no
 secret and reads the token only from environment; token-bearing scripts, argv,
-remote URLs, and persisted Git config are never created. Existing credential
-helpers and interactive prompting are disabled for that child. SSH, plaintext
-HTTP, non-GitHub/local remotes, explicit repository mismatch, and
-credential-bearing URLs fail before the remote command. One authentication
-failure refreshes and retries under the same deadline; a second failure stops.
-Ambient mode does not install or invoke this helper.
+remote URLs, and persisted Git config are never created. A checkout may retain
+one exact same-repository SSH `origin`; when a child addresses that alias, Cara
+overlays its process-local `remote.origin.url` with the exact HTTPS URL, so App
+credentials still own the network request and on-disk config is unchanged.
+Explicit SSH URLs, plaintext HTTP, non-GitHub/local remotes, repository mismatch,
+and credential-bearing URLs fail before the remote command. Existing credential
+helpers and interactive prompting are disabled for that child. One
+authentication failure refreshes and retries under the same deadline; a second
+failure stops. Ambient mode does not install or invoke this helper.
 
 Status, check, sync, loop, JSON, and MCP receipts expose secret-free provider
 telemetry: authenticated source class, total/GraphQL/REST/gh-CLI call counts,

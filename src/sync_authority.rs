@@ -650,6 +650,18 @@ mod tests {
         .unwrap();
     }
 
+    fn write_app_policy(repository: &Path) {
+        fs::create_dir_all(repository.join(".caravan")).unwrap();
+        fs::write(
+            repository.join(".caravan/config.yaml"),
+            format!(
+                "version: 1\nmin_cara_version: \"{}\"\ngithub_auth:\n  mode: app_installation\n  app_slug: caravan\n  installation_id: 42\nsync:\n  allow_fetch: true\n  max_caravans: 3\n",
+                env!("CARGO_PKG_VERSION")
+            ),
+        )
+        .unwrap();
+    }
+
     fn fixture() -> (tempfile::TempDir, PathBuf) {
         let root = tempfile::tempdir().unwrap();
         let remote = root.path().join("remote.git");
@@ -795,6 +807,62 @@ mod tests {
 
         assert_eq!(prepared.context().config.sync.max_caravans, 1);
         assert!(prepared.authority().is_some());
+    }
+
+    #[test]
+    fn sync_bootstrap_defers_app_runtime_validation_to_trusted_default_policy() {
+        if std::env::var_os("CARA_SYNC_APP_BOOTSTRAP_CHILD").is_some() {
+            let (_root, checkout) = fixture();
+            git(&checkout, &["checkout", "-b", "ambient-candidate"]);
+            let candidate_policy =
+                fs::read_to_string(checkout.join(".caravan/config.yaml")).unwrap();
+            git(&checkout, &["checkout", "main"]);
+            write_app_policy(&checkout);
+            git(&checkout, &["add", ".caravan/config.yaml"]);
+            git(&checkout, &["commit", "-m", "trusted App policy"]);
+            git(&checkout, &["push", "origin", "main"]);
+            git(&checkout, &["checkout", "ambient-candidate"]);
+
+            let seed = AppContext::load_for_sync_from_directory(&checkout, None).unwrap();
+            assert_eq!(
+                seed.config.github_auth.mode,
+                crate::config::GithubAuthMode::Ambient
+            );
+            let trusted = local_default_policy(&checkout, "origin/main", Duration::from_secs(30))
+                .unwrap()
+                .unwrap();
+            trusted.validate_runtime_environment().unwrap();
+            assert_eq!(
+                trusted.github_auth.mode,
+                crate::config::GithubAuthMode::AppInstallation
+            );
+            assert_eq!(trusted.github_auth.app_slug.as_deref(), Some("caravan"));
+            assert_eq!(trusted.github_auth.installation_id, Some(42));
+            assert_eq!(trusted.sync.max_caravans, 3);
+            assert_eq!(
+                fs::read_to_string(checkout.join(".caravan/config.yaml")).unwrap(),
+                candidate_policy,
+                "candidate policy remains ambient and is never made scheduler authority"
+            );
+            return;
+        }
+
+        let output = Command::new(std::env::current_exe().unwrap())
+            .arg("sync_bootstrap_defers_app_runtime_validation_to_trusted_default_policy")
+            .arg("--nocapture")
+            .env("CARA_SYNC_APP_BOOTSTRAP_CHILD", "1")
+            .env("CARA_GITHUB_AUTH_MODE", "app_installation")
+            .env("CARA_GITHUB_APP_SLUG", "caravan")
+            .env("CARA_GITHUB_APP_INSTALLATION_ID", "42")
+            .env("CARA_GITHUB_APP_CREDENTIAL_COMMAND", "/reviewed/broker")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child regression fixture failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

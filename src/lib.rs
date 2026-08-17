@@ -870,8 +870,12 @@ impl AppContext {
         let repository_path = resolve_repository_root(invocation_directory)?;
         let config_path = PathBuf::from(config::DEFAULT_CONFIG_PATH);
         let config_existed = repository_path.join(&config_path).exists();
+        // This placeholder is not repository policy. In particular its default
+        // ambient github_auth mode must not reject an App runtime before sync
+        // fetches and loads the trusted default-branch policy. Explicit configs,
+        // fetch-disabled local authority, and the materialized default context
+        // still perform normal fail-closed runtime identity validation.
         let config = CaravanConfig::sync_bootstrap_default();
-        config.validate_runtime_environment()?;
         Ok(Self {
             repository_path,
             config_path,

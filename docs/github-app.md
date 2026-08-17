@@ -93,14 +93,19 @@ review of `github-app-policy.json` and its contract test.
 
 ## Git transport and branch rules
 
-API and Git use the same cached installation principal. Remote Git accepts one
-exact HTTPS repository. Cara supplies `x-access-token` credentials through a
-static environment-configured credential helper whose text contains no token.
-It clears other helpers, prompts, hooks, Git/cURL tracing, insecure TLS flags,
-and injected config parameters for that child. It rejects SSH, plaintext HTTP,
-local or mismatched remotes, URL credentials, multiple origin URLs, `pushurl`,
-`url.*.insteadOf`, and URL-specific TLS overrides before credential resolution.
-All existing force-with-lease OID checks remain authoritative.
+API and Git use the same cached installation principal. Remote Git executes
+against one exact HTTPS repository. Cara supplies `x-access-token` credentials
+through a static environment-configured credential helper whose text contains no
+token. A checkout may retain one exact same-repository SSH `origin` as its local
+identity: for an `origin`-addressed child only, Cara overlays
+`remote.origin.url` in that child's private Git environment with the exact HTTPS
+URL and never rewrites on-disk config or uses SSH credentials. Explicit SSH URLs
+still refuse. Cara clears other helpers, prompts, hooks, Git/cURL tracing,
+insecure TLS flags, and ambient injected config parameters for that child. It
+rejects plaintext HTTP, local or mismatched remotes, URL credentials, multiple
+origin URLs, `pushurl`, `url.*.insteadOf`, and URL-specific TLS overrides before
+credential resolution. All existing force-with-lease OID checks remain
+authoritative.
 
 Repository rules should let the App force-update **only Caravan-managed PR
 source branches**. Do not permit force-push or bypass on the default branch.
