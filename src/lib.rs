@@ -674,7 +674,10 @@ RECOVERY, LOCKS, AND OBSERVABILITY
   Missing policy stays ambient; broker environment alone never activates. Cara
   validates exact identity/expiry, single-flights refresh, exposes only
   secret-free App telemetry, and never falls back on policy/runtime mismatch or
-  broker failure. Remote Git operations use that same cached
+  broker failure. The explicitly read-only `ci-admission-gate` is the sole
+  exception: it may consume its workflow's inherited read token without App
+  writer inference, and cannot activate that scope through environment policy or
+  reach a mutation command. Remote Git operations otherwise use the same cached
   principal through an environment-only HTTPS credential helper. SSH, plaintext
   HTTP, local/mismatched remotes, and credential-bearing URLs fail before Git.
   The least-privilege permission/branch/webhook/single-writer baseline is
@@ -805,6 +808,34 @@ impl AppContext {
         invocation_directory: &Path,
         path: Option<&Path>,
     ) -> Result<Self, ConfigError> {
+        Self::load_from_directory_with_runtime_validation(invocation_directory, path, true)
+    }
+
+    /// Load trusted policy for the read-only CI admission command without
+    /// requiring the repository's writer credential runtime. Provider reads
+    /// still use only the caller-supplied workflow token, and this context is
+    /// never exposed to mutation commands.
+    pub fn load_for_ci_admission(path: Option<&Path>) -> Result<Self, ConfigError> {
+        let invocation_directory =
+            std::env::current_dir().map_err(|error| ConfigError::RepositoryNotFound {
+                path: PathBuf::from("."),
+                message: error.to_string(),
+            })?;
+        Self::load_for_ci_admission_from_directory(&invocation_directory, path)
+    }
+
+    pub fn load_for_ci_admission_from_directory(
+        invocation_directory: &Path,
+        path: Option<&Path>,
+    ) -> Result<Self, ConfigError> {
+        Self::load_from_directory_with_runtime_validation(invocation_directory, path, false)
+    }
+
+    fn load_from_directory_with_runtime_validation(
+        invocation_directory: &Path,
+        path: Option<&Path>,
+        validate_runtime_environment: bool,
+    ) -> Result<Self, ConfigError> {
         // Preserve explicit-config parse precedence for stable machine errors:
         // a malformed requested file is reported even before repository lookup.
         let explicit_config = path
@@ -833,7 +864,9 @@ impl AppContext {
                 (relative, false, CaravanConfig::default())
             }
         };
-        config.validate_runtime_environment()?;
+        if validate_runtime_environment {
+            config.validate_runtime_environment()?;
+        }
         Ok(Self {
             repository_path,
             config_path,
@@ -2884,6 +2917,29 @@ mod tests {
         );
         assert!(context.config_existed);
         assert!(!nested.join(".caravan").exists());
+    }
+
+    #[test]
+    fn ci_admission_context_preserves_app_policy_without_writer_credentials() {
+        let directory = tempfile::tempdir().unwrap();
+        git(directory.path(), &["init"]);
+        std::fs::create_dir_all(directory.path().join(".caravan")).unwrap();
+        std::fs::write(
+            directory.path().join(config::DEFAULT_CONFIG_PATH),
+            "version: 1\ngithub_auth:\n  mode: app_installation\n  app_slug: caravan-ci-test\n  installation_id: 42\n",
+        )
+        .unwrap();
+
+        let context =
+            AppContext::load_for_ci_admission_from_directory(directory.path(), None).unwrap();
+        assert_eq!(
+            context.config.github_auth.mode,
+            config::GithubAuthMode::AppInstallation
+        );
+        assert_eq!(
+            context.config.github_auth.app_slug.as_deref(),
+            Some("caravan-ci-test")
+        );
     }
 
     #[test]

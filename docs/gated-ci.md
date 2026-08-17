@@ -42,13 +42,15 @@ on:
 Do **not** subscribe heavy CI to `labeled` or `unlabeled`. Priority, force,
 skip, park, and unpark transitions would create unrelated check generations.
 
-The first job checks out the trusted base SHA—not PR code—and runs:
+The first job checks out the trusted base SHA—not PR code—and runs with the workflow's read-only `GH_TOKEN`:
 
 ```bash
 cara --json ci-admission-gate \
   --event "$GITHUB_EVENT_PATH" \
   --github-output "$GITHUB_OUTPUT"
 ```
+
+`ci-admission-gate` is the only command that may suppress configured writer-auth inference. This command-scoped exception never selects App credentials, never reaches a mutation surface, and cannot be activated by an environment variable. Repository policy remains App-only for sync, admission writers, and every provider/Git write. An absent, under-scoped, or unusable workflow token produces `run_unproven`, which runs expensive CI rather than falsely deferring it.
 
 Heavy jobs use:
 

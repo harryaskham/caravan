@@ -49,7 +49,7 @@ pub fn evaluate(context: &AppContext, input: &CiAdmissionGateInput) -> CiAdmissi
             None,
         );
     }
-    let prepared = match crate::sync_authority::prepare(context) {
+    let prepared = match crate::sync_authority::prepare_for_ci_admission(context) {
         Ok(prepared) => prepared,
         Err(error) => {
             return output(

@@ -149,12 +149,26 @@ impl PreparedSyncContext {
 /// Fetch and materialize authoritative policy unless an explicit config or a
 /// reviewed opt-out says this invocation owns its policy directly.
 pub(crate) fn prepare(context: &AppContext) -> Result<PreparedSyncContext, AppError> {
+    prepare_with_runtime_policy(context, true)
+}
+
+pub(crate) fn prepare_for_ci_admission(
+    context: &AppContext,
+) -> Result<PreparedSyncContext, AppError> {
+    prepare_with_runtime_policy(context, false)
+}
+
+fn prepare_with_runtime_policy(
+    context: &AppContext,
+    validate_runtime_environment: bool,
+) -> Result<PreparedSyncContext, AppError> {
     if context.config_path.is_absolute() {
         return Ok(unmaterialized(context.clone()));
     }
     if !context.config.sync.allow_fetch {
-        let local = AppContext::load_from_directory(&context.repository_path, None)
-            .map_err(|error| config_error_for_sync(&error))?;
+        let local =
+            load_materialized_context(&context.repository_path, validate_runtime_environment)
+                .map_err(|error| config_error_for_sync(&error))?;
         return Ok(unmaterialized(local));
     }
 
@@ -184,7 +198,7 @@ pub(crate) fn prepare(context: &AppContext) -> Result<PreparedSyncContext, AppEr
     if local_default_policy(&repository, &default_ref, local_timeout)?
         .is_some_and(|config| !config.sync.allow_fetch)
     {
-        let mut local = AppContext::load_from_directory(&repository, None)
+        let mut local = load_materialized_context(&repository, validate_runtime_environment)
             .map_err(|error| config_error_for_sync(&error))?;
         local.config.sync.allow_fetch = false;
         return Ok(unmaterialized(local));
@@ -198,7 +212,19 @@ pub(crate) fn prepare(context: &AppContext) -> Result<PreparedSyncContext, AppEr
         timeout,
         local_timeout,
         materialization_timeout,
+        validate_runtime_environment,
     )
+}
+
+fn load_materialized_context(
+    repository: &Path,
+    validate_runtime_environment: bool,
+) -> Result<AppContext, crate::config::ConfigError> {
+    if validate_runtime_environment {
+        AppContext::load_from_directory(repository, None)
+    } else {
+        AppContext::load_for_ci_admission_from_directory(repository, None)
+    }
 }
 
 fn authoritative_local_git_timeout(
@@ -231,6 +257,7 @@ fn unmaterialized(context: AppContext) -> PreparedSyncContext {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Authority identity plus command-local auth policy stay explicit.
 fn materialize_fetched_default(
     repository: PathBuf,
     default_ref: String,
@@ -239,6 +266,7 @@ fn materialize_fetched_default(
     timeout: Duration,
     local_timeout: Duration,
     materialization_timeout: Duration,
+    validate_runtime_environment: bool,
 ) -> Result<PreparedSyncContext, AppError> {
     let branch = default_ref.strip_prefix("origin/").ok_or_else(|| {
         authority_error(
@@ -295,7 +323,7 @@ fn materialize_fetched_default(
     ));
     let materialized =
         MaterializedWorktree::create(&repository, path, &oid, materialization_timeout)?;
-    let loaded = AppContext::load_from_directory(&materialized.path, None)
+    let loaded = load_materialized_context(&materialized.path, validate_runtime_environment)
         .map_err(|error| config_error_for_sync(&error))?;
     crate::sync::progress::emit(
         "policy_fetch",
