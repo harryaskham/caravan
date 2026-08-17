@@ -771,8 +771,12 @@ impl ProcessRunner {
         let runner = auth_probe_runner(cwd, self.operation_deadline);
         let origin = discover_github_repository(&runner, cwd);
         let explicit = explicit_github_repository(request)?;
-        let repository = origin
-            .or(explicit)
+        // An explicit HTTPS URL is the command's exact transport authority. If
+        // the command names only `origin`, the checkout's single remote remains
+        // repository identity and an SSH origin is overlaid to exact HTTPS for
+        // this child below; no on-disk Git config is rewritten.
+        let repository = explicit
+            .or(origin)
             .ok_or_else(|| "no exact GitHub repository remote is available".to_owned())?;
         validate_github_app_git_repository(&repository, request)?;
         validate_github_app_git_configuration(&runner)?;
@@ -1398,10 +1402,8 @@ fn validate_github_app_git_repository(
     repository: &GithubRepository,
     request: &CommandSpec,
 ) -> Result<(), String> {
-    if repository.git_transport != GithubGitTransport::Https {
-        return Err(
-            "App transport requires an HTTPS origin; SSH and plaintext HTTP refuse".to_owned(),
-        );
+    if repository.git_transport == GithubGitTransport::Http {
+        return Err("plaintext HTTP remotes are forbidden in App mode".to_owned());
     }
     for argument in &request.args {
         if let Some(explicit) = parse_github_remote(argument)
@@ -1425,7 +1427,7 @@ fn is_remote_git_request(request: &CommandSpec) -> bool {
 }
 
 fn github_app_git_environment(auth: &GithubAppGitAuth) -> BTreeMap<String, String> {
-    BTreeMap::from([
+    let mut environment = BTreeMap::from([
         (
             GITHUB_APP_GIT_TOKEN_ENV.to_owned(),
             auth.credential.token.clone(),
@@ -1455,7 +1457,22 @@ fn github_app_git_environment(auth: &GithubAppGitAuth) -> BTreeMap<String, Strin
         ("GIT_CONFIG_VALUE_3".to_owned(), "/dev/null".to_owned()),
         ("GIT_CONFIG_KEY_4".to_owned(), "http.sslVerify".to_owned()),
         ("GIT_CONFIG_VALUE_4".to_owned(), "true".to_owned()),
-    ])
+    ]);
+    if auth.repository.git_transport == GithubGitTransport::Ssh {
+        environment.insert("GIT_CONFIG_COUNT".to_owned(), "6".to_owned());
+        environment.insert(
+            "GIT_CONFIG_KEY_5".to_owned(),
+            "remote.origin.url".to_owned(),
+        );
+        environment.insert(
+            "GIT_CONFIG_VALUE_5".to_owned(),
+            format!(
+                "https://{}/{}/{}.git",
+                auth.repository.host, auth.repository.owner, auth.repository.name
+            ),
+        );
+    }
+    environment
 }
 
 fn should_refresh_github_app_git_auth(
@@ -2048,14 +2065,46 @@ mod tests {
     }
 
     #[test]
-    fn app_git_transport_requires_exact_https_repository() {
+    fn app_git_transport_uses_exact_https_and_overlays_origin_only() {
         let request = CommandSpec::new("git").args(["push", "origin", "HEAD:refs/heads/x"]);
         let https = parse_github_remote("https://github.com/owner/repo.git").unwrap();
         validate_github_app_git_repository(&https, &request).unwrap();
 
         let ssh = parse_github_remote("git@github.com:owner/repo.git").unwrap();
-        let error = validate_github_app_git_repository(&ssh, &request).unwrap_err();
-        assert!(error.contains("HTTPS origin"));
+        validate_github_app_git_repository(&ssh, &request).unwrap();
+        let environment = github_app_git_environment(&GithubAppGitAuth {
+            credential: GithubAppCredential {
+                token: "never-render-me".to_owned(),
+                app_slug: "caravan".to_owned(),
+                installation_id: 42,
+                expires_unix_secs: current_unix_secs() + 3_600,
+            },
+            repository: ssh,
+        });
+        assert_eq!(
+            environment.get("GIT_CONFIG_COUNT").map(String::as_str),
+            Some("6")
+        );
+        assert_eq!(
+            environment.get("GIT_CONFIG_KEY_5").map(String::as_str),
+            Some("remote.origin.url")
+        );
+        assert_eq!(
+            environment.get("GIT_CONFIG_VALUE_5").map(String::as_str),
+            Some("https://github.com/owner/repo.git")
+        );
+
+        let explicit_ssh = CommandSpec::new("git").args([
+            "ls-remote",
+            "git@github.com:owner/repo.git",
+            "refs/heads/main",
+        ]);
+        let error = validate_github_app_git_repository(
+            &parse_github_remote("git@github.com:owner/repo.git").unwrap(),
+            &explicit_ssh,
+        )
+        .unwrap_err();
+        assert!(error.contains("non-HTTPS"));
 
         let other = CommandSpec::new("git").args([
             "ls-remote",
