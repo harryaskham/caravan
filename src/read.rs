@@ -3014,6 +3014,58 @@ pub(crate) fn status_after_branch_rewrite_with_deadline(
     })
 }
 
+/// Membership facts for `ci-admission-gate`.
+///
+/// This is not fleet status. The gate may only ask whether one open PR is an
+/// active Caravan member; generation dumps, merged history, check rollups, and
+/// compatibility analysis stay on `status` / `status_for_remote_candidate`.
+#[derive(Debug, Clone)]
+pub(crate) struct AdmissionMembership {
+    pub repository: RepositoryId,
+    pub candidate: PullRequestSnapshot,
+    pub enrolled: bool,
+    pub default_head: crate::model::CommitOid,
+    pub provider_api: crate::model::GitHubApiTelemetry,
+}
+
+/// Discover only the exact PR plus current open labelled members.
+pub(crate) fn admission_membership(
+    context: &AppContext,
+    number: PrNumber,
+) -> Result<AdmissionMembership, AppError> {
+    let deadline = Instant::now() + Duration::from_secs(context.config.command_timeout_secs);
+    let runner = crate::command::ProcessRunner::in_directory(&context.repository_path)
+        .with_timeout(Duration::from_secs(context.config.command_timeout_secs))
+        .with_operation_deadline(deadline);
+    let discovery = GitHubDiscovery::new(runner.clone()).with_options(
+        crate::github::DiscoveryOptions {
+            require_current_pr_resolution: false,
+            include_historical_pull_requests: false,
+            focus_pr: Some(number),
+            repository: context.config.repository.clone(),
+            ..crate::github::DiscoveryOptions::default()
+        },
+    );
+    let snapshot = discovery
+        .discover_admission_membership(number)
+        .map_err(|error| discovery_error(&error))?;
+    let analysis =
+        crate::graph::derive_for_actor(&snapshot, context.config.sync.resolved_head_merge_actor());
+    let candidate = analysis.pull_requests.get(&number).cloned().ok_or_else(|| {
+        AppError::validation(
+            "admission_candidate_not_found",
+            format!("PR #{number} is absent from admission membership discovery"),
+        )
+    })?;
+    Ok(AdmissionMembership {
+        repository: snapshot.repository,
+        enrolled: analysis.fleet.containing(number).is_some(),
+        default_head: snapshot.default_branch.oid,
+        candidate,
+        provider_api: runner.github_api_telemetry(),
+    })
+}
+
 /// Discover the fleet and bind one exact remote candidate without checkout mutation.
 pub(crate) fn status_for_remote_candidate(
     context: &AppContext,

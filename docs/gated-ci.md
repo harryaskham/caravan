@@ -52,6 +52,8 @@ cara --json ci-admission-gate \
 
 `ci-admission-gate` is the only command that may suppress configured writer-auth inference. This command-scoped exception never selects App credentials, never reaches a mutation surface, and cannot be activated by an environment variable. Repository policy remains App-only for sync, admission writers, and every provider/Git write. An absent, under-scoped, or unusable workflow token produces `run_unproven`, which runs expensive CI rather than falsely deferring it.
 
+Membership evaluation is a four-call read: repository identity, default-branch tip, open `caravan` members, and the exact wake PR. It does not list merged history, does not download check rollups, and does not run compatibility analysis. Those remain `cara status` / sync costs. The gate may only ask whether that exact open PR is an active member.
+
 Heavy jobs use:
 
 ```yaml
