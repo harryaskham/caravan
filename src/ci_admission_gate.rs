@@ -199,8 +199,8 @@ fn evaluate_live_provider(
     config_fingerprint: String,
     authority_materialized: bool,
 ) -> CiAdmissionGateOutput {
-    let status = match crate::read::status_for_remote_candidate(context, selected_pr) {
-        Ok(status) => status,
+    let membership = match crate::read::admission_membership(context, selected_pr) {
+        Ok(membership) => membership,
         Err(error) => {
             return output(
                 context,
@@ -220,14 +220,14 @@ fn evaluate_live_provider(
             );
         }
     };
-    let telemetry = Some(status.provider_api.clone());
-    if !effective_policy_trusted(authority_materialized, status.config_provenance.as_ref()) {
+    let telemetry = Some(membership.provider_api.clone());
+    if !effective_policy_trusted(authority_materialized, None) {
         return output(
             context,
             Some(event),
             Some(selected_pr),
             Some(policy),
-            Some(&status),
+            None,
             CiAdmissionGateDecision::RunUnproven,
             false,
             false,
@@ -237,23 +237,8 @@ fn evaluate_live_provider(
             telemetry,
         );
     }
-    let Some(candidate) = status.analysis.pull_requests.get(&selected_pr) else {
-        return output(
-            context,
-            Some(event),
-            Some(selected_pr),
-            Some(policy),
-            Some(&status),
-            CiAdmissionGateDecision::RunUnproven,
-            false,
-            false,
-            "selected PR is absent from complete provider discovery; expensive CI is required"
-                .to_owned(),
-            config_fingerprint,
-            telemetry,
-        );
-    };
-    if status.repository != event.repository
+    let candidate = &membership.candidate;
+    if membership.repository != event.repository
         || candidate.head.oid != event.head
         || candidate.base.oid != event.base
         || candidate.cross_repository
@@ -265,7 +250,7 @@ fn evaluate_live_provider(
             Some(event),
             Some(selected_pr),
             Some(policy),
-            Some(&status),
+            None,
             CiAdmissionGateDecision::RunUnproven,
             false,
             false,
@@ -275,22 +260,24 @@ fn evaluate_live_provider(
             telemetry,
         );
     }
-    let enrolled = status.analysis.fleet.containing(selected_pr).is_some();
+    let enrolled = membership.enrolled;
     let member_label_present = candidate.has_label(&policy.member_label);
     let (decision, reason) = membership_decision(enrolled, member_label_present);
-    output(
+    let mut receipt = output(
         context,
         Some(event),
         Some(selected_pr),
         Some(policy),
-        Some(&status),
+        None,
         decision,
         enrolled,
         member_label_present,
         reason.to_owned(),
         config_fingerprint,
         telemetry,
-    )
+    );
+    receipt.default_head = Some(membership.default_head);
+    receipt
 }
 
 #[allow(clippy::too_many_arguments)]

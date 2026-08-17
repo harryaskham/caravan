@@ -16,6 +16,9 @@ use crate::model::{
 };
 
 const PR_JSON_FIELDS: &str = "number,title,body,state,isDraft,mergeStateStatus,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository,baseRefName,baseRefOid,labels,autoMergeRequest,statusCheckRollup,createdAt,mergedAt,url,updatedAt";
+/// Membership-only admission must not download check rollups, bodies, or
+/// auto-merge payloads. Those belong to fleet status, not the CI gate.
+const ADMISSION_PR_JSON_FIELDS: &str = "number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository,baseRefName,baseRefOid,labels,createdAt,url,updatedAt";
 // Merged predecessors are graph history, never CI candidates. Omitting the
 // rollup prevents old check suites from dominating provider response size.
 const PR_HISTORY_JSON_FIELDS: &str = "number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository,baseRefName,baseRefOid,labels,autoMergeRequest,createdAt,mergedAt,url,updatedAt";
@@ -1800,6 +1803,65 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
         self
     }
 
+    /// Exact-PR membership for `ci-admission-gate`.
+    ///
+    /// Admission may only ask whether one open PR is an active Caravan member.
+    /// It must not pay for generation dumps, merged history, check rollups, or
+    /// compatibility analysis.
+    pub fn discover_admission_membership(
+        &self,
+        focus_pr: PrNumber,
+    ) -> Result<model::RepositorySnapshot, DiscoveryError> {
+        let repository_json: RepositoryJson =
+            self.json(repository_command(self.options.repository.as_deref()))?;
+        let default_branch_name = repository_json
+            .default_branch_ref
+            .ok_or(DiscoveryError::MissingDefaultBranch)?
+            .name;
+        let repository = repository_id(&repository_json.name_with_owner)?;
+        let default_ref: GitRefJson = self.json(default_branch_command(
+            &repository.slug(),
+            &default_branch_name,
+        ))?;
+        let default_branch = BranchSnapshot {
+            repository: repository.clone(),
+            name: default_branch_name,
+            oid: CommitOid(default_ref.object.sha),
+        };
+        let labeled_rows: Vec<PullRequestJson> = self.json(admission_labeled_members_command(
+            &repository.slug(),
+            &self.options.label,
+            self.options.open_limit,
+        ))?;
+        let exact: PullRequestJson = self.json(admission_pull_request_command(
+            &repository,
+            &focus_pr.0.to_string(),
+        ))?;
+        let mut pull_requests = labeled_rows
+            .into_iter()
+            .map(|row| row.into_snapshot(&repository))
+            .collect::<Result<Vec<_>, _>>()?;
+        if !pull_requests
+            .iter()
+            .any(|pull_request| pull_request.number == focus_pr)
+        {
+            pull_requests.push(exact.into_snapshot(&repository)?);
+        }
+        Ok(model::RepositorySnapshot {
+            repository,
+            default_branch,
+            merge_candidates: Vec::new(),
+            merge_candidates_truncated: 0,
+            previous_default_oid: None,
+            default_branch_movements: Vec::new(),
+            current_branch: None,
+            current_pr: Some(focus_pr),
+            pull_requests,
+            generation_facts: Vec::new(),
+            observed_at: Some(provider_observed_at()),
+        })
+    }
+
     /// Resolve canonical provider identity/freshness for one exact PR snapshot.
     /// This shares the status/show schema and performs no checkout or mutation.
     /// Resolve canonical provider identity/freshness for one exact PR snapshot.
@@ -2999,6 +3061,35 @@ fn pull_request_command(repository: &RepositoryId, selector: &str) -> CommandSpe
     ])
 }
 
+fn admission_pull_request_command(repository: &RepositoryId, selector: &str) -> CommandSpec {
+    CommandSpec::new("gh").args([
+        "pr",
+        "view",
+        selector,
+        "--repo",
+        repository.slug().as_str(),
+        "--json",
+        ADMISSION_PR_JSON_FIELDS,
+    ])
+}
+
+fn admission_labeled_members_command(repository: &str, label: &str, limit: usize) -> CommandSpec {
+    CommandSpec::new("gh").args([
+        "pr".to_owned(),
+        "list".to_owned(),
+        "--repo".to_owned(),
+        repository.to_owned(),
+        "--state".to_owned(),
+        "open".to_owned(),
+        "--label".to_owned(),
+        label.to_owned(),
+        "--limit".to_owned(),
+        limit.to_string(),
+        "--json".to_owned(),
+        ADMISSION_PR_JSON_FIELDS.to_owned(),
+    ])
+}
+
 fn create_pull_request_command(
     repository: &RepositoryId,
     input: &CreatePullRequestInput,
@@ -3755,6 +3846,59 @@ mod tests {
                 .pull_requests
                 .iter()
                 .all(|pull_request| pull_request.number != PrNumber(99))
+        );
+        discovery.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn admission_membership_discovery_is_four_light_reads() {
+        let active = pr_list_json(1, "active", "acme/widgets", false);
+        let exact_list = pr_list_json(2, "candidate", "acme/widgets", false)
+            .replace(r#""labels":[{"name":"caravan"}]"#, r#""labels":[]"#);
+        let exact = exact_list[1..exact_list.len() - 1].to_owned();
+        let discovery = GitHubDiscovery::new(FakeRunner::new(vec![
+            (
+                repository_command(None),
+                CommandOutput::success(
+                    r#"{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}"#,
+                ),
+            ),
+            (
+                default_branch_command("acme/widgets", "main"),
+                CommandOutput::success(r#"{"object":{"sha":"default-sha"}}"#),
+            ),
+            (
+                admission_labeled_members_command("acme/widgets", "caravan", 1_000),
+                CommandOutput::success(active),
+            ),
+            (
+                admission_pull_request_command(&repository(), "2"),
+                CommandOutput::success(exact),
+            ),
+        ]));
+
+        let snapshot = discovery
+            .discover_admission_membership(PrNumber(2))
+            .expect("admission membership");
+        let numbers = snapshot
+            .pull_requests
+            .iter()
+            .map(|pull_request| pull_request.number)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(numbers, BTreeSet::from([PrNumber(1), PrNumber(2)]));
+        assert!(snapshot.generation_facts.is_empty());
+        assert!(snapshot.merge_candidates.is_empty());
+        assert!(
+            !admission_labeled_members_command("acme/widgets", "caravan", 1_000)
+                .args
+                .iter()
+                .any(|argument| argument.contains("statusCheckRollup"))
+        );
+        assert!(
+            !admission_pull_request_command(&repository(), "2")
+                .args
+                .iter()
+                .any(|argument| argument.contains("statusCheckRollup"))
         );
         discovery.runner.assert_exhausted();
     }
