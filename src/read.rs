@@ -3037,26 +3037,29 @@ pub(crate) fn admission_membership(
     let runner = crate::command::ProcessRunner::in_directory(&context.repository_path)
         .with_timeout(Duration::from_secs(context.config.command_timeout_secs))
         .with_operation_deadline(deadline);
-    let discovery = GitHubDiscovery::new(runner.clone()).with_options(
-        crate::github::DiscoveryOptions {
+    let discovery =
+        GitHubDiscovery::new(runner.clone()).with_options(crate::github::DiscoveryOptions {
             require_current_pr_resolution: false,
             include_historical_pull_requests: false,
             focus_pr: Some(number),
             repository: context.config.repository.clone(),
             ..crate::github::DiscoveryOptions::default()
-        },
-    );
+        });
     let snapshot = discovery
         .discover_admission_membership(number)
         .map_err(|error| discovery_error(&error))?;
     let analysis =
         crate::graph::derive_for_actor(&snapshot, context.config.sync.resolved_head_merge_actor());
-    let candidate = analysis.pull_requests.get(&number).cloned().ok_or_else(|| {
-        AppError::validation(
-            "admission_candidate_not_found",
-            format!("PR #{number} is absent from admission membership discovery"),
-        )
-    })?;
+    let candidate = analysis
+        .pull_requests
+        .get(&number)
+        .cloned()
+        .ok_or_else(|| {
+            AppError::validation(
+                "admission_candidate_not_found",
+                format!("PR #{number} is absent from admission membership discovery"),
+            )
+        })?;
     Ok(AdmissionMembership {
         repository: snapshot.repository,
         enrolled: analysis.fleet.containing(number).is_some(),

@@ -3888,14 +3888,18 @@ mod tests {
         assert_eq!(numbers, BTreeSet::from([PrNumber(1), PrNumber(2)]));
         assert!(snapshot.generation_facts.is_empty());
         assert!(snapshot.merge_candidates.is_empty());
-        assert!(!admission_labeled_members_command("acme/widgets", "caravan", 1_000)
-            .args
-            .iter()
-            .any(|argument| argument.contains("statusCheckRollup")));
-        assert!(!admission_pull_request_command(&repository(), "2")
-            .args
-            .iter()
-            .any(|argument| argument.contains("statusCheckRollup")));
+        assert!(
+            !admission_labeled_members_command("acme/widgets", "caravan", 1_000)
+                .args
+                .iter()
+                .any(|argument| argument.contains("statusCheckRollup"))
+        );
+        assert!(
+            !admission_pull_request_command(&repository(), "2")
+                .args
+                .iter()
+                .any(|argument| argument.contains("statusCheckRollup"))
+        );
         discovery.runner.assert_exhausted();
     }
 

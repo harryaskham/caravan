@@ -658,9 +658,11 @@ mod tests {
         assert_eq!(first.wake_pr, Some(PrNumber(41)));
         assert_eq!(first.selected_pr, Some(PrNumber(99)));
         assert_eq!(first.receipt_fingerprint, second.receipt_fingerprint);
-        assert!(!serde_json::to_string(&first)
-            .unwrap()
-            .contains("ghs_secret_sentinel"));
+        assert!(
+            !serde_json::to_string(&first)
+                .unwrap()
+                .contains("ghs_secret_sentinel")
+        );
 
         let (_directory, path) = write_event("labeled", None);
         let labeled = evaluate_trusted(
