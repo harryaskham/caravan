@@ -1,0 +1,254 @@
+﻿2026-08-17T12:31:26.8540928Z Current runner version: '2.335.1'
+2026-08-17T12:31:26.8556444Z Runner name: 'cacophony-ms-dev-5'
+2026-08-17T12:31:26.8557495Z Runner group name: 'Default'
+2026-08-17T12:31:26.8558878Z Machine name: 'ms-dev-5'
+2026-08-17T12:31:26.8563787Z ##[group]GITHUB_TOKEN Permissions
+2026-08-17T12:31:26.8568967Z Actions: read
+2026-08-17T12:31:26.8571310Z Checks: read
+2026-08-17T12:31:26.8575316Z Contents: read
+2026-08-17T12:31:26.8580106Z Metadata: read
+2026-08-17T12:31:26.8581552Z PullRequests: read
+2026-08-17T12:31:26.8582794Z ##[endgroup]
+2026-08-17T12:31:26.8587366Z Secret source: Actions
+2026-08-17T12:31:26.8588569Z Prepare workflow directory
+2026-08-17T12:31:26.9500438Z Prepare all required actions
+2026-08-17T12:31:26.9558536Z Getting action download info
+2026-08-17T12:31:27.3476726Z Download action repository 'actions/checkout@v6' (SHA:d23441a48e516b6c34aea4fa41551a30e30af803)
+2026-08-17T12:31:32.3853843Z Complete job name: Caravan admission gate
+2026-08-17T12:31:32.4919178Z ##[group]Run actions/checkout@v6
+2026-08-17T12:31:32.4921871Z with:
+2026-08-17T12:31:32.4923199Z   ref: d34540c06a3c1a30e3e934bdb4cbb9f306279851
+2026-08-17T12:31:32.4924815Z   fetch-depth: 1
+2026-08-17T12:31:32.4926083Z   fetch-tags: false
+2026-08-17T12:31:32.4927243Z   persist-credentials: false
+2026-08-17T12:31:32.4928744Z   repository: harryaskham/cacophony
+2026-08-17T12:31:32.4941219Z   token: ***
+2026-08-17T12:31:32.4942490Z   ssh-strict: true
+2026-08-17T12:31:32.4943743Z   ssh-user: git
+2026-08-17T12:31:32.4944804Z   clean: true
+2026-08-17T12:31:32.4945921Z   sparse-checkout-cone-mode: true
+2026-08-17T12:31:32.4947418Z   show-progress: true
+2026-08-17T12:31:32.4948845Z   lfs: false
+2026-08-17T12:31:32.4949824Z   submodules: false
+2026-08-17T12:31:32.4951047Z   set-safe-directory: true
+2026-08-17T12:31:32.4952702Z   allow-unsafe-pr-checkout: false
+2026-08-17T12:31:32.4954864Z env:
+2026-08-17T12:31:32.4957571Z   SEGMENT_DOWNLOAD_TIMEOUT_MINS: 5
+2026-08-17T12:31:32.4959829Z   CACO_CI_CACHE_RESTORE_BUDGET_SECONDS: 480
+2026-08-17T12:31:32.4961793Z   CACO_CI_CACHE_RESTORE_FLOOR_BYTES_PER_SECOND: 3000000
+2026-08-17T12:31:32.4963626Z   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+2026-08-17T12:31:32.4965716Z   CACO_CI_SELECTED_REF: a67cca6cff793b9ad3b9bce262f53a006368076f
+2026-08-17T12:31:32.4967979Z   CACO_CI_EXPECTED_HEAD: a67cca6cff793b9ad3b9bce262f53a006368076f
+2026-08-17T12:31:32.4970993Z   CACO_CI_EXPECTED_BASE: d34540c06a3c1a30e3e934bdb4cbb9f306279851
+2026-08-17T12:31:32.4973241Z   CACO_CI_HEAD_REF: ci/cara-admission-canary-20260817123014
+2026-08-17T12:31:32.4975152Z   CACO_CI_EVENT_NAME: pull_request
+2026-08-17T12:31:32.4976650Z   CACO_CI_PR_NUMBER: 2932
+2026-08-17T12:31:32.4978645Z   CACO_CI_HEAD_REPOSITORY: harryaskham/cacophony
+2026-08-17T12:31:32.4980201Z   CACO_CI_DISPATCH_HEAD: 
+2026-08-17T12:31:32.4981632Z   CACO_CI_RECOVERY_GENERATION: 
+2026-08-17T12:31:32.4983184Z   CACO_CI_RECOVERY_WORKFLOW_REVISION: 
+2026-08-17T12:31:32.4984711Z   CACO_CI_RECOVERY_WORKFLOW_TREE: 
+2026-08-17T12:31:32.4986960Z   CACO_CI_RECOVERY_PRIOR_RUN: 
+2026-08-17T12:31:32.4988473Z   CACO_CI_RECOVERY_FAILURE_FINGERPRINT: 
+2026-08-17T12:31:32.4989863Z ##[endgroup]
+2026-08-17T12:31:32.7000197Z Syncing repository: harryaskham/cacophony
+2026-08-17T12:31:32.7003769Z ##[group]Getting Git version info
+2026-08-17T12:31:32.7006213Z Working directory is '/var/lib/github-runner-workdirs/cacophony-ms-dev-5/cacophony/cacophony'
+2026-08-17T12:31:32.7010374Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git version
+2026-08-17T12:31:32.7045013Z git version 2.54.0
+2026-08-17T12:31:32.7074142Z ##[endgroup]
+2026-08-17T12:31:32.7100804Z Temporarily overriding HOME='/var/lib/github-runner-workdirs/cacophony-ms-dev-5/_temp/abfa2db0-ef4f-41e5-9e5e-a014781285c2' before making global git config changes
+2026-08-17T12:31:32.7104970Z Adding repository directory to the temporary git global config as a safe directory
+2026-08-17T12:31:32.7110277Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git config --global --add safe.directory /var/lib/github-runner-workdirs/cacophony-ms-dev-5/cacophony/cacophony
+2026-08-17T12:31:32.7162344Z Deleting the contents of '/var/lib/github-runner-workdirs/cacophony-ms-dev-5/cacophony/cacophony'
+2026-08-17T12:31:32.7167791Z ##[group]Determining repository object format
+2026-08-17T12:31:32.7169964Z ##[endgroup]
+2026-08-17T12:31:32.7172187Z ##[group]Initializing the repository
+2026-08-17T12:31:32.7176186Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git init /var/lib/github-runner-workdirs/cacophony-ms-dev-5/cacophony/cacophony
+2026-08-17T12:31:32.7247906Z hint: Using 'master' as the name for the initial branch. This default branch name
+2026-08-17T12:31:32.7250834Z hint: will change to "main" in Git 3.0. To configure the initial branch name
+2026-08-17T12:31:32.7253298Z hint: to use in all of your new repositories, which will suppress this warning,
+2026-08-17T12:31:32.7254999Z hint: call:
+2026-08-17T12:31:32.7255932Z hint:
+2026-08-17T12:31:32.7257414Z hint: 	git config --global init.defaultBranch <name>
+2026-08-17T12:31:32.7258738Z hint:
+2026-08-17T12:31:32.7260286Z hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+2026-08-17T12:31:32.7262687Z hint: 'development'. The just-created branch can be renamed via this command:
+2026-08-17T12:31:32.7264379Z hint:
+2026-08-17T12:31:32.7265470Z hint: 	git branch -m <name>
+2026-08-17T12:31:32.7267710Z hint:
+2026-08-17T12:31:32.7269125Z hint: Disable this message with "git config set advice.defaultBranchName false"
+2026-08-17T12:31:32.7271935Z Initialized empty Git repository in /var/lib/github-runner-workdirs/cacophony-ms-dev-5/cacophony/cacophony/.git/
+2026-08-17T12:31:32.7278508Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git remote add origin https://github.com/harryaskham/cacophony
+2026-08-17T12:31:32.7323713Z ##[endgroup]
+2026-08-17T12:31:32.7326145Z ##[group]Disabling automatic garbage collection
+2026-08-17T12:31:32.7330960Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git config --local gc.auto 0
+2026-08-17T12:31:32.7390093Z ##[endgroup]
+2026-08-17T12:31:32.7392040Z ##[group]Setting up auth
+2026-08-17T12:31:32.7394030Z Removing SSH command configuration
+2026-08-17T12:31:32.7402858Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-08-17T12:31:32.7464638Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-08-17T12:31:32.7989095Z Removing HTTP extra header
+2026-08-17T12:31:32.7999313Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-08-17T12:31:32.8062389Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-08-17T12:31:32.8551419Z Removing includeIf entries pointing to credentials config files
+2026-08-17T12:31:32.8562974Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-08-17T12:31:32.8625703Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-08-17T12:31:32.9107241Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git config --file /var/lib/github-runner-workdirs/cacophony-ms-dev-5/_temp/git-credentials-8839f1ab-b3c0-49ce-bca5-7cb3d5bf24ed.config http.https://github.com/.extraheader AUTHORIZATION: basic ***
+2026-08-17T12:31:32.9184615Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git config --local includeIf.gitdir:/var/lib/github-runner-workdirs/cacophony-ms-dev-5/cacophony/cacophony/.git.path /var/lib/github-runner-workdirs/cacophony-ms-dev-5/_temp/git-credentials-8839f1ab-b3c0-49ce-bca5-7cb3d5bf24ed.config
+2026-08-17T12:31:32.9245943Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git config --local includeIf.gitdir:/var/lib/github-runner-workdirs/cacophony-ms-dev-5/cacophony/cacophony/.git/worktrees/*.path /var/lib/github-runner-workdirs/cacophony-ms-dev-5/_temp/git-credentials-8839f1ab-b3c0-49ce-bca5-7cb3d5bf24ed.config
+2026-08-17T12:31:32.9294380Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git config --local includeIf.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-8839f1ab-b3c0-49ce-bca5-7cb3d5bf24ed.config
+2026-08-17T12:31:32.9351647Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git config --local includeIf.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-8839f1ab-b3c0-49ce-bca5-7cb3d5bf24ed.config
+2026-08-17T12:31:32.9400269Z ##[endgroup]
+2026-08-17T12:31:32.9402063Z ##[group]Fetching the repository
+2026-08-17T12:31:32.9407363Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin d34540c06a3c1a30e3e934bdb4cbb9f306279851
+2026-08-17T12:31:41.8597915Z From https://github.com/harryaskham/cacophony
+2026-08-17T12:31:41.8598884Z  * branch            d34540c06a3c1a30e3e934bdb4cbb9f306279851 -> FETCH_HEAD
+2026-08-17T12:31:41.8646721Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git rev-parse --verify --quiet d34540c06a3c1a30e3e934bdb4cbb9f306279851^{object}
+2026-08-17T12:31:41.8687308Z d34540c06a3c1a30e3e934bdb4cbb9f306279851
+2026-08-17T12:31:41.8693114Z ##[endgroup]
+2026-08-17T12:31:41.8694086Z ##[group]Determining the checkout info
+2026-08-17T12:31:41.8695243Z ##[endgroup]
+2026-08-17T12:31:41.8700620Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git sparse-checkout disable
+2026-08-17T12:31:41.8759290Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git config --local --unset-all extensions.worktreeConfig
+2026-08-17T12:31:41.8801238Z ##[group]Checking out the ref
+2026-08-17T12:31:41.8804450Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git checkout --progress --force d34540c06a3c1a30e3e934bdb4cbb9f306279851
+2026-08-17T12:31:43.0318811Z Updating files:  95% (3836/4035)
+2026-08-17T12:31:43.1422959Z Updating files:  96% (3874/4035)
+2026-08-17T12:31:43.1457197Z Updating files:  97% (3914/4035)
+2026-08-17T12:31:43.1579012Z Updating files:  98% (3955/4035)
+2026-08-17T12:31:43.1745816Z Updating files:  99% (3995/4035)
+2026-08-17T12:31:43.1747213Z Updating files: 100% (4035/4035)
+2026-08-17T12:31:43.1752833Z Updating files: 100% (4035/4035), done.
+2026-08-17T12:31:43.1831948Z Note: switching to 'd34540c06a3c1a30e3e934bdb4cbb9f306279851'.
+2026-08-17T12:31:43.1836707Z 
+2026-08-17T12:31:43.1837732Z You are in 'detached HEAD' state. You can look around, make experimental
+2026-08-17T12:31:43.1838766Z changes and commit them, and you can discard any commits you make in this
+2026-08-17T12:31:43.1839763Z state without impacting any branches by switching back to a branch.
+2026-08-17T12:31:43.1840434Z 
+2026-08-17T12:31:43.1840791Z If you want to create a new branch to retain commits you create, you may
+2026-08-17T12:31:43.1841793Z do so (now or later) by using -c with the switch command. Example:
+2026-08-17T12:31:43.1842284Z 
+2026-08-17T12:31:43.1842593Z   git switch -c <new-branch-name>
+2026-08-17T12:31:43.1842923Z 
+2026-08-17T12:31:43.1843338Z Or undo this operation with:
+2026-08-17T12:31:43.1843724Z 
+2026-08-17T12:31:43.1843941Z   git switch -
+2026-08-17T12:31:43.1844160Z 
+2026-08-17T12:31:43.1844701Z Turn off this advice by setting config variable advice.detachedHead to false
+2026-08-17T12:31:43.1845175Z 
+2026-08-17T12:31:43.1846113Z HEAD is now at d34540c Configure Caravan GitHub App authentication (#2931)
+2026-08-17T12:31:43.1969519Z ##[endgroup]
+2026-08-17T12:31:43.2042620Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git log -1 --format=%H
+2026-08-17T12:31:43.2094749Z d34540c06a3c1a30e3e934bdb4cbb9f306279851
+2026-08-17T12:31:43.2114512Z ##[group]Removing auth
+2026-08-17T12:31:43.2115424Z Removing SSH command configuration
+2026-08-17T12:31:43.2119340Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-08-17T12:31:43.2182174Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-08-17T12:31:43.2732722Z Removing HTTP extra header
+2026-08-17T12:31:43.2737308Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-08-17T12:31:43.2791639Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-08-17T12:31:43.3339696Z Removing includeIf entries pointing to credentials config files
+2026-08-17T12:31:43.3341661Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-08-17T12:31:43.3389183Z includeif.gitdir:/var/lib/github-runner-workdirs/cacophony-ms-dev-5/cacophony/cacophony/.git.path
+2026-08-17T12:31:43.3390665Z includeif.gitdir:/var/lib/github-runner-workdirs/cacophony-ms-dev-5/cacophony/cacophony/.git/worktrees/*.path
+2026-08-17T12:31:43.3391885Z includeif.gitdir:/github/workspace/.git.path
+2026-08-17T12:31:43.3393474Z includeif.gitdir:/github/workspace/.git/worktrees/*.path
+2026-08-17T12:31:43.3402765Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git config --local --get-all includeif.gitdir:/var/lib/github-runner-workdirs/cacophony-ms-dev-5/cacophony/cacophony/.git.path
+2026-08-17T12:31:43.3447752Z /var/lib/github-runner-workdirs/cacophony-ms-dev-5/_temp/git-credentials-8839f1ab-b3c0-49ce-bca5-7cb3d5bf24ed.config
+2026-08-17T12:31:43.3461843Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git config --local --unset includeif.gitdir:/var/lib/github-runner-workdirs/cacophony-ms-dev-5/cacophony/cacophony/.git.path /var/lib/github-runner-workdirs/cacophony-ms-dev-5/_temp/git-credentials-8839f1ab-b3c0-49ce-bca5-7cb3d5bf24ed.config
+2026-08-17T12:31:43.3519385Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git config --local --get-all includeif.gitdir:/var/lib/github-runner-workdirs/cacophony-ms-dev-5/cacophony/cacophony/.git/worktrees/*.path
+2026-08-17T12:31:43.3555516Z /var/lib/github-runner-workdirs/cacophony-ms-dev-5/_temp/git-credentials-8839f1ab-b3c0-49ce-bca5-7cb3d5bf24ed.config
+2026-08-17T12:31:43.3570920Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git config --local --unset includeif.gitdir:/var/lib/github-runner-workdirs/cacophony-ms-dev-5/cacophony/cacophony/.git/worktrees/*.path /var/lib/github-runner-workdirs/cacophony-ms-dev-5/_temp/git-credentials-8839f1ab-b3c0-49ce-bca5-7cb3d5bf24ed.config
+2026-08-17T12:31:43.3619958Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git.path
+2026-08-17T12:31:43.3662348Z /github/runner_temp/git-credentials-8839f1ab-b3c0-49ce-bca5-7cb3d5bf24ed.config
+2026-08-17T12:31:43.3681493Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git config --local --unset includeif.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-8839f1ab-b3c0-49ce-bca5-7cb3d5bf24ed.config
+2026-08-17T12:31:43.3741366Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git/worktrees/*.path
+2026-08-17T12:31:43.3781519Z /github/runner_temp/git-credentials-8839f1ab-b3c0-49ce-bca5-7cb3d5bf24ed.config
+2026-08-17T12:31:43.3788753Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git config --local --unset includeif.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-8839f1ab-b3c0-49ce-bca5-7cb3d5bf24ed.config
+2026-08-17T12:31:43.3840814Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-08-17T12:31:43.4377529Z Removing credentials config '/var/lib/github-runner-workdirs/cacophony-ms-dev-5/_temp/git-credentials-8839f1ab-b3c0-49ce-bca5-7cb3d5bf24ed.config'
+2026-08-17T12:31:43.4390521Z ##[endgroup]
+2026-08-17T12:31:43.4736155Z ##[group]Run set -euo pipefail
+2026-08-17T12:31:43.4736695Z [36;1mset -euo pipefail[0m
+2026-08-17T12:31:43.4737215Z [36;1mroot="cara-$CARA_VERSION-$CARA_TARGET"[0m
+2026-08-17T12:31:43.4738416Z [36;1marchive="$root.tar.gz"[0m
+2026-08-17T12:31:43.4739423Z [36;1murl="https://github.com/harryaskham/caravan/releases/download/v$CARA_VERSION/$archive"[0m
+2026-08-17T12:31:43.4740879Z [36;1mwork="$(mktemp -d "$RUNNER_TEMP/cara-admission.XXXXXX")"[0m
+2026-08-17T12:31:43.4741336Z [36;1mtrap 'rm -rf "$work"' EXIT[0m
+2026-08-17T12:31:43.4741929Z [36;1mexpected_hash="$(nix hash convert --hash-algo sha256 --to sri "$CARA_ARCHIVE_SHA256")"[0m
+2026-08-17T12:31:43.4742568Z [36;1mprefetch="$(nix store prefetch-file --json --expected-hash "$expected_hash" "$url")"[0m
+2026-08-17T12:31:43.4743167Z [36;1m[[ "$prefetch" =~ \"storePath\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]][0m
+2026-08-17T12:31:43.4743651Z [36;1marchive_path="${BASH_REMATCH[1]}"[0m
+2026-08-17T12:31:43.4744165Z [36;1m[[ -f "$archive_path" ]][0m
+2026-08-17T12:31:43.4744548Z [36;1mtar -xzf "$archive_path" -C "$work"[0m
+2026-08-17T12:31:43.4745047Z [36;1minstall -D -m 0755 "$work/$root/cara" "$RUNNER_TEMP/cara-admission-bin/cara"[0m
+2026-08-17T12:31:43.4745621Z [36;1m"$RUNNER_TEMP/cara-admission-bin/cara" --version[0m
+2026-08-17T12:31:43.4755617Z shell: /nix/store/0641h8qfqaxnwrsw2nzrz6i1wbzyx92l-bash-interactive-5.3p9/bin/bash -e {0}
+2026-08-17T12:31:43.4756185Z env:
+2026-08-17T12:31:43.4756614Z   SEGMENT_DOWNLOAD_TIMEOUT_MINS: 5
+2026-08-17T12:31:43.4757037Z   CACO_CI_CACHE_RESTORE_BUDGET_SECONDS: 480
+2026-08-17T12:31:43.4757455Z   CACO_CI_CACHE_RESTORE_FLOOR_BYTES_PER_SECOND: 3000000
+2026-08-17T12:31:43.4758473Z   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+2026-08-17T12:31:43.4759164Z   CACO_CI_SELECTED_REF: a67cca6cff793b9ad3b9bce262f53a006368076f
+2026-08-17T12:31:43.4759686Z   CACO_CI_EXPECTED_HEAD: a67cca6cff793b9ad3b9bce262f53a006368076f
+2026-08-17T12:31:43.4760223Z   CACO_CI_EXPECTED_BASE: d34540c06a3c1a30e3e934bdb4cbb9f306279851
+2026-08-17T12:31:43.4760714Z   CACO_CI_HEAD_REF: ci/cara-admission-canary-20260817123014
+2026-08-17T12:31:43.4761111Z   CACO_CI_EVENT_NAME: pull_request
+2026-08-17T12:31:43.4761581Z   CACO_CI_PR_NUMBER: 2932
+2026-08-17T12:31:43.4761979Z   CACO_CI_HEAD_REPOSITORY: harryaskham/cacophony
+2026-08-17T12:31:43.4762364Z   CACO_CI_DISPATCH_HEAD: 
+2026-08-17T12:31:43.4762711Z   CACO_CI_RECOVERY_GENERATION: 
+2026-08-17T12:31:43.4763081Z   CACO_CI_RECOVERY_WORKFLOW_REVISION: 
+2026-08-17T12:31:43.4763471Z   CACO_CI_RECOVERY_WORKFLOW_TREE: 
+2026-08-17T12:31:43.4763836Z   CACO_CI_RECOVERY_PRIOR_RUN: 
+2026-08-17T12:31:43.4764208Z   CACO_CI_RECOVERY_FAILURE_FINGERPRINT: 
+2026-08-17T12:31:43.4764588Z   CARA_VERSION: 0.0.121
+2026-08-17T12:31:43.4764906Z   CARA_TARGET: x86_64-linux
+2026-08-17T12:31:43.4765386Z   CARA_ARCHIVE_SHA256: 641fafd739986cd0f9341c06daddb710711dc6c3f5296aecffdb667cdf5a7756
+2026-08-17T12:31:43.4765890Z ##[endgroup]
+2026-08-17T12:31:43.9467654Z cara 0.0.121
+2026-08-17T12:31:43.9591708Z ##[group]Run set -euo pipefail
+2026-08-17T12:31:43.9592421Z [36;1mset -euo pipefail[0m
+2026-08-17T12:31:43.9592924Z [36;1m"$RUNNER_TEMP/cara-admission-bin/cara" --json ci-admission-gate \[0m
+2026-08-17T12:31:43.9593416Z [36;1m  --event "$GITHUB_EVENT_PATH" \[0m
+2026-08-17T12:31:43.9594313Z [36;1m  --github-output "$GITHUB_OUTPUT" >/dev/null[0m
+2026-08-17T12:31:43.9596974Z shell: /nix/store/0641h8qfqaxnwrsw2nzrz6i1wbzyx92l-bash-interactive-5.3p9/bin/bash -e {0}
+2026-08-17T12:31:43.9597518Z env:
+2026-08-17T12:31:43.9597834Z   SEGMENT_DOWNLOAD_TIMEOUT_MINS: 5
+2026-08-17T12:31:43.9598291Z   CACO_CI_CACHE_RESTORE_BUDGET_SECONDS: 480
+2026-08-17T12:31:43.9598704Z   CACO_CI_CACHE_RESTORE_FLOOR_BYTES_PER_SECOND: 3000000
+2026-08-17T12:31:43.9599115Z   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+2026-08-17T12:31:43.9599560Z   CACO_CI_SELECTED_REF: a67cca6cff793b9ad3b9bce262f53a006368076f
+2026-08-17T12:31:43.9600052Z   CACO_CI_EXPECTED_HEAD: a67cca6cff793b9ad3b9bce262f53a006368076f
+2026-08-17T12:31:43.9601263Z   CACO_CI_EXPECTED_BASE: d34540c06a3c1a30e3e934bdb4cbb9f306279851
+2026-08-17T12:31:43.9601877Z   CACO_CI_HEAD_REF: ci/cara-admission-canary-20260817123014
+2026-08-17T12:31:43.9602322Z   CACO_CI_EVENT_NAME: pull_request
+2026-08-17T12:31:43.9602675Z   CACO_CI_PR_NUMBER: 2932
+2026-08-17T12:31:43.9603022Z   CACO_CI_HEAD_REPOSITORY: harryaskham/cacophony
+2026-08-17T12:31:43.9603456Z   CACO_CI_DISPATCH_HEAD: 
+2026-08-17T12:31:43.9603780Z   CACO_CI_RECOVERY_GENERATION: 
+2026-08-17T12:31:43.9604125Z   CACO_CI_RECOVERY_WORKFLOW_REVISION: 
+2026-08-17T12:31:43.9604494Z   CACO_CI_RECOVERY_WORKFLOW_TREE: 
+2026-08-17T12:31:43.9604843Z   CACO_CI_RECOVERY_PRIOR_RUN: 
+2026-08-17T12:31:43.9605224Z   CACO_CI_RECOVERY_FAILURE_FINGERPRINT: 
+2026-08-17T12:31:43.9608290Z   GH_TOKEN: ***
+2026-08-17T12:31:43.9608585Z ##[endgroup]
+2026-08-17T12:31:43.9810498Z ##[error]Process completed with exit code 1.
+2026-08-17T12:31:43.9992783Z Post job cleanup.
+2026-08-17T12:31:44.1217726Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git version
+2026-08-17T12:31:44.1269706Z git version 2.54.0
+2026-08-17T12:31:44.1325691Z Temporarily overriding HOME='/var/lib/github-runner-workdirs/cacophony-ms-dev-5/_temp/f58925d4-8236-40e3-945a-18ec53f92fa2' before making global git config changes
+2026-08-17T12:31:44.1326638Z Adding repository directory to the temporary git global config as a safe directory
+2026-08-17T12:31:44.1334057Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git config --global --add safe.directory /var/lib/github-runner-workdirs/cacophony-ms-dev-5/cacophony/cacophony
+2026-08-17T12:31:44.1381649Z Removing SSH command configuration
+2026-08-17T12:31:44.1388832Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-08-17T12:31:44.1441923Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-08-17T12:31:44.1881736Z Removing HTTP extra header
+2026-08-17T12:31:44.1886668Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-08-17T12:31:44.1940644Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-08-17T12:31:44.2342557Z Removing includeIf entries pointing to credentials config files
+2026-08-17T12:31:44.2353104Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-08-17T12:31:44.2403800Z [command]/nix/store/k3wl6cg7q50zkx47af3msmg1yrg1f203-git-2.54.0/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-08-17T12:31:44.2997626Z Evaluate and set job outputs
+2026-08-17T12:31:44.3009373Z Cleaning up orphan processes
