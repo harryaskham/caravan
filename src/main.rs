@@ -567,6 +567,16 @@ fn load_context(cli: &Cli) -> Result<AppContext, i32> {
     emit_context_error(cli, loaded)
 }
 
+fn load_ci_admission_context(cli: &Cli) -> Result<AppContext, i32> {
+    let loaded = match cli.repo.as_deref() {
+        Some(repository) => {
+            AppContext::load_for_ci_admission_from_directory(repository, cli.config.as_deref())
+        }
+        None => AppContext::load_for_ci_admission(cli.config.as_deref()),
+    };
+    emit_context_error(cli, loaded)
+}
+
 fn resolve_sync_context(cli: &Cli) -> Result<AppContext, caravan::config::ConfigError> {
     match cli.repo.as_deref() {
         Some(repository) => {
@@ -1405,8 +1415,10 @@ fn run_ci_gate(cli: &Cli, input: &caravan::CiGateInput) -> Result<(), i32> {
 }
 
 fn run_ci_admission_gate(cli: &Cli, input: &caravan::CiAdmissionGateInput) -> Result<(), i32> {
-    let context = load_context(cli)?;
-    let output = caravan::ci_admission_gate::evaluate(&context, input);
+    let context = load_ci_admission_context(cli)?;
+    let output = caravan::command::with_github_auth_inference_disabled(|| {
+        caravan::ci_admission_gate::evaluate(&context, input)
+    });
     if let Some(path) = &input.github_output
         && let Err(error) = write_ci_admission_gate_outputs(path, &output)
     {

@@ -4,6 +4,7 @@
 //! hermetic while production still uses the installed, authenticated `git` and
 //! `gh` binaries.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -26,6 +27,33 @@ const OUTPUT_LIMIT_EVIDENCE_BYTES: usize = 4 * 1024;
 const GITHUB_AUTH_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const GITHUB_APP_GIT_TOKEN_ENV: &str = "CARA_GITHUB_APP_GIT_TOKEN";
 const GITHUB_APP_GIT_CREDENTIAL_HELPER: &str = "!f() { if test \"$1\" = get; then printf '%s\\n' 'username=x-access-token' \"password=$CARA_GITHUB_APP_GIT_TOKEN\"; fi; }; f";
+
+thread_local! {
+    /// Command-scoped escape used only by the read-only CI admission surface.
+    /// It is not environment-controlled and therefore cannot weaken another
+    /// CLI/MCP operation's configured App writer identity.
+    static GITHUB_AUTH_INFERENCE_DISABLE_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+struct GithubAuthInferenceReset;
+
+impl Drop for GithubAuthInferenceReset {
+    fn drop(&mut self) {
+        GITHUB_AUTH_INFERENCE_DISABLE_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+/// Run one explicitly read-only operation without applying repository writer
+/// authentication inference to its Git/GitHub subprocesses.
+pub fn with_github_auth_inference_disabled<T>(operation: impl FnOnce() -> T) -> T {
+    GITHUB_AUTH_INFERENCE_DISABLE_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
+    let _reset = GithubAuthInferenceReset;
+    operation()
+}
+
+fn github_auth_inference_enabled() -> bool {
+    GITHUB_AUTH_INFERENCE_DISABLE_DEPTH.with(|depth| depth.get() == 0)
+}
 
 /// Whether one checkout's `origin` names a GitHub repository at all.
 ///
@@ -657,7 +685,7 @@ impl Default for ProcessRunner {
             timeout: DEFAULT_COMMAND_TIMEOUT,
             operation_deadline: None,
             github_request_budget: None,
-            infer_github_auth: true,
+            infer_github_auth: github_auth_inference_enabled(),
             github_app_auth_retry: true,
             stdout_capture_limit: MAX_STDOUT_CAPTURE_BYTES,
             stderr_capture_limit: MAX_STDERR_CAPTURE_BYTES,
@@ -681,7 +709,7 @@ impl ProcessRunner {
             timeout: DEFAULT_COMMAND_TIMEOUT,
             operation_deadline: None,
             github_request_budget: None,
-            infer_github_auth: true,
+            infer_github_auth: github_auth_inference_enabled(),
             github_app_auth_retry: true,
             stdout_capture_limit: MAX_STDOUT_CAPTURE_BYTES,
             stderr_capture_limit: MAX_STDERR_CAPTURE_BYTES,
@@ -1930,6 +1958,16 @@ mod tests {
             .unwrap();
         assert_eq!(repair.matches("\"push\"").count(), 1);
         assert_eq!(repair.matches(".git_write()").count(), 1);
+    }
+
+    #[test]
+    fn read_only_auth_inference_disable_is_scoped_and_restored() {
+        assert!(ProcessRunner::new().infer_github_auth);
+        with_github_auth_inference_disabled(|| {
+            assert!(!ProcessRunner::new().infer_github_auth);
+            assert!(!ProcessRunner::in_directory(".").infer_github_auth);
+        });
+        assert!(ProcessRunner::new().infer_github_auth);
     }
 
     #[test]
