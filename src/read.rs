@@ -2606,6 +2606,19 @@ fn resolve_admission_with_generation_and_gate(
     let mut skipped = Vec::new();
     let mut rejected = Vec::new();
 
+    let unjoined_parent_dependencies: std::collections::BTreeSet<PrNumber> = analysis
+        .fleet
+        .unqueued
+        .iter()
+        .flat_map(|num| {
+            analysis
+                .pull_requests
+                .get(num)
+                .map(|pr| crate::admission::dependency_prs(analysis, pr))
+                .unwrap_or_default()
+        })
+        .collect();
+
     for number in &analysis.fleet.unqueued {
         let Some(pull_request) = analysis.pull_requests.get(number) else {
             continue;
@@ -2707,18 +2720,29 @@ fn resolve_admission_with_generation_and_gate(
         // still elected the red PR as next_candidate while `cara check --pr N`
         // called it ineligible, and the two surfaces disagreed about the same PR
         // (observed on cacophony PR 2276).
+        let has_unjoined_descendants = unjoined_parent_dependencies.contains(number);
         if !pull_request.has_label("caravan-force")
             && has_failing_check(pull_request)
             && !admission_gate
                 .is_some_and(|gate| candidate_may_have_deferred_gate(pull_request, gate))
         {
-            skipped.push(SkippedAdmissionCandidate {
-                pr: *number,
-                priority_label: configured.first().map(|(label, _)| (*label).clone()),
-                priority_rank: configured.first().map(|(_, rank)| rank + 1),
-                created_at,
-                reason: "candidate has a failing required check; queueing behind red only guarantees a later rebase, so the queue advances until it is fixed".to_owned(),
-            });
+            if has_unjoined_descendants {
+                rejected.push(RejectedAdmissionCandidate {
+                    pr: *number,
+                    priority_rank: (configured.len() == 1).then(|| configured[0].1 + 1),
+                    created_at: pull_request.created_at.clone(),
+                    blocks_order: true,
+                    reason: "candidate has a failing required check and unjoined descendants depend on its base chain; descendants cannot be admitted or retargeted past an unjoined ancestor".to_owned(),
+                });
+            } else {
+                skipped.push(SkippedAdmissionCandidate {
+                    pr: *number,
+                    priority_label: configured.first().map(|(label, _)| (*label).clone()),
+                    priority_rank: configured.first().map(|(_, rank)| rank + 1),
+                    created_at,
+                    reason: "candidate has a failing required check; queueing behind red only guarantees a later rebase, so the queue advances until it is fixed".to_owned(),
+                });
+            }
             continue;
         }
         if pull_request.has_label("caravan-join-skipped") {
