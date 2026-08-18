@@ -104,6 +104,62 @@ pub(crate) fn remove(repository: &Path, key: &str) -> Result<(), AppError> {
     }
 }
 
+pub(crate) fn list_keys(repository: &Path, prefix: &str) -> Result<Vec<String>, AppError> {
+    let output = ProcessRunner::in_directory(repository)
+        .run(&CommandSpec::new("git").args([
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ]))
+        .map_err(|error| {
+            AppError::structured(
+                ErrorCategory::ExecutionFailure,
+                "native_stack_checkpoint_storage_discovery_failed",
+                error.to_string(),
+                None,
+            )
+        })?;
+    if !output.is_success() {
+        return Err(AppError::structured(
+            ErrorCategory::TargetNotFound,
+            "git_repository_not_found",
+            "native Stack checkpoint state requires a Git repository",
+            Some(json!({"stderr": output.stderr})),
+        ));
+    }
+    let dir = PathBuf::from(output.stdout.trim())
+        .join("caravan")
+        .join("native-stack");
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut keys = Vec::new();
+    let entries = fs::read_dir(&dir).map_err(|error| {
+        storage_error(
+            "native_stack_checkpoint_read_failed",
+            &error.to_string(),
+            &dir,
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            storage_error(
+                "native_stack_checkpoint_read_failed",
+                &error.to_string(),
+                &dir,
+            )
+        })?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with(prefix) && name_str.ends_with(".json") {
+            let key = name_str.trim_end_matches(".json").to_owned();
+            keys.push(key);
+        }
+    }
+    keys.sort();
+    Ok(keys)
+}
+
 fn checkpoint_path(repository: &Path, key: &str) -> Result<PathBuf, AppError> {
     if key.is_empty()
         || key.len() > 128

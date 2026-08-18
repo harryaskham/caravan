@@ -314,6 +314,27 @@ impl SyncProvider for FakeProvider {
         Ok(self.native_stack.borrow().clone())
     }
 
+    fn native_stack_land_poll_for_sync(
+        &self,
+        _repository: &RepositoryId,
+        checkpoint: &crate::github::GitHubStackLandCheckpoint,
+    ) -> Result<crate::github::GitHubStackLandCheckpoint, AppError> {
+        let mut next = checkpoint.clone();
+        next.phase = crate::github::GitHubStackLandPhase::Terminal;
+        next.terminal_status = Some(crate::github::GitHubStackMergeStatus::Merged);
+        Ok(next)
+    }
+
+    fn native_stack_land_release_for_sync(
+        &self,
+        _repository: &RepositoryId,
+        checkpoint: &crate::github::GitHubStackLandCheckpoint,
+    ) -> Result<crate::github::GitHubStackLandCheckpoint, AppError> {
+        let mut next = checkpoint.clone();
+        next.phase = crate::github::GitHubStackLandPhase::Released;
+        Ok(next)
+    }
+
     fn verify_pull_request(
         &self,
         _repository: &RepositoryId,
@@ -11520,4 +11541,157 @@ fn stack_membership_race_never_retries_synchronous_merge() {
     assert_eq!(scheduler.wake_class, SchedulerWakeClass::ExternalDecision);
     assert!(!scheduler.retryable);
     assert_eq!(error.details().unwrap()["merge_mutated"], false);
+}
+
+#[test]
+#[allow(clippy::too_many_lines, clippy::unreadable_literal)]
+fn submitted_landing_checkpoint_is_finalized_and_orphaned_rulesets_cleaned_up() {
+    let pulls = vec![
+        caravan_member(1, "root", "main"),
+        caravan_member(2, "child", "root"),
+    ];
+    let mut status = caravan_status(pulls.clone(), Some(PrNumber(1)), true);
+    enable_native_backend(&mut status);
+    let generation = native_generation(&status, 42, &[PrNumber(1), PrNumber(2)]);
+    let (_directory, config, native) = github_native_fixture();
+
+    let evidence = generation
+        .topology
+        .entries
+        .iter()
+        .cloned()
+        .map(|generation| crate::github::GitHubStackMergeEntryEvidence {
+            generation,
+            blockers: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    let prefix = crate::github::plan_github_stack_ready_prefix(&generation, &evidence)
+        .expect("complete exact-green Stack has a ready prefix");
+    let plan = prefix
+        .direct_squash_plan("op:stack:42".to_owned(), "operator".to_owned())
+        .unwrap();
+    let begin = crate::github::GitHubMutationAdapter::<crate::command::ProcessRunner>::native_stack_land_begin(
+        &status.repository,
+        &plan,
+    );
+    let checkpoint = crate::github::advance(
+        &begin,
+        &crate::github::GitHubStackLockedMergeReceipt {
+            schema_version: 1,
+            merge: crate::github::GitHubStackMergeReceipt {
+                schema_version: 1,
+                repository: status.repository.clone(),
+                plan: plan.clone(),
+                request: crate::github::GitHubStackMergeRequestIdentity {
+                    method: "PUT".to_owned(),
+                    path: "repos/owner/repo/pulls/1/merge-async".to_owned(),
+                    selected_top: PrNumber(2),
+                    selected_top_sha: plan.selected.last().unwrap().head.oid.clone(),
+                    ordered_pull_requests: plan.selected.iter().map(|entry| entry.pr).collect(),
+                    ordered_heads: plan
+                        .selected
+                        .iter()
+                        .map(|entry| entry.head.oid.clone())
+                        .collect(),
+                    github_request_id: None,
+                },
+                checkpoint: None,
+                status: crate::github::GitHubStackMergeStatus::Submitted,
+                provider_status: None,
+                provider_message: None,
+                provider_sha: None,
+                observation: None,
+                evidence_hash: String::new(),
+            },
+            branch_lock: crate::github::GitHubStackBranchLockGeneration {
+                id: 20_921_432,
+                node_id: "R_lock".to_owned(),
+                name: "cara-stack-merge-lock-test1".to_owned(),
+                repository: status.repository.clone(),
+                source: status.repository.slug(),
+                source_type: "Repository".to_owned(),
+                target: "branch".to_owned(),
+                enforcement: "active".to_owned(),
+                selected_pull_requests: vec![PrNumber(1), PrNumber(2)],
+                selected_refs: vec!["refs/heads/root".to_owned(), "refs/heads/child".to_owned()],
+                current_user_can_bypass: "never".to_owned(),
+                created_at: String::new(),
+                updated_at: String::new(),
+            },
+            branch_lock_verified: true,
+            checkpoint: Some(crate::github::GitHubStackLockedMergeCheckpoint {
+                schema_version: 1,
+                repository: status.repository.clone(),
+                merge: crate::github::GitHubStackMergeCheckpoint {
+                    schema_version: 1,
+                    repository: status.repository.clone(),
+                    plan: plan.clone(),
+                    request: crate::github::GitHubStackMergeRequestIdentity {
+                        method: "PUT".to_owned(),
+                        path: "repos/owner/repo/pulls/1/merge-async".to_owned(),
+                        selected_top: PrNumber(2),
+                        selected_top_sha: plan.selected.last().unwrap().head.oid.clone(),
+                        ordered_pull_requests: plan.selected.iter().map(|entry| entry.pr).collect(),
+                        ordered_heads: plan
+                            .selected
+                            .iter()
+                            .map(|entry| entry.head.oid.clone())
+                            .collect(),
+                        github_request_id: None,
+                    },
+                    uuid: "e735abe8-a039-4a58-b4b1-a838ac2a6014".to_owned(),
+                    initial_provider_status: "submitted".to_owned(),
+                    evidence_hash: String::new(),
+                },
+                branch_lock: crate::github::GitHubStackBranchLockGeneration {
+                    id: 20_921_432,
+                    node_id: "R_lock".to_owned(),
+                    name: "cara-stack-merge-lock-test1".to_owned(),
+                    repository: status.repository.clone(),
+                    source: status.repository.slug(),
+                    source_type: "Repository".to_owned(),
+                    target: "branch".to_owned(),
+                    enforcement: "active".to_owned(),
+                    selected_pull_requests: vec![PrNumber(1), PrNumber(2)],
+                    selected_refs: vec![
+                        "refs/heads/root".to_owned(),
+                        "refs/heads/child".to_owned(),
+                    ],
+                    current_user_can_bypass: "never".to_owned(),
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                },
+                evidence_hash: String::new(),
+            }),
+            evidence_hash: String::new(),
+        },
+    );
+
+    // Write the land checkpoint to disk
+    crate::stack_checkpoint::write(&native.repository_path, "land-42", &checkpoint).unwrap();
+
+    let provider = FakeProvider::with_pull_requests(pulls);
+    *provider.native_stack.borrow_mut() = Some(generation);
+
+    let keys = crate::stack_checkpoint::list_keys(&native.repository_path, "land-").unwrap();
+    eprintln!("debug: listed keys = {keys:?}");
+    let changed = reconcile_pending_native_stack_landing_checkpoints(
+        &AppContext {
+            repository_path: native.repository_path.clone(),
+            config_path: std::path::PathBuf::from(".caravan/config.yaml"),
+            config_existed: true,
+            config: config.clone(),
+        },
+        &status,
+        &provider,
+    )
+    .unwrap();
+
+    assert!(changed);
+    let loaded = crate::stack_checkpoint::load::<crate::github::GitHubStackLandCheckpoint>(
+        &native.repository_path,
+        "land-42",
+    )
+    .unwrap();
+    assert!(loaded.is_none(), "loaded is {loaded:?}");
 }
