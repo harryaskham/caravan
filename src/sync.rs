@@ -6359,6 +6359,7 @@ fn candidate_local_admission_refusal(
             candidate_pr,
             admission_gate.expect("checked as present"),
             &required_runs,
+            gate_deferred,
         )?
     {
         progress.deferred_admission_gates.insert(candidate_pr);
@@ -6397,29 +6398,25 @@ fn gate_deferral_allows_required_runs(
     candidate_pr: PrNumber,
     gate: &crate::config::CiAdmissionGateConfig,
     required_runs: &crate::required_runs::RequiredRunsAssessment,
+    exact_gate_failure: bool,
 ) -> Result<bool, AppError> {
-    let gate_coverage = required_runs
-        .coverage
-        .iter()
-        .filter(|coverage| coverage.context == gate.context)
-        .collect::<Vec<_>>();
-    if gate_coverage.len() != 1
-        || gate_coverage[0].state != crate::required_runs::RequiredContextState::Failing
-        || !required_runs
-            .required_contexts
-            .iter()
-            .any(|context| context == &gate.context)
-    {
+    // The exact configured gate is reduced from current-head check/run lineage
+    // before required-run evaluation. A stacked candidate's intermediate base
+    // does not normally carry branch protection, so requiring the gate to also
+    // appear in that base's protected contexts deadlocks valid admission. The
+    // trusted default policy configures the gate; branch-local required runs
+    // remain an independent safety check for every non-gate context.
+    if !exact_gate_failure {
         return Err(AppError::structured(
             ErrorCategory::Validation,
             "auto_admission_gate_evidence_invalid",
-            "configured admission gate is not one exact required failing context on the candidate head",
+            "configured admission gate is not one exact current failing context on the candidate head",
             Some(json!({
                 "candidate_pr": candidate_pr,
                 "gate": gate,
                 "required_runs": required_runs,
                 "mutated": false,
-                "safe_next_action": "repair the canonical admission-gate workflow/protection contract; do not guess from missing or unrelated CI",
+                "safe_next_action": "repair the canonical admission-gate workflow contract; do not guess from missing or unrelated CI",
             })),
         ));
     }
@@ -6617,7 +6614,7 @@ fn recover_enrolled_admission_gate(
     else {
         return Ok(false);
     };
-    if !gate_deferral_allows_required_runs(candidate_pr, gate, required_runs)? {
+    if !gate_deferral_allows_required_runs(candidate_pr, gate, required_runs, true)? {
         return Ok(false);
     }
     let retrigger = admission_gate_retrigger(provider, &status.repository, &candidate, gate)?;
