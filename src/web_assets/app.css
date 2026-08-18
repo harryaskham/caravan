@@ -104,7 +104,7 @@ button:focus-visible, [role="tab"]:focus-visible, a:focus-visible, summary:focus
 .status-dot.bad { background: var(--danger); }
 
 .content { grid-column: 2; min-width: 0; min-height: 0; height: 100%; padding: 14px 16px 16px; overflow: hidden; }
-.dashboard { display: grid; grid-template-rows: auto minmax(0,1fr); gap: 12px; height: 100%; min-height: 0; overflow: hidden; }
+.dashboard { display: grid; grid-template-rows: auto auto minmax(0,1fr); gap: 12px; height: 100%; min-height: 0; overflow: hidden; }
 .dashboard-scroll { display: grid; align-content: start; gap: 12px; min-height: 0; overflow-y: auto; padding: 1px 4px 16px 1px; scrollbar-gutter: stable; }
 .dashboard.no-caravans .caravan-section { min-height: 58px; }
 .dashboard.no-caravans .caravan-list { padding-bottom: 0; }
@@ -119,6 +119,10 @@ button:focus-visible, [role="tab"]:focus-visible, a:focus-visible, summary:focus
 .metric { display: block; margin-top: 6px; font: 600 1.55rem/1 var(--font-display); }
 .metric-label { color: var(--ink-soft); font-size: .62rem; letter-spacing: .08em; text-transform: uppercase; }
 .error-banner { grid-column: 1/-1; padding: 13px 16px; color: #782e2a; background: #f4dcd7; border: 1px solid rgba(166,63,59,.25); border-radius: var(--radius-md); }
+.telemetry-section { padding: 11px 13px; background: rgba(255,255,255,.43); border: 1px solid var(--line); border-radius: var(--radius-lg); }
+.telemetry-grid { display: grid; grid-template-columns: repeat(3, minmax(140px, 1fr)); gap: 8px; }
+.telemetry-grid .overview-card { min-height: 58px; }
+.telemetry-wide { grid-column: 1 / -1; overflow-wrap: anywhere; }
 
 .section-block { min-width: 0; min-height: 0; }
 .caravan-section { display: flex; flex-direction: column; }

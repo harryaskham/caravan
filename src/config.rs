@@ -429,6 +429,121 @@ impl Default for JournalConfig {
     }
 }
 
+/// Durable, repository-shared log policy. The local journal remains the
+/// authoritative write-ahead source; flushing is additive and best-effort.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct LogConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flush: Option<LogFlushConfig>,
+}
+
+impl LogConfig {
+    fn is_default(&self) -> bool {
+        self.flush.is_none()
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        let Some(flush) = &self.flush else {
+            return Ok(());
+        };
+        if flush.branch.trim().is_empty()
+            || flush.branch.starts_with('-')
+            || flush.branch.contains("..")
+            || flush.branch.contains(char::is_whitespace)
+        {
+            return Err(ConfigError::Validation(
+                "log.flush.branch must be a non-empty safe Git branch name".to_owned(),
+            ));
+        }
+        if flush.interval == 0 {
+            return Err(ConfigError::Validation(
+                "log.flush.interval must be at least 1".to_owned(),
+            ));
+        }
+        if flush.retries > 10 {
+            return Err(ConfigError::Validation(
+                "log.flush.retries must be between 0 and 10".to_owned(),
+            ));
+        }
+        let allowed = ["sync", "join", "new", "evict"];
+        if flush
+            .after
+            .iter()
+            .any(|operation| !allowed.contains(&operation.as_str()))
+        {
+            return Err(ConfigError::Validation(
+                "log.flush.after entries must be sync, join, new, or evict".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Independent orphan state-branch publication for raw telemetry records.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct LogFlushConfig {
+    pub branch: String,
+    pub after: Vec<String>,
+    /// Minimum age of the branch head before an automatic flush. YAML accepts
+    /// seconds or a compact `60m` / `2h` duration.
+    #[serde(deserialize_with = "deserialize_log_flush_interval")]
+    pub interval: u64,
+    pub retries: u32,
+}
+
+fn deserialize_log_flush_interval<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Value {
+        Seconds(u64),
+        Compact(String),
+    }
+    match Value::deserialize(deserializer)? {
+        Value::Seconds(seconds) => Ok(seconds),
+        Value::Compact(value) => {
+            let (digits, multiplier) = if let Some(value) = value.strip_suffix('h') {
+                (value, 60 * 60)
+            } else if let Some(value) = value.strip_suffix('m') {
+                (value, 60)
+            } else if let Some(value) = value.strip_suffix('s') {
+                (value, 1)
+            } else {
+                (value.as_str(), 1)
+            };
+            digits
+                .parse::<u64>()
+                .ok()
+                .and_then(|number| number.checked_mul(multiplier))
+                .ok_or_else(|| {
+                    serde::de::Error::custom(
+                        "log.flush.interval must be seconds or a compact duration such as 60m",
+                    )
+                })
+        }
+    }
+}
+
+impl Default for LogFlushConfig {
+    fn default() -> Self {
+        Self {
+            branch: "caravan-log".to_owned(),
+            after: vec![
+                "sync".to_owned(),
+                "join".to_owned(),
+                "new".to_owned(),
+                "evict".to_owned(),
+            ],
+            interval: 60 * 60,
+            retries: 3,
+        }
+    }
+}
+
 /// Foreground `cara loop` policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
@@ -777,6 +892,8 @@ pub struct CaravanConfig {
     #[serde(rename = "loop")]
     pub loop_config: LoopConfig,
     pub journal: JournalConfig,
+    #[serde(default, skip_serializing_if = "LogConfig::is_default")]
+    pub log: LogConfig,
     pub hooks: BTreeMap<EventKind, HookConfig>,
 }
 
@@ -828,6 +945,7 @@ impl Default for CaravanConfig {
             sync: SyncConfig::default(),
             loop_config: LoopConfig::default(),
             journal: JournalConfig::default(),
+            log: LogConfig::default(),
             hooks: BTreeMap::new(),
         }
     }
@@ -1095,6 +1213,7 @@ impl CaravanConfig {
                 "journal.max_archives must be between 0 and 100".to_owned(),
             ));
         }
+        self.log.validate()?;
         for (event, hook) in &self.hooks {
             if hook.command.trim().is_empty() {
                 return Err(ConfigError::Validation(format!(
@@ -2299,5 +2418,26 @@ sync:
                 .to_string()
                 .contains("requires sync.head_merge_actor: caravan")
         );
+    }
+
+    #[test]
+    fn log_flush_is_opt_in_bounded_and_backward_compatible() {
+        let legacy = CaravanConfig::parse("version: 1\n").unwrap();
+        assert!(legacy.log.flush.is_none());
+
+        let configured = CaravanConfig::parse(
+            "version: 1\nlog:\n  flush:\n    branch: caravan-log\n    after: [sync, join, new, evict]\n    interval: 60m\n    retries: 3\n",
+        )
+        .unwrap();
+        let flush = configured.log.flush.unwrap();
+        assert_eq!(flush.branch, "caravan-log");
+        assert_eq!(flush.interval, 3600);
+        assert_eq!(flush.retries, 3);
+
+        let invalid = CaravanConfig::parse(
+            "version: 1\nlog:\n  flush:\n    branch: caravan-log\n    after: [delete]\n    interval: 1\n    retries: 0\n",
+        )
+        .unwrap_err();
+        assert!(invalid.to_string().contains("log.flush.after"));
     }
 }

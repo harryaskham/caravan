@@ -1411,6 +1411,9 @@ pub enum EventKind {
     /// Exact current provider generation is mechanically conflicting. This is
     /// notification evidence for repair coordinators, never merge authority.
     ConflictDetected,
+    /// One complete sync tick, including duration and zero-cost tick counters.
+    /// Telemetry only; it grants no queue or mutation authority.
+    SyncCompleted,
     SyncFailed,
     JoinFailed,
     /// One exact unjoined candidate was refused locally before membership;

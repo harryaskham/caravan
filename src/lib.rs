@@ -49,6 +49,7 @@ pub mod stack_policy;
 pub mod stack_recovery;
 pub mod sync;
 mod sync_authority;
+pub mod telemetry;
 pub mod unpark;
 pub mod web;
 pub mod writer_guard;
@@ -1501,6 +1502,11 @@ pub fn build_router() -> ToolRouter<AppContext> {
         "log",
         "Return a bounded, deterministically ordered snapshot of canonical events and secret-free hook delivery receipts. Follow mode is CLI-only.",
         |context: &AppContext, input: journal::LogInput| journal::snapshot(context, &input),
+    );
+    router.add_typed_tool_with_output_schema(
+        "log_flush",
+        "Publish locally retained journal records to the configured actor-partitioned telemetry state branch. Independent of queue liveness.",
+        |context: &AppContext, input: telemetry::LogFlushInput| telemetry::flush(context, &input),
     );
     router.add_typed_tool_with_output_schema(
         "status",
