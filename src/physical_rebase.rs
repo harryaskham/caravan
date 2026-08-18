@@ -1910,6 +1910,20 @@ fn push_prepared_with_runner(
     })
 }
 
+fn read_source_config(
+    runner: &impl CommandRunner,
+    source: &BranchSnapshot,
+) -> Option<crate::config::CaravanConfig> {
+    let object = format!("{}:{}", source.oid.0, crate::config::DEFAULT_CONFIG_PATH);
+    let output = runner
+        .run(&CommandSpec::new("git").args(["show", object.as_str()]))
+        .ok()?;
+    if !output.is_success() {
+        return None;
+    }
+    crate::config::CaravanConfig::parse(&output.stdout).ok()
+}
+
 fn preflight_ci_triggers(
     runner: &impl CommandRunner,
     source: &BranchSnapshot,
@@ -1927,6 +1941,13 @@ fn preflight_ci_triggers(
         "rebase_ci_preflight_failed",
         "could not inspect workflows at the exact default revision",
     )?;
+    let config = read_source_config(runner, source).unwrap_or_default();
+    let has_admission_gate = config.ci.admission_gate.is_some();
+    let required_types = if has_admission_gate {
+        vec!["opened", "synchronize", "reopened"]
+    } else {
+        vec!["opened", "synchronize", "reopened", "edited", "labeled"]
+    };
     let mut supported = Vec::new();
     for path in listing.stdout.lines().filter(|path| {
         Path::new(path).extension().is_some_and(|extension| {
@@ -1953,12 +1974,15 @@ fn preflight_ci_triggers(
             continue;
         };
         let Some(policy) = pull_request.as_mapping() else {
-            // A null/scalar pull_request uses GitHub's default activity types,
-            // which omit `edited` and therefore cannot prove the base retarget.
+            // A null/scalar pull_request uses GitHub default activity types
+            // (opened, synchronize, reopened). This satisfies admission_gate workflows.
+            if has_admission_gate {
+                supported.push(path.to_owned());
+            }
             continue;
         };
         let types = yaml_strings(yaml_get(policy, "types"));
-        if !["opened", "synchronize", "reopened", "edited", "labeled"]
+        if !required_types
             .iter()
             .all(|required| types.iter().any(|item| item == required))
         {
@@ -1973,12 +1997,21 @@ fn preflight_ci_triggers(
     if supported.is_empty() {
         return Err(decision(
             "rebase_ci_trigger_missing",
-            "no exact-default pull_request workflow can run for the selected parent base on synchronize, edited, and labeled events",
+            if has_admission_gate {
+                "no exact-default pull_request workflow can run for the selected parent base on opened, synchronize, and reopened events"
+            } else {
+                "no exact-default pull_request workflow can run for the selected parent base on synchronize, edited, and labeled events"
+            },
             json!({
                 "target_base": target_branch,
                 "workflow_source_oid": source.oid,
-                "required_types": ["opened", "synchronize", "reopened", "edited", "labeled"],
-                "next": "enable a dedicated stack/full pull_request workflow without a branches filter and include types opened, synchronize, reopened, edited, labeled, and unlabeled; gate jobs on main base or the caravan PR label",
+                "required_types": required_types,
+                "admission_gate": has_admission_gate,
+                "next": if has_admission_gate {
+                    "enable a pull_request workflow without a branches filter and include types opened, synchronize, and reopened"
+                } else {
+                    "enable a dedicated stack/full pull_request workflow without a branches filter and include types opened, synchronize, reopened, edited, labeled, and unlabeled; gate jobs on main base or the caravan PR label"
+                },
                 "resumable": true
             }),
         ));
@@ -4720,5 +4753,51 @@ mod tests {
             .next(),
             Some(fixture.feature.0.as_str())
         );
+    }
+    #[test]
+    fn admission_gate_workflows_satisfy_rebase_ci_preflight() {
+        let fix = fixture();
+        let runner = ProcessRunner::in_directory(&fix.clone);
+
+        git(&fix.clone, &["checkout", "main"]);
+        std::fs::create_dir_all(fix.clone.join(".caravan")).unwrap();
+        std::fs::write(
+            fix.clone.join(".caravan/config.yaml"),
+            "version: 1
+ci:
+  admission_gate:
+    mode: caravan_label
+    context: admission-gate
+    member_label: caravan
+",
+        )
+        .unwrap();
+        std::fs::write(
+            fix.clone.join(".github/workflows/ci.yml"),
+            "on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+jobs: {}
+",
+        )
+        .unwrap();
+        git(
+            &fix.clone,
+            &["add", ".caravan/config.yaml", ".github/workflows/ci.yml"],
+        );
+        git(
+            &fix.clone,
+            &["commit", "-m", "add admission gate and workflow"],
+        );
+        let head = CommitOid(git(&fix.clone, &["rev-parse", "HEAD"]));
+
+        let source = BranchSnapshot {
+            repository: fix.repository.clone(),
+            name: "main".to_owned(),
+            oid: head,
+        };
+
+        let result = preflight_ci_triggers(&runner, &source, "feature").unwrap();
+        assert!(result.contains(&".github/workflows/ci.yml".to_owned()));
     }
 }
