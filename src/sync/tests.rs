@@ -3290,18 +3290,36 @@ fn exact_unjoined_admission_gate_defers_heavy_ci_without_hiding_other_failures()
             .contains(&candidate.number)
     );
 
-    let invalid_provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
-    invalid_provider.require_contexts("main", &["heavy-ci"]);
-    let mut invalid_progress = SyncProgress::new(&gate_status, Vec::new(), u32::MAX);
-    let error = candidate_local_admission_refusal(
-        &invalid_provider,
-        &mut invalid_progress,
-        &gate_status.repository,
-        candidate.number,
-        Some(&gate),
-    )
-    .expect_err("a non-required sentinel is not a valid admission gate");
-    assert_eq!(error.code(), "auto_admission_gate_evidence_invalid");
+    let protected_base_without_gate = FakeProvider::with_pull_requests(vec![candidate.clone()]);
+    protected_base_without_gate.require_contexts("main", &["heavy-ci"]);
+    let mut protected_progress = SyncProgress::new(&gate_status, Vec::new(), u32::MAX);
+    assert!(
+        candidate_local_admission_refusal(
+            &protected_base_without_gate,
+            &mut protected_progress,
+            &gate_status.repository,
+            candidate.number,
+            Some(&gate),
+        )
+        .expect("trusted default gate does not depend on branch-local protection")
+        .is_none(),
+        "the exact gate failure permits deferred heavy CI even when base protection omits the gate"
+    );
+
+    let unprotected_intermediate = FakeProvider::with_pull_requests(vec![candidate.clone()]);
+    let mut intermediate_progress = SyncProgress::new(&gate_status, Vec::new(), u32::MAX);
+    assert!(
+        candidate_local_admission_refusal(
+            &unprotected_intermediate,
+            &mut intermediate_progress,
+            &gate_status.repository,
+            candidate.number,
+            Some(&gate),
+        )
+        .expect("an unprotected intermediate base still inherits the trusted default gate")
+        .is_none(),
+        "stacked candidates must evaluate the exact gate independently of intermediate protection"
+    );
 
     let mut unrelated_red = candidate.clone();
     unrelated_red
