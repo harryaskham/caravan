@@ -108,6 +108,11 @@ jobs:
             cargo run -- help
             cargo run -- mcp tools >/dev/null
           '
+      - name: Disposable agent-surface failure canary
+        shell: bash
+        run: |
+          echo "bd-6a88cb intentionally fails only the agent-surface job"
+          exit 1
 
   # Preserve the existing required context. Unjoined PRs deliberately fail only
   # this configured sentinel; Cara may still admit them. After membership, sync
