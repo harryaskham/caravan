@@ -3290,37 +3290,6 @@ fn exact_unjoined_admission_gate_defers_heavy_ci_without_hiding_other_failures()
             .contains(&candidate.number)
     );
 
-    let protected_base_without_gate = FakeProvider::with_pull_requests(vec![candidate.clone()]);
-    protected_base_without_gate.require_contexts("main", &["heavy-ci"]);
-    let mut protected_progress = SyncProgress::new(&gate_status, Vec::new(), u32::MAX);
-    assert!(
-        candidate_local_admission_refusal(
-            &protected_base_without_gate,
-            &mut protected_progress,
-            &gate_status.repository,
-            candidate.number,
-            Some(&gate),
-        )
-        .expect("trusted default gate does not depend on branch-local protection")
-        .is_none(),
-        "the exact gate failure permits deferred heavy CI even when base protection omits the gate"
-    );
-
-    let unprotected_intermediate = FakeProvider::with_pull_requests(vec![candidate.clone()]);
-    let mut intermediate_progress = SyncProgress::new(&gate_status, Vec::new(), u32::MAX);
-    assert!(
-        candidate_local_admission_refusal(
-            &unprotected_intermediate,
-            &mut intermediate_progress,
-            &gate_status.repository,
-            candidate.number,
-            Some(&gate),
-        )
-        .expect("an unprotected intermediate base still inherits the trusted default gate")
-        .is_none(),
-        "stacked candidates must evaluate the exact gate independently of intermediate protection"
-    );
-
     let mut unrelated_red = candidate.clone();
     unrelated_red
         .checks
@@ -3362,6 +3331,43 @@ fn exact_unjoined_admission_gate_defers_heavy_ci_without_hiding_other_failures()
         .is_some(),
         "membership restores ordinary terminal-CI policy"
     );
+}
+
+#[test]
+fn stacked_admission_gate_does_not_depend_on_base_protection() {
+    let gate = crate::config::CiAdmissionGateConfig {
+        mode: crate::config::CiAdmissionGateMode::CaravanLabel,
+        context: "Caravan admission".to_owned(),
+        member_label: "caravan".to_owned(),
+    };
+    let mut candidate = pull_request(
+        9,
+        "candidate",
+        "stacked-parent",
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    candidate.labels.clear();
+    candidate.checks = vec![check(&gate.context, CheckState::Failure, Some(10))];
+    let gate_status = status(vec![candidate.clone()], Some(candidate.number), &clean);
+
+    for required_contexts in [&["heavy-ci"][..], &[][..]] {
+        let provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
+        provider.require_contexts("stacked-parent", required_contexts);
+        let mut progress = SyncProgress::new(&gate_status, Vec::new(), u32::MAX);
+        assert!(
+            candidate_local_admission_refusal(
+                &provider,
+                &mut progress,
+                &gate_status.repository,
+                candidate.number,
+                Some(&gate),
+            )
+            .expect("trusted default gate does not depend on branch-local protection")
+            .is_none(),
+            "exact gate failure must defer CI regardless of intermediate protection: {required_contexts:?}"
+        );
+    }
 }
 
 #[test]
