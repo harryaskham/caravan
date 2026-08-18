@@ -588,3 +588,33 @@ fn decision_json_names_selection_intent_and_dispositions() {
         "blocked_automatic_order"
     );
 }
+
+/// bd-fdf94f: an unjoined parent with failing CI must fail closed as an order-blocking
+/// rejection rather than a skippable candidate when unjoined descendants depend on it,
+/// preventing the queue from retargeting or admitting the descendant past its parent.
+#[test]
+fn unjoined_parent_with_failing_ci_blocks_descendant_auto_admission() {
+    let mut parent = pr(2772, "parent", "main", false);
+    parent.checks.push(crate::model::CheckSnapshot {
+        name: "test".to_owned(),
+        state: crate::model::CheckState::Failure,
+        provider_state: Some("FAILURE".to_owned()),
+        ..crate::model::CheckSnapshot::default()
+    });
+    let child = pr(2773, "child", "parent", false);
+
+    let analysis = analysis(vec![parent.clone(), child.clone()]);
+    let labels = crate::config::CaravanConfig::default().agent_priority_labels;
+    let admission = crate::read::resolve_admission(&analysis, &labels);
+
+    // Parent must be a blocking rejection, not skipped
+    assert!(
+        admission.rejected.iter().any(|r| r.pr == parent.number
+            && r.blocks_order
+            && r.reason.contains("unjoined descendants")),
+        "parent must block order because child depends on its base chain"
+    );
+    // Next candidate must be None or point to the blocking parent, not leapfrog to child
+    assert_ne!(admission.next_candidate, Some(child.number));
+    assert_eq!(admission.next_candidate, Some(parent.number));
+}
