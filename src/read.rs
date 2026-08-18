@@ -3456,7 +3456,11 @@ fn check_analysis_with_recommendation(
         .cloned()
         .collect::<Vec<_>>();
     let mut ordering_note: Option<String> = None;
-    validate_candidate(pull_request, &mut problems);
+    validate_candidate(
+        pull_request,
+        &mut problems,
+        status.auto_admission.admission_gate.as_ref(),
+    );
     // In physical membership mode the provider's synthetic merge ref is
     // advisory only: prepare/apply independently fetch and verify the exact PR
     // head plus current default/tail, prove merge-tree compatibility and range
@@ -4000,7 +4004,11 @@ fn resolve_target_caravan<'a>(
     }
 }
 
-fn validate_candidate(pull_request: &PullRequestSnapshot, problems: &mut Vec<GraphProblem>) {
+fn validate_candidate(
+    pull_request: &PullRequestSnapshot,
+    problems: &mut Vec<GraphProblem>,
+    admission_gate: Option<&crate::config::CiAdmissionGateConfig>,
+) {
     let mut messages = BTreeSet::new();
     if pull_request.state != PullRequestState::Open {
         messages.insert("candidate PR is not open");
@@ -4024,7 +4032,10 @@ fn validate_candidate(pull_request: &PullRequestSnapshot, problems: &mut Vec<Gra
     // fixing it rewrites the head, and every member stacked behind it is then
     // rebased anyway — so admitting a red candidate buys nothing and costs the
     // whole tail a re-stitch. `caravan-force` remains the audited override.
-    if !pull_request.has_label("caravan-force") && has_failing_check(pull_request) {
+    let gate_deferred =
+        admission_gate.is_some_and(|gate| candidate_may_have_deferred_gate(pull_request, gate));
+    if !pull_request.has_label("caravan-force") && has_failing_check(pull_request) && !gate_deferred
+    {
         messages.insert(if has_cancelled_check(pull_request) {
             // Naming the cancellation is the whole point: the reader must not
             // treat this as a code failure and evict or repair on the strength
@@ -5717,7 +5728,7 @@ mod tests {
         blocked.merge_state_status = Some("BLOCKED".to_owned());
         let mut problems = Vec::new();
 
-        validate_candidate(&blocked, &mut problems);
+        validate_candidate(&blocked, &mut problems, None);
 
         assert!(
             problems.is_empty(),
@@ -5997,7 +6008,7 @@ mod tests {
         ];
         let mut problems = Vec::new();
 
-        validate_candidate(&regressed, &mut problems);
+        validate_candidate(&regressed, &mut problems, None);
 
         assert!(
             problems
@@ -6035,7 +6046,7 @@ mod tests {
         });
         let mut problems = Vec::new();
 
-        validate_candidate(&cancelled, &mut problems);
+        validate_candidate(&cancelled, &mut problems, None);
 
         let reason = problems
             .iter()
@@ -6069,7 +6080,7 @@ mod tests {
         });
         let mut problems = Vec::new();
 
-        validate_candidate(&red, &mut problems);
+        validate_candidate(&red, &mut problems, None);
 
         assert!(
             problems
@@ -6094,7 +6105,7 @@ mod tests {
         });
         let mut problems = Vec::new();
 
-        validate_candidate(&forced, &mut problems);
+        validate_candidate(&forced, &mut problems, None);
 
         assert!(
             !problems
@@ -6118,7 +6129,7 @@ mod tests {
         });
         let mut problems = Vec::new();
 
-        validate_candidate(&pending, &mut problems);
+        validate_candidate(&pending, &mut problems, None);
 
         assert!(
             !problems
@@ -6332,6 +6343,51 @@ mod tests {
     /// bd-7546ea live pair: PR2228 head ccc3af5c is the direct parent of
     /// PR2235 head f0bae700, so an exact local proof must classify it as
     /// strict-prefix ancestry, never as divergence.
+
+    #[test]
+    fn validate_candidate_exempts_deferred_gate_sentinel() {
+        let gate = crate::config::CiAdmissionGateConfig {
+            mode: crate::config::CiAdmissionGateMode::CaravanLabel,
+            context: "cara-admission".to_owned(),
+            member_label: "caravan".to_owned(),
+        };
+        let mut deferred = pr(10, "deferred-pr", "main", false);
+        deferred.checks.push(crate::model::CheckSnapshot {
+            name: "cara-admission".to_owned(),
+            state: crate::model::CheckState::Failure,
+            provider_state: Some("FAILURE".to_owned()),
+            ..crate::model::CheckSnapshot::default()
+        });
+
+        let mut problems = Vec::new();
+        validate_candidate(&deferred, &mut problems, Some(&gate));
+        assert!(
+            problems.is_empty(),
+            "deferred admission gate sentinel must not be treated as a failing check during candidate validation: {problems:?}"
+        );
+
+        let mut regular_problems = Vec::new();
+        validate_candidate(&deferred, &mut regular_problems, None);
+        assert!(
+            !regular_problems.is_empty(),
+            "without admission gate configured, failure must still be caught"
+        );
+
+        // Unrelated failure alongside the gate context must still refuse
+        deferred.checks.push(crate::model::CheckSnapshot {
+            name: "unit-tests".to_owned(),
+            state: crate::model::CheckState::Failure,
+            provider_state: Some("FAILURE".to_owned()),
+            ..crate::model::CheckSnapshot::default()
+        });
+        let mut mixed_problems = Vec::new();
+        validate_candidate(&deferred, &mut mixed_problems, Some(&gate));
+        assert!(
+            !mixed_problems.is_empty(),
+            "unrelated failures alongside gate sentinel must still refuse"
+        );
+    }
+
     #[test]
     fn large_human_status_defers_git_compatibility_but_sync_does_not() {
         assert!(!defer_status_compatibility_for_scale(true, 29));
