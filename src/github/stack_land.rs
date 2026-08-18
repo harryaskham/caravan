@@ -313,7 +313,8 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
     }
 }
 
-fn advance(
+#[must_use]
+pub fn advance(
     checkpoint: &GitHubStackLandCheckpoint,
     receipt: &GitHubStackLockedMergeReceipt,
 ) -> GitHubStackLandCheckpoint {

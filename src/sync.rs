@@ -1116,6 +1116,21 @@ pub trait SyncProvider {
         ))
     }
 
+    fn list_active_stack_branch_locks_for_sync(
+        &self,
+        _repository: &RepositoryId,
+    ) -> Result<Vec<crate::github::GitHubStackBranchLockGeneration>, AppError> {
+        Ok(Vec::new())
+    }
+
+    fn delete_stack_branch_lock_for_sync(
+        &self,
+        _repository: &RepositoryId,
+        _lock: &crate::github::GitHubStackBranchLockGeneration,
+    ) -> Result<(), AppError> {
+        Ok(())
+    }
+
     fn verify_pull_request(
         &self,
         repository: &RepositoryId,
@@ -1424,6 +1439,23 @@ impl<R: crate::command::CommandRunner> SyncProvider for GitHubMutationAdapter<R>
         checkpoint: &crate::github::GitHubStackLandCheckpoint,
     ) -> Result<crate::github::GitHubStackLandCheckpoint, AppError> {
         self.native_stack_land_release(repository, checkpoint)
+            .map_err(native_sync_error)
+    }
+
+    fn list_active_stack_branch_locks_for_sync(
+        &self,
+        repository: &RepositoryId,
+    ) -> Result<Vec<crate::github::GitHubStackBranchLockGeneration>, AppError> {
+        self.list_active_stack_branch_locks(repository)
+            .map_err(native_sync_error)
+    }
+
+    fn delete_stack_branch_lock_for_sync(
+        &self,
+        repository: &RepositoryId,
+        lock: &crate::github::GitHubStackBranchLockGeneration,
+    ) -> Result<(), AppError> {
+        self.delete_stack_branch_lock(repository, lock)
             .map_err(native_sync_error)
     }
 
@@ -2390,6 +2422,84 @@ fn record_closed_lifecycle_mutation(
 /// candidate is freshly refetched and exact-precondition fenced immediately
 /// before its single write; a changed pass returns before repair/rebase/auto-
 /// merge so terminal records never trigger active work.
+#[allow(clippy::too_many_lines)]
+fn reconcile_pending_native_stack_landing_checkpoints(
+    context: &AppContext,
+    status: &StatusOutput,
+    provider: &impl SyncProvider,
+) -> Result<bool, AppError> {
+    if context.config.stack_type != crate::config::StackType::Github {
+        return Ok(false);
+    }
+    let repository = &status.repository;
+    let keys = crate::stack_checkpoint::list_keys(&context.repository_path, "land-")?;
+    let mut changed = false;
+    for key in keys {
+        if let Some(mut checkpoint) = crate::stack_checkpoint::load::<
+            crate::github::GitHubStackLandCheckpoint,
+        >(&context.repository_path, &key)?
+        {
+            if !checkpoint.verify() || checkpoint.repository != *repository {
+                continue;
+            }
+            if matches!(
+                checkpoint.phase,
+                crate::github::GitHubStackLandPhase::Submitted
+                    | crate::github::GitHubStackLandPhase::Terminal
+            ) {
+                // Poll and finalize
+                for _ in 0..5 {
+                    let before_phase = checkpoint.phase;
+                    checkpoint = match checkpoint.phase {
+                        crate::github::GitHubStackLandPhase::Submitted => {
+                            provider.native_stack_land_poll_for_sync(repository, &checkpoint)?
+                        }
+                        crate::github::GitHubStackLandPhase::Terminal => {
+                            provider.native_stack_land_release_for_sync(repository, &checkpoint)?
+                        }
+                        _ => break,
+                    };
+                    crate::stack_checkpoint::write(&context.repository_path, &key, &checkpoint)?;
+                    if checkpoint.phase == before_phase
+                        || checkpoint.phase == crate::github::GitHubStackLandPhase::Released
+                    {
+                        break;
+                    }
+                }
+                if checkpoint.phase == crate::github::GitHubStackLandPhase::Released {
+                    crate::stack_checkpoint::remove(&context.repository_path, &key)?;
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    // Clean up any unreferenced or orphaned Cara stack branch locks on the provider
+    if context.config.stack_rollout.mutations_opt_in {
+        let active_locks = provider.list_active_stack_branch_locks_for_sync(repository)?;
+        let mut live_lock_names = std::collections::BTreeSet::new();
+        for key in crate::stack_checkpoint::list_keys(&context.repository_path, "land-")? {
+            if let Some(checkpoint) = crate::stack_checkpoint::load::<
+                crate::github::GitHubStackLandCheckpoint,
+            >(&context.repository_path, &key)?
+            {
+                if let Some(lock) = checkpoint.outstanding_lock() {
+                    live_lock_names.insert(lock.name.clone());
+                }
+            }
+        }
+        for active_lock in active_locks {
+            if !live_lock_names.contains(&active_lock.name) {
+                // Orphaned or duplicate ruleset lock - delete it to unwedge branch updates
+                provider.delete_stack_branch_lock_for_sync(repository, &active_lock)?;
+                changed = true;
+            }
+        }
+    }
+
+    Ok(changed)
+}
+
 // Keep the fresh-read lease, one-write label transaction, and lifecycle-specific
 // postconditions visible in one linear safety boundary.
 #[allow(clippy::too_many_lines)]
@@ -4611,6 +4721,15 @@ fn sync_with_lock(
         &runner,
     )?;
     let provider = GitHubMutationAdapter::new(runner);
+
+    // Poll and finalize any submitted landing checkpoints and cleanup orphaned rulesets
+    // before evaluating compatibility, rebase, or admission.
+    if reconcile_pending_native_stack_landing_checkpoints(context, &status, &provider)? {
+        status = read::fleet_status_for_sync(context, operation_deadline, Some(&github_budget))?;
+        if let Some(authority) = authority {
+            authority.bind_invocation(&mut status)?;
+        }
+    }
 
     // A provider Stack append may become visible before its ordinary membership
     // transaction completes. Project only that one exact extra tail back to the

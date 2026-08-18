@@ -474,6 +474,47 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
             }),
         ))
     }
+
+    /// List all active rulesets created by Cara across all operations.
+    pub fn list_active_stack_branch_locks(
+        &self,
+        repository: &RepositoryId,
+    ) -> Result<Vec<GitHubStackBranchLockGeneration>, GitHubStackBranchLockError> {
+        let summaries: Vec<RulesetSummary> = self.json(list_rulesets_command(repository))?;
+        let mut locks = Vec::new();
+        for summary in summaries {
+            if summary.name.starts_with(NAME_PREFIX) {
+                if let Some(lock) = self.read_stack_branch_lock(repository, summary.id)? {
+                    locks.push(lock);
+                }
+            }
+        }
+        Ok(locks)
+    }
+
+    /// Delete a Cara-created ruleset directly by its verified generation.
+    pub fn delete_stack_branch_lock(
+        &self,
+        repository: &RepositoryId,
+        lock: &GitHubStackBranchLockGeneration,
+    ) -> Result<(), GitHubStackBranchLockError> {
+        let command = delete_ruleset_command(repository, lock.id);
+        let output = self.runner.run(&command).map_err(|error| {
+            GitHubStackBranchLockError::Provider(MutationError::Provider(DiscoveryError::Runner(
+                error,
+            )))
+        })?;
+        if output.is_success() || output.stderr.contains("HTTP 404") {
+            return Ok(());
+        }
+        Err(GitHubStackBranchLockError::Provider(
+            MutationError::Provider(DiscoveryError::CommandFailed {
+                command,
+                code: output.code,
+                stderr: output.stderr,
+            }),
+        ))
+    }
 }
 
 fn validate_lock_plan(
