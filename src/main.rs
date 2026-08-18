@@ -186,6 +186,14 @@ struct LogCommand {
     /// Keep streaming new records until interrupted (CLI-only).
     #[arg(short = 'f', long)]
     follow: bool,
+    #[command(subcommand)]
+    command: Option<LogSubcommand>,
+}
+
+#[derive(Debug, Subcommand)]
+enum LogSubcommand {
+    /// Publish local journal records to the configured telemetry state branch.
+    Flush(caravan::telemetry::LogFlushInput),
 }
 
 #[derive(Debug, Subcommand)]
@@ -473,11 +481,11 @@ fn run(cli: &Cli) -> Result<(), i32> {
         Command::CiGate(input) => run_ci_gate(cli, input),
         Command::CiAdmissionGate(input) => run_ci_admission_gate(cli, input),
         Command::Check(input) => run_check(cli, input),
-        Command::New(input) => run_create_membership(cli, input),
+        Command::New(input) => run_with_log_flush(cli, "new", || run_create_membership(cli, input)),
         Command::Renew(input) => {
             run_membership(cli, |context| caravan::membership::renew(context, input))
         }
-        Command::Join(input) => run_join_membership(cli, input),
+        Command::Join(input) => run_with_log_flush(cli, "join", || run_join_membership(cli, input)),
         Command::Rejoin(input) => {
             run_membership(cli, |context| caravan::membership::rejoin(context, input))
         }
@@ -502,11 +510,11 @@ fn run(cli: &Cli) -> Result<(), i32> {
         Command::NativeStack(command) => run_native_stack(cli, command),
         Command::PauseRecovery(command) => run_pause_recovery(cli, command),
         Command::Admit(input) => run_admit(cli, input),
-        Command::Sync(input) => run_sync(cli, input),
+        Command::Sync(input) => run_with_log_flush(cli, "sync", || run_sync(cli, input)),
         Command::Plan(command) => run_plan(cli, command),
         Command::Concat(input) => run_concat(cli, input),
         Command::Repair(command) => run_repair(cli, command),
-        Command::Evict(input) => run_evict(cli, input),
+        Command::Evict(input) => run_with_log_flush(cli, "evict", || run_evict(cli, input)),
         Command::Split(input) => run_split(cli, input),
         Command::Loop(input) => run_loop(cli, input),
         Command::RecoveryRequest(input) => run_recovery_request(cli, input),
@@ -605,8 +613,73 @@ fn emit_context_error(
     })
 }
 
+/// Run the queue operation first, then detach best-effort telemetry publication.
+/// Spawn/config failures are deliberately discarded: this sidecar can never
+/// alter, delay, or roll back the already-completed queue result.
+fn run_with_log_flush(
+    cli: &Cli,
+    operation: &str,
+    execute: impl FnOnce() -> Result<(), i32>,
+) -> Result<(), i32> {
+    let result = execute();
+    if result.is_ok()
+        && load_context(cli).ok().is_some_and(|context| {
+            context
+                .config
+                .log
+                .flush
+                .as_ref()
+                .is_some_and(|flush| flush.after.iter().any(|configured| configured == operation))
+        })
+    {
+        if let Ok(executable) = std::env::current_exe() {
+            let mut command = std::process::Command::new(executable);
+            if let Some(repository) = &cli.repo {
+                command.arg("--repository").arg(repository);
+            }
+            if let Some(config) = &cli.config {
+                command.arg("--config").arg(config);
+            }
+            let _ = command
+                .args(["log", "flush"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+        }
+    }
+    result
+}
+
 fn run_log(cli: &Cli, command: &LogCommand) -> Result<(), i32> {
     let context = load_context(cli)?;
+    if let Some(LogSubcommand::Flush(input)) = &command.command {
+        let result = caravan::telemetry::flush(&context, input);
+        if cli.json {
+            return emit_result(true, result);
+        }
+        return match result {
+            Ok(output) => {
+                if output.published {
+                    println!(
+                        "published {} record(s) for {} to {} at {}",
+                        output.records_added,
+                        output.actor,
+                        output.branch,
+                        output.head_after.as_deref().unwrap_or("unknown")
+                    );
+                } else {
+                    println!(
+                        "log flush skipped for {}: {}",
+                        output.actor,
+                        output.skipped_reason.as_deref().unwrap_or("no changes")
+                    );
+                }
+                Ok(())
+            }
+            Err(error) => emit_human_error(error),
+        };
+    }
     if !command.follow {
         let result = caravan::journal::snapshot(&context, &command.input);
         if cli.json {
@@ -2119,6 +2192,9 @@ fn run_sync(cli: &Cli, input: &SyncInput) -> Result<(), i32> {
             caravan::sync::sync(&context, input)
         })
     };
+    if let Ok(output) = &result {
+        caravan::telemetry::append_sync_sample(&context, output);
+    }
     if cli.json {
         return emit_sync_json_result(result, sync_summary);
     }

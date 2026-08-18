@@ -19,6 +19,7 @@
       <span id="connection" class="connection" role="status">Connecting</span>
       <button id="plan-sync" class="button" type="button" data-mutates="false" hidden>Plan sync</button>
       <button id="sync-all" class="button button-primary" type="button" hidden>Sync all</button>
+      <button id="toggle-telemetry" class="sidebar-toggle" type="button" aria-controls="telemetry" aria-expanded="false" hidden title="Toggle queue telemetry">▥ <span>Metrics</span></button>
       <button id="show-evidence" class="sidebar-toggle" type="button" aria-controls="evidence-sidebar" aria-expanded="false" hidden>Evidence</button>
       <button id="show-config" class="button" type="button" hidden>Config</button>
       <button id="refresh-all" class="button" type="button">Refresh</button>
@@ -35,6 +36,10 @@
     <section class="content">
       <div id="dashboard" class="dashboard" hidden>
         <section id="repo-overview" class="overview-grid" aria-labelledby="repo-title"></section>
+        <section id="telemetry" class="section-block telemetry-section" aria-labelledby="telemetry-title" hidden>
+          <div class="section-heading"><div><p class="eyebrow">Durable history</p><h2 id="telemetry-title">Queue telemetry</h2></div></div>
+          <div id="telemetry-content" class="telemetry-grid"></div>
+        </section>
 
         <div class="dashboard-scroll" tabindex="0" aria-label="Active topology and Saloon">
         <section class="section-block caravan-section" aria-labelledby="caravans-title">

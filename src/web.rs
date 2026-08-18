@@ -240,6 +240,9 @@ pub struct WebRepositorySnapshot {
     /// Bounded durable Cara event/hook journal snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub journal: Option<crate::journal::LogOutput>,
+    /// Raw state-branch telemetry aggregated for dashboard presentation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<crate::telemetry::TelemetrySummary>,
     /// Bounded in-memory action jobs, newest last.
     #[serde(default)]
     pub actions: Vec<WebActionJob>,
@@ -1216,6 +1219,7 @@ fn load_repositories_with_tenancy(
                     hosted_tenancy: None,
                     last_action: None,
                     journal: None,
+                    telemetry: None,
                     actions: Vec::new(),
                 }),
                 refresh_lock: Mutex::new(()),
@@ -1811,6 +1815,9 @@ fn refresh_repository_locked(repository: &RepositoryEntry) {
         },
     )
     .map(bound_web_journal);
+    // State-branch telemetry is an optional read-only projection. A transient
+    // fetch/read failure never replaces the queue snapshot or its health.
+    let telemetry = crate::telemetry::summary(&repository.context).ok();
     let mut snapshot = repository
         .snapshot
         .lock()
@@ -1821,6 +1828,7 @@ fn refresh_repository_locked(repository: &RepositoryEntry) {
     if let Ok(journal) = journal {
         snapshot.journal = Some(journal);
     }
+    snapshot.telemetry = telemetry;
     match result {
         Ok(status) => {
             let (candidate_compatibility, truncated) =
@@ -2925,6 +2933,7 @@ mod tests {
                 hosted_tenancy: None,
                 last_action: None,
                 journal: None,
+                telemetry: None,
                 actions: Vec::new(),
             }),
             refresh_lock: Mutex::new(()),

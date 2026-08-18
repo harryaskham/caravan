@@ -5,6 +5,9 @@
     tabs: document.querySelector("#repo-tabs"),
     dashboard: document.querySelector("#dashboard"),
     overview: document.querySelector("#repo-overview"),
+    telemetry: document.querySelector("#telemetry"),
+    telemetryContent: document.querySelector("#telemetry-content"),
+    toggleTelemetry: document.querySelector("#toggle-telemetry"),
     caravans: document.querySelector("#caravans"),
     concatControl: document.querySelector("#concat-control"),
     concatSource: document.querySelector("#concat-source"),
@@ -45,6 +48,7 @@
   let selectedRepo = null;
   let requestInFlight = false;
   let inspectorMode = null;
+  let telemetryVisible = window.localStorage.getItem("caravan.telemetry.visible") === "true";
   const concatPlans = new Map();
   const sidebarState = {
     repositories: window.localStorage.getItem("caravan.sidebar.repositories") !== "collapsed",
@@ -238,6 +242,35 @@
       <article class="overview-card"><span class="metric-label">Caravans</span><strong class="metric">${activeCaravans.length}</strong><p>${parkedCaravans.length} parked · ${activeMembers.size} PRs</p></article>
       <article class="overview-card"><span class="metric-label">Saloon</span><strong class="metric">${saloon.length}</strong><p>not yet joined</p></article>
       <article class="overview-card"><span class="metric-label">Attention</span><strong class="metric">${problems.length + (repo.error ? 1 : 0)}</strong><p>${state.read_only ? "read only" : "mutable"}</p></article>`;
+  }
+
+  function renderTelemetry(repo) {
+    const telemetry = repo.telemetry;
+    ui.toggleTelemetry.hidden = !telemetry;
+    ui.toggleTelemetry.setAttribute("aria-expanded", String(telemetryVisible));
+    ui.telemetry.hidden = !telemetryVisible || !telemetry;
+    if (!telemetry) return;
+    if (!telemetry.available) {
+      ui.telemetryContent.innerHTML = `<div class="empty-state"><p>No telemetry branch has been published yet.</p></div>`;
+      return;
+    }
+    const cancelledShare = telemetry.actions_runs
+      ? Math.round((telemetry.actions_cancelled / telemetry.actions_runs) * 100)
+      : 0;
+    const refusals = Object.entries(telemetry.admission_refusals ?? {})
+      .sort((left, right) => right[1] - left[1])
+      .slice(0, 5)
+      .map(([code, count]) => `${escapeHtml(code)} (${count})`).join(" · ") || "None recorded";
+    const queueMinutes = Math.round(telemetry.median_queue_ms / 60000);
+    const syncAverage = telemetry.sync_samples ? Math.round(telemetry.sync_total_ms / telemetry.sync_samples) : 0;
+    ui.telemetryContent.innerHTML = `
+      <article class="overview-card"><span class="metric-label">Raw records</span><strong class="metric">${telemetry.records}</strong><p>${telemetry.actors} actor files</p></article>
+      <article class="overview-card"><span class="metric-label">Caravan size</span><strong class="metric">${telemetry.median_caravan_members}</strong><p>median · max ${telemetry.max_caravan_members}</p></article>
+      <article class="overview-card"><span class="metric-label">Queue time</span><strong class="metric">${queueMinutes}m</strong><p>median across ${telemetry.completed_queue_prs} merged PRs</p></article>
+      <article class="overview-card"><span class="metric-label">Actions</span><strong class="metric">${telemetry.actions_runs}</strong><p>${cancelledShare}% cancelled · ${Math.round(telemetry.actions_wall_ms / 60000)} wall-min</p></article>
+      <article class="overview-card"><span class="metric-label">Sync / provider</span><strong class="metric">${syncAverage}ms</strong><p>${telemetry.provider_calls} calls · rate floor ${telemetry.min_rate_limit_remaining ?? "unknown"}</p></article>
+      <article class="overview-card"><span class="metric-label">Lifecycle</span><strong class="metric">${telemetry.evictions}</strong><p>evictions · ${telemetry.parks} parks · ${telemetry.unparks} unparks</p></article>
+      <article class="overview-card telemetry-wide"><span class="metric-label">Admission refusals</span><p>${refusals}</p></article>`;
   }
 
   function actionButton(label, action, input, tone = "", mutates = true, auditRequired = false) {
@@ -570,6 +603,7 @@
     ui.config.hidden = false;
     renderTabs();
     renderOverview(repo);
+    renderTelemetry(repo);
     renderCaravans(repo);
     renderConcatControl(repo, actionBusy);
     renderSaloon(repo);
@@ -749,6 +783,11 @@
       group.open ? "open" : "closed",
     );
   }, true);
+  ui.toggleTelemetry.addEventListener("click", () => {
+    telemetryVisible = !telemetryVisible;
+    window.localStorage.setItem("caravan.telemetry.visible", String(telemetryVisible));
+    renderTelemetry(selected());
+  });
   ui.dashboard.addEventListener("click", (event) => {
     const button = event.target.closest("[data-web-action]");
     if (!button) return;

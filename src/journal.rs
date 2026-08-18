@@ -204,6 +204,23 @@ pub fn append_delivery(
     )
 }
 
+/// Read every locally retained record for durable state-branch publication.
+/// This is intentionally separate from the bounded operator query surface.
+pub(crate) fn records_for_flush(context: &AppContext) -> Result<Vec<JournalRecord>, AppError> {
+    let paths = paths(
+        &context.repository_path,
+        context.config.command_timeout_secs,
+    )?;
+    fs::create_dir_all(&paths.directory)
+        .map_err(|error| io_error("journal_directory_failed", &error))?;
+    let lock = open_lock(&paths.lock)?;
+    FileExt::lock_shared(&lock).map_err(|error| io_error("journal_lock_failed", &error))?;
+    let result =
+        read_all_locked(&paths, context.config.journal.max_archives).map(|(records, _)| records);
+    let _ = FileExt::unlock(&lock);
+    result
+}
+
 /// Read a bounded snapshot. A torn final JSONL record is safely ignored.
 pub fn snapshot(context: &AppContext, input: &LogInput) -> Result<LogOutput, AppError> {
     validate_input(input)?;
