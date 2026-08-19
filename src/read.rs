@@ -344,6 +344,17 @@ fn validate_native_stack_entries(
             *consistency = StackConsistency::Drifted;
             continue;
         };
+        // A leading merged provider row is retained historical topology, not
+        // part of the active rewrite suffix. Whether hot discovery happened to
+        // include that closed PR must not change the verdict: preserve it and
+        // begin exact head/base validation at the first open row.
+        let retained_merged_prefix = previous_open_head.is_none()
+            && entry.state.eq_ignore_ascii_case("closed")
+            && entry.merged_at.is_some()
+            && pull.is_merged();
+        if retained_merged_prefix {
+            continue;
+        }
         if pull.head.oid != entry.head.sha || pull.head.name != entry.head.ref_name {
             problems.push(StackBackendProblem {
                 code: "github_stack_head_drift".to_owned(),
@@ -7924,6 +7935,67 @@ mod tests {
             StackConsistency::Exact
         );
         assert!(backend.problems.is_empty());
+    }
+
+    #[test]
+    fn discovered_merged_prefix_is_historical_not_active_base_or_head_drift() {
+        let mut predecessor = pr(1, "root", "obsolete-base", true);
+        predecessor.state = crate::model::PullRequestState::Merged;
+        predecessor.merged_at = Some("2026-08-09T09:00:00Z".to_owned());
+        let current = pr(2, "child", "main", true);
+        let status = status(current.clone(), vec![predecessor.clone(), current.clone()]);
+        let provider = FixedStackProvider(Ok(crate::github::GitHubStackInventory {
+            truncated: false,
+            stacks: vec![crate::github::GitHubStackSnapshot {
+                id: 9001,
+                number: 42,
+                node_id: "S_retained".to_owned(),
+                base: crate::github::GitHubStackBase {
+                    ref_name: "main".to_owned(),
+                },
+                open: true,
+                created_at: "2026-08-09T08:00:00Z".to_owned(),
+                pull_requests: vec![
+                    crate::github::GitHubStackPullRequest {
+                        number: 1,
+                        state: "closed".to_owned(),
+                        draft: false,
+                        merged_at: predecessor.merged_at.clone(),
+                        head: crate::github::GitHubStackPullRequestHead {
+                            ref_name: predecessor.head.name.clone(),
+                            // Historical provider identity is retained even if
+                            // hot closed-PR discovery reports another head.
+                            sha: crate::model::CommitOid(
+                                "9999999999999999999999999999999999999999".to_owned(),
+                            ),
+                        },
+                    },
+                    crate::github::GitHubStackPullRequest {
+                        number: 2,
+                        state: "open".to_owned(),
+                        draft: false,
+                        merged_at: None,
+                        head: crate::github::GitHubStackPullRequestHead {
+                            ref_name: current.head.name.clone(),
+                            sha: current.head.oid.clone(),
+                        },
+                    },
+                ],
+            }],
+        }));
+        let backend = stack_backend_status(
+            crate::config::StackType::Github,
+            &provider,
+            &status.repository,
+            &status.analysis,
+        );
+        assert_eq!(backend.native_stacks[0].caravan_id, Some(PrNumber(2)));
+        assert!(!backend.native_stacks[0].problems.iter().any(|problem| {
+            matches!(
+                problem.code.as_str(),
+                "github_stack_head_drift" | "github_stack_pr_base_drift"
+            )
+        }));
     }
 
     #[test]

@@ -90,6 +90,21 @@ pub struct GitHubStackUnstackPlan {
     pub desired_after: Option<GitHubStackTopology>,
 }
 
+/// Exact raw-snapshot clearance used only when fresh PR truth proves that the
+/// provider Stack representation itself drifted. Unlike ordinary unstack this
+/// deliberately leases the Stack resource's own immutable rows, not current PR
+/// heads, so a stale representation can be removed without weakening ordinary
+/// mutation checks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GitHubStackDriftClearReceipt {
+    pub schema_version: u32,
+    pub operation_id: String,
+    pub actor: String,
+    pub before: GitHubStackSnapshot,
+    pub cleared: bool,
+    pub recovered_after_ambiguous_response: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GitHubStackMutationOperation {
@@ -547,6 +562,58 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
     /// Unstack one exact generation. This operation is resumable, not atomic
     /// with any later Cara reshape; its receipt says only what this REST call
     /// proved.
+    pub fn native_stack_clear_drifted(
+        &self,
+        repository: &RepositoryId,
+        operation_id: &str,
+        actor: &str,
+        expected: &GitHubStackSnapshot,
+    ) -> Result<GitHubStackDriftClearReceipt, GitHubStackMutationError> {
+        validate_operation_identity(operation_id, actor)?;
+        let actual = self.read_native_stack_snapshot(repository, expected.number)?;
+        if actual.as_ref() != Some(expected) {
+            return Err(GitHubStackMutationError::InconsistentProviderState {
+                diagnostic: format!(
+                    "drift-clear Stack #{} raw generation changed before mutation",
+                    expected.number
+                ),
+            });
+        }
+        let command = native_stack_unstack_command(repository, expected.number);
+        let response = self.runner.run(&command);
+        let after = self.read_native_stack_snapshot(repository, expected.number)?;
+        if after.is_none() {
+            return Ok(GitHubStackDriftClearReceipt {
+                schema_version: STACK_SCHEMA_VERSION,
+                operation_id: operation_id.to_owned(),
+                actor: actor.to_owned(),
+                before: expected.clone(),
+                cleared: true,
+                recovered_after_ambiguous_response: match response.as_ref() {
+                    Ok(output) => !output.is_success(),
+                    Err(_) => true,
+                },
+            });
+        }
+        match response {
+            Ok(output) => Err(GitHubStackMutationError::InconsistentProviderState {
+                diagnostic: format!(
+                    "drift-clear Stack #{} remained after provider response {}",
+                    expected.number,
+                    output
+                        .code
+                        .map_or_else(|| "signal".to_owned(), |code| code.to_string())
+                ),
+            }),
+            Err(error) => Err(GitHubStackMutationError::InconsistentProviderState {
+                diagnostic: format!(
+                    "drift-clear Stack #{} request failed and representation remained: {error}",
+                    expected.number
+                ),
+            }),
+        }
+    }
+
     pub fn native_stack_unstack(
         &self,
         repository: &RepositoryId,
@@ -2491,6 +2558,34 @@ mod tests {
             error,
             GitHubStackMutationError::InvalidPlan { .. }
         ));
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn drift_clear_leases_raw_stack_rows_without_requiring_current_pr_heads() {
+        let snapshot = stack_snapshot(&topology(2));
+        let calls = vec![
+            (
+                native_stack_read_command(&repository(), 42),
+                CommandOutput::success(serde_json::to_string(&snapshot).unwrap()),
+            ),
+            (
+                native_stack_unstack_command(&repository(), 42),
+                CommandOutput::success("{}"),
+            ),
+            (
+                native_stack_read_command(&repository(), 42),
+                CommandOutput::failure(1, "gh: Not Found (HTTP 404)"),
+            ),
+            inventory_call(&[]),
+        ];
+        let adapter = GitHubMutationAdapter::new(FakeRunner::new(calls));
+        let receipt = adapter
+            .native_stack_clear_drifted(&repository(), "op-drift-clear", "cara", &snapshot)
+            .unwrap();
+        assert!(receipt.cleared);
+        assert!(!receipt.recovered_after_ambiguous_response);
+        assert_eq!(receipt.before, snapshot);
         adapter.runner.assert_exhausted();
     }
 
