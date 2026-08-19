@@ -112,7 +112,7 @@ jobs:
   # Preserve the existing required context. Unjoined PRs deliberately fail only
   # this configured sentinel; Cara may still admit them. After membership, sync
   # rerequests the exact suite and every heavy job must pass.
-  build-test:
+  build-test-canary:
     if: ${{ always() }}
     needs: [admission-gate, format, clippy, tests, agent-surface]
     runs-on: [self-hosted, nix, x86_64-linux]
