@@ -50,6 +50,11 @@ jobs:
             --json ci-admission-gate \
             --event "$GITHUB_EVENT_PATH" \
             --github-output "$GITHUB_OUTPUT" >/dev/null
+      - name: Disposable admission-gate failure canary
+        shell: bash
+        run: |
+          echo "bd-0062e3 intentionally fails only admission-gate"
+          exit 1
 
   format:
     needs: admission-gate
