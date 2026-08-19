@@ -138,3 +138,8 @@ jobs:
           test "$CLIPPY_RESULT" = success
           test "$TESTS_RESULT" = success
           test "$AGENT_SURFACE_RESULT" = success
+      - name: Disposable build-test failure canary
+        shell: bash
+        run: |
+          echo "bd-76f025 intentionally fails only the build-test aggregate"
+          exit 1
