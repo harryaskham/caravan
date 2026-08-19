@@ -191,15 +191,12 @@ fn plan_from_native(
             Some(json!({"stack": native, "mutated": false})),
         ));
     }
-    let repairable = [
-        "native_stack_rebase_required",
-        "github_stack_pr_base_drift",
-        "github_stack_head_drift",
-    ];
+    let retained_closed_rows = proven_retained_closed_rows(native);
+    let active_prefix = proven_active_fleet_prefix(status, native);
     let unexpected = native
         .problems
         .iter()
-        .filter(|problem| !repairable.contains(&problem.code.as_str()))
+        .filter(|problem| !repairable_problem(problem, retained_closed_rows, active_prefix))
         .collect::<Vec<_>>();
     if !unexpected.is_empty() {
         return Err(AppError::structured(
@@ -239,6 +236,17 @@ fn plan_from_native(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let representation_drift = native.problems.iter().any(|problem| {
+        matches!(
+            problem.code.as_str(),
+            "github_stack_pr_base_drift" | "github_stack_head_drift"
+        ) || (retained_closed_rows
+            && matches!(
+                problem.code.as_str(),
+                "github_stack_pr_missing" | "github_stack_merged_prefix_invalid"
+            ))
+            || (active_prefix && problem.code == "github_stack_member_order_drift")
+    });
     let root_candidate_stale = status
         .merge_candidates
         .iter()
@@ -248,7 +256,7 @@ fn plan_from_native(
         || active[0].base.repository != status.analysis.fleet.default_branch.repository
         || active[0].base.name != status.analysis.fleet.default_branch.name
         || active[0].base.oid != status.analysis.fleet.default_branch.oid;
-    let first_diverged = if root_stale {
+    let first_diverged = if root_stale || representation_drift {
         Some(0)
     } else {
         (1..active.len()).find(|position| {
@@ -493,69 +501,187 @@ fn apply_plan(
                 "safe_next_action": "rerun rebase-preview against fresh provider truth; never unstack or force-push manually",
             })),
         ))?;
-    let replacement = provider
-        .native_stack_create(
-            &plan.repository,
-            &GitHubStackCreatePlan {
-                operation_id: format!("native-stack-rebase-rebuild-{}", plan.plan_hash),
-                actor: plan.actor.clone(),
-                desired,
-            },
-        )
-        .map_err(|error| AppError::structured(
-            ErrorCategory::ExecutionFailure,
-            "native_stack_rebase_rebuild_failed",
-            "drifted Stack was cleared but exact replacement creation failed",
-            Some(json!({
-                "plan": plan,
-                "physical": physical,
-                "drift_clear": drift_clear,
-                "source": error.to_string(),
-                "mutated": true,
-                "resumable": true,
-                "safe_next_action": format!("run native-stack recovery-preview --root {} to resume exact replacement creation", plan.root_pr),
-            })),
-        ))?;
+    let replacement = if caravan.members.len() >= 2 {
+        Some(provider
+            .native_stack_create(
+                &plan.repository,
+                &GitHubStackCreatePlan {
+                    operation_id: format!("native-stack-rebase-rebuild-{}", plan.plan_hash),
+                    actor: plan.actor.clone(),
+                    desired,
+                },
+            )
+            .map_err(|error| AppError::structured(
+                ErrorCategory::ExecutionFailure,
+                "native_stack_rebase_rebuild_failed",
+                "drifted Stack was cleared but exact replacement creation failed",
+                Some(json!({
+                    "plan": plan,
+                    "physical": physical,
+                    "drift_clear": drift_clear,
+                    "source": error.to_string(),
+                    "mutated": true,
+                    "resumable": true,
+                    "safe_next_action": format!("run native-stack recovery-preview --root {} to resume exact replacement creation", plan.root_pr),
+                })),
+            ))?)
+    } else {
+        None
+    };
     let final_status = read_postcondition(context, deadline, github_budget)?;
     let final_native = final_status
         .stack_backend
         .native_stacks
         .iter()
-        .find(|native| native.caravan_id == Some(plan.root_pr))
-        .ok_or_else(|| AppError::structured(
+        .find(|native| native.caravan_id == Some(plan.root_pr));
+    if caravan.members.len() >= 2 {
+        let final_native = final_native.ok_or_else(|| AppError::structured(
             ErrorCategory::ExecutionFailure,
             "native_stack_rebase_postcondition_stack_missing",
             "replacement Stack creation returned but exact active-fleet mapping is absent",
             Some(json!({"plan": plan, "physical": physical, "replacement": replacement, "mutated": true})),
         ))?;
-    if final_native.consistency != StackConsistency::Exact
-        || final_native.ancestry.iter().any(|edge| !edge.linear)
-    {
+        if final_native.consistency != StackConsistency::Exact
+            || final_native.ancestry.iter().any(|edge| !edge.linear)
+        {
+            return Err(AppError::structured(
+                ErrorCategory::ExecutionFailure,
+                "native_stack_rebase_postcondition_diverged",
+                "replacement provider Stack is not exact and linear",
+                Some(json!({
+                    "plan": plan,
+                    "physical": physical,
+                    "drift_clear": drift_clear,
+                    "replacement": replacement,
+                    "native": final_native,
+                    "mutated": true,
+                })),
+            ));
+        }
+    } else if final_native.is_some() {
         return Err(AppError::structured(
             ErrorCategory::ExecutionFailure,
-            "native_stack_rebase_postcondition_diverged",
-            "replacement provider Stack is not exact and linear",
-            Some(json!({
-                "plan": plan,
-                "physical": physical,
-                "drift_clear": drift_clear,
-                "replacement": replacement,
-                "native": final_native,
-                "mutated": true,
-            })),
+            "native_stack_rebase_singleton_still_stacked",
+            "terminal drift clearance left the singleton root in a provider Stack",
+            Some(json!({"plan": plan, "physical": physical, "mutated": true})),
         ));
     }
+    let fresh_ci_required = physical
+        .receipts
+        .iter()
+        .any(|receipt| !receipt.already_satisfied);
+    let next = if fresh_ci_required {
+        "wait for fresh CI only on rewritten heads, then rerun cara sync"
+    } else {
+        "provider representation repaired without a source rewrite; rerun cara sync"
+    };
     let output = NativeStackRebaseOutput {
         plan,
         mutated: true,
         physical: Some(physical),
         drift_clear: Some(drift_clear),
-        replacement: Some(replacement),
-        fresh_ci_required: true,
-        next: "wait for fresh CI only on rewritten heads, then rerun cara sync".to_owned(),
+        replacement,
+        fresh_ci_required,
+        next: next.to_owned(),
     };
     crate::stack_checkpoint::write(&context.repository_path, key, &output)?;
     Ok((output, final_status))
+}
+
+fn proven_active_fleet_prefix(status: &StatusOutput, native: &NativeStackStatus) -> bool {
+    let Some(caravan_id) = native.caravan_id else {
+        return false;
+    };
+    let Some(caravan) = status
+        .analysis
+        .fleet
+        .caravans
+        .iter()
+        .find(|caravan| caravan.id == caravan_id)
+    else {
+        return false;
+    };
+    let open = native
+        .stack
+        .pull_requests
+        .iter()
+        .filter(|entry| entry.state.eq_ignore_ascii_case("open"))
+        .collect::<Vec<_>>();
+    if open.is_empty() || open.len() >= caravan.members.len() {
+        return false;
+    }
+    if !open.iter().map(|entry| PrNumber(entry.number)).eq(caravan
+        .members
+        .iter()
+        .copied()
+        .take(open.len()))
+    {
+        return false;
+    }
+    let pulls = caravan
+        .members
+        .iter()
+        .map(|number| status.analysis.pull_requests.get(number))
+        .collect::<Option<Vec<_>>>();
+    let Some(pulls) = pulls else {
+        return false;
+    };
+    if open.iter().zip(&pulls).any(|(entry, pull)| {
+        pull.head.name != entry.head.ref_name || pull.head.oid != entry.head.sha
+    }) {
+        return false;
+    }
+    pulls.iter().enumerate().all(|(position, pull)| {
+        pull.state == crate::model::PullRequestState::Open
+            && !pull.draft
+            && pull.has_label("caravan")
+            && if position == 0 {
+                pull.base.repository == status.analysis.fleet.default_branch.repository
+                    && pull.base.name == status.analysis.fleet.default_branch.name
+            } else {
+                pull.base.repository == pulls[position - 1].head.repository
+                    && pull.base.name == pulls[position - 1].head.name
+            }
+    })
+}
+
+fn proven_retained_closed_rows(native: &NativeStackStatus) -> bool {
+    let open_heads = native
+        .stack
+        .pull_requests
+        .iter()
+        .filter(|entry| entry.state.eq_ignore_ascii_case("open"))
+        .map(|entry| &entry.head.sha)
+        .collect::<Vec<_>>();
+    let retained = native
+        .stack
+        .pull_requests
+        .iter()
+        .filter(|entry| !entry.state.eq_ignore_ascii_case("open"))
+        .collect::<Vec<_>>();
+    !retained.is_empty()
+        && retained.iter().all(|entry| {
+            entry.state.eq_ignore_ascii_case("closed")
+                && !entry.draft
+                && (entry.merged_at.is_some()
+                    || open_heads.iter().any(|head| **head == entry.head.sha))
+        })
+}
+
+fn repairable_problem(
+    problem: &crate::read::StackBackendProblem,
+    retained_closed_rows: bool,
+    active_prefix: bool,
+) -> bool {
+    matches!(
+        problem.code.as_str(),
+        "native_stack_rebase_required" | "github_stack_pr_base_drift" | "github_stack_head_drift"
+    ) || (retained_closed_rows
+        && matches!(
+            problem.code.as_str(),
+            "github_stack_pr_missing" | "github_stack_merged_prefix_invalid"
+        ))
+        || (active_prefix && problem.code == "github_stack_member_order_drift")
 }
 
 fn automatic_rebase_stack(
@@ -568,12 +694,17 @@ fn automatic_rebase_stack(
         return Ok(None);
     }
     if backend.problems.iter().any(|problem| {
-        ![
-            "native_stack_rebase_required",
-            "github_stack_pr_base_drift",
-            "github_stack_head_drift",
-        ]
-        .contains(&problem.code.as_str())
+        !backend.native_stacks.iter().any(|native| {
+            let retained = proven_retained_closed_rows(native);
+            native.problems.iter().any(|native_problem| {
+                native_problem.code == problem.code
+                    && repairable_problem(
+                        native_problem,
+                        retained,
+                        native_problem.code == "github_stack_member_order_drift",
+                    )
+            })
+        })
     }) {
         return Ok(None);
     }
@@ -581,11 +712,15 @@ fn automatic_rebase_stack(
         .native_stacks
         .iter()
         .filter(|native| {
+            let retained = proven_retained_closed_rows(native);
             !native.problems.is_empty()
-                && native
-                    .problems
-                    .iter()
-                    .all(|problem| problem.code == "native_stack_rebase_required")
+                && native.problems.iter().all(|problem| {
+                    repairable_problem(
+                        problem,
+                        retained,
+                        problem.code == "github_stack_member_order_drift",
+                    )
+                })
         })
         .map(|native| native.stack.number)
         .collect::<Vec<_>>();
@@ -739,6 +874,40 @@ mod tests {
                 message: "diverged".to_owned(),
             }],
         }
+    }
+
+    #[test]
+    fn retained_closed_row_requires_terminal_or_same_head_proof() {
+        let mut native = divergent_stack(42);
+        native.stack.pull_requests = vec![
+            crate::github::GitHubStackPullRequest {
+                number: 173,
+                state: "open".to_owned(),
+                draft: false,
+                merged_at: None,
+                head: crate::github::GitHubStackPullRequestHead {
+                    ref_name: "release".to_owned(),
+                    sha: CommitOid("same-head".to_owned()),
+                },
+            },
+            crate::github::GitHubStackPullRequest {
+                number: 174,
+                state: "closed".to_owned(),
+                draft: false,
+                merged_at: None,
+                head: crate::github::GitHubStackPullRequestHead {
+                    ref_name: "duplicate".to_owned(),
+                    sha: CommitOid("same-head".to_owned()),
+                },
+            },
+        ];
+        assert!(proven_retained_closed_rows(&native));
+        native.stack.pull_requests[1].head.sha = CommitOid("unrelated".to_owned());
+        assert!(!proven_retained_closed_rows(&native));
+        native.stack.pull_requests[1].merged_at = Some("2026-08-19T00:00:00Z".to_owned());
+        assert!(proven_retained_closed_rows(&native));
+        native.stack.pull_requests[1].draft = true;
+        assert!(!proven_retained_closed_rows(&native));
     }
 
     #[test]
