@@ -1448,6 +1448,25 @@ fn healthy_chain() -> Vec<PullRequestSnapshot> {
 }
 
 #[test]
+fn closed_unmerged_head_collapsed_to_default_is_audited_without_mutation() {
+    let closed = pull_request(
+        40,
+        "main",
+        "main",
+        PullRequestState::Closed,
+        AutoMergeState::disabled(),
+    );
+    let status = status(vec![closed], None, &clean);
+
+    assert_eq!(
+        status.auto_admission.terminal_closed_at_default_pr_ids,
+        [PrNumber(40)]
+    );
+    assert!(status.analysis.fleet.caravans.is_empty());
+    assert!(status.admission.candidates.is_empty());
+}
+
+#[test]
 fn closed_unmerged_active_member_is_terminalized_outside_capacity() {
     let closed = pull_request(
         41,
@@ -1464,6 +1483,13 @@ fn closed_unmerged_active_member_is_terminalized_outside_capacity() {
     assert_eq!(
         status.auto_admission.terminal_closed_pr_ids,
         [closed.number]
+    );
+    assert!(
+        status
+            .auto_admission
+            .terminal_closed_at_default_pr_ids
+            .is_empty(),
+        "an intact closed source head is terminal history, not overwrite evidence"
     );
     let provider = FakeProvider::with_pull_requests(vec![closed.clone()]);
 

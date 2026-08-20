@@ -66,7 +66,11 @@ reports `max_caravans`, active/parked counts, `terminal_closed_prs` and its
 bounded deterministic PR IDs, `excess_active_caravans`, and
 `at_caravan_capacity`; plan and mutation refusals carry the same active counts.
 Closed-unmerged records are terminal provenance, not caravans, and never consume
-capacity. A candidate incompatible with every target, terminal-red on its exact current
+capacity. The read-only `terminal_closed_at_default_pr_ids` audit identifies
+closed-unmerged rows whose current provider head exactly equals the current
+default generation. That is destructive-cleanup evidence requiring owner
+investigation: Cara never closes PRs and never treats branch identity, Stack
+ancestry, or a landed parent as proof that an unmerged patch may be discarded. A candidate incompatible with every target, terminal-red on its exact current
 check generation, or missing protection-required run coverage is refused before
 membership, labelled `caravan-join-skipped`, and receives a durable
 generation-bound comment; later candidates and every already-enrolled caravan
