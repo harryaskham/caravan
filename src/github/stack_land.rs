@@ -21,7 +21,7 @@ use super::{
 use crate::command::CommandRunner;
 use crate::model::RepositoryId;
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 /// Ordered landing phase. The order is the safety property: a lock is never
 /// released before terminal proof, and terminal proof is never reached without
@@ -59,6 +59,13 @@ pub struct GitHubStackLandCheckpoint {
     pub terminal_status: Option<GitHubStackMergeStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lock_release: Option<GitHubStackBranchLockReceipt>,
+    /// Fresh post-release observations that have not yet proven complete
+    /// logical/provider convergence. Persisted across processes so eventual
+    /// consistency has one bounded retry budget rather than an endless loop.
+    #[serde(default)]
+    pub convergence_observations: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub convergence_last_problem: Option<String>,
     pub evidence_hash: String,
 }
 
@@ -97,6 +104,20 @@ impl GitHubStackLandCheckpoint {
             | GitHubStackLandPhase::Submitted
             | GitHubStackLandPhase::Terminal => self.branch_lock.as_ref(),
         }
+    }
+
+    /// Reseal after a provider test adapter advances durable phase evidence.
+    #[cfg(test)]
+    pub(crate) fn reseal(self) -> Self {
+        self.seal()
+    }
+
+    /// Record one fresh but incomplete post-release convergence observation.
+    pub(crate) fn observe_convergence_pending(&self, problem: impl Into<String>) -> Self {
+        let mut next = self.clone();
+        next.convergence_observations = next.convergence_observations.saturating_add(1);
+        next.convergence_last_problem = Some(problem.into());
+        next.seal()
     }
 }
 
@@ -161,6 +182,8 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
             merge: None,
             terminal_status: None,
             lock_release: None,
+            convergence_observations: 0,
+            convergence_last_problem: None,
             evidence_hash: String::new(),
         }
         .seal()
