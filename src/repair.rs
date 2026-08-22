@@ -3,8 +3,9 @@
 //! A repair session never mutates the caller's checkout. It checks out one
 //! exact provider head into a linked worktree below Git's common metadata,
 //! starts a non-committing merge against an exact target, and persists enough
-//! evidence to verify an agent-owned conflict resolution before a plain
-//! fast-forward push. The same clean workspace can then resume `sync --all`.
+//! evidence to verify an agent-owned conflict resolution and targeted validation
+//! before one exact force-with-lease publication. The same clean workspace can
+//! then resume `sync --all`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -62,6 +63,11 @@ pub struct RepairContinueInput {
     #[arg(long)]
     #[serde(default)]
     pub no_sync: bool,
+    /// Reviewed targeted validation command executed in the isolated workspace
+    /// before publication; repeat for a bounded ordered set.
+    #[arg(long = "validate", value_name = "COMMAND")]
+    #[serde(default)]
+    pub validation_commands: Vec<String>,
 }
 
 /// Apply reviewed semantic source changes to exact paths in one repair session.
@@ -320,6 +326,8 @@ pub struct RepairSession {
     pub agent_edit_authorization: Option<RepairAgentEditAuthorization>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_edit_receipt: Option<RepairAgentEditReceipt>,
+    #[serde(default)]
+    pub validation: Vec<RepairValidationReceipt>,
     pub created_unix_ms: u64,
     pub updated_unix_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -358,6 +366,8 @@ pub struct RepairStatusOutput {
     pub agent_edit_authorization: Option<RepairAgentEditAuthorization>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_edit_receipt: Option<RepairAgentEditReceipt>,
+    #[serde(default)]
+    pub validation: Vec<RepairValidationReceipt>,
     pub materialization_timeout_secs: u64,
     pub created_unix_ms: u64,
     pub updated_unix_ms: u64,
@@ -384,6 +394,14 @@ pub struct RepairStartOutput {
 
 /// Exact non-force publication proof.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepairValidationReceipt {
+    pub command_hash: String,
+    pub order: usize,
+    pub passed: bool,
+}
+
+/// Exact non-force publication proof.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RepairPublicationReceipt {
     pub pr: PrNumber,
     pub branch: String,
@@ -392,8 +410,12 @@ pub struct RepairPublicationReceipt {
     pub new_head: CommitOid,
     pub parents: Vec<CommitOid>,
     pub force: bool,
+    /// Exact reviewed old remote head used by `--force-with-lease`.
+    pub expected_remote_head: CommitOid,
     pub remote_verified: bool,
     pub fresh_ci_required: bool,
+    #[serde(default)]
+    pub validation: Vec<RepairValidationReceipt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_edit_receipt: Option<RepairAgentEditReceipt>,
 }
@@ -637,6 +659,7 @@ fn start_exact_with_writer_guard(
         semantic_grant_revocations: Vec::new(),
         agent_edit_authorization: None,
         agent_edit_receipt: None,
+        validation: Vec::new(),
         created_unix_ms: now,
         updated_unix_ms: now,
         published_head: None,
@@ -1757,7 +1780,58 @@ fn semantic_merge_result(
     })
 }
 
-/// Verify agent-owned conflict resolution, publish non-force, and resume sync.
+fn run_targeted_validation(
+    runner: &impl CommandRunner,
+    commands: &[String],
+) -> Result<Vec<RepairValidationReceipt>, AppError> {
+    if commands.len() > 16
+        || commands
+            .iter()
+            .any(|command| command.is_empty() || command.len() > 4096)
+    {
+        return Err(AppError::validation(
+            "repair_validation_commands_invalid",
+            "repair validation allows at most 16 non-empty commands of at most 4096 bytes",
+        ));
+    }
+    commands
+        .iter()
+        .enumerate()
+        .map(|(order, command)| {
+            let command_hash = crate::membership::fnv1a64(command.as_bytes());
+            let output = runner
+                .run(
+                    &CommandSpec::new("bash")
+                        .args(["-lc", command.as_str()])
+                        .env("GIT_TERMINAL_PROMPT", "0"),
+                )
+                .map_err(|error| {
+                    AppError::structured(
+                        ErrorCategory::ExecutionFailure,
+                        "repair_validation_execution_failed",
+                        "targeted repair validation could not be executed",
+                        Some(json!({"order": order, "command_hash": command_hash, "source": error.to_string(), "provider_mutated": false})),
+                    )
+                })?;
+            if !output.is_success() {
+                return Err(AppError::structured(
+                    ErrorCategory::Validation,
+                    "repair_validation_failed",
+                    "targeted repair validation failed; output is intentionally omitted from the durable receipt",
+                    Some(json!({"order": order, "command_hash": command_hash, "exit_code": output.code, "provider_mutated": false, "workspace_preserved": true})),
+                ));
+            }
+            Ok(RepairValidationReceipt {
+                command_hash,
+                order,
+                passed: true,
+            })
+        })
+        .collect()
+}
+
+/// Verify agent-owned conflict resolution, validate, publish under an exact
+/// force-with-lease, and resume sync.
 #[allow(clippy::too_many_lines)]
 pub fn continue_session(
     context: &AppContext,
@@ -1809,9 +1883,11 @@ pub fn continue_session(
                 target: repair.target.oid.clone(),
                 new_head,
                 parents: vec![repair.head.oid.clone(), repair.target.oid.clone()],
-                force: false,
+                force: true,
+                expected_remote_head: repair.head.oid.clone(),
                 remote_verified: true,
                 fresh_ci_required: true,
+                validation: repair.validation.clone(),
                 agent_edit_receipt: repair.agent_edit_receipt.clone(),
             });
         return resume_or_return(context, input, &paths, repair, publication);
@@ -1913,6 +1989,8 @@ pub fn continue_session(
         RepairState::Published => unreachable!("published state returned above"),
     };
 
+    let validation = run_targeted_validation(&runner, &input.validation_commands)?;
+
     // The prepared merge is valid only for the exact target generation too.
     // A moved default/predecessor must be rediscovered rather than publishing
     // a repair against stale ancestry.
@@ -1925,16 +2003,21 @@ pub fn continue_session(
                 "repair": repair_lock_receipt(&repair)?,
                 "remote_expected_head": &repair.head.oid,
                 "new_head": &new_head,
-                "force": false,
+                "force_with_lease": format!("refs/heads/{}:{}", repair.head.name, repair.head.oid),
             }),
             true,
         )?;
         let destination = format!("HEAD:refs/heads/{}", repair.head.name);
+        let lease = format!(
+            "--force-with-lease=refs/heads/{}:{}",
+            repair.head.name, repair.head.oid
+        );
         require_success(
             &runner,
             CommandSpec::new("git")
                 .args([
                     "push",
+                    lease.as_str(),
                     repair.provider_git_url.as_str(),
                     destination.as_str(),
                 ])
@@ -1963,6 +2046,7 @@ pub fn continue_session(
         oid: new_head.clone(),
     };
     verify_remote_head(&runner, &repair.provider_git_url, &published)?;
+    repair.validation.clone_from(&validation);
     let publication = RepairPublicationReceipt {
         pr: repair.pr,
         branch: repair.head.name.clone(),
@@ -1970,9 +2054,11 @@ pub fn continue_session(
         target: repair.target.oid.clone(),
         new_head: new_head.clone(),
         parents,
-        force: false,
+        force: true,
+        expected_remote_head: repair.head.oid.clone(),
         remote_verified: true,
         fresh_ci_required: true,
+        validation,
         agent_edit_receipt: repair.agent_edit_receipt.clone(),
     };
     repair.state = RepairState::Published;
@@ -2117,6 +2203,7 @@ fn repair_status_output(repair: &RepairSession) -> Result<RepairStatusOutput, Ap
         semantic_grant_revocations: repair.semantic_grant_revocations.clone(),
         agent_edit_authorization: repair.agent_edit_authorization.clone(),
         agent_edit_receipt: repair.agent_edit_receipt.clone(),
+        validation: repair.validation.clone(),
         materialization_timeout_secs: repair.materialization_timeout_secs,
         created_unix_ms: repair.created_unix_ms,
         updated_unix_ms: repair.updated_unix_ms,
@@ -3817,6 +3904,7 @@ mod tests {
                 session: output.repair.session.clone(),
                 actor: Some("other-agent".to_owned()),
                 no_sync: true,
+                validation_commands: Vec::new(),
             },
         )
         .unwrap_err();
@@ -3828,6 +3916,7 @@ mod tests {
                 session: output.repair.session,
                 actor: Some("caco-merger".to_owned()),
                 no_sync: true,
+                validation_commands: Vec::new(),
             },
         )
         .unwrap();
@@ -3874,6 +3963,7 @@ mod tests {
                 session: output.repair.session,
                 actor: Some("caco-merger".to_owned()),
                 no_sync: true,
+                validation_commands: Vec::new(),
             },
         )
         .unwrap_err();
@@ -3918,6 +4008,7 @@ mod tests {
                 session: output.repair.session,
                 actor: None,
                 no_sync: true,
+                validation_commands: Vec::new(),
             },
         )
         .unwrap();
@@ -3970,6 +4061,7 @@ mod tests {
                 session: output.repair.session,
                 actor: None,
                 no_sync: true,
+                validation_commands: Vec::new(),
             },
         )
         .unwrap_err();
@@ -4072,6 +4164,7 @@ mod tests {
                 session: input.session,
                 actor: None,
                 no_sync: true,
+                validation_commands: Vec::new(),
             },
         )
         .unwrap();
@@ -4317,6 +4410,7 @@ mod tests {
                 session: input.session,
                 actor: None,
                 no_sync: true,
+                validation_commands: Vec::new(),
             },
         )
         .unwrap_err();
@@ -4374,6 +4468,7 @@ mod tests {
                 session: output.repair.session,
                 actor: None,
                 no_sync: true,
+                validation_commands: Vec::new(),
             },
         )
         .unwrap_err();
@@ -4444,7 +4539,7 @@ mod tests {
     }
 
     #[test]
-    fn verified_resolution_has_exact_merge_parents_and_plain_pushes() {
+    fn verified_resolution_has_exact_merge_parents_and_exact_lease() {
         let fixture = fixture();
         let context = context(&fixture.clone);
         let output = start_exact(
@@ -4469,11 +4564,15 @@ mod tests {
                 session: output.repair.session,
                 actor: None,
                 no_sync: true,
+                validation_commands: vec!["test -f shared.txt".to_owned()],
             },
         )
         .unwrap();
         let receipt = result.publication.expect("publication receipt");
-        assert!(!receipt.force);
+        assert!(receipt.force);
+        assert_eq!(receipt.expected_remote_head, fixture.candidate.head.oid);
+        assert_eq!(receipt.validation.len(), 1);
+        assert!(receipt.validation[0].passed);
         assert!(receipt.remote_verified);
         assert_eq!(
             receipt.parents,

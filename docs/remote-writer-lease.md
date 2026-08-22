@@ -149,7 +149,7 @@ through temporary worktree preparation, barrier verification, and the marked
 force-with-lease push; reshape eviction uses the same path. Lease loss after
 preparation stops before push and preserves the remote head. Repair discovery,
 workspace materialization, semantic grant/revoke, continuation, and the marked
-non-force provider publication push now share their operation guard too. Repair
+exact old-head force-with-lease publication now shares the operation guard too. Repair
 sync derives a second workspace-local lock while sharing the parent's exact
 remote guard, so it performs no second broker acquire and releases remote only
 when the last owner drops. Checkpoints automatically bind the latest grant and
