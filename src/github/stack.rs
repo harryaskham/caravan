@@ -559,6 +559,30 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
         })
     }
 
+    /// Fresh raw Stack snapshot for receipt-bound recovery after a provider
+    /// generation race. Inventory completeness is required so absence is proof,
+    /// not a partial-view guess.
+    pub fn native_stack_snapshot_for_recovery(
+        &self,
+        repository: &RepositoryId,
+        stack_number: u64,
+    ) -> Result<Option<GitHubStackSnapshot>, GitHubStackMutationError> {
+        let inventory = self.exact_inventory(repository)?;
+        let mut matches = inventory
+            .stacks
+            .into_iter()
+            .filter(|stack| stack.number == stack_number);
+        let observed = matches.next();
+        if matches.next().is_some() {
+            return Err(GitHubStackMutationError::InconsistentProviderState {
+                diagnostic: format!(
+                    "Stack #{stack_number} appears more than once in complete provider inventory"
+                ),
+            });
+        }
+        Ok(observed)
+    }
+
     /// Unstack one exact generation. This operation is resumable, not atomic
     /// with any later Cara reshape; its receipt says only what this REST call
     /// proved.
