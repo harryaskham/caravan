@@ -384,6 +384,7 @@ mod tests {
                 root_auto_merge: Vec::new(),
                 root_promotion: Vec::new(),
                 root_merge: Vec::new(),
+                ci_generation_dispatches: Vec::new(),
                 native_stack_land: Vec::new(),
                 native_membership_recovery: Vec::new(),
                 native_append_membership_recovery: Vec::new(),

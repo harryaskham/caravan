@@ -1461,6 +1461,57 @@ fn healthy_chain() -> Vec<PullRequestSnapshot> {
 }
 
 #[test]
+fn queue_owned_base_change_dispatches_ci_for_exact_tuple_once() {
+    let pull = caravan_member(40, "feature", "main");
+    let status = caravan_status(vec![pull.clone()], Some(PrNumber(40)), true);
+    let provider = FakeProvider::with_pull_requests(vec![pull.clone()]);
+    provider.serve_lineage(
+        PrNumber(40),
+        HeadRunLineage {
+            head_sha: pull.head.oid.0.clone(),
+            check_suites: vec![crate::required_runs::CheckSuiteLineage {
+                id: 4040,
+                head_sha: pull.head.oid.0.clone(),
+                status: "completed".to_owned(),
+                conclusion: "success".to_owned(),
+                app_slug: "github-actions".to_owned(),
+                rerequestable: true,
+            }],
+            workflow_runs: Vec::new(),
+            head_committed_at: Some(PUBLISHED_AT.to_owned()),
+            complete: true,
+        },
+    );
+    provider.allow_rerequest(4040, &pull.head.oid.0);
+    let mut progress = SyncProgress::new(&status, vec![PrNumber(40)], 10);
+    progress.steps.push(MutationStep {
+        kind: MutationKind::SetBase,
+        state: MutationStepState::Completed,
+        pr: Some(PrNumber(40)),
+        summary: "promoted root".to_owned(),
+    });
+
+    dispatch_exact_ci_after_queue_mutations(&provider, &mut progress, &status).unwrap();
+    dispatch_exact_ci_after_queue_mutations(&provider, &mut progress, &status).unwrap();
+
+    assert_eq!(progress.ci_generation_dispatches.len(), 1);
+    let dispatch = &progress.ci_generation_dispatches[0];
+    assert_eq!(dispatch.pr, PrNumber(40));
+    assert_eq!(dispatch.head_oid, pull.head.oid);
+    assert_eq!(dispatch.base_oid, pull.base.oid);
+    assert_eq!(dispatch.caravan_members, [PrNumber(40)]);
+    assert_eq!(dispatch.check_suite_id, 4040);
+    assert_eq!(
+        progress
+            .provider_receipts
+            .iter()
+            .filter(|receipt| receipt.kind == MutationKind::RequestCheckSuite)
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn closed_unmerged_head_collapsed_to_default_is_audited_without_mutation() {
     let closed = pull_request(
         40,
