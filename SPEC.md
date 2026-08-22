@@ -87,6 +87,16 @@ they neither become permanent source failures nor satisfy readiness after
 admission. A stale head/base/membership aggregate never authorizes a merge, and
 operators must not amend or force-push solely to manufacture a run.
 
+Provider request budget is reserved for current queue work. Open orphan native
+Stacks remain visible as orphan inventory but do not spend pairwise ancestry
+comparison calls until they map to a live logical caravan; status reports
+`orphan_ancestry_reads_skipped`. A foreign `caravan-join-skipped` label with no
+Cara receipt is cursor-bound to repository, PR, head, provider `updated_at`, and
+config fingerprint. An unchanged row reuses its durable cursor without another
+comments read; any relevant provider/config generation change invalidates the
+cursor and restores full receipt validation. Admission output reports
+`skip_cursor_hits` and `skip_cursor_writes` alongside total request allocation.
+
 A candidate incompatible with every target, terminal-red on its exact current
 check generation, or missing protection-required run coverage is refused before
 membership, labelled `caravan-join-skipped`, and receives a durable

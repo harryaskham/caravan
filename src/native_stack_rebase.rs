@@ -958,6 +958,7 @@ mod tests {
             mutation_support: crate::read::StackMutationSupport::NativeStack,
             native_stacks: stacks,
             provider_stacks_truncated: false,
+            orphan_ancestry_reads_skipped: 0,
             missing_caravans: Vec::new(),
             problems: vec![crate::read::StackBackendProblem {
                 code: "native_stack_rebase_required".to_owned(),
