@@ -520,7 +520,7 @@ actor and records complete path/staged-index/diff fingerprints. Secret-like,
 symlink/gitlink, unstaged/untracked, out-of-scope, and drifted edits fail closed.
 `repair revoke-grant` restores recorded pre-grant blobs. Stage reviewed changes
 and run `cara repair continue --session ID [--actor A]`: it verifies the session,
-uses non-force publication, requires fresh CI, and resumes sync-all. For human
+uses an exact old-head force-with-lease publication, runs reviewed targeted validation, requires fresh CI, and resumes sync-all. For human
 flow testing, `cara loop --manual [--shell 'zsh -i']` opens a real TTY only at
 external decisions, exports a private `CARA_DECISION_FILE`, releases the lock,
 and always rediscovers after shell success; it is never JSON/MCP/hook behavior.
@@ -1788,7 +1788,7 @@ pub fn build_router() -> ToolRouter<AppContext> {
     );
     router.add_typed_tool_with_output_schema(
         "repair_continue",
-        "Verify staged conflict resolution stayed inside the typed path scope, recheck the exact provider head, create an exact-parent merge commit, publish by ordinary non-force fast-forward, and resume sync-all from the managed workspace.",
+        "Verify staged conflict resolution stayed inside the typed path scope, run reviewed targeted validation, recheck the exact provider head, create an exact-parent merge commit, publish under the exact old-head force-with-lease, and resume sync-all from the isolated workspace.",
         |context: &AppContext, input: repair::RepairContinueInput| repair::continue_session(context, &input),
     );
     router.add_typed_tool_with_output_schema(

@@ -504,8 +504,10 @@ isolated workspace after a typed semantic/CI decision. Continue still rejects
 unstaged/untracked files, unresolved conflicts, Git internals, symlinks/gitlinks,
 secret-like paths, identity drift, excess path/diff bounds, and actor mismatch.
 Before commit it records the complete bounded path list plus path, staged-index,
-and binary-diff fingerprints; publication is non-force and explicitly requires
-fresh CI.
+and binary-diff fingerprints. Reviewed `--validate` commands run in the isolated
+workspace before publication; the resulting command hashes and outcomes are
+receipted. Publication uses the exact recorded old head as a force-with-lease
+and explicitly requires fresh CI.
 
 A semantic grant is distinct from a mechanical conflict: it is bounded, expiring,
 and bound to session/repository/head/target, actor/reason, exact one-parent source
@@ -528,8 +530,9 @@ exact provider head and target, allowed conflict paths, mechanically staged
 baseline, config path, lifecycle state, and publication receipt. Continue
 rejects unstaged/untracked files, unresolved markers, edits outside the typed
 conflict scope, changed parents, and moved provider heads. It creates the exact
-merge commit itself, publishes only by ordinary non-force fast-forward, verifies
-the provider ref, and resumes `sync --all` from the clean managed workspace.
+merge commit itself, publishes only under the exact old-head force-with-lease,
+verifies the provider ref, and resumes `sync --all` from the clean isolated
+workspace.
 Interrupted committed or published sessions resume idempotently; nonterminal
 workspaces are preserved rather than deleted. After inspecting status, an
 operator can explicitly remove abandoned local state with `repair abort
