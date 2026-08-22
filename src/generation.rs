@@ -42,11 +42,56 @@ pub enum GenerationDisposition {
     InvalidGenerationMetadata,
 }
 
+/// Lifecycle meaning of one generation classification.
+///
+/// Temporary deferral must never be confused with durable supersession: only
+/// the latter carries exact closure evidence, and even then the default action
+/// is a proposal rather than a provider mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GenerationLifecycleDisposition {
+    #[default]
+    Active,
+    TemporaryDeferral,
+    DurableSupersession,
+    InvalidMetadata,
+}
+
+/// Repository-selected lifecycle action. Preserve is the upgrade-safe default;
+/// stronger actions are projected only onto exact durable supersessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SupersededGenerationAction {
+    #[default]
+    Preserve,
+    ProposeClosure,
+    Close,
+}
+
+/// Exact immutable evidence authorizing a supersession proposal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GenerationSupersessionEvidence {
+    pub superseded_pr: PrNumber,
+    pub superseded_provider_head: CommitOid,
+    pub canonical_pr: PrNumber,
+    pub canonical_provider_head: CommitOid,
+    pub authority: String,
+    /// True only for one unambiguous canonical generation. A separate reviewed
+    /// policy still decides whether to preserve, propose closure, or close.
+    pub closure_eligible: bool,
+}
+
 /// Bounded evidence explaining one generation classification.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct GenerationFinding {
     pub pr: PrNumber,
     pub disposition: GenerationDisposition,
+    #[serde(default)]
+    pub lifecycle: GenerationLifecycleDisposition,
+    #[serde(default)]
+    pub lifecycle_action: SupersededGenerationAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersession: Option<GenerationSupersessionEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canonical_pr: Option<PrNumber>,
     #[serde(default)]
@@ -457,6 +502,16 @@ fn record_canonical_component(
                 GenerationFinding {
                     pr: *pr,
                     disposition: GenerationDisposition::SupersededGeneration,
+                    lifecycle: GenerationLifecycleDisposition::DurableSupersession,
+                    lifecycle_action: SupersededGenerationAction::Preserve,
+                    supersession: Some(GenerationSupersessionEvidence {
+                        superseded_pr: *pr,
+                        superseded_provider_head: fact.provider_head.clone(),
+                        canonical_pr: canonical,
+                        canonical_provider_head: valid[&canonical].0.provider_head.clone(),
+                        authority: authority.to_owned(),
+                        closure_eligible: true,
+                    }),
                     canonical_pr: Some(canonical),
                     related_prs: component.to_vec(),
                     agent: Some(provenance.agent.clone()),
@@ -466,7 +521,7 @@ fn record_canonical_component(
                         provenance.generation
                     ),
                     safe_next_action: format!(
-                        "preserve PR #{canonical}; after owner review, close or reflect PR #{pr} without admitting it. Cara never auto-closes generations"
+                        "preserve PR #{canonical}; exact evidence permits a configured closure proposal for PR #{pr}, but no provider mutation occurs without reviewed policy"
                     ),
                 },
             );
@@ -490,6 +545,9 @@ pub fn analyze(
                 GenerationFinding {
                     pr: fact.pr,
                     disposition: GenerationDisposition::InvalidGenerationMetadata,
+                    lifecycle: GenerationLifecycleDisposition::InvalidMetadata,
+                    lifecycle_action: SupersededGenerationAction::Preserve,
+                    supersession: None,
                     canonical_pr: None,
                     related_prs: vec![fact.pr],
                     agent: None,
@@ -560,6 +618,9 @@ pub fn analyze(
                     GenerationFinding {
                         pr: *pr,
                         disposition: GenerationDisposition::AmbiguousGeneration,
+                        lifecycle: GenerationLifecycleDisposition::TemporaryDeferral,
+                        lifecycle_action: SupersededGenerationAction::Preserve,
+                        supersession: None,
                         canonical_pr: None,
                         related_prs: component.clone(),
                         agent: Some(provenance.agent.clone()),
@@ -677,6 +738,9 @@ pub fn analyze(
                     GenerationFinding {
                         pr: *pr,
                         disposition: GenerationDisposition::AmbiguousGeneration,
+                        lifecycle: GenerationLifecycleDisposition::TemporaryDeferral,
+                        lifecycle_action: SupersededGenerationAction::Preserve,
+                        supersession: None,
                         canonical_pr: None,
                         related_prs: component.clone(),
                         agent: Some(provenance.agent.clone()),
@@ -716,6 +780,9 @@ fn current_finding(
     GenerationFinding {
         pr: fact.pr,
         disposition: GenerationDisposition::CurrentGeneration,
+        lifecycle: GenerationLifecycleDisposition::Active,
+        lifecycle_action: SupersededGenerationAction::Preserve,
+        supersession: None,
         canonical_pr: Some(fact.pr),
         related_prs,
         agent: Some(provenance.agent.clone()),
@@ -725,6 +792,42 @@ fn current_finding(
         safe_next_action:
             "normal admission preflight may continue under immediate generation revalidation"
                 .to_owned(),
+    }
+}
+
+/// Apply repository lifecycle policy without widening supersession evidence.
+/// Ambiguous, invalid, and current generations are always preserve-only.
+pub fn apply_lifecycle_policy(
+    integrity: &mut GenerationIntegrityStatus,
+    action: SupersededGenerationAction,
+) {
+    for finding in &mut integrity.findings {
+        let exact = finding.lifecycle == GenerationLifecycleDisposition::DurableSupersession
+            && finding
+                .supersession
+                .as_ref()
+                .is_some_and(|evidence| evidence.closure_eligible);
+        finding.lifecycle_action = if exact {
+            action
+        } else {
+            SupersededGenerationAction::Preserve
+        };
+        if exact {
+            finding.safe_next_action = match action {
+                SupersededGenerationAction::Preserve => format!(
+                    "preserve PR #{} and its exact provider head; repository policy does not authorize a closure proposal",
+                    finding.pr
+                ),
+                SupersededGenerationAction::ProposeClosure => format!(
+                    "propose closure of PR #{} using its exact supersession evidence; do not mutate provider state",
+                    finding.pr
+                ),
+                SupersededGenerationAction::Close => format!(
+                    "close PR #{} only after fresh exact-head and canonical-generation revalidation",
+                    finding.pr
+                ),
+            };
+        }
     }
 }
 
@@ -1126,14 +1229,68 @@ mod tests {
     }
 
     #[test]
-    fn identical_sources_choose_immutable_newest_pr_and_never_auto_close() {
+    fn lifecycle_policy_never_widens_ambiguous_or_invalid_evidence() {
+        let mut status = analyze(
+            &[
+                fact(1, "agent-a", &["bd-aaaaaa"], 'a', "1"),
+                fact(2, "agent-a", &["bd-aaaaaa"], 'b', "2"),
+            ],
+            |_base, _head| CommitRelation::Diverged,
+        );
+        apply_lifecycle_policy(&mut status, SupersededGenerationAction::Close);
+        assert!(status.findings.iter().all(|finding| {
+            finding.lifecycle == GenerationLifecycleDisposition::TemporaryDeferral
+                && finding.lifecycle_action == SupersededGenerationAction::Preserve
+                && finding.supersession.is_none()
+        }));
+    }
+
+    #[test]
+    fn exact_supersession_projects_configured_closure_action() {
+        let mut status = analyze(
+            &[
+                fact(1, "agent-a", &["bd-aaaaaa"], 'a', "1"),
+                fact(2, "agent-a", &["bd-aaaaaa"], 'a', "2"),
+            ],
+            |_base, _head| CommitRelation::Identical,
+        );
+        apply_lifecycle_policy(&mut status, SupersededGenerationAction::Close);
+        let old = status.finding(PrNumber(1)).expect("superseded finding");
+        assert_eq!(old.lifecycle_action, SupersededGenerationAction::Close);
+        assert!(old.supersession.as_ref().unwrap().closure_eligible);
+        let current = status.finding(PrNumber(2)).expect("canonical finding");
+        assert_eq!(
+            current.lifecycle_action,
+            SupersededGenerationAction::Preserve
+        );
+    }
+
+    #[test]
+    fn identical_sources_emit_exact_durable_supersession_evidence() {
         let mut old = fact(1, "agent-a", &["bd-aaaaaa"], 'a', "1");
         let newer = fact(2, "agent-a", &["bd-aaaaaa"], 'a', "2");
         old.provider_head = oid('c');
+        let old_provider_head = old.provider_head.clone();
+        let canonical_provider_head = newer.provider_head.clone();
         let status = analyze(&[old, newer], |_base, _head| CommitRelation::Identical);
         let old = status.finding(PrNumber(1)).unwrap();
         assert_eq!(old.disposition, GenerationDisposition::SupersededGeneration);
+        assert_eq!(
+            old.lifecycle,
+            GenerationLifecycleDisposition::DurableSupersession
+        );
         assert_eq!(old.canonical_pr, Some(PrNumber(2)));
-        assert!(old.safe_next_action.contains("never auto-closes"));
+        assert_eq!(
+            old.supersession,
+            Some(GenerationSupersessionEvidence {
+                superseded_pr: PrNumber(1),
+                superseded_provider_head: old_provider_head,
+                canonical_pr: PrNumber(2),
+                canonical_provider_head,
+                authority: "exact source containment".to_owned(),
+                closure_eligible: true,
+            })
+        );
+        assert!(old.safe_next_action.contains("configured closure proposal"));
     }
 }
