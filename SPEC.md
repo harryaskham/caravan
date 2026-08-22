@@ -77,7 +77,17 @@ The read-only `terminal_closed_at_default_pr_ids` audit identifies
 closed-unmerged rows whose current provider head exactly equals the current
 default generation. That is destructive-cleanup evidence requiring owner
 investigation: Cara never closes PRs and never treats branch identity, Stack
-ancestry, or a landed parent as proof that an unmerged patch may be discarded. A candidate incompatible with every target, terminal-red on its exact current
+ancestry, or a landed parent as proof that an unmerged patch may be discarded. Every Cara-owned mutation that changes an active member's head, base, or
+membership generation has an explicit exact-generation CI postcondition. After
+fresh rediscovery Cara rerequests one provider check suite on the unchanged head
+and records a receipt binding PR, head OID, base OID, complete logical caravan
+membership, mutation kinds, and suite ID. The same tuple dispatches at most once
+per operation. Pre-membership `deferred_unjoined` runs remain diagnostic history;
+they neither become permanent source failures nor satisfy readiness after
+admission. A stale head/base/membership aggregate never authorizes a merge, and
+operators must not amend or force-push solely to manufacture a run.
+
+A candidate incompatible with every target, terminal-red on its exact current
 check generation, or missing protection-required run coverage is refused before
 membership, labelled `caravan-join-skipped`, and receives a durable
 generation-bound comment; later candidates and every already-enrolled caravan

@@ -179,6 +179,21 @@ pub struct CiGenerationSelection {
 
 /// Exact check and workflow-run evidence for one selected PR.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CiGenerationDispatchReceipt {
+    pub schema_version: u32,
+    pub pr: PrNumber,
+    pub head_oid: crate::model::CommitOid,
+    pub base_oid: crate::model::CommitOid,
+    #[serde(default)]
+    pub caravan_members: Vec<PrNumber>,
+    #[serde(default)]
+    pub mutation_kinds: Vec<MutationKind>,
+    pub check_suite_id: u64,
+    pub operation_id: OperationId,
+}
+
+/// Exact check and workflow-run evidence for one selected PR.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CiObservation {
     pub pr: PrNumber,
     pub disposition: CiDisposition,
@@ -990,6 +1005,10 @@ pub struct SyncOutput {
     /// landed content actually reached the default branch.
     #[serde(default)]
     pub root_merge: Vec<RootMergeReceipt>,
+    /// Exact post-mutation CI requests bound to head, base, and logical
+    /// membership generations. A stale aggregate can never stand in for these.
+    #[serde(default)]
+    pub ci_generation_dispatches: Vec<CiGenerationDispatchReceipt>,
     /// Durable native Stack landing transactions completed or still pending in
     /// this tick. Absent on the stable Caravan backend.
     #[serde(default)]
@@ -4293,6 +4312,7 @@ fn bounded_prefix_output(
         root_auto_merge: Vec::new(),
         root_promotion: progress.root_promotion,
         root_merge: progress.root_merge,
+        ci_generation_dispatches: progress.ci_generation_dispatches,
         native_stack_land: progress.native_stack_land,
         native_membership_recovery: Vec::new(),
         native_append_membership_recovery: Vec::new(),
@@ -4374,6 +4394,7 @@ fn root_first_output(
         root_auto_merge: progress.root_auto_merge,
         root_promotion: progress.root_promotion,
         root_merge: progress.root_merge,
+        ci_generation_dispatches: progress.ci_generation_dispatches,
         native_stack_land: progress.native_stack_land,
         native_membership_recovery: Vec::new(),
         native_append_membership_recovery: Vec::new(),
@@ -4462,6 +4483,7 @@ fn closed_lifecycle_output(
         root_auto_merge: Vec::new(),
         root_promotion: Vec::new(),
         root_merge: Vec::new(),
+        ci_generation_dispatches: Vec::new(),
         native_stack_land: Vec::new(),
         native_membership_recovery: Vec::new(),
         native_append_membership_recovery: Vec::new(),
@@ -4571,6 +4593,7 @@ fn native_membership_recovery_output(
         root_auto_merge: Vec::new(),
         root_promotion: Vec::new(),
         root_merge: Vec::new(),
+        ci_generation_dispatches: Vec::new(),
         native_stack_land: Vec::new(),
         native_membership_recovery: vec![recovery],
         native_append_membership_recovery: Vec::new(),
@@ -4592,6 +4615,7 @@ fn native_membership_recovery_output(
 fn native_stack_rebase_output(
     context: &AppContext,
     input: &SyncInput,
+    provider: &impl SyncProvider,
     started: Instant,
     operation_deadline: Instant,
     initial_status_elapsed: Duration,
@@ -4630,6 +4654,20 @@ fn native_stack_rebase_output(
         .as_ref()
         .map(|physical| physical.receipts.clone())
         .unwrap_or_default();
+    let mut ci_progress = SyncProgress::new(
+        &status,
+        vec![rebase.plan.root_pr],
+        context.config.sync.max_mutations_per_tick,
+    );
+    for member in &rebase.plan.members {
+        ci_progress.steps.push(MutationStep {
+            kind: MutationKind::NativeStackLand,
+            state: MutationStepState::Completed,
+            pr: Some(member.pr),
+            summary: "native Stack reconstruction requires exact-generation CI".to_owned(),
+        });
+    }
+    dispatch_exact_ci_after_queue_mutations(provider, &mut ci_progress, &status)?;
     Ok(SyncOutput {
         tick: SyncTickReceipt {
             schema_version: 1,
@@ -4651,11 +4689,12 @@ fn native_stack_rebase_output(
             final_status_ms: 0,
         }),
         lock_recovery,
-        provider_receipts: Vec::new(),
+        provider_receipts: ci_progress.provider_receipts,
         closed_lifecycle_transitions: Vec::new(),
         root_auto_merge: Vec::new(),
         root_promotion: Vec::new(),
         root_merge: Vec::new(),
+        ci_generation_dispatches: ci_progress.ci_generation_dispatches,
         native_stack_land: Vec::new(),
         native_membership_recovery: Vec::new(),
         native_append_membership_recovery: Vec::new(),
@@ -4733,6 +4772,7 @@ fn native_append_membership_recovery_output(
         root_auto_merge: Vec::new(),
         root_promotion: Vec::new(),
         root_merge: Vec::new(),
+        ci_generation_dispatches: Vec::new(),
         native_stack_land: Vec::new(),
         native_membership_recovery: Vec::new(),
         native_append_membership_recovery: vec![recovery.clone()],
@@ -4919,6 +4959,7 @@ fn sync_with_lock(
         return native_stack_rebase_output(
             context,
             input,
+            &provider,
             started,
             operation_deadline,
             initial_status_elapsed,
@@ -5326,6 +5367,7 @@ fn sync_with_lock(
         );
         status.clone()
     };
+    dispatch_exact_ci_after_queue_mutations(&provider, &mut progress, &final_status)?;
     if let Some(problem) =
         first_blocking_completion_problem(&final_status, &progress, context.config.force_merge)
     {
@@ -5401,6 +5443,7 @@ fn sync_with_lock(
             merge_sync_progress(&mut progress, post_admission);
             final_status =
                 read::fleet_status_for_sync(context, operation_deadline, Some(&github_budget))?;
+            dispatch_exact_ci_after_queue_mutations(&provider, &mut progress, &final_status)?;
             if let Some(problem) = first_blocking_completion_problem(
                 &final_status,
                 &progress,
@@ -5463,6 +5506,7 @@ fn sync_with_lock(
         root_auto_merge: progress.root_auto_merge,
         root_promotion: progress.root_promotion,
         root_merge: progress.root_merge,
+        ci_generation_dispatches: progress.ci_generation_dispatches,
         native_stack_land: progress.native_stack_land,
         native_membership_recovery: Vec::new(),
         native_append_membership_recovery: Vec::new(),
@@ -5579,6 +5623,9 @@ fn merge_sync_progress(target: &mut SyncProgress, mut source: SyncProgress) {
     target
         .native_stack_land
         .append(&mut source.native_stack_land);
+    target
+        .ci_generation_dispatches
+        .append(&mut source.ci_generation_dispatches);
     target.rebase_plans.append(&mut source.rebase_plans);
     target.rebase_receipts.append(&mut source.rebase_receipts);
     target.paused_caravans.append(&mut source.paused_caravans);
@@ -6662,6 +6709,109 @@ fn checks_have_exact_deferred_gate(
         .filter(|check| check.name == gate.context)
         .collect::<Vec<_>>();
     matching.len() == 1 && matching[0].state == CheckState::Failure
+}
+
+fn dispatch_exact_ci_after_queue_mutations(
+    provider: &impl SyncProvider,
+    progress: &mut SyncProgress,
+    status: &StatusOutput,
+) -> Result<(), AppError> {
+    let mut triggers = BTreeMap::<PrNumber, Vec<MutationKind>>::new();
+    for step in &progress.steps {
+        if step.state == MutationStepState::Completed
+            && matches!(
+                step.kind,
+                MutationKind::SetBase | MutationKind::RebaseBranch | MutationKind::NativeStackLand
+            )
+            && let Some(pr) = step.pr
+        {
+            triggers.entry(pr).or_default().push(step.kind);
+        }
+    }
+    for receipt in &progress.provider_receipts {
+        if matches!(
+            receipt.kind,
+            MutationKind::AddLabel | MutationKind::SetLabels
+        ) && receipt
+            .before
+            .as_ref()
+            .is_some_and(PullRequestSnapshot::is_active_caravan_member)
+            != receipt.after.is_active_caravan_member()
+        {
+            triggers
+                .entry(receipt.after.number)
+                .or_default()
+                .push(receipt.kind);
+        }
+    }
+    for (pr, mut mutation_kinds) in triggers {
+        mutation_kinds.sort_by_key(|kind| format!("{kind:?}"));
+        mutation_kinds.dedup();
+        let Some(current) = status.analysis.pull_requests.get(&pr) else {
+            continue;
+        };
+        if current.state != PullRequestState::Open || !current.is_active_caravan_member() {
+            continue;
+        }
+        let caravan_members = status
+            .analysis
+            .fleet
+            .containing(pr)
+            .map_or_else(Vec::new, |caravan| caravan.members.clone());
+        if progress.ci_generation_dispatches.iter().any(|dispatch| {
+            dispatch.pr == pr
+                && dispatch.head_oid == current.head.oid
+                && dispatch.base_oid == current.base.oid
+                && dispatch.caravan_members == caravan_members
+        }) {
+            continue;
+        }
+        let expected = PullRequestPrecondition::from(current);
+        let lineage = provider
+            .head_run_lineage(&status.repository, &expected)
+            .map_err(|error| mutation_error(&error, progress, Some(pr)))?;
+        let suite_id = crate::required_runs::rerequestable_suite(
+            Some(&lineage),
+            &current.head.oid.0,
+        )
+        .ok_or_else(|| {
+            AppError::structured(
+                ErrorCategory::ExecutionFailure,
+                "post_mutation_ci_dispatch_unavailable",
+                "queue-owned mutation produced a new head/base/membership tuple but no exact-head rerequestable CI suite exists",
+                Some(json!({
+                    "pr": pr,
+                    "head": current.head,
+                    "base": current.base,
+                    "mutation_kinds": mutation_kinds,
+                    "lineage": lineage,
+                    "retryable": true,
+                    "safe_next_action": "wait for the provider to expose one exact-head check suite, then rerun the same sync tick; do not amend or force-push solely to create CI",
+                })),
+            )
+        })?;
+        progress.ensure_mutation_capacity(1)?;
+        let receipt = provider
+            .rerequest_check_suite(&status.repository, &expected, suite_id)
+            .map_err(|error| mutation_error(&error, progress, Some(pr)))?;
+        progress.record(
+            receipt,
+            &format!("requested exact-generation CI suite {suite_id} after queue-owned mutation"),
+        );
+        progress
+            .ci_generation_dispatches
+            .push(CiGenerationDispatchReceipt {
+                schema_version: 1,
+                pr,
+                head_oid: current.head.oid.clone(),
+                base_oid: current.base.oid.clone(),
+                caravan_members,
+                mutation_kinds,
+                check_suite_id: suite_id,
+                operation_id: progress.operation_id.clone(),
+            });
+    }
+    Ok(())
 }
 
 fn perform_admission_gate_retrigger(
@@ -8114,6 +8264,9 @@ fn sync_checkpoint_evidence(progress: &SyncProgress) -> Value {
         "rebase_plans": checkpoint_rebase_plans(&progress.rebase_plans),
         "rebase_receipts": checkpoint_rebase_receipts(&progress.rebase_receipts),
         "provider_receipts": checkpoint_provider_receipts(&progress.provider_receipts),
+        "ci_generation_dispatches": bounded_checkpoint_sequence(
+            progress.ci_generation_dispatches.iter().map(|receipt| json!(receipt)).collect()
+        ),
         "native_stack_land": bounded_checkpoint_sequence(
             progress.native_stack_land.iter().map(|checkpoint| json!({
                 "repository": checkpoint.repository,
@@ -9555,6 +9708,7 @@ struct SyncProgress {
     /// Durable proof of each caravan-owned squash merge and where it landed.
     root_merge: Vec<RootMergeReceipt>,
     native_stack_land: Vec<crate::github::GitHubStackLandCheckpoint>,
+    ci_generation_dispatches: Vec<CiGenerationDispatchReceipt>,
     /// Configured merge actor for this tick.
     head_merge_actor: HeadMergeActor,
     /// Reviewed policy for a foreign provider auto-merge request.
@@ -9606,6 +9760,7 @@ impl SyncProgress {
             root_promotion: Vec::new(),
             root_merge: Vec::new(),
             native_stack_land: Vec::new(),
+            ci_generation_dispatches: Vec::new(),
             // Exactly one fact decides who merges: the configured policy
             // projected onto status. Every surface reads the same value.
             head_merge_actor: status.head_merge.actor,
