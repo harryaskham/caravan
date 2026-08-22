@@ -653,6 +653,10 @@ impl CiConfig {
 pub struct SyncActionsConfig {
     /// Greedily admit eligible unlabelled PRs after existing caravans converge.
     pub join_unlabelled_prs: bool,
+    /// Lifecycle policy for exact unambiguous superseded Cacophony generations.
+    /// Preserve is the upgrade-safe default; ambiguous or invalid rows ignore
+    /// this setting and always remain preserve-only.
+    pub superseded_generations: crate::generation::SupersededGenerationAction,
 }
 
 /// Deterministic engine response to exact current terminal-red CI.
@@ -1554,6 +1558,31 @@ mod tests {
         let rendered = serde_yaml::to_string(&CaravanConfig::default()).expect("config serializes");
         assert!(!rendered.contains("head_merge_actor"), "{rendered}");
         assert!(!rendered.contains("auto_merge_head"), "{rendered}");
+    }
+
+    #[test]
+    fn superseded_generation_lifecycle_is_explicit_and_preserve_by_default() {
+        let default = CaravanConfig::parse("version: 1\n").expect("defaults parse");
+        assert_eq!(
+            default.sync.actions.superseded_generations,
+            crate::generation::SupersededGenerationAction::Preserve
+        );
+
+        for (value, expected) in [
+            (
+                "propose_closure",
+                crate::generation::SupersededGenerationAction::ProposeClosure,
+            ),
+            (
+                "close",
+                crate::generation::SupersededGenerationAction::Close,
+            ),
+        ] {
+            let yaml =
+                format!("version: 1\nsync:\n  actions:\n    superseded_generations: {value}\n");
+            let configured = CaravanConfig::parse(&yaml).expect("typed lifecycle action parses");
+            assert_eq!(configured.sync.actions.superseded_generations, expected);
+        }
     }
 
     #[test]

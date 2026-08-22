@@ -1362,18 +1362,18 @@ impl RuntimeProvenance {
 /// been deleted or is otherwise unreachable, the same commits are frequently
 /// still in the local object database, and an exact local proof is strictly
 /// better than declaring an entire same-stream component unprovable.
-fn open_generation_facts(
+fn lifecycle_generation_facts(
     pull_requests: &[crate::model::PullRequestSnapshot],
     generation_facts: &[crate::model::PullRequestGenerationFact],
 ) -> Vec<crate::model::PullRequestGenerationFact> {
-    let open_prs = pull_requests
+    let lifecycle_prs = pull_requests
         .iter()
-        .filter(|pull| pull.state == crate::model::PullRequestState::Open)
+        .filter(|pull| pull.state == crate::model::PullRequestState::Open || pull.is_merged())
         .map(|pull| pull.number)
         .collect::<std::collections::BTreeSet<_>>();
     generation_facts
         .iter()
-        .filter(|fact| open_prs.contains(&fact.pr))
+        .filter(|fact| lifecycle_prs.contains(&fact.pr))
         .cloned()
         .collect()
 }
@@ -2304,12 +2304,13 @@ fn status_with_discovery_options(
     // Compatibility preparation fetches exact objects used by the preferred
     // local ancestry proof. Keep generation analysis after that fetch while the
     // earlier label read still guarantees a provider attempt before local work.
-    // Generation integrity governs current admission. Historical lifecycle rows
-    // stay in human status, but comparing every closed Cacophony generation is
-    // an unrelated N+1 fan-out that can exhaust the command watchdog at 30+
-    // open PRs. Keep only fresh open provider generations here.
+    // Generation integrity governs current admission and stale-generation
+    // lifecycle. Retain open rows plus recently merged canonical successors so
+    // an old open generation can be proven superseded after its successor
+    // lands. Closed-unmerged history remains excluded: it cannot authorize a
+    // canonical generation and comparing it adds unrelated N+1 provider work.
     let mut generation_facts =
-        open_generation_facts(&snapshot.pull_requests, &snapshot.generation_facts);
+        lifecycle_generation_facts(&snapshot.pull_requests, &snapshot.generation_facts);
     for pr in crate::generation::duplicate_stream_prs(&generation_facts)
         .into_iter()
         .take(32)
@@ -2326,7 +2327,7 @@ fn status_with_discovery_options(
         crate::command::ProcessRunner::in_directory(&context.repository_path)
             .with_timeout(child_timeout)
             .with_operation_deadline(operation_deadline);
-    let generation_integrity = crate::generation::analyze(&generation_facts, |base, head| {
+    let mut generation_integrity = crate::generation::analyze(&generation_facts, |base, head| {
         // bd-7546ea: exact local objects are an authoritative ancestry proof.
         // Try that bounded proof first so locally present cumulative generations
         // avoid one provider compare plus four subprocesses per pair. Provider
@@ -2350,6 +2351,10 @@ fn status_with_discovery_options(
             },
         }
     });
+    crate::generation::apply_lifecycle_policy(
+        &mut generation_integrity,
+        context.config.sync.actions.superseded_generations,
+    );
     let provider_identity_elapsed = started.elapsed();
     apply_generation_graph_problems(&mut analysis, &generation_integrity);
     let mut stack_backend = stack_backend_status(
@@ -6449,10 +6454,13 @@ mod tests {
     }
 
     #[test]
-    fn generation_integrity_excludes_historical_lifecycle_rows() {
+    fn generation_integrity_includes_merged_successors_but_excludes_closed_unmerged_rows() {
         let open = pr(1, "open", "main", false);
         let mut merged = pr(2, "merged", "main", false);
         merged.state = crate::model::PullRequestState::Merged;
+        merged.merged_at = Some("2026-08-22T00:00:00Z".to_owned());
+        let mut closed = pr(3, "closed", "main", false);
+        closed.state = crate::model::PullRequestState::Closed;
         let fact = |number| crate::model::PullRequestGenerationFact {
             pr: PrNumber(number),
             provider_head: crate::model::CommitOid(format!("{number:040x}")),
@@ -6462,10 +6470,13 @@ mod tests {
             supersedes: std::collections::BTreeSet::new(),
         };
 
-        let facts = open_generation_facts(&[open, merged], &[fact(1), fact(2)]);
+        let facts =
+            lifecycle_generation_facts(&[open, merged, closed], &[fact(1), fact(2), fact(3)]);
 
-        assert_eq!(facts.len(), 1);
-        assert_eq!(facts[0].pr, PrNumber(1));
+        assert_eq!(
+            facts.iter().map(|fact| fact.pr).collect::<Vec<_>>(),
+            vec![PrNumber(1), PrNumber(2)]
+        );
     }
 
     #[test]
