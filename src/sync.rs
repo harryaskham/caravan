@@ -525,6 +525,37 @@ pub struct AutoJoinSkipReceipt {
     pub evidence_hash: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ForeignSkipCursor {
+    schema_version: u32,
+    repository: RepositoryId,
+    pr: PrNumber,
+    head_oid: crate::model::CommitOid,
+    updated_at: Option<String>,
+    config_fingerprint: String,
+}
+
+impl ForeignSkipCursor {
+    fn key(pr: PrNumber) -> String {
+        format!("foreign-skip-{}", pr.0)
+    }
+
+    fn matches(
+        &self,
+        context: &AppContext,
+        repository: &RepositoryId,
+        pull: &PullRequestSnapshot,
+    ) -> bool {
+        self.schema_version == 1
+            && self.repository == *repository
+            && self.pr == pull.number
+            && self.head_oid == pull.head.oid
+            && self.updated_at == pull.updated_at
+            && self.config_fingerprint == auto_admission_config_fingerprint(context)
+            && pull.has_label(AUTO_ADMISSION_SKIP_LABEL)
+    }
+}
+
 impl AutoJoinSkipReceipt {
     fn finalize_hash(mut self) -> Self {
         self.evidence_hash.clear();
@@ -651,6 +682,12 @@ pub struct AutoAdmissionOutput {
     pub gate_deferrals: Vec<AdmissionGateDeferral>,
     #[serde(default)]
     pub remaining_candidates: Vec<PrNumber>,
+    /// Durable foreign-skip cursors reused without another comments API read.
+    #[serde(default)]
+    pub skip_cursor_hits: u32,
+    /// New immutable foreign-skip cursors persisted in this tick.
+    #[serde(default)]
+    pub skip_cursor_writes: u32,
     /// Exact capacity refusal evidence when the configured deadline can no
     /// longer guarantee that a larger chain drains.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -719,6 +756,8 @@ impl Default for AutoAdmissionOutput {
             skips: Vec::new(),
             gate_deferrals: Vec::new(),
             remaining_candidates: Vec::new(),
+            skip_cursor_hits: 0,
+            skip_cursor_writes: 0,
             capacity_refusal: None,
             fleet_capacity_refusal: None,
         }
@@ -747,6 +786,8 @@ impl AutoAdmissionOutput {
             skips: Vec::new(),
             gate_deferrals: Vec::new(),
             remaining_candidates: Vec::new(),
+            skip_cursor_hits: 0,
+            skip_cursor_writes: 0,
             capacity_refusal: None,
             fleet_capacity_refusal: None,
         }
@@ -5762,6 +5803,8 @@ where
         skips: Vec::new(),
         gate_deferrals: Vec::new(),
         remaining_candidates: Vec::new(),
+        skip_cursor_hits: 0,
+        skip_cursor_writes: 0,
         capacity_refusal: None,
         fleet_capacity_refusal: None,
     };
@@ -5803,6 +5846,34 @@ where
         let Some(skipped) = next else {
             break;
         };
+        let candidate = status
+            .analysis
+            .pull_requests
+            .get(&skipped.pr)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::validation(
+                    "auto_admission_candidate_missing",
+                    format!("skipped candidate #{} disappeared", skipped.pr),
+                )
+            })?;
+        let cursor_key = ForeignSkipCursor::key(skipped.pr);
+        if let Some(cursor) = crate::stack_checkpoint::load::<ForeignSkipCursor>(
+            &context.repository_path,
+            &cursor_key,
+        )? {
+            if cursor.matches(context, &status.repository, &candidate) {
+                validated_skips.insert(skipped.pr);
+                output.skip_cursor_hits = output.skip_cursor_hits.saturating_add(1);
+                progress.already(
+                    MutationKind::RemoveLabel,
+                    skipped.pr,
+                    "reused immutable foreign-skip cursor without rereading comments",
+                );
+                continue;
+            }
+            crate::stack_checkpoint::remove(&context.repository_path, &cursor_key)?;
+        }
         let comments = provider
             .pull_request_comment_bodies(&status.repository, skipped.pr)
             .map_err(|error| mutation_error(&error, progress, Some(skipped.pr)))?;
@@ -5851,6 +5922,19 @@ where
         // the PR is protected finds it admitted. That is worse than no hold at
         // all (bd-239640).
         if retained.is_none() {
+            crate::stack_checkpoint::write(
+                &context.repository_path,
+                &cursor_key,
+                &ForeignSkipCursor {
+                    schema_version: 1,
+                    repository: status.repository.clone(),
+                    pr: skipped.pr,
+                    head_oid: candidate.head.oid.clone(),
+                    updated_at: candidate.updated_at.clone(),
+                    config_fingerprint: auto_admission_config_fingerprint(context),
+                },
+            )?;
+            output.skip_cursor_writes = output.skip_cursor_writes.saturating_add(1);
             validated_skips.insert(skipped.pr);
             progress.already(
                 MutationKind::RemoveLabel,
@@ -5864,17 +5948,6 @@ where
             output.continuation = AutoAdmissionContinuation::MutationBudgetExhausted;
             break;
         }
-        let candidate = status
-            .analysis
-            .pull_requests
-            .get(&skipped.pr)
-            .cloned()
-            .ok_or_else(|| {
-                AppError::validation(
-                    "auto_admission_candidate_missing",
-                    format!("skipped candidate #{} disappeared", skipped.pr),
-                )
-            })?;
         let old_hash = retained
             .as_ref()
             .map_or("missing", |receipt| receipt.evidence_hash.as_str());

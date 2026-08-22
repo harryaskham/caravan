@@ -906,6 +906,7 @@ mod tests {
             mutation_support: crate::read::StackMutationSupport::ReadOnlyPreview,
             native_stacks: Vec::new(),
             provider_stacks_truncated: false,
+            orphan_ancestry_reads_skipped: 0,
             missing_caravans: Vec::new(),
             problems: Vec::new(),
         }

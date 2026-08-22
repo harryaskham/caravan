@@ -206,6 +206,11 @@ pub struct StackBackendStatus {
     pub native_stacks: Vec<NativeStackStatus>,
     #[serde(default)]
     pub provider_stacks_truncated: bool,
+    /// Immutable orphan Stack rows whose pairwise commit ancestry was skipped;
+    /// their inventory identity remains visible but cannot consume hot-queue
+    /// comparison budget until they map to a live logical caravan.
+    #[serde(default)]
+    pub orphan_ancestry_reads_skipped: usize,
     #[serde(default)]
     pub missing_caravans: Vec<PrNumber>,
     #[serde(default)]
@@ -220,6 +225,7 @@ impl Default for StackBackendStatus {
             mutation_support: StackMutationSupport::Caravan,
             native_stacks: Vec::new(),
             provider_stacks_truncated: false,
+            orphan_ancestry_reads_skipped: 0,
             missing_caravans: Vec::new(),
             problems: Vec::new(),
         }
@@ -504,13 +510,17 @@ fn native_stack_status(
         &mut problems,
         &mut consistency,
     );
-    let ancestry = assess_native_stack_ancestry(
-        provider,
-        repository,
-        &stack,
-        &mut problems,
-        &mut consistency,
-    );
+    let ancestry = if caravan_id.is_some() {
+        assess_native_stack_ancestry(
+            provider,
+            repository,
+            &stack,
+            &mut problems,
+            &mut consistency,
+        )
+    } else {
+        Vec::new()
+    };
     NativeStackStatus {
         stack,
         caravan_id,
@@ -629,6 +639,19 @@ fn stack_backend_status(
         .map(|stack| native_stack_status(stack, provider, repository, analysis, &mut represented))
         .collect::<Vec<_>>();
 
+    let orphan_ancestry_reads_skipped = native_stacks
+        .iter()
+        .filter(|native| native.caravan_id.is_none() && native.stack.open)
+        .map(|native| {
+            native
+                .stack
+                .pull_requests
+                .iter()
+                .filter(|entry| entry.state.eq_ignore_ascii_case("open"))
+                .count()
+                .saturating_sub(1)
+        })
+        .sum();
     let missing_caravans = if inventory.truncated {
         Vec::new()
     } else {
@@ -664,6 +687,7 @@ fn stack_backend_status(
         mutation_support: StackMutationSupport::ReadOnlyPreview,
         native_stacks,
         provider_stacks_truncated: inventory.truncated,
+        orphan_ancestry_reads_skipped,
         missing_caravans,
         problems,
     }
@@ -8014,6 +8038,57 @@ mod tests {
                 "github_stack_head_drift" | "github_stack_pr_base_drift"
             )
         }));
+    }
+
+    #[test]
+    fn open_orphan_stack_skips_hot_ancestry_comparisons() {
+        let status = status(pr(10, "current", "main", true), Vec::new());
+        let provider = FixedStackProvider(Ok(crate::github::GitHubStackInventory {
+            truncated: false,
+            stacks: vec![crate::github::GitHubStackSnapshot {
+                id: 9002,
+                number: 43,
+                node_id: "S_orphan".to_owned(),
+                base: crate::github::GitHubStackBase {
+                    ref_name: "main".to_owned(),
+                },
+                open: true,
+                created_at: "2026-08-09T08:00:00Z".to_owned(),
+                pull_requests: vec![
+                    crate::github::GitHubStackPullRequest {
+                        number: 98,
+                        state: "open".to_owned(),
+                        draft: false,
+                        merged_at: None,
+                        head: crate::github::GitHubStackPullRequestHead {
+                            ref_name: "old-root".to_owned(),
+                            sha: crate::model::CommitOid("8".repeat(40)),
+                        },
+                    },
+                    crate::github::GitHubStackPullRequest {
+                        number: 99,
+                        state: "open".to_owned(),
+                        draft: false,
+                        merged_at: None,
+                        head: crate::github::GitHubStackPullRequestHead {
+                            ref_name: "old-child".to_owned(),
+                            sha: crate::model::CommitOid("9".repeat(40)),
+                        },
+                    },
+                ],
+            }],
+        }));
+
+        let backend = stack_backend_status(
+            crate::config::StackType::Github,
+            &provider,
+            &status.repository,
+            &status.analysis,
+        );
+
+        assert_eq!(backend.native_stacks[0].caravan_id, None);
+        assert!(backend.native_stacks[0].ancestry.is_empty());
+        assert_eq!(backend.orphan_ancestry_reads_skipped, 1);
     }
 
     #[test]

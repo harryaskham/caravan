@@ -2897,7 +2897,7 @@ fn a_human_applied_join_skip_is_not_stripped_for_lacking_a_cara_receipt() {
     let mut progress = SyncProgress::new(&status, Vec::new(), u32::MAX);
     let github_budget = crate::command::GithubRequestBudget::new(100);
 
-    let (_status, _output) = run_auto_admission(
+    let (status, first) = run_auto_admission(
         &context,
         status,
         &provider,
@@ -2907,6 +2907,22 @@ fn a_human_applied_join_skip_is_not_stripped_for_lacking_a_cara_receipt() {
         &writer_guard,
     )
     .expect("auto admission runs");
+    assert_eq!(first.skip_cursor_writes, 1);
+    assert_eq!(first.skip_cursor_hits, 0);
+
+    let mut retry_progress = SyncProgress::new(&status, Vec::new(), u32::MAX);
+    let (_status, retry) = run_auto_admission(
+        &context,
+        status,
+        &provider,
+        &mut retry_progress,
+        Instant::now() + Duration::from_secs(30),
+        &github_budget,
+        &writer_guard,
+    )
+    .expect("unchanged foreign skip reuses its durable cursor");
+    assert_eq!(retry.skip_cursor_hits, 1);
+    assert_eq!(retry.skip_cursor_writes, 0);
 
     assert!(
         provider.pulls.borrow()[&held.number].has_label(AUTO_ADMISSION_SKIP_LABEL),
@@ -10868,6 +10884,7 @@ fn enable_native_backend(status: &mut StatusOutput) {
         mutation_support: crate::read::StackMutationSupport::NativeStack,
         native_stacks: Vec::new(),
         provider_stacks_truncated: false,
+        orphan_ancestry_reads_skipped: 0,
         missing_caravans: Vec::new(),
         problems: Vec::new(),
     };
@@ -11236,6 +11253,7 @@ fn native_singleton_tail_without_stack_lands_and_retries_idempotently() {
         mutation_support: crate::read::StackMutationSupport::NativeStack,
         native_stacks: Vec::new(),
         provider_stacks_truncated: false,
+        orphan_ancestry_reads_skipped: 0,
         missing_caravans: Vec::new(),
         problems: Vec::new(),
     };

@@ -1587,6 +1587,7 @@ mod tests {
             mutation_support: StackMutationSupport::NativeStack,
             native_stacks,
             provider_stacks_truncated: false,
+            orphan_ancestry_reads_skipped: 0,
             missing_caravans: vec![PrNumber(101)],
             problems: vec![StackBackendProblem {
                 code: "github_stack_absent".to_owned(),
@@ -1739,6 +1740,7 @@ mod tests {
             mutation_support: StackMutationSupport::NativeStack,
             native_stacks: vec![native],
             provider_stacks_truncated: false,
+            orphan_ancestry_reads_skipped: 0,
             missing_caravans: Vec::new(),
             problems: vec![StackBackendProblem {
                 code: "github_stack_member_order_drift".to_owned(),
@@ -1837,6 +1839,7 @@ mod tests {
             mutation_support: StackMutationSupport::NativeStack,
             native_stacks: vec![native],
             provider_stacks_truncated: false,
+            orphan_ancestry_reads_skipped: 0,
             missing_caravans: Vec::new(),
             problems: vec![
                 StackBackendProblem {
