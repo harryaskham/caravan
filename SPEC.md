@@ -66,7 +66,14 @@ reports `max_caravans`, active/parked counts, `terminal_closed_prs` and its
 bounded deterministic PR IDs, `excess_active_caravans`, and
 `at_caravan_capacity`; plan and mutation refusals carry the same active counts.
 Closed-unmerged records are terminal provenance, not caravans, and never consume
-capacity. The read-only `terminal_closed_at_default_pr_ids` audit identifies
+capacity. A native Stack prefix landing remains one durable `land-*` convergence
+transaction after provider terminal merge and lock release: Cara retains the
+checkpoint across fresh ticks until every selected PR is merged, the surviving
+logical suffix is rooted at default with exact linear bases, and the provider
+Stack exactly represents that suffix. Ordinary promotion, descendant rebase,
+and Stack reconstruction resume beneath that receipt; terminal merge alone
+never discards it, and released checkpoints no longer leave orphan ruleset locks.
+The read-only `terminal_closed_at_default_pr_ids` audit identifies
 closed-unmerged rows whose current provider head exactly equals the current
 default generation. That is destructive-cleanup evidence requiring owner
 investigation: Cara never closes PRs and never treats branch identity, Stack

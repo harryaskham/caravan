@@ -332,7 +332,20 @@ impl SyncProvider for FakeProvider {
     ) -> Result<crate::github::GitHubStackLandCheckpoint, AppError> {
         let mut next = checkpoint.clone();
         next.phase = crate::github::GitHubStackLandPhase::Released;
-        Ok(next)
+        next.lock_release = Some(crate::github::GitHubStackBranchLockReceipt {
+            schema_version: 1,
+            operation_id: "release-test-lock".to_owned(),
+            actor: "test".to_owned(),
+            repository: checkpoint.repository.clone(),
+            operation: crate::github::GitHubStackBranchLockOperation::Release,
+            disposition: crate::github::GitHubStackBranchLockDisposition::Completed,
+            request_method: "DELETE".to_owned(),
+            request_path: "repos/owner/repo/rulesets/1".to_owned(),
+            github_request_id: None,
+            lock: checkpoint.branch_lock.clone(),
+            evidence_hash: "test-receipt".to_owned(),
+        });
+        Ok(next.reseal())
     }
 
     fn verify_pull_request(
@@ -11595,7 +11608,7 @@ fn stack_membership_race_never_retries_synchronous_merge() {
 
 #[test]
 #[allow(clippy::too_many_lines, clippy::unreadable_literal)]
-fn submitted_landing_checkpoint_is_finalized_and_orphaned_rulesets_cleaned_up() {
+fn submitted_landing_checkpoint_is_retained_until_full_convergence() {
     let pulls = vec![
         caravan_member(1, "root", "main"),
         caravan_member(2, "child", "root"),
@@ -11737,11 +11750,51 @@ fn submitted_landing_checkpoint_is_finalized_and_orphaned_rulesets_cleaned_up() 
     )
     .unwrap();
 
-    assert!(changed);
+    assert!(!changed);
     let loaded = crate::stack_checkpoint::load::<crate::github::GitHubStackLandCheckpoint>(
         &native.repository_path,
         "land-42",
     )
     .unwrap();
-    assert!(loaded.is_none(), "loaded is {loaded:?}");
+    let loaded = loaded
+        .expect("terminal provider status alone must not discard the convergence transaction");
+    assert_eq!(loaded.convergence_observations, 1);
+    assert!(loaded.convergence_last_problem.is_some());
+    assert!(loaded.verify());
+
+    for expected in 2..8 {
+        assert!(
+            !reconcile_pending_native_stack_landing_checkpoints(
+                &AppContext {
+                    repository_path: native.repository_path.clone(),
+                    config_path: std::path::PathBuf::from(".caravan/config.yaml"),
+                    config_existed: true,
+                    config: config.clone(),
+                },
+                &status,
+                &provider,
+            )
+            .unwrap()
+        );
+        let observed = crate::stack_checkpoint::load::<crate::github::GitHubStackLandCheckpoint>(
+            &native.repository_path,
+            "land-42",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(observed.convergence_observations, expected);
+    }
+    let error = reconcile_pending_native_stack_landing_checkpoints(
+        &AppContext {
+            repository_path: native.repository_path.clone(),
+            config_path: std::path::PathBuf::from(".caravan/config.yaml"),
+            config_existed: true,
+            config,
+        },
+        &status,
+        &provider,
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), "github_stack_convergence_deadline_exceeded");
+    assert_eq!(error.details().unwrap()["retryable"], false);
 }

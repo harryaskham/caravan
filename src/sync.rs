@@ -2466,9 +2466,29 @@ fn reconcile_pending_native_stack_landing_checkpoints(
                         break;
                     }
                 }
-                if checkpoint.phase == crate::github::GitHubStackLandPhase::Released {
+            }
+            if checkpoint.phase == crate::github::GitHubStackLandPhase::Released {
+                if native_stack_landing_converged(status, &checkpoint) {
                     crate::stack_checkpoint::remove(&context.repository_path, &key)?;
                     changed = true;
+                } else {
+                    checkpoint = checkpoint.observe_convergence_pending(
+                        "fresh provider status has not yet proven merged prefix, promoted linear suffix, and exact Stack membership",
+                    );
+                    crate::stack_checkpoint::write(&context.repository_path, &key, &checkpoint)?;
+                    if checkpoint.convergence_observations >= 8 {
+                        return Err(AppError::structured(
+                            ErrorCategory::ExecutionFailure,
+                            "github_stack_convergence_deadline_exceeded",
+                            "native Stack landing reached terminal merge but complete queue convergence was not proven within the bounded observation window",
+                            Some(json!({
+                                "checkpoint": checkpoint,
+                                "retryable": false,
+                                "operator_action_required": true,
+                                "safe_next_action": "inspect fresh logical membership, PR bases/heads, provider Stack membership, and cara-stack-merge-lock rulesets; do not resubmit the merge",
+                            })),
+                        ));
+                    }
                 }
             }
         }
@@ -2498,6 +2518,99 @@ fn reconcile_pending_native_stack_landing_checkpoints(
     }
 
     Ok(changed)
+}
+
+/// Exact final postcondition for one native Stack landing transaction.
+///
+/// A terminal provider merge and lock release are necessary but not sufficient:
+/// the same durable checkpoint remains until fresh discovery proves that every
+/// selected row merged, the surviving logical suffix is rooted at default and
+/// linearly based, and its provider Stack representation is exact. Ordinary
+/// sync owns the intervening promotion/rebase/reconstruction writes; a restart
+/// resumes because this checkpoint is deliberately retained across them.
+fn native_stack_landing_converged(
+    status: &StatusOutput,
+    checkpoint: &crate::github::GitHubStackLandCheckpoint,
+) -> bool {
+    if checkpoint.phase != crate::github::GitHubStackLandPhase::Released
+        || checkpoint.lock_release.is_none()
+        || checkpoint.terminal_status != Some(crate::github::GitHubStackMergeStatus::Merged)
+    {
+        return false;
+    }
+    let selected = checkpoint
+        .plan
+        .selected
+        .iter()
+        .map(|entry| entry.pr)
+        .collect::<BTreeSet<_>>();
+    if selected.iter().any(|pr| {
+        status
+            .analysis
+            .pull_requests
+            .get(pr)
+            .is_none_or(|pull| !pull.is_merged())
+    }) {
+        return false;
+    }
+    let surviving = checkpoint
+        .plan
+        .before
+        .topology
+        .entries
+        .iter()
+        .filter(|entry| !selected.contains(&entry.pr))
+        .map(|entry| entry.pr)
+        .collect::<Vec<_>>();
+    if surviving.is_empty() {
+        return true;
+    }
+    let pulls = surviving
+        .iter()
+        .map(|pr| status.analysis.pull_requests.get(pr))
+        .collect::<Option<Vec<_>>>();
+    let Some(pulls) = pulls else {
+        return false;
+    };
+    if pulls
+        .iter()
+        .any(|pull| pull.state != PullRequestState::Open)
+        || pulls[0].base.repository != status.analysis.fleet.default_branch.repository
+        || pulls[0].base.name != status.analysis.fleet.default_branch.name
+        || pulls.iter().enumerate().skip(1).any(|(index, pull)| {
+            pull.base.repository != pulls[index - 1].head.repository
+                || pull.base.name != pulls[index - 1].head.name
+        })
+    {
+        return false;
+    }
+    let logical_exact = status
+        .analysis
+        .fleet
+        .caravans
+        .iter()
+        .any(|caravan| caravan.members == surviving && !caravan.parked);
+    if !logical_exact {
+        return false;
+    }
+    if surviving.len() == 1 {
+        return !status.stack_backend.native_stacks.iter().any(|native| {
+            native.stack.pull_requests.iter().any(|entry| {
+                entry.number == surviving[0].0 && entry.state.eq_ignore_ascii_case("open")
+            }) && native.consistency != crate::read::StackConsistency::Exact
+        });
+    }
+    status.stack_backend.native_stacks.iter().any(|native| {
+        native.consistency == crate::read::StackConsistency::Exact
+            && native.ancestry.iter().all(|edge| edge.linear)
+            && native
+                .stack
+                .pull_requests
+                .iter()
+                .filter(|entry| entry.state.eq_ignore_ascii_case("open"))
+                .map(|entry| PrNumber(entry.number))
+                .eq(surviving.iter().copied())
+    })
 }
 
 // Keep the fresh-read lease, one-write label transaction, and lifecycle-specific
@@ -10557,7 +10670,11 @@ impl SyncProgress {
             self.native_stack_land.push(checkpoint);
             return Ok(());
         }
-        crate::stack_checkpoint::remove(&native.repository_path, &key)?;
+        // Keep the released checkpoint durable until a later fresh status proves
+        // the complete convergence postcondition (logical suffix, branch bases,
+        // provider Stack, and scoped lock release). Removing it at provider
+        // terminality recreated the exact manual-recovery gap this transaction
+        // is meant to close.
         let status = checkpoint.terminal_status;
         self.native_stack_land.push(checkpoint.clone());
         match status {
