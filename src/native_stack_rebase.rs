@@ -116,6 +116,93 @@ pub struct NativeStackRebaseOutput {
     pub next: String,
 }
 
+const DRIFT_CLEAR_REDISCOVERY_ATTEMPTS: usize = 3;
+const DRIFT_CLEAR_REDISCOVERY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn same_drift_clear_scope(before: &GitHubStackSnapshot, after: &GitHubStackSnapshot) -> bool {
+    before.id == after.id
+        && before.number == after.number
+        && before.node_id == after.node_id
+        && before.base == after.base
+        && before
+            .pull_requests
+            .iter()
+            .map(|entry| entry.number)
+            .eq(after.pull_requests.iter().map(|entry| entry.number))
+}
+
+fn drift_clear_generation_changed(error: &crate::github::GitHubStackMutationError) -> bool {
+    matches!(
+        error,
+        crate::github::GitHubStackMutationError::InconsistentProviderState { diagnostic }
+            if diagnostic.contains("raw generation changed before mutation")
+    )
+}
+
+fn clear_drifted_with_bounded_rediscovery<R: crate::command::CommandRunner>(
+    provider: &GitHubMutationAdapter<R>,
+    repository: &RepositoryId,
+    operation_id: &str,
+    actor: &str,
+    expected: &GitHubStackSnapshot,
+    deadline: std::time::Instant,
+) -> Result<GitHubStackDriftClearReceipt, crate::github::GitHubStackMutationError> {
+    let mut current = expected.clone();
+    for attempt in 0..DRIFT_CLEAR_REDISCOVERY_ATTEMPTS {
+        match provider.native_stack_clear_drifted(repository, operation_id, actor, &current) {
+            Ok(receipt) => return Ok(receipt),
+            Err(error)
+                if drift_clear_generation_changed(&error)
+                    && attempt + 1 < DRIFT_CLEAR_REDISCOVERY_ATTEMPTS
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(DRIFT_CLEAR_REDISCOVERY_DELAY);
+                match provider.native_stack_snapshot_for_recovery(repository, current.number)? {
+                    None => {
+                        return Ok(GitHubStackDriftClearReceipt {
+                            schema_version: 1,
+                            operation_id: operation_id.to_owned(),
+                            actor: actor.to_owned(),
+                            before: current,
+                            cleared: true,
+                            recovered_after_ambiguous_response: true,
+                        });
+                    }
+                    Some(observed) if same_drift_clear_scope(&current, &observed) => {
+                        current = observed;
+                    }
+                    Some(observed) => {
+                        return Err(
+                            crate::github::GitHubStackMutationError::InconsistentProviderState {
+                                diagnostic: format!(
+                                    "drift-clear Stack #{} changed identity or ordered membership during bounded rediscovery: expected id {} node {} PRs {:?}, observed id {} node {} PRs {:?}",
+                                    current.number,
+                                    current.id,
+                                    current.node_id,
+                                    current
+                                        .pull_requests
+                                        .iter()
+                                        .map(|entry| entry.number)
+                                        .collect::<Vec<_>>(),
+                                    observed.id,
+                                    observed.node_id,
+                                    observed
+                                        .pull_requests
+                                        .iter()
+                                        .map(|entry| entry.number)
+                                        .collect::<Vec<_>>(),
+                                ),
+                            },
+                        );
+                    }
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("bounded drift-clear loop always returns")
+}
+
 pub fn preview(
     context: &AppContext,
     input: &NativeStackRebasePreviewInput,
@@ -481,26 +568,29 @@ fn apply_plan(
         .with_operation_deadline(deadline);
     let provider = GitHubMutationAdapter::new(writer.runner(provider_runner));
     let clear_operation = format!("native-stack-rebase-clear-{}", plan.plan_hash);
-    let drift_clear = provider
-        .native_stack_clear_drifted(
-            &plan.repository,
-            &clear_operation,
-            &plan.actor,
-            &plan.provider_before,
-        )
-        .map_err(|error| AppError::structured(
-            ErrorCategory::ExecutionFailure,
-            "native_stack_rebase_drift_clear_failed",
-            "branch rewrite completed but exact drifted provider Stack clearance failed",
-            Some(json!({
-                "plan": plan,
-                "physical": physical,
-                "source": error.to_string(),
-                "mutated": true,
-                "resumable": true,
-                "safe_next_action": "rerun rebase-preview against fresh provider truth; never unstack or force-push manually",
-            })),
-        ))?;
+    let drift_clear = clear_drifted_with_bounded_rediscovery(
+        &provider,
+        &plan.repository,
+        &clear_operation,
+        &plan.actor,
+        &plan.provider_before,
+        deadline,
+    )
+    .map_err(|error| AppError::structured(
+        ErrorCategory::ExecutionFailure,
+        "native_stack_rebase_drift_clear_failed",
+        "branch rewrite completed but exact drifted provider Stack clearance failed",
+        Some(json!({
+            "plan": plan,
+            "physical": physical,
+            "source": error.to_string(),
+            "mutated": true,
+            "resumable": true,
+            "recovery_class": "provider_stack_generation_race",
+            "rediscovery_attempts": DRIFT_CLEAR_REDISCOVERY_ATTEMPTS,
+            "safe_next_action": "rerun rebase-preview against fresh provider truth; never unstack or force-push manually",
+        })),
+    ))?;
     let replacement = if caravan.members.len() >= 2 {
         Some(provider
             .native_stack_create(
@@ -874,6 +964,56 @@ mod tests {
                 message: "diverged".to_owned(),
             }],
         }
+    }
+
+    #[test]
+    fn drift_clear_rediscovery_accepts_only_same_stack_and_ordered_membership() {
+        let mut before = divergent_stack(42).stack;
+        before.pull_requests = vec![
+            crate::github::GitHubStackPullRequest {
+                number: 10,
+                state: "open".to_owned(),
+                draft: false,
+                merged_at: None,
+                head: crate::github::GitHubStackPullRequestHead {
+                    ref_name: "root".to_owned(),
+                    sha: CommitOid("old-root".to_owned()),
+                },
+            },
+            crate::github::GitHubStackPullRequest {
+                number: 11,
+                state: "open".to_owned(),
+                draft: false,
+                merged_at: None,
+                head: crate::github::GitHubStackPullRequestHead {
+                    ref_name: "tail".to_owned(),
+                    sha: CommitOid("old-tail".to_owned()),
+                },
+            },
+        ];
+        let mut refreshed = before.clone();
+        refreshed.pull_requests[1].head.sha = CommitOid("new-tail".to_owned());
+        assert!(same_drift_clear_scope(&before, &refreshed));
+
+        let mut reordered = refreshed.clone();
+        reordered.pull_requests.swap(0, 1);
+        assert!(!same_drift_clear_scope(&before, &reordered));
+
+        let mut replaced = refreshed;
+        replaced.node_id = "replacement".to_owned();
+        assert!(!same_drift_clear_scope(&before, &replaced));
+    }
+
+    #[test]
+    fn drift_clear_retry_classifier_is_narrow() {
+        let race = crate::github::GitHubStackMutationError::InconsistentProviderState {
+            diagnostic: "drift-clear Stack #42 raw generation changed before mutation".to_owned(),
+        };
+        assert!(drift_clear_generation_changed(&race));
+        let other = crate::github::GitHubStackMutationError::InconsistentProviderState {
+            diagnostic: "drift-clear Stack #42 remained after provider response 500".to_owned(),
+        };
+        assert!(!drift_clear_generation_changed(&other));
     }
 
     #[test]
