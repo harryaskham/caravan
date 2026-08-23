@@ -462,8 +462,8 @@ fn historical_parent_lease_matches(
     // same branch whose OID this batch has just rewritten.
     current.repository == *repository
         && target.repository == *repository
-        && (current == target || current.name == target.name)
-        && matches!(new_base, PlannedBase::Simulated(_))
+        && (current == target
+            || (current.name == target.name && matches!(new_base, PlannedBase::Simulated(_))))
 }
 
 /// Materialize one exact rebase generation and retain its worktree through apply.
@@ -2786,19 +2786,36 @@ mod tests {
         let oid = CommitOid("bd54cb0267f058fa892763da06082b0e03f03ad7".to_owned());
         let current = branch(&repository, "main", &oid);
         let target = current.clone();
-        let new_base = PlannedBase::Simulated(target.clone());
+        for new_base in [
+            PlannedBase::Remote(target.clone()),
+            PlannedBase::Simulated(target.clone()),
+        ] {
+            assert!(historical_parent_lease_matches(
+                &repository,
+                &current,
+                &target,
+                &new_base,
+            ));
+        }
 
+        let advanced_same_name = branch(&repository, "main", &CommitOid("a".repeat(40)));
+        assert!(!historical_parent_lease_matches(
+            &repository,
+            &current,
+            &advanced_same_name,
+            &PlannedBase::Remote(advanced_same_name.clone()),
+        ));
         assert!(historical_parent_lease_matches(
             &repository,
             &current,
-            &target,
-            &new_base,
+            &advanced_same_name,
+            &PlannedBase::Simulated(advanced_same_name.clone()),
         ));
         assert!(!historical_parent_lease_matches(
             &repository,
             &current,
             &branch(&repository, "different-parent", &CommitOid("a".repeat(40))),
-            &new_base,
+            &PlannedBase::Simulated(target),
         ));
     }
 
