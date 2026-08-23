@@ -1730,7 +1730,11 @@ permission dry-run after irreversible control mutation. Independent caravans
 may apply with bounded parallelism; each chain is strictly parent-to-descendant.
 A child provider `BaseRefOid` which still names an ancestor of its
 already-advanced parent branch is retained as an explicit historical range
-boundary; a non-descendant or changed exact head remains a true race. A
+boundary. That boundary's old ref name is provenance, not the current-parent
+lease: same-batch planning accepts either the exact selected current parent or
+the same named parent branch at its newly simulated OID. A non-descendant,
+different selected branch, repository mismatch, or changed exact head remains a
+true race. A
 mandatory midpoint rediscovery verifies every new head and refreshes invalidated
 CI before ordinary sync policy runs.
 
