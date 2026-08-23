@@ -448,6 +448,24 @@ pub fn rewrite_candidate(
     apply_prepared(&prepared)
 }
 
+fn historical_parent_lease_matches(
+    repository: &RepositoryId,
+    current: &BranchSnapshot,
+    target: &BranchSnapshot,
+    new_base: &PlannedBase,
+) -> bool {
+    // `branch` in HistoricalParentBranch is the retained lower commit-range
+    // boundary. Its ref name may legitimately be the child's old provider base
+    // after root promotion/retargeting. Mutation authority comes from the exact
+    // selected current-parent lease: it either equals the target exactly (the
+    // provider already projects the selected parent generation) or names the
+    // same branch whose OID this batch has just rewritten.
+    current.repository == *repository
+        && target.repository == *repository
+        && (current == target || current.name == target.name)
+        && matches!(new_base, PlannedBase::Simulated(_))
+}
+
 /// Materialize one exact rebase generation and retain its worktree through apply.
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::needless_pass_by_value)]
@@ -486,15 +504,12 @@ pub fn prepare_candidate(
         ));
     }
     if let PlannedRangeBase::HistoricalParentBranch { branch, current } = &range_source
-        && (branch.name != current.name
-            || current.name != target.name
-            || current.repository != *repository
-            || !matches!(&new_base, PlannedBase::Simulated(_)))
+        && !historical_parent_lease_matches(repository, current, target, &new_base)
     {
         return Err(decision(
             "rebase_historical_parent_mismatch",
             "historical child range must bind the exact current parent branch selected for same-batch rewrite",
-            json!({"pr": candidate.number, "historical_parent": current, "target": target, "resumable": true}),
+            json!({"pr": candidate.number, "range_boundary": branch, "historical_parent": current, "target": target, "resumable": true}),
         ));
     }
     if let PlannedRangeBase::HistoricalSourceBranch { current, .. } = &range_source
@@ -2760,6 +2775,31 @@ mod tests {
         .next()
         .unwrap()
         .to_owned()
+    }
+
+    #[test]
+    fn historical_parent_lease_accepts_identical_selected_parent_with_older_named_boundary() {
+        let repository = RepositoryId {
+            owner: "harryaskham".to_owned(),
+            name: "cacophony".to_owned(),
+        };
+        let oid = CommitOid("bd54cb0267f058fa892763da06082b0e03f03ad7".to_owned());
+        let current = branch(&repository, "main", &oid);
+        let target = current.clone();
+        let new_base = PlannedBase::Simulated(target.clone());
+
+        assert!(historical_parent_lease_matches(
+            &repository,
+            &current,
+            &target,
+            &new_base,
+        ));
+        assert!(!historical_parent_lease_matches(
+            &repository,
+            &current,
+            &branch(&repository, "different-parent", &CommitOid("a".repeat(40))),
+            &new_base,
+        ));
     }
 
     #[test]
