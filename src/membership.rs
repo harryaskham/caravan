@@ -1905,7 +1905,12 @@ fn execute_locked(
     } else {
         EventKind::CaravanCreated
     };
-    if request.operation.is_join() || physical_branch_rewrites {
+    // Every successful membership operation needs the same durable admission
+    // proof. In particular, a root `new` with physical rewrites disabled still
+    // has an exact default-branch predecessor and source head; omitting this
+    // receipt leaves callers unable to distinguish publication from durable
+    // membership (bd-0ad238).
+    {
         let join_receipt = build_join_receipt(
             context,
             &repository,
