@@ -123,11 +123,11 @@ impl GithubAuthConfig {
             GithubAuthMode::Ambient => Err(ConfigError::Validation(
                 "github_auth policy is ambient but runtime requested App authentication".to_owned(),
             )),
+            GithubAuthMode::AppInstallation if mode.is_empty() => Ok(()),
             GithubAuthMode::AppInstallation => {
                 if mode != "app_installation" {
                     return Err(ConfigError::Validation(
-                        "github_auth App policy requires CARA_GITHUB_AUTH_MODE=app_installation"
-                            .to_owned(),
+                        "runtime auth mode conflicts with github_auth.mode".to_owned(),
                     ));
                 }
                 if slug.map(str::trim) != self.app_slug.as_deref() {
@@ -2188,15 +2188,34 @@ mod github_auth_tests {
     }
 
     #[test]
-    fn app_runtime_requires_mode_identity_and_broker() {
+    fn app_policy_allows_local_ambient_auth_and_fences_runtime_opt_in() {
         let policy = GithubAuthConfig {
             mode: GithubAuthMode::AppInstallation,
             app_slug: Some("caravan".to_owned()),
             installation_id: Some(42),
         };
+
+        policy
+            .validate_runtime_values(None, None, None, None)
+            .unwrap();
+        policy
+            .validate_runtime_values(
+                Some("app_installation"),
+                Some("caravan"),
+                Some("42"),
+                Some("/broker"),
+            )
+            .unwrap();
+
         for values in [
-            (None, Some("caravan"), Some("42"), Some("/broker")),
+            (Some("ambient"), None, None, Some("/broker")),
             (Some("app_installation"), None, Some("42"), Some("/broker")),
+            (
+                Some("app_installation"),
+                Some("other"),
+                Some("42"),
+                Some("/broker"),
+            ),
             (
                 Some("app_installation"),
                 Some("caravan"),
