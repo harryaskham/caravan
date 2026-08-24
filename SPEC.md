@@ -202,7 +202,8 @@ source class, total GraphQL/REST/gh-CLI calls, and the latest GraphQL
 cost/remaining/reset observation. Queries collect rate-limit evidence in-band.
 GitHub App mode is independent from ambient `gh` identity. An exact repository
 named by configured `gh repo view OWNER/REPO`, `--repo OWNER/REPO`, REST
-`repos/OWNER/REPO/...`, or canonical GraphQL `repository(owner:,name:)` selects
+`repos/OWNER/REPO/...`, literal GraphQL `repository(owner:,name:)`, or typed
+GraphQL `-F owner=OWNER -F name=REPO` variables selects
 the reviewed installation credential before the request executes, even when the
 managed checkout's `origin` is a daemon-local mirror. The broker response must
 bind exact App slug, installation ID, and repository; wrong installation,
