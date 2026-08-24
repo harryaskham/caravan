@@ -798,7 +798,7 @@ fn automatic_rebase_stack(
     }) {
         return Ok(None);
     }
-    let divergent = backend
+    let mut divergent = backend
         .native_stacks
         .iter()
         .filter(|native| {
@@ -814,16 +814,13 @@ fn automatic_rebase_stack(
         })
         .map(|native| native.stack.number)
         .collect::<Vec<_>>();
-    match divergent.as_slice() {
-        [] => Ok(None),
-        [stack] => Ok(Some(*stack)),
-        _ => Err(AppError::structured(
-            ErrorCategory::Validation,
-            "native_stack_auto_rebase_ambiguous",
-            "multiple divergent native Stacks cannot share one automatic rewrite tick",
-            Some(json!({"stacks": divergent, "mutated": false})),
-        )),
-    }
+    // One tick owns at most one exact Stack rewrite. Provider Stack numbers are
+    // immutable identities, so sorting them gives rediscovery a stable choice
+    // while the postcondition read leaves every remaining Stack for a later
+    // tick. Refusing cardinality >1 as retryable only repeats the same set
+    // forever (bd-b55412).
+    divergent.sort_unstable();
+    Ok(divergent.into_iter().next())
 }
 
 pub(crate) fn auto_apply_from_status(
@@ -1052,17 +1049,17 @@ mod tests {
     }
 
     #[test]
-    fn automatic_rebase_selects_only_one_pure_ancestry_drift() {
+    fn automatic_rebase_selects_one_stable_stack_per_tick() {
         assert_eq!(automatic_rebase_stack(&backend(Vec::new())).unwrap(), None);
         assert_eq!(
             automatic_rebase_stack(&backend(vec![divergent_stack(42)])).unwrap(),
             Some(42)
         );
         assert_eq!(
-            automatic_rebase_stack(&backend(vec![divergent_stack(42), divergent_stack(43)]))
-                .unwrap_err()
-                .code(),
-            "native_stack_auto_rebase_ambiguous"
+            automatic_rebase_stack(&backend(vec![divergent_stack(43), divergent_stack(42)]))
+                .unwrap(),
+            Some(42),
+            "provider discovery order must not change the selected Stack"
         );
         let mut unavailable = backend(vec![divergent_stack(42)]);
         unavailable.provider_stacks_truncated = true;
