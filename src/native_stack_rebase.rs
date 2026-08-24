@@ -774,14 +774,12 @@ fn repairable_problem(
         || (active_prefix && problem.code == "github_stack_member_order_drift")
 }
 
-fn automatic_rebase_stack(
-    backend: &crate::read::StackBackendStatus,
-) -> Result<Option<u64>, AppError> {
+fn automatic_rebase_stack(backend: &crate::read::StackBackendStatus) -> Option<u64> {
     if backend.provider_stacks_truncated
         || backend.capability != crate::read::StackCapability::Available
         || backend.mutation_support != crate::read::StackMutationSupport::NativeStack
     {
-        return Ok(None);
+        return None;
     }
     if backend.problems.iter().any(|problem| {
         !backend.native_stacks.iter().any(|native| {
@@ -796,9 +794,9 @@ fn automatic_rebase_stack(
             })
         })
     }) {
-        return Ok(None);
+        return None;
     }
-    let divergent = backend
+    let mut divergent = backend
         .native_stacks
         .iter()
         .filter(|native| {
@@ -814,16 +812,13 @@ fn automatic_rebase_stack(
         })
         .map(|native| native.stack.number)
         .collect::<Vec<_>>();
-    match divergent.as_slice() {
-        [] => Ok(None),
-        [stack] => Ok(Some(*stack)),
-        _ => Err(AppError::structured(
-            ErrorCategory::Validation,
-            "native_stack_auto_rebase_ambiguous",
-            "multiple divergent native Stacks cannot share one automatic rewrite tick",
-            Some(json!({"stacks": divergent, "mutated": false})),
-        )),
-    }
+    // One tick owns at most one exact Stack rewrite. Provider Stack numbers are
+    // immutable identities, so sorting them gives rediscovery a stable choice
+    // while the postcondition read leaves every remaining Stack for a later
+    // tick. Refusing cardinality >1 as retryable only repeats the same set
+    // forever (bd-b55412).
+    divergent.sort_unstable();
+    divergent.into_iter().next()
 }
 
 pub(crate) fn auto_apply_from_status(
@@ -833,7 +828,7 @@ pub(crate) fn auto_apply_from_status(
     deadline: std::time::Instant,
     github_budget: &crate::command::GithubRequestBudget,
 ) -> Result<Option<(NativeStackRebaseOutput, StatusOutput)>, AppError> {
-    let Some(stack) = automatic_rebase_stack(&status.stack_backend)? else {
+    let Some(stack) = automatic_rebase_stack(&status.stack_backend) else {
         return Ok(None);
     };
     let intent = NativeStackRebasePreviewInput {
@@ -1052,27 +1047,26 @@ mod tests {
     }
 
     #[test]
-    fn automatic_rebase_selects_only_one_pure_ancestry_drift() {
-        assert_eq!(automatic_rebase_stack(&backend(Vec::new())).unwrap(), None);
+    fn automatic_rebase_selects_one_stable_stack_per_tick() {
+        assert_eq!(automatic_rebase_stack(&backend(Vec::new())), None);
         assert_eq!(
-            automatic_rebase_stack(&backend(vec![divergent_stack(42)])).unwrap(),
+            automatic_rebase_stack(&backend(vec![divergent_stack(42)])),
             Some(42)
         );
         assert_eq!(
-            automatic_rebase_stack(&backend(vec![divergent_stack(42), divergent_stack(43)]))
-                .unwrap_err()
-                .code(),
-            "native_stack_auto_rebase_ambiguous"
+            automatic_rebase_stack(&backend(vec![divergent_stack(43), divergent_stack(42)])),
+            Some(42),
+            "provider discovery order must not change the selected Stack"
         );
         let mut unavailable = backend(vec![divergent_stack(42)]);
         unavailable.provider_stacks_truncated = true;
-        assert_eq!(automatic_rebase_stack(&unavailable).unwrap(), None);
+        assert_eq!(automatic_rebase_stack(&unavailable), None);
         let mut mixed = backend(vec![divergent_stack(42)]);
         mixed.problems.push(crate::read::StackBackendProblem {
             code: "github_stack_member_order_drift".to_owned(),
             message: "mixed".to_owned(),
         });
-        assert_eq!(automatic_rebase_stack(&mixed).unwrap(), None);
+        assert_eq!(automatic_rebase_stack(&mixed), None);
     }
 
     #[test]
