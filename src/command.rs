@@ -1522,13 +1522,29 @@ fn explicit_gh_repository(request: &CommandSpec) -> Option<GithubRepository> {
         // GraphQL requests carry the exact repository in the query rather than
         // `--repo`. Cara emits the canonical `repository(owner:"…", name:"…")`
         // form; bind App auth to it instead of falling back to a local mirror.
-        return request.args.iter().find_map(|argument| {
+        if let Some(repository) = request.args.iter().find_map(|argument| {
             let (_, tail) = argument.split_once("repository(owner:\"")?;
             let (owner, tail) = tail.split_once('"')?;
             let (_, tail) = tail.split_once("name:\"")?;
             let (name, _) = tail.split_once('"')?;
             github_repository_from_slug(&format!("{owner}/{name}"))
-        });
+        }) {
+            return Some(repository);
+        }
+        // Variable-based GraphQL requests carry exact owner/name as typed `-F`
+        // values. Treat the pair as one identity only for an actual GraphQL
+        // request; unrelated fields named owner/name never enter this path.
+        let owner = request
+            .args
+            .iter()
+            .find_map(|argument| argument.strip_prefix("owner="));
+        let name = request
+            .args
+            .iter()
+            .find_map(|argument| argument.strip_prefix("name="));
+        return owner
+            .zip(name)
+            .and_then(|(owner, name)| github_repository_from_slug(&format!("{owner}/{name}")));
     }
     None
 }
@@ -2004,7 +2020,11 @@ mod tests {
             "api",
             "graphql",
             "-f",
-            "query=query { repository(owner:\"harryaskham\", name:\"caravan\") { name } }",
+            "query=query($owner:String!,$name:String!){repository(owner:$owner,name:$name){name}}",
+            "-F",
+            "owner=harryaskham",
+            "-F",
+            "name=caravan",
         ]);
 
         assert_eq!(
