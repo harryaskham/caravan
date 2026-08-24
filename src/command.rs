@@ -773,15 +773,27 @@ impl ProcessRunner {
         {
             return None;
         }
+        let cwd = self.cwd.as_deref().unwrap_or_else(|| Path::new("."));
+        let runner = auth_probe_runner(cwd, self.operation_deadline);
+        let runner = self
+            .github_request_budget
+            .as_ref()
+            .map_or(runner.clone(), |budget| {
+                runner.with_github_request_budget(budget.clone())
+            });
+        let repository =
+            explicit_gh_repository(request).or_else(|| discover_github_repository(&runner, cwd));
         match github_app_mode() {
             Err(message) => Some(GithubAuthSelection::Refused(message)),
-            Ok(Some(_)) => resolve_github_auth(self.cwd.as_deref(), self.operation_deadline)
+            Ok(Some(_)) => repository
+                .and_then(|repository| resolve_github_auth_for_repository(&runner, &repository))
                 .or_else(|| {
                     Some(GithubAuthSelection::Refused(
-                        "App mode could not resolve the exact repository".to_owned(),
+                        "App mode could not resolve the exact repository from the request or checkout".to_owned(),
                     ))
                 }),
-            Ok(None) => resolve_github_auth(self.cwd.as_deref(), self.operation_deadline),
+            Ok(None) => repository
+                .and_then(|repository| resolve_github_auth_for_repository(&runner, &repository)),
         }
     }
 
@@ -1016,6 +1028,7 @@ fn discover_github_repository(runner: &ProcessRunner, cwd: &Path) -> Option<Gith
     parsed
 }
 
+#[cfg(test)]
 fn resolve_github_auth(
     cwd: Option<&Path>,
     operation_deadline: Option<Instant>,
@@ -1197,9 +1210,7 @@ fn resolve_github_app_credential(
         return Err("credential broker response names a different installation".to_owned());
     }
     bind_github_app_principal(repository, &credential)?;
-    if !github_token_can_access(runner, repository, &credential.token) {
-        return Err("App installation token cannot access the exact repository".to_owned());
-    }
+    github_app_token_repository_access(runner, repository, &credential.token)?;
     Ok(credential)
 }
 
@@ -1274,23 +1285,60 @@ fn github_token_for_login(
         .filter(|token| !token.is_empty())
 }
 
+fn github_repository_access_command(repository: &GithubRepository, token: &str) -> CommandSpec {
+    CommandSpec::new("gh")
+        .args([
+            "api",
+            "--hostname",
+            repository.host.as_str(),
+            "--silent",
+            repository.api_path().as_str(),
+        ])
+        .env("GH_TOKEN", token)
+}
+
+fn classify_github_app_repository_access(output: &CommandOutput) -> Result<(), String> {
+    if output.is_success() {
+        return Ok(());
+    }
+    let diagnostic = output.stderr.to_ascii_lowercase();
+    if diagnostic.contains("http 404") || diagnostic.contains("not found") {
+        return Err("exact repository is absent, renamed, or no longer granted to the selected GitHub App installation".to_owned());
+    }
+    if diagnostic.contains("http 403") || diagnostic.contains("forbidden") {
+        return Err("selected GitHub App installation lacks an exact repository grant or required metadata permission".to_owned());
+    }
+    if diagnostic.contains("http 401") || diagnostic.contains("bad credentials") {
+        return Err(
+            "selected GitHub App installation token was rejected by the provider".to_owned(),
+        );
+    }
+    Err(
+        "GitHub App exact-repository access probe failed with an unclassified provider response"
+            .to_owned(),
+    )
+}
+
+fn github_app_token_repository_access(
+    runner: &ProcessRunner,
+    repository: &GithubRepository,
+    token: &str,
+) -> Result<(), String> {
+    let output = runner
+        .run(&github_repository_access_command(repository, token))
+        .map_err(|_| {
+            "GitHub App exact-repository access probe hit a transport failure".to_owned()
+        })?;
+    classify_github_app_repository_access(&output)
+}
+
 fn github_token_can_access(
     runner: &ProcessRunner,
     repository: &GithubRepository,
     token: &str,
 ) -> bool {
     runner
-        .run(
-            &CommandSpec::new("gh")
-                .args([
-                    "api",
-                    "--hostname",
-                    repository.host.as_str(),
-                    "--silent",
-                    repository.api_path().as_str(),
-                ])
-                .env("GH_TOKEN", token),
-        )
+        .run(&github_repository_access_command(repository, token))
         .is_ok_and(|output| output.is_success())
 }
 
@@ -1404,6 +1452,85 @@ fn validate_github_app_git_configuration(runner: &ProcessRunner) -> Result<(), S
         ),
         _ => Err("could not inspect Git transport configuration".to_owned()),
     }
+}
+
+fn github_repository_from_slug(slug: &str) -> Option<GithubRepository> {
+    let slug = slug.trim().trim_end_matches(".git");
+    let (owner, name) = slug.split_once('/')?;
+    if owner.is_empty()
+        || name.is_empty()
+        || name.contains('/')
+        || owner.starts_with('-')
+        || name.starts_with('-')
+    {
+        return None;
+    }
+    Some(GithubRepository {
+        host: "github.com".to_owned(),
+        owner: owner.to_owned(),
+        name: name.to_owned(),
+        git_transport: GithubGitTransport::Https,
+    })
+}
+
+/// Exact repository explicitly named by a `gh` request.
+///
+/// Managed checkouts may point `origin` at a daemon-local mirror. In App mode
+/// the request's configured `owner/repo` is stronger authority than that local
+/// transport and must select the installation token before `gh` executes.
+fn explicit_gh_repository(request: &CommandSpec) -> Option<GithubRepository> {
+    if !is_gh_request(request) {
+        return None;
+    }
+    for (index, argument) in request.args.iter().enumerate() {
+        if argument == "--repo" || argument == "-R" {
+            return request
+                .args
+                .get(index + 1)
+                .and_then(|slug| github_repository_from_slug(slug));
+        }
+        if let Some(slug) = argument
+            .strip_prefix("--repo=")
+            .or_else(|| argument.strip_prefix("-R="))
+        {
+            return github_repository_from_slug(slug);
+        }
+    }
+    if request.args.first().is_some_and(|arg| arg == "repo")
+        && request.args.get(1).is_some_and(|arg| arg == "view")
+    {
+        return request
+            .args
+            .get(2)
+            .filter(|arg| !arg.starts_with('-'))
+            .and_then(|slug| github_repository_from_slug(slug));
+    }
+    if request.args.first().is_some_and(|arg| arg == "api") {
+        if let Some(repository) = request.args.iter().skip(1).find_map(|argument| {
+            let path = argument.trim_start_matches('/');
+            let mut parts = path.split('/');
+            (parts.next() == Some("repos"))
+                .then(|| {
+                    let owner = parts.next()?;
+                    let name = parts.next()?;
+                    github_repository_from_slug(&format!("{owner}/{name}"))
+                })
+                .flatten()
+        }) {
+            return Some(repository);
+        }
+        // GraphQL requests carry the exact repository in the query rather than
+        // `--repo`. Cara emits the canonical `repository(owner:"…", name:"…")`
+        // form; bind App auth to it instead of falling back to a local mirror.
+        return request.args.iter().find_map(|argument| {
+            let (_, tail) = argument.split_once("repository(owner:\"")?;
+            let (owner, tail) = tail.split_once('"')?;
+            let (_, tail) = tail.split_once("name:\"")?;
+            let (name, _) = tail.split_once('"')?;
+            github_repository_from_slug(&format!("{owner}/{name}"))
+        });
+    }
+    None
 }
 
 fn explicit_github_repository(request: &CommandSpec) -> Result<Option<GithubRepository>, String> {
@@ -1859,6 +1986,95 @@ mod tests {
                 Err("exact live fencing token was not observed".to_owned())
             }
         }
+    }
+
+    #[test]
+    fn explicit_gh_repository_covers_configured_repo_and_api_forms() {
+        let positional = CommandSpec::new("gh").args([
+            "repo",
+            "view",
+            "harryaskham/cacophony",
+            "--json",
+            "nameWithOwner",
+        ]);
+        let flagged = CommandSpec::new("gh").args(["pr", "list", "--repo", "harryaskham/caravan"]);
+        let api =
+            CommandSpec::new("gh").args(["api", "repos/harryaskham/pi-daemon/stacks?per_page=100"]);
+        let graphql = CommandSpec::new("gh").args([
+            "api",
+            "graphql",
+            "-f",
+            "query=query { repository(owner:\"harryaskham\", name:\"caravan\") { name } }",
+        ]);
+
+        assert_eq!(
+            explicit_gh_repository(&positional).unwrap().cache_key(),
+            "github.com/harryaskham/cacophony"
+        );
+        assert_eq!(
+            explicit_gh_repository(&flagged).unwrap().cache_key(),
+            "github.com/harryaskham/caravan"
+        );
+        assert_eq!(
+            explicit_gh_repository(&api).unwrap().cache_key(),
+            "github.com/harryaskham/pi-daemon"
+        );
+        assert_eq!(
+            explicit_gh_repository(&graphql).unwrap().cache_key(),
+            "github.com/harryaskham/caravan"
+        );
+    }
+
+    #[test]
+    fn app_repository_access_failures_remain_typed_and_secret_free() {
+        let not_found = CommandOutput {
+            code: Some(1),
+            stdout: String::new(),
+            stderr: "gh: Not Found (HTTP 404)".to_owned(),
+        };
+        let forbidden = CommandOutput {
+            code: Some(1),
+            stdout: String::new(),
+            stderr: "gh: Forbidden (HTTP 403)".to_owned(),
+        };
+        let unauthorized = CommandOutput {
+            code: Some(1),
+            stdout: String::new(),
+            stderr: "gh: Bad credentials (HTTP 401)".to_owned(),
+        };
+
+        assert!(
+            classify_github_app_repository_access(&not_found)
+                .unwrap_err()
+                .contains("absent, renamed")
+        );
+        assert!(
+            classify_github_app_repository_access(&forbidden)
+                .unwrap_err()
+                .contains("lacks an exact repository grant")
+        );
+        assert!(
+            classify_github_app_repository_access(&unauthorized)
+                .unwrap_err()
+                .contains("token was rejected")
+        );
+    }
+
+    #[test]
+    fn explicit_gh_repository_ignores_ambiguous_or_unconfigured_forms() {
+        assert!(explicit_gh_repository(&CommandSpec::new("gh").args(["repo", "view"])).is_none());
+        assert!(
+            explicit_gh_repository(&CommandSpec::new("gh").args([
+                "pr",
+                "list",
+                "--repo",
+                "bad/repo/extra"
+            ]))
+            .is_none()
+        );
+        assert!(
+            explicit_gh_repository(&CommandSpec::new("git").args(["fetch", "origin"])).is_none()
+        );
     }
 
     #[test]
