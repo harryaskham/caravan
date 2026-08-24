@@ -200,9 +200,16 @@ request rather than an additional per-process access probe.
 Every bounded provider operation accumulates secret-free API telemetry: auth
 source class, total GraphQL/REST/gh-CLI calls, and the latest GraphQL
 cost/remaining/reset observation. Queries collect rate-limit evidence in-band.
-A GitHub App installation token is accepted through the same ambient-token path
-and may identify its source through a non-secret runtime hint; app secrets never
-belong in repository config. Automation should use one event-driven loop,
+GitHub App mode is independent from ambient `gh` identity. An exact repository
+named by configured `gh repo view OWNER/REPO`, `--repo OWNER/REPO`, REST
+`repos/OWNER/REPO/...`, or canonical GraphQL `repository(owner:,name:)` selects
+the reviewed installation credential before the request executes, even when the
+managed checkout's `origin` is a daemon-local mirror. The broker response must
+bind exact App slug, installation ID, and repository; wrong installation,
+repository scope/grant failure, absent/renamed repository, and transport failure
+remain typed refusals and never fall back to a user account. The access probe
+shares the operation's deadline and authenticated request budget. App secrets
+never belong in repository config or receipts. Automation should use one event-driven loop,
 coalesce wakes, reuse one exact discovery snapshot within a tick, back off near
 reset, and retain exact fresh reads before mutation. Cache data is never
 provider mutation authority.
