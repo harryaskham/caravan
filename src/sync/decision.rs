@@ -532,6 +532,7 @@ pub(super) fn scheduler_failure_status(error: &AppError) -> SyncFailureScheduler
                 | "squash_merge_not_enabled"
                 | "unsafe_checkout"
                 | "github_stack_repository_not_opted_in"
+                | "github_stack_convergence_deadline_exceeded"
         ) =>
         {
             (

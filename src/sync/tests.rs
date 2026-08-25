@@ -11676,6 +11676,40 @@ fn stack_membership_race_never_retries_synchronous_merge() {
 }
 
 #[test]
+fn terminal_stack_convergence_receipt_never_advertises_retry_tick() {
+    let error = AppError::structured(
+        ErrorCategory::ExecutionFailure,
+        "github_stack_convergence_deadline_exceeded",
+        "terminal native Stack convergence requires fresh operator inspection",
+        Some(json!({
+            "operation_id": "01a03826-fce7-7d81-9de9-f238f221224c:stack:3216",
+            "terminal_status": "failed",
+            "provider_atomic": false,
+            "operator_action_required": true,
+            "retryable": false,
+            "safe_next_action": "inspect fresh membership, bases, heads, Stack, and rulesets; do not resubmit the merge",
+            "scheduler_status": {
+                "disposition": "retry_tick",
+                "wake_class": "retry_tick",
+                "retryable": true,
+                "error_code": "github_stack_convergence_deadline_exceeded",
+                "schema_version": 1
+            }
+        })),
+    );
+
+    let scheduler = scheduler_failure_status(&error);
+    assert_eq!(scheduler.disposition, SchedulerDisposition::OperatorAction);
+    assert_eq!(scheduler.wake_class, SchedulerWakeClass::OperatorAction);
+    assert!(!scheduler.retryable);
+    let attached = attach_scheduler_failure(&error, &scheduler);
+    let details = attached.details().unwrap();
+    assert_eq!(details["retryable"], false);
+    assert_eq!(details["scheduler_status"]["retryable"], false);
+    assert_eq!(details["scheduler_status"]["wake_class"], "operator_action");
+}
+
+#[test]
 #[allow(clippy::too_many_lines, clippy::unreadable_literal)]
 fn submitted_landing_checkpoint_is_retained_until_full_convergence() {
     let pulls = vec![
