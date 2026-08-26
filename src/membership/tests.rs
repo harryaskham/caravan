@@ -1622,6 +1622,54 @@ fn join_receipt_proves_exact_tail_ancestry_and_durable_force_preservation() {
 }
 
 #[test]
+fn created_root_receipt_falls_back_to_exact_provider_created_head() {
+    let candidate = pull_request(195, "created", "main", &[ACTIVE_LABEL]);
+    let before = status(candidate.clone(), Vec::new());
+    let provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
+    let output = execute(
+        before.clone(),
+        &clean,
+        &provider,
+        MembershipRequest {
+            operation: MembershipOperation::New,
+            create_pr: false,
+            tail_pr: None,
+            head_pr: None,
+            reason: None,
+            priority_label: None,
+            agent_priority_labels: Vec::new(),
+        },
+    )
+    .expect("root membership succeeds");
+    let default = before.analysis.fleet.default_branch.clone();
+
+    let receipt = build_join_receipt(
+        &AppContext::default(),
+        &repository(),
+        &before,
+        JoinReceiptEvidence {
+            predecessor: Some(JoinPredecessorReceipt {
+                pr: PrNumber(0),
+                branch: default.name,
+                head_oid: default.oid.clone(),
+            }),
+            candidate_source_head_oid: None,
+            source: None,
+            default_branch_oid: default.oid,
+            rebase_receipt: None,
+        },
+        &output,
+    )
+    .expect("provider-created head is retained in the mandatory receipt");
+
+    assert_eq!(
+        receipt.candidate_source_head_oid,
+        output.pull_request.head.oid
+    );
+    assert!(receipt.membership_durable);
+}
+
+#[test]
 fn root_new_receipt_uses_default_branch_predecessor_bd_d15ba3() {
     let candidate = pull_request(1, "one", "main", &[]);
     let before = status(candidate.clone(), Vec::new());

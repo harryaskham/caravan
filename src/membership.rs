@@ -2032,14 +2032,15 @@ fn build_join_receipt(
             Some(json!({"candidate_pr": output.pull_request.number})),
         )
     })?;
-    let source_head = evidence.candidate_source_head_oid.ok_or_else(|| {
-        AppError::structured(
-            ErrorCategory::ExecutionFailure,
-            "join_receipt_source_missing",
-            "successful membership operation did not retain its source head",
-            Some(json!({"candidate_pr": output.pull_request.number})),
-        )
-    })?;
+    // `new --create-pr` without physical rewrites has no PR in the initial
+    // status, so there is no pre-mutation candidate head to retain. The
+    // provider creation receipt is folded into `output.pull_request`; its exact
+    // head is the authoritative requested/created source generation. Physical
+    // rewrites still supply the old head explicitly and remain subject to the
+    // stronger source-provenance/ancestry checks below.
+    let source_head = evidence
+        .candidate_source_head_oid
+        .unwrap_or_else(|| output.pull_request.head.oid.clone());
     let source = evidence.source;
     if context.config.physical_branch_rewrites_enabled() && source.is_none() {
         return Err(AppError::structured(
