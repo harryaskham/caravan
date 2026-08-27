@@ -3,6 +3,8 @@
 //! Every bounded v1 domain tool is backed by the same GitHub-facing operation
 //! used by the human and JSON CLI surfaces.
 
+compile_error!("bd-d046b1 intentional CI-failure canary");
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
