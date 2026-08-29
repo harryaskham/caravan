@@ -458,6 +458,39 @@ mutating control. Interactive actions use same-origin CSRF, exact snapshot
 sequences, and existing typed Cara operations and receipts; they never execute
 arbitrary shell input.
 
+The flake also exports `nixosModules.caravan`, `darwinModules.caravan`, and
+`nixOnDroidModules.caravan` for a persistent dashboard. The shared
+`services.caravan.web` option tree maps to a systemd user service, launchd user
+agent, or Nix-on-Droid supervisord program respectively. For example, Helsinki
+can expose one read-only dashboard on its tailnet address without starting a
+sync loop:
+
+```nix
+{
+  inputs.caravan.url = "github:harryaskham/caravan";
+  imports = [ inputs.caravan.nixosModules.caravan ];
+
+  services.caravan.web = {
+    enable = true;
+    bind = "100.x.y.z"; # Helsinki's tailnet address; arbitrary binds are allowed.
+    port = 4774;
+    readOnly = true;
+    interval = 30;
+    repositories = [
+      "/home/harry/.cacophony/caravan-worktrees/cacophony"
+      "/home/harry/.cacophony/caravan-worktrees/caravan"
+      "/home/harry/.cacophony/caravan-worktrees/pi-daemon"
+    ];
+  };
+}
+```
+
+The service runs only `cara web`; scheduling `cara sync` remains the
+responsibility of Cacophony cron. The dashboard uses same-origin relative API
+requests, so tailnet access does not need a public-origin option. Keep a
+non-loopback plaintext listener private to the tailnet or place TLS in front of
+it.
+
 An optional `POST /api/v1/webhooks/github` endpoint accepts GitHub App webhooks
 only when an HMAC secret environment variable and exact installation ID are
 configured. It verifies `X-Hub-Signature-256`, installation, explicit repository,
