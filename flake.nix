@@ -35,7 +35,7 @@
       feedback-cli,
       ...
     }:
-    flake-utils.lib.eachDefaultSystem (
+    (flake-utils.lib.eachDefaultSystem (
       system:
       let
         pkgs = import nixpkgs { inherit system; };
@@ -164,6 +164,10 @@
 
         checks = {
           default = caravan;
+          service-modules = import ./nix/module-eval-test.nix {
+            inherit pkgs;
+            serviceModules = import ./nix/service-modules.nix { inherit self; };
+          };
           workflow-lint = pkgs.runCommand "caravan-workflow-lint" {
             nativeBuildInputs = [
               pkgs.actionlint
@@ -196,5 +200,19 @@
 
         formatter = pkgs.nixfmt-rfc-style;
       }
-    );
+    ))
+    // (let
+      serviceModules = import ./nix/service-modules.nix { inherit self; };
+    in
+    {
+      nixosModules.default = serviceModules.nixos;
+      nixosModules.caravan = serviceModules.nixos;
+      darwinModules.default = serviceModules.darwin;
+      darwinModules.caravan = serviceModules.darwin;
+      nixOnDroidModules.default = serviceModules.nixOnDroid;
+      nixOnDroidModules.caravan = serviceModules.nixOnDroid;
+      overlays.default = final: prev: {
+        caravan = self.packages.${prev.system}.caravan;
+      };
+    });
 }
