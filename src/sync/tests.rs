@@ -11676,11 +11676,52 @@ fn stack_membership_race_never_retries_synchronous_merge() {
 }
 
 #[test]
+fn terminal_stack_convergence_receipt_never_advertises_retry_tick() {
+    let error = AppError::structured(
+        ErrorCategory::ExecutionFailure,
+        "github_stack_convergence_deadline_exceeded",
+        "terminal native Stack convergence requires fresh operator inspection",
+        Some(json!({
+            "operation_id": "01a03826-fce7-7d81-9de9-f238f221224c:stack:3216",
+            "terminal_status": "failed",
+            "provider_atomic": false,
+            "operator_action_required": true,
+            "retryable": false,
+            "safe_next_action": "inspect fresh membership, bases, heads, Stack, and rulesets; do not resubmit the merge",
+            "scheduler_status": {
+                "disposition": "retry_tick",
+                "wake_class": "retry_tick",
+                "retryable": true,
+                "error_code": "github_stack_convergence_deadline_exceeded",
+                "schema_version": 1
+            }
+        })),
+    );
+
+    let scheduler = scheduler_failure_status(&error);
+    assert_eq!(scheduler.disposition, SchedulerDisposition::OperatorAction);
+    assert_eq!(scheduler.wake_class, SchedulerWakeClass::OperatorAction);
+    assert!(!scheduler.retryable);
+    let attached = attach_scheduler_failure(&error, &scheduler);
+    let details = attached.details().unwrap();
+    assert_eq!(details["retryable"], false);
+    assert_eq!(details["scheduler_status"]["retryable"], false);
+    assert_eq!(details["scheduler_status"]["wake_class"], "operator_action");
+}
+
+#[test]
 #[allow(clippy::too_many_lines, clippy::unreadable_literal)]
-fn submitted_landing_checkpoint_is_retained_until_full_convergence() {
+fn submitted_landing_checkpoint_is_retained_without_blocking_after_stale_deadline() {
     let pulls = vec![
         caravan_member(1, "root", "main"),
         caravan_member(2, "child", "root"),
+        {
+            let mut unrelated = unlabelled_candidate();
+            unrelated.number = PrNumber(3);
+            unrelated.title = "unrelated".to_owned();
+            unrelated.head = branch("unrelated");
+            unrelated
+        },
     ];
     let mut status = caravan_status(pulls.clone(), Some(PrNumber(1)), true);
     enable_native_backend(&mut status);
@@ -11853,17 +11894,66 @@ fn submitted_landing_checkpoint_is_retained_until_full_convergence() {
         .unwrap();
         assert_eq!(observed.convergence_observations, expected);
     }
-    let error = reconcile_pending_native_stack_landing_checkpoints(
-        &AppContext {
-            repository_path: native.repository_path.clone(),
-            config_path: std::path::PathBuf::from(".caravan/config.yaml"),
-            config_existed: true,
-            config,
-        },
-        &status,
-        &provider,
+    assert!(
+        !reconcile_pending_native_stack_landing_checkpoints(
+            &AppContext {
+                repository_path: native.repository_path.clone(),
+                config_path: std::path::PathBuf::from(".caravan/config.yaml"),
+                config_existed: true,
+                config: config.clone(),
+            },
+            &status,
+            &provider,
+        )
+        .expect("stale released checkpoint quarantines only its exact merge")
+    );
+    let observed = crate::stack_checkpoint::load::<crate::github::GitHubStackLandCheckpoint>(
+        &native.repository_path,
+        "land-42",
     )
-    .unwrap_err();
-    assert_eq!(error.code(), "github_stack_convergence_deadline_exceeded");
-    assert_eq!(error.details().unwrap()["retryable"], false);
+    .unwrap()
+    .expect("the resumable convergence cursor remains durable");
+    assert_eq!(observed.convergence_observations, 8);
+    assert_eq!(
+        observed.phase,
+        crate::github::GitHubStackLandPhase::Released
+    );
+    assert!(status.analysis.fleet.unqueued.contains(&PrNumber(3)));
+    assert!(
+        provider
+            .calls
+            .borrow()
+            .iter()
+            .all(|kind| *kind != MutationKind::SquashMerge)
+    );
+
+    // A later fresh projection closes the delayed selected prefix. The exact
+    // checkpoint then clears normally without having blocked the unrelated
+    // root while the provider's earlier projection was stale.
+    let mut converged = status;
+    for selected in [PrNumber(1), PrNumber(2)] {
+        let pull = converged.analysis.pull_requests.get_mut(&selected).unwrap();
+        pull.state = PullRequestState::Merged;
+    }
+    assert!(
+        reconcile_pending_native_stack_landing_checkpoints(
+            &AppContext {
+                repository_path: native.repository_path.clone(),
+                config_path: std::path::PathBuf::from(".caravan/config.yaml"),
+                config_existed: true,
+                config,
+            },
+            &converged,
+            &provider,
+        )
+        .expect("fresh delayed prefix closure completes convergence")
+    );
+    assert!(
+        crate::stack_checkpoint::load::<crate::github::GitHubStackLandCheckpoint>(
+            &native.repository_path,
+            "land-42",
+        )
+        .unwrap()
+        .is_none()
+    );
 }
