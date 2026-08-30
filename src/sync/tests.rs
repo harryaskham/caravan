@@ -11711,10 +11711,17 @@ fn terminal_stack_convergence_receipt_never_advertises_retry_tick() {
 
 #[test]
 #[allow(clippy::too_many_lines, clippy::unreadable_literal)]
-fn submitted_landing_checkpoint_is_retained_until_full_convergence() {
+fn submitted_landing_checkpoint_is_retained_without_blocking_after_stale_deadline() {
     let pulls = vec![
         caravan_member(1, "root", "main"),
         caravan_member(2, "child", "root"),
+        {
+            let mut unrelated = unlabelled_candidate();
+            unrelated.number = PrNumber(3);
+            unrelated.title = "unrelated".to_owned();
+            unrelated.head = branch("unrelated");
+            unrelated
+        },
     ];
     let mut status = caravan_status(pulls.clone(), Some(PrNumber(1)), true);
     enable_native_backend(&mut status);
@@ -11887,17 +11894,66 @@ fn submitted_landing_checkpoint_is_retained_until_full_convergence() {
         .unwrap();
         assert_eq!(observed.convergence_observations, expected);
     }
-    let error = reconcile_pending_native_stack_landing_checkpoints(
-        &AppContext {
-            repository_path: native.repository_path.clone(),
-            config_path: std::path::PathBuf::from(".caravan/config.yaml"),
-            config_existed: true,
-            config,
-        },
-        &status,
-        &provider,
+    assert!(
+        !reconcile_pending_native_stack_landing_checkpoints(
+            &AppContext {
+                repository_path: native.repository_path.clone(),
+                config_path: std::path::PathBuf::from(".caravan/config.yaml"),
+                config_existed: true,
+                config: config.clone(),
+            },
+            &status,
+            &provider,
+        )
+        .expect("stale released checkpoint quarantines only its exact merge")
+    );
+    let observed = crate::stack_checkpoint::load::<crate::github::GitHubStackLandCheckpoint>(
+        &native.repository_path,
+        "land-42",
     )
-    .unwrap_err();
-    assert_eq!(error.code(), "github_stack_convergence_deadline_exceeded");
-    assert_eq!(error.details().unwrap()["retryable"], false);
+    .unwrap()
+    .expect("the resumable convergence cursor remains durable");
+    assert_eq!(observed.convergence_observations, 8);
+    assert_eq!(
+        observed.phase,
+        crate::github::GitHubStackLandPhase::Released
+    );
+    assert!(status.analysis.fleet.unqueued.contains(&PrNumber(3)));
+    assert!(
+        provider
+            .calls
+            .borrow()
+            .iter()
+            .all(|kind| *kind != MutationKind::SquashMerge)
+    );
+
+    // A later fresh projection closes the delayed selected prefix. The exact
+    // checkpoint then clears normally without having blocked the unrelated
+    // root while the provider's earlier projection was stale.
+    let mut converged = status;
+    for selected in [PrNumber(1), PrNumber(2)] {
+        let pull = converged.analysis.pull_requests.get_mut(&selected).unwrap();
+        pull.state = PullRequestState::Merged;
+    }
+    assert!(
+        reconcile_pending_native_stack_landing_checkpoints(
+            &AppContext {
+                repository_path: native.repository_path.clone(),
+                config_path: std::path::PathBuf::from(".caravan/config.yaml"),
+                config_existed: true,
+                config,
+            },
+            &converged,
+            &provider,
+        )
+        .expect("fresh delayed prefix closure completes convergence")
+    );
+    assert!(
+        crate::stack_checkpoint::load::<crate::github::GitHubStackLandCheckpoint>(
+            &native.repository_path,
+            "land-42",
+        )
+        .unwrap()
+        .is_none()
+    );
 }

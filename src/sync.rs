@@ -2536,19 +2536,14 @@ fn reconcile_pending_native_stack_landing_checkpoints(
                         "fresh provider status has not yet proven merged prefix, promoted linear suffix, and exact Stack membership",
                     );
                     crate::stack_checkpoint::write(&context.repository_path, &key, &checkpoint)?;
-                    if checkpoint.convergence_observations >= 8 {
-                        return Err(AppError::structured(
-                            ErrorCategory::ExecutionFailure,
-                            "github_stack_convergence_deadline_exceeded",
-                            "native Stack landing reached terminal merge but complete queue convergence was not proven within the bounded observation window",
-                            Some(json!({
-                                "checkpoint": checkpoint,
-                                "retryable": false,
-                                "operator_action_required": true,
-                                "safe_next_action": "inspect fresh logical membership, PR bases/heads, provider Stack membership, and cara-stack-merge-lock rulesets; do not resubmit the merge",
-                            })),
-                        ));
-                    }
+                    // A released checkpoint is an exact quarantine for this one
+                    // terminal provider merge, not a global queue lock. Provider
+                    // projections can retain merged prefix rows or stale Stack
+                    // membership long after the merge and branch-lock release.
+                    // Keep the saturating observation cursor until fresh status
+                    // proves convergence, but let ordinary reconciliation repair
+                    // the promoted suffix and admit unrelated roots. The Released
+                    // phase guarantees that no later tick can resubmit the merge.
                 }
             }
         }
