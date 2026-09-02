@@ -455,13 +455,18 @@ fn native_stack_status(
                 .is_some_and(|pull| pull.state == crate::model::PullRequestState::Open)
         })
         .collect::<Vec<_>>();
-    let terminal_merged = !stack.open
-        && !members.is_empty()
-        && members.iter().all(|number| {
-            analysis
-                .pull_requests
-                .get(number)
-                .is_some_and(crate::model::PullRequestSnapshot::is_merged)
+    // GitHub can retain a Stack as `open` after every member merged, while
+    // also refusing to unstack those terminal rows. Treat exact provider merge
+    // provenance as terminal history regardless of the stale Stack-level flag.
+    let terminal_merged = !stack.pull_requests.is_empty()
+        && stack.pull_requests.iter().all(|entry| {
+            entry.merged_at.is_some()
+                && (entry.state.eq_ignore_ascii_case("closed")
+                    || entry.state.eq_ignore_ascii_case("merged"))
+                && analysis
+                    .pull_requests
+                    .get(&PrNumber(entry.number))
+                    .is_none_or(crate::model::PullRequestSnapshot::is_merged)
         });
     let caravan = current_members
         .first()
@@ -8120,7 +8125,9 @@ mod tests {
                 base: crate::github::GitHubStackBase {
                     ref_name: "main".to_owned(),
                 },
-                open: false,
+                // GitHub may leave the Stack-level state open even though
+                // every member has exact terminal merge provenance.
+                open: true,
                 created_at: "2026-08-10T14:00:00Z".to_owned(),
                 pull_requests: vec![
                     crate::github::GitHubStackPullRequest {
