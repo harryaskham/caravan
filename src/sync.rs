@@ -8915,6 +8915,14 @@ fn ci_generation_evidence(
     evidence
 }
 
+fn root_checks_passing(observed: &PullRequestSnapshot) -> bool {
+    // Merge authorization must use the exact root snapshot refreshed immediately
+    // before the provider merge. The tick-level CI cache can predate a rerun or
+    // late failing job on the same head, which otherwise turns GitHub's BLOCKED
+    // state into a false `forge_refuses_merge` / branch-protection diagnosis.
+    classify_checks(&observed.checks, false) == CiDisposition::Passing
+}
+
 fn classify_checks(checks: &[CheckSnapshot], forced: bool) -> CiDisposition {
     if forced {
         return CiDisposition::Forced;
@@ -11096,12 +11104,7 @@ impl SyncProgress {
         }
         let facts = RootMergeFacts {
             default_branch: &default_branch,
-            checks_passing: self
-                .ci
-                .iter()
-                .rev()
-                .find(|observation| observation.pr == number)
-                .is_some_and(|observation| observation.disposition == CiDisposition::Passing),
+            checks_passing: root_checks_passing(&observed),
             required_runs_satisfied: self
                 .required_runs
                 .iter()

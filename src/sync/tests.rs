@@ -8809,6 +8809,25 @@ fn newest_same_head_pending_generation_supersedes_old_failure() {
 }
 
 #[test]
+fn exact_refreshed_root_failure_blocks_merge_even_after_earlier_green_observation() {
+    let mut root = pull_request(
+        3253,
+        "root-head",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    root.checks = vec![required_workflow_check(
+        CHECK_LINT,
+        CheckState::Failure,
+        3253,
+        "2026-08-27T14:53:33Z",
+    )];
+
+    assert!(!root_checks_passing(&root));
+}
+
+#[test]
 fn newest_same_head_success_supersedes_old_cancellation() {
     let head = "same-head";
     let old_cancelled = required_workflow_check(
