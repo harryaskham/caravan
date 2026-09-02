@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub mod admission;
+mod bd_8d157d_intentional_compile_failure;
 pub mod ci;
 pub mod ci_admission_gate;
 pub mod ci_gate;
