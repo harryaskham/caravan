@@ -1943,7 +1943,7 @@ mod tests {
 
     fn inventory_call(topologies: &[GitHubStackTopology]) -> (CommandSpec, CommandOutput) {
         (
-            super::super::native_stack_list_command(&repository()),
+            super::super::native_stack_list_command(&repository(), 1),
             CommandOutput::success(inventory_json(topologies)),
         )
     }
@@ -2383,7 +2383,7 @@ mod tests {
     #[test]
     fn capability_404_and_rate_failure_are_distinct_and_zero_write() {
         let unavailable = GitHubMutationAdapter::new(FakeRunner::new(vec![(
-            super::super::native_stack_list_command(&repository()),
+            super::super::native_stack_list_command(&repository(), 1),
             CommandOutput::failure(1, "gh: Not Found (HTTP 404)"),
         )]));
         let plan = GitHubStackCreatePlan {
@@ -2398,7 +2398,7 @@ mod tests {
         unavailable.runner.assert_exhausted();
 
         let unknown = GitHubMutationAdapter::new(FakeRunner::new(vec![(
-            super::super::native_stack_list_command(&repository()),
+            super::super::native_stack_list_command(&repository(), 1),
             CommandOutput::failure(1, "gh: rate limit exceeded (HTTP 403)"),
         )]));
         assert!(matches!(
@@ -2735,7 +2735,7 @@ mod tests {
                 CommandOutput::failure(1, "gh: Not Found (HTTP 404)"),
             ),
             (
-                super::super::native_stack_list_command(&repository()),
+                super::super::native_stack_list_command(&repository(), 1),
                 CommandOutput::failure(1, "gh: Not Found (HTTP 404)"),
             ),
         ]));

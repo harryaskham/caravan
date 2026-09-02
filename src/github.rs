@@ -94,13 +94,13 @@ impl Default for DiscoveryOptions {
     }
 }
 
-/// One bounded provider-native Stack inventory page.
+/// One bounded provider-native Stack inventory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct GitHubStackInventory {
     pub stacks: Vec<GitHubStackSnapshot>,
-    /// Exactly one page of 100 Stacks is read. A full page cannot prove that no
-    /// later page exists, so callers must surface truncation rather than infer
-    /// repository-wide completeness.
+    /// The bounded page budget was exhausted before a short terminal page.
+    /// Callers must surface truncation rather than infer repository-wide
+    /// completeness.
     pub truncated: bool,
 }
 
@@ -668,36 +668,49 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
         self
     }
 
-    /// Read one bounded page of provider-native Stacks without mutating Stack,
-    /// PR, branch, or local tracking state.
+    /// Read a bounded, paginated inventory of provider-native Stacks without
+    /// mutating Stack, PR, branch, or local tracking state.
     pub fn native_stack_inventory(
         &self,
         repository: &RepositoryId,
     ) -> Result<GitHubStackInventory, GitHubStackReadError> {
-        let command = native_stack_list_command(repository);
-        let output = self
-            .runner
-            .run(&command)
-            .map_err(GitHubStackReadError::Runner)?;
-        if !output.is_success() {
-            let diagnostic = output.stderr.trim().to_owned();
-            if diagnostic.contains("HTTP 404") {
-                return Err(GitHubStackReadError::Unavailable { diagnostic });
-            }
-            return Err(GitHubStackReadError::CommandFailed {
-                code: output.code,
-                diagnostic,
-            });
-        }
-        let stacks: Vec<GitHubStackSnapshot> =
-            serde_json::from_str(&output.stdout).map_err(|error| {
-                GitHubStackReadError::InvalidJson {
-                    message: error.to_string(),
+        const PAGE_SIZE: usize = 100;
+        const MAX_PAGES: u32 = 10;
+
+        let mut stacks = Vec::new();
+        for page in 1..=MAX_PAGES {
+            let command = native_stack_list_command(repository, page);
+            let output = self
+                .runner
+                .run(&command)
+                .map_err(GitHubStackReadError::Runner)?;
+            if !output.is_success() {
+                let diagnostic = output.stderr.trim().to_owned();
+                if diagnostic.contains("HTTP 404") {
+                    return Err(GitHubStackReadError::Unavailable { diagnostic });
                 }
-            })?;
+                return Err(GitHubStackReadError::CommandFailed {
+                    code: output.code,
+                    diagnostic,
+                });
+            }
+            let mut page_stacks: Vec<GitHubStackSnapshot> = serde_json::from_str(&output.stdout)
+                .map_err(|error| GitHubStackReadError::InvalidJson {
+                    message: error.to_string(),
+                })?;
+            let terminal_page = page_stacks.len() < PAGE_SIZE;
+            stacks.append(&mut page_stacks);
+            if terminal_page {
+                return Ok(GitHubStackInventory {
+                    stacks,
+                    truncated: false,
+                });
+            }
+        }
+
         Ok(GitHubStackInventory {
-            truncated: stacks.len() == 100,
             stacks,
+            truncated: true,
         })
     }
 
@@ -2860,10 +2873,13 @@ fn repository_id(slug: &str) -> Result<RepositoryId, DiscoveryError> {
     })
 }
 
-fn native_stack_list_command(repository: &RepositoryId) -> CommandSpec {
+fn native_stack_list_command(repository: &RepositoryId, page: u32) -> CommandSpec {
     CommandSpec::new("gh").args([
         "api",
-        &format!("repos/{}/stacks?per_page=100&page=1", repository.slug()),
+        &format!(
+            "repos/{}/stacks?per_page=100&page={page}",
+            repository.slug()
+        ),
     ])
 }
 
@@ -6549,7 +6565,7 @@ mod tests {
 
     #[test]
     fn native_stack_inventory_decodes_one_bounded_read_only_page() {
-        let command = native_stack_list_command(&repository());
+        let command = native_stack_list_command(&repository(), 1);
         let runner = FakeRunner::new(vec![(
             command,
             CommandOutput::success(
@@ -6569,8 +6585,52 @@ mod tests {
     }
 
     #[test]
+    fn native_stack_inventory_reads_until_a_short_terminal_page() {
+        let full_page = (1..=100)
+            .map(|number| {
+                serde_json::json!({
+                    "id": number,
+                    "number": number,
+                    "node_id": format!("S_{number}"),
+                    "base": { "ref": "main" },
+                    "open": false,
+                    "created_at": "2026-07-31T10:00:00Z",
+                    "pull_requests": []
+                })
+            })
+            .collect::<Vec<_>>();
+        let second_page = serde_json::json!([{
+            "id": 101,
+            "number": 101,
+            "node_id": "S_101",
+            "base": { "ref": "main" },
+            "open": true,
+            "created_at": "2026-08-01T10:00:00Z",
+            "pull_requests": []
+        }]);
+        let runner = FakeRunner::new(vec![
+            (
+                native_stack_list_command(&repository(), 1),
+                CommandOutput::success(serde_json::to_string(&full_page).unwrap()),
+            ),
+            (
+                native_stack_list_command(&repository(), 2),
+                CommandOutput::success(second_page.to_string()),
+            ),
+        ]);
+        let adapter = GitHubMutationAdapter::new(runner);
+
+        let inventory = adapter.native_stack_inventory(&repository()).unwrap();
+
+        assert_eq!(inventory.stacks.len(), 101);
+        assert_eq!(inventory.stacks.last().unwrap().number, 101);
+        assert!(!inventory.truncated);
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
     fn native_stack_inventory_distinguishes_unavailable_from_unknown() {
-        let command = native_stack_list_command(&repository());
+        let command = native_stack_list_command(&repository(), 1);
         let unavailable = GitHubMutationAdapter::new(FakeRunner::new(vec![(
             command.clone(),
             CommandOutput::failure(1, "gh: Not Found (HTTP 404)"),
