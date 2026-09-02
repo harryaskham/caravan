@@ -4058,6 +4058,11 @@ mod tests {
             "const SALOON_ORDER = [\"ready\", \"conflicting\", \"saddling\", \"other\", \"bounty\"]"
         ));
         assert!(APP_JS.contains("admissionFact(status, \"candidates\", pr)"));
+        assert!(
+            APP_JS.contains("const projection = pr.draft ? null : compatibilityFact(repo, pr)")
+        );
+        assert!(APP_JS.contains("Draft pull request; mark it ready before admission"));
+        assert!(APP_JS.contains("pr.draft ? \"\" : actionButton(\"Preflight\""));
         assert!(APP_JS.contains("Ready (${ready.map(targetLabel).join(\", \")})"));
         assert!(APP_JS.contains("Conflicting (${conflicting.map(targetLabel).join(\", \")})"));
         assert!(APP_JS.contains("Exact target compatibility"));
