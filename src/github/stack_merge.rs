@@ -1781,6 +1781,49 @@ mod tests {
         );
     }
 
+    /// Regression for bd-bbf2a3 / Stack #3575: failure while reshaping a
+    /// descendant must not erase the independently landable native prefix.
+    #[test]
+    fn ready_two_member_prefix_isolated_from_conflicting_descendant() {
+        let mut stack = generation();
+        let parent = stack.topology.entries.last().unwrap().head.clone();
+        stack.topology.entries.push(GitHubStackEntryGeneration {
+            position: 2,
+            pr: PrNumber(103),
+            stack_state: "open".to_owned(),
+            pull_request_state: PullRequestState::Open,
+            draft: false,
+            merged_at: None,
+            base: parent,
+            head: branch("conflicting-descendant", "ccc333"),
+        });
+        let preserved_suffix = stack.topology.entries[2..].to_vec();
+        let mut evidence = ready_evidence(&stack);
+        evidence[2].blockers = vec![GitHubStackMergeBlocker::MechanicallyBlocked];
+
+        let prefix = plan_github_stack_ready_prefix(&stack, &evidence).unwrap();
+
+        assert_eq!(prefix.selected, stack.topology.entries[..2]);
+        assert_eq!(
+            prefix.first_blocked,
+            Some(GitHubStackBlockedEntry {
+                pr: stack.topology.entries[2].pr,
+                position: 2,
+                blockers: vec![GitHubStackMergeBlocker::MechanicallyBlocked],
+            }),
+            "the suffix retains exact blocker evidence for the later repair tick"
+        );
+        let plan = prefix
+            .direct_squash_plan("op-ready-prefix", "cara")
+            .unwrap();
+        assert_eq!(plan.selected, stack.topology.entries[..2]);
+        assert_eq!(
+            plan.branch_lock_plan().selected[2..],
+            preserved_suffix,
+            "landing seals and preserves the blocked suffix rather than replaying it first"
+        );
+    }
+
     #[test]
     fn planner_skips_a_proven_merged_prefix_and_selects_the_open_frontier() {
         let mut stack = terminal_stack(generation(), 1);
