@@ -1412,10 +1412,51 @@ fn native_prefix_waits_for_provider_regeneration(
         })
 }
 
+fn quarantined_native_caravan_ids(status: &StatusOutput) -> BTreeSet<PrNumber> {
+    status
+        .stack_backend
+        .native_stacks
+        .iter()
+        .filter(|native| {
+            native.stack.open
+                && native.caravan_id.is_some()
+                && !native.problems.is_empty()
+                && native
+                    .problems
+                    .iter()
+                    .all(|problem| problem.code == "github_stack_member_order_drift")
+        })
+        .filter_map(|native| native.caravan_id)
+        .collect()
+}
+
+fn blocking_native_stack_problems(status: &StatusOutput) -> Vec<&crate::read::StackBackendProblem> {
+    let isolated = status
+        .stack_backend
+        .native_stacks
+        .iter()
+        .filter(|native| {
+            native.stack.open
+                && native.caravan_id.is_some()
+                && !native.problems.is_empty()
+                && native
+                    .problems
+                    .iter()
+                    .all(|problem| problem.code == "github_stack_member_order_drift")
+        })
+        .flat_map(|native| native.problems.iter())
+        .collect::<Vec<_>>();
+    status
+        .stack_backend
+        .problems
+        .iter()
+        .filter(|problem| !isolated.contains(problem))
+        .collect()
+}
+
 pub(crate) fn require_native_stack_backend_healthy(status: &StatusOutput) -> Result<(), AppError> {
-    if status.stack_backend.configured != crate::config::StackType::Github
-        || status.stack_backend.problems.is_empty()
-    {
+    let blocking = blocking_native_stack_problems(status);
+    if status.stack_backend.configured != crate::config::StackType::Github || blocking.is_empty() {
         return Ok(());
     }
     Err(AppError::structured(
@@ -1423,7 +1464,7 @@ pub(crate) fn require_native_stack_backend_healthy(status: &StatusOutput) -> Res
         "github_stack_backend_unhealthy",
         "native GitHub Stack state does not exactly match Cara's logical caravans",
         Some(json!({
-            "problems": status.stack_backend.problems,
+            "problems": blocking,
             "native_stacks": status.stack_backend.native_stacks,
             "mutated": false,
             "provider_mutations": 0,
@@ -9214,6 +9255,7 @@ fn parked_caravan_may_need_gate_recovery(status: &StatusOutput, caravan: &Carava
 }
 
 fn select_caravans(status: &StatusOutput, all: bool) -> Result<Vec<Caravan>, AppError> {
+    let quarantined = quarantined_native_caravan_ids(status);
     let mut caravans = if all {
         status
             .analysis
@@ -9221,7 +9263,8 @@ fn select_caravans(status: &StatusOutput, all: bool) -> Result<Vec<Caravan>, App
             .caravans
             .iter()
             .filter(|caravan| {
-                !caravan.parked || parked_caravan_may_need_gate_recovery(status, caravan)
+                !quarantined.contains(&caravan.id)
+                    && (!caravan.parked || parked_caravan_may_need_gate_recovery(status, caravan))
             })
             .cloned()
             .collect()
@@ -9258,6 +9301,27 @@ fn select_caravans(status: &StatusOutput, all: bool) -> Result<Vec<Caravan>, App
                     format!("PR #{current} is not an active caravan member"),
                 )
             })?;
+        if quarantined.contains(&caravan.id) {
+            let native = status
+                .stack_backend
+                .native_stacks
+                .iter()
+                .find(|native| native.caravan_id == Some(caravan.id));
+            return Err(AppError::structured(
+                ErrorCategory::Validation,
+                "github_stack_membership_repair_required",
+                "the selected caravan is quarantined because provider and Cara member order differ",
+                Some(json!({
+                    "caravan": caravan,
+                    "provider_stack": native.map(|native| &native.stack),
+                    "problems": native.map(|native| &native.problems),
+                    "mutated": false,
+                    "retryable": false,
+                    "operator_action_required": true,
+                    "safe_next_action": format!("review `cara native-stack recovery-preview --root {} --actor <actor> --reason <reason>` against the exact provider and Caravan member orders; apply only the returned exact reviewed plan", caravan.id),
+                })),
+            ));
+        }
         if caravan.parked && !parked_caravan_may_need_gate_recovery(status, &caravan) {
             return Err(AppError::structured(
                 ErrorCategory::Validation,
@@ -9942,11 +10006,39 @@ impl SyncProgress {
     ) -> Self {
         let operation_id = OperationId::new();
         let events = conflict_detected_events(status, &operation_id);
+        let steps = status
+            .stack_backend
+            .native_stacks
+            .iter()
+            .filter(|native| quarantined_native_caravan_ids(status).contains(&native.caravan_id.unwrap_or(PrNumber(0))))
+            .map(|native| {
+                let caravan = native
+                    .caravan_id
+                    .and_then(|id| status.analysis.fleet.caravans.iter().find(|caravan| caravan.id == id));
+                let logical_members = caravan.map_or_else(Vec::new, |caravan| caravan.members.clone());
+                let logical_generations = logical_members
+                    .iter()
+                    .filter_map(|pr| status.analysis.pull_requests.get(pr).map(PullRequestPrecondition::from))
+                    .collect::<Vec<_>>();
+                MutationStep {
+                    kind: MutationKind::NativeStackLand,
+                    state: MutationStepState::AlreadySatisfied,
+                    pr: native.caravan_id,
+                    summary: format!(
+                        "topology quarantine receipt: Stack #{} provider_before={} caravan_members={:?} caravan_generations={} mutated=false retryable=false repair=review native-stack recovery-preview and apply only its exact sealed intent; rollback=preserve provider_before byte-for-byte",
+                        native.stack.number,
+                        serde_json::to_string(&native.stack).expect("provider Stack evidence serializes"),
+                        logical_members,
+                        serde_json::to_string(&logical_generations).expect("logical generation evidence serializes"),
+                    ),
+                }
+            })
+            .collect();
         Self {
             operation_id,
             repository: status.repository.clone(),
             default_branch: status.default_branch.clone(),
-            steps: Vec::new(),
+            steps,
             provider_receipts: Vec::new(),
             root_auto_merge: Vec::new(),
             root_promotion: Vec::new(),

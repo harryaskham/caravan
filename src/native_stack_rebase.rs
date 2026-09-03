@@ -280,10 +280,19 @@ fn plan_from_native(
     }
     let retained_closed_rows = proven_retained_closed_rows(native);
     let active_prefix = proven_active_fleet_prefix(status, native);
+    let representation_only_membership_repair = !native.problems.is_empty()
+        && native
+            .problems
+            .iter()
+            .all(|problem| problem.code == "github_stack_member_order_drift");
     let unexpected = native
         .problems
         .iter()
-        .filter(|problem| !repairable_problem(problem, retained_closed_rows, active_prefix))
+        .filter(|problem| {
+            !(repairable_problem(problem, retained_closed_rows, active_prefix)
+                || (representation_only_membership_repair
+                    && problem.code == "github_stack_member_order_drift"))
+        })
         .collect::<Vec<_>>();
     if !unexpected.is_empty() {
         return Err(AppError::structured(
@@ -343,7 +352,9 @@ fn plan_from_native(
         || active[0].base.repository != status.analysis.fleet.default_branch.repository
         || active[0].base.name != status.analysis.fleet.default_branch.name
         || active[0].base.oid != status.analysis.fleet.default_branch.oid;
-    let first_diverged = if root_stale || representation_drift {
+    let first_diverged = if representation_only_membership_repair {
+        None
+    } else if root_stale || representation_drift {
         Some(0)
     } else {
         (1..active.len()).find(|position| {
@@ -353,15 +364,16 @@ fn plan_from_native(
                 .find(|edge| edge.child_pr == active[*position].number)
                 .is_none_or(|edge| !edge.linear)
         })
-    }
-    .ok_or_else(|| {
-        AppError::structured(
+    };
+    if !representation_only_membership_repair && first_diverged.is_none() {
+        return Err(AppError::structured(
             ErrorCategory::Validation,
             "native_stack_rebase_not_required",
             "the active fleet root and every adjacent head already match current ancestry",
             Some(json!({"stack": native.stack.number, "mutated": false})),
-        )
-    })?;
+        ));
+    }
+    let first_diverged = first_diverged.unwrap_or(active.len());
     if native.ancestry.iter().any(|edge| {
         caravan.members[first_diverged..].contains(&edge.child_pr)
             && matches!(
@@ -464,10 +476,12 @@ fn apply_plan(
 ) -> Result<(NativeStackRebaseOutput, StatusOutput), AppError> {
     let timeout = std::time::Duration::from_secs(context.config.command_timeout_secs);
     let mut prepared = Vec::with_capacity(plan.members.len());
-    let mut target = crate::physical_rebase::PlannedBase::Remote(BranchSnapshot {
-        repository: plan.repository.clone(),
-        name: plan.members[0].parent_branch.clone(),
-        oid: plan.members[0].parent_head.clone(),
+    let mut target = plan.members.first().map(|member| {
+        crate::physical_rebase::PlannedBase::Remote(BranchSnapshot {
+            repository: plan.repository.clone(),
+            name: member.parent_branch.clone(),
+            oid: member.parent_head.clone(),
+        })
     });
     for member in &plan.members {
         let candidate = status
@@ -485,7 +499,7 @@ fn apply_plan(
             &plan.repository,
             candidate,
             crate::physical_rebase::range_base_for_rewritten_parent(candidate, &parent),
-            target,
+            target.expect("non-empty rebase plan has a target"),
             &status.analysis.fleet.default_branch,
             crate::physical_rebase::RebaseExecutionBudget::new(timeout)
                 .with_deadline(deadline)
@@ -497,16 +511,26 @@ fn apply_plan(
                     },
                 )),
         )?;
-        target = crate::physical_rebase::PlannedBase::Simulated(BranchSnapshot {
-            repository: plan.repository.clone(),
-            name: member.branch.clone(),
-            oid: item.plan.new_head_oid.clone(),
-        });
+        target = Some(crate::physical_rebase::PlannedBase::Simulated(
+            BranchSnapshot {
+                repository: plan.repository.clone(),
+                name: member.branch.clone(),
+                oid: item.plan.new_head_oid.clone(),
+            },
+        ));
         prepared.push(item);
     }
     let prepared_refs = prepared.iter().collect::<Vec<_>>();
-    let physical = crate::physical_rebase::apply_prepared_atomically(&prepared_refs)?;
-    let rewritten_status =
+    let physical = if prepared_refs.is_empty() {
+        None
+    } else {
+        Some(crate::physical_rebase::apply_prepared_atomically(
+            &prepared_refs,
+        )?)
+    };
+    let rewritten_status = if physical.is_none() {
+        status.clone()
+    } else {
         read_postcondition(context, deadline, github_budget).map_err(|error| {
             AppError::structured(
                 ErrorCategory::ExecutionFailure,
@@ -520,7 +544,8 @@ fn apply_plan(
                     "resumable": true,
                 })),
             )
-        })?;
+        })?
+    };
     let caravan = rewritten_status
         .analysis
         .fleet
@@ -656,10 +681,12 @@ fn apply_plan(
             Some(json!({"plan": plan, "physical": physical, "mutated": true})),
         ));
     }
-    let fresh_ci_required = physical
-        .receipts
-        .iter()
-        .any(|receipt| !receipt.already_satisfied);
+    let fresh_ci_required = physical.as_ref().is_some_and(|physical| {
+        physical
+            .receipts
+            .iter()
+            .any(|receipt| !receipt.already_satisfied)
+    });
     let next = if fresh_ci_required {
         "wait for fresh CI only on rewritten heads, then rerun cara sync"
     } else {
@@ -668,7 +695,7 @@ fn apply_plan(
     let output = NativeStackRebaseOutput {
         plan,
         mutated: true,
-        physical: Some(physical),
+        physical,
         drift_clear: Some(drift_clear),
         replacement,
         fresh_ci_required,
@@ -786,11 +813,7 @@ fn automatic_rebase_stack(backend: &crate::read::StackBackendStatus) -> Option<u
             let retained = proven_retained_closed_rows(native);
             native.problems.iter().any(|native_problem| {
                 native_problem.code == problem.code
-                    && repairable_problem(
-                        native_problem,
-                        retained,
-                        native_problem.code == "github_stack_member_order_drift",
-                    )
+                    && repairable_problem(native_problem, retained, false)
             })
         })
     }) {
@@ -802,13 +825,10 @@ fn automatic_rebase_stack(backend: &crate::read::StackBackendStatus) -> Option<u
         .filter(|native| {
             let retained = proven_retained_closed_rows(native);
             !native.problems.is_empty()
-                && native.problems.iter().all(|problem| {
-                    repairable_problem(
-                        problem,
-                        retained,
-                        problem.code == "github_stack_member_order_drift",
-                    )
-                })
+                && native
+                    .problems
+                    .iter()
+                    .all(|problem| repairable_problem(problem, retained, false))
         })
         .map(|native| native.stack.number)
         .collect::<Vec<_>>();

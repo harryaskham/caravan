@@ -11388,6 +11388,82 @@ fn open_native_stack_drift_refuses_before_any_merge_plan_or_write() {
     assert_eq!(*provider.native_stack_reads.borrow(), 0);
 }
 
+#[test]
+fn sync_all_quarantines_member_order_drift_and_lands_independent_root() {
+    let pulls = vec![
+        caravan_member(1, "root", "main"),
+        caravan_member(2, "child", "root"),
+        caravan_member(3, "missing-tail", "child"),
+        caravan_member(4, "independent", "main"),
+    ];
+    let mut status = caravan_status(pulls.clone(), Some(PrNumber(1)), true);
+    enable_native_backend(&mut status);
+    let provider_generation = native_generation(&status, 42, &[PrNumber(1), PrNumber(2)]);
+    let provider_stack = crate::github::GitHubStackSnapshot {
+        id: provider_generation.id,
+        number: provider_generation.number,
+        node_id: provider_generation.node_id,
+        open: provider_generation.open,
+        created_at: provider_generation.created_at,
+        base: crate::github::GitHubStackBase {
+            ref_name: provider_generation.topology.base.name.clone(),
+        },
+        pull_requests: provider_generation
+            .topology
+            .entries
+            .iter()
+            .map(|entry| crate::github::GitHubStackPullRequest {
+                number: entry.pr.0,
+                state: "open".to_owned(),
+                draft: entry.draft,
+                merged_at: entry.merged_at.clone(),
+                head: crate::github::GitHubStackPullRequestHead {
+                    ref_name: entry.head.name.clone(),
+                    sha: entry.head.oid.clone(),
+                },
+            })
+            .collect(),
+    };
+    let drift = crate::read::StackBackendProblem {
+        code: "github_stack_member_order_drift".to_owned(),
+        message: "Stack #42 current open members [1,2] do not equal caravan #1 members [1,2,3]"
+            .to_owned(),
+    };
+    status.stack_backend.native_stacks = vec![crate::read::NativeStackStatus {
+        stack: provider_stack,
+        caravan_id: Some(PrNumber(1)),
+        consistency: crate::read::StackConsistency::Drifted,
+        ancestry: Vec::new(),
+        problems: vec![drift.clone()],
+    }];
+    status.stack_backend.problems = vec![drift];
+    let provider = FakeProvider::with_pull_requests(pulls);
+    let (_directory, config, native) = github_native_fixture();
+
+    let progress = execute_bounded_with_native(
+        &status,
+        &provider,
+        true,
+        false,
+        false,
+        64,
+        &BTreeMap::new(),
+        RequiredRunsPolicy::from_config(&config.sync),
+        Some(native),
+    )
+    .expect("pure member-order drift is isolated from independent caravans");
+
+    assert_eq!(progress.synchronized_caravans, vec![PrNumber(4)]);
+    assert_eq!(progress.root_merge.len(), 1);
+    assert_eq!(progress.root_merge[0].pr, PrNumber(4));
+    assert!(provider.calls.borrow().contains(&MutationKind::SquashMerge));
+    assert!(progress.steps.iter().any(|step| {
+        step.summary.contains("topology quarantine receipt")
+            && step.summary.contains("mutated=false")
+            && step.summary.contains("retryable=false")
+    }));
+}
+
 /// bd-ef8e3b: one complete fresh intersection read chooses the lock-fenced
 /// native backend for both a provider-represented singleton and a normal
 /// multi-entry Stack. Neither shape may reach ordinary synchronous squash.
