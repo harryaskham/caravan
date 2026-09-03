@@ -4379,10 +4379,16 @@ fn root_first_output(
     lock_recovery: Option<OperationLockRecovery>,
     lock: &mut WriterOperationGuard,
 ) -> Result<SyncOutput, AppError> {
+    let native_prefix = progress.native_stack.is_some();
     lock.checkpoint(
-        "root_first_merge_complete",
+        if native_prefix {
+            "native_prefix_first_complete"
+        } else {
+            "root_first_merge_complete"
+        },
         json!({
             "root_merge": &progress.root_merge,
+            "native_stack_land": &progress.native_stack_land,
             "provider_state": sync_checkpoint_evidence(&progress),
             "continuation": "ordinary fleet analysis deferred to the next bounded tick",
         }),
@@ -4399,10 +4405,14 @@ fn root_first_output(
     );
     scheduler_status.disposition = SchedulerDisposition::RetryTick;
     scheduler_status.wake_class = SchedulerWakeClass::RetryTick;
-    scheduler_status.reason = format!(
-        "landed {} exact green Cara-owned root(s) before whole-fleet analysis; rerun the next bounded tick from the durable provider cursor",
-        progress.root_merge.len()
-    );
+    scheduler_status.reason = if native_prefix {
+        "advanced native Stack prefix convergence before descendant replay; rerun the next bounded tick from the durable provider cursor".to_owned()
+    } else {
+        format!(
+            "landed {} exact green Cara-owned root(s) before whole-fleet analysis; rerun the next bounded tick from the durable provider cursor",
+            progress.root_merge.len()
+        )
+    };
     let receipt = progress.operation_receipt();
     Ok(SyncOutput {
         tick: SyncTickReceipt {
@@ -5113,6 +5123,49 @@ fn sync_with_lock(
         status = read::fleet_status_for_sync(context, operation_deadline, Some(&github_budget))?;
     }
     let convergence_started = Instant::now();
+
+    // Native Stack landing has the same priority as the Cara-owned root fast
+    // path above. In particular, do not let physical replay of a later blocked
+    // descendant prevent an independently ready Stack prefix from landing.
+    // The locked Stack transaction preserves and receipts the unselected
+    // suffix; a subsequent tick may then repair it against the advanced base.
+    if context.config.stack_type == crate::config::StackType::Github {
+        progress::emit(
+            "native_prefix_first",
+            "evaluating one exact green native Stack prefix before descendant replay",
+        );
+        if let Some(progress) = execute_native_stack_prefix_first(
+            &status,
+            &provider,
+            input.all,
+            context.config.force_merge,
+            context
+                .config
+                .sync
+                .max_mutations_per_tick
+                .saturating_sub(parking_mutations),
+            RequiredRunsPolicy::from_config(&context.config.sync),
+            NativeSyncContext::from_context(context),
+        )? {
+            progress::emit(
+                "native_prefix_first",
+                "advanced a native Stack prefix; deferring descendant replay to the next tick",
+            );
+            return root_first_output(
+                context,
+                input,
+                started,
+                operation_deadline,
+                initial_status_elapsed,
+                convergence_started.elapsed(),
+                progress,
+                status,
+                lock_recovery,
+                &mut lock,
+            );
+        }
+    }
+
     let mut physical_rebuild = PhysicalRebuildOutcome::default();
     if context.config.physical_branch_rewrites_enabled() {
         lock.checkpoint(
@@ -7520,6 +7573,69 @@ fn execute_bounded(
         required_runs,
         None,
     )
+}
+
+/// Advance at most one ready native Stack prefix before physical descendant
+/// replay. A blocked suffix is deliberately not an error here: the provider's
+/// prefix transaction preserves it, and replay resumes on a later tick.
+#[allow(clippy::too_many_arguments)]
+fn execute_native_stack_prefix_first(
+    status: &StatusOutput,
+    provider: &impl SyncProvider,
+    all: bool,
+    force_merge: bool,
+    mutation_limit: u32,
+    required_runs: RequiredRunsPolicy,
+    native_stack: Option<NativeSyncContext>,
+) -> Result<Option<SyncProgress>, AppError> {
+    let Some(native_stack) = native_stack else {
+        return Ok(None);
+    };
+    require_native_stack_backend_healthy(status)?;
+    let mut caravans = select_caravans(status, all)?;
+    caravans.retain(|caravan| {
+        !caravan.parked
+            && !status
+                .pauses
+                .iter()
+                .any(|pause| pause.state.is_effective() && pause.record.caravan_head == caravan.id)
+    });
+
+    for caravan in caravans {
+        if !matches!(
+            native_route_for_caravan(status, provider, &caravan, Some(&native_stack))?,
+            NativeCaravanRoute::NativeStack(_)
+        ) {
+            continue;
+        }
+        let mut progress = SyncProgress::new(status, vec![caravan.id], mutation_limit);
+        progress.native_stack = Some(native_stack.clone());
+        progress.required_runs_grace_secs = required_runs.grace_secs;
+        progress.required_runs_retrigger_enabled = false;
+        preflight_repository(provider, status, &progress)?;
+        validate_graph(
+            status,
+            std::slice::from_ref(&caravan),
+            &progress,
+            force_merge,
+        )?;
+        reconcile_caravan(
+            status,
+            provider,
+            &caravan,
+            false,
+            force_merge,
+            &BTreeMap::new(),
+            &mut progress,
+        )?;
+        // Promotion/disarm writes performed while proving readiness are also
+        // durable progress. Return them instead of discarding their receipts
+        // and entering physical replay in the same tick.
+        if !progress.native_stack_land.is_empty() || progress.operation_receipt().changed {
+            return Ok(Some(progress));
+        }
+    }
+    Ok(None)
 }
 
 fn root_first_eligible(status: &StatusOutput, caravan: &Caravan) -> bool {
