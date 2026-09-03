@@ -2,8 +2,9 @@
 
 use super::{
     AppError, ControlLabelAudit, GitHubMutationReceipt, MembershipOperation, MembershipProvider,
-    MergeMethod, MutationKind, MutationStep, MutationStepState, OperationId, OperationReceipt,
-    PullRequestPrecondition, PullRequestSnapshot, RepositoryId, comment_error, mutation_error,
+    MergeMethod, MutationError, MutationKind, MutationStep, MutationStepState, OperationId,
+    OperationReceipt, PullRequestPrecondition, PullRequestSnapshot, RepositoryId, comment_error,
+    mutation_error,
 };
 
 pub(super) struct ExecutionState {
@@ -67,6 +68,67 @@ impl ExecutionState {
                 .as_ref()
                 .expect("membership execution has current PR facts"),
         )
+    }
+
+    pub(super) fn rollback_membership_envelope(
+        &mut self,
+        provider: &impl MembershipProvider,
+        repository: &RepositoryId,
+    ) -> Result<Vec<GitHubMutationReceipt>, MutationError> {
+        let mut rollback = Vec::new();
+        for completed in self.provider_receipts.clone().into_iter().rev() {
+            let Some(before) = completed.before.as_ref() else {
+                continue;
+            };
+            let receipt = match completed.kind {
+                MutationKind::SetBase => {
+                    provider.set_base(repository, &self.precondition(), &before.base.name)?
+                }
+                MutationKind::AddLabel => {
+                    let Some(label) = completed
+                        .after
+                        .labels
+                        .difference(&before.labels)
+                        .next()
+                        .cloned()
+                    else {
+                        continue;
+                    };
+                    provider.remove_label(repository, &self.precondition(), &label)?
+                }
+                MutationKind::RemoveLabel => {
+                    let Some(label) = before
+                        .labels
+                        .difference(&completed.after.labels)
+                        .next()
+                        .cloned()
+                    else {
+                        continue;
+                    };
+                    provider.add_label(repository, &self.precondition(), &label)?
+                }
+                MutationKind::EnableAutoMerge | MutationKind::DisableAutoMerge => {
+                    if before.auto_merge.enabled {
+                        provider.enable_squash_auto_merge(repository, &self.precondition())?
+                    } else {
+                        provider.disable_auto_merge(repository, &self.precondition())?
+                    }
+                }
+                MutationKind::Comment
+                | MutationKind::CreatePullRequest
+                | MutationKind::SetLabels
+                | MutationKind::ForceIntentTransaction
+                | MutationKind::RebaseBranch
+                | MutationKind::RerunChecks
+                | MutationKind::RequestCheckSuite
+                | MutationKind::SquashMerge
+                | MutationKind::NativeStackLand
+                | MutationKind::Checkout => continue,
+            };
+            self.current = Some(receipt.after.clone());
+            rollback.push(receipt);
+        }
+        Ok(rollback)
     }
 
     pub(super) fn ensure_base(

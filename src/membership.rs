@@ -833,6 +833,103 @@ fn membership_identity_changes(
     changed
 }
 
+fn revalidate_join_target(
+    status: &StatusOutput,
+    target: &JoinTarget,
+    provider: &impl MembershipProvider,
+) -> Result<(), AppError> {
+    revalidate_join_root(status, target, provider)?;
+    let Some(parent_number) = target
+        .caravan
+        .members
+        .len()
+        .checked_sub(2)
+        .and_then(|index| target.caravan.members.get(index))
+        .copied()
+    else {
+        return Ok(());
+    };
+    let expected_parent = status
+        .analysis
+        .pull_requests
+        .get(&parent_number)
+        .ok_or_else(|| {
+            AppError::structured(
+                ErrorCategory::Validation,
+                "join_tail_parent_missing",
+                "selected caravan tail parent is absent from discovery",
+                Some(json!({
+                    "tail_pr": target.tail.number,
+                    "parent_pr": parent_number,
+                    "mutated": false,
+                    "safe_next_action": "rediscover the target caravan; do not attach to a tail whose parent is missing",
+                })),
+            )
+        })?;
+    let actual_parent = provider
+        .refetch_pull_request(&status.repository, parent_number)
+        .map_err(|error| {
+            AppError::structured(
+                ErrorCategory::ExecutionFailure,
+                "join_tail_parent_refetch_failed",
+                "could not revalidate selected tail parent before join mutation",
+                Some(json!({
+                    "tail_pr": target.tail.number,
+                    "parent_pr": parent_number,
+                    "error": error.to_string(),
+                    "mutated": false,
+                })),
+            )
+        })?;
+    let actual_tail = provider
+        .refetch_pull_request(&status.repository, target.tail.number)
+        .map_err(|error| {
+            AppError::structured(
+                ErrorCategory::ExecutionFailure,
+                "join_tail_refetch_failed",
+                "could not revalidate selected tail before join mutation",
+                Some(json!({
+                    "tail_pr": target.tail.number,
+                    "parent_pr": parent_number,
+                    "error": error.to_string(),
+                    "mutated": false,
+                })),
+            )
+        })?;
+    let parent_matches = membership_identity_matches(expected_parent, &actual_parent);
+    let tail_matches = membership_identity_matches(&target.tail, &actual_tail);
+    let parent_lease_matches = actual_tail.base.name == actual_parent.head.name
+        && actual_tail.base.oid == actual_parent.head.oid;
+    if parent_matches
+        && tail_matches
+        && parent_lease_matches
+        && actual_parent.state == crate::model::PullRequestState::Open
+        && actual_tail.state == crate::model::PullRequestState::Open
+    {
+        return Ok(());
+    }
+    Err(AppError::structured(
+        ErrorCategory::Validation,
+        "join_tail_parent_moved_before_apply",
+        "selected caravan tail or its parent changed after join preview",
+        Some(json!({
+            "tail_pr": target.tail.number,
+            "parent_pr": parent_number,
+            "parent_changed_fields": membership_identity_changes(expected_parent, &actual_parent),
+            "tail_changed_fields": membership_identity_changes(&target.tail, &actual_tail),
+            "expected_parent": membership_identity(expected_parent),
+            "actual_parent": membership_identity(&actual_parent),
+            "expected_tail": membership_identity(&target.tail),
+            "actual_tail": membership_identity(&actual_tail),
+            "parent_lease_matches": parent_lease_matches,
+            "mutated": false,
+            "retryable": true,
+            "retry_command": "rerun the same `cara join` command",
+            "safe_next_action": "rediscover the exact target caravan and retry only when its parent-to-tail lease is live",
+        })),
+    ))
+}
+
 fn revalidate_join_root(
     status: &StatusOutput,
     target: &JoinTarget,
@@ -2409,6 +2506,9 @@ fn execute_with_rebase_guard_and_config(
     )?;
     revalidate_generation_before_membership(&status, candidate.number, provider)?;
     revalidate_native_admission_generation(&status, &candidate, &eligibility, provider)?;
+    if let Some(target) = target.as_ref() {
+        revalidate_join_target(&status, target, provider)?;
+    }
     if eligibility.admission_compatibility_authorization.is_some()
         && let Some(context) = context
         && context.config_existed
@@ -2454,40 +2554,75 @@ fn execute_with_rebase_guard_and_config(
     );
     state.current = Some(candidate);
 
-    state.ensure_base(provider, &status.repository, &desired_base)?;
-    // Durable force intent follows the PR through base/position changes. Only
-    // explicit revoke, eviction, or successful merge consumes it (bd-91e96a).
-    // A generation-bound automatic skip is advisory only; every explicit
-    // membership operation is a manual override and consumes it.
-    state.ensure_label_absent(provider, &status.repository, SKIPPED_LABEL)?;
-    for label in &request.agent_priority_labels {
-        if Some(label.as_str()) != desired_priority_label {
-            state.ensure_label_absent(provider, &status.repository, label)?;
+    let mutation_result = (|| -> Result<(), AppError> {
+        state.ensure_base(provider, &status.repository, &desired_base)?;
+        // Durable force intent follows the PR through base/position changes. Only
+        // explicit revoke, eviction, or successful merge consumes it (bd-91e96a).
+        // A generation-bound automatic skip is advisory only; every explicit
+        // membership operation is a manual override and consumes it.
+        state.ensure_label_absent(provider, &status.repository, SKIPPED_LABEL)?;
+        for label in &request.agent_priority_labels {
+            if Some(label.as_str()) != desired_priority_label {
+                state.ensure_label_absent(provider, &status.repository, label)?;
+            }
         }
+        if let Some(label) = desired_priority_label {
+            state.ensure_label_present(provider, &status.repository, label)?;
+        }
+        if request.operation.is_renewal() {
+            state.ensure_label_absent(provider, &status.repository, EVICTED_LABEL)?;
+        }
+        state.ensure_label_present(provider, &status.repository, ACTIVE_LABEL)?;
+        // Under the caravan-owned merge actor nobody delegates to the provider,
+        // not even a fresh root: cara promotes and squashes it itself.
+        if request.operation.is_join() || status.head_merge.actor.caravan() {
+            state.ensure_auto_merge_disabled(provider, &status.repository)?;
+        } else {
+            state.ensure_squash_auto_merge(provider, &status.repository)?;
+        }
+        let audit = membership_audit(
+            &request,
+            &before_labels,
+            &eligibility,
+            state.current.as_ref().expect("current PR"),
+            admission_priority_basis,
+            status.head_merge.actor,
+        );
+        state.ensure_control_label_comment(provider, &status.repository, &audit)
+    })();
+    if let Err(source) = mutation_result {
+        let original_receipts = state.provider_receipts.clone();
+        return match state.rollback_membership_envelope(provider, &status.repository) {
+            Ok(rollback_receipts) => Err(AppError::structured(
+                ErrorCategory::ExecutionFailure,
+                "membership_envelope_rolled_back",
+                "membership mutation failed and every completed base/label/auto-merge step was rolled back",
+                Some(json!({
+                    "source_code": source.code(),
+                    "source": source.details(),
+                    "provider_receipts": original_receipts,
+                    "rollback_receipts": rollback_receipts,
+                    "mutated": false,
+                    "resumable": true,
+                    "safe_next_action": format!("rediscover and rerun `cara {}`", request.operation.name()),
+                })),
+            )),
+            Err(rollback) => Err(AppError::structured(
+                ErrorCategory::ExecutionFailure,
+                "membership_envelope_rollback_indeterminate",
+                "membership mutation failed and exact rollback could not be proven",
+                Some(json!({
+                    "source_code": source.code(),
+                    "source": source.details(),
+                    "provider_receipts": original_receipts,
+                    "rollback_error": rollback.to_string(),
+                    "mutated": true,
+                    "resumable": false,
+                    "safe_next_action": "inspect the exact PR base, labels, and auto-merge state; do not retry membership until the partial envelope is classified",
+                })),
+            )),
+        };
     }
-    if let Some(label) = desired_priority_label {
-        state.ensure_label_present(provider, &status.repository, label)?;
-    }
-    if request.operation.is_renewal() {
-        state.ensure_label_absent(provider, &status.repository, EVICTED_LABEL)?;
-    }
-    state.ensure_label_present(provider, &status.repository, ACTIVE_LABEL)?;
-    // Under the caravan-owned merge actor nobody delegates to the provider,
-    // not even a fresh root: cara promotes and squashes it itself.
-    if request.operation.is_join() || status.head_merge.actor.caravan() {
-        state.ensure_auto_merge_disabled(provider, &status.repository)?;
-    } else {
-        state.ensure_squash_auto_merge(provider, &status.repository)?;
-    }
-    let audit = membership_audit(
-        &request,
-        &before_labels,
-        &eligibility,
-        state.current.as_ref().expect("current PR"),
-        admission_priority_basis,
-        status.head_merge.actor,
-    );
-    state.ensure_control_label_comment(provider, &status.repository, &audit)?;
 
     let receipt = state.operation_receipt();
     let pull_request = state
