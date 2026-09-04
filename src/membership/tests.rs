@@ -984,6 +984,79 @@ fn join_root_drift_after_preview_fails_before_provider_mutation() {
 }
 
 #[test]
+fn join_refuses_closed_tail_parent_before_any_provider_mutation() {
+    let root = pull_request(1, "one", "main", &[ACTIVE_LABEL]);
+    let mut parent = pull_request(2, "two", "one", &[ACTIVE_LABEL]);
+    parent.base.oid.clone_from(&root.head.oid);
+    let mut tail = pull_request(3, "three", "two", &[ACTIVE_LABEL]);
+    tail.base.oid.clone_from(&parent.head.oid);
+    let candidate = pull_request(4, "four", "main", &[]);
+    let status = status(
+        candidate.clone(),
+        vec![root.clone(), parent.clone(), tail.clone()],
+    );
+    let request = MembershipRequest {
+        operation: MembershipOperation::Join,
+        create_pr: false,
+        tail_pr: Some(3),
+        head_pr: None,
+        reason: Some("closed parent fixture".to_owned()),
+        priority_label: None,
+        agent_priority_labels: Vec::new(),
+    };
+    let target = resolve_join_target(&status, &request).unwrap();
+    let mut closed_parent = parent;
+    closed_parent.state = crate::model::PullRequestState::Closed;
+    let provider = FakeProvider::with_pull_requests(vec![root, closed_parent, tail, candidate]);
+    let provider_before = provider.pull_requests.borrow().clone();
+
+    let error = revalidate_join_target(&status, &target, &provider).unwrap_err();
+
+    assert_eq!(error.code(), "join_tail_parent_moved_before_apply");
+    let details = error.details().unwrap();
+    assert_eq!(details["mutated"], false);
+    assert_eq!(details["parent_changed_fields"], json!(["state"]));
+    assert_eq!(*provider.pull_requests.borrow(), provider_before);
+}
+
+#[test]
+fn join_refuses_stale_parent_to_tail_lease_before_any_provider_mutation() {
+    let root = pull_request(1, "one", "main", &[ACTIVE_LABEL]);
+    let mut parent = pull_request(2, "two", "one", &[ACTIVE_LABEL]);
+    parent.base.oid.clone_from(&root.head.oid);
+    let mut tail = pull_request(3, "three", "two", &[ACTIVE_LABEL]);
+    tail.base.oid.clone_from(&parent.head.oid);
+    let candidate = pull_request(4, "four", "main", &[]);
+    let status = status(
+        candidate.clone(),
+        vec![root.clone(), parent.clone(), tail.clone()],
+    );
+    let request = MembershipRequest {
+        operation: MembershipOperation::Join,
+        create_pr: false,
+        tail_pr: Some(3),
+        head_pr: None,
+        reason: Some("stale tail fixture".to_owned()),
+        priority_label: None,
+        agent_priority_labels: Vec::new(),
+    };
+    let target = resolve_join_target(&status, &request).unwrap();
+    let mut stale_tail = tail;
+    stale_tail.base.oid = CommitOid("stale-parent-head".to_owned());
+    let provider = FakeProvider::with_pull_requests(vec![root, parent, stale_tail, candidate]);
+    let provider_before = provider.pull_requests.borrow().clone();
+
+    let error = revalidate_join_target(&status, &target, &provider).unwrap_err();
+
+    assert_eq!(error.code(), "join_tail_parent_moved_before_apply");
+    let details = error.details().unwrap();
+    assert_eq!(details["mutated"], false);
+    assert_eq!(details["parent_lease_matches"], false);
+    assert_eq!(details["tail_changed_fields"], json!(["base"]));
+    assert_eq!(*provider.pull_requests.borrow(), provider_before);
+}
+
+#[test]
 fn empty_source_join_is_zero_mutation_with_exact_receipt() {
     let temporary = tempfile::tempdir().unwrap();
     let remote = temporary.path().join("remote.git");
@@ -2011,11 +2084,15 @@ fn duplicate_explicit_join_retry_resumes_the_same_attach() {
         request.clone(),
     )
     .expect_err("injected provider failure stops the first attempt");
-    assert_eq!(error.code(), "github_mutation_failed");
+    assert_eq!(error.code(), "membership_envelope_rolled_back");
+    assert_eq!(
+        error.details().unwrap()["source_code"],
+        "github_mutation_failed"
+    );
 
     *provider.fail_kind.borrow_mut() = None;
     let partial = provider.pull_requests.borrow()[&PrNumber(3)].clone();
-    assert_eq!(partial.base.name, "one");
+    assert_eq!(partial.base.name, "main");
     assert!(!partial.has_label(ACTIVE_LABEL));
 
     let output = execute(
@@ -2029,7 +2106,7 @@ fn duplicate_explicit_join_retry_resumes_the_same_attach() {
     assert_eq!(output.pull_request.base.name, "one");
     assert!(output.pull_request.has_label(ACTIVE_LABEL));
     assert!(output.receipt.completed_steps.iter().any(|step| {
-        step.kind == MutationKind::SetBase && step.state == MutationStepState::AlreadySatisfied
+        step.kind == MutationKind::SetBase && step.state == MutationStepState::Completed
     }));
     let intent = output
         .admission_intent
@@ -2040,10 +2117,9 @@ fn duplicate_explicit_join_retry_resumes_the_same_attach() {
     );
     assert_eq!(intent.target_caravan, Some(PrNumber(1)));
     assert_eq!(intent.bypassed_unjoined_prs, vec![PrNumber(2)]);
-    assert_eq!(
-        intent.dependency_prs,
-        vec![PrNumber(1)],
-        "the resumed candidate now depends on its joined target root"
+    assert!(
+        intent.dependency_prs.is_empty(),
+        "the rolled-back retry computes intent from the restored main base"
     );
     assert!(intent.provider_mutated);
 }
@@ -2157,7 +2233,12 @@ fn provider_failure_during_permitted_join_reports_partial_evidence() {
     )
     .expect_err("provider failure fails the operation");
 
-    assert_eq!(error.code(), "github_mutation_failed");
+    assert_eq!(error.code(), "membership_envelope_rolled_back");
+    assert_eq!(
+        error.details().unwrap()["source_code"],
+        "github_mutation_failed"
+    );
+    assert_eq!(error.details().unwrap()["mutated"], false);
 }
 
 #[test]
@@ -2336,7 +2417,7 @@ fn missing_labels_fail_before_provider_mutation() {
 }
 
 #[test]
-fn partial_failure_reports_receipts_and_rerun_resumes() {
+fn partial_failure_rolls_back_membership_envelope_and_rerun_resumes() {
     let candidate = pull_request(1, "one", "main", &[]);
     let provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
     *provider.fail_kind.borrow_mut() = Some(MutationKind::EnableAutoMerge);
@@ -2356,7 +2437,9 @@ fn partial_failure_reports_receipts_and_rerun_resumes() {
         request.clone(),
     )
     .unwrap_err();
+    assert_eq!(error.code(), "membership_envelope_rolled_back");
     let details = mcp_cli::StructuredError::details(&error).unwrap();
+    assert_eq!(details["mutated"], false);
     assert!(
         details["provider_receipts"]
             .as_array()
@@ -2366,15 +2449,16 @@ fn partial_failure_reports_receipts_and_rerun_resumes() {
                 receipt["kind"] == serde_json::Value::String("add_label".to_owned())
             })
     );
+    assert!(!provider.pull_requests.borrow()[&PrNumber(1)].has_label(ACTIVE_LABEL));
 
     *provider.fail_kind.borrow_mut() = None;
-    let partial = provider
+    let restored = provider
         .pull_requests
         .borrow()
         .get(&PrNumber(1))
         .unwrap()
         .clone();
-    let output = execute(status(partial, Vec::new()), &clean, &provider, request).unwrap();
+    let output = execute(status(restored, Vec::new()), &clean, &provider, request).unwrap();
     assert_eq!(output.pull_request.auto_merge, AutoMergeState::squash());
 }
 
@@ -2403,7 +2487,7 @@ fn explicit_membership_reason_must_not_be_whitespace() {
 }
 
 #[test]
-fn comment_failure_is_a_resumable_partial_label_mutation() {
+fn comment_failure_rolls_back_membership_envelope() {
     let candidate = pull_request(1, "one", "main", &[]);
     let provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
     *provider.fail_kind.borrow_mut() = Some(MutationKind::Comment);
@@ -2423,17 +2507,12 @@ fn comment_failure_is_a_resumable_partial_label_mutation() {
     )
     .unwrap_err();
 
-    assert_eq!(error.code(), "github_comment_failed");
+    assert_eq!(error.code(), "membership_envelope_rolled_back");
     let details = error.details().unwrap();
-    assert_eq!(details["stage"], "control_label_comment");
+    assert_eq!(details["source_code"], "github_comment_failed");
+    assert_eq!(details["mutated"], false);
     assert_eq!(details["resumable"], true);
-    assert!(
-        details["completed_steps"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|step| step["kind"] == "add_label")
-    );
+    assert!(!provider.pull_requests.borrow()[&PrNumber(1)].has_label(ACTIVE_LABEL));
 }
 
 #[test]
