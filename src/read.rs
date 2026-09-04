@@ -2888,6 +2888,57 @@ fn resolve_admission_with_generation_and_gate(
         });
     }
 
+    // A temporarily blocked root protects only its own dependency domain. Its
+    // descendants cannot be retargeted past it, but unrelated green work must
+    // not leave an otherwise empty repository idle. Unknown/conflicting rank
+    // metadata remains globally blocking because its canonical position cannot
+    // be computed safely; this exception is limited to the exact failing-check
+    // root shape above.
+    let blocked_roots = rejected
+        .iter()
+        .filter(|candidate| {
+            candidate.blocks_order
+                && candidate
+                    .reason
+                    .starts_with("candidate has a failing required check and unjoined descendants")
+        })
+        .map(|candidate| candidate.pr)
+        .collect::<BTreeSet<_>>();
+    if !blocked_roots.is_empty() {
+        let mut independent = Vec::new();
+        for candidate in candidates {
+            let dependencies = analysis
+                .pull_requests
+                .get(&candidate.pr)
+                .map(|pull| crate::admission::dependency_prs(analysis, pull))
+                .unwrap_or_default();
+            let blocked_by = dependencies
+                .iter()
+                .copied()
+                .filter(|dependency| blocked_roots.contains(dependency))
+                .collect::<Vec<_>>();
+            if blocked_by.is_empty() {
+                independent.push(candidate);
+            } else {
+                skipped.push(SkippedAdmissionCandidate {
+                    pr: candidate.pr,
+                    priority_label: candidate.priority_label,
+                    priority_rank: candidate.priority_rank,
+                    created_at: candidate.created_at,
+                    reason: format!(
+                        "preserved behind temporarily blocked dependency domain rooted at {}; unrelated ready candidates may proceed without bypassing or retargeting this chain",
+                        blocked_by
+                            .iter()
+                            .map(|pr| format!("#{pr}"))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ),
+                });
+            }
+        }
+        candidates = independent;
+    }
+
     // An absent explicit priority sorts after every configured rank. GitHub's
     // immutable creation timestamp is FIFO; PR number deterministically breaks
     // equal timestamps. Missing timestamps form a deterministic fallback group
@@ -2931,7 +2982,10 @@ fn resolve_admission_with_generation_and_gate(
         .chain(
             rejected
                 .iter()
-                .filter(|candidate| candidate.blocks_order)
+                .filter(|candidate| {
+                    candidate.blocks_order
+                        && (candidates.is_empty() || !blocked_roots.contains(&candidate.pr))
+                })
                 .map(|candidate| {
                     (
                         candidate.priority_rank.unwrap_or(priority_labels.len() + 1),
@@ -6338,6 +6392,45 @@ mod tests {
                 .iter()
                 .all(|candidate| !candidate.blocks_order
                     && candidate.reason.contains("divergent or unproved"))
+        );
+    }
+
+    #[test]
+    fn blocked_fifo_dependency_domain_does_not_starve_unrelated_green_candidate() {
+        let mut blocked_root = pr(10, "blocked-root", "main", false);
+        blocked_root.checks.push(crate::model::CheckSnapshot {
+            name: "ios-smoke".to_owned(),
+            state: crate::model::CheckState::Failure,
+            provider_state: Some("FAILURE".to_owned()),
+            ..crate::model::CheckSnapshot::default()
+        });
+        let dependent = pr(20, "dependent", "blocked-root", false);
+        let unrelated = pr(30, "unrelated", "main", false);
+        let status = status(blocked_root, vec![dependent, unrelated]);
+        let labels = crate::config::CaravanConfig::default().agent_priority_labels;
+
+        let admission = resolve_admission(&status.analysis, &labels);
+
+        assert_eq!(admission.next_candidate, Some(PrNumber(30)));
+        assert!(admission.rejected.iter().any(|candidate| {
+            candidate.pr == PrNumber(10)
+                && candidate.blocks_order
+                && candidate.reason.contains("unjoined descendants")
+        }));
+        assert!(admission.skipped.iter().any(|candidate| {
+            candidate.pr == PrNumber(20)
+                && candidate.reason.contains("dependency domain rooted at #10")
+                && candidate
+                    .reason
+                    .contains("without bypassing or retargeting")
+        }));
+        assert_eq!(
+            admission
+                .candidates
+                .iter()
+                .map(|candidate| candidate.pr)
+                .collect::<Vec<_>>(),
+            vec![PrNumber(30)]
         );
     }
 
