@@ -356,7 +356,10 @@
   }
 
   function targetSets(repo, pr) {
-    const projection = compatibilityFact(repo, pr);
+    // Draft state is authoritative even if a compatibility row from the same
+    // head generation was retained across the provider's ready→draft update.
+    // Never let stale mechanical compatibility render as Ready for a draft.
+    const projection = pr.draft ? null : compatibilityFact(repo, pr);
     const targets = projection?.targets ?? [];
     return {
       projection,
@@ -389,7 +392,7 @@
   }
 
   function reasonForPr(status, pr) {
-    if (pr.draft) return "Draft pull request";
+    if (pr.draft) return "Draft pull request; mark it ready before admission";
     if (hasLabel(pr, "caravan-evicted")) return "Explicitly evicted; renew or rejoin after fresh validation";
     const rejection = admissionFact(status, "rejected", pr);
     if (rejection) return rejection.reason;
@@ -430,7 +433,7 @@
     const admissions = group === "ready" ? ready.map((target) => target.kind === "caravan_tail"
       ? actionButton(`Join #${target.tail_pr}`, "join", { pr: pr.number, tail_pr: target.tail_pr, create_pr: false, reason: "Caravan dashboard exact compatible admission", priority_label: null }, "primary")
       : actionButton("New caravan", "new", { pr: pr.number, create_pr: false, reason: "Caravan dashboard exact compatible admission", priority_label: null }, "primary")).join("") : "";
-    const preflightTarget = ready.find((target) => target.tail_pr)?.tail_pr ?? (compatibilityFact(repo, pr)?.targets ?? []).find((target) => target.tail_pr)?.tail_pr;
+    const preflightTarget = pr.draft ? null : ready.find((target) => target.tail_pr)?.tail_pr ?? (compatibilityFact(repo, pr)?.targets ?? []).find((target) => target.tail_pr)?.tail_pr;
     const groupTone = group === "ready" ? "good" : group === "conflicting" || group === "bounty" ? "bad" : "warn";
     const priorities = repo.effective_config?.agent_priority_labels ?? [];
     const selectedPriorities = priorities.filter((label) => hasLabel(pr, label));
@@ -446,7 +449,7 @@
       <p class="reason">${escapeHtml(reasonForPr(status, pr))}</p>
       ${compatibilityRows(repo, pr)}
       ${checkRows(pr.checks)}
-      <div class="card-actions">${actionButton("Preflight", "check", { pr: pr.number, ...(preflightTarget ? { tail_pr: preflightTarget } : {}) }, "", false)}${admissions}${priorityControls}</div>
+      <div class="card-actions">${pr.draft ? "" : actionButton("Preflight", "check", { pr: pr.number, ...(preflightTarget ? { tail_pr: preflightTarget } : {}) }, "", false)}${admissions}${priorityControls}</div>
     </article>`;
   }
 
