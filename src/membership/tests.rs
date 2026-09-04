@@ -2084,11 +2084,15 @@ fn duplicate_explicit_join_retry_resumes_the_same_attach() {
         request.clone(),
     )
     .expect_err("injected provider failure stops the first attempt");
-    assert_eq!(error.code(), "github_mutation_failed");
+    assert_eq!(error.code(), "membership_envelope_rolled_back");
+    assert_eq!(
+        error.details().unwrap()["source_code"],
+        "github_mutation_failed"
+    );
 
     *provider.fail_kind.borrow_mut() = None;
     let partial = provider.pull_requests.borrow()[&PrNumber(3)].clone();
-    assert_eq!(partial.base.name, "one");
+    assert_eq!(partial.base.name, "main");
     assert!(!partial.has_label(ACTIVE_LABEL));
 
     let output = execute(
@@ -2102,7 +2106,7 @@ fn duplicate_explicit_join_retry_resumes_the_same_attach() {
     assert_eq!(output.pull_request.base.name, "one");
     assert!(output.pull_request.has_label(ACTIVE_LABEL));
     assert!(output.receipt.completed_steps.iter().any(|step| {
-        step.kind == MutationKind::SetBase && step.state == MutationStepState::AlreadySatisfied
+        step.kind == MutationKind::SetBase && step.state == MutationStepState::Completed
     }));
     let intent = output
         .admission_intent
@@ -2113,10 +2117,9 @@ fn duplicate_explicit_join_retry_resumes_the_same_attach() {
     );
     assert_eq!(intent.target_caravan, Some(PrNumber(1)));
     assert_eq!(intent.bypassed_unjoined_prs, vec![PrNumber(2)]);
-    assert_eq!(
-        intent.dependency_prs,
-        vec![PrNumber(1)],
-        "the resumed candidate now depends on its joined target root"
+    assert!(
+        intent.dependency_prs.is_empty(),
+        "the rolled-back retry computes intent from the restored main base"
     );
     assert!(intent.provider_mutated);
 }
@@ -2230,7 +2233,12 @@ fn provider_failure_during_permitted_join_reports_partial_evidence() {
     )
     .expect_err("provider failure fails the operation");
 
-    assert_eq!(error.code(), "github_mutation_failed");
+    assert_eq!(error.code(), "membership_envelope_rolled_back");
+    assert_eq!(
+        error.details().unwrap()["source_code"],
+        "github_mutation_failed"
+    );
+    assert_eq!(error.details().unwrap()["mutated"], false);
 }
 
 #[test]
