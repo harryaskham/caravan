@@ -12069,7 +12069,7 @@ fn submitted_landing_checkpoint_is_retained_without_blocking_after_stale_deadlin
         ancestry: Vec::new(),
         problems: Vec::new(),
     }];
-    assert!(converged.analysis.pull_requests.get(&PrNumber(1)).is_none());
+    assert!(!converged.analysis.pull_requests.contains_key(&PrNumber(1)));
     assert!(
         converged
             .analysis
