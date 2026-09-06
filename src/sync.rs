@@ -2640,10 +2640,11 @@ fn native_stack_landing_converged(
         .iter()
         .map(|entry| entry.pr)
         .collect::<BTreeSet<_>>();
-    let terminal_provider_stack =
-        status.stack_backend.native_stacks.iter().find(|native| {
-            native.stack.number == checkpoint.plan.before.number && !native.stack.open
-        });
+    let terminal_provider_stack = status
+        .stack_backend
+        .native_stacks
+        .iter()
+        .find(|native| native.stack.number == checkpoint.plan.before.number);
     if selected.iter().any(|pr| {
         let current_merged = status
             .analysis

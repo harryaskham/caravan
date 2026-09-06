@@ -12021,8 +12021,8 @@ fn submitted_landing_checkpoint_is_retained_without_blocking_after_stale_deadlin
     );
 
     // GitHub may drop the merged prefix from ordinary PR discovery after
-    // closing the unselected suffix. Reopening that exact suffix must retire
-    // the released checkpoint from the closed provider Stack's immutable merge
+    // closing the unselected suffix. Reopening that exact suffix may reopen the
+    // provider Stack too; it must still retire the released checkpoint from the Stack's immutable merge
     // provenance instead of requiring the vanished prefix in current status.
     let reopened_suffix = caravan_member(2, "child", "main");
     let mut unrelated = unlabelled_candidate();
@@ -12039,7 +12039,7 @@ fn submitted_landing_checkpoint_is_retained_without_blocking_after_stale_deadlin
             base: crate::github::GitHubStackBase {
                 ref_name: "main".to_owned(),
             },
-            open: false,
+            open: true,
             created_at: "2026-08-01T00:00:00Z".to_owned(),
             pull_requests: vec![
                 crate::github::GitHubStackPullRequest {
@@ -12054,7 +12054,7 @@ fn submitted_landing_checkpoint_is_retained_without_blocking_after_stale_deadlin
                 },
                 crate::github::GitHubStackPullRequest {
                     number: 2,
-                    state: "closed".to_owned(),
+                    state: "open".to_owned(),
                     draft: false,
                     merged_at: None,
                     head: crate::github::GitHubStackPullRequestHead {
