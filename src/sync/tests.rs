@@ -11823,7 +11823,7 @@ fn submitted_landing_checkpoint_is_retained_without_blocking_after_stale_deadlin
     let generation = native_generation(&status, 42, &[PrNumber(1), PrNumber(2)]);
     let (_directory, config, native) = github_native_fixture();
 
-    let evidence = generation
+    let mut evidence = generation
         .topology
         .entries
         .iter()
@@ -11833,6 +11833,7 @@ fn submitted_landing_checkpoint_is_retained_without_blocking_after_stale_deadlin
             blockers: Vec::new(),
         })
         .collect::<Vec<_>>();
+    evidence[1].blockers = vec![crate::github::GitHubStackMergeBlocker::RequiredChecksNotReady];
     let prefix = crate::github::plan_github_stack_ready_prefix(&generation, &evidence)
         .expect("complete exact-green Stack has a ready prefix");
     let plan = prefix
@@ -11880,8 +11881,8 @@ fn submitted_landing_checkpoint_is_retained_without_blocking_after_stale_deadlin
                 source_type: "Repository".to_owned(),
                 target: "branch".to_owned(),
                 enforcement: "active".to_owned(),
-                selected_pull_requests: vec![PrNumber(1), PrNumber(2)],
-                selected_refs: vec!["refs/heads/root".to_owned(), "refs/heads/child".to_owned()],
+                selected_pull_requests: vec![PrNumber(1)],
+                selected_refs: vec!["refs/heads/root".to_owned()],
                 current_user_can_bypass: "never".to_owned(),
                 created_at: String::new(),
                 updated_at: String::new(),
@@ -11920,11 +11921,8 @@ fn submitted_landing_checkpoint_is_retained_without_blocking_after_stale_deadlin
                     source_type: "Repository".to_owned(),
                     target: "branch".to_owned(),
                     enforcement: "active".to_owned(),
-                    selected_pull_requests: vec![PrNumber(1), PrNumber(2)],
-                    selected_refs: vec![
-                        "refs/heads/root".to_owned(),
-                        "refs/heads/child".to_owned(),
-                    ],
+                    selected_pull_requests: vec![PrNumber(1)],
+                    selected_refs: vec!["refs/heads/root".to_owned()],
                     current_user_can_bypass: "never".to_owned(),
                     created_at: String::new(),
                     updated_at: String::new(),
@@ -12022,21 +12020,71 @@ fn submitted_landing_checkpoint_is_retained_without_blocking_after_stale_deadlin
             .all(|kind| *kind != MutationKind::SquashMerge)
     );
 
-    // A later fresh projection closes the delayed selected prefix. The exact
-    // checkpoint then clears normally without having blocked the unrelated
-    // root while the provider's earlier projection was stale.
-    let mut converged = status;
-    for selected in [PrNumber(1), PrNumber(2)] {
-        let pull = converged.analysis.pull_requests.get_mut(&selected).unwrap();
-        pull.state = PullRequestState::Merged;
-    }
+    // GitHub may drop the merged prefix from ordinary PR discovery after
+    // closing the unselected suffix. Reopening that exact suffix must retire
+    // the released checkpoint from the closed provider Stack's immutable merge
+    // provenance instead of requiring the vanished prefix in current status.
+    let reopened_suffix = caravan_member(2, "child", "main");
+    let mut unrelated = unlabelled_candidate();
+    unrelated.number = PrNumber(3);
+    unrelated.title = "unrelated".to_owned();
+    unrelated.head = branch("unrelated");
+    let mut converged = caravan_status(vec![reopened_suffix, unrelated], None, true);
+    enable_native_backend(&mut converged);
+    converged.stack_backend.native_stacks = vec![crate::read::NativeStackStatus {
+        stack: crate::github::GitHubStackSnapshot {
+            id: 42,
+            number: 42,
+            node_id: "S_closed".to_owned(),
+            base: crate::github::GitHubStackBase {
+                ref_name: "main".to_owned(),
+            },
+            open: false,
+            created_at: "2026-08-01T00:00:00Z".to_owned(),
+            pull_requests: vec![
+                crate::github::GitHubStackPullRequest {
+                    number: 1,
+                    state: "closed".to_owned(),
+                    draft: false,
+                    merged_at: Some("2026-09-06T00:00:00Z".to_owned()),
+                    head: crate::github::GitHubStackPullRequestHead {
+                        ref_name: "root".to_owned(),
+                        sha: CommitOid("root".to_owned()),
+                    },
+                },
+                crate::github::GitHubStackPullRequest {
+                    number: 2,
+                    state: "closed".to_owned(),
+                    draft: false,
+                    merged_at: None,
+                    head: crate::github::GitHubStackPullRequestHead {
+                        ref_name: "child".to_owned(),
+                        sha: CommitOid("child".to_owned()),
+                    },
+                },
+            ],
+        },
+        caravan_id: None,
+        consistency: crate::read::StackConsistency::Exact,
+        ancestry: Vec::new(),
+        problems: Vec::new(),
+    }];
+    assert!(converged.analysis.pull_requests.get(&PrNumber(1)).is_none());
+    assert!(
+        converged
+            .analysis
+            .fleet
+            .caravans
+            .iter()
+            .any(|caravan| { caravan.members == vec![PrNumber(2)] && !caravan.parked })
+    );
     assert!(
         reconcile_pending_native_stack_landing_checkpoints(
             &AppContext {
                 repository_path: native.repository_path.clone(),
                 config_path: std::path::PathBuf::from(".caravan/config.yaml"),
                 config_existed: true,
-                config,
+                config: config.clone(),
             },
             &converged,
             &provider,
@@ -12051,4 +12099,23 @@ fn submitted_landing_checkpoint_is_retained_without_blocking_after_stale_deadlin
         .unwrap()
         .is_none()
     );
+
+    let drain_provider = FakeProvider::with_pull_requests(
+        converged.analysis.pull_requests.values().cloned().collect(),
+    );
+    let drained = execute_bounded_with_native(
+        &converged,
+        &drain_provider,
+        true,
+        false,
+        false,
+        64,
+        &BTreeMap::new(),
+        RequiredRunsPolicy::from_config(&config.sync),
+        Some(native),
+    )
+    .expect("reopened exact singleton uses the normal landing path");
+    assert_eq!(drained.root_merge.len(), 1);
+    assert_eq!(drained.root_merge[0].pr, PrNumber(2));
+    assert!(drained.native_stack_land.is_empty());
 }

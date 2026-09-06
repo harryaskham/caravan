@@ -2640,12 +2640,25 @@ fn native_stack_landing_converged(
         .iter()
         .map(|entry| entry.pr)
         .collect::<BTreeSet<_>>();
+    let terminal_provider_stack =
+        status.stack_backend.native_stacks.iter().find(|native| {
+            native.stack.number == checkpoint.plan.before.number && !native.stack.open
+        });
     if selected.iter().any(|pr| {
-        status
+        let current_merged = status
             .analysis
             .pull_requests
             .get(pr)
-            .is_none_or(|pull| !pull.is_merged())
+            .is_some_and(crate::model::PullRequestSnapshot::is_merged);
+        let terminal_stack_merged = terminal_provider_stack.is_some_and(|native| {
+            native.stack.pull_requests.iter().any(|entry| {
+                entry.number == pr.0
+                    && entry.merged_at.is_some()
+                    && (entry.state.eq_ignore_ascii_case("closed")
+                        || entry.state.eq_ignore_ascii_case("merged"))
+            })
+        });
+        !current_merged && !terminal_stack_merged
     }) {
         return false;
     }
