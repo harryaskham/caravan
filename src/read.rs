@@ -2244,6 +2244,19 @@ fn status_with_discovery_options(
     }
     let compatibility_deferred_for_scale =
         defer_status_compatibility_for_scale(bounded_compatibility, snapshot.pull_requests.len());
+    // A focused remote-PR check first spends a bounded fleet/provider discovery
+    // phase, then needs a complete compatibility proof for that exact subject.
+    // Give that proof one fresh child-command budget rather than whatever crumbs
+    // remain from discovery in a large repository. This is scoped to explicit
+    // `focus_pr`; fleet status and mutation capacity are unchanged.
+    let focused_compatibility_reserve = focus_pr.map(|_| child_timeout).unwrap_or_default();
+    let post_discovery_deadline = if focus_pr.is_some() {
+        std::time::Instant::now()
+            .checked_add(child_timeout)
+            .unwrap_or(operation_deadline)
+    } else {
+        operation_deadline
+    };
     let compatibility_deadline = if bounded_compatibility {
         let now = std::time::Instant::now();
         if compatibility_deferred_for_scale {
@@ -2259,7 +2272,7 @@ fn status_with_discovery_options(
             )
         }
     } else {
-        operation_deadline
+        post_discovery_deadline
     };
     let checker = GitCompatibilityChecker::new(&context.repository_path, "origin")
         .with_timeout(child_timeout)
@@ -2331,7 +2344,7 @@ fn status_with_discovery_options(
     let local_generation_runner =
         crate::command::ProcessRunner::in_directory(&context.repository_path)
             .with_timeout(child_timeout)
-            .with_operation_deadline(operation_deadline);
+            .with_operation_deadline(post_discovery_deadline);
     let mut generation_integrity = crate::generation::analyze(&generation_facts, |base, head| {
         // bd-7546ea: exact local objects are an authoritative ancestry proof.
         // Try that bounded proof first so locally present cumulative generations
@@ -2439,7 +2452,7 @@ fn status_with_discovery_options(
 
     let total = started.elapsed();
     if (!bounded_compatibility || compatibility_complete)
-        && std::time::Instant::now() >= operation_deadline
+        && std::time::Instant::now() >= post_discovery_deadline
     {
         return Err(AppError::structured(
             ErrorCategory::Timeout,
@@ -2463,7 +2476,7 @@ fn status_with_discovery_options(
         Duration::ZERO
     };
     output.timing = Some(StatusTiming {
-        deadline_ms: millis(operation_budget),
+        deadline_ms: millis(operation_budget.saturating_add(focused_compatibility_reserve)),
         total_ms: millis(total),
         completion_reserve_ms: millis(if bounded_compatibility {
             STATUS_COMPLETION_RESERVE.saturating_add(STATUS_POST_ANALYSIS_RESERVE)
