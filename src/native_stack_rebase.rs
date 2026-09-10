@@ -210,7 +210,12 @@ pub fn preview(
     let _planning = context.acquire_planning_operation("native-stack-rebase-preview")?;
     let deadline = std::time::Instant::now()
         + std::time::Duration::from_secs(context.config.sync.max_duration_secs);
-    let status = read::status_with_deadline(context, deadline)?;
+    // The stack number is the complete subject identity. A targeted preview
+    // must not depend on whichever historical branch the caller's checkout
+    // happens to have selected; fleet discovery deliberately declines to
+    // resolve that unrelated local branch while retaining all selected-Stack
+    // validation below.
+    let status = read::fleet_status(context, deadline, None)?;
     plan_from_status(context, &status, input)
 }
 
@@ -457,10 +462,7 @@ fn read_postcondition(
     deadline: std::time::Instant,
     github_budget: Option<&crate::command::GithubRequestBudget>,
 ) -> Result<StatusOutput, AppError> {
-    github_budget.map_or_else(
-        || read::status_with_deadline(context, deadline),
-        |budget| read::status_with_deadline_and_budget(context, deadline, Some(budget)),
-    )
+    read::fleet_status(context, deadline, github_budget)
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -892,7 +894,9 @@ pub fn apply(
     let writer = context.acquire_writer_operation("native-stack-rebase-apply")?;
     let deadline = std::time::Instant::now()
         + std::time::Duration::from_secs(context.config.sync.max_duration_secs);
-    let status = read::status_with_deadline(context, deadline)?;
+    // Apply is fenced by an explicit Stack plus sealed plan hash, so local
+    // current-branch resolution is unrelated state rather than authority.
+    let status = read::fleet_status(context, deadline, None)?;
     let intent = NativeStackRebasePreviewInput {
         stack: input.stack,
         actor: input.actor.clone(),
