@@ -74,6 +74,8 @@ struct FakeProvider {
     /// Ordinary squash requests GitHub refuses because a Stack appeared after
     /// the exact routing read.
     stack_merge_refusals: RefCell<u32>,
+    released_reobserve_status: RefCell<Option<crate::github::GitHubStackMergeStatus>>,
+    released_reobservations: RefCell<u32>,
 }
 
 impl FakeProvider {
@@ -119,6 +121,8 @@ impl FakeProvider {
             native_stack_intersection_reads: RefCell::new(0),
             native_stack_routing_failure: RefCell::new(None),
             stack_merge_refusals: RefCell::new(0),
+            released_reobserve_status: RefCell::new(None),
+            released_reobservations: RefCell::new(0),
         }
     }
 
@@ -323,6 +327,20 @@ impl SyncProvider for FakeProvider {
         next.phase = crate::github::GitHubStackLandPhase::Terminal;
         next.terminal_status = Some(crate::github::GitHubStackMergeStatus::Merged);
         Ok(next)
+    }
+
+    fn native_stack_land_reobserve_released_for_sync(
+        &self,
+        _repository: &RepositoryId,
+        checkpoint: &crate::github::GitHubStackLandCheckpoint,
+    ) -> Result<crate::github::GitHubStackLandCheckpoint, AppError> {
+        *self.released_reobservations.borrow_mut() += 1;
+        let Some(status) = *self.released_reobserve_status.borrow() else {
+            return Ok(checkpoint.clone());
+        };
+        let mut next = checkpoint.clone();
+        next.terminal_status = Some(status);
+        Ok(next.reseal())
     }
 
     fn native_stack_land_release_for_sync(
@@ -12020,6 +12038,17 @@ fn submitted_landing_checkpoint_is_retained_without_blocking_after_stale_deadlin
             .all(|kind| *kind != MutationKind::SquashMerge)
     );
 
+    // The released receipt can initially be indeterminate even though the
+    // saved UUID later becomes terminal failed after GitHub landed only the
+    // exact lower prefix. Re-observation is read-only and updates that same
+    // checkpoint; it never resubmits the merge.
+    let mut indeterminate = observed;
+    indeterminate.terminal_status = Some(crate::github::GitHubStackMergeStatus::Indeterminate);
+    let indeterminate = indeterminate.reseal();
+    crate::stack_checkpoint::write(&native.repository_path, "land-42", &indeterminate).unwrap();
+    *provider.released_reobserve_status.borrow_mut() =
+        Some(crate::github::GitHubStackMergeStatus::Failed);
+
     // GitHub may drop the merged prefix from ordinary PR discovery after
     // closing the unselected suffix. Reopening that exact suffix may reopen the
     // provider Stack too; it must still retire the released checkpoint from the Stack's immutable merge
@@ -12099,6 +12128,7 @@ fn submitted_landing_checkpoint_is_retained_without_blocking_after_stale_deadlin
         .unwrap()
         .is_none()
     );
+    assert_eq!(*provider.released_reobservations.borrow(), 1);
 
     let drain_provider = FakeProvider::with_pull_requests(
         converged.analysis.pull_requests.values().cloned().collect(),
