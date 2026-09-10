@@ -301,6 +301,46 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
         Ok(advance(checkpoint, &receipt))
     }
 
+    /// Re-observe the exact durable UUID after an indeterminate result was
+    /// released. This never resubmits: it performs only the provider status
+    /// read bound to the saved merge checkpoint, and preserves the already-
+    /// completed lock release while replacing indeterminate with later terminal
+    /// proof.
+    pub fn native_stack_land_reobserve_released(
+        &self,
+        repository: &RepositoryId,
+        checkpoint: &GitHubStackLandCheckpoint,
+    ) -> Result<GitHubStackLandCheckpoint, GitHubStackLandError> {
+        validate(repository, checkpoint)?;
+        if checkpoint.phase != GitHubStackLandPhase::Released
+            || checkpoint.terminal_status != Some(GitHubStackMergeStatus::Indeterminate)
+        {
+            return Err(GitHubStackLandError::OutOfOrder {
+                expected: "a released indeterminate checkpoint with an exact UUID".to_owned(),
+                actual: checkpoint.phase,
+            });
+        }
+        let merge =
+            checkpoint
+                .merge
+                .as_ref()
+                .ok_or_else(|| GitHubStackLandError::InvalidCheckpoint {
+                    diagnostic: "released indeterminate checkpoint omitted its merge UUID"
+                        .to_owned(),
+                })?;
+        let receipt = self.native_stack_merge_poll_locked(repository, merge)?;
+        if !matches!(
+            receipt.merge.status,
+            GitHubStackMergeStatus::Merged | GitHubStackMergeStatus::Failed
+        ) {
+            return Ok(checkpoint.clone());
+        }
+        let mut next = checkpoint.clone();
+        next.merge.clone_from(&receipt.checkpoint);
+        next.terminal_status = Some(receipt.merge.status);
+        Ok(next.seal())
+    }
+
     /// Release the lock, and only after terminal provider proof.
     ///
     /// A pending or still-submitted transaction is refused here rather than

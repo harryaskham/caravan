@@ -1165,6 +1165,17 @@ pub trait SyncProvider {
         ))
     }
 
+    fn native_stack_land_reobserve_released_for_sync(
+        &self,
+        _repository: &RepositoryId,
+        _checkpoint: &crate::github::GitHubStackLandCheckpoint,
+    ) -> Result<crate::github::GitHubStackLandCheckpoint, AppError> {
+        Err(AppError::validation(
+            "github_stack_sync_provider_unavailable",
+            "this sync provider does not implement released Stack re-observation",
+        ))
+    }
+
     fn native_stack_land_release_for_sync(
         &self,
         _repository: &RepositoryId,
@@ -1531,6 +1542,15 @@ impl<R: crate::command::CommandRunner> SyncProvider for GitHubMutationAdapter<R>
         checkpoint: &crate::github::GitHubStackLandCheckpoint,
     ) -> Result<crate::github::GitHubStackLandCheckpoint, AppError> {
         self.native_stack_land_poll(repository, checkpoint)
+            .map_err(native_sync_error)
+    }
+
+    fn native_stack_land_reobserve_released_for_sync(
+        &self,
+        repository: &RepositoryId,
+        checkpoint: &crate::github::GitHubStackLandCheckpoint,
+    ) -> Result<crate::github::GitHubStackLandCheckpoint, AppError> {
+        self.native_stack_land_reobserve_released(repository, checkpoint)
             .map_err(native_sync_error)
     }
 
@@ -2569,6 +2589,22 @@ fn reconcile_pending_native_stack_landing_checkpoints(
                 }
             }
             if checkpoint.phase == crate::github::GitHubStackLandPhase::Released {
+                if checkpoint.terminal_status
+                    == Some(crate::github::GitHubStackMergeStatus::Indeterminate)
+                    && checkpoint.merge.is_some()
+                {
+                    let observed = provider
+                        .native_stack_land_reobserve_released_for_sync(repository, &checkpoint)?;
+                    if observed != checkpoint {
+                        checkpoint = observed;
+                        crate::stack_checkpoint::write(
+                            &context.repository_path,
+                            &key,
+                            &checkpoint,
+                        )?;
+                        changed = true;
+                    }
+                }
                 if native_stack_landing_converged(status, &checkpoint) {
                     crate::stack_checkpoint::remove(&context.repository_path, &key)?;
                     changed = true;
@@ -2624,17 +2660,24 @@ fn reconcile_pending_native_stack_landing_checkpoints(
 /// linearly based, and its provider Stack representation is exact. Ordinary
 /// sync owns the intervening promotion/rebase/reconstruction writes; a restart
 /// resumes because this checkpoint is deliberately retained across them.
+#[allow(clippy::too_many_lines)]
 fn native_stack_landing_converged(
     status: &StatusOutput,
     checkpoint: &crate::github::GitHubStackLandCheckpoint,
 ) -> bool {
     if checkpoint.phase != crate::github::GitHubStackLandPhase::Released
         || checkpoint.lock_release.is_none()
-        || checkpoint.terminal_status != Some(crate::github::GitHubStackMergeStatus::Merged)
+        || !matches!(
+            checkpoint.terminal_status,
+            Some(
+                crate::github::GitHubStackMergeStatus::Merged
+                    | crate::github::GitHubStackMergeStatus::Failed
+            )
+        )
     {
         return false;
     }
-    let selected = checkpoint
+    let planned_selected = checkpoint
         .plan
         .selected
         .iter()
@@ -2645,31 +2688,39 @@ fn native_stack_landing_converged(
         .native_stacks
         .iter()
         .find(|native| native.stack.number == checkpoint.plan.before.number);
-    if selected.iter().any(|pr| {
-        let current_merged = status
+    let merged = |pr: PrNumber| {
+        status
             .analysis
             .pull_requests
-            .get(pr)
-            .is_some_and(crate::model::PullRequestSnapshot::is_merged);
-        let terminal_stack_merged = terminal_provider_stack.is_some_and(|native| {
-            native.stack.pull_requests.iter().any(|entry| {
-                entry.number == pr.0
-                    && entry.merged_at.is_some()
-                    && (entry.state.eq_ignore_ascii_case("closed")
-                        || entry.state.eq_ignore_ascii_case("merged"))
+            .get(&pr)
+            .is_some_and(crate::model::PullRequestSnapshot::is_merged)
+            || terminal_provider_stack.is_some_and(|native| {
+                native.stack.pull_requests.iter().any(|entry| {
+                    entry.number == pr.0
+                        && entry.merged_at.is_some()
+                        && (entry.state.eq_ignore_ascii_case("closed")
+                            || entry.state.eq_ignore_ascii_case("merged"))
+                })
             })
-        });
-        !current_merged && !terminal_stack_merged
-    }) {
+    };
+    let ordered = &checkpoint.plan.before.topology.entries;
+    let merged_prefix_len = ordered.iter().take_while(|entry| merged(entry.pr)).count();
+    if merged_prefix_len == 0
+        || ordered
+            .iter()
+            .skip(merged_prefix_len)
+            .any(|entry| merged(entry.pr))
+        || ordered[..merged_prefix_len]
+            .iter()
+            .any(|entry| !planned_selected.contains(&entry.pr))
+        || (checkpoint.terminal_status == Some(crate::github::GitHubStackMergeStatus::Merged)
+            && planned_selected.iter().any(|pr| !merged(*pr)))
+    {
         return false;
     }
-    let surviving = checkpoint
-        .plan
-        .before
-        .topology
-        .entries
+    let surviving = ordered
         .iter()
-        .filter(|entry| !selected.contains(&entry.pr))
+        .skip(merged_prefix_len)
         .map(|entry| entry.pr)
         .collect::<Vec<_>>();
     if surviving.is_empty() {
