@@ -1500,7 +1500,25 @@ recovery shapes. `recovery-apply` requires that hash, independently
 rediscovers the same evidence, and accepts only the mapping shape authorized by
 the action: zero for legacy create, the exact checkpointed provider prefix for
 append, or one exact desired mapping on an idempotent lost-response retry. It
-then calls the existing exact Stack create/add adapter. Truncated inventory,
+then calls the corresponding exact Stack create/add adapter.
+
+A recovery-only `RecoveryAdd` action may reconstruct a contiguous accepted
+logical suffix on one existing partial Stack while retaining closed rows in
+place. Preview binds the complete raw Stack identity/order, independently
+refetches every row's PR state/head/base, and rereads the raw Stack to reject
+observation races. The open rows must equal the exact logical prefix; closed
+history is never membership authority. Only missing-discovery diagnostics for
+those specifically proven closed rows are exempted. Foreign open rows,
+history intersecting active membership, unknown/duplicate/reordered rows,
+moved generations, and multiple or truncated mappings remain refusals.
+Apply persists the original sealed plan before any write, checks the complete
+raw generation twice, and appends only the accepted suffix. Exact readback
+recovers a lost response; an already-satisfied replay writes nothing and retains
+the original plan hash. Retained history and all source generations must remain
+unchanged. Ordinary append validation still requires a merged historical prefix;
+this exception is confined to explicit reviewed recovery.
+
+Truncated inventory,
 singleton input, pauses/parking, non-green
 or changed generations, missing capability/opt-in, and multiple/partial/drifted
 mappings refuse before mutation. Its postcondition rereads every source PR and

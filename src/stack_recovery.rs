@@ -215,6 +215,7 @@ struct RecoveryFacts<'a> {
     pulls: &'a BTreeMap<PrNumber, PullRequestSnapshot>,
     backend: &'a StackBackendStatus,
     pauses: &'a [PauseStatus],
+    recovery_rows: Option<&'a crate::github::GitHubStackGeneration>,
 }
 
 impl<'a> RecoveryFacts<'a> {
@@ -227,6 +228,7 @@ impl<'a> RecoveryFacts<'a> {
             pulls: &status.analysis.pull_requests,
             backend: &status.stack_backend,
             pauses: &status.pauses,
+            recovery_rows: None,
         }
     }
 }
@@ -286,9 +288,12 @@ pub fn preview(
     crate::initialization::require_ready(&status.initialization)?;
     let pending =
         crate::stack_membership::load_pending(&context.repository_path, PrNumber(input.root))?;
+    let rows = observe_recovery_rows(context, &status, PrNumber(input.root), deadline)?;
+    let mut facts = RecoveryFacts::from_status(&status);
+    facts.recovery_rows = rows.as_ref();
     let (plan, observation) = build_plan(
         &context.config,
-        &RecoveryFacts::from_status(&status),
+        &facts,
         PrNumber(input.root),
         &input.actor,
         &input.reason,
@@ -303,6 +308,98 @@ pub fn preview(
         provider_receipt: None,
         next: "review the exact plan hash, then run `cara native-stack recovery-apply` with the same root/actor/reason and --plan-hash; preview never mutates provider state".to_owned(),
     })
+}
+
+/// Fresh row evidence is scoped to one complete provider intersection. It is
+/// never inferred from a missing-PR diagnostic or from a partial inventory.
+fn observe_recovery_rows(
+    context: &AppContext,
+    status: &StatusOutput,
+    root: PrNumber,
+    deadline: Instant,
+) -> Result<Option<crate::github::GitHubStackGeneration>, AppError> {
+    let facts = RecoveryFacts::from_status(status);
+    let caravan = require_recovery_caravan(&facts, root)?;
+    let candidates = facts
+        .backend
+        .native_stacks
+        .iter()
+        .filter(|native| {
+            native
+                .stack
+                .pull_requests
+                .iter()
+                .any(|row| caravan.members.contains(&PrNumber(row.number)))
+        })
+        .collect::<Vec<_>>();
+    let [native] = candidates.as_slice() else {
+        // Existing plan validation diagnoses zero/ambiguous mappings.
+        return Ok(None);
+    };
+    if native
+        .stack
+        .pull_requests
+        .iter()
+        .all(|row| row.state.eq_ignore_ascii_case("open"))
+        && native.stack.pull_requests.len() >= caravan.members.len()
+    {
+        return Ok(None);
+    }
+    if facts.backend.provider_stacks_truncated {
+        return Err(refusal(
+            "github_stack_recovery_inventory_truncated",
+            "partial inventory cannot authorize recovery row selection",
+            json!({"mutated": false}),
+        ));
+    }
+    let runner = ProcessRunner::in_directory(&context.repository_path)
+        .with_timeout(Duration::from_secs(context.config.command_timeout_secs))
+        .with_operation_deadline(deadline);
+    let provider = GitHubMutationAdapter::new(runner);
+    let rows = provider
+        .native_stack_rows_for_recovery(facts.repository, native.stack.number)
+        .map_err(|error| {
+            refusal(
+                "github_stack_recovery_rows_unproven",
+                &error.to_string(),
+                json!({"mutated": false}),
+            )
+        })?
+        .ok_or_else(|| {
+            refusal(
+                "github_stack_recovery_stack_disappeared",
+                "selected Stack disappeared during row observation",
+                json!({"mutated": false}),
+            )
+        })?;
+    if !exact_retained_mapping(native, &rows, &rows.topology) {
+        return Err(refusal(
+            "github_stack_recovery_inventory_changed",
+            "fresh raw rows differ from the complete inventory",
+            json!({"mutated": false}),
+        ));
+    }
+    let raw_members = rows
+        .topology
+        .entries
+        .iter()
+        .map(|entry| entry.pr.0)
+        .collect::<BTreeSet<_>>();
+    if facts.backend.native_stacks.iter().any(|other| {
+        other.stack.number != rows.number
+            && other
+                .stack
+                .pull_requests
+                .iter()
+                .any(|row| raw_members.contains(&row.number))
+    }) {
+        return Err(refusal(
+            "github_stack_recovery_history_intersection",
+            "another provider Stack intersects the selected raw rows, including retained history",
+            json!({"mutated": false}),
+        ));
+    }
+    Ok(Some(rows))
 }
 
 /// Clear only a stale local zero-write checkpoint after proving complete provider absence.
@@ -453,6 +550,9 @@ fn clear_checkpoint_with_backend(
 fn membership_plan_members(plan: &NativeMembershipPlan) -> Vec<PrNumber> {
     match plan {
         NativeMembershipPlan::AbsentSingleton { member, .. } => vec![*member],
+        NativeMembershipPlan::RecoveryAdd { accepted, .. } => {
+            accepted.entries.iter().map(|entry| entry.pr).collect()
+        }
         NativeMembershipPlan::Create { plan } => {
             plan.desired.entries.iter().map(|entry| entry.pr).collect()
         }
@@ -481,9 +581,34 @@ pub fn apply(
     crate::initialization::require_ready(&status.initialization)?;
     let root = PrNumber(input.root);
     let pending = crate::stack_membership::load_pending(&context.repository_path, root)?;
+    let rows = observe_recovery_rows(context, &status, root, deadline)?;
+    let saved = crate::stack_checkpoint::load::<NativeStackRecoveryPlan>(
+        &context.repository_path,
+        &format!(
+            "recovery-plan-{}-{}",
+            root.0,
+            input.plan_hash.replace(':', "-")
+        ),
+    )?;
+    if saved
+        .as_ref()
+        .is_some_and(|plan| !plan.verify() || plan.plan_hash != input.plan_hash)
+    {
+        return Err(refusal(
+            "github_stack_recovery_checkpoint_drift",
+            "recorded recovery authorization is invalid",
+            json!({"mutated": false}),
+        ));
+    }
+    let original_rows = saved.as_ref().and_then(|plan| match &plan.action {
+        NativeMembershipPlan::RecoveryAdd { plan, .. } => Some(&plan.before),
+        _ => None,
+    });
+    let mut facts = RecoveryFacts::from_status(&status);
+    facts.recovery_rows = original_rows.or(rows.as_ref());
     let (plan, observation) = build_plan(
         &context.config,
-        &RecoveryFacts::from_status(&status),
+        &facts,
         root,
         &input.actor,
         &input.reason,
@@ -766,6 +891,40 @@ fn fresh_members_for_plan(
         .collect()
 }
 
+fn persist_reviewed_plan(
+    context: &AppContext,
+    plan: &NativeStackRecoveryPlan,
+) -> Result<(), AppError> {
+    // Keep the original authorization through response loss; never replace it
+    // with a plan reconstructed from the resulting provider state.
+    if !plan.verify() {
+        return Err(refusal(
+            "github_stack_recovery_plan_invalid",
+            "refusing to persist an unsealed recovery plan",
+            json!({"mutated": false}),
+        ));
+    }
+    let key = format!(
+        "recovery-plan-{}-{}",
+        plan.caravan_id.0,
+        plan.plan_hash.replace(':', "-")
+    );
+    if let Some(recorded) =
+        crate::stack_checkpoint::load::<NativeStackRecoveryPlan>(&context.repository_path, &key)?
+    {
+        if &recorded != plan || !recorded.verify() {
+            return Err(refusal(
+                "github_stack_recovery_checkpoint_drift",
+                "the recorded reviewed plan differs from this recovery attempt",
+                json!({"plan_hash": plan.plan_hash, "mutated": false}),
+            ));
+        }
+    } else {
+        crate::stack_checkpoint::write(&context.repository_path, &key, plan)?;
+    }
+    Ok(())
+}
+
 fn apply_plan_with_provider(
     context: &AppContext,
     plan: NativeStackRecoveryPlan,
@@ -794,6 +953,8 @@ fn apply_plan_with_provider(
             }),
         ));
     }
+
+    persist_reviewed_plan(context, &plan)?;
 
     let native_receipt = provider
         .converge_membership(&plan.action)
@@ -982,8 +1143,38 @@ fn build_plan_with_policy(
         &serde_json::to_vec(&desired).expect("native topology serializes"),
     );
     let operation_id = format!("native-stack-recovery-{}-{topology_hash}", root.0);
+    let retained_checkpoint = if pending.is_none() {
+        facts
+            .recovery_rows
+            .map(|before| {
+                let target = before
+                    .recovery_suffix_target(facts.repository, &desired)
+                    .map_err(|error| {
+                        refusal(
+                            "github_stack_recovery_suffix_invalid",
+                            &error.to_string(),
+                            json!({"root": root, "mutated": false}),
+                        )
+                    })?;
+                Ok::<_, AppError>(
+                    NativeMembershipCheckpoint::from_plan(&NativeMembershipPlan::RecoveryAdd {
+                        plan: Box::new(crate::github::GitHubStackAddPlan {
+                            operation_id: operation_id.clone(),
+                            actor: actor.to_owned(),
+                            before: before.clone(),
+                            desired: target,
+                        }),
+                        accepted: Box::new(desired.clone()),
+                    })
+                    .expect("recovery topology has an open root"),
+                )
+            })
+            .transpose()?
+    } else {
+        None
+    };
     let (pending_hash, action) = recovery_action(
-        pending,
+        pending.or(retained_checkpoint.as_ref()),
         facts.repository,
         facts.backend,
         caravan,
@@ -1113,13 +1304,18 @@ fn require_rollout(config: &CaravanConfig, facts: &RecoveryFacts<'_>) -> Result<
         .filter(|problem| {
             problem.code != "github_stack_absent"
                 && problem.code != "github_stack_member_order_drift"
+                && !proven_retained_row_discovery_gap(facts, problem)
         })
         .collect::<Vec<_>>();
     if !unexpected_problems.is_empty() {
         return Err(refusal(
             "github_stack_recovery_backend_unhealthy",
             "native Stack recovery permits only the expected missing-Stack backend problem",
-            json!({"problems": unexpected_problems, "mutated": false}),
+            json!({
+                "problems": unexpected_problems,
+                "retained_closed_rows": retained_closed_rows(facts.backend),
+                "mutated": false,
+            }),
         ));
     }
     if facts.backend.provider_stacks_truncated {
@@ -1143,6 +1339,53 @@ fn require_rollout(config: &CaravanConfig, facts: &RecoveryFacts<'_>) -> Result<
         ));
     }
     Ok(())
+}
+
+fn proven_retained_row_discovery_gap(
+    facts: &RecoveryFacts<'_>,
+    problem: &crate::read::StackBackendProblem,
+) -> bool {
+    if problem.code != "github_stack_pr_missing" {
+        return false;
+    }
+    facts.recovery_rows.is_some_and(|generation| {
+        generation.topology.entries.iter().any(|entry| {
+            entry.pull_request_state != PullRequestState::Open
+                && !facts.pulls.contains_key(&entry.pr)
+                && problem.message
+                    == format!(
+                        "Stack #{} PR #{} is absent from Cara discovery",
+                        generation.number, entry.pr,
+                    )
+        })
+    })
+}
+
+/// Preserve provider rows that ordinary active-member discovery cannot represent.
+/// This is diagnostic evidence only: closed rows never authorize a prefix match
+/// or relax the complete inventory and fresh-provider leases required by apply.
+fn retained_closed_rows(backend: &StackBackendStatus) -> Vec<serde_json::Value> {
+    backend
+        .native_stacks
+        .iter()
+        .flat_map(|native| {
+            native
+                .stack
+                .pull_requests
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.state.eq_ignore_ascii_case("closed"))
+                .map(move |(position, row)| {
+                    json!({
+                        "stack": native.stack.number,
+                        "stack_id": native.stack.id,
+                        "stack_node_id": native.stack.node_id,
+                        "position": position,
+                        "row": row,
+                    })
+                })
+        })
+        .collect()
 }
 
 fn require_member_green(pull: &PullRequestSnapshot) -> Result<(), AppError> {
@@ -1236,6 +1479,38 @@ fn stateless_prefix_action(
     }
 }
 
+fn rebuild_retained_action(
+    plan: &crate::github::GitHubStackAddPlan,
+    accepted: &GitHubStackTopology,
+    operation_id: &str,
+    actor: &str,
+) -> Result<NativeMembershipPlan, AppError> {
+    let target = plan
+        .before
+        .recovery_suffix_target(&accepted.base.repository, accepted)
+        .map_err(|error| {
+            refusal(
+                "github_stack_recovery_checkpoint_drifted",
+                &error.to_string(),
+                json!({"mutated": false}),
+            )
+        })?;
+    if target != plan.desired {
+        return Err(refusal(
+            "github_stack_recovery_checkpoint_drifted",
+            "retained-row target differs from the sealed accepted suffix",
+            json!({"mutated": false}),
+        ));
+    }
+    let mut plan = plan.clone();
+    operation_id.clone_into(&mut plan.operation_id);
+    actor.clone_into(&mut plan.actor);
+    Ok(NativeMembershipPlan::RecoveryAdd {
+        plan: Box::new(plan),
+        accepted: Box::new(accepted.clone()),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn recovery_action(
     pending: Option<&NativeMembershipCheckpoint>,
@@ -1276,6 +1551,9 @@ fn recovery_action(
     }
     let action = match &pending.plan {
         NativeMembershipPlan::Create { plan } if &plan.desired == desired => legacy_create(),
+        NativeMembershipPlan::RecoveryAdd { plan, accepted } if accepted.as_ref() == desired => {
+            rebuild_retained_action(plan, accepted, operation_id, actor)?
+        }
         NativeMembershipPlan::Add {
             repository: planned_repository,
             stack_number,
@@ -1354,6 +1632,16 @@ fn mapping_observation(
         })
         .collect::<Vec<_>>();
     let observation = match (action, intersecting.as_slice()) {
+        (NativeMembershipPlan::RecoveryAdd { plan, .. }, [native])
+            if exact_retained_mapping(native, &plan.before, &plan.before.topology) =>
+        {
+            Some(NativeStackRecoveryObservation::ExactPrefixPendingAdd)
+        }
+        (NativeMembershipPlan::RecoveryAdd { plan, .. }, [native])
+            if exact_retained_mapping(native, &plan.before, &plan.desired) =>
+        {
+            Some(NativeStackRecoveryObservation::ExactAlreadySatisfied)
+        }
         (NativeMembershipPlan::Create { .. }, []) => Some(NativeStackRecoveryObservation::Absent),
         (NativeMembershipPlan::Create { .. }, [native]) if exact_mapping(native, members) => {
             Some(NativeStackRecoveryObservation::ExactAlreadySatisfied)
@@ -1396,6 +1684,35 @@ fn exact_mapping(native: &NativeStackStatus, members: &[PrNumber]) -> bool {
             .iter()
             .map(|entry| PrNumber(entry.number))
             .eq(members.iter().copied())
+}
+
+// Discovery carries only Stack-resource fields. Match all of them here; apply
+// must still perform the fresh PR base/head leases in the provider transaction.
+fn exact_retained_mapping(
+    native: &NativeStackStatus,
+    before: &crate::github::GitHubStackGeneration,
+    target: &GitHubStackTopology,
+) -> bool {
+    let stack = &native.stack;
+    stack.id == before.id
+        && stack.number == before.number
+        && stack.node_id == before.node_id
+        && stack.open == before.open
+        && stack.created_at == before.created_at
+        && stack.base.ref_name == target.base.name
+        && stack.pull_requests.len() == target.entries.len()
+        && stack
+            .pull_requests
+            .iter()
+            .zip(&target.entries)
+            .all(|(row, entry)| {
+                row.number == entry.pr.0
+                    && row.state == entry.stack_state
+                    && row.draft == entry.draft
+                    && row.merged_at == entry.merged_at
+                    && row.head.ref_name == entry.head.name
+                    && row.head.sha == entry.head.oid
+            })
 }
 
 fn exact_prefix_mapping(
@@ -1613,6 +1930,7 @@ mod tests {
             pulls,
             backend,
             pauses: &[],
+            recovery_rows: None,
         }
     }
 
@@ -2018,6 +2336,13 @@ mod tests {
         ) -> Result<NativeMembershipReceipt, NativeMembershipError> {
             self.creates.set(self.creates.get() + 1);
             let (repository, operation_id, actor, operation, desired) = match plan {
+                NativeMembershipPlan::RecoveryAdd { plan, accepted } => (
+                    accepted.base.repository.clone(),
+                    plan.operation_id.clone(),
+                    plan.actor.clone(),
+                    crate::github::GitHubStackMutationOperation::Add,
+                    plan.desired.clone(),
+                ),
                 NativeMembershipPlan::Create { plan } => (
                     plan.desired.base.repository.clone(),
                     plan.operation_id.clone(),
@@ -2158,6 +2483,26 @@ mod tests {
         assert!(output.provider_receipt.unwrap().verify());
         assert_eq!(provider.pulls[&PrNumber(101)].head, root.head);
         assert_eq!(provider.pulls[&PrNumber(102)].head, child.head);
+        let reviewed = output.plan;
+        let checkpoint_key = format!(
+            "recovery-plan-{}-{}",
+            reviewed.caravan_id.0,
+            reviewed.plan_hash.replace(':', "-")
+        );
+        let saved = crate::stack_checkpoint::load::<NativeStackRecoveryPlan>(
+            &context.repository_path,
+            &checkpoint_key,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(saved, reviewed);
+        let mut corrupt = saved;
+        corrupt.reason = "changed after authorization".to_owned();
+        crate::stack_checkpoint::write(&context.repository_path, &checkpoint_key, &corrupt)
+            .unwrap();
+        let error = apply_with_provider(&context, reviewed, observation, &provider).unwrap_err();
+        assert_eq!(error.code(), "github_stack_recovery_checkpoint_drift");
+        assert_eq!(provider.creates.get(), 1);
     }
 
     #[test]
@@ -2377,6 +2722,190 @@ mod tests {
             ancestry: Vec::new(),
             problems: Vec::new(),
         }
+    }
+
+    #[test]
+    fn retained_suffix_plan_replays_with_the_original_hash() {
+        let main = branch("main", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let root = pull(101, main.clone());
+        let child = pull(102, root.head.clone());
+        let tail = pull(103, child.head.clone());
+        let caravans =
+            vec![Caravan::new(vec![PrNumber(101), PrNumber(102), PrNumber(103)]).unwrap()];
+        let pulls = BTreeMap::from([
+            (root.number, root.clone()),
+            (child.number, child),
+            (tail.number, tail),
+        ]);
+        let mut topology = crate::stack_membership::topology_from_members(&main, [&root]).unwrap();
+        let mut history = topology.entries[0].clone();
+        history.position = 1;
+        history.pr = PrNumber(999);
+        history.head = branch("retained", "retained-head");
+        history.pull_request_state = PullRequestState::Closed;
+        history.stack_state = "closed".to_owned();
+        topology.entries.push(history);
+        let before = crate::github::GitHubStackGeneration {
+            id: 3832,
+            number: 3832,
+            node_id: "S_3832".to_owned(),
+            open: true,
+            created_at: String::new(),
+            topology,
+        };
+        let project = |topology: &GitHubStackTopology| {
+            let mut native = exact_native_stack(3832, &[]);
+            native.stack.pull_requests = topology
+                .entries
+                .iter()
+                .map(|entry| crate::github::GitHubStackPullRequest {
+                    number: entry.pr.0,
+                    state: entry.stack_state.clone(),
+                    draft: entry.draft,
+                    merged_at: entry.merged_at.clone(),
+                    head: crate::github::GitHubStackPullRequestHead {
+                        ref_name: entry.head.name.clone(),
+                        sha: entry.head.oid.clone(),
+                    },
+                })
+                .collect();
+            native
+        };
+        let mut backend = stack_backend_fixture(vec![project(&before.topology)]);
+        backend.problems.push(crate::read::StackBackendProblem {
+            code: "github_stack_pr_missing".to_owned(),
+            message: "Stack #3832 PR #999 is absent from Cara discovery".to_owned(),
+        });
+        let mut evidence = facts(&main, &caravans, &pulls, &backend);
+        evidence.recovery_rows = Some(&before);
+        let (plan, observation) = build_plan(
+            &config(),
+            &evidence,
+            PrNumber(101),
+            "operator",
+            "recover suffix",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            observation,
+            NativeStackRecoveryObservation::ExactPrefixPendingAdd
+        );
+        let NativeMembershipPlan::RecoveryAdd { plan: action, .. } = &plan.action else {
+            panic!("recovery action expected")
+        };
+        assert_eq!(action.desired.entries.len(), 4);
+        assert_eq!(
+            &action.desired.entries[..2],
+            before.topology.entries.as_slice()
+        );
+        backend.native_stacks = vec![project(&action.desired)];
+        let mut evidence = facts(&main, &caravans, &pulls, &backend);
+        evidence.recovery_rows = Some(&before);
+        let (replay, observation) = build_plan(
+            &config(),
+            &evidence,
+            PrNumber(101),
+            "operator",
+            "recover suffix",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            observation,
+            NativeStackRecoveryObservation::ExactAlreadySatisfied
+        );
+        assert_eq!(replay.plan_hash, plan.plan_hash);
+    }
+
+    #[test]
+    fn retained_mapping_binds_identity_order_and_closed_head() {
+        let mut native = exact_native_stack(3832, &[3826, 3831, 3830]);
+        native.stack.pull_requests[2].state = "closed".to_owned();
+        let base = branch("main", "main-head");
+        let topology = GitHubStackTopology {
+            base: base.clone(),
+            entries: native
+                .stack
+                .pull_requests
+                .iter()
+                .enumerate()
+                .map(
+                    |(position, row)| crate::github::GitHubStackEntryGeneration {
+                        position: u32::try_from(position).unwrap(),
+                        pr: PrNumber(row.number),
+                        stack_state: row.state.clone(),
+                        pull_request_state: if position == 2 {
+                            PullRequestState::Closed
+                        } else {
+                            PullRequestState::Open
+                        },
+                        draft: row.draft,
+                        merged_at: row.merged_at.clone(),
+                        base: base.clone(),
+                        head: BranchSnapshot {
+                            repository: base.repository.clone(),
+                            name: row.head.ref_name.clone(),
+                            oid: row.head.sha.clone(),
+                        },
+                    },
+                )
+                .collect(),
+        };
+        let before = crate::github::GitHubStackGeneration {
+            id: native.stack.id,
+            number: native.stack.number,
+            node_id: native.stack.node_id.clone(),
+            open: native.stack.open,
+            created_at: native.stack.created_at.clone(),
+            topology,
+        };
+        assert!(exact_retained_mapping(&native, &before, &before.topology));
+        let backend = stack_backend_fixture(vec![native.clone()]);
+        let pulls = BTreeMap::new();
+        let mut evidence = facts(&base, &[], &pulls, &backend);
+        let gap = crate::read::StackBackendProblem {
+            code: "github_stack_pr_missing".to_owned(),
+            message: "Stack #3832 PR #3830 is absent from Cara discovery".to_owned(),
+        };
+        assert!(!proven_retained_row_discovery_gap(&evidence, &gap));
+        evidence.recovery_rows = Some(&before);
+        assert!(proven_retained_row_discovery_gap(&evidence, &gap));
+        let mut foreign = gap.clone();
+        foreign.message = "Stack #9999 PR #3830 is absent from Cara discovery".to_owned();
+        assert!(!proven_retained_row_discovery_gap(&evidence, &foreign));
+        let mut open = gap;
+        open.message = "Stack #3832 PR #3826 is absent from Cara discovery".to_owned();
+        assert!(!proven_retained_row_discovery_gap(&evidence, &open));
+        let mut changed = native.clone();
+        changed.stack.node_id.push_str("-replacement");
+        assert!(!exact_retained_mapping(&changed, &before, &before.topology));
+        let mut changed = native.clone();
+        changed.stack.pull_requests.swap(1, 2);
+        assert!(!exact_retained_mapping(&changed, &before, &before.topology));
+        native.stack.pull_requests[2].head.sha = CommitOid("moved-history".to_owned());
+        assert!(!exact_retained_mapping(&native, &before, &before.topology));
+    }
+
+    #[test]
+    fn retained_closed_row_evidence_preserves_raw_identity_and_position() {
+        let mut stack = exact_native_stack(3832, &[3826, 3831, 3830]);
+        stack.stack.pull_requests[2].state = "closed".to_owned();
+        let expected_row = serde_json::to_value(&stack.stack.pull_requests[2]).unwrap();
+        let backend = stack_backend_fixture(vec![stack]);
+        let evidence = retained_closed_rows(&backend);
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0]["stack"], 3832);
+        assert_eq!(evidence[0]["stack_node_id"], "S_3832");
+        assert_eq!(evidence[0]["position"], 2);
+        assert_eq!(evidence[0]["row"], expected_row);
+        assert!(
+            retained_closed_rows(&stack_backend_fixture(vec![exact_native_stack(
+                3832,
+                &[3826, 3831]
+            )]))
+            .is_empty()
+        );
     }
 
     #[test]
