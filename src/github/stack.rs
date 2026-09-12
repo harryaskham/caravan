@@ -58,6 +58,94 @@ pub struct GitHubStackGeneration {
     pub topology: GitHubStackTopology,
 }
 
+impl GitHubStackGeneration {
+    /// Construct a recovery-only suffix target. This is a pure topology check,
+    /// not write authorization: callers must lease this complete raw generation
+    /// and independently prove acceptance of every supplied logical member.
+    pub fn recovery_suffix_target(
+        &self,
+        repository: &RepositoryId,
+        accepted: &GitHubStackTopology,
+    ) -> Result<GitHubStackTopology, GitHubStackMutationError> {
+        validate_topology(repository, accepted, 2)?;
+        if accepted.entries.iter().any(|entry| {
+            entry.pull_request_state != PullRequestState::Open
+                || entry.draft
+                || entry.merged_at.is_some()
+        }) {
+            return Err(invalid_plan(
+                "github_stack_recovery_members_ineligible",
+                "every accepted recovery member must be open, non-draft, and unmerged",
+            ));
+        }
+        if !self.open || self.topology.base != accepted.base {
+            return Err(invalid_plan(
+                "github_stack_recovery_base_drift",
+                "recovery requires the exact open Stack base",
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        let mut prefix = 0;
+        for (position, row) in self.topology.entries.iter().enumerate() {
+            if usize::try_from(row.position).ok() != Some(position) || !seen.insert(row.pr) {
+                return Err(invalid_plan(
+                    "github_stack_recovery_rows_invalid",
+                    "raw positions and PR identities must be unique and ordered",
+                ));
+            }
+            if row.pull_request_state == PullRequestState::Open {
+                let Some(expected) = accepted.entries.get(prefix) else {
+                    return Err(invalid_plan(
+                        "github_stack_recovery_prefix_invalid",
+                        "provider has extra open members",
+                    ));
+                };
+                if row.pr != expected.pr
+                    || row.head != expected.head
+                    || row.base != expected.base
+                    || row.draft
+                    || row.merged_at.is_some()
+                {
+                    return Err(invalid_plan(
+                        "github_stack_recovery_prefix_invalid",
+                        "open provider rows differ from the exact accepted prefix",
+                    ));
+                }
+                prefix += 1;
+            } else if accepted.entries.iter().any(|entry| entry.pr == row.pr) {
+                return Err(invalid_plan(
+                    "github_stack_recovery_history_intersects",
+                    "retained history intersects active accepted membership",
+                ));
+            }
+        }
+        if prefix == 0 || prefix >= accepted.entries.len() {
+            return Err(invalid_plan(
+                "github_stack_recovery_suffix_missing",
+                "recovery requires a nonempty exact prefix and missing accepted suffix",
+            ));
+        }
+        let mut target = self.topology.clone();
+        for entry in &accepted.entries[prefix..] {
+            if entry.pull_request_state != PullRequestState::Open || !seen.insert(entry.pr) {
+                return Err(invalid_plan(
+                    "github_stack_recovery_suffix_invalid",
+                    "suffix must contain only distinct accepted open members",
+                ));
+            }
+            let mut entry = entry.clone();
+            entry.position = u32::try_from(target.entries.len()).map_err(|_| {
+                invalid_plan(
+                    "github_stack_recovery_too_many_rows",
+                    "Stack row position exceeds u32",
+                )
+            })?;
+            target.entries.push(entry);
+        }
+        Ok(target)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct GitHubStackCreatePlan {
     pub operation_id: String,
@@ -559,6 +647,116 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
         })
     }
 
+    /// Execute only an exact recovery suffix target while preserving every raw
+    /// retained row. Higher-level recovery owns acceptance, inventory uniqueness,
+    /// reviewed-plan sealing, and the writer lock; this layer owns provider leases.
+    pub fn native_stack_recovery_add(
+        &self,
+        repository: &RepositoryId,
+        plan: &GitHubStackAddPlan,
+        accepted: &GitHubStackTopology,
+    ) -> Result<GitHubStackMutationReceipt, GitHubStackMutationError> {
+        validate_operation_identity(&plan.operation_id, &plan.actor)?;
+        let intended = plan.before.recovery_suffix_target(repository, accepted)?;
+        if intended != plan.desired {
+            return Err(invalid_plan(
+                "github_stack_recovery_target_changed",
+                "recovery target does not preserve raw rows and the exact accepted suffix",
+            ));
+        }
+        let actual = self.native_stack_rows_for_recovery(repository, plan.before.number)?;
+        if actual.as_ref().is_some_and(|generation| {
+            same_stack_identity(generation, &plan.before) && generation.topology == intended
+        }) {
+            return Ok(stack_receipt(StackReceiptInput {
+                repository,
+                operation_id: &plan.operation_id,
+                actor: &plan.actor,
+                operation: GitHubStackMutationOperation::Add,
+                disposition: GitHubStackMutationDisposition::AlreadySatisfied,
+                request: add_request(repository, plan),
+                before: actual.clone(),
+                after: actual,
+                provider_output: None,
+            }));
+        }
+        if actual.as_ref() != Some(&plan.before) {
+            return Err(stale_generation(&plan.before, actual.as_ref()));
+        }
+        self.verify_topology_fresh(repository, &intended)?;
+        let leased = self.native_stack_rows_for_recovery(repository, plan.before.number)?;
+        if leased.as_ref() != Some(&plan.before) {
+            return Err(stale_generation(&plan.before, leased.as_ref()));
+        }
+        let command = native_stack_add_command(repository, plan);
+        self.complete_known_stack_mutation_with_row_recovery(
+            KnownStackMutation {
+                repository,
+                operation_id: &plan.operation_id,
+                actor: &plan.actor,
+                operation: GitHubStackMutationOperation::Add,
+                before: &plan.before,
+                desired_after: Some(&plan.desired),
+                request: add_request(repository, plan),
+                command: &command,
+            },
+            true,
+        )
+    }
+
+    /// Observe every retained row against fresh PR truth without interpreting
+    /// closed rows as active membership. This read-only evidence is not a valid
+    /// ordinary append generation; callers must separately seal recovery scope.
+    pub fn native_stack_rows_for_recovery(
+        &self,
+        repository: &RepositoryId,
+        stack_number: u64,
+    ) -> Result<Option<GitHubStackGeneration>, GitHubStackMutationError> {
+        let Some(snapshot) = self.read_native_stack_snapshot(repository, stack_number)? else {
+            return Ok(None);
+        };
+        let mut seen = BTreeSet::new();
+        for row in &snapshot.pull_requests {
+            if !seen.insert(row.number) || normalized_stack_pr_state(row).is_none() {
+                return Err(GitHubStackMutationError::InconsistentProviderState {
+                    diagnostic: format!(
+                        "Stack #{stack_number} recovery rows contain duplicate PRs or unknown states"
+                    ),
+                });
+            }
+        }
+        let generation = self.observe_stack_rows(repository, &snapshot)?;
+        // Closed history is retained in the evidence, not used as a live
+        // predecessor. The remaining open rows must still form a valid chain.
+        let mut active = generation.topology.clone();
+        active
+            .entries
+            .retain(|entry| entry.pull_request_state == PullRequestState::Open);
+        for (position, entry) in active.entries.iter_mut().enumerate() {
+            entry.position = u32::try_from(position).map_err(|_| {
+                invalid_plan(
+                    "github_stack_recovery_too_many_rows",
+                    "Stack row position exceeds u32",
+                )
+            })?;
+        }
+        validate_topology(repository, &active, 1)?;
+        // Individual PR reads are not atomic with the Stack read. Do not emit
+        // recovery evidence if any raw row changed while those reads ran.
+        if self
+            .read_native_stack_snapshot(repository, stack_number)?
+            .as_ref()
+            != Some(&snapshot)
+        {
+            return Err(GitHubStackMutationError::InconsistentProviderState {
+                diagnostic: format!(
+                    "Stack #{stack_number} raw rows changed during recovery observation"
+                ),
+            });
+        }
+        Ok(Some(generation))
+    }
+
     /// Fresh raw Stack snapshot for receipt-bound recovery after a provider
     /// generation race. Inventory completeness is required so absence is proof,
     /// not a partial-view guess.
@@ -706,18 +904,30 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
 
     fn complete_known_stack_mutation(
         &self,
+        mutation: KnownStackMutation<'_>,
+    ) -> Result<GitHubStackMutationReceipt, GitHubStackMutationError> {
+        self.complete_known_stack_mutation_with_row_recovery(mutation, false)
+    }
+
+    fn complete_known_stack_mutation_with_row_recovery(
+        &self,
         mut mutation: KnownStackMutation<'_>,
+        recovery_rows: bool,
     ) -> Result<GitHubStackMutationReceipt, GitHubStackMutationError> {
         let response = self.runner.run(mutation.command);
         let provider_output = response.as_ref().ok().and_then(bounded_provider_output);
         mutation.request.github_request_id = response.as_ref().ok().and_then(github_request_id);
         let response_diagnostic = mutation_response_diagnostic(&response);
-        let rediscovered =
-            self.native_stack_generation(mutation.repository, mutation.before.number);
+        let rediscovered = if recovery_rows {
+            self.native_stack_rows_for_recovery(mutation.repository, mutation.before.number)
+        } else {
+            self.native_stack_generation(mutation.repository, mutation.before.number)
+        };
         let postcondition = |actual: &Option<GitHubStackGeneration>| match mutation.desired_after {
             Some(desired) => actual.as_ref().is_some_and(|generation| {
                 same_stack_identity(generation, mutation.before)
-                    && if mutation.operation == GitHubStackMutationOperation::Add {
+                    && if !recovery_rows && mutation.operation == GitHubStackMutationOperation::Add
+                    {
                         provider_converged_add_topology(
                             &mutation.before.topology,
                             desired,
@@ -988,6 +1198,27 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
         stack: &GitHubStackSnapshot,
         allowed_stale_tail_base: Option<PrNumber>,
     ) -> Result<GitHubStackGeneration, GitHubStackMutationError> {
+        let generation = self.observe_stack_rows(repository, stack)?;
+        let topology = &generation.topology;
+        let collapsed = self.prove_collapsed_frontier(repository, topology)?;
+        validate_topology_with_collapsed_frontier(
+            repository,
+            topology,
+            1,
+            allowed_stale_tail_base,
+            collapsed.as_ref(),
+        )?;
+        Ok(generation)
+    }
+
+    // Fresh provider row evidence is deliberately separate from ordinary
+    // topology validation. Recovery needs to preserve closed rows in their raw
+    // positions, but this observation alone never authorizes a provider write.
+    fn observe_stack_rows(
+        &self,
+        repository: &RepositoryId,
+        stack: &GitHubStackSnapshot,
+    ) -> Result<GitHubStackGeneration, GitHubStackMutationError> {
         let base: StackRefResponse = self
             .json(native_stack_base_ref_command(
                 repository,
@@ -1036,14 +1267,6 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
             entries.push(entry_from_pr(position, &stack_pr.state, pr)?);
         }
         let topology = GitHubStackTopology { base, entries };
-        let collapsed = self.prove_collapsed_frontier(repository, &topology)?;
-        validate_topology_with_collapsed_frontier(
-            repository,
-            &topology,
-            1,
-            allowed_stale_tail_base,
-            collapsed.as_ref(),
-        )?;
         Ok(GitHubStackGeneration {
             id: stack.id,
             number: stack.number,
@@ -2092,6 +2315,222 @@ mod tests {
 
         assert_eq!(observed, generation(repeated));
         adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn recovery_row_observation_retains_closed_tail_without_authorizing_append() {
+        let mut retained = topology(3);
+        retained.entries[2].pull_request_state = PullRequestState::Closed;
+        retained.entries[2].stack_state = "closed".to_owned();
+        retained.entries[2].merged_at = None;
+        let mut calls = direct_generation_calls(&retained);
+        calls.push((
+            native_stack_read_command(&repository(), 42),
+            CommandOutput::success(stack_json(&retained)),
+        ));
+        let adapter = GitHubMutationAdapter::new(FakeRunner::new(calls));
+        let observed = adapter
+            .native_stack_rows_for_recovery(&repository(), 42)
+            .expect("fresh row evidence")
+            .expect("existing Stack");
+        assert_eq!(observed.topology, retained);
+        assert!(validate_topology(&repository(), &observed.topology, 2).is_err());
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn recovery_suffix_target_preserves_closed_history_and_appends_all_missing_members() {
+        let mut accepted = topology(3);
+        let mut fourth = accepted.entries[2].clone();
+        fourth.position = 3;
+        fourth.pr = PrNumber(104);
+        fourth.base = accepted.entries[2].head.clone();
+        fourth.head = branch("fourth", "fourth-head");
+        accepted.entries.push(fourth);
+        let mut raw = topology(3);
+        raw.entries[2].pr = PrNumber(999);
+        raw.entries[2].pull_request_state = PullRequestState::Closed;
+        raw.entries[2].stack_state = "closed".to_owned();
+        let before = generation(raw.clone());
+        let target = before
+            .recovery_suffix_target(&repository(), &accepted)
+            .unwrap();
+        assert_eq!(&target.entries[..3], raw.entries.as_slice());
+        assert_eq!(target.entries.len(), 5);
+        assert_eq!(target.entries[3].pr, accepted.entries[2].pr);
+        assert_eq!(target.entries[4].pr, accepted.entries[3].pr);
+        assert_eq!(target.entries[3].base, accepted.entries[2].base);
+        assert_eq!(target.entries[4].position, 4);
+        let mut moved = before.clone();
+        moved.topology.entries[1].head.oid = CommitOid("moved".to_owned());
+        assert!(
+            moved
+                .recovery_suffix_target(&repository(), &accepted)
+                .is_err()
+        );
+        let mut intersecting = before;
+        intersecting.topology.entries[2].pr = accepted.entries[2].pr;
+        assert!(
+            intersecting
+                .recovery_suffix_target(&repository(), &accepted)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn recovery_add_preserves_history_and_recovers_lost_response() {
+        let accepted = topology(3);
+        let mut raw = topology(2);
+        raw.entries[1].pr = PrNumber(999);
+        raw.entries[1].pull_request_state = PullRequestState::Closed;
+        raw.entries[1].stack_state = "closed".to_owned();
+        let before = generation(raw);
+        let desired = before
+            .recovery_suffix_target(&repository(), &accepted)
+            .unwrap();
+        let plan = GitHubStackAddPlan {
+            operation_id: "recover-suffix".to_owned(),
+            actor: "cara".to_owned(),
+            before,
+            desired,
+        };
+        let reads = |topology: &GitHubStackTopology| {
+            let mut calls = direct_generation_calls(topology);
+            calls.push((
+                native_stack_read_command(&repository(), 42),
+                CommandOutput::success(stack_json(topology)),
+            ));
+            calls
+        };
+        let mut calls = reads(&plan.before.topology);
+        calls.extend(generation_observation_calls(&plan.desired));
+        calls.extend(reads(&plan.before.topology));
+        calls.push((
+            native_stack_add_command(&repository(), &plan),
+            CommandOutput::failure(1, "response lost"),
+        ));
+        calls.extend(reads(&plan.desired));
+        let adapter = GitHubMutationAdapter::new(FakeRunner::new(calls));
+        let receipt = adapter
+            .native_stack_recovery_add(&repository(), &plan, &accepted)
+            .unwrap();
+        assert_eq!(
+            receipt.disposition,
+            GitHubStackMutationDisposition::RecoveredAfterAmbiguousResponse
+        );
+        assert!(receipt.verify());
+        adapter.runner.assert_exhausted();
+        let retry = GitHubMutationAdapter::new(FakeRunner::new(reads(&plan.desired)));
+        let receipt = retry
+            .native_stack_recovery_add(&repository(), &plan, &accepted)
+            .unwrap();
+        assert_eq!(
+            receipt.disposition,
+            GitHubStackMutationDisposition::AlreadySatisfied
+        );
+        retry.runner.assert_exhausted();
+
+        // Even a freshly self-consistent provider snapshot must not replace
+        // the reviewed generation of retained history on a retry.
+        let mut changed_history = plan.before.topology.clone();
+        changed_history.entries[1].head.oid = CommitOid("changed-history".to_owned());
+        let drifted = GitHubMutationAdapter::new(FakeRunner::new(reads(&changed_history)));
+        assert!(matches!(
+            drifted.native_stack_recovery_add(&repository(), &plan, &accepted),
+            Err(GitHubStackMutationError::StaleGeneration { .. })
+        ));
+        drifted.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn recovery_row_observation_refuses_ambiguous_inventory_before_pr_reads() {
+        for duplicate in [false, true] {
+            let mut snapshot = stack_snapshot(&topology(3));
+            if duplicate {
+                snapshot.pull_requests[2] = snapshot.pull_requests[1].clone();
+            } else {
+                snapshot.pull_requests[2].state = "UNKNOWN".to_owned();
+            }
+            let adapter = GitHubMutationAdapter::new(FakeRunner::new(vec![(
+                native_stack_read_command(&repository(), 42),
+                CommandOutput::success(serde_json::to_string(&snapshot).unwrap()),
+            )]));
+            assert!(matches!(
+                adapter.native_stack_rows_for_recovery(&repository(), 42),
+                Err(GitHubStackMutationError::InconsistentProviderState { .. })
+            ));
+            adapter.runner.assert_exhausted();
+        }
+    }
+
+    #[test]
+    fn recovery_row_observation_refuses_open_chain_through_closed_history() {
+        let mut retained = topology(3);
+        retained.entries[1].pull_request_state = PullRequestState::Closed;
+        retained.entries[1].stack_state = "closed".to_owned();
+        retained.entries[1].merged_at = None;
+        // The final open PR still targets the closed row. Removing that row
+        // from live membership must not make this an acceptable active chain.
+        let adapter =
+            GitHubMutationAdapter::new(FakeRunner::new(direct_generation_calls(&retained)));
+        assert!(matches!(
+            adapter.native_stack_rows_for_recovery(&repository(), 42),
+            Err(GitHubStackMutationError::InvalidPlan { ref code, .. })
+                if code == "github_stack_base_chain_invalid"
+        ));
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn recovery_row_observation_refuses_raw_row_race() {
+        let retained = topology(3);
+        let mut calls = direct_generation_calls(&retained);
+        let mut changed = stack_snapshot(&retained);
+        changed.pull_requests.swap(1, 2);
+        calls.push((
+            native_stack_read_command(&repository(), 42),
+            CommandOutput::success(serde_json::to_string(&changed).unwrap()),
+        ));
+        let adapter = GitHubMutationAdapter::new(FakeRunner::new(calls));
+        assert!(matches!(
+            adapter.native_stack_rows_for_recovery(&repository(), 42),
+            Err(GitHubStackMutationError::InconsistentProviderState { .. })
+        ));
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn recovery_row_observation_refuses_changed_closed_tail_head() {
+        let mut retained = topology(3);
+        retained.entries[2].pull_request_state = PullRequestState::Closed;
+        retained.entries[2].stack_state = "closed".to_owned();
+        retained.entries[2].merged_at = None;
+        let mut calls = direct_generation_calls(&retained);
+        let mut moved = retained.entries[2].clone();
+        moved.head.oid = CommitOid("moved-closed-head".to_owned());
+        calls.last_mut().expect("closed PR read").1 =
+            CommandOutput::success(pull_request_json(&moved));
+        let adapter = GitHubMutationAdapter::new(FakeRunner::new(calls));
+        assert!(matches!(
+            adapter.native_stack_rows_for_recovery(&repository(), 42),
+            Err(GitHubStackMutationError::InconsistentProviderState { .. })
+        ));
+        adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn ordinary_append_rejects_retained_closed_tail_bd_6d1499() {
+        // Recovery of an open prefix followed by a retained closed row must
+        // not weaken the ordinary append contract or silently drop that row.
+        let mut retained = topology(3);
+        retained.entries[2].pull_request_state = PullRequestState::Closed;
+        retained.entries[2].stack_state = "closed".to_owned();
+        retained.entries[2].merged_at = None;
+        assert!(matches!(
+            validate_topology(&repository(), &retained, 2),
+            Err(GitHubStackMutationError::InvalidPlan { ref code, .. })
+                if code == "github_stack_state_order_invalid"
+        ));
     }
 
     #[test]

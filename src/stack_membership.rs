@@ -37,6 +37,12 @@ pub enum NativeMembershipPlan {
     Create {
         plan: Box<GitHubStackCreatePlan>,
     },
+    /// Reviewed recovery-only append preserving raw retained provider rows.
+    /// Never selected by ordinary admission.
+    RecoveryAdd {
+        plan: Box<GitHubStackAddPlan>,
+        accepted: Box<GitHubStackTopology>,
+    },
     Add {
         repository: RepositoryId,
         operation_id: String,
@@ -75,7 +81,7 @@ pub struct NativeMembershipCheckpoint {
 }
 
 impl NativeMembershipCheckpoint {
-    fn from_plan(plan: &NativeMembershipPlan) -> Option<Self> {
+    pub(crate) fn from_plan(plan: &NativeMembershipPlan) -> Option<Self> {
         let caravan_id = plan.caravan_id()?;
         let mut checkpoint = Self {
             schema_version: 1,
@@ -107,6 +113,7 @@ impl NativeMembershipPlan {
         match self {
             Self::AbsentSingleton { .. } => None,
             Self::Create { plan } => plan.desired.entries.first().map(|entry| entry.pr),
+            Self::RecoveryAdd { accepted, .. } => accepted.entries.first().map(|entry| entry.pr),
             Self::Add {
                 expected_members, ..
             } => expected_members.first().copied(),
@@ -334,6 +341,12 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
                 caravan_id: *caravan_id,
                 member: *member,
             }),
+            NativeMembershipPlan::RecoveryAdd { plan, accepted } => self
+                .native_stack_recovery_add(&accepted.base.repository, plan, accepted)
+                .map(|receipt| NativeMembershipReceipt::StackMutation {
+                    receipt: Box::new(receipt),
+                })
+                .map_err(Into::into),
             NativeMembershipPlan::Create { plan } => self
                 .native_stack_create(&plan.desired.base.repository, plan)
                 .map(|receipt| NativeMembershipReceipt::StackMutation {
