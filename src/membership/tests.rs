@@ -947,8 +947,53 @@ fn join_root_check_progress_does_not_stale_mutation_identity() {
     root.checks[0].provider_state = Some("IN_PROGRESS".to_owned());
     let provider = FakeProvider::with_pull_requests(vec![root, candidate]);
 
-    revalidate_join_root(&status, &target, &provider)
+    revalidate_join_root(&status, &target, &provider, true)
         .expect("check-only churn is not mutation-authority drift");
+}
+
+#[test]
+fn native_join_root_allows_unchanged_historical_base_but_keeps_identity_fences() {
+    let mut root = pull_request(1, "one", "main", &[ACTIVE_LABEL]);
+    root.base.oid = CommitOid("historical-main".to_owned());
+    let candidate = pull_request(2, "two", "main", &[]);
+    let mut status = status(candidate.clone(), vec![root.clone()]);
+    let request = MembershipRequest {
+        operation: MembershipOperation::Join,
+        create_pr: false,
+        tail_pr: Some(1),
+        head_pr: None,
+        reason: Some("native unchanged-root fixture".to_owned()),
+        priority_label: None,
+        agent_priority_labels: Vec::new(),
+    };
+    let target = resolve_join_target(&status, &request).unwrap();
+    let provider = FakeProvider::with_pull_requests(vec![root.clone(), candidate.clone()]);
+    revalidate_join_root(&status, &target, &provider, false).unwrap();
+    let strict = revalidate_join_root(&status, &target, &provider, true).unwrap_err();
+    assert_eq!(
+        strict.details().unwrap()["require_current_default_generation"],
+        true
+    );
+    assert_eq!(strict.details().unwrap()["mutated"], false);
+
+    let mut moved = root.clone();
+    moved.base.oid = CommitOid("changed-after-preview".to_owned());
+    let moved_provider = FakeProvider::with_pull_requests(vec![moved, candidate.clone()]);
+    let error = revalidate_join_root(&status, &target, &moved_provider, false).unwrap_err();
+    assert_eq!(error.details().unwrap()["changed_fields"], json!(["base"]));
+
+    // Even matching snapshots must still target the repository's default ref.
+    root.base.name = "other".to_owned();
+    status
+        .analysis
+        .pull_requests
+        .get_mut(&PrNumber(1))
+        .unwrap()
+        .base = root.base.clone();
+    let provider = FakeProvider::with_pull_requests(vec![root, candidate]);
+    let error = revalidate_join_root(&status, &target, &provider, false).unwrap_err();
+    assert_eq!(error.details().unwrap()["same_default_ref"], false);
+    assert_eq!(error.details().unwrap()["mutated"], false);
 }
 
 #[test]
@@ -971,7 +1016,7 @@ fn join_root_drift_after_preview_fails_before_provider_mutation() {
     let provider = FakeProvider::with_pull_requests(vec![moved_root, candidate]);
     let provider_before = provider.pull_requests.borrow().clone();
 
-    let error = revalidate_join_root(&status, &target, &provider).unwrap_err();
+    let error = revalidate_join_root(&status, &target, &provider, false).unwrap_err();
 
     assert_eq!(error.code(), "join_root_moved_before_apply");
     let details = error.details().unwrap();
@@ -1010,7 +1055,7 @@ fn join_refuses_closed_tail_parent_before_any_provider_mutation() {
     let provider = FakeProvider::with_pull_requests(vec![root, closed_parent, tail, candidate]);
     let provider_before = provider.pull_requests.borrow().clone();
 
-    let error = revalidate_join_target(&status, &target, &provider).unwrap_err();
+    let error = revalidate_join_target(&status, &target, &provider, false).unwrap_err();
 
     assert_eq!(error.code(), "join_tail_parent_moved_before_apply");
     let details = error.details().unwrap();
@@ -1046,7 +1091,7 @@ fn join_refuses_stale_parent_to_tail_lease_before_any_provider_mutation() {
     let provider = FakeProvider::with_pull_requests(vec![root, parent, stale_tail, candidate]);
     let provider_before = provider.pull_requests.borrow().clone();
 
-    let error = revalidate_join_target(&status, &target, &provider).unwrap_err();
+    let error = revalidate_join_target(&status, &target, &provider, false).unwrap_err();
 
     assert_eq!(error.code(), "join_tail_parent_moved_before_apply");
     let details = error.details().unwrap();
