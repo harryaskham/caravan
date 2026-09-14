@@ -1161,6 +1161,11 @@ the genuinely unique commits. Main changes outside the effective source range
 are never replayed into the child. An empty effective source patch returns `join_empty_source_noop` with the complete receipt and zero
 provider/branch mutation.
 
+Native and metadata-only membership do not physically rewrite the root source branch.
+Their final root check requires unchanged preview/live identity and the same default repository/ref, but does not require the root's historical base OID to equal the newly advanced default tip.
+This matches their preflight contract and avoids reporting `join_root_moved_before_apply` with identical expected/actual snapshots after an ordinary default-branch advance.
+Physical-rewrite mode still requires the exact current default generation, and every mode still rejects root head/base/label/state drift and a stale parent-to-tail lease before mutation.
+
 It preserves bounded owned two-parent candidate topology with
 `rebase-merges=rebase-cousins`, so a stacked child is rooted on the selected
 parent generation instead of preserving a stale cousin root. It independently

@@ -837,8 +837,9 @@ fn revalidate_join_target(
     status: &StatusOutput,
     target: &JoinTarget,
     provider: &impl MembershipProvider,
+    require_current_default: bool,
 ) -> Result<(), AppError> {
-    revalidate_join_root(status, target, provider)?;
+    revalidate_join_root(status, target, provider, require_current_default)?;
     let Some(parent_number) = target
         .caravan
         .members
@@ -934,6 +935,7 @@ fn revalidate_join_root(
     status: &StatusOutput,
     target: &JoinTarget,
     provider: &impl MembershipProvider,
+    require_current_default: bool,
 ) -> Result<(), AppError> {
     let root_number = target.caravan.head().expect("join caravan is non-empty");
     let expected = status
@@ -951,8 +953,17 @@ fn revalidate_join_root(
                 Some(json!({"root_pr": root_number, "error": error.to_string(), "mutated": false})),
             )
         })?;
+    let default = &status.analysis.fleet.default_branch;
+    // Native/metadata-only membership does not rewrite the root branch. Its
+    // unchanged historical base OID can lag a moving default branch, just as
+    // preflight permits when physical_branch_rewrites_enabled() is false.
+    // Keep exact preview-vs-live identity and repository/ref fences in every
+    // mode; only the physical writer additionally needs the current base OID.
+    let same_default_ref =
+        actual.base.repository == default.repository && actual.base.name == default.name;
     if membership_identity_matches(expected, &actual)
-        && actual.base == status.analysis.fleet.default_branch
+        && same_default_ref
+        && (!require_current_default || actual.base.oid == default.oid)
     {
         return Ok(());
     }
@@ -967,6 +978,8 @@ fn revalidate_join_root(
             "expected": membership_identity(expected),
             "actual": membership_identity(&actual),
             "required_default": status.analysis.fleet.default_branch,
+            "require_current_default_generation": require_current_default,
+            "same_default_ref": same_default_ref,
             "ignored_check_churn": true,
             "mutated": false,
             "retryable": true,
@@ -1610,7 +1623,8 @@ fn execute_locked(
             })?,
         );
         if let Some(target) = target
-            && let Err(error) = revalidate_join_root(&status, target, &provider)
+            && let Err(error) =
+                revalidate_join_root(&status, target, &provider, physical_branch_rewrites)
         {
             return Err(record_join_preflight_failure(
                 context,
@@ -1852,7 +1866,8 @@ fn execute_locked(
             }
         }
         if let Some(target) = initial_join_target.as_ref()
-            && let Err(error) = revalidate_join_root(&status, target, &provider)
+            && let Err(error) =
+                revalidate_join_root(&status, target, &provider, physical_branch_rewrites)
         {
             return Err(record_join_preflight_failure(
                 context,
@@ -2507,7 +2522,12 @@ fn execute_with_rebase_guard_and_config(
     revalidate_generation_before_membership(&status, candidate.number, provider)?;
     revalidate_native_admission_generation(&status, &candidate, &eligibility, provider)?;
     if let Some(target) = target.as_ref() {
-        revalidate_join_target(&status, target, provider)?;
+        revalidate_join_target(
+            &status,
+            target,
+            provider,
+            context.is_some_and(|context| context.config.physical_branch_rewrites_enabled()),
+        )?;
     }
     if eligibility.admission_compatibility_authorization.is_some()
         && let Some(context) = context
