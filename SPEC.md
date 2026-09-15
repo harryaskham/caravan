@@ -1685,7 +1685,16 @@ planned parent and seals the replacement in the topology receipt. This is the
 ordinary cumulative merge shape, not cousin history. Octopus/root parents and
 every unrelated cousin/external parent remain rejected. The rebuilt head tree must
 exactly equal an independently computed clean `merge-tree` for current target +
-old candidate head before any write. Post-rewrite
+old candidate head before any write. When a terminal two-parent source merge
+contains authored edits beyond a clean automatic merge of its parents, replay
+may restore only that exact binary delta onto the sequenced candidate. This
+requires a non-target replay commit retaining target ancestry, a clean delta
+application, and equality with the independently computed final merge tree
+before amending the replay commit. The receipt binds the source merge,
+automatic/source/replay trees and patch object identity. It never amends the
+target, broadly flattens history, or substitutes the expected tree for a failed
+replay. Conflicted automatic merges, conflicting deltas and remaining tree
+mismatches fail closed without remote publication. Post-rewrite
 provider rediscovery is operation-specific: `join`/`rejoin` require the exact
 live tail named by the rebase receipt; `new`/`renew` require the exact current
 default branch generation and no inferred membership tail. A new caravan has no
