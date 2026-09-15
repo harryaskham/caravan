@@ -338,6 +338,16 @@ pub struct RebaseTopologyParentReplacement {
     pub new_parent: CommitOid,
 }
 
+/// Exact terminal merge resolution delta reapplied after sequencer replay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReplayedMergeResolution {
+    pub source_merge: CommitOid,
+    pub automatic_merge_tree: CommitOid,
+    pub source_tree: CommitOid,
+    pub replay_tree: CommitOid,
+    pub patch_oid: CommitOid,
+}
+
 /// Complete merge-preserving proof retained in plan and apply receipt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct MergePreservingTopology {
@@ -359,6 +369,8 @@ pub struct MergePreservingTopology {
     /// commit count (bd-a720be).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub elided_target_merges: Vec<CommitOid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<ReplayedMergeResolution>,
 }
 
 /// Serializable immutable plan produced once and pushed without recomputation.
@@ -752,6 +764,17 @@ pub fn prepare_candidate(
             }),
         ));
     }
+    let resolution = if has_merges && flattened.is_none() && !reuse_existing_head {
+        replay_terminal_resolution(
+            &worktree_runner,
+            &old_topology,
+            expected_merge_tree.as_ref(),
+            &target.oid,
+            candidate.number,
+        )?
+    } else {
+        None
+    };
     let new_head = rev_parse(&worktree_runner, "HEAD")?;
     let new_tree = rev_parse(&worktree_runner, "HEAD^{tree}")?;
     if new_head != candidate.head.oid {
@@ -778,7 +801,7 @@ pub fn prepare_candidate(
             candidate.number,
         )?;
     }
-    let merge_topology = expected_merge_tree
+    let mut merge_topology = expected_merge_tree
         .filter(|_| flattened.is_none())
         .map(|expected| {
             build_merge_topology_proof(
@@ -792,6 +815,9 @@ pub fn prepare_candidate(
             )
         })
         .transpose()?;
+    if let Some(proof) = &mut merge_topology {
+        proof.resolution = resolution;
+    }
     let lease = format!(
         "--force-with-lease=refs/heads/{}:{}",
         candidate.head.name, candidate.head.oid.0
@@ -960,12 +986,133 @@ fn validate_merge_preserving_topology(
     Ok(())
 }
 
-/// Build one commit carrying the proven merge tree directly on the target.
-///
-/// bd-85b71d: used only for a root Cara is about to squash-merge, where history
-/// is discarded at landing. The resulting head has the exact tree that
-/// `expected_merge_tree` already proved clean against the target, so the content
-/// that lands is unchanged while nothing has to be replayed.
+/// Select only a replayed candidate tree that needs resolution restoration.
+fn resolution_replay_tree(
+    runner: &impl CommandRunner,
+    target: &CommitOid,
+    expected: &CommitOid,
+) -> Result<Option<CommitOid>, AppError> {
+    let head = rev_parse(runner, "HEAD")?;
+    // Never amend the target itself or a history that lost target ancestry.
+    if &head == target || !is_ancestor(runner, target, &head)? {
+        return Ok(None);
+    }
+    let tree = rev_parse(runner, "HEAD^{tree}")?;
+    Ok((&tree != expected).then_some(tree))
+}
+
+fn replay_terminal_resolution(
+    runner: &impl CommandRunner,
+    source: &[RebaseTopologyCommit],
+    expected: Option<&CommitOid>,
+    target: &CommitOid,
+    pr: PrNumber,
+) -> Result<Option<ReplayedMergeResolution>, AppError> {
+    let Some(expected) = expected else {
+        return Ok(None);
+    };
+    let Some(replay_tree) = resolution_replay_tree(runner, target, expected)? else {
+        return Ok(None);
+    };
+    let Some(terminal) = source.last().filter(|commit| commit.parents.len() == 2) else {
+        return Ok(None);
+    };
+    // Only a clean, independently recreated source merge exposes an unambiguous
+    // authored delta. Conflicted/internal merges retain the existing refusal.
+    let automatic = run(
+        runner,
+        CommandSpec::new("git").args([
+            "merge-tree",
+            "--write-tree",
+            &terminal.parents[0].0,
+            &terminal.parents[1].0,
+        ]),
+    )?;
+    if !automatic.is_success() {
+        return Ok(None);
+    }
+    let automatic_merge_tree = CommitOid(
+        automatic
+            .stdout
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned(),
+    );
+    validate_oid(&automatic_merge_tree)?;
+    let source_tree = rev_parse(runner, &format!("{}^{{tree}}", terminal.oid.0))?;
+    let patch = require_success(
+        runner,
+        CommandSpec::new("git").args([
+            "diff",
+            "--binary",
+            "--full-index",
+            &automatic_merge_tree.0,
+            &source_tree.0,
+            "--",
+        ]),
+        "rebase_resolution_diff_failed",
+        "cannot derive the terminal authored merge delta",
+    )?;
+    if patch.stdout.is_empty() {
+        return Ok(None);
+    }
+    let patch_hash = require_success(
+        runner,
+        CommandSpec::new("git")
+            .args(["hash-object", "--stdin"])
+            .stdin(patch.stdout.clone()),
+        "rebase_resolution_diff_failed",
+        "cannot bind merge resolution delta",
+    )?;
+    let applied = run(
+        runner,
+        CommandSpec::new("git")
+            .args(["apply", "--3way", "--index", "-"])
+            .stdin(patch.stdout),
+    )?;
+    if !applied.is_success() {
+        return Err(decision(
+            "rebase_resolution_conflict",
+            "authored terminal merge delta does not replay cleanly",
+            json!({"pr": pr, "mutated": false}),
+        ));
+    }
+    let result = CommitOid(
+        require_success(
+            runner,
+            CommandSpec::new("git").arg("write-tree"),
+            "rebase_resolution_tree_failed",
+            "cannot read resolved index tree",
+        )?
+        .stdout
+        .trim()
+        .to_owned(),
+    );
+    if &result != expected {
+        return Err(decision(
+            "rebase_merge_tree_mismatch",
+            "reapplied resolution still differs from independently proven target tree",
+            json!({"pr": pr, "expected_tree": expected, "actual_tree": result, "mutated": false}),
+        ));
+    }
+    require_success(
+        runner,
+        CommandSpec::new("git").args(["commit", "--amend", "--no-edit"]),
+        "rebase_resolution_commit_failed",
+        "cannot preserve the verified resolution in replayed history",
+    )?;
+    Ok(Some(ReplayedMergeResolution {
+        source_merge: terminal.oid.clone(),
+        automatic_merge_tree,
+        source_tree,
+        replay_tree,
+        patch_oid: CommitOid(patch_hash.stdout.trim().to_owned()),
+    }))
+}
+
+/// Build the independently proven tree directly on the target, only for an
+/// explicitly authorized root that will be squash-landed (bd-85b71d).
 fn flatten_to_target(
     runner: &impl CommandRunner,
     candidate: &PullRequestSnapshot,
@@ -1456,6 +1603,7 @@ fn build_merge_topology_proof(
             }
         }),
         elided_target_merges,
+        resolution: None,
     })
 }
 
@@ -4421,6 +4569,86 @@ mod tests {
     /// independently clean. When Cara owns the squash merge the history is
     /// discarded at landing, so the root is flattened onto the proven tree
     /// instead of replayed.
+    #[test]
+    fn semantic_resolution_never_amends_the_target_commit() {
+        let fixture = fixture();
+        git(&fixture.clone, &["checkout", "main"]);
+        let target = CommitOid(git(&fixture.clone, &["rev-parse", "HEAD"]));
+        let different_tree = CommitOid(git(&fixture.clone, &["rev-parse", "feature^{tree}"]));
+        let runner = ProcessRunner::in_directory(&fixture.clone);
+        assert!(
+            resolution_replay_tree(&runner, &target, &different_tree)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(git(&fixture.clone, &["rev-parse", "HEAD"]), target.0);
+    }
+
+    #[test]
+    fn semantic_merge_only_edit_survives_replay() {
+        let fixture = fixture();
+        git(&fixture.clone, &["checkout", "feature"]);
+        git(&fixture.clone, &["merge", "--no-ff", "--no-commit", "main"]);
+        std::fs::write(fixture.clone.join("merge-only"), "intentional resolution\n").unwrap();
+        git(&fixture.clone, &["add", "merge-only"]);
+        git(&fixture.clone, &["commit", "-m", "semantic repair merge"]);
+        let head = CommitOid(git(&fixture.clone, &["rev-parse", "HEAD"]));
+        git(&fixture.clone, &["push", "origin", "feature"]);
+        git(&fixture.clone, &["checkout", "main"]);
+        std::fs::write(fixture.clone.join("later-main"), "unrelated advancement\n").unwrap();
+        git(&fixture.clone, &["add", "later-main"]);
+        git(&fixture.clone, &["commit", "-m", "advance main"]);
+        git(&fixture.clone, &["push", "origin", "main"]);
+        let target_head = CommitOid(git(&fixture.clone, &["rev-parse", "HEAD"]));
+        let target = branch(&fixture.repository, "main", &target_head);
+        let candidate = PullRequestSnapshot {
+            merge_state_status: None,
+            number: PrNumber(3897),
+            title: "semantic merge".to_owned(),
+            url: "https://example.invalid/3897".to_owned(),
+            state: PullRequestState::Open,
+            draft: false,
+            head: branch(&fixture.repository, "feature", &head),
+            base: target.clone(),
+            cross_repository: false,
+            labels: BTreeSet::new(),
+            auto_merge: AutoMergeState::disabled(),
+            checks: Vec::new(),
+            created_at: None,
+            merged_at: None,
+            updated_at: None,
+        };
+        let prepared = prepare_candidate(
+            &fixture.clone,
+            &fixture.repository,
+            &candidate,
+            remote_range(&candidate),
+            PlannedBase::Remote(target.clone()),
+            &target,
+            RebaseExecutionBudget::new(TEST_REBASE_BUDGET),
+        )
+        .expect("terminal semantic delta must survive under exact tree proof");
+        assert!(
+            prepared
+                .plan
+                .merge_topology
+                .as_ref()
+                .unwrap()
+                .resolution
+                .is_some()
+        );
+        assert_eq!(
+            git(
+                &fixture.clone,
+                &[
+                    "show",
+                    &format!("{}:merge-only", prepared.plan.new_head_oid.0)
+                ]
+            ),
+            "intentional resolution"
+        );
+    }
+
     #[test]
     fn a_squashed_root_is_flattened_instead_of_replaying_its_merges() {
         let fixture = fixture();
