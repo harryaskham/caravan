@@ -424,6 +424,19 @@ fn fully_reported_contexts_are_satisfied_pending_or_failing() {
 }
 
 #[test]
+fn cancelled_sibling_does_not_hide_a_genuine_current_failure() {
+    let mut case = Case::new();
+    case.checks = vec![
+        check("Check & Lint", CheckState::Failure),
+        check("Fast Tests (unit)", CheckState::Cancelled),
+    ];
+    case.lineage = None;
+    let assessment = case.assess();
+    assert_eq!(assessment.status, RequiredRunsStatus::Failing);
+    assert_eq!(assessment.recovery, RequiredRunsRecovery::None);
+}
+
+#[test]
 fn superseded_required_rows_remain_diagnostic_but_never_vote() {
     const OLD_RUN: u64 = 31_270_552_471;
     const NEW_RUN: u64 = 31_270_627_003;

@@ -634,23 +634,25 @@ pub fn assess(input: &RequiredRunsInput<'_>) -> RequiredRunsAssessment {
         }
     } else if coverage
         .iter()
+        .any(|item| item.state == RequiredContextState::Failing)
+    {
+        // A cancelled sibling is not permission to rerun a suite containing a
+        // genuine current failure. Source/CI failure policy owns that result.
+        (
+            RequiredRunsStatus::Failing,
+            format!(
+                "PR #{} head {head_sha} has an honest required-context failure owned by CI decision policy",
+                input.pr.0
+            ),
+        )
+    } else if coverage
+        .iter()
         .any(|item| item.state == RequiredContextState::CancelledSuperseded)
     {
         (
             RequiredRunsStatus::CancelledSuperseded,
             format!(
                 "PR #{} head {head_sha} has only cancelled or superseded lineage for a required context, which never reports a verdict",
-                input.pr.0
-            ),
-        )
-    } else if coverage
-        .iter()
-        .any(|item| item.state == RequiredContextState::Failing)
-    {
-        (
-            RequiredRunsStatus::Failing,
-            format!(
-                "PR #{} head {head_sha} has an honest required-context failure owned by CI decision policy",
                 input.pr.0
             ),
         )

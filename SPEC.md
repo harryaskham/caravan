@@ -1179,6 +1179,18 @@ emit `required_runs_retriggered`; visible stalls emit `required_runs_missing`
 once per distinct problem fingerprint (kind, PR, head OID, contexts), and both
 problem lists and hook evidence stay bounded.
 
+Deferred-admission recovery uses the existing configured gate path, not another
+scheduler. An exact failed gate cannot exempt genuine failures or unknown
+verdicts in sibling checks, including checks on unprotected intermediate bases.
+Before retriggering, exact-head workflow lineage is reread: an active attempt or
+newer run of the same workflow/event is reused while its rollup catches up.
+Repeated ticks in that state perform no provider mutation. A cancelled gate
+attempt is not a failed-job target. If a selected failed-job run is found no
+longer failed during the provider's exact PR/head preflight, sync records a
+zero-write observation and reobserves CI rather than treating it as a mutation
+failure. A genuine current required-context failure also outranks a cancelled
+sibling when selecting required-run recovery.
+
 A stalled member never fails the tick and never contaminates another member: the
 scheduler status degrades instead. `missing_required_runs` in
 `scheduler_status` makes the disposition `operator_action` with wake class

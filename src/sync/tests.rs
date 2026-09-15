@@ -791,6 +791,12 @@ impl SyncProvider for FakeProvider {
             .and_then(|runs| runs.iter().find(|run| run.database_id == run_id))
             .cloned()
             .expect("exact failed run");
+        if !run.conclusion.eq_ignore_ascii_case("failure") {
+            return Err(MutationError::RunNotFailed {
+                run_id,
+                conclusion: run.conclusion,
+            });
+        }
         if !run.pull_requests.contains(&expected.number) {
             return Err(MutationError::RunPullRequestMismatch {
                 run_id,
@@ -3571,6 +3577,31 @@ fn deferred_gate_uses_canonical_exact_head_generation_vote() {
 }
 
 #[test]
+fn deferred_gate_does_not_exempt_unprotected_source_failure() {
+    let gate = crate::config::CiAdmissionGateConfig {
+        mode: crate::config::CiAdmissionGateMode::CaravanLabel,
+        context: "cara-admission".to_owned(),
+        member_label: "caravan".to_owned(),
+    };
+    let sentinel = check(&gate.context, CheckState::Failure, Some(10));
+    assert!(checks_have_exact_deferred_gate(&gate, &[sentinel.clone()]));
+    for state in [
+        CheckState::Failure,
+        CheckState::TimedOut,
+        CheckState::ActionRequired,
+        CheckState::Unknown,
+    ] {
+        assert!(!checks_have_exact_deferred_gate(
+            &gate,
+            &[
+                sentinel.clone(),
+                check("unprotected source test", state, Some(10)),
+            ]
+        ));
+    }
+}
+
+#[test]
 fn deferred_gate_maps_to_one_exact_rerequestable_suite() {
     let gate = crate::config::CiAdmissionGateConfig {
         mode: crate::config::CiAdmissionGateMode::CaravanLabel,
@@ -3631,6 +3662,89 @@ fn deferred_gate_maps_to_one_exact_rerequestable_suite() {
         provider.workflow_reruns.borrow().as_slice(),
         [(candidate.number, 10)]
     );
+    assert!(provider.rerequests.borrow().is_empty());
+}
+
+#[test]
+fn deferred_gate_reuses_pending_or_newer_run_instead_of_replaying() {
+    let gate = WorkflowRunLineage {
+        run_id: 10,
+        check_suite_id: 77,
+        workflow_name: "CI".to_owned(),
+        head_sha: "head".to_owned(),
+        status: "completed".to_owned(),
+        conclusion: "failure".to_owned(),
+        event: "pull_request".to_owned(),
+    };
+    let mut lineage = HeadRunLineage {
+        head_sha: "head".to_owned(),
+        workflow_runs: vec![gate.clone()],
+        complete: true,
+        ..HeadRunLineage::default()
+    };
+    assert_eq!(admission_gate_replacement_run(&lineage, 10).unwrap(), None);
+    lineage.workflow_runs[0].status = "in_progress".to_owned();
+    assert_eq!(
+        admission_gate_replacement_run(&lineage, 10).unwrap(),
+        Some(10)
+    );
+    lineage.workflow_runs[0] = gate.clone();
+    let mut newer = gate;
+    newer.run_id = 11;
+    lineage.workflow_runs.push(newer);
+    assert_eq!(
+        admission_gate_replacement_run(&lineage, 10).unwrap(),
+        Some(11)
+    );
+    lineage.workflow_runs[1].head_sha = "foreign".to_owned();
+    assert_eq!(admission_gate_replacement_run(&lineage, 10).unwrap(), None);
+    lineage.workflow_runs[0].conclusion = "cancelled".to_owned();
+    assert_eq!(
+        admission_gate_replacement_run(&lineage, 10)
+            .unwrap_err()
+            .code(),
+        "auto_admission_gate_run_not_failed"
+    );
+}
+
+#[test]
+fn cancelled_run_refetch_does_not_fail_sync_or_request_failed_jobs() {
+    let member = caravan_member(1, "one", "main");
+    let provider = FakeProvider::with_pull_requests(vec![member.clone()]);
+    let mut cancelled = failed_run(10, &member);
+    cancelled.conclusion = "cancelled".to_owned();
+    provider
+        .failed_runs
+        .borrow_mut()
+        .insert(member.number, vec![cancelled]);
+    let status = caravan_status(vec![member.clone()], Some(member.number), true);
+    let mut progress = SyncProgress::new(&status, vec![member.number], 1);
+    progress
+        .rerun_exact_failed_runs(&provider, &repository(), member.number, &[10])
+        .unwrap();
+    assert!(progress.provider_receipts.is_empty());
+    assert!(provider.workflow_reruns.borrow().is_empty());
+}
+
+#[test]
+fn reusing_deferred_gate_attempt_is_zero_write_across_ticks() {
+    let member = caravan_member(1, "one", "main");
+    let provider = FakeProvider::with_pull_requests(vec![member.clone()]);
+    let status = caravan_status(vec![member.clone()], Some(member.number), true);
+    for _ in 0..2 {
+        // No mutation budget is needed to reuse authoritative provider work.
+        let mut progress = SyncProgress::new(&status, vec![member.number], 0);
+        perform_admission_gate_retrigger(
+            &provider,
+            &mut progress,
+            &repository(),
+            member.number,
+            AdmissionGateRetrigger::ReuseRun { run_id: 10 },
+        )
+        .unwrap();
+        assert!(progress.provider_receipts.is_empty());
+    }
+    assert!(provider.workflow_reruns.borrow().is_empty());
     assert!(provider.rerequests.borrow().is_empty());
 }
 
