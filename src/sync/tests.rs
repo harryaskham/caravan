@@ -10889,6 +10889,42 @@ fn native_generation(
     }
 }
 
+#[test]
+fn failed_native_request_requires_actual_manual_merge_observation() {
+    let pulls = linear_chain(2);
+    let mut observed = status(pulls.clone(), None, &clean);
+    let before = native_generation(&observed, 42, &[PrNumber(1), PrNumber(2)]);
+    let plan = crate::github::GitHubStackAsyncMergePlan {
+        operation_id: "failed-request".to_owned(),
+        actor: "test".to_owned(),
+        selected: before.topology.entries.clone(),
+        before,
+        merge_method: crate::github::GitHubStackMergeMethod::Squash,
+        merge_action: crate::github::GitHubStackMergeAction::DirectMerge,
+    };
+    let mut checkpoint = crate::github::GitHubMutationAdapter::<crate::command::ProcessRunner>::native_stack_land_begin(&repository(), &plan);
+    checkpoint.terminal_status = Some(crate::github::GitHubStackMergeStatus::Failed);
+    let provider = FakeProvider::with_pull_requests(pulls);
+    checkpoint = provider
+        .native_stack_land_release_for_sync(&repository(), &checkpoint)
+        .unwrap();
+    assert!(
+        !native_stack_landing_converged(&observed, &checkpoint),
+        "authorization/green checks are not merge completion"
+    );
+    for pr in [PrNumber(1), PrNumber(2)] {
+        let pull = observed.analysis.pull_requests.get_mut(&pr).unwrap();
+        pull.state = PullRequestState::Merged;
+        pull.merged_at = Some("2026-09-17T00:00:00Z".to_owned());
+    }
+    assert!(native_stack_landing_converged(&observed, &checkpoint));
+    assert_eq!(
+        checkpoint.terminal_status,
+        Some(crate::github::GitHubStackMergeStatus::Failed),
+        "manual convergence never rewrites the provider rejection as success"
+    );
+}
+
 fn github_native_fixture() -> (
     tempfile::TempDir,
     crate::config::CaravanConfig,

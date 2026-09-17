@@ -2606,6 +2606,18 @@ fn reconcile_pending_native_stack_landing_checkpoints(
                     }
                 }
                 if native_stack_landing_converged(status, &checkpoint) {
+                    // A manual merge may converge a previously failed request.
+                    // Retire it from active scheduling without erasing that
+                    // failure or rewriting it into a successful API outcome.
+                    let archive_key = format!(
+                        "retired-{key}-{}",
+                        checkpoint.evidence_hash.replace(':', "-")
+                    );
+                    crate::stack_checkpoint::write(
+                        &context.repository_path,
+                        &archive_key,
+                        &checkpoint,
+                    )?;
                     crate::stack_checkpoint::remove(&context.repository_path, &key)?;
                     changed = true;
                 } else {
@@ -11199,7 +11211,13 @@ impl SyncProgress {
                 ErrorCategory::ExecutionFailure,
                 "github_stack_merge_failed",
                 "GitHub reported terminal native Stack merge failure",
-                Some(json!({"checkpoint": checkpoint, "resumable": false})),
+                Some(json!({
+                    "recovery_handoff": checkpoint.failure_handoff(),
+                    "checkpoint": checkpoint,
+                    "resumable": false,
+                    "retryable": false,
+                    "safe_next_action": "consume the stable owner handoff; revalidate current root/head/base/protection and independent CI before any new prefix request, or reconcile a proved manual merge; never replay the rejected UUID",
+                })),
             )),
             Some(crate::github::GitHubStackMergeStatus::Indeterminate) => {
                 Err(AppError::structured(

@@ -73,6 +73,18 @@ logical suffix is rooted at default with exact linear bases, and the provider
 Stack exactly represents that suffix. Ordinary promotion, descendant rebase,
 and Stack reconstruction resume beneath that receipt; terminal merge alone
 never discards it, and released checkpoints no longer leave orphan ruleset locks.
+Terminal checkpoints retain the sealed provider receipt, including rejection
+message and observations. A released, proved failed request emits a stable
+`recovery_handoff` identity rather than authorizing replay of its UUID. Exact
+expected-required-check rejection is distinguished from generic rejection and
+legacy missing evidence. Root-only revalidation is a candidate action, not a
+merge authorization: current root/head/base, active protection, independent
+root CI/synthetic identity, complete Stack membership/lock scope, and existing
+writer exclusion must all be checked before a new request. Indeterminate or
+unreleased transactions do not offer this failed-request recovery path. A
+later authoritative manual merge can converge the queue without converting
+the original provider failure into success. Before removing a converged active
+checkpoint, retain its exact evidence under a non-active `retired-land-*` key.
 The read-only `terminal_closed_at_default_pr_ids` audit identifies
 closed-unmerged rows whose current provider head exactly equals the current
 default generation. That is destructive-cleanup evidence requiring owner
