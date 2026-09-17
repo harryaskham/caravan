@@ -23,6 +23,27 @@ use crate::model::RepositoryId;
 
 const SCHEMA_VERSION: u32 = 2;
 
+/// Stable owner handoff for a proved rejection, never a merge authorization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GitHubStackFailureHandoff {
+    pub id: String,
+    pub classification: String,
+    pub failed_operation: String,
+    pub failed_uuid: Option<String>,
+    pub root: Option<crate::model::PrNumber>,
+    pub root_head: Option<crate::model::CommitOid>,
+    pub provider_message: Option<String>,
+    pub root_only_revalidation_candidate: bool,
+    pub automatic_retry: bool,
+    pub required_revalidation: Vec<String>,
+}
+
+fn expected_check_rejection(message: &str) -> bool {
+    let words = message.split_whitespace().collect::<Vec<_>>();
+    matches!(words.as_slice(), [n, "of", total, "required", "status", "checks", "are", "expected."]
+        if n.parse::<u32>().is_ok_and(|n| n > 0 && total.parse::<u32>().is_ok_and(|total| n <= total)))
+}
+
 /// Ordered landing phase. The order is the safety property: a lock is never
 /// released before terminal proof, and terminal proof is never reached without
 /// a verified lock.
@@ -57,6 +78,9 @@ pub struct GitHubStackLandCheckpoint {
     pub merge: Option<GitHubStackLockedMergeCheckpoint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_status: Option<GitHubStackMergeStatus>,
+    /// Preserve the sealed terminal reason, not just a lossy status flag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_receipt: Option<Box<GitHubStackLockedMergeReceipt>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lock_release: Option<GitHubStackBranchLockReceipt>,
     /// Fresh post-release observations that have not yet proven complete
@@ -85,9 +109,66 @@ impl GitHubStackLandCheckpoint {
         self.schema_version == SCHEMA_VERSION
             && !self.provider_atomic
             && phase_shape(self).is_ok()
+            && self.terminal_receipt.as_ref().is_none_or(|receipt| {
+                receipt.verify()
+                    && receipt.merge.repository == self.repository
+                    && receipt.merge.plan == self.plan
+                    && Some(receipt.merge.status) == self.terminal_status
+            })
             && serde_json::to_vec(&material)
                 .ok()
                 .is_some_and(|bytes| crate::membership::fnv1a64(&bytes) == expected)
+    }
+
+    /// Repeated reads yield the same handoff identity. Consumers deduplicate
+    /// this immutable rejection; a new attempt always needs fresh authority.
+    #[must_use]
+    pub fn failure_handoff(&self) -> Option<GitHubStackFailureHandoff> {
+        if !self.verify()
+            || self.phase != GitHubStackLandPhase::Released
+            || self.terminal_status != Some(GitHubStackMergeStatus::Failed)
+        {
+            return None;
+        }
+        let receipt = self.terminal_receipt.as_ref();
+        let message = receipt.and_then(|receipt| receipt.merge.provider_message.clone());
+        let expected = message.as_deref().is_some_and(expected_check_rejection);
+        let root = self.plan.selected.first();
+        let classification = if expected {
+            "required_check_context_mismatch"
+        } else if receipt.is_none() {
+            "terminal_evidence_missing"
+        } else {
+            "provider_rejected"
+        };
+        let identity = crate::membership::fnv1a64(
+            &serde_json::to_vec(&(
+                &self.repository,
+                &self.plan,
+                self.merge.as_ref().map(|merge| &merge.merge.uuid),
+                receipt.map(|receipt| &receipt.evidence_hash),
+                classification,
+            ))
+            .expect("handoff identity serializes"),
+        );
+        Some(GitHubStackFailureHandoff {
+            id: format!("native-rejection:{identity}"),
+            classification: classification.to_owned(),
+            failed_operation: self.plan.operation_id.clone(),
+            failed_uuid: self.merge.as_ref().map(|merge| merge.merge.uuid.clone()),
+            root: root.map(|root| root.pr),
+            root_head: root.map(|root| root.head.oid.clone()),
+            provider_message: message,
+            root_only_revalidation_candidate: expected && self.plan.selected.len() > 1,
+            automatic_retry: false,
+            required_revalidation: [
+                "current provider root state: reconcile authoritative manual merge before any new request",
+                "exact root head/base and active required protection",
+                "independent root CI and synthetic merge identity; never inherit suffix CI",
+                "complete current Stack membership and whole-Stack lock scope",
+                "existing writer exclusion and new exact request identity; never replay failed UUID",
+            ].into_iter().map(str::to_owned).collect(),
+        })
     }
 
     /// A lock this transaction still owns and must eventually release.
@@ -181,6 +262,7 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
             branch_lock: None,
             merge: None,
             terminal_status: None,
+            terminal_receipt: None,
             lock_release: None,
             convergence_observations: 0,
             convergence_last_problem: None,
@@ -338,6 +420,7 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
         let mut next = checkpoint.clone();
         next.merge.clone_from(&receipt.checkpoint);
         next.terminal_status = Some(receipt.merge.status);
+        next.terminal_receipt = Some(Box::new(receipt.clone()));
         Ok(next.seal())
     }
 
@@ -393,6 +476,7 @@ pub fn advance(
         | GitHubStackMergeStatus::Indeterminate => {
             next.phase = GitHubStackLandPhase::Terminal;
             next.terminal_status = Some(receipt.merge.status);
+            next.terminal_receipt = Some(Box::new(receipt.clone()));
         }
         GitHubStackMergeStatus::Submitted
         | GitHubStackMergeStatus::Pending
@@ -598,7 +682,7 @@ mod tests {
     }
 
     fn locked_receipt(status: GitHubStackMergeStatus) -> GitHubStackLockedMergeReceipt {
-        GitHubStackLockedMergeReceipt {
+        let mut receipt = GitHubStackLockedMergeReceipt {
             schema_version: 1,
             merge: GitHubStackMergeReceipt {
                 schema_version: 1,
@@ -617,11 +701,82 @@ mod tests {
             branch_lock_verified: true,
             checkpoint: Some(merge_checkpoint()),
             evidence_hash: String::new(),
-        }
+        };
+        receipt.evidence_hash = crate::membership::fnv1a64(&serde_json::to_vec(&receipt).unwrap());
+        receipt
     }
 
     fn begin() -> GitHubStackLandCheckpoint {
         GitHubMutationAdapter::<NeverRuns>::native_stack_land_begin(&repository(), &plan())
+    }
+
+    #[test]
+    fn expected_check_rejection_produces_stable_non_retrying_handoff() {
+        let mut receipt = locked_receipt(GitHubStackMergeStatus::Failed);
+        receipt.merge.provider_message =
+            Some("3 of 3 required status checks are expected.".to_owned());
+        receipt.evidence_hash.clear();
+        receipt.evidence_hash = crate::membership::fnv1a64(&serde_json::to_vec(&receipt).unwrap());
+        let mut released = advance(&begin(), &receipt);
+        released.phase = GitHubStackLandPhase::Released;
+        let mut release = GitHubStackBranchLockReceipt {
+            schema_version: 1,
+            operation_id: plan().operation_id.clone(),
+            actor: "cara".to_owned(),
+            repository: repository(),
+            operation: super::super::GitHubStackBranchLockOperation::Release,
+            disposition: super::super::GitHubStackBranchLockDisposition::Completed,
+            request_method: "DELETE".to_owned(),
+            request_path: "ruleset/42".to_owned(),
+            github_request_id: None,
+            lock: Some(lock()),
+            evidence_hash: String::new(),
+        };
+        release.evidence_hash = crate::membership::fnv1a64(&serde_json::to_vec(&release).unwrap());
+        released.lock_release = Some(release);
+        released = released.seal();
+        let first = released.failure_handoff().unwrap();
+        assert_eq!(first.classification, "required_check_context_mismatch");
+        assert!(first.root_only_revalidation_candidate);
+        assert!(!first.automatic_retry);
+        assert!(!first.required_revalidation.is_empty());
+        released.convergence_observations += 1;
+        released = released.seal();
+        assert_eq!(released.failure_handoff().unwrap().id, first.id);
+        let roundtrip: GitHubStackLandCheckpoint =
+            serde_json::from_slice(&serde_json::to_vec(&released).unwrap()).unwrap();
+        assert!(roundtrip.verify());
+        assert_eq!(roundtrip.failure_handoff().unwrap(), first);
+        let mut legacy = released.clone();
+        legacy.terminal_receipt = None;
+        legacy = legacy.seal();
+        let legacy_handoff = legacy.failure_handoff().unwrap();
+        assert_eq!(legacy_handoff.classification, "terminal_evidence_missing");
+        assert!(!legacy_handoff.root_only_revalidation_candidate);
+        let mut uncertain = legacy.clone();
+        uncertain.terminal_status = Some(GitHubStackMergeStatus::Indeterminate);
+        uncertain = uncertain.seal();
+        assert!(uncertain.failure_handoff().is_none());
+        let mut unreleased = released.clone();
+        unreleased.phase = GitHubStackLandPhase::Terminal;
+        unreleased.lock_release = None;
+        unreleased = unreleased.seal();
+        assert!(unreleased.failure_handoff().is_none());
+        released
+            .terminal_receipt
+            .as_mut()
+            .unwrap()
+            .merge
+            .provider_message = Some("tampered".to_owned());
+        released = released.seal();
+        assert!(released.failure_handoff().is_none());
+        assert!(!expected_check_rejection("tests failed"));
+        assert!(!expected_check_rejection(
+            "0 of 3 required status checks are expected."
+        ));
+        assert!(!expected_check_rejection(
+            "4 of 3 required status checks are expected."
+        ));
     }
 
     #[test]
