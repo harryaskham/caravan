@@ -3584,7 +3584,10 @@ fn deferred_gate_does_not_exempt_unprotected_source_failure() {
         member_label: "caravan".to_owned(),
     };
     let sentinel = check(&gate.context, CheckState::Failure, Some(10));
-    assert!(checks_have_exact_deferred_gate(&gate, &[sentinel.clone()]));
+    assert!(checks_have_exact_deferred_gate(
+        &gate,
+        std::slice::from_ref(&sentinel)
+    ));
     for state in [
         CheckState::Failure,
         CheckState::TimedOut,
