@@ -1705,8 +1705,13 @@ with no cousin rebasing, and every old/new parent edge is mapped in the receipt.
 When a child merge commit names its exact old provider base as one parent and
 that same parent branch has a retained simulated replacement earlier in the
 same globally verified batch, Cara maps only that old parent generation to the
-planned parent and seals the replacement in the topology receipt. This is the
-ordinary cumulative merge shape, not cousin history. Octopus/root parents and
+planned parent and seals the replacement in the topology receipt. Excluded
+parents proven to be ancestors of that exact old boundary are also permitted:
+the earlier parent rewrite may have replaced their OIDs. This exception requires
+the retained same-batch replacement; absence of that proof, a different boundary,
+or unrelated ancestry does not authorize replay. Internal topology and independent
+final-tree checks remain mandatory. This is the ordinary cumulative merge shape,
+not cousin history. Octopus/root parents and
 every unrelated cousin/external parent remain rejected. The rebuilt head tree must
 exactly equal an independently computed clean `merge-tree` for current target +
 old candidate head before any write. When a terminal two-parent source merge

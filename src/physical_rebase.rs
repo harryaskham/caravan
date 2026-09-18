@@ -971,8 +971,14 @@ fn validate_merge_preserving_topology(
             .iter()
             .filter(|parent| !range.contains(*parent))
         {
-            if replaced_parent_boundary == Some(parent) {
-                continue;
+            if let Some(old_boundary) = replaced_parent_boundary {
+                // Only the exact same-batch parent replacement admits this
+                // exception. Its excluded ancestors belong to the original
+                // leased base, even when rebasing the parent changed their OIDs.
+                // Unrelated history still must belong to the new target.
+                if is_ancestor(runner, parent, old_boundary)? {
+                    continue;
+                }
             }
             if !is_ancestor(runner, parent, &target.oid)? {
                 return Err(decision(
@@ -3976,6 +3982,155 @@ mod tests {
             )
             .unwrap()
         );
+    }
+
+    fn assert_boundary_replacement_refusals(
+        fixture: &Fixture,
+        prepared: &PreparedRebase,
+        target: &BranchSnapshot,
+        old_parent: &CommitOid,
+        pr: PrNumber,
+    ) {
+        let runner = process_runner(&fixture.clone, TEST_REBASE_BUDGET, None, None);
+        let proof = prepared.plan.merge_topology.as_ref().unwrap();
+        for boundary in [None, Some(&fixture.old_main)] {
+            assert!(
+                validate_merge_preserving_topology(
+                    &runner,
+                    &proof.old_commits,
+                    target,
+                    boundary,
+                    pr,
+                )
+                .is_err(),
+                "missing or wrong boundary must not authorize original ancestry"
+            );
+        }
+        let foreign_oid = CommitOid(git(
+            &fixture.clone,
+            &[
+                "commit-tree",
+                &prepared.plan.new_tree_oid.0,
+                "-m",
+                "unrelated root",
+            ],
+        ));
+        let mut topology = proof.old_commits.clone();
+        topology[0].parents = vec![foreign_oid];
+        let error =
+            validate_merge_preserving_topology(&runner, &topology, target, Some(old_parent), pr)
+                .unwrap_err();
+        assert_eq!(error.code(), "rebase_cousin_history");
+    }
+
+    fn advance_fixture_parent(fixture: &Fixture) -> CommitOid {
+        git(&fixture.clone, &["checkout", "feature"]);
+        std::fs::write(fixture.clone.join("parent-followup"), "parent followup\n").unwrap();
+        git(&fixture.clone, &["add", "parent-followup"]);
+        git(&fixture.clone, &["commit", "-m", "advance old parent"]);
+        let head = CommitOid(git(&fixture.clone, &["rev-parse", "HEAD"]));
+        git(&fixture.clone, &["push", "origin", "feature"]);
+        head
+    }
+
+    #[test]
+    fn old_base_ancestor_in_merged_child_maps_to_prepared_parent() {
+        let fixture = fixture();
+        let old_ancestor = fixture.feature.clone();
+        let old_parent = advance_fixture_parent(&fixture);
+        git(
+            &fixture.clone,
+            &["checkout", "-b", "child", &old_ancestor.0],
+        );
+        std::fs::write(fixture.clone.join("child-side"), "child\n").unwrap();
+        git(&fixture.clone, &["add", "child-side"]);
+        git(&fixture.clone, &["commit", "-m", "child from older parent"]);
+        git(
+            &fixture.clone,
+            &[
+                "merge",
+                "--no-ff",
+                "feature",
+                "-m",
+                "merge exact old parent",
+            ],
+        );
+        std::fs::write(fixture.clone.join("child-followup"), "followup\n").unwrap();
+        git(&fixture.clone, &["add", "child-followup"]);
+        git(
+            &fixture.clone,
+            &["commit", "-m", "child after parent merge"],
+        );
+        let child_head = CommitOid(git(&fixture.clone, &["rev-parse", "HEAD"]));
+        git(&fixture.clone, &["push", "-u", "origin", "child"]);
+        let parent = open_candidate(
+            7,
+            "parent",
+            branch(&fixture.repository, "feature", &old_parent),
+            branch(&fixture.repository, "main", &fixture.old_main),
+        );
+        let child = open_candidate(
+            8,
+            "child",
+            branch(&fixture.repository, "child", &child_head),
+            parent.head.clone(),
+        );
+        let default = branch(&fixture.repository, "main", &fixture.new_main);
+        let prepared_parent = prepare_candidate(
+            &fixture.clone,
+            &fixture.repository,
+            &parent,
+            range_base_for_remote_target(&parent, &default),
+            PlannedBase::Remote(default.clone()),
+            &default,
+            RebaseExecutionBudget::new(TEST_REBASE_BUDGET),
+        )
+        .expect("rewritten parent");
+        let target = branch(
+            &fixture.repository,
+            "feature",
+            &prepared_parent.plan.new_head_oid,
+        );
+        let runner = process_runner(&fixture.clone, TEST_REBASE_BUDGET, None, None);
+        assert!(is_ancestor(&runner, &old_ancestor, &old_parent).unwrap());
+        assert!(!is_ancestor(&runner, &old_ancestor, &target.oid).unwrap());
+        let prepared = prepare_candidate(
+            &fixture.clone,
+            &fixture.repository,
+            &child,
+            range_base_for_rewritten_parent(&child, &parent.head),
+            PlannedBase::Simulated(target.clone()),
+            &default,
+            RebaseExecutionBudget::new(TEST_REBASE_BUDGET),
+        )
+        .expect("proven old-base ancestor is not foreign history");
+        assert!(is_ancestor(&runner, &target.oid, &prepared.plan.new_head_oid).unwrap());
+        let proof = prepared.plan.merge_topology.as_ref().unwrap();
+        assert_eq!(prepared.plan.new_tree_oid, proof.expected_merge_tree_oid);
+        assert_eq!(
+            proof.parent_replacement.as_ref().unwrap().old_parent,
+            old_parent
+        );
+        assert_boundary_replacement_refusals(
+            &fixture,
+            &prepared,
+            &target,
+            &old_parent,
+            child.number,
+        );
+        for (path, content) in [
+            ("parent-followup", "parent followup"),
+            ("child-side", "child"),
+            ("child-followup", "followup"),
+        ] {
+            assert_eq!(
+                git(
+                    &fixture.clone,
+                    &["show", &format!("{}:{path}", prepared.plan.new_head_oid.0)]
+                ),
+                content
+            );
+        }
     }
 
     #[test]
