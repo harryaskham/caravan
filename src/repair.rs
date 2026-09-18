@@ -3207,9 +3207,39 @@ pub(crate) fn provider_git_url(
         "repair_provider_url_failed",
         "could not resolve the explicit provider-owned Git URL",
     )?;
-    let url = output.stdout.trim().to_owned();
-    validate_provider_git_url(repository, &url)?;
-    Ok(url)
+    provider_git_url_for_mode(
+        repository,
+        output.stdout.trim(),
+        context.config.github_auth.mode,
+    )
+}
+
+fn provider_git_url_for_mode(
+    repository: &RepositoryId,
+    url: &str,
+    mode: crate::config::GithubAuthMode,
+) -> Result<String, AppError> {
+    validate_provider_git_url(repository, url)?;
+    if mode == crate::config::GithubAuthMode::AppInstallation {
+        // Provider discovery returns sshUrl, but App Git must use the same
+        // installation principal over canonical HTTPS, never ambient SSH.
+        if !(url.starts_with("git@github.com:")
+            || url.starts_with("ssh://git@github.com/")
+            || url.starts_with("https://github.com/"))
+        {
+            return Err(AppError::structured(
+                ErrorCategory::Validation,
+                "repair_provider_url_invalid",
+                "App repair requires an exact GitHub repository URL",
+                Some(json!({"repository": repository})),
+            ));
+        }
+        return Ok(format!(
+            "https://github.com/{}/{}.git",
+            repository.owner, repository.name
+        ));
+    }
+    Ok(url.to_owned())
 }
 
 fn validate_provider_git_url(repository: &RepositoryId, url: &str) -> Result<(), AppError> {
@@ -3494,6 +3524,71 @@ mod tests {
             .expect("UTF-8 git output")
             .trim()
             .to_owned()
+    }
+
+    #[test]
+    fn provider_url_app_mode_uses_canonical_https_bd_d1389f() {
+        let repository = RepositoryId {
+            owner: "owner".into(),
+            name: "repo".into(),
+        };
+        for url in [
+            "git@github.com:owner/repo.git",
+            "ssh://git@github.com/owner/repo.git",
+            "https://github.com/owner/repo.git",
+        ] {
+            assert_eq!(
+                provider_git_url_for_mode(
+                    &repository,
+                    url,
+                    crate::config::GithubAuthMode::AppInstallation
+                )
+                .unwrap(),
+                "https://github.com/owner/repo.git"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_url_ambient_mode_preserves_transport_bd_d1389f() {
+        let repository = RepositoryId {
+            owner: "owner".into(),
+            name: "repo".into(),
+        };
+        for url in [
+            "git@github.com:owner/repo.git",
+            "ssh://git@github.com/owner/repo.git",
+            "https://github.com/owner/repo.git",
+        ] {
+            assert_eq!(
+                provider_git_url_for_mode(&repository, url, crate::config::GithubAuthMode::Ambient)
+                    .unwrap(),
+                url
+            );
+        }
+    }
+
+    #[test]
+    fn provider_url_app_mode_rejects_unproved_identity_bd_d1389f() {
+        let repository = RepositoryId {
+            owner: "owner".into(),
+            name: "repo".into(),
+        };
+        for url in [
+            "git@github.com:other/repo.git",
+            "https://github.com/owner/other.git",
+            "http://github.com/owner/repo.git",
+            "/tmp/local-repository",
+        ] {
+            assert!(
+                provider_git_url_for_mode(
+                    &repository,
+                    url,
+                    crate::config::GithubAuthMode::AppInstallation
+                )
+                .is_err()
+            );
+        }
     }
 
     struct Fixture {
