@@ -4023,16 +4023,21 @@ mod tests {
         assert_eq!(error.code(), "rebase_cousin_history");
     }
 
-    #[test]
-    fn old_base_ancestor_in_merged_child_maps_to_prepared_parent() {
-        let fixture = fixture();
-        let old_ancestor = fixture.feature.clone();
+    fn advance_fixture_parent(fixture: &Fixture) -> CommitOid {
         git(&fixture.clone, &["checkout", "feature"]);
         std::fs::write(fixture.clone.join("parent-followup"), "parent followup\n").unwrap();
         git(&fixture.clone, &["add", "parent-followup"]);
         git(&fixture.clone, &["commit", "-m", "advance old parent"]);
-        let old_parent = CommitOid(git(&fixture.clone, &["rev-parse", "HEAD"]));
+        let head = CommitOid(git(&fixture.clone, &["rev-parse", "HEAD"]));
         git(&fixture.clone, &["push", "origin", "feature"]);
+        head
+    }
+
+    #[test]
+    fn old_base_ancestor_in_merged_child_maps_to_prepared_parent() {
+        let fixture = fixture();
+        let old_ancestor = fixture.feature.clone();
+        let old_parent = advance_fixture_parent(&fixture);
         git(
             &fixture.clone,
             &["checkout", "-b", "child", &old_ancestor.0],
