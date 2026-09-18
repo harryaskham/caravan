@@ -609,8 +609,10 @@ remote URLs, and persisted Git config are never created. A checkout may retain
 one exact same-repository SSH `origin`; when a child addresses that alias, Cara
 overlays its process-local `remote.origin.url` with the exact HTTPS URL, so App
 credentials still own the network request and on-disk config is unchanged.
-Explicit SSH URLs, plaintext HTTP, non-GitHub/local remotes, repository mismatch,
-and credential-bearing URLs fail before the remote command. Existing credential
+Provider-owned repair and reshape URL discovery validates the exact repository before selecting canonical HTTPS in App mode, even when GitHub returns an `sshUrl`.
+Ambient mode retains the provider-selected transport.
+Explicit SSH URLs passed to the App Git transport, plaintext HTTP, non-GitHub/local remotes, repository mismatch,
+and credential-bearing URLs still fail before the remote command. Existing credential
 helpers and interactive prompting are disabled for that child. One
 authentication failure refreshes and retries under the same deadline; a second
 failure stops. Ambient mode does not install or invoke this helper.
