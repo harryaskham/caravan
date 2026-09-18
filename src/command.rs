@@ -1946,6 +1946,11 @@ fn terminate_and_reap(child: &mut Child) -> std::io::Result<std::process::ExitSt
     let grace_deadline = Instant::now() + TERMINATION_GRACE;
     loop {
         if let Some(status) = child.try_wait()? {
+            // The shell may exit on TERM while a descendant ignores it and
+            // retains stdout/stderr. Finish the owned group before joining
+            // capture threads; reaping only the leader is not pipe closure.
+            #[cfg(unix)]
+            signal_process_group(child.id(), "-KILL");
             return Ok(status);
         }
         if Instant::now() >= grace_deadline {
@@ -3001,6 +3006,24 @@ mod tests {
                 });
             }
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_kills_descendants_holding_capture_pipes_after_shell_exit() {
+        let started = Instant::now();
+        let error = ProcessRunner::new()
+            .with_timeout(Duration::from_millis(100))
+            .run(&CommandSpec::new("sh").args([
+                "-c",
+                "(trap '' TERM; printf descendant-started; sleep 5) & wait",
+            ]))
+            .expect_err("deadline must terminate the complete owned group");
+        assert!(matches!(error, CommandRunError::Timeout { .. }));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "pipe-holding descendant outlived timeout cleanup"
+        );
     }
 
     #[test]
