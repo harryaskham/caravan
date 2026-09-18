@@ -6832,8 +6832,18 @@ fn gate_deferral_allows_required_runs(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdmissionGateRetrigger {
-    CheckSuite { check_suite_id: u64 },
-    GitHubActionsRun { run_id: u64, check_suite_id: u64 },
+    /// Provider already has a replacement or active attempt; wait for its
+    /// rollup rather than replaying the older deferred attempt.
+    ReuseRun {
+        run_id: u64,
+    },
+    CheckSuite {
+        check_suite_id: u64,
+    },
+    GitHubActionsRun {
+        run_id: u64,
+        check_suite_id: u64,
+    },
 }
 
 fn admission_gate_retrigger(
@@ -6882,6 +6892,9 @@ fn admission_gate_retrigger(
                 json!({"pr": candidate.number, "head": candidate.head, "lineage": lineage, "mutated": false}),
             ),
         ));
+    }
+    if let Some(run_id) = admission_gate_replacement_run(&lineage, *gate_run_id)? {
+        return Ok(AdmissionGateRetrigger::ReuseRun { run_id });
     }
     let suite_ids = lineage
         .workflow_runs
@@ -6944,10 +6957,21 @@ fn checks_have_exact_deferred_gate(
 ) -> bool {
     let current = crate::model::latest_checks_per_identity(checks).0;
     let matching = current
-        .into_iter()
+        .iter()
         .filter(|check| check.name == gate.context)
         .collect::<Vec<_>>();
-    matching.len() == 1 && matching[0].state == CheckState::Failure
+    matching.len() == 1
+        && matching[0].state == CheckState::Failure
+        && current.iter().all(|check| {
+            check.name == gate.context
+                || !matches!(
+                    check.state,
+                    CheckState::Failure
+                        | CheckState::TimedOut
+                        | CheckState::ActionRequired
+                        | CheckState::Unknown
+                )
+        })
 }
 
 fn dispatch_exact_ci_after_queue_mutations(
@@ -7053,6 +7077,50 @@ fn dispatch_exact_ci_after_queue_mutations(
     Ok(())
 }
 
+fn admission_gate_replacement_run(
+    lineage: &crate::required_runs::HeadRunLineage,
+    gate_run_id: u64,
+) -> Result<Option<u64>, AppError> {
+    let runs = lineage
+        .workflow_runs
+        .iter()
+        .filter(|run| run.run_id == gate_run_id && run.head_sha == lineage.head_sha)
+        .collect::<Vec<_>>();
+    let [gate] = runs.as_slice() else {
+        return Err(AppError::validation(
+            "auto_admission_gate_run_ambiguous",
+            "gate run must have one exact-head lineage row",
+        ));
+    };
+    let latest = lineage
+        .workflow_runs
+        .iter()
+        .filter(|run| {
+            run.head_sha == lineage.head_sha
+                && !gate.workflow_name.is_empty()
+                && run.workflow_name == gate.workflow_name
+                && run.event == gate.event
+                && run.run_id >= gate_run_id
+        })
+        .max_by_key(|run| run.run_id)
+        .unwrap_or(gate);
+    if latest.run_id > gate_run_id
+        || matches!(
+            latest.status.as_str(),
+            "queued" | "in_progress" | "pending" | "waiting" | "requested"
+        )
+    {
+        return Ok(Some(latest.run_id));
+    }
+    if latest.status != "completed" || latest.conclusion != "failure" {
+        return Err(AppError::validation(
+            "auto_admission_gate_run_not_failed",
+            "deferred gate rerun requires a completed failed attempt; rediscover current checks",
+        ));
+    }
+    Ok(None)
+}
+
 fn perform_admission_gate_retrigger(
     provider: &impl SyncProvider,
     progress: &mut SyncProgress,
@@ -7060,8 +7128,12 @@ fn perform_admission_gate_retrigger(
     candidate_pr: PrNumber,
     retrigger: AdmissionGateRetrigger,
 ) -> Result<(), AppError> {
+    if matches!(retrigger, AdmissionGateRetrigger::ReuseRun { .. }) {
+        return Ok(());
+    }
     progress.ensure_mutation_capacity(1)?;
     let (receipt, summary) = match retrigger {
+        AdmissionGateRetrigger::ReuseRun { .. } => unreachable!("reuse performs no mutation"),
         AdmissionGateRetrigger::CheckSuite { check_suite_id } => (
             provider
                 .rerequest_check_suite(
@@ -10697,9 +10769,24 @@ impl SyncProgress {
     ) -> Result<(), AppError> {
         for run_id in run_ids {
             self.ensure_mutation_capacity(1)?;
-            let receipt = provider
-                .rerun_failed_run(repository, &self.precondition(number), *run_id)
-                .map_err(|error| mutation_error(&error, self, Some(number)))?;
+            let receipt =
+                match provider.rerun_failed_run(repository, &self.precondition(number), *run_id) {
+                    Ok(receipt) => receipt,
+                    // This typed refusal occurs after exact PR/head validation
+                    // and before the rerun POST. Reobserve CI instead of treating
+                    // cancellation or completion races as a failed mutation.
+                    Err(MutationError::RunNotFailed { run_id, conclusion }) => {
+                        self.already(
+                            MutationKind::RerunChecks,
+                            number,
+                            &format!(
+                                "run {run_id} is now {conclusion}; no failed-job rerun requested"
+                            ),
+                        );
+                        continue;
+                    }
+                    Err(error) => return Err(mutation_error(&error, self, Some(number))),
+                };
             self.record(
                 receipt,
                 &format!("reran failed jobs for exact workflow run {run_id}"),
