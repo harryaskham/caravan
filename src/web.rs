@@ -2260,6 +2260,8 @@ fn enqueue_webhook_sync(repository: &Arc<RepositoryEntry>) -> bool {
                 request: WebActionRequest {
                     expected_refresh_sequence,
                     action: WebAction::Sync(SyncInput {
+                        closed_pr: None,
+                        expected_closed_head: None,
                         all: true,
                         rerun_failed: false,
                         dry_run: false,

@@ -1209,6 +1209,16 @@ pub struct AdmitInput {}
 /// Input for `cara sync`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Args)]
 pub struct SyncInput {
+    /// Reconcile only one CLOSED, unmerged PR's lifecycle labels; no queue work or hooks.
+    #[arg(long, conflicts_with_all = ["all", "rerun_failed"])]
+    #[serde(default)]
+    pub closed_pr: Option<u64>,
+
+    /// Exact source head required when applying --closed-pr (obtain it from --dry-run).
+    #[arg(long, requires = "closed_pr")]
+    #[serde(default)]
+    pub expected_closed_head: Option<String>,
+
     /// Synchronize every caravan rather than only the current branch's caravan.
     #[arg(long)]
     #[serde(default)]

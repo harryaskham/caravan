@@ -51,6 +51,7 @@ fn plan_sync_inner(
     input: &SyncInput,
     authority: Option<&crate::sync_authority::DefaultBranchAuthority>,
 ) -> Result<SyncPlanOutput, AppError> {
+    super::closed::validate_input(input, false)?;
     let lock = context.acquire_planning_operation("plan-sync")?;
     let started = Instant::now();
     let operation_deadline = started + sync_operation_budget(context);
@@ -62,6 +63,22 @@ fn plan_sync_inner(
         authority.bind_invocation(&mut status)?;
     }
     crate::initialization::require_ready(&status.initialization)?;
+    if input.closed_pr.is_some() {
+        super::require_current_policy(context, &status)?;
+        if let Some(authority) = authority {
+            authority.revalidate()?;
+        }
+        return super::closed::plan(
+            status,
+            input,
+            github_budget.used(),
+            context
+                .config
+                .validate_tick_bounds()
+                .err()
+                .map(|error| error.to_string()),
+        );
+    }
     super::require_native_stack_backend_healthy(&status)?;
     if let Some(authority) = authority {
         authority.revalidate()?;

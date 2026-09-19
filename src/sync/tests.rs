@@ -1554,6 +1554,172 @@ fn closed_unmerged_head_collapsed_to_default_is_audited_without_mutation() {
     assert!(status.admission.candidates.is_empty());
 }
 
+fn scoped_closed_input(pr: &PullRequestSnapshot) -> SyncInput {
+    SyncInput {
+        closed_pr: Some(pr.number.0),
+        expected_closed_head: Some(pr.head.oid.0.clone()),
+        ..SyncInput::default()
+    }
+}
+
+#[test]
+fn scoped_closed_cleanup_ignores_unrelated_native_failure_and_is_idempotent() {
+    let mut selected = pull_request(
+        41,
+        "closed",
+        "main",
+        PullRequestState::Closed,
+        AutoMergeState::disabled(),
+    );
+    selected.labels.insert("keep-me".to_owned());
+    selected.labels.insert(PARKED_LABEL.to_owned());
+    let other = pull_request(
+        42,
+        "other",
+        "main",
+        PullRequestState::Closed,
+        AutoMergeState::disabled(),
+    );
+    let mut draft = pull_request(
+        43,
+        "draft",
+        "main",
+        PullRequestState::Open,
+        AutoMergeState::disabled(),
+    );
+    draft.draft = true;
+    let mut snapshot = status(
+        vec![selected.clone(), other.clone(), draft.clone()],
+        None,
+        &clean,
+    );
+    enable_native_backend(&mut snapshot);
+    snapshot.stack_backend.problems = vec![crate::read::StackBackendProblem {
+        code: "github_stack_member_order_drift".to_owned(),
+        message: "unrelated Stack remains invalid".to_owned(),
+    }];
+    assert!(require_native_stack_backend_healthy(&snapshot).is_err());
+    let provider =
+        FakeProvider::with_pull_requests(vec![selected.clone(), other.clone(), draft.clone()]);
+    let input = scoped_closed_input(&selected);
+    let preview = closed::plan(snapshot.clone(), &input, 0, None).unwrap();
+    assert_eq!(preview.actions.len(), 1);
+    assert_eq!(preview.actions[0].pr, Some(selected.number));
+    assert_eq!(preview.provider_writes, 0);
+    assert!(!preview.auto_admission.enabled);
+    assert!(preview.physical_rebase_plans.is_empty());
+    assert!(preview.would_emit_events.is_empty());
+    let result = closed::reconcile(&snapshot, &input, &provider).unwrap();
+    assert_eq!(result.transitions.len(), 1);
+    assert_eq!(*provider.calls.borrow(), [MutationKind::SetLabels]);
+    let terminal = provider.pulls.borrow()[&selected.number].clone();
+    assert_eq!(
+        terminal.labels,
+        BTreeSet::from(["keep-me".to_owned(), CLOSED_LABEL.to_owned()])
+    );
+    assert_eq!(terminal.head, selected.head);
+    assert_eq!(terminal.base, selected.base);
+    assert_eq!(provider.pulls.borrow()[&other.number], other);
+    assert_eq!(provider.pulls.borrow()[&draft.number], draft);
+    snapshot
+        .analysis
+        .pull_requests
+        .insert(terminal.number, terminal);
+    assert!(
+        !closed::reconcile(&snapshot, &input, &provider)
+            .unwrap()
+            .changed
+    );
+    assert_eq!(provider.calls.borrow().len(), 1);
+    assert_eq!(
+        closed::plan(snapshot, &input, 0, None).unwrap().actions[0].state,
+        SyncPlanActionState::AlreadySatisfied
+    );
+}
+
+#[test]
+fn scoped_closed_cleanup_refuses_nonclosed_or_wrong_head_and_invalid_input() {
+    let selected = pull_request(
+        41,
+        "closed",
+        "main",
+        PullRequestState::Closed,
+        AutoMergeState::disabled(),
+    );
+    let input = scoped_closed_input(&selected);
+    for state in [PullRequestState::Open, PullRequestState::Merged] {
+        let mut row = selected.clone();
+        row.state = state;
+        let snapshot = status(vec![row.clone()], None, &clean);
+        let provider = FakeProvider::with_pull_requests(vec![row]);
+        assert_eq!(
+            closed::reconcile(&snapshot, &input, &provider)
+                .unwrap_err()
+                .code(),
+            "closed_member_identity_changed"
+        );
+        assert!(provider.calls.borrow().is_empty());
+    }
+    let snapshot = status(vec![selected.clone()], None, &clean);
+    let provider = FakeProvider::with_pull_requests(vec![selected]);
+    let mut wrong = input.clone();
+    wrong.expected_closed_head = Some("wrong".to_owned());
+    assert_eq!(
+        closed::reconcile(&snapshot, &wrong, &provider)
+            .unwrap_err()
+            .code(),
+        "closed_member_identity_changed"
+    );
+    wrong.expected_closed_head = None;
+    assert!(closed::plan(snapshot.clone(), &wrong, 0, None).is_ok());
+    assert_eq!(
+        closed::reconcile(&snapshot, &wrong, &provider)
+            .unwrap_err()
+            .code(),
+        "closed_member_input_invalid"
+    );
+    wrong = input;
+    wrong.all = true;
+    assert!(closed::reconcile(&snapshot, &wrong, &provider).is_err());
+    assert!(closed::plan(snapshot, &wrong, 0, None).is_err());
+    assert!(provider.calls.borrow().is_empty());
+}
+
+#[test]
+fn scoped_closed_cleanup_fences_reopen_head_and_label_races() {
+    let selected = pull_request(
+        41,
+        "closed",
+        "main",
+        PullRequestState::Closed,
+        AutoMergeState::disabled(),
+    );
+    let input = scoped_closed_input(&selected);
+    let snapshot = status(vec![selected.clone()], None, &clean);
+    for race in 0..4 {
+        let mut changed = selected.clone();
+        match race {
+            0 => changed.state = PullRequestState::Open,
+            1 => changed.head.oid.0 = "moved-head".to_owned(),
+            2 => {
+                changed.labels.insert("concurrent-label".to_owned());
+            }
+            _ => changed.state = PullRequestState::Merged,
+        }
+        for stale_read in [false, true] {
+            let provider = FakeProvider::with_pull_requests(vec![changed.clone()]);
+            if stale_read {
+                provider.serve_stale_read(selected.number, selected.clone());
+            }
+            assert!(closed::reconcile(&snapshot, &input, &provider).is_err());
+            assert_eq!(provider.pulls.borrow()[&selected.number], changed);
+            if !stale_read {
+                assert!(provider.calls.borrow().is_empty());
+            }
+        }
+    }
+}
+
 #[test]
 fn closed_unmerged_active_member_is_terminalized_outside_capacity() {
     let closed = pull_request(
@@ -1864,6 +2030,8 @@ fn no_write_caravan_plan_records_actions_without_provider_mutation() {
         &provider,
         &caravan,
         &SyncInput {
+            closed_pr: None,
+            expected_closed_head: None,
             all: true,
             rerun_failed: false,
             dry_run: false,
@@ -1913,6 +2081,8 @@ fn no_write_auto_admission_plans_only_first_exact_candidate() {
         &context,
         &status,
         &SyncInput {
+            closed_pr: None,
+            expected_closed_head: None,
             all: true,
             rerun_failed: false,
             dry_run: false,
@@ -1965,6 +2135,8 @@ fn fleet_capacity_never_blocks_joining_an_existing_caravan() {
         &context,
         &status,
         &SyncInput {
+            closed_pr: None,
+            expected_closed_head: None,
             all: true,
             rerun_failed: false,
             dry_run: false,
@@ -2023,6 +2195,8 @@ fn default_fleet_capacity_is_a_typed_no_write_plan_stop() {
         &context,
         &status,
         &SyncInput {
+            closed_pr: None,
+            expected_closed_head: None,
             all: true,
             rerun_failed: false,
             dry_run: false,
@@ -2051,6 +2225,8 @@ fn default_fleet_capacity_is_a_typed_no_write_plan_stop() {
         &context,
         &status,
         &SyncInput {
+            closed_pr: None,
+            expected_closed_head: None,
             all: true,
             rerun_failed: false,
             dry_run: false,
@@ -2179,6 +2355,8 @@ fn no_write_auto_admission_never_leapfrogs_rejected_canonical_candidate() {
         &context,
         &status,
         &SyncInput {
+            closed_pr: None,
+            expected_closed_head: None,
             all: true,
             rerun_failed: false,
             dry_run: false,
@@ -8013,6 +8191,8 @@ fn a_deferred_prefix_tick_succeeds_as_a_retryable_bounded_progress_receipt() {
     let output = bounded_prefix_output(
         &context,
         &SyncInput {
+            closed_pr: None,
+            expected_closed_head: None,
             all: true,
             dry_run: false,
             rerun_failed: false,
@@ -9541,6 +9721,8 @@ fn plan_and_sync_agree_that_newer_green_required_runs_make_the_root_eligible() {
         &plan_provider,
         &caravan,
         &SyncInput {
+            closed_pr: None,
+            expected_closed_head: None,
             all: true,
             rerun_failed: false,
             dry_run: false,

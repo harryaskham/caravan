@@ -2105,6 +2105,8 @@ fn resume_or_return(
     match crate::sync::sync_with_writer_guard(
         &workspace_context,
         &SyncInput {
+            closed_pr: None,
+            expected_closed_head: None,
             all: true,
             rerun_failed: false,
             dry_run: false,

@@ -49,6 +49,7 @@ use crate::writer_guard::WriterOperationGuard;
 use crate::{AdmitInput, AppContext, AppError, CheckInput, SyncInput};
 
 mod budget;
+mod closed;
 mod decision;
 mod plan;
 pub mod progress;
@@ -2340,6 +2341,19 @@ fn sync_with_optional_writer_guard(
     let started = Instant::now();
     let budget = sync_operation_budget(context);
     let operation_deadline = started + budget;
+    closed::validate_input(input, true)?;
+    if input.closed_pr.is_some() {
+        // Metadata-only cleanup must never dispatch hooks or check out a branch,
+        // even when discovery or the exact label transaction refuses.
+        return sync_without_hooks(
+            context,
+            input,
+            started,
+            operation_deadline,
+            writer_guard,
+            authority,
+        );
+    }
     match sync_without_hooks(
         context,
         input,
@@ -2854,7 +2868,11 @@ fn reconcile_closed_lifecycle(
                 receipt,
                 "atomically replaced closed-unmerged PR lifecycle labels",
             );
-            if !current.is_closed_unmerged() || current.labels != desired_labels {
+            let mut expected_after = PullRequestPrecondition::from(&fresh);
+            expected_after.labels.clone_from(&desired_labels);
+            if !current.is_closed_unmerged()
+                || !expected_after.mutation_identity_eq(&PullRequestPrecondition::from(&current))
+            {
                 return Err(closed_lifecycle_postcondition_error(
                     "replace_terminal_labels",
                     &planned,
@@ -5029,6 +5047,36 @@ fn sync_with_lock(
         .with_operation_deadline(operation_deadline)
         .with_github_request_budget(github_budget.clone());
     let runner = lock.runner(runner);
+    if input.closed_pr.is_some() {
+        let provider = GitHubMutationAdapter::new(runner);
+        let convergence_started = Instant::now();
+        let reconciliation = closed::reconcile(&status, input, &provider)?;
+        let convergence_elapsed = convergence_started.elapsed();
+        let rediscovery_started = Instant::now();
+        if reconciliation.changed {
+            status = read::fleet_status_for_sync(context, operation_deadline, Some(&github_budget))
+                .map_err(|error| AppError::structured(
+                    error.category(), "closed_member_rediscovery_failed",
+                    "label transaction completed but fleet rediscovery failed; preserve its receipt",
+                    Some(json!({"mutated": true, "source": error.details(),
+                        "provider_receipts": &reconciliation.provider_receipts,
+                        "closed_lifecycle_transitions": &reconciliation.transitions})),
+                ))?;
+        }
+        return closed_lifecycle_output(
+            context,
+            input,
+            started,
+            operation_deadline,
+            initial_status_elapsed,
+            convergence_elapsed,
+            rediscovery_started.elapsed(),
+            reconciliation,
+            status,
+            lock_recovery,
+            &mut lock,
+        );
+    }
     // A decision can require an exact branch checkout. Prove checkout safety
     // before the first provider mutation so a dirty worktree can never turn a
     // partially-mutated sync into an unrepairable decision receipt.

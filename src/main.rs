@@ -5155,6 +5155,21 @@ provider.wait()
     }
 
     #[test]
+    fn scoped_closed_sync_parses_preview_and_rejects_broad_flags() {
+        let cli = Cli::try_parse_from(["cara", "sync", "--closed-pr", "3983", "--dry-run"])
+            .expect("scoped preview parses");
+        let Command::Sync(input) = cli.command else {
+            panic!("expected sync");
+        };
+        assert_eq!(input.closed_pr, Some(3983));
+        assert!(input.dry_run);
+        for flag in ["--all", "--rerun-failed"] {
+            assert!(Cli::try_parse_from(["cara", "sync", "--closed-pr", "3983", flag]).is_err());
+        }
+        assert!(Cli::try_parse_from(["cara", "sync", "--expected-closed-head", "head"]).is_err());
+    }
+
+    #[test]
     fn plan_sync_parses_as_read_only_nested_command() {
         let cli = Cli::try_parse_from(["cara", "plan", "sync", "--all", "--rerun-failed"])
             .expect("plan sync parses");
