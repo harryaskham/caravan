@@ -212,6 +212,8 @@ cara --json force-intent preview|apply|revoke --pr N --head OID \
   --membership-generation G --failure-fingerprint F --reason R \
   --expires-at-ms T --auto-merge squash
 cara plan sync [--all] [--rerun-failed]
+cara sync --closed-pr N --dry-run
+cara sync --closed-pr N --expected-closed-head OID # labels only; no hooks or queue work
 cara plan concat --source-head-pr S --target-tail-pr T --actor A --reason R
 cara concat --source-head-pr S --target-tail-pr T --actor A --reason R --expected-plan-hash H
 cara admit | cara sync [--all] [--rerun-failed] | cara loop [--once] [--manual --shell COMMAND]
