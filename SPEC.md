@@ -323,6 +323,20 @@ state is observable. Provider races and read failures are classified and
 resumable; an unchanged terminal row performs zero writes on every duplicate
 sync.
 
+When unrelated native Stack topology prevents broad sync, `cara sync --closed-pr
+<N> --dry-run` (also `cara plan sync --closed-pr <N>`) previews only that closed,
+unmerged member's lifecycle label replacement. Apply with `cara sync --closed-pr
+<N> --expected-closed-head <full-oid>`. This uses the same repository writer lock,
+default-policy authority, discovery, repeated exact provider preconditions and
+post-write readback, but returns before pending-land processing, native Stack
+recovery/rebase, admission or merge. It never dispatches hooks or checks out a
+branch, including on failure. `--all` and `--rerun-failed` are incompatible.
+Missing, reopened, merged, mismatched-head, and drifted-label snapshots refuse;
+an already-terminal row performs no writes. Other PRs and unrelated labels remain
+untouched. A successful label receipt does not claim that unrelated Stack health
+has recovered, nor authorize replay of any previous queue operation. The scoped
+path does not create a scheduler or an alternative provider writer.
+
 ### Inspection
 
 - `cara status` — repository overview: current PR, all caravans, the canonical priority-then-FIFO admission list with per-PR reasons, invalid graph fragments, and pending decision points.

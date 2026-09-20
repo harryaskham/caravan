@@ -144,6 +144,8 @@ pub fn tick(context: &AppContext) -> Result<LoopTickOutput, AppError> {
     match crate::sync::sync_prepared(
         context,
         &SyncInput {
+            closed_pr: None,
+            expected_closed_head: None,
             all: true,
             rerun_failed: false,
             dry_run: false,
