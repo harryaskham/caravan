@@ -103,7 +103,7 @@ const DEFAULT_MISSING_REQUIRED_RUNS_GRACE_SECS: u64 = 300;
 /// Stable provenance reason retained on every required-run receipt.
 const REQUIRED_RUNS_CONVERGENCE_REASON: &str = "bounded scheduler verification that every required context has reporting run lineage on the exact current head";
 /// Evolvable deterministic best-effort queue heuristic exposed in receipts.
-pub const AUTO_ADMISSION_HEURISTIC_VERSION: &str = "priority_fifo_greedy_v1";
+pub const AUTO_ADMISSION_HEURISTIC_VERSION: &str = "priority_fifo_greedy_v2_deferred_evidence";
 
 /// One observed rolling-head transition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -142,6 +142,7 @@ pub enum WorkflowFailureClass {
     StaleGeneration,
     RetryableInfrastructure,
     SourceOrTestFailure,
+    DeferredAdmission,
     Cancelled,
     Unknown,
 }
@@ -6743,7 +6744,7 @@ fn candidate_local_admission_refusal(
     let mut ci = progress.observe_ci(provider, repository, candidate_pr)?;
     // `caravan-force` is member repair authority, not authority to enrol a
     // known-red unjoined PR. Required CI is therefore never bypassed here.
-    ci.disposition = classify_checks(&ci.checks, false);
+    ci.disposition = classify_checks(&ci.effective_checks, false);
     let unknown_checks = crate::model::latest_checks_per_identity(&ci.checks)
         .0
         .into_iter()
@@ -6770,12 +6771,12 @@ fn candidate_local_admission_refusal(
         // classified CI. Raw provider rows may contain both a CheckRun and its
         // synthetic WorkflowRunLineage vote for one run; counting those as two
         // gates deadlocks admission despite one unambiguous failed sentinel.
-        candidate_has_exact_deferred_gate(progress, candidate_pr, gate, &ci.effective_checks)
+        candidate_has_exact_deferred_gate(progress, candidate_pr, gate, &ci)
     });
     if gate_deferred {
         let gate = admission_gate.expect("checked as present");
         let non_gate_checks = ci
-            .checks
+            .effective_checks
             .iter()
             .filter(|check| check.name != gate.context)
             .cloned()
@@ -6900,12 +6901,14 @@ fn admission_gate_retrigger(
     candidate: &PullRequestSnapshot,
     gate: &crate::config::CiAdmissionGateConfig,
 ) -> Result<AdmissionGateRetrigger, AppError> {
-    let gate_run_ids = crate::model::latest_checks_per_identity(&candidate.checks)
+    let mut gate_run_ids = crate::model::latest_checks_per_identity(&candidate.checks)
         .0
         .into_iter()
         .filter(|check| check.name == gate.context && check.state == CheckState::Failure)
         .filter_map(|check| check.details_url.as_deref().and_then(workflow_run_id))
         .collect::<Vec<_>>();
+    gate_run_ids.sort_unstable();
+    gate_run_ids.dedup();
     let [gate_run_id] = gate_run_ids.as_slice() else {
         return Err(AppError::structured(
             ErrorCategory::Validation,
@@ -7223,7 +7226,7 @@ fn recover_enrolled_admission_gate(
         return Ok(false);
     };
     if !candidate.has_label(&gate.member_label)
-        || !checks_have_exact_deferred_gate(gate, &observation.effective_checks)
+        || !observation_has_proven_deferred_gate(gate, observation)
     {
         return Ok(false);
     }
@@ -7259,7 +7262,7 @@ fn verify_required_runs_and_recover_gate(
     observation: &CiObservation,
 ) -> Result<bool, AppError> {
     progress.verify_required_runs(provider, &status.repository, caravan_id, candidate_pr)?;
-    if observation.disposition != CiDisposition::Failed {
+    if observation.disposition == CiDisposition::Passing {
         return Ok(false);
     }
     recover_enrolled_admission_gate(
@@ -7276,12 +7279,13 @@ fn candidate_has_exact_deferred_gate(
     progress: &SyncProgress,
     candidate_pr: PrNumber,
     gate: &crate::config::CiAdmissionGateConfig,
-    checks: &[CheckSnapshot],
+    observation: &CiObservation,
 ) -> bool {
     let Some(candidate) = progress.current.get(&candidate_pr) else {
         return false;
     };
-    !candidate.has_label(&gate.member_label) && checks_have_exact_deferred_gate(gate, checks)
+    !candidate.has_label(&gate.member_label)
+        && observation_has_proven_deferred_gate(gate, observation)
 }
 
 fn auto_admission_provider_state_unknown(
@@ -8875,6 +8879,12 @@ fn classify_workflow_failure(
     candidate: Option<&MergeCandidateIdentity>,
 ) -> ClassifiedWorkflowRunFailure {
     let (mut generation, mut reasons) = workflow_run_generation(&diagnostic);
+    let deferred = crate::ci::proven_deferred_job(&diagnostic).is_some();
+    if deferred && generation == WorkflowRunGeneration::MissingAssociation {
+        // Actions may omit pull_requests for an otherwise exact run. The
+        // bounded sentinel receipt independently binds both head and base.
+        generation = WorkflowRunGeneration::Current;
+    }
     let mut candidate_lineage_unknown = false;
     if let Some(candidate) = candidate {
         if candidate.pr != diagnostic.expected_pr {
@@ -8918,6 +8928,12 @@ fn classify_workflow_failure(
         (
             WorkflowFailureClass::StaleGeneration,
             WorkflowFailureAction::FreshCandidateTrigger,
+        )
+    } else if deferred && !candidate_lineage_unknown {
+        reasons.push("exact gate-only deferral: CI is unevaluated until membership".to_owned());
+        (
+            WorkflowFailureClass::DeferredAdmission,
+            WorkflowFailureAction::WaitOrInspect,
         )
     } else if failed_lineage_step && !lineage_receipt_present {
         let cause = if candidate_lineage_unknown {
@@ -9170,7 +9186,23 @@ fn ci_generation_evidence(
     let Some(lineage) = lineage else {
         return evidence;
     };
-    if !lineage.complete || lineage.head_sha != head_oid {
+    if !lineage.complete
+        || lineage.head_sha != head_oid
+        || lineage
+            .workflow_runs
+            .iter()
+            .map(|run| run.run_id)
+            .collect::<BTreeSet<_>>()
+            .len()
+            != lineage.workflow_runs.len()
+        || lineage
+            .check_suites
+            .iter()
+            .map(|suite| suite.id)
+            .collect::<BTreeSet<_>>()
+            .len()
+            != lineage.check_suites.len()
+    {
         return evidence;
     }
 
@@ -9267,6 +9299,87 @@ fn ci_generation_evidence(
     }
     evidence.effective_checks = effective;
     evidence
+}
+
+/// A complete gate-only diagnostic can replace synthetic workflow failures
+/// with UNEVALUATED votes, never green. Contradictory raw jobs, other workflows,
+/// stale tuples, and incomplete evidence retain their original failure votes.
+fn reduce_proven_deferred_generations(
+    evidence: &mut CiGenerationEvidence,
+    raw: &[CheckSnapshot],
+    diagnostics: &[ClassifiedWorkflowRunFailure],
+) {
+    for diagnostic in diagnostics {
+        if diagnostic.classification != WorkflowFailureClass::DeferredAdmission {
+            continue;
+        }
+        let d = &diagnostic.diagnostic;
+        let Some(job) = crate::ci::proven_deferred_job(d) else {
+            continue;
+        };
+        let matches = evidence
+            .selected_generations
+            .iter()
+            .filter(|selection| {
+                let run = &selection.workflow_run;
+                run.run_id == d.run_id
+                    && run.check_suite_id == d.check_suite_id
+                    && run.head_sha == d.head_sha.0
+                    && run.workflow_name == d.workflow_name
+                    && run.event == d.event
+                    && generation_check_state(run, &selection.check_suite) == CheckState::Failure
+            })
+            .count();
+        if matches != 1
+            || diagnostics
+                .iter()
+                .filter(|other| other.diagnostic.run_id == d.run_id)
+                .count()
+                != 1
+            || !raw.iter().any(|check| {
+                check.name == job.name
+                    && check.state == CheckState::Failure
+                    && check.provider_kind.as_deref() != Some("WorkflowRunLineage")
+                    && check.details_url.as_deref().and_then(workflow_run_id) == Some(d.run_id)
+            })
+            || raw.iter().any(|check| {
+                check.provider_kind.as_deref() != Some("WorkflowRunLineage")
+                    && check.details_url.as_deref().and_then(workflow_run_id) == Some(d.run_id)
+                    && check.name != job.name
+                    && check_is_failure(check)
+            })
+        {
+            continue;
+        }
+        for check in &mut evidence.effective_checks {
+            if check.provider_kind.as_deref() == Some("WorkflowRunLineage")
+                && check.details_url.as_deref().and_then(workflow_run_id) == Some(d.run_id)
+            {
+                check.state = CheckState::InProgress;
+                check.provider_state =
+                    Some("unevaluated: deferred_unjoined; awaiting membership".to_owned());
+            }
+        }
+    }
+}
+
+fn observation_has_proven_deferred_gate(
+    gate: &crate::config::CiAdmissionGateConfig,
+    observation: &CiObservation,
+) -> bool {
+    classify_checks(&observation.effective_checks, false) == CiDisposition::Waiting
+        && observation.failure_diagnostics.iter().any(|diagnostic| {
+            diagnostic.classification == WorkflowFailureClass::DeferredAdmission
+                && crate::ci::proven_deferred_job(&diagnostic.diagnostic)
+                    .is_some_and(|job| job.name == gate.context)
+                && observation.effective_checks.iter().any(|check| {
+                    check.name == gate.context
+                        && check.provider_state.as_deref()
+                            == Some("unevaluated: deferred_unjoined; awaiting membership")
+                        && check.details_url.as_deref().and_then(workflow_run_id)
+                            == Some(diagnostic.diagnostic.run_id)
+                })
+        })
 }
 
 fn root_checks_passing(observed: &PullRequestSnapshot) -> bool {
@@ -10455,7 +10568,7 @@ impl SyncProgress {
             }
         }
 
-        let generation =
+        let mut generation =
             ci_generation_evidence(&current.checks, &current.head.oid.0, lineage.as_ref());
         if !generation.selected_generations.is_empty() {
             disposition = classify_checks(&generation.effective_checks, forced);
@@ -10475,9 +10588,15 @@ impl SyncProgress {
         let failure_diagnostics = if selected_run_ids.is_empty() {
             Vec::new()
         } else {
-            provider
+            let mut response = provider
                 .failed_run_diagnostics(repository, &self.precondition(number), &selected_run_ids)
-                .map_err(|error| mutation_error(&error, self, Some(number)))?
+                .map_err(|error| mutation_error(&error, self, Some(number)))?;
+            if response.runs_truncated {
+                for run in &mut response.runs {
+                    run.jobs_truncated = true;
+                }
+            }
+            response
                 .runs
                 .into_iter()
                 .map(|diagnostic| {
@@ -10485,6 +10604,8 @@ impl SyncProgress {
                 })
                 .collect::<Vec<_>>()
         };
+        reduce_proven_deferred_generations(&mut generation, &current.checks, &failure_diagnostics);
+        disposition = classify_checks(&generation.effective_checks, forced);
         let mut rerunnable_run_ids = failure_diagnostics
             .iter()
             .filter(|diagnostic| diagnostic.action == WorkflowFailureAction::RerunFailedJobs)

@@ -96,8 +96,17 @@ and records a receipt binding PR, head OID, base OID, complete logical caravan
 membership, mutation kinds, and suite ID. The same tuple dispatches at most once
 per operation. Pre-membership `deferred_unjoined` runs remain diagnostic history;
 they neither become permanent source failures nor satisfy readiness after
-admission. A stale head/base/membership aggregate never authorizes a merge, and
-operators must not amend or force-push solely to manufacture a run.
+admission. Gate-only deferral requires complete exact-head workflow/suite lineage,
+a single failed sentinel job/step, and bounded log evidence of `deferred_unjoined`
+with exit 78 bound to the exact PR/head/base. The classifier retains raw evidence
+and marks that selected generation unevaluated/awaiting membership, never green;
+a workflow-wide failure must not fabricate independent source failures from its
+successful or skipped jobs. Other failures, contradictory or truncated evidence,
+and stale/cancelled generations remain blocking. The corrected admission heuristic
+invalidates prior engine-owned skip receipts without a source push, retaining audit
+comments and leaving unowned/manual skip labels untouched.
+A stale head/base/membership aggregate never authorizes a merge, and operators must
+not amend or force-push solely to manufacture a run.
 
 Provider request budget is reserved for current queue work. Open orphan native
 Stacks remain visible as orphan inventory but do not spend pairwise ancestry

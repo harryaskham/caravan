@@ -1,0 +1,17 @@
+{
+  "run": {"id":35526976658,"run_attempt":1,"workflow_id":253334670,"check_suite_id":96192279727,"name":"CI","event":"pull_request","status":"completed","conclusion":"failure","head_sha":"70688328bc9305c9de10f7122070b446f7bc51d4","pull_requests":[]},
+  "jobs": {"total_count":12,"jobs":[
+    {"id":106120734921,"name":"Caravan admission gate","status":"completed","conclusion":"success","steps":[]},
+    {"id":106120735538,"name":"macOS app (nix build)","status":"completed","conclusion":"skipped","steps":[]},
+    {"id":106120735731,"name":"sccache rustc spawn canary","status":"completed","conclusion":"skipped","steps":[]},
+    {"id":106120841805,"name":"Public Fast Tests preparation","status":"completed","conclusion":"skipped","steps":[]},
+    {"id":106120841875,"name":"Changed surface admission","status":"completed","conclusion":"skipped","steps":[]},
+    {"id":106120841921,"name":"Fast Tests preparation","status":"completed","conclusion":"skipped","steps":[]},
+    {"id":106120842120,"name":"cara-admission","status":"completed","conclusion":"failure","steps":[{"number":1,"name":"Set up job","status":"completed","conclusion":"success"},{"number":2,"name":"Defer unjoined PR or require protected CI","status":"completed","conclusion":"failure"},{"number":3,"name":"Complete job","status":"completed","conclusion":"success"}]},
+    {"id":106120842199,"name":"Rust Fast Tests work","status":"completed","conclusion":"skipped","steps":[]},
+    {"id":106120842318,"name":"Rust Check & Lint work","status":"completed","conclusion":"skipped","steps":[]},
+    {"id":106120842435,"name":"Stale merge-ref recovery","status":"completed","conclusion":"skipped","steps":[]},
+    {"id":106120842733,"name":"Fast Tests (unit)","status":"completed","conclusion":"skipped","steps":[]},
+    {"id":106120842890,"name":"Check & Lint","status":"completed","conclusion":"skipped","steps":[]}
+  ]}
+}

@@ -2834,4 +2834,4 @@ fn mutation_error(error: &MutationError, state: &ExecutionState) -> AppError {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

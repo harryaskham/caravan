@@ -127,10 +127,14 @@ jobs:
           CLIPPY_RESULT: ${{ needs.clippy.result }}
           TESTS_RESULT: ${{ needs.tests.result }}
           AGENT_SURFACE_RESULT: ${{ needs.agent-surface.result }}
+          DEFERRED_PR: ${{ github.event.pull_request.number }}
+          DEFERRED_HEAD: ${{ github.event.pull_request.head.sha }}
+          DEFERRED_BASE: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
           if [ "$DEFERRED_UNJOINED" = true ]; then
             echo "Caravan admission deferred: heavy CI starts after membership"
+            printf 'cara-deferred-admission pr=%s head=%s base=%s decision=deferred_unjoined exit=78\n' "$DEFERRED_PR" "$DEFERRED_HEAD" "$DEFERRED_BASE"
             exit 78
           fi
           test "$RUN_CI" = true
