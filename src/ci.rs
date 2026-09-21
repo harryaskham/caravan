@@ -1,7 +1,7 @@
 //! Bounded, structured GitHub Actions failure evidence.
 //!
-//! This layer deliberately consumes provider JSON only. It never reads full job
-//! logs, never classifies policy, and never decides whether to rerun a run.
+//! This layer consumes provider JSON plus bounded, allowlisted machine receipts
+//! from job logs. It never retains raw logs or decides whether to rerun a run.
 
 use std::collections::BTreeSet;
 
@@ -64,6 +64,14 @@ pub enum LineageEvidenceStatus {
     Unavailable,
 }
 
+/// Exact generation carried by the deferred sentinel's bounded log evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DeferredAdmissionReceipt {
+    pub pr: PrNumber,
+    pub head_oid: CommitOid,
+    pub base_oid: CommitOid,
+}
+
 /// One failed/cancelled/timed-out Actions job and its bounded failed steps.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct WorkflowJobFailureDiagnostic {
@@ -84,6 +92,8 @@ pub struct WorkflowJobFailureDiagnostic {
     pub selected_lineage: Option<SelectedRefLineageReceipt>,
     #[serde(default)]
     pub lineage_evidence_status: LineageEvidenceStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_admission: Option<DeferredAdmissionReceipt>,
 }
 
 /// Bounded provider evidence for one immutable Actions run.
@@ -120,7 +130,7 @@ pub struct WorkflowFailureDiagnostics {
     pub runs_truncated: bool,
 }
 
-/// Fetch structured run/job/step evidence without downloading raw logs.
+/// Fetch structured run/job/step evidence with bounded machine-receipt extraction.
 pub fn diagnose_failed_runs(
     runner: &impl CommandRunner,
     repository: &RepositoryId,
@@ -162,7 +172,11 @@ fn enrich_lineage_receipts(
             step.name.to_ascii_lowercase().contains("lineage")
                 || step.name.to_ascii_lowercase().contains("selected ref")
         });
-        if !is_lineage_job {
+        let is_admission_job = job
+            .failed_steps
+            .iter()
+            .any(|step| is_admission_step(&step.name));
+        if !is_lineage_job && !is_admission_job {
             continue;
         }
         if requested >= MAX_LINEAGE_LOG_JOBS {
@@ -171,13 +185,26 @@ fn enrich_lineage_receipts(
         }
         requested += 1;
         let command = workflow_job_log_command(repository, job.job_id);
-        let Ok(output) = runner.run(&command) else {
+        let Ok(mut output) = runner.run(&command) else {
             job.lineage_evidence_status = LineageEvidenceStatus::Unavailable;
             continue;
         };
+        // New gh versions refuse ANSI-bearing log bodies unless explicitly
+        // allowed; older supported versions do not recognize that flag. Retry
+        // only this read-only refusal, without ever exposing the raw body.
+        if !output.is_success() && output.stderr.contains("--allow-escape-sequences") {
+            let mut allowed = command.clone();
+            allowed.args.push("--allow-escape-sequences".to_owned());
+            if let Ok(retry) = runner.run(&allowed) {
+                output = retry;
+            }
+        }
         if !output.is_success() || !range_was_honored(&output.stdout) {
             job.lineage_evidence_status = LineageEvidenceStatus::Unavailable;
             continue;
+        }
+        if is_admission_job && !response_range_is_truncated(&output.stdout) {
+            job.deferred_admission = parse_deferred_admission_receipt(&output.stdout);
         }
         job.selected_lineage = parse_selected_lineage_receipt(&output.stdout);
         job.lineage_evidence_status = if job.selected_lineage.is_some() {
@@ -188,6 +215,119 @@ fn enrich_lineage_receipts(
             LineageEvidenceStatus::Missing
         };
     }
+}
+
+fn is_admission_step(name: &str) -> bool {
+    matches!(
+        name,
+        "Defer unjoined PR or require protected CI"
+            | "Defer unjoined PR or require every pinned gate"
+    )
+}
+
+/// Parse only actual output/environment rows, never echoed shell source. Retain
+/// no raw log text or unrelated environment values (which may contain secrets).
+fn parse_deferred_admission_receipt(output: &str) -> Option<DeferredAdmissionReceipt> {
+    let lines = output
+        .lines()
+        .map(|line| {
+            line.split_once(' ')
+                .filter(|(stamp, _)| stamp.ends_with('Z'))
+                .map_or(line, |(_, body)| body)
+                .trim()
+        })
+        .collect::<Vec<_>>();
+    if !lines.contains(&"##[error]Process completed with exit code 78.") {
+        return None;
+    }
+    let receipts = lines
+        .iter()
+        .filter_map(|line| line.strip_prefix("cara-deferred-admission "))
+        .collect::<Vec<_>>();
+    if !receipts.is_empty() {
+        let [receipt] = receipts.as_slice() else {
+            return None;
+        };
+        let fields = receipt
+            .split_ascii_whitespace()
+            .filter_map(|field| field.split_once('='))
+            .collect::<Vec<_>>();
+        let field = |key| {
+            fields
+                .iter()
+                .find_map(|(name, value)| (*name == key).then_some(*value))
+        };
+        if fields.len() != 5 || field("decision")? != "deferred_unjoined" || field("exit")? != "78"
+        {
+            return None;
+        }
+        return Some(DeferredAdmissionReceipt {
+            pr: PrNumber(field("pr")?.parse().ok()?),
+            head_oid: parse_oid(field("head")?)?,
+            base_oid: parse_oid(field("base")?)?,
+        });
+    }
+    // Compatibility with the deployed Cacophony sentinel, before the compact
+    // cross-repository receipt was introduced.
+    let value = |key: &str| -> Option<&str> {
+        let values = lines
+            .iter()
+            .filter_map(|line| line.strip_prefix(key))
+            .collect::<Vec<_>>();
+        let first = *values.first()?;
+        values.iter().all(|value| *value == first).then_some(first)
+    };
+    if !lines.contains(
+        &"Caravan admission deferred until exact PR membership (decision=deferred_unjoined)",
+    ) || !lines.contains(&"##[error]Process completed with exit code 78.")
+        || value("ADMISSION_DECISION: ")? != "deferred_unjoined"
+        || value("DEFERRED_UNJOINED: ")? != "true"
+        || value("RUN_CI: ")? != "false"
+        || value("ADMISSION_RESULT: ")? != "success"
+        || value("CACO_CI_EVENT_NAME: ")? != "pull_request"
+    {
+        return None;
+    }
+    Some(DeferredAdmissionReceipt {
+        pr: PrNumber(value("CACO_CI_PR_NUMBER: ")?.parse().ok()?),
+        head_oid: parse_oid(value("CACO_CI_EXPECTED_HEAD: ")?)?,
+        base_oid: parse_oid(value("CACO_CI_EXPECTED_BASE: ")?)?,
+    })
+}
+
+/// A gate-only failure is unevaluated, not a source failure. Both bounded job
+/// evidence and the log receipt must agree with the immutable provider tuple.
+pub(crate) fn proven_deferred_job(
+    diagnostic: &WorkflowRunFailureDiagnostic,
+) -> Option<&WorkflowJobFailureDiagnostic> {
+    let [job] = diagnostic.failed_jobs.as_slice() else {
+        return None;
+    };
+    let receipt = job.deferred_admission.as_ref()?;
+    let [step] = job.failed_steps.as_slice() else {
+        return None;
+    };
+    (diagnostic.status == "completed"
+        && diagnostic.conclusion == "failure"
+        && diagnostic.event == "pull_request"
+        && !diagnostic.jobs_truncated
+        && diagnostic.jobs_total > 0
+        && !job.steps_truncated
+        && job.status == "completed"
+        && job.conclusion == "failure"
+        && step.status == "completed"
+        && step.conclusion == "failure"
+        && is_admission_step(&step.name)
+        && receipt.pr == diagnostic.expected_pr
+        && receipt.head_oid == diagnostic.expected_head_oid
+        && receipt.head_oid == diagnostic.head_sha
+        && receipt.base_oid == diagnostic.expected_base_oid
+        && diagnostic.pull_requests.iter().all(|association| {
+            association.pr == receipt.pr
+                && association.head_oid.as_ref() == Some(&receipt.head_oid)
+                && association.base_oid.as_ref() == Some(&receipt.base_oid)
+        }))
+    .then_some(job)
 }
 
 fn range_was_honored(output: &str) -> bool {
@@ -474,6 +614,7 @@ impl WorkflowJobJson {
         let steps_truncated = failed_steps.len() > MAX_FAILED_STEPS;
         failed_steps.truncate(MAX_FAILED_STEPS);
         WorkflowJobFailureDiagnostic {
+            deferred_admission: None,
             job_id: self.id,
             name: self.name,
             status: self.status,
@@ -511,7 +652,7 @@ impl WorkflowStepJson {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::cell::RefCell;
     use std::collections::{BTreeSet, VecDeque};
 
@@ -543,6 +684,35 @@ mod tests {
         }
     }
 
+    pub(crate) fn deferred_fixture(
+        expected: &PullRequestPrecondition,
+        log: &str,
+    ) -> WorkflowFailureDiagnostics {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/deferred-admission-4014.json"
+        ))
+        .unwrap();
+        let repository = repository();
+        let runner = FakeRunner::new(vec![
+            (
+                workflow_run_command(&repository, 35_526_976_658),
+                CommandOutput::success(fixture["run"].to_string()),
+            ),
+            (
+                workflow_jobs_command(&repository, 35_526_976_658),
+                CommandOutput::success(fixture["jobs"].to_string()),
+            ),
+            (
+                workflow_job_log_command(&repository, 106_120_842_120),
+                CommandOutput::success(log),
+            ),
+        ]);
+        let response =
+            diagnose_failed_runs(&runner, &repository, expected, &[35_526_976_658]).unwrap();
+        assert!(runner.calls.borrow().is_empty());
+        response
+    }
+
     fn repository() -> RepositoryId {
         RepositoryId {
             owner: "harryaskham".to_owned(),
@@ -572,6 +742,29 @@ mod tests {
             base = "c".repeat(40),
             prior = "d".repeat(40),
         )
+    }
+
+    #[test]
+    fn deferred_admission_compact_receipt_is_exact_and_not_echoed_source() {
+        let line = format!(
+            "cara-deferred-admission pr=12 head={} base={} decision=deferred_unjoined exit=78",
+            "a".repeat(40),
+            "b".repeat(40)
+        );
+        let body = format!("{line}\n##[error]Process completed with exit code 78.\n");
+        let receipt = parse_deferred_admission_receipt(&body).unwrap();
+        assert_eq!(receipt.pr, PrNumber(12));
+        assert_eq!(receipt.head_oid.0, "a".repeat(40));
+        assert_eq!(receipt.base_oid.0, "b".repeat(40));
+        assert!(parse_deferred_admission_receipt(&format!("{line}\n{body}")).is_none());
+        assert!(
+            parse_deferred_admission_receipt(&body.replace("cara-deferred", "echo cara-deferred"))
+                .is_none()
+        );
+        assert!(
+            parse_deferred_admission_receipt(&body.replace("exit code 78", "exit code 1"))
+                .is_none()
+        );
     }
 
     #[test]

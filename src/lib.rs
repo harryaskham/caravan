@@ -289,7 +289,7 @@ the exact pinned binary. It performs strict parsing and no repository/provider a
    only as a
    deliberate per-invocation opt-out; an explicit `--config` remains explicit.
    With `sync.actions.join_unlabelled_prs: true`, only sync-all also grows the
-   fleet after existing caravans converge: `priority_fifo_greedy_v1` tries
+   fleet after existing caravans converge: `priority_fifo_greedy_v2_deferred_evidence` tries
    canonical candidates and deterministic live tails, joins the first compatible
    target, and records exact generation-bound `caravan-join-skipped` evidence
    before considering a later candidate. Manual membership consumes that label.

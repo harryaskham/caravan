@@ -45,6 +45,7 @@ struct FakeProvider {
     calls: RefCell<Vec<MutationKind>>,
     failed_runs: RefCell<BTreeMap<PrNumber, Vec<WorkflowRunSnapshot>>>,
     diagnostic_heads: RefCell<BTreeMap<PrNumber, CommitOid>>,
+    diagnostic_overrides: RefCell<BTreeMap<PrNumber, WorkflowFailureDiagnostics>>,
     diagnostic_job_conclusions: RefCell<BTreeMap<PrNumber, String>>,
     diagnostic_lineage: RefCell<BTreeMap<PrNumber, crate::ci::SelectedRefLineageReceipt>>,
     admin_permission: bool,
@@ -78,6 +79,9 @@ struct FakeProvider {
     released_reobservations: RefCell<u32>,
 }
 
+mod deferred_admission;
+use deferred_admission::prove_deferred;
+
 impl FakeProvider {
     fn with_pull_requests(pulls: Vec<PullRequestSnapshot>) -> Self {
         Self {
@@ -103,6 +107,7 @@ impl FakeProvider {
             calls: RefCell::new(Vec::new()),
             failed_runs: RefCell::new(BTreeMap::new()),
             diagnostic_heads: RefCell::new(BTreeMap::new()),
+            diagnostic_overrides: RefCell::new(BTreeMap::new()),
             diagnostic_job_conclusions: RefCell::new(BTreeMap::new()),
             diagnostic_lineage: RefCell::new(BTreeMap::new()),
             admin_permission: true,
@@ -699,6 +704,9 @@ impl SyncProvider for FakeProvider {
         expected: &PullRequestPrecondition,
         run_ids: &[u64],
     ) -> Result<WorkflowFailureDiagnostics, MutationError> {
+        if let Some(response) = self.diagnostic_overrides.borrow().get(&expected.number) {
+            return Ok(response.clone());
+        }
         let failed_runs = self
             .failed_runs
             .borrow()
@@ -737,6 +745,7 @@ impl SyncProvider for FakeProvider {
                             base_oid: Some(expected.base_oid.clone()),
                         }],
                         failed_jobs: vec![crate::ci::WorkflowJobFailureDiagnostic {
+                            deferred_admission: None,
                             job_id: *run_id,
                             name: "test infrastructure".to_owned(),
                             status: "completed".to_owned(),
@@ -1087,6 +1096,7 @@ fn classified_failure(
             expected_base_oid: CommitOid("base".to_owned()),
             pull_requests: Vec::new(),
             failed_jobs: vec![crate::ci::WorkflowJobFailureDiagnostic {
+                deferred_admission: None,
                 job_id: 1,
                 name: workflow.to_owned(),
                 status: "completed".to_owned(),
@@ -3578,6 +3588,7 @@ fn exact_unjoined_admission_gate_defers_heavy_ci_without_hiding_other_failures()
     let gate_status = status(vec![candidate.clone()], Some(candidate.number), &clean);
     let provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
     provider.require_contexts("main", &[&gate.context, "heavy-ci"]);
+    prove_deferred(&provider, &candidate, &gate.context);
     let mut progress = SyncProgress::new(&gate_status, Vec::new(), u32::MAX);
 
     assert!(
@@ -3662,6 +3673,7 @@ fn stacked_admission_gate_does_not_depend_on_base_protection() {
     for required_contexts in [&["heavy-ci"][..], &[][..]] {
         let provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
         provider.require_contexts("stacked-parent", required_contexts);
+        prove_deferred(&provider, &candidate, &gate.context);
         let mut progress = SyncProgress::new(&gate_status, Vec::new(), u32::MAX);
         assert!(
             candidate_local_admission_refusal(
@@ -3708,6 +3720,7 @@ fn deferred_gate_uses_canonical_exact_head_generation_vote() {
     let gate_status = status(vec![candidate.clone()], Some(candidate.number), &clean);
     let provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
     provider.require_contexts("main", &[&gate.context, "heavy-ci"]);
+    prove_deferred(&provider, &candidate, &gate.context);
     provider.serve_lineage(
         candidate.number,
         HeadRunLineage {
@@ -3974,6 +3987,7 @@ fn enrolled_deferred_gate_resumes_with_exact_actions_workflow_rerun() {
         Some(member.number),
         true,
     );
+    prove_deferred(&provider, &member, &gate.context);
     status.auto_admission.admission_gate = Some(gate);
 
     let progress = execute(&status, &provider, true, false, false)

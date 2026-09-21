@@ -445,6 +445,40 @@ fn exact_native_clean(
     })
 }
 
+/// Hermetic sync integration seam: production membership preflight, mutations,
+/// and postcondition verification, using this module's exact provider fake.
+pub(crate) fn apply_deferred_fixture(
+    before: StatusOutput,
+    tail: Option<PrNumber>,
+    gate: &str,
+) -> MembershipOutput {
+    let provider =
+        FakeProvider::with_pull_requests(before.analysis.pull_requests.values().cloned().collect());
+    execute_with_rebase_guard_and_config(
+        before,
+        &clean,
+        &provider,
+        MembershipRequest {
+            operation: if tail.is_some() {
+                MembershipOperation::Join
+            } else {
+                MembershipOperation::New
+            },
+            create_pr: false,
+            tail_pr: tail.map(|number| number.0),
+            head_pr: None,
+            reason: Some("sync-owned deferred fixture".to_owned()),
+            priority_label: None,
+            agent_priority_labels: Vec::new(),
+        },
+        None,
+        false,
+        None,
+        Some(gate),
+    )
+    .expect("exact deferred proof reaches durable membership")
+}
+
 #[test]
 fn sync_proven_gate_capability_survives_membership_apply_preflight() {
     let clean_candidate = pull_request(60, "candidate", "main", &[]);
