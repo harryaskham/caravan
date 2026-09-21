@@ -317,7 +317,7 @@ fn deferred_admission_negative_evidence_never_grants_admission() {
             "truncated_steps" => diagnostics.runs[0].failed_jobs[0].steps_truncated = true,
             "missing_log" => diagnostics.runs[0].failed_jobs[0].deferred_admission = None,
             "stale_base" => {
-                diagnostics.runs[0].expected_base_oid = CommitOid("new-base".to_owned())
+                diagnostics.runs[0].expected_base_oid = CommitOid("new-base".to_owned());
             }
             "stale_head" => diagnostics.runs[0].head_sha = CommitOid("old-head".to_owned()),
             "cancelled" => lineage.workflow_runs[0].conclusion = "cancelled".to_owned(),
@@ -332,11 +332,11 @@ fn deferred_admission_negative_evidence_never_grants_admission() {
             "unknown" => {
                 candidate
                     .checks
-                    .push(check("unknown job", CheckState::Unknown, Some(RUN)))
+                    .push(check("unknown job", CheckState::Unknown, Some(RUN)));
             }
             "wrong_failure_step" => {
                 diagnostics.runs[0].failed_jobs[0].failed_steps[0].name =
-                    "Compile source".to_owned()
+                    "Compile source".to_owned();
             }
             _ => unreachable!(),
         }

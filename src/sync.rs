@@ -9169,6 +9169,26 @@ fn generation_check_state(run: &WorkflowRunLineage, suite: &CheckSuiteLineage) -
     CheckState::Failure
 }
 
+/// Incomplete, cross-head, or duplicate provider identities cannot replace raw CI.
+fn has_exact_unambiguous_lineage(lineage: &HeadRunLineage, head_oid: &str) -> bool {
+    lineage.complete
+        && lineage.head_sha == head_oid
+        && lineage
+            .workflow_runs
+            .iter()
+            .map(|run| run.run_id)
+            .collect::<BTreeSet<_>>()
+            .len()
+            == lineage.workflow_runs.len()
+        && lineage
+            .check_suites
+            .iter()
+            .map(|suite| suite.id)
+            .collect::<BTreeSet<_>>()
+            .len()
+            == lineage.check_suites.len()
+}
+
 /// Replace positively identified workflow rows with one vote from the newest
 /// exact-head run + suite generation. Missing, partial, or cross-head lineage
 /// suppresses nothing and therefore keeps the ordinary rollup fail-closed.
@@ -9186,23 +9206,7 @@ fn ci_generation_evidence(
     let Some(lineage) = lineage else {
         return evidence;
     };
-    if !lineage.complete
-        || lineage.head_sha != head_oid
-        || lineage
-            .workflow_runs
-            .iter()
-            .map(|run| run.run_id)
-            .collect::<BTreeSet<_>>()
-            .len()
-            != lineage.workflow_runs.len()
-        || lineage
-            .check_suites
-            .iter()
-            .map(|suite| suite.id)
-            .collect::<BTreeSet<_>>()
-            .len()
-            != lineage.check_suites.len()
-    {
+    if !has_exact_unambiguous_lineage(lineage, head_oid) {
         return evidence;
     }
 
