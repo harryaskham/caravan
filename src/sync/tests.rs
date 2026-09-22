@@ -14,6 +14,44 @@ use crate::required_runs::{
     RequiredRunsStatus, WorkflowRunLineage,
 };
 
+#[test]
+fn conflict_generation_survives_outer_outcome_and_duplicate_serialization() {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/rebase-failure-generation.json"
+    ))
+    .unwrap();
+    let evidence: crate::physical_rebase::RebaseFailureGeneration =
+        serde_json::from_value(fixture.clone()).unwrap();
+    assert!(matches!(
+        &evidence.attempted_target,
+        crate::physical_rebase::PlannedBase::Simulated(_)
+    ));
+    assert_eq!(serde_json::to_value(&evidence).unwrap(), fixture);
+    for enclosing_outcome in ["partial", "indeterminate"] {
+        let error = AppError::structured(
+            ErrorCategory::ExecutionFailure,
+            "rebase_conflict",
+            "fixture conflict",
+            Some(json!({
+                "failure_generation": fixture,
+                "provider_mutation_outcome": enclosing_outcome,
+                "actor_operation_id": "existing-scheduled-operation"
+            })),
+        );
+        let attached = attach_physical_rebuild(error, &PhysicalRebuildOutcome::default());
+        let details = attached.details().unwrap();
+        assert_eq!(details["failure_generation"], fixture);
+        assert_eq!(details["provider_mutation_outcome"], enclosing_outcome);
+        assert_eq!(
+            details["actor_operation_id"],
+            "existing-scheduled-operation"
+        );
+        let replay: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&details).unwrap()).unwrap();
+        assert_eq!(replay, details);
+    }
+}
+
 /// Provider timestamp used by every hermetic head in this fixture set. It is
 /// far enough in the past that the default grace period has always elapsed.
 const PUBLISHED_AT: &str = "2020-01-01T00:00:00Z";
