@@ -790,6 +790,7 @@ scheduler/recovery dispositions to exact Cara commands while explicitly denying
 raw Git/GitHub writes, generic authenticated shell, manual control labels, check
 spoofing, admin bypass, secrets, and a second merge actor. It is deliberately
 small: embedded config-aware Cara help remains the complete and current manual.
+Queue-monitoring tasks also load [the operating guide](.agents/skills/cara-operator/references/queue-monitoring.md) for ready-prefix decisions, bounded no-progress escalation, acknowledged owner repair, exact-generation CI, and verified outcomes without another writer.
 The bundled `references/safe-path-canary.md` records a public Stack partial-prefix
 dogfood run in which the routing agent delegated an exact peer-owned eviction,
 performed no provider mutation, and resumed canonical sync only after the owner
