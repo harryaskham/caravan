@@ -108,6 +108,10 @@ If authority or separation is unsupported, return the exact refusal and one boun
 
 ## Classify CI by the failing step and generation
 
+Read effective branch protection, active rulesets and the project's release contract to identify the actual required-check set.
+Do not treat the full PR rollup or an overall red workflow as proof that every failed job blocks merge or delivery.
+Optional artifact/evidence transport can be unavailable while required source checks pass; keep the unavailable evidence truthful without inventing a gate or editing protection to hide it.
+
 | Observation | Bounded continuation |
 |---|---|
 | Admission-only deferral; heavy jobs skipped | Verify exact gate decision and full lineage; preserve it as unevaluated, never green. Let the existing admission actor perform any authorized membership-before-CI trigger once. |
@@ -116,7 +120,7 @@ If authority or separation is unsupported, return the exact refusal and one boun
 | Lock/hash, lint, compile, or assertion failure | Route exact logs and a bounded reproducer to the source owner. Preserve strict checks and invariants; do not mask it with skips, blanket reruns or wider timeouts. |
 | Runner/transport/resource preflight failure | Separate it from source failure. Seek an acknowledged infrastructure diagnosis and at most the authorized, generation-bound recovery. |
 | Queued workflow/job | Check workflow-level status, concurrency, exact superseded generations and matching runner evidence; PR check rollup alone may omit the pending run. |
-| Build passed but artifact upload/handoff failed | Keep artifact transport and device/emulator qualification incomplete. Do not invent artifact hashes, delete storage broadly, or call a successful build device acceptance. |
+| Build passed but optional artifact upload/handoff failed | Report the handoff unavailable and device/emulator evidence unproven; do not promote optional transport into a merge/release gate. Do not invent artifact hashes, delete storage broadly, or call a successful build device acceptance. |
 
 A proposed infrastructure retry requires fresh exact head/run/attempt evidence, owner/custody agreement, and reconciliation of competing or uncertain attempts.
 Do not carry an old retry authorization onto a new source generation.
@@ -163,6 +167,10 @@ A useful progress report says what actually changed and which acceptance remains
 
 Keep source merge, current-base CI qualification, immutable release, artifact/checksum verification, installed bytes, running service identity, live/device acceptance and fleet rollout separate.
 Use existing release/install actors and declarative routes; a source fix does not authorize a release dispatch or manual binary installation.
+For an authorized Play-first release, CI builds/signs/verifies, uploads and commits to Play, and verifies track readback before best-effort artifact/receipt archival.
+Storage quota or missing asynchronous handoff evidence must not block that delivery path or cause a successful Play publication to be retried.
+Keep real source/package/version/signer checks and known critical product failures as gates; missing optional evidence is not one.
+A PR debug-APK job is not the Play publisher: do not claim an upload from its build success, tag an unmerged head, or introduce a second publisher or storage/rebuild prerequisite.
 Keep completed classifier/release work closed when a new metadata, topology, delivery, runner or artifact problem appears.
 Do not create new runtime pins, cleanup jobs or secondary merge actors to paper over those separate failures.
 

@@ -172,6 +172,27 @@ fn monitoring_keeps_generation_ci_and_delivery_acceptance_separate() {
 }
 
 #[test]
+fn optional_handoff_is_not_promoted_into_a_delivery_gate() {
+    let skill = normalized(SKILL);
+    let guide = normalized(MONITORING);
+    assert!(skill.contains("actual required-check set and delivery policy"));
+    for required in [
+        "effective branch protection, active rulesets",
+        "overall red workflow",
+        "do not promote optional transport into a merge/release gate",
+        "verifies track readback before best-effort artifact/receipt archival",
+        "Storage quota or missing asynchronous handoff evidence must not block",
+        "A PR debug-APK job is not the Play publisher",
+        "Keep real source/package/version/signer checks",
+    ] {
+        assert!(
+            guide.contains(required),
+            "missing gate distinction `{required}`"
+        );
+    }
+}
+
+#[test]
 fn historical_canary_is_not_authority_for_a_second_scheduler() {
     let canary = normalized(CANARY);
     assert!(canary.contains("historical evidence, not a reusable operation receipt"));
