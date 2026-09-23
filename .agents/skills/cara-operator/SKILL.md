@@ -1,6 +1,6 @@
 ---
 name: cara-operator
-description: Route Caravan queue diagnosis and recovery through live Cara help, status, planning, and exact typed operations without becoming a second merge writer.
+description: Keep Caravan queues moving through exact-generation diagnosis, ready-prefix recovery, acknowledged owner repairs, CI triage, and bounded typed operations. Use for PR/Stack monitoring, repeated sync refusals, stalled owners, and release handoffs without becoming a second merge writer.
 ---
 
 # Cara operator routing
@@ -9,6 +9,7 @@ Use this skill when a Caravan PR, Stack, sync tick, release, or recovery receipt
 needs diagnosis. This file is intentionally a short discovery/routing layer, not
 a second Caravan handbook. The installed Cara binary and the repository's
 validated config are authoritative.
+For queue monitoring or unblocking, also read [the operating guide](references/queue-monitoring.md) before acting; it supplies the progress, ownership, CI, and recovery decision loop.
 
 ## Start from live authority
 
@@ -19,17 +20,20 @@ validated config are authoritative.
    help wins.
 3. Run `cara config check`, then `cara status --json`. Preserve repository, PR,
    head/base, Stack, check, config, policy, and operation fingerprints.
+   Distinguish live branch tips from PR base projections and CI-event bases; inspect the existing scheduler's terminal receipt, not just whether it is running.
 4. Before any mutation run the matching read-only command: `cara check`,
    `cara plan sync --all`, a native-Stack preview/status command, or the exact
    recovery preview named by the current receipt.
 
 Do not replay old status after main, head, labels, checks, config, Stack, or
 provider generation changes. Rediscover first.
+Use the existing designated writer; a monitoring loop must not start a competing sync, source repair, or merge actor.
 
 ## Route the typed disposition
 
 - `retry_tick`, pending CI, or a current exact-head synthetic candidate: wait for
   provider refresh and retry only within the caller's bounded policy.
+  Repeated identical evidence needs a liveness diagnosis, not faster polling or an invented mutation authorization.
 - `external_decision` or `operator_action`: present the exact choice/evidence;
   do not invent a default or hot-loop.
 - initialization/resource problems: use idempotent `cara init` only after its
@@ -46,8 +50,17 @@ provider generation changes. Rediscover first.
 - terminal red: follow effective `terminal_red` policy and provenance. Never
   manually add/remove Caravan control labels.
 
-Unrelated caravans continue independently. One blocked generation is not
-permission to stop, rewrite, or evict another.
+## Keep qualified work moving
+
+Identify the blocking member, qualified prefix, affected descendants, and admission impact on the first refusal.
+Do not make ready parents wait indefinitely for an unavailable tail owner: inspect live help/status/plan for a supported prefix-landing or exact tail-isolation disposition as well as owner repair.
+Route any sealed top-eviction/reshape plan to its authorized owner; preserve the suffix and never invent a direct prefix merge when the typed path refuses.
+If neither route is available, promptly name the exact missing authority or implementation gap, affected ready PRs, and one bounded operator decision rather than another unchanged report.
+Track one stable blocker fingerprint, age/no-progress count, accepted owner, next action, and next verification point; repeated tick IDs are not progress.
+A stored message is not owner acknowledgement, capacity is not assignment, and assignment is not execution; follow through to the actual repair or exact refusal.
+Before activating a receiver, recheck its current assignment and preserve existing WIP under explicit sequencing and custody fences.
+One blocked generation is not permission to stop, rewrite, or evict another.
+Existing fleet policy may block new admissions; continue only independent work the live policy permits, without silently bypassing that gate.
 
 ## Mutation boundary
 

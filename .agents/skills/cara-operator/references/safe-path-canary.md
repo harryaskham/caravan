@@ -30,3 +30,6 @@ ready PR `#73`, which merged as true-main `e0afb4a2` under operation
 
 This canary demonstrates diagnosis/delegation without unsafe direct rescue or a
 second queue writer.
+It is historical evidence, not a reusable operation receipt or permission to start a manual sync beside a configured scheduler.
+In a deployment with an existing designated writer, that actor performs the post-eviction rediscovery and landing; the monitor verifies its result.
+See [the monitoring guide](queue-monitoring.md) for owner acknowledgement, ready-prefix decisions, and bounded no-progress escalation.
