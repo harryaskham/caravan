@@ -53,6 +53,7 @@ Use the existing designated writer; a monitoring loop must not start a competing
 ## Keep qualified work moving
 
 Identify the blocking member, qualified prefix, affected descendants, and admission impact on the first refusal.
+Read the actual required-check set and delivery policy; a red optional artifact/evidence job is not automatically a merge or release gate.
 Do not make ready parents wait indefinitely for an unavailable tail owner: inspect live help/status/plan for a supported prefix-landing or exact tail-isolation disposition as well as owner repair.
 Route any sealed top-eviction/reshape plan to its authorized owner; preserve the suffix and never invent a direct prefix merge when the typed path refuses.
 If neither route is available, promptly name the exact missing authority or implementation gap, affected ready PRs, and one bounded operator decision rather than another unchanged report.
