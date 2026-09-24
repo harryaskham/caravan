@@ -1020,6 +1020,43 @@ Submitted or indeterminate native operations retain their existing poll/reconcil
 contract and are never replayed by policy revalidation. Drafts, explicit holds,
 ownership, provider protection and transaction fences remain independent gates.
 
+### Exact post-mutation CI execution
+
+After an engine-owned membership/base/head transition, CI-start selection uses
+actual applicable reporting checks and complete provider execution identity.
+The configured admission gate identifies its workflow when present; otherwise
+the effective required context/App set supplies applicability. Actions is not
+universally required: independent third-party requirements remain visible and
+retain their failure semantics. An unrelated queued suite or the lowest suite
+ID is never a substitute for application/workflow proof. Legacy missing-run
+recovery without that proof refuses ambiguous suites instead of guessing.
+
+Optional execution metadata retains workflow ID, run attempt and provider PR
+head/base refs/OIDs. Missing old metadata stays unknown. A real CheckRun binds
+App, current head, suite and run; a synthesized workflow aggregate cannot supply
+that authority. The newest applicable execution must bind the exact PR/head/base
+and workflow. Truncated, duplicated, unknown, wrong-App or stale evidence refuses
+before any CI write. A historical report may identify the workflow, but cannot
+supply the current execution's base binding.
+
+Existing active executions, or completed executions with no failed applicable
+context, are reused without a provider write. Optional workflow failure does not
+authorize a restart. A legitimate completed restart rechecks App/workflow/run/
+attempt/suite and PR facts, then uses the Actions-specific whole-run endpoint,
+never a generic fallback from a foreign App's suite. Draft, parked, held and
+inactive members receive no post-mutation start.
+
+The normal repository writer persists a secret-free common-Git checkpoint for
+both reuse and restart, binding repository, membership tuple, workflow and exact
+execution to the original operation. A reused run becoming red does not authorize
+another automatic start. Budget refusal precedes intent. A definitive pre-write
+refusal remains retryable with archived evidence; response loss, readback failure
+or lost acknowledgement persistence preserves the intent and forbids a duplicate
+write. A positively observed successor can resolve liveness without inventing an
+acknowledgement for the old operation; observed attempts never regress. Completed
+membership is preserved even if the later CI-start phase fails. These records
+are internal engine state, not an operator approval or second queue executor.
+
 Normal behavior:
 
 - Root: promoted to the exact default branch, then squash-merged by Cara itself.

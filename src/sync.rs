@@ -191,6 +191,10 @@ pub struct CiGenerationDispatchReceipt {
     #[serde(default)]
     pub mutation_kinds: Vec<MutationKind>,
     pub check_suite_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<crate::ci_dispatch::CiExecution>,
+    #[serde(default)]
+    pub disposition: crate::ci_dispatch::DispatchDisposition,
     pub operation_id: OperationId,
 }
 
@@ -1354,6 +1358,20 @@ pub trait SyncProvider {
         expected: &PullRequestPrecondition,
     ) -> Result<HeadRunLineage, MutationError>;
 
+    /// Exact App/workflow/attempt-fenced CI start; unsupported providers never
+    /// fall back to a head-only suite selection.
+    fn restart_ci_execution(
+        &self,
+        _repository: &RepositoryId,
+        _expected: &PullRequestPrecondition,
+        _selected: &crate::ci_dispatch::CiExecution,
+    ) -> Result<GitHubMutationReceipt, AppError> {
+        Err(AppError::validation(
+            "ci_execution_restart_unavailable",
+            "provider does not implement exact CI execution restart",
+        ))
+    }
+
     /// Request exactly one existing check suite again on the unchanged head.
     fn rerequest_check_suite(
         &self,
@@ -1762,6 +1780,15 @@ impl<R: crate::command::CommandRunner> SyncProvider for GitHubMutationAdapter<R>
         expected: &PullRequestPrecondition,
     ) -> Result<HeadRunLineage, MutationError> {
         self.head_run_lineage(repository, expected)
+    }
+
+    fn restart_ci_execution(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+        selected: &crate::ci_dispatch::CiExecution,
+    ) -> Result<GitHubMutationReceipt, AppError> {
+        self.restart_ci_execution(repository, expected, selected)
     }
 
     fn rerequest_check_suite(
@@ -4902,7 +4929,12 @@ fn native_stack_rebase_output(
             summary: "native Stack reconstruction requires exact-generation CI".to_owned(),
         });
     }
-    dispatch_exact_ci_after_queue_mutations(provider, &mut ci_progress, &status)?;
+    dispatch_exact_ci_after_queue_mutations(
+        &context.repository_path,
+        provider,
+        &mut ci_progress,
+        &status,
+    )?;
     Ok(SyncOutput {
         tick: SyncTickReceipt {
             schema_version: 1,
@@ -5675,7 +5707,12 @@ fn sync_with_lock(
         );
         status.clone()
     };
-    dispatch_exact_ci_after_queue_mutations(&provider, &mut progress, &final_status)?;
+    dispatch_exact_ci_after_queue_mutations(
+        &context.repository_path,
+        &provider,
+        &mut progress,
+        &final_status,
+    )?;
     if let Some(problem) =
         first_blocking_completion_problem(&final_status, &progress, context.config.force_merge)
     {
@@ -5751,7 +5788,12 @@ fn sync_with_lock(
             merge_sync_progress(&mut progress, post_admission);
             final_status =
                 read::fleet_status_for_sync(context, operation_deadline, Some(&github_budget))?;
-            dispatch_exact_ci_after_queue_mutations(&provider, &mut progress, &final_status)?;
+            dispatch_exact_ci_after_queue_mutations(
+                &context.repository_path,
+                &provider,
+                &mut progress,
+                &final_status,
+            )?;
             if let Some(problem) = first_blocking_completion_problem(
                 &final_status,
                 &progress,
@@ -7041,6 +7083,7 @@ fn checks_have_exact_deferred_gate(
 }
 
 fn dispatch_exact_ci_after_queue_mutations(
+    repository_path: &std::path::Path,
     provider: &impl SyncProvider,
     progress: &mut SyncProgress,
     status: &StatusOutput,
@@ -7073,71 +7116,127 @@ fn dispatch_exact_ci_after_queue_mutations(
                 .push(receipt.kind);
         }
     }
+    let held = crate::stack_policy::held_caravan_members(status);
     for (pr, mut mutation_kinds) in triggers {
         mutation_kinds.sort_by_key(|kind| format!("{kind:?}"));
         mutation_kinds.dedup();
         let Some(current) = status.analysis.pull_requests.get(&pr) else {
             continue;
         };
-        if current.state != PullRequestState::Open || !current.is_active_caravan_member() {
+        if current.state != PullRequestState::Open
+            || !current.is_active_caravan_member()
+            || current.draft
+            || current.has_label("caravan-parked")
+            || status
+                .analysis
+                .fleet
+                .containing(pr)
+                .is_some_and(|caravan| caravan.parked)
+            || held.contains(&pr)
+        {
             continue;
         }
-        let caravan_members = status
-            .analysis
-            .fleet
-            .containing(pr)
-            .map_or_else(Vec::new, |caravan| caravan.members.clone());
+        dispatch_ci_for_member(
+            repository_path,
+            provider,
+            progress,
+            status,
+            current,
+            &mutation_kinds,
+        )?;
+    }
+    Ok(())
+}
+
+fn dispatch_ci_for_member(
+    repository_path: &std::path::Path,
+    provider: &impl SyncProvider,
+    progress: &mut SyncProgress,
+    status: &StatusOutput,
+    current: &PullRequestSnapshot,
+    mutation_kinds: &[MutationKind],
+) -> Result<(), AppError> {
+    let pr = current.number;
+    let caravan_members = status
+        .analysis
+        .fleet
+        .containing(pr)
+        .map_or_else(Vec::new, |caravan| caravan.members.clone());
+    let expected = PullRequestPrecondition::from(current);
+    let lineage = provider
+        .head_run_lineage(&status.repository, &expected)
+        .map_err(|error| mutation_error(&error, progress, Some(pr)))?;
+    let policy = provider
+        .branch_required_contexts(&status.repository, &status.default_branch)
+        .map_err(|error| mutation_error(&error, progress, Some(pr)))?;
+    if policy.branch != status.default_branch {
+        return Err(AppError::validation(
+            "ci_dispatch_policy_target_changed",
+            "CI-start policy is not for the actual landing target",
+        ));
+    }
+    let gate = status
+        .auto_admission
+        .admission_gate
+        .as_ref()
+        .map(|gate| gate.context.as_str());
+    for execution in crate::ci_dispatch::select(current, &policy, gate, &lineage)? {
         if progress.ci_generation_dispatches.iter().any(|dispatch| {
             dispatch.pr == pr
-                && dispatch.head_oid == current.head.oid
-                && dispatch.base_oid == current.base.oid
                 && dispatch.caravan_members == caravan_members
+                && dispatch.execution.as_ref() == Some(&execution)
         }) {
             continue;
         }
-        let expected = PullRequestPrecondition::from(current);
-        let lineage = provider
-            .head_run_lineage(&status.repository, &expected)
-            .map_err(|error| mutation_error(&error, progress, Some(pr)))?;
-        let suite_id = crate::required_runs::rerequestable_suite(
-            Some(&lineage),
-            &current.head.oid.0,
+        let binding = crate::ci_dispatch::DispatchBinding {
+            repository: status.repository.clone(),
+            pull_request: execution.pull_request.clone(),
+            caravan_members: caravan_members.clone(),
+            workflow_id: execution.workflow_id,
+        };
+        let operation_id = progress.operation_id.clone();
+        let dispatched = crate::ci_dispatch::dispatch(
+            repository_path,
+            &binding,
+            &execution,
+            &operation_id,
+            || progress.ensure_mutation_capacity(1),
+            || provider.restart_ci_execution(&status.repository, &expected, &execution),
         )
-        .ok_or_else(|| {
+        .map_err(|error| {
             AppError::structured(
-                ErrorCategory::ExecutionFailure,
-                "post_mutation_ci_dispatch_unavailable",
-                "queue-owned mutation produced a new head/base/membership tuple but no exact-head rerequestable CI suite exists",
+                error.category(),
+                error.code(),
+                error.to_string(),
                 Some(json!({
-                    "pr": pr,
-                    "head": current.head,
-                    "base": current.base,
-                    "mutation_kinds": mutation_kinds,
-                    "lineage": lineage,
-                    "retryable": true,
-                    "safe_next_action": "wait for the provider to expose one exact-head check suite, then rerun the same sync tick; do not amend or force-push solely to create CI",
+                    "source": error.details(), "operation_receipt": progress.operation_receipt(),
+                    "provider_receipts": progress.provider_receipts, "execution": execution,
+                    "membership_replay_allowed": false,
                 })),
             )
         })?;
-        progress.ensure_mutation_capacity(1)?;
-        let receipt = provider
-            .rerequest_check_suite(&status.repository, &expected, suite_id)
-            .map_err(|error| mutation_error(&error, progress, Some(pr)))?;
-        progress.record(
-            receipt,
-            &format!("requested exact-generation CI suite {suite_id} after queue-owned mutation"),
-        );
+        if let Some(receipt) = dispatched.provider_receipt {
+            progress.record(
+                receipt,
+                &format!(
+                    "requested proved CI run {} attempt {} after queue mutation",
+                    execution.run_id, execution.run_attempt
+                ),
+            );
+        }
         progress
             .ci_generation_dispatches
             .push(CiGenerationDispatchReceipt {
-                schema_version: 1,
+                schema_version: 2,
                 pr,
                 head_oid: current.head.oid.clone(),
                 base_oid: current.base.oid.clone(),
-                caravan_members,
-                mutation_kinds,
-                check_suite_id: suite_id,
-                operation_id: progress.operation_id.clone(),
+                caravan_members: caravan_members.clone(),
+                mutation_kinds: mutation_kinds.to_vec(),
+                check_suite_id: execution.check_suite_id,
+                execution: Some(execution),
+                disposition: dispatched.disposition,
+                operation_id: dispatched.operation_id,
             });
     }
     Ok(())

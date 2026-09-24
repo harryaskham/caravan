@@ -76,6 +76,7 @@ fn run(run_id: u64, head_sha: &str, status: &str, conclusion: &str) -> WorkflowR
         run_id,
         check_suite_id: run_id,
         workflow_name: "CI".to_owned(),
+        execution: None,
         head_sha: head_sha.to_owned(),
         status: status.to_owned(),
         conclusion: conclusion.to_owned(),
