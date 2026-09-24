@@ -28,6 +28,7 @@ fn contexts(values: &[&str]) -> RequiredContextsRead {
         branch: "main".to_owned(),
         protected: true,
         contexts: values.iter().map(|value| (*value).to_owned()).collect(),
+        checks: Vec::new(),
         complete: true,
     }
     .normalized()
@@ -666,6 +667,7 @@ fn bounded_reads_never_grow_without_limit() {
         branch: "main".to_owned(),
         protected: true,
         contexts: many,
+        checks: Vec::new(),
         complete: true,
     }
     .normalized();
@@ -785,6 +787,7 @@ fn cacophony_pr2208_required_contexts_survive_legacy_and_typed_declarations() {
             "Check & Lint".to_owned(),
             "Fast Tests (unit)".to_owned(),
         ],
+        checks: Vec::new(),
         complete: true,
     }
     .normalized();

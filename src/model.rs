@@ -194,6 +194,15 @@ pub struct CheckSnapshot {
     /// workflows may legitimately publish the same job name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_name: Option<String>,
+    /// Numeric GitHub App identity; never infer it from a workflow name or URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_id: Option<u64>,
+    /// Provider suite identity binds a deferred gate to real workflow lineage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_suite_id: Option<u64>,
+    /// Commit to which the provider bound this observation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_oid: Option<CommitOid>,
     /// Provider start timestamp (`startedAt`, else `createdAt`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<String>,
@@ -230,6 +239,9 @@ impl Default for CheckSnapshot {
             details_url: None,
             provider_kind: None,
             workflow_name: None,
+            app_id: None,
+            check_suite_id: None,
+            head_oid: None,
             started_at: None,
             completed_at: None,
             superseded: false,
@@ -246,6 +258,8 @@ pub struct CheckIdentity {
     pub name: String,
     pub provider_kind: Option<String>,
     pub workflow_name: Option<String>,
+    pub app_id: Option<u64>,
+    pub head_oid: Option<CommitOid>,
 }
 
 impl CheckSnapshot {
@@ -256,6 +270,8 @@ impl CheckSnapshot {
             name: self.name.clone(),
             provider_kind: self.provider_kind.clone(),
             workflow_name: self.workflow_name.clone(),
+            app_id: self.app_id,
+            head_oid: self.head_oid.clone(),
         }
     }
 
@@ -297,6 +313,8 @@ impl CheckSnapshot {
             WorkflowIdentity {
                 provider_kind: self.provider_kind.clone(),
                 workflow_name,
+                app_id: self.app_id,
+                head_oid: self.head_oid.clone(),
             },
             run_id,
         ))
@@ -307,6 +325,8 @@ impl CheckSnapshot {
 struct WorkflowIdentity {
     provider_kind: Option<String>,
     workflow_name: String,
+    app_id: Option<u64>,
+    head_oid: Option<CommitOid>,
 }
 
 /// Reduce a rollup lineage to current check/workflow observations.

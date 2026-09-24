@@ -3564,6 +3564,7 @@ mod tests {
             updated_at: None,
         };
         let analysis = crate::graph::GraphAnalysis {
+            required_policy: None,
             fleet: crate::model::CaravanFleet {
                 repository: repository.clone(),
                 default_branch: branch("main", "main-oid"),

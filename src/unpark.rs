@@ -21,9 +21,8 @@ use crate::command::{CommandRunner, CommandSpec, ProcessRunner};
 use crate::github::{GitHubMutationAdapter, GitHubMutationReceipt, MutationError};
 use crate::journal::{JournalRecord, LogInput};
 use crate::model::{
-    CheckSnapshot, CheckState, MutationKind, MutationStep, MutationStepState, OperationId,
-    OperationReceipt, PrNumber, PullRequestPrecondition, PullRequestSnapshot, PullRequestState,
-    RepositoryId,
+    CheckSnapshot, MutationKind, MutationStep, MutationStepState, OperationId, OperationReceipt,
+    PrNumber, PullRequestPrecondition, PullRequestSnapshot, PullRequestState, RepositoryId,
 };
 use crate::read::StatusOutput;
 use crate::required_runs::{
@@ -290,14 +289,13 @@ fn read_required_contexts(
     input: &UnparkInput,
     provider_mutated: bool,
 ) -> Result<RequiredContextsRead, AppError> {
-    let branch = status
-        .analysis
-        .pull_requests
-        .get(&PrNumber(input.pr))
-        .map_or(input.base_ref.as_str(), |pull| pull.base.name.as_str());
-    provider
+    let branch = &status.analysis.fleet.default_branch.name;
+    let mut policy = provider
         .branch_required_contexts(&status.repository, branch)
-        .map_err(|error| required_contexts_error(&error, input, provider_mutated))
+        .map_err(|error| required_contexts_error(&error, input, provider_mutated))?
+        .normalized();
+    policy.complete &= policy.branch == *branch;
+    Ok(policy)
 }
 
 fn remove_parked_label(
@@ -429,24 +427,9 @@ fn prepare(
             input,
         ));
     }
+    // Keep all check evidence in diagnostics, but only effective requirements
+    // decide whether the exact parked generation has recovered.
     let (authoritative, superseded) = crate::model::latest_checks_per_identity(&pull.checks);
-    if authoritative.is_empty()
-        || authoritative.iter().any(|check| {
-            !matches!(
-                check.state,
-                CheckState::Success | CheckState::Neutral | CheckState::Skipped
-            )
-        })
-    {
-        return Err(AppError::structured(
-            ErrorCategory::Validation,
-            "unpark_ci_not_green",
-            "newest authoritative required-check generation is not green",
-            Some(
-                json!({"pr": pr, "head": input.head, "authoritative_checks": authoritative, "superseded_checks": superseded, "mutated": false}),
-            ),
-        ));
-    }
     let authoritative_checks = authoritative.into_iter().cloned().collect::<Vec<_>>();
     let superseded_checks = superseded.into_iter().cloned().collect::<Vec<_>>();
     let required_runs = required_runs(&pull, required_contexts, &authoritative_checks);
@@ -456,7 +439,16 @@ fn prepare(
     ) {
         return Err(AppError::structured(
             ErrorCategory::Validation,
-            "unpark_required_checks_not_green",
+            if matches!(
+                required_runs.status,
+                RequiredRunsStatus::Failing
+                    | RequiredRunsStatus::CancelledSuperseded
+                    | RequiredRunsStatus::Pending
+            ) {
+                "unpark_ci_not_green"
+            } else {
+                "unpark_required_checks_not_green"
+            },
             "protection-declared required checks are not proven green on the exact parked generation",
             Some(json!({
                 "pr": pr,
@@ -506,6 +498,7 @@ fn stable_required_runs_evidence(assessment: &RequiredRunsAssessment) -> Value {
         "base": assessment.base,
         "status": assessment.status,
         "required_contexts": assessment.required_contexts,
+        "required_policy": assessment.required_policy,
         "coverage": assessment.coverage,
         "missing_contexts": assessment.missing_contexts,
         "observed_check_suites": assessment.observed_check_suites,
@@ -595,28 +588,14 @@ fn finish(
         ));
     }
     let (authoritative, _) = crate::model::latest_checks_per_identity(&current.checks);
-    if authoritative.is_empty()
-        || authoritative.iter().any(|check| {
-            !matches!(
-                check.state,
-                CheckState::Success | CheckState::Neutral | CheckState::Skipped
-            )
-        })
-    {
-        return Err(postcondition(
-            "unpark_postcondition_ci_drift",
-            "authoritative checks drifted after parking transition",
-            input,
-            &provider_receipt,
-            final_status,
-        ));
-    }
     let authoritative = authoritative.into_iter().cloned().collect::<Vec<_>>();
     let post_required_runs = required_runs(current, required_contexts, &authoritative);
-    if !matches!(
-        post_required_runs.status,
-        RequiredRunsStatus::Satisfied | RequiredRunsStatus::NotRequired
-    ) {
+    if prepared.required_context_read.as_ref() != Some(required_contexts)
+        || !matches!(
+            post_required_runs.status,
+            RequiredRunsStatus::Satisfied | RequiredRunsStatus::NotRequired
+        )
+    {
         return Err(postcondition(
             "unpark_postcondition_required_checks_drift",
             "protection-declared required checks drifted after parking transition",
@@ -1127,6 +1106,7 @@ mod tests {
                 .iter()
                 .map(|context| (*context).to_owned())
                 .collect(),
+            checks: Vec::new(),
             complete: true,
         }
     }

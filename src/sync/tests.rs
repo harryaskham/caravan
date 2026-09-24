@@ -54,6 +54,8 @@ struct FakeProvider {
     comments: RefCell<BTreeMap<PrNumber, Vec<String>>>,
     /// Protection-declared required contexts, keyed by branch name.
     required_contexts: RefCell<BTreeMap<String, RequiredContextsRead>>,
+    policy_reads: RefCell<Vec<String>>,
+    policy_overrides: RefCell<VecDeque<RequiredContextsRead>>,
     /// Head lineage served for a PR, keyed by PR number.
     head_lineage: RefCell<BTreeMap<PrNumber, VecDeque<HeadRunLineage>>>,
     /// Every PR whose head lineage was actually read, in order.
@@ -80,10 +82,26 @@ struct FakeProvider {
 }
 
 mod deferred_admission;
+mod effective_policy;
 use deferred_admission::prove_deferred;
 
 impl FakeProvider {
     fn with_pull_requests(pulls: Vec<PullRequestSnapshot>) -> Self {
+        // Historical CI fixtures intend their initial observations to be
+        // required. Declare that policy explicitly rather than relying on the
+        // removed production all-check gate. Optional-check tests override it.
+        let contexts = pulls
+            .iter()
+            .flat_map(|pull| pull.checks.iter().map(|check| check.name.clone()))
+            .collect();
+        let policy = RequiredContextsRead {
+            branch: "main".to_owned(),
+            protected: true,
+            contexts,
+            checks: Vec::new(),
+            complete: true,
+        }
+        .normalized();
         Self {
             allows_auto_merge: true,
             allows_squash_merge: true,
@@ -114,7 +132,9 @@ impl FakeProvider {
             branch_head: RefCell::new(branch("main").oid),
             audits: RefCell::new(Vec::new()),
             comments: RefCell::new(BTreeMap::new()),
-            required_contexts: RefCell::new(BTreeMap::new()),
+            required_contexts: RefCell::new(BTreeMap::from([("main".to_owned(), policy)])),
+            policy_reads: RefCell::new(Vec::new()),
+            policy_overrides: RefCell::new(VecDeque::new()),
             head_lineage: RefCell::new(BTreeMap::new()),
             lineage_reads: RefCell::new(Vec::new()),
             rerequestable_suites: RefCell::new(BTreeMap::new()),
@@ -139,6 +159,7 @@ impl FakeProvider {
                 branch: branch.to_owned(),
                 protected: true,
                 contexts: contexts.iter().map(|value| (*value).to_owned()).collect(),
+                checks: Vec::new(),
                 complete: true,
             }
             .normalized(),
@@ -894,6 +915,10 @@ impl SyncProvider for FakeProvider {
         _repository: &RepositoryId,
         branch: &str,
     ) -> Result<RequiredContextsRead, MutationError> {
+        self.policy_reads.borrow_mut().push(branch.to_owned());
+        if let Some(policy) = self.policy_overrides.borrow_mut().pop_front() {
+            return Ok(policy);
+        }
         Ok(self
             .required_contexts
             .borrow()
@@ -1492,6 +1517,25 @@ fn healthy_chain() -> Vec<PullRequestSnapshot> {
             AutoMergeState::disabled(),
         ),
     ]
+}
+
+// Explicit landing-target reports: a stacked parent never exempts children
+// from main's requirements. Use these only where the scenario is not a stall.
+fn reporting_chain(contexts: &[&str], state: CheckState) -> Vec<PullRequestSnapshot> {
+    let mut pulls = healthy_chain();
+    for pull in &mut pulls {
+        pull.checks = contexts
+            .iter()
+            .map(|context| check(context, state, None))
+            .collect();
+    }
+    pulls
+}
+
+fn root_stalled_chain() -> Vec<PullRequestSnapshot> {
+    let mut pulls = reporting_chain(&required_context_names(), CheckState::Success);
+    pulls[0].checks.clear();
+    pulls
 }
 
 #[test]
@@ -3396,7 +3440,7 @@ fn failing_unjoined_candidate_is_skipped_after_existing_caravan_progress() {
         AutoMergeState::disabled(),
     );
     candidate.labels.clear();
-    candidate.checks = vec![check("test", CheckState::Failure, None)];
+    candidate.checks = vec![check("build-test", CheckState::Failure, None)];
     pulls.push(candidate.clone());
     let mut later_candidate = pull_request(
         2597,
@@ -3406,7 +3450,7 @@ fn failing_unjoined_candidate_is_skipped_after_existing_caravan_progress() {
         AutoMergeState::disabled(),
     );
     later_candidate.labels.clear();
-    later_candidate.checks = vec![check("test", CheckState::Success, None)];
+    later_candidate.checks = vec![check("build-test", CheckState::Success, None)];
     pulls.push(later_candidate.clone());
 
     let status = caravan_status(pulls.clone(), None, true);
@@ -4145,7 +4189,7 @@ fn oversized_skip_receipt_fails_before_label_mutation() {
 
 #[test]
 fn pending_ci_reports_waiting_without_speculative_mutation() {
-    let mut pulls = healthy_chain();
+    let mut pulls = reporting_chain(&["build-test"], CheckState::Queued);
     pulls[0].checks = vec![check("build-test", CheckState::Queued, Some(7))];
     let provider = FakeProvider::with_pull_requests(pulls.clone());
     let status = status(pulls, Some(PrNumber(1)), &clean);
@@ -5321,7 +5365,7 @@ fn unknown_provider_state_is_a_non_rerunnable_ci_decision() {
 
 #[test]
 fn rerun_failed_selects_only_exact_current_run_then_stops() {
-    let mut pulls = healthy_chain();
+    let mut pulls = reporting_chain(&["build-test"], CheckState::Success);
     pulls[0].checks = vec![check("build-test", CheckState::Failure, Some(10))];
     let matching = failed_run(10, &pulls[0]);
     let spurious = failed_run(11, &pulls[0]);
@@ -5353,7 +5397,7 @@ fn rerun_failed_selects_only_exact_current_run_then_stops() {
 
 #[test]
 fn forced_downstream_failure_remains_in_chain_without_blocking() {
-    let mut pulls = healthy_chain();
+    let mut pulls = reporting_chain(&["build-test"], CheckState::Success);
     pulls[0].checks = vec![check("build-test", CheckState::Success, Some(1))];
     pulls[1].labels.insert("caravan-force".to_owned());
     pulls[1].checks = vec![check("build-test", CheckState::Failure, Some(20))];
@@ -8415,7 +8459,11 @@ fn a_head_with_zero_required_runs_is_reported_instead_of_waiting_forever() {
     );
     assert_eq!(scheduler.disposition, SchedulerDisposition::OperatorAction);
     assert_eq!(scheduler.wake_class, SchedulerWakeClass::OperatorAction);
-    assert_eq!(scheduler.missing_required_runs.len(), 1);
+    assert_eq!(
+        scheduler.missing_required_runs.len(),
+        3,
+        "each member must meet the landing-target policy, not its intermediate parent policy"
+    );
 }
 
 #[test]
@@ -8500,7 +8548,7 @@ fn a_delayed_run_inside_the_grace_period_is_an_ordinary_ci_wait() {
 
 #[test]
 fn a_delayed_run_that_finally_arrives_is_pending_not_missing() {
-    let pulls = healthy_chain();
+    let pulls = root_stalled_chain();
     let provider = FakeProvider::with_pull_requests(pulls.clone());
     provider.require_contexts("main", &required_context_names());
     let head = head_of(&pulls, 1);
@@ -8566,7 +8614,7 @@ fn a_run_on_a_superseded_head_never_satisfies_the_current_head() {
 
 #[test]
 fn a_cancelled_superseded_suite_is_retriggered_exactly_once_and_recovers() {
-    let pulls = healthy_chain();
+    let pulls = root_stalled_chain();
     let provider = FakeProvider::with_pull_requests(pulls.clone());
     provider.require_contexts("main", &required_context_names());
     let head = head_of(&pulls, 1);
@@ -8661,7 +8709,7 @@ fn a_refused_retrigger_becomes_a_typed_operator_problem() {
 
 #[test]
 fn disabled_retrigger_still_detects_and_reports_the_stall() {
-    let pulls = healthy_chain();
+    let pulls = root_stalled_chain();
     let provider = FakeProvider::with_pull_requests(pulls.clone());
     provider.require_contexts("main", &required_context_names());
     let head = head_of(&pulls, 1);
@@ -8757,13 +8805,17 @@ fn a_partial_lineage_read_never_claims_a_missing_required_run() {
 
 #[test]
 fn a_satisfied_head_reads_no_lineage_and_reports_no_problem() {
-    let mut pulls = healthy_chain();
+    let mut pulls = root_stalled_chain();
     pulls[0].checks = vec![
         check(CHECK_LINT, CheckState::Success, Some(7)),
         check(FAST_TESTS, CheckState::Success, Some(8)),
     ];
-    pulls[1].checks = vec![check("build-test", CheckState::Success, Some(9))];
-    pulls[2].checks = vec![check("build-test", CheckState::Success, Some(10))];
+    pulls[1]
+        .checks
+        .push(check("build-test", CheckState::Success, Some(9)));
+    pulls[2]
+        .checks
+        .push(check("build-test", CheckState::Success, Some(10)));
     let provider = FakeProvider::with_pull_requests(pulls.clone());
     provider.require_contexts("main", &required_context_names());
     let status = status(pulls, Some(PrNumber(1)), &clean);
@@ -8792,28 +8844,54 @@ fn a_satisfied_head_reads_no_lineage_and_reports_no_problem() {
 }
 
 #[test]
-fn an_unprotected_base_requires_nothing_from_a_member() {
+fn an_unprotected_landing_target_requires_nothing_from_every_member() {
+    let pulls = healthy_chain();
+    let provider = FakeProvider::with_pull_requests(pulls.clone());
+    provider
+        .required_contexts
+        .borrow_mut()
+        .insert("main".into(), RequiredContextsRead::unprotected("main"));
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+    let progress = execute(&status, &provider, false, false, false).unwrap();
+    for number in [1_u64, 2, 3] {
+        assert_eq!(
+            required_runs_receipt(&progress, number).assessment.status,
+            RequiredRunsStatus::NotRequired
+        );
+    }
+    assert!(provider.lineage_reads.borrow().is_empty());
+}
+
+#[test]
+fn unprotected_intermediate_parents_never_exempt_landing_requirements() {
     let pulls = healthy_chain();
     let provider = FakeProvider::with_pull_requests(pulls.clone());
     provider.require_contexts("main", &required_context_names());
-    let status = status(pulls, Some(PrNumber(1)), &clean);
-
-    let progress =
-        execute(&status, &provider, false, false, false).expect("a stall is not an error");
-
-    for number in [2_u64, 3] {
-        assert_eq!(
-            required_runs_receipt(&progress, number).assessment.status,
-            RequiredRunsStatus::NotRequired,
-            "member #{number} stacks on an unprotected branch"
-        );
+    for parent in ["one", "two"] {
+        provider
+            .required_contexts
+            .borrow_mut()
+            .insert(parent.into(), RequiredContextsRead::unprotected(parent));
     }
-    assert!(!provider.lineage_reads.borrow().contains(&PrNumber(2)));
+    let status = status(pulls, Some(PrNumber(1)), &clean);
+    let progress = execute(&status, &provider, false, false, false).unwrap();
+    for number in [1_u64, 2, 3] {
+        let assessment = &required_runs_receipt(&progress, number).assessment;
+        assert_eq!(assessment.status, RequiredRunsStatus::MissingRequiredRuns);
+        assert_eq!(assessment.required_policy.as_ref().unwrap().branch, "main");
+    }
+    assert!(
+        provider
+            .policy_reads
+            .borrow()
+            .iter()
+            .all(|branch| branch == "main")
+    );
 }
 
 #[test]
 fn one_stalled_member_never_hides_or_contaminates_another() {
-    let mut pulls = healthy_chain();
+    let mut pulls = root_stalled_chain();
     pulls[1].checks = vec![
         check(CHECK_LINT, CheckState::Success, Some(9)),
         check(FAST_TESTS, CheckState::InProgress, Some(10)),
@@ -8846,7 +8924,8 @@ fn one_stalled_member_never_hides_or_contaminates_another() {
 
 #[test]
 fn independently_stalled_members_are_reported_separately() {
-    let pulls = healthy_chain();
+    let mut pulls = root_stalled_chain();
+    pulls[1].checks.clear();
     let provider = FakeProvider::with_pull_requests(pulls.clone());
     provider.require_contexts("main", &required_context_names());
     provider.require_contexts("one", &required_context_names());
@@ -8885,7 +8964,7 @@ fn missing_required_run_hook_evidence_is_deduplicated_and_bounded() {
     let replay = execute(&status, &provider, false, false, false).expect("second pass");
     merge_sync_progress(&mut progress, replay);
 
-    assert_eq!(progress.missing_required_runs.len(), 1);
+    assert_eq!(progress.missing_required_runs.len(), 3);
     assert_eq!(
         progress
             .required_runs
@@ -8901,7 +8980,7 @@ fn missing_required_run_hook_evidence_is_deduplicated_and_bounded() {
         .filter(|event| event.kind == EventKind::RequiredRunsMissing)
         .count();
     assert_eq!(
-        emitted, 1,
+        emitted, 3,
         "two convergence passes over one member must not notify hooks twice"
     );
     let problem = &progress.missing_required_runs[0];
@@ -8943,16 +9022,18 @@ fn grace_starts_at_publication_not_at_a_preserved_commit_date() {
 
     // A tick two minutes after publication is still inside the default grace.
     let published_unix = crate::required_runs::rfc3339_to_unix_secs(PUBLISHED).expect("timestamp");
+    let required_contexts = RequiredContextsRead {
+        branch: "main".to_owned(),
+        protected: true,
+        contexts: vec![CHECK_LINT.to_owned(), FAST_TESTS.to_owned()],
+        checks: Vec::new(),
+        complete: true,
+    };
     let assessment = crate::required_runs::assess(&crate::required_runs::RequiredRunsInput {
         pr: pull_request.number,
         head: &pull_request.head,
         base: &pull_request.base,
-        contexts: &RequiredContextsRead {
-            branch: "main".to_owned(),
-            protected: true,
-            contexts: vec![CHECK_LINT.to_owned(), FAST_TESTS.to_owned()],
-            complete: true,
-        },
+        contexts: &required_contexts,
         lineage: Some(&lineage),
         checks: &pull_request.checks,
         head_published_at: head_published_at(&pull_request, Some(&lineage)).as_deref(),
@@ -8969,12 +9050,7 @@ fn grace_starts_at_publication_not_at_a_preserved_commit_date() {
         pr: pull_request.number,
         head: &pull_request.head,
         base: &pull_request.base,
-        contexts: &RequiredContextsRead {
-            branch: "main".to_owned(),
-            protected: true,
-            contexts: vec![CHECK_LINT.to_owned(), FAST_TESTS.to_owned()],
-            complete: true,
-        },
+        contexts: &required_contexts,
         lineage: Some(&lineage),
         checks: &pull_request.checks,
         head_published_at: head_published_at(&pull_request, Some(&lineage)).as_deref(),
@@ -9560,7 +9636,7 @@ fn root_first_refuses_tail_containing_evicted_unmerged_middle_bd_70f4d9() {
     let mut red_middle = caravan_member(2, "red-middle", "main");
     red_middle.labels.remove("caravan");
     red_middle.labels.insert("caravan-evicted".to_owned());
-    red_middle.checks = vec![check("ci", CheckState::Failure, None)];
+    red_middle.checks = vec![check("build-test", CheckState::Failure, None)];
 
     // The provider already retargeted the physical tail to main, which erases
     // the branch edge from graph membership while its Git history still
@@ -11582,6 +11658,11 @@ fn native_sync_checkpoints_partial_prefix_before_lock_or_source_write() {
         },
     ];
 
+    // A passing diagnostic alone is no longer merge authority. Supply the
+    // explicit complete landing-target receipt for the ready root only.
+    progress
+        .verify_required_runs(&provider, &status.repository, caravan.id, PrNumber(1))
+        .unwrap();
     let error = progress
         .drain_native_stack(&provider, &status, &caravan, 42, &native)
         .expect_err("fake provider stops at native lock acquisition");

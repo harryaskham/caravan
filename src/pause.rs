@@ -2242,6 +2242,7 @@ mod tests {
             healthy: true,
             initialization: crate::initialization::InitializationStatus::default(),
             analysis: GraphAnalysis {
+                required_policy: None,
                 fleet: CaravanFleet {
                     repository: repository(),
                     default_branch: branch("main", "base"),
