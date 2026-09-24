@@ -215,7 +215,7 @@ fn ci_dispatch_refuses_wrong_app_suite_workflow_attempt_base_head_and_partial_ev
                     .execution
                     .as_mut()
                     .unwrap()
-                    .run_attempt = 0
+                    .run_attempt = 0;
             }
             "base" => {
                 lineage.workflow_runs[0]
@@ -223,7 +223,7 @@ fn ci_dispatch_refuses_wrong_app_suite_workflow_attempt_base_head_and_partial_ev
                     .as_mut()
                     .unwrap()
                     .pull_requests[0]
-                    .base_sha = "c".repeat(40)
+                    .base_sha = "c".repeat(40);
             }
             "head" => lineage.workflow_runs[0].head_sha = "c".repeat(40),
             "pr" => {
@@ -232,7 +232,7 @@ fn ci_dispatch_refuses_wrong_app_suite_workflow_attempt_base_head_and_partial_ev
                     .as_mut()
                     .unwrap()
                     .pull_requests[0]
-                    .number = PrNumber(227)
+                    .number = PrNumber(227);
             }
             "duplicate" => lineage.workflow_runs.push(lineage.workflow_runs[0].clone()),
             "partial" => lineage.complete = false,
@@ -618,7 +618,7 @@ fn ci_dispatch_storage_failure_prevents_provider_write_and_truncation_is_not_com
         )
         .is_err()
     );
-    lineage.workflow_runs = (0..(MAX_REPORTED_LINEAGE + 1))
+    lineage.workflow_runs = (0..=MAX_REPORTED_LINEAGE)
         .map(|offset| {
             let mut run = lineage.workflow_runs[0].clone();
             run.run_id += u64::try_from(offset).unwrap();

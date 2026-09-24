@@ -1,5 +1,5 @@
 //! Applicable workflow execution selection and durable post-mutation CI starts.
-//! Eligibility remains in required_runs; this module never waives a requirement.
+//! Eligibility remains in `required_runs`; this module never waives a requirement.
 
 use crate::{
     AppError, ErrorCategory,
