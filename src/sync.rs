@@ -2801,14 +2801,39 @@ fn native_stack_landing_converged(
     })
 }
 
-// Keep the fresh-read lease, one-write label transaction, and lifecycle-specific
-// postconditions visible in one linear safety boundary.
-#[allow(clippy::too_many_lines)]
 fn reconcile_closed_lifecycle(
     status: &StatusOutput,
     provider: &impl SyncProvider,
 ) -> Result<ClosedLifecycleReconciliation, AppError> {
     let mut output = ClosedLifecycleReconciliation::default();
+    if let Err(error) = apply_closed_lifecycle(status, provider, &mut output) {
+        if output.transitions.is_empty() {
+            return Err(error);
+        }
+        return Err(AppError::structured(
+            error.category(),
+            "closed_member_partial",
+            "closed-member reconciliation stopped after provider transitions; preserve completed receipts",
+            Some(
+                json!({"source_code": error.code(), "source": error.details(),
+                "mutated": true, "resumable": true, "source_heads_unchanged": null,
+                "provider_receipts": output.provider_receipts,
+                "closed_lifecycle_transitions": output.transitions,
+                "safe_next_action": "rediscover current provider state and resume normal sync; do not replay completed label transitions"}),
+            ),
+        ));
+    }
+    Ok(output)
+}
+
+// Keep the fresh-read lease, one-write label transaction, and lifecycle-specific
+// postconditions visible in one linear safety boundary.
+#[allow(clippy::too_many_lines)]
+fn apply_closed_lifecycle(
+    status: &StatusOutput,
+    provider: &impl SyncProvider,
+    output: &mut ClosedLifecycleReconciliation,
+) -> Result<(), AppError> {
     let candidates = status
         .analysis
         .pull_requests
@@ -2865,7 +2890,7 @@ fn reconcile_closed_lifecycle(
                 })?;
             let current = receipt.after.clone();
             record_closed_lifecycle_mutation(
-                &mut output,
+                output,
                 receipt,
                 "atomically replaced closed-unmerged PR lifecycle labels",
             );
@@ -2920,7 +2945,7 @@ fn reconcile_closed_lifecycle(
                 })?;
             let current = receipt.after.clone();
             record_closed_lifecycle_mutation(
-                &mut output,
+                output,
                 receipt,
                 "removed caravan-closed while preserving open or merged labels",
             );
@@ -2950,7 +2975,7 @@ fn reconcile_closed_lifecycle(
             });
         }
     }
-    Ok(output)
+    Ok(())
 }
 
 #[derive(Default)]
@@ -5140,6 +5165,52 @@ fn sync_with_lock(
     )?;
     let provider = GitHubMutationAdapter::new(runner);
 
+    // Closed-member metadata must not wait behind a topology failure caused by
+    // that very closure. Settle only lifecycle labels, then rediscover and return:
+    // no landing checkpoint, source rewrite, admission or merge runs this tick.
+    let closed_lifecycle_started = Instant::now();
+    progress::emit(
+        "closed_lifecycle",
+        "converging terminal lifecycle labels before native topology",
+    );
+    let closed_lifecycle = reconcile_closed_lifecycle(&status, &provider)?;
+    if closed_lifecycle.changed {
+        let final_status_started = Instant::now();
+        status = read::status_with_deadline_and_budget(
+            context, operation_deadline, Some(&github_budget),
+        ).map_err(|error| AppError::structured(
+            error.category(), "closed_pr_terminalization_rediscovery_failed",
+            "closed PR labels changed but the authoritative postcondition could not be rediscovered",
+            Some(json!({
+                "source": error.details(),
+                "closed_lifecycle_transitions": &closed_lifecycle.transitions,
+                "provider_receipts": &closed_lifecycle.provider_receipts,
+                "resumable": true, "branch_action": "preserved",
+                "safe_next_action": "rerun the same trusted sync to rediscover and converge exact provider state",
+            })),
+        ))?;
+        progress::emit(
+            "closed_lifecycle",
+            format!(
+                "converged {} closed lifecycle row(s); active work deferred",
+                closed_lifecycle.transitions.len(),
+            ),
+        );
+        return closed_lifecycle_output(
+            context,
+            input,
+            started,
+            operation_deadline,
+            initial_status_elapsed,
+            closed_lifecycle_started.elapsed(),
+            final_status_started.elapsed(),
+            closed_lifecycle,
+            status,
+            lock_recovery,
+            &mut lock,
+        );
+    }
+
     // Poll and finalize any submitted landing checkpoints and cleanup orphaned rulesets
     // before evaluating compatibility, rebase, or admission.
     if reconcile_pending_native_stack_landing_checkpoints(context, &status, &provider)? {
@@ -5235,60 +5306,6 @@ fn sync_with_lock(
         );
     }
     require_native_stack_backend_healthy(&status)?;
-
-    // Terminal provider state is reconciled before root landing, repair,
-    // physical rebase, capacity, or admission. A changed pass returns after an
-    // authoritative rediscovery, so a closed generation can never trigger
-    // active queue work in the same tick.
-    let closed_lifecycle_started = Instant::now();
-    progress::emit(
-        "closed_lifecycle",
-        "converging closed-unmerged, reopened, and merged lifecycle labels",
-    );
-    let closed_lifecycle = reconcile_closed_lifecycle(&status, &provider)?;
-    if closed_lifecycle.changed {
-        let final_status_started = Instant::now();
-        status = read::status_with_deadline_and_budget(
-            context,
-            operation_deadline,
-            Some(&github_budget),
-        )
-        .map_err(|error| {
-            AppError::structured(
-                error.category(),
-                "closed_pr_terminalization_rediscovery_failed",
-                "closed PR labels changed but the authoritative postcondition could not be rediscovered",
-                Some(json!({
-                    "source": error.details(),
-                    "closed_lifecycle_transitions": &closed_lifecycle.transitions,
-                    "provider_receipts": &closed_lifecycle.provider_receipts,
-                    "resumable": true,
-                    "branch_action": "preserved",
-                    "safe_next_action": "rerun the same trusted sync to rediscover and converge exact provider state",
-                })),
-            )
-        })?;
-        progress::emit(
-            "closed_lifecycle",
-            format!(
-                "converged {} closed lifecycle row(s); active work deferred",
-                closed_lifecycle.transitions.len()
-            ),
-        );
-        return closed_lifecycle_output(
-            context,
-            input,
-            started,
-            operation_deadline,
-            initial_status_elapsed,
-            closed_lifecycle_started.elapsed(),
-            final_status_started.elapsed(),
-            closed_lifecycle,
-            status,
-            lock_recovery,
-            &mut lock,
-        );
-    }
 
     // Root landing is the first active-fleet provider convergence action for
     // the Caravan-owned backend. Native mode must first perform the complete

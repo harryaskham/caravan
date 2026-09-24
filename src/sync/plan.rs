@@ -63,7 +63,7 @@ fn plan_sync_inner(
         authority.bind_invocation(&mut status)?;
     }
     crate::initialization::require_ready(&status.initialization)?;
-    if input.closed_pr.is_some() {
+    if input.closed_pr.is_some() || super::closed::has_pending(&status) {
         super::require_current_policy(context, &status)?;
         if let Some(authority) = authority {
             authority.revalidate()?;

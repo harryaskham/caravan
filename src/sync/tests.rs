@@ -81,6 +81,7 @@ struct FakeProvider {
     released_reobservations: RefCell<u32>,
 }
 
+mod closed_reformation;
 mod deferred_admission;
 mod effective_policy;
 use deferred_admission::prove_deferred;

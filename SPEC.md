@@ -315,8 +315,9 @@ preconditions.
 ### Closed-unmerged terminalization
 
 Trusted `cara sync` discovery retains bounded closed history selected by each of
-`caravan`, `caravan-parked`, and `caravan-closed`. Before root merge, repair,
-physical rebase, admission, or auto-merge logic, sync freshly refetches each
+`caravan`, `caravan-parked`, and `caravan-closed`. Before native topology gates,
+pending-land processing, root merge, repair, physical rebase, admission, or
+auto-merge logic, sync freshly refetches each
 candidate from the authoritative provider. Only exact state `CLOSED` with
 `mergedAt == null` is eligible: one complete-label provider write adds
 `caravan-closed` while removing `caravan-parked` and `caravan`, then sync returns
@@ -330,9 +331,36 @@ compares state, `mergedAt`, head, base, labels, and auto-merge immediately befor
 mutation and returns provider before/after facts, so no multi-write partial label
 state is observable. Provider races and read failures are classified and
 resumable; an unchanged terminal row performs zero writes on every duplicate
-sync.
+sync. This applies to closed roots, middles, tails, and multiple closures;
+`plan sync --all` exposes the same lifecycle-only pass before topology checks.
+A failure after earlier transitions preserves their complete provider receipts
+and reports partial progress, never zero mutation. A resumed tick rediscovers
+current labels rather than replaying successful transitions.
 
-When unrelated native Stack topology prevents broad sync, `cara sync --closed-pr
+Active membership and retained provider history are separate. Normal sync can
+reform one missing native suffix after a leading, freshly proved merged prefix:
+it matches the exact current open prefix, not the total retained row count.
+Complete inventory, unique Stack identity (including historical intersections),
+fresh PR state/head/base, collapsed-root proof, and the existing writer lease
+remain mandatory. The new plan records the entire retained generation directly;
+it never invents a prior membership checkpoint. Recovery preserves every raw
+historical row and appends only the missing accepted open suffix. It neither
+qualifies CI nor merges; subsequent normal discovery evaluates the current
+remaining generation. Complete repeated observations perform no further append.
+
+Before recovery append, every accepted open child must provably contain its
+predecessor head. Divergent, behind, or unknown ancestry refuses before the
+provider write rather than allowing an implicit source rebase. Ordinary append
+rules are unchanged. Unmerged, reopened, interleaved, unknown, or non-linear
+retained history is not silently filtered into an automatic mutation:
+`github_stack_closed_history_requires_owner` preserves it and identifies the
+source-preserving recovery boundary. Closed rows remain excluded from active
+membership even when provider reformation refuses. This is not authority for
+native force-with-lease rebase, historical operation replay, or destructive
+history removal. Explicit `native-stack recovery-preview` / `recovery-apply`
+retain their own fresh-proof contract; there is no new tail-eviction preview verb.
+
+For intentionally scoped cleanup,  `cara sync --closed-pr
 <N> --dry-run` (also `cara plan sync --closed-pr <N>`) previews only that closed,
 unmerged member's lifecycle label replacement. Apply with `cara sync --closed-pr
 <N> --expected-closed-head <full-oid>`. This uses the same repository writer lock,
