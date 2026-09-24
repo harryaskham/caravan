@@ -684,6 +684,25 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
             return Err(stale_generation(&plan.before, actual.as_ref()));
         }
         self.verify_topology_fresh(repository, &intended)?;
+        // Base metadata alone is not ancestry. The native add endpoint may
+        // rebase a divergent candidate; recovery must refuse before that write.
+        for pair in accepted.entries.windows(2) {
+            let relation =
+                self.compare_commits(repository, &pair[0].head.oid, &pair[1].head.oid)?;
+            if !matches!(
+                relation,
+                crate::generation::CommitRelation::Ahead
+                    | crate::generation::CommitRelation::Identical
+            ) {
+                return Err(invalid_plan(
+                    "github_stack_recovery_source_rewrite_required",
+                    &format!(
+                        "PR #{} does not provably contain predecessor #{}; preserve source and use owner recovery instead of automatic rebase ({relation:?})",
+                        pair[1].pr, pair[0].pr
+                    ),
+                ));
+            }
+        }
         let leased = self.native_stack_rows_for_recovery(repository, plan.before.number)?;
         if leased.as_ref() != Some(&plan.before) {
             return Err(stale_generation(&plan.before, leased.as_ref()));
@@ -2404,6 +2423,12 @@ mod tests {
         };
         let mut calls = reads(&plan.before.topology);
         calls.extend(generation_observation_calls(&plan.desired));
+        calls.extend(
+            accepted
+                .entries
+                .windows(2)
+                .map(|pair| compare_call(&pair[0].head.oid, &pair[1].head.oid, "ahead")),
+        );
         calls.extend(reads(&plan.before.topology));
         calls.push((
             native_stack_add_command(&repository(), &plan),
@@ -2440,6 +2465,45 @@ mod tests {
             Err(GitHubStackMutationError::StaleGeneration { .. })
         ));
         drifted.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn closed_prefix_recovery_refuses_source_rewrite_before_post() {
+        for relation in ["diverged", "behind", "unknown"] {
+            let accepted = topology(3);
+            let before = generation(topology(2));
+            let plan = GitHubStackAddPlan {
+                operation_id: "no-rewrite".to_owned(),
+                actor: "cara".to_owned(),
+                desired: before
+                    .recovery_suffix_target(&repository(), &accepted)
+                    .unwrap(),
+                before,
+            };
+            let mut calls = direct_generation_calls(&plan.before.topology);
+            calls.push((
+                native_stack_read_command(&repository(), 42),
+                CommandOutput::success(stack_json(&plan.before.topology)),
+            ));
+            calls.extend(generation_observation_calls(&plan.desired));
+            calls.push(compare_call(
+                &accepted.entries[0].head.oid,
+                &accepted.entries[1].head.oid,
+                "ahead",
+            ));
+            calls.push(compare_call(
+                &accepted.entries[1].head.oid,
+                &accepted.entries[2].head.oid,
+                relation,
+            ));
+            let adapter = GitHubMutationAdapter::new(FakeRunner::new(calls));
+            assert!(
+                adapter
+                    .native_stack_recovery_add(&repository(), &plan, &accepted)
+                    .is_err()
+            );
+            adapter.runner.assert_exhausted(); // No add, source push or lease-discard path.
+        }
     }
 
     #[test]

@@ -67,6 +67,45 @@ pub(super) fn reconcile(
     reconcile_closed_lifecycle(&selected(status, input)?, provider)
 }
 
+fn desired_labels(pr: &crate::model::PullRequestSnapshot) -> std::collections::BTreeSet<String> {
+    let mut labels = pr.labels.clone();
+    if pr.is_closed_unmerged() {
+        labels.remove("caravan");
+        labels.remove(PARKED_LABEL);
+        labels.insert(CLOSED_LABEL.to_owned());
+    } else {
+        labels.remove(CLOSED_LABEL);
+    }
+    labels
+}
+
+pub(super) fn has_pending(status: &StatusOutput) -> bool {
+    status
+        .analysis
+        .pull_requests
+        .values()
+        .any(|pr| desired_labels(pr) != pr.labels)
+}
+
+fn lifecycle_action(pr: &crate::model::PullRequestSnapshot) -> SyncPlanAction {
+    let labels = desired_labels(pr);
+    SyncPlanAction {
+        order: 0,
+        phase: SyncPlanPhase::ProviderConvergence,
+        state: if labels == pr.labels {
+            SyncPlanActionState::AlreadySatisfied
+        } else {
+            SyncPlanActionState::WouldMutate
+        },
+        kind: "reconcile_closed_member_labels".to_owned(),
+        pr: Some(pr.number),
+        caravan_id: None,
+        expected: Some(PullRequestPrecondition::from(pr)),
+        target: Some(json!({"labels": labels, "expected_closed_head": pr.head.oid})),
+        reason: "metadata-only: preserve every other PR, branch and queue operation".to_owned(),
+    }
+}
+
 pub(super) fn plan(
     status: StatusOutput,
     input: &SyncInput,
@@ -74,18 +113,26 @@ pub(super) fn plan(
     tick_refusal: Option<String>,
 ) -> Result<SyncPlanOutput, AppError> {
     validate_input(input, false)?;
-    let scoped = selected(&status, input)?;
-    let pr = scoped
-        .analysis
-        .pull_requests
-        .values()
-        .next()
-        .expect("selected row");
-    let mut labels = pr.labels.clone();
-    labels.remove("caravan");
-    labels.remove(PARKED_LABEL);
-    labels.insert(CLOSED_LABEL.to_owned());
-    let changed = labels != pr.labels;
+    let mut actions = if input.closed_pr.is_some() {
+        let scoped = selected(&status, input)?;
+        scoped
+            .analysis
+            .pull_requests
+            .values()
+            .map(lifecycle_action)
+            .collect::<Vec<_>>()
+    } else {
+        status
+            .analysis
+            .pull_requests
+            .values()
+            .filter(|pr| desired_labels(pr) != pr.labels)
+            .map(lifecycle_action)
+            .collect::<Vec<_>>()
+    };
+    for (index, action) in actions.iter_mut().enumerate() {
+        action.order = u32::try_from(index + 1).unwrap_or(u32::MAX);
+    }
     Ok(SyncPlanOutput {
         schema_version: 1,
         tick_refusal,
@@ -94,31 +141,17 @@ pub(super) fn plan(
         local_ephemeral_preflight: false,
         repository: status.repository.clone(),
         default_branch: status.analysis.fleet.default_branch.clone(),
-        all: false,
+        all: input.all,
         plan_hash: String::new(),
         selected_caravans: Vec::new(),
         physical_rebase_plans: Vec::new(),
         physical_apply_admission: SyncApplyAdmissionPlan::default(),
         ci: Vec::new(),
-        actions: vec![SyncPlanAction {
-            order: 1,
-            phase: SyncPlanPhase::ProviderConvergence,
-            state: if changed {
-                SyncPlanActionState::WouldMutate
-            } else {
-                SyncPlanActionState::AlreadySatisfied
-            },
-            kind: "reconcile_closed_member_labels".to_owned(),
-            pr: Some(pr.number),
-            caravan_id: None,
-            expected: Some(PullRequestPrecondition::from(pr)),
-            target: Some(json!({"labels": labels, "expected_closed_head": pr.head.oid})),
-            reason: "metadata-only: preserve every other PR, branch and queue operation".to_owned(),
-        }],
+        actions,
         auto_admission: SyncAutoAdmissionPlan {
             enabled: false,
             heuristic_version: AUTO_ADMISSION_HEURISTIC_VERSION.to_owned(),
-            continuation: "explicit closed-member cleanup never admits work".to_owned(),
+            continuation: "closed-member lifecycle reconciliation never admits work".to_owned(),
             fleet_capacity_refusal: None,
             candidate_pr: None,
             target_tail: None,

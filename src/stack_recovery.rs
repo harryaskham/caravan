@@ -38,6 +38,8 @@ use crate::stack_membership::{
 };
 use crate::{AppContext, AppError};
 
+mod closed_prefix;
+
 const MAX_TEXT: usize = 2_000;
 const PROVIDER_VISIBLE_APPEND_PROBLEMS: [&str; 3] = [
     "github_stack_member_order_drift",
@@ -207,6 +209,7 @@ pub struct NativeStackRecoveryOutput {
     pub next: String,
 }
 
+#[derive(Clone, Copy)]
 struct RecoveryFacts<'a> {
     repository: &'a RepositoryId,
     graph_problems: &'a [crate::model::GraphProblem],
@@ -234,6 +237,16 @@ impl<'a> RecoveryFacts<'a> {
 }
 
 pub(crate) trait NativeStackRecoveryProvider {
+    fn native_stack_generation(
+        &self,
+        _repository: &RepositoryId,
+        _number: u64,
+    ) -> Result<Option<crate::github::GitHubStackGeneration>, GitHubStackMutationError> {
+        Err(GitHubStackMutationError::Unavailable {
+            diagnostic: "exact retained generation observation is unavailable".to_owned(),
+        })
+    }
+
     fn verify_precondition_with_checks(
         &self,
         repository: &RepositoryId,
@@ -253,6 +266,14 @@ pub(crate) trait NativeStackRecoveryProvider {
 }
 
 impl<R: CommandRunner> NativeStackRecoveryProvider for GitHubMutationAdapter<R> {
+    fn native_stack_generation(
+        &self,
+        repository: &RepositoryId,
+        number: u64,
+    ) -> Result<Option<crate::github::GitHubStackGeneration>, GitHubStackMutationError> {
+        self.native_stack_generation(repository, number)
+    }
+
     fn verify_precondition_with_checks(
         &self,
         repository: &RepositoryId,
@@ -806,7 +827,10 @@ fn needs_auto_recovery(backend: &StackBackendStatus, caravan: &Caravan) -> bool 
             .filter(|entry| entry.state.eq_ignore_ascii_case("open"))
             .map(|entry| PrNumber(entry.number))
             .collect::<Vec<_>>();
-        return open_members.len() + 1 == caravan.members.len()
+        let retained_history = native.stack.pull_requests.len() != open_members.len();
+        return !open_members.is_empty()
+            && open_members.len() < caravan.members.len()
+            && (retained_history || open_members.len() + 1 == caravan.members.len())
             && caravan.members.starts_with(&open_members);
     };
     true
@@ -817,20 +841,27 @@ pub(crate) fn auto_recover_missing(
     status: &StatusOutput,
     provider: &impl NativeStackRecoveryProvider,
 ) -> Result<Option<NativeStackRecoveryOutput>, AppError> {
+    auto_recover_from_facts(context, &RecoveryFacts::from_status(status), provider)
+}
+
+fn auto_recover_from_facts(
+    context: &AppContext,
+    facts: &RecoveryFacts<'_>,
+    provider: &impl NativeStackRecoveryProvider,
+) -> Result<Option<NativeStackRecoveryOutput>, AppError> {
     if context.config.stack_type != StackType::Github
         || !context.config.stack_rollout.mutations_opt_in
-        || status.stack_backend.provider_stacks_truncated
-        || status.stack_backend.capability != StackCapability::Available
-        || status.stack_backend.mutation_support != StackMutationSupport::NativeStack
+        || facts.backend.provider_stacks_truncated
+        || facts.backend.capability != StackCapability::Available
+        || facts.backend.mutation_support != StackMutationSupport::NativeStack
     {
         return Ok(None);
     }
-    let missing = status
-        .analysis
-        .fleet
+    closed_prefix::require_supported_history(facts)?;
+    let missing = facts
         .caravans
         .iter()
-        .filter(|caravan| needs_auto_recovery(&status.stack_backend, caravan))
+        .filter(|caravan| needs_auto_recovery(facts.backend, caravan))
         .collect::<Vec<_>>();
     let [caravan] = missing.as_slice() else {
         if missing.is_empty() {
@@ -848,9 +879,14 @@ pub(crate) fn auto_recover_missing(
     let pending = crate::stack_membership::load_pending(&context.repository_path, caravan.id)?;
     let actor = "caravan-scheduler";
     let reason = "stateless sync recovery from complete provider Stack inventory";
+    let rows = closed_prefix::observe(facts, caravan, provider)?;
+    let exact = RecoveryFacts {
+        recovery_rows: rows.as_ref(),
+        ..*facts
+    };
     let (plan, observation) = build_plan_with_policy(
         &context.config,
-        &RecoveryFacts::from_status(status),
+        &exact,
         caravan.id,
         actor,
         reason,
@@ -1143,46 +1179,34 @@ fn build_plan_with_policy(
         &serde_json::to_vec(&desired).expect("native topology serializes"),
     );
     let operation_id = format!("native-stack-recovery-{}-{topology_hash}", root.0);
-    let retained_checkpoint = if pending.is_none() {
-        facts
-            .recovery_rows
-            .map(|before| {
-                let target = before
-                    .recovery_suffix_target(facts.repository, &desired)
-                    .map_err(|error| {
-                        refusal(
-                            "github_stack_recovery_suffix_invalid",
-                            &error.to_string(),
-                            json!({"root": root, "mutated": false}),
-                        )
-                    })?;
-                Ok::<_, AppError>(
-                    NativeMembershipCheckpoint::from_plan(&NativeMembershipPlan::RecoveryAdd {
-                        plan: Box::new(crate::github::GitHubStackAddPlan {
-                            operation_id: operation_id.clone(),
-                            actor: actor.to_owned(),
-                            before: before.clone(),
-                            desired: target,
-                        }),
-                        accepted: Box::new(desired.clone()),
-                    })
-                    .expect("recovery topology has an open root"),
-                )
-            })
-            .transpose()?
-    } else {
-        None
-    };
-    let (pending_hash, action) = recovery_action(
-        pending.or(retained_checkpoint.as_ref()),
-        facts.repository,
-        facts.backend,
-        caravan,
-        &desired,
-        &pulls,
-        &operation_id,
-        actor,
-    )?;
+    // Fresh provider evidence is sufficient authority for a new plan. Do not
+    // manufacture a historical membership checkpoint or claim its hash exists.
+    let (pending_hash, action) =
+        if let Some(before) = facts.recovery_rows.filter(|_| pending.is_none()) {
+            (
+                None,
+                NativeMembershipPlan::RecoveryAdd {
+                    plan: Box::new(crate::github::GitHubStackAddPlan {
+                        operation_id: operation_id.clone(),
+                        actor: actor.to_owned(),
+                        before: before.clone(),
+                        desired: closed_prefix::target(before, &desired)?,
+                    }),
+                    accepted: Box::new(desired.clone()),
+                },
+            )
+        } else {
+            recovery_action(
+                pending,
+                facts.repository,
+                facts.backend,
+                caravan,
+                &desired,
+                &pulls,
+                &operation_id,
+                actor,
+            )?
+        };
     let observation = mapping_observation(facts.backend, &caravan.members, &action, &desired)?;
     let plan = NativeStackRecoveryPlan {
         schema_version: 1,
@@ -1196,8 +1220,9 @@ fn build_plan_with_policy(
         reason: reason.to_owned(),
         config_fingerprint,
         pending_membership_checkpoint_hash: pending_hash,
-        mapping_precondition: "zero_create_or_checkpointed_exact_prefix_add_or_exact_desired_retry"
-            .to_owned(),
+        mapping_precondition:
+            "complete_inventory_exact_active_prefix_and_retained_generation_or_exact_retry"
+                .to_owned(),
         plan_hash: String::new(),
     }
     .seal();
@@ -1838,6 +1863,8 @@ fn refusal(code: &str, message: &str, details: serde_json::Value) -> AppError {
 
 #[cfg(test)]
 mod tests {
+    mod closed_prefix;
+
     use super::*;
     use crate::config::StackRolloutConfig;
     use crate::github::{GitHubStackBase, GitHubStackSnapshot};

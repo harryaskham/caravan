@@ -83,6 +83,7 @@ struct FakeProvider {
 }
 
 mod ci_dispatch;
+mod closed_reformation;
 mod deferred_admission;
 mod effective_policy;
 use deferred_admission::prove_deferred;
