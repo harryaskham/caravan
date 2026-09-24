@@ -708,17 +708,19 @@ Splitting retargets the selected non-head to the default branch, making it a new
   without provider writes; return ordered exact actions and rediscovery barriers.
 - `cara sync` — synchronize the current caravan.
 - `cara sync --all` — synchronize every non-paused caravan in deterministic head order. Human invocations of `sync` and `loop` stream bounded stage progress to stderr — initial discovery, physical planning and apply, midpoint revalidation, provider convergence, auto-admission, and final rediscovery — so a long network tick is never silent. Progress is observational only: no policy depends on it, details are truncated, and JSON/MCP callers install no observer and keep byte-identical envelopes.
-- `cara repair start --pr N [--target-pr T]` — create or reuse a durable isolated provider-owned workspace at PR `N`'s exact head, and start an exact-target non-committing merge. The target is current default when omitted.
+- `cara repair start --pr N [--target-pr T] [--non-force --actor A --reason R]` — create or reuse a durable isolated provider-owned workspace at PR `N`'s exact head and start an exact-target non-committing merge. The target is current default when omitted. Opt-in non-force sessions bind actor/reason and exact source/target provider generations; the actor is custody/audit, not an ownership transfer.
 - `cara repair status --session ID` — inspect the persisted exact head/target/conflict/workspace/publication receipt without mutation.
 - `cara repair authorize-agent-edits --session ID --actor A --reason R [--expires-secs N]` — after exact session/config/provider head+target revalidation, authorize one identity to stage bounded arbitrary repository-content edits in the isolated workspace. Persist repository/PR/head/target/session/config/manifest/actor/reason/expiry; no provider mutation.
 - `cara repair grant --session ID --path P... --source-revision SHA --actor A --reason R [--expires-secs N]` — after exact session/head/target/config/provider revalidation, three-way apply and stage reviewed changes from one exact source commit to bounded tracked regular paths. Persist actor/reason/source parent+blobs+patch fingerprint/original+expected result OIDs/expiry; no provider mutation.
 - `cara repair revoke-grant --session ID --path P... --actor A --reason R` — before continue, the exact granting actor may revoke paths; Cara restores/stages their pre-grant blobs, removes receipts, and records bounded local-only revocation evidence.
 - `cara repair continue --session ID [--actor A] [--no-sync]` — verify and commit typed conflict/grant edits plus any exact session-authorized agent edits. Broad edits require matching actor and unexpired authority; Cara records bounded path/staged-index/binary-diff fingerprints, runs bounded reviewed targeted validation, publishes by exact old-head force-with-lease under exact remote-head checks, marks fresh CI required, then resumes `sync --all` unless explicitly suppressed.
-- `cara repair abort --session ID --confirm` — after explicit review, remove only the local persisted workspace/session; provider state is never changed.
+- MCP clients use the distinct `repair_start_non_force` tool, not an unfamiliar flag sent to a legacy server. Unknown-tool refusal must never downgrade to `repair_start`. Non-force wire manifests use a versioned state discriminator, including for legacy cleanup refusal; missing custody or attempt evidence fails closed.
+- For a session created with `--non-force`, `repair continue --session ID --actor A --no-sync` is required, including replay. It verifies the exact old-head/target merge parents, workspace, provider incarnation/control metadata, live refs and writer fences, then publishes only the validated OID with `git push --no-force`, without tags or submodule refs. No automatic sync or queue/topology mutation is permitted. A durable pre-write attempt marker and validation evidence fence response loss; only the exact observed successor confirms publication without retry, while an unchanged old ref remains unresolved. Legacy sessions/receipts retain their actual force-with-lease policy and cannot be reclassified.
+- `cara repair abort --session ID --confirm` — after explicit review, remove only the local persisted workspace/session; provider state is never changed. An unresolved non-force publication intent refuses cleanup, preserving uncertainty evidence.
 - `cara pause --head-pr N --actor A --reason R` — place an explicit incident or maintenance hold on one exact caravan and disable only its head auto-merge.
 - `cara resume --head-pr N --actor A` — explicitly revalidate and release that hold.
 - `cara unpark --repository-slug OWNER/NAME --pr N --head H --base-ref BRANCH --base B --membership-generation G --parking-fingerprint F --provider-state open_parked --actor A --reason R` — recover one exact engine-owned terminal-red parked generation after its newest authoritative checks become green; this is separate from explicit pause resume.
-- `cara native-stack rebase-preview --stack N --actor A --reason R` / `rebase-apply --expected-plan-hash H` — plan and atomically publish the complete divergent open suffix under exact branch leases, preserving the native Stack as topology owner; provider membership/head/base and linear ancestry are rediscovered afterward and every changed head requires fresh CI.
+- `cara native-stack rebase-preview --stack N --actor A --reason R` / `rebase-apply --expected-plan-hash H` — plan and atomically force-with-lease publish the complete divergent open suffix under exact branch leases, preserving the native Stack as topology owner; provider membership/head/base and linear ancestry are rediscovered afterward and every changed head requires fresh CI.
 - `cara restore-parked --repository-slug OWNER/NAME --pr N --head H --base-ref BRANCH --base B --membership-generation G --parking-fingerprint F --provider-state open_labels_missing --actor A --reason R` — restore `caravan` and `caravan-parked` together after a stale cleanup stripped both from the exact still-open parked generation; require the latest durable parking event and its same-generation provider receipt, preserve unrelated labels, keep auto-merge disabled, and never create or activate a replacement.
 - `cara --json pause-recovery prepare|checkpoint-base|checkpoint-head|finalize|rollback ...` — bind one exact external owner generation to an already-active pause; checkpoint independently rediscovered external base/head writes; then release only after exact final virtual-merge/check attestation or exact old-state rollback. This surface never mutates the provider.
 - `cara loop` — repeatedly run `sync --all` at the configured interval. A failed tick is bounded evidence, not a stop condition: canonical events are dispatched to configured hooks and the loop keeps ticking so retryable provider races, moved default branches, and unresolved external decisions converge without an operator restart. Only an explicit stop signal ends it, and the summary reports total, failed, and consecutive-failure counts plus bounded recent-failure receipts. `loop --once` remains a single bounded tick and still returns its typed error.
@@ -1640,6 +1642,24 @@ complete divergent suffix, atomically publishes exact force-with-lease updates,
 records the sealed plan/receipts, and returns immediately for fresh CI. Multiple
 Stacks, mixed drift, unknown ancestry, or incomplete inventory remain an
 explicit native-rebase decision before normal convergence.
+
+This automatic path and explicit `native-stack rebase-apply` are forceful even
+when `rebase_on_join` is false. A parent-cardinality refusal must not relax that
+guard or discard authored history. It returns the exact source/member/plan and
+original failure evidence to the acknowledged source owner, who may use the
+explicit non-force repair session above after reconciling earlier uncertain
+operations. The new merge retains every old source object and parent edge;
+a successful source continuation is not queue readiness or permission to retry
+a failed native operation. Source/parent/state/control/config drift refuses,
+and children must rediscover their parent after each source change.
+
+There is no standalone sealed tail-eviction preview CLI. The `plan` namespace
+supports sync/concat; `evict` has no dry-run flag and performs its own exact
+preflight/checkpoint before mutation. A sealed plan attached to one partial-prefix
+decision or a historical canary is not generic eviction authority. If neither
+acknowledged owner continuation nor a currently supported, separately authorized
+queue-only route is available, return its precise refusal and bounded custody or
+capability decision to the existing actor; never invent another merge writer.
 
 `native-stack recovery-preview` seals
 current repository, ordered membership, immutable head/base generations,

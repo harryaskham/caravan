@@ -40,11 +40,13 @@ Use the existing designated writer; a monitoring loop must not start a competing
   plan and repository policy are reviewed.
 - membership: use exact `cara new`, `join`, `rejoin`, or `renew` only when
   `cara check` authorizes that same generation.
-- partial-prefix or topology recovery: route the sealed top-eviction/reshape
-  plan to the exact owner. Never synthesize labels or a different suffix.
+- partial-prefix or topology recovery: route an existing sealed top-eviction/reshape
+  decision to the exact owner. There is no standalone sealed tail-eviction preview CLI.
 - source repair: route the exact candidate to its owner and use first-party Cara
-  repair. Keep the source head immutable unless the typed owner repair contract
-  explicitly authorizes an exact leased replacement.
+  repair. For no-force authority use [history-preserving repair](references/history-preserving-repair.md):
+  `repair start --non-force`, then the same actor's `repair continue --no-sync`.
+  Explicit/automatic native rebase and legacy repair still use force-with-lease;
+  never select them as a non-force fallback or synthesize a different suffix.
 - timeout/transport failure: reread provider/main before retry. A failed caller
   receipt can follow a successful provider mutation.
 - terminal red: follow effective `terminal_red` policy and provenance. Never

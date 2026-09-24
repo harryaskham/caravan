@@ -4,8 +4,9 @@
 //! exact provider head into a linked worktree below Git's common metadata,
 //! starts a non-committing merge against an exact target, and persists enough
 //! evidence to verify an agent-owned conflict resolution and targeted validation
-//! before one exact force-with-lease publication. The same clean workspace can
-//! then resume `sync --all`.
+//! before publication. Legacy sessions use force-with-lease and may resume
+//! `sync --all`. Explicit non-force sessions preserve the old head as a merge
+//! parent, publish only by fast-forward, and never enter sync implicitly.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -24,7 +25,18 @@ use crate::model::{BranchSnapshot, CommitOid, PrNumber, PullRequestSnapshot, Rep
 use crate::operation_lock::OperationLock;
 use crate::{AppContext, AppError, SyncInput};
 
+mod non_force;
+pub use non_force::NonForceRepair;
+
+#[derive(Default)]
+struct RepairStartIntent {
+    target_pr: Option<PrNumber>,
+    non_force: Option<NonForceRepair>,
+}
+
 const REPAIR_VERSION: u32 = 1;
+const NON_FORCE_REPAIR_VERSION: u32 = 2;
+const NON_FORCE_WIRE_STATE: &str = "non_force_v1";
 const REPAIR_GIT_NAME_CONFIG: &str = "user.name=Caravan Repair";
 const REPAIR_GIT_EMAIL_CONFIG: &str = "user.email=caravan-repair@users.noreply.github.com";
 const REPAIR_DIRECTORY: &str = "repair-workspaces";
@@ -47,6 +59,48 @@ pub struct RepairStartInput {
     #[arg(long, value_name = "PR")]
     #[serde(default)]
     pub target_pr: Option<u64>,
+    /// Preserve all existing source history and publish only by normal fast-forward.
+    /// Requires actor/reason; continuation requires the same actor and --no-sync.
+    #[arg(long)]
+    #[serde(default)]
+    pub non_force: bool,
+    /// Authorized source owner's audit identity, not a custody transfer.
+    #[arg(long)]
+    #[serde(default)]
+    pub actor: Option<String>,
+    /// Bounded non-secret reason for the non-force source continuation.
+    #[arg(long)]
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Distinct MCP capability: older servers must reject the unknown tool rather
+/// than ignore an unfamiliar non-force flag on legacy `repair_start`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NonForceRepairStartInput {
+    pub pr: u64,
+    #[serde(default)]
+    pub target_pr: Option<u64>,
+    pub actor: String,
+    pub reason: String,
+}
+
+/// Start only an explicit non-force session; this entry point has no force switch.
+pub fn start_non_force(
+    context: &AppContext,
+    input: NonForceRepairStartInput,
+) -> Result<RepairStartOutput, AppError> {
+    start(
+        context,
+        &RepairStartInput {
+            pr: input.pr,
+            target_pr: input.target_pr,
+            non_force: true,
+            actor: Some(input.actor),
+            reason: Some(input.reason),
+        },
+    )
 }
 
 /// Verify, publish, and resume one persisted repair session.
@@ -285,6 +339,9 @@ pub struct RepairPathGrantRevocation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RepairSession {
     pub version: u32,
+    /// Absent legacy sessions retain their force-with-lease semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub non_force: Option<NonForceRepair>,
     pub session: String,
     pub repository: RepositoryId,
     pub pr: PrNumber,
@@ -338,6 +395,8 @@ pub struct RepairSession {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RepairStatusOutput {
     pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub non_force: Option<NonForceRepair>,
     pub session: String,
     pub repository: RepositoryId,
     pub pr: PrNumber,
@@ -392,7 +451,7 @@ pub struct RepairStartOutput {
     pub next: String,
 }
 
-/// Exact non-force publication proof.
+/// Exact targeted validation evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RepairValidationReceipt {
     pub command_hash: String,
@@ -400,7 +459,7 @@ pub struct RepairValidationReceipt {
     pub passed: bool,
 }
 
-/// Exact non-force publication proof.
+/// Exact publication proof; `force` records the actual persisted session policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RepairPublicationReceipt {
     pub pr: PrNumber,
@@ -410,7 +469,8 @@ pub struct RepairPublicationReceipt {
     pub new_head: CommitOid,
     pub parents: Vec<CommitOid>,
     pub force: bool,
-    /// Exact reviewed old remote head used by `--force-with-lease`.
+    /// Exact reviewed old remote head. Legacy sessions use force-with-lease;
+    /// explicit non-force sessions instead retain Git's fast-forward refusal.
     pub expected_remote_head: CommitOid,
     pub remote_verified: bool,
     pub fresh_ci_required: bool,
@@ -483,13 +543,25 @@ pub fn start(
             })?,
         None => status.analysis.fleet.default_branch.clone(),
     };
+    let non_force = NonForceRepair::new(
+        input,
+        &status.repository,
+        &candidate,
+        input
+            .target_pr
+            .and_then(|number| status.analysis.pull_requests.get(&PrNumber(number))),
+        &status.analysis.fleet.default_branch.name,
+    )?;
     let provider_git_url = provider_git_url(context, &status.repository)?;
     let output = start_exact_with_writer_guard(
         context,
         &status.repository,
         &candidate,
         &target,
-        input.target_pr.map(PrNumber),
+        RepairStartIntent {
+            target_pr: input.target_pr.map(PrNumber),
+            non_force,
+        },
         &provider_git_url,
         Some(&lock),
     )?;
@@ -516,7 +588,10 @@ fn start_exact(
         repository,
         candidate,
         target,
-        target_pr,
+        RepairStartIntent {
+            target_pr,
+            non_force: None,
+        },
         provider_git_url,
         None,
     )
@@ -528,14 +603,28 @@ fn start_exact_with_writer_guard(
     repository: &RepositoryId,
     candidate: &PullRequestSnapshot,
     target: &BranchSnapshot,
-    target_pr: Option<PrNumber>,
+    intent: RepairStartIntent,
     provider_git_url: &str,
     writer_guard: Option<&crate::writer_guard::WriterOperationGuard>,
 ) -> Result<RepairStartOutput, AppError> {
+    let RepairStartIntent {
+        target_pr,
+        non_force,
+    } = intent;
     require_owned_repair(repository, candidate, target)?;
     let paths = repair_paths(&context.repository_path, candidate.number)?;
     if paths.manifest.exists() {
         let existing = read_manifest(&paths.manifest)?;
+        let mut existing_policy = existing.non_force.clone();
+        if let Some(policy) = &mut existing_policy {
+            policy.publication_attempted = false;
+        }
+        if existing_policy != non_force {
+            return Err(non_force::refusal(
+                "repair_publication_policy_changed",
+                "existing session custody/generation/publication policy differs; inspect it without upgrading or relabelling legacy evidence",
+            ));
+        }
         if existing.head == candidate.head && existing.target == *target {
             if existing.state == RepairState::Preparing {
                 if existing.repository != *repository
@@ -599,10 +688,11 @@ fn start_exact_with_writer_guard(
                 );
             }
             validate_workspace(&paths, &existing)?;
+            let next = repair_continuation_next(&existing);
             return Ok(RepairStartOutput {
                 repair: existing,
                 already_exists: true,
-                next: "edit only the reported conflicting paths, stage the resolutions, then run `cara repair continue --session <id>`".to_owned(),
+                next,
             });
         }
         return Err(AppError::structured(
@@ -631,7 +721,12 @@ fn start_exact_with_writer_guard(
     })?;
     let now = unix_ms();
     let repair = RepairSession {
-        version: REPAIR_VERSION,
+        version: if non_force.is_some() {
+            NON_FORCE_REPAIR_VERSION
+        } else {
+            REPAIR_VERSION
+        },
+        non_force,
         session: format!(
             "pr-{}-{}",
             candidate.number.0,
@@ -832,6 +927,14 @@ fn materialize_repair(
         record_phase_error(&mut repair, paths, RepairPhase::Merging, timeout, 0, &error)?;
         return Err(error);
     }
+    if repair.non_force.is_some() && try_rev_parse(&workspace_runner, "MERGE_HEAD")?.is_none() {
+        let error = non_force::refusal(
+            "repair_non_force_already_contains_target",
+            "source already contains the exact target; no source rewrite is needed. Preserve history and return current topology evidence to the existing queue actor",
+        );
+        record_phase_error(&mut repair, paths, RepairPhase::Merging, timeout, 0, &error)?;
+        return Err(error);
+    }
     let merge_head = rev_parse(&workspace_runner, "MERGE_HEAD")?;
     if merge_head != target.oid {
         return Err(AppError::structured(
@@ -865,11 +968,20 @@ fn materialize_repair(
     repair.last_error = None;
     repair.updated_unix_ms = unix_ms();
     write_manifest(&paths.manifest, &repair)?;
+    let next = repair_continuation_next(&repair);
     Ok(RepairStartOutput {
         repair,
         already_exists: resumed,
-        next: "resolve only the reported conflicting paths in the managed workspace, stage them, then run `cara repair continue --session <id>`; do not commit, update refs, or push manually".to_owned(),
+        next,
     })
+}
+
+fn repair_continuation_next(repair: &RepairSession) -> String {
+    if repair.non_force.is_some() {
+        "resolve/stage only authorized conflicts in the preserved workspace (a clean merge needs no edits); continue the exact session with the recorded --actor and --no-sync. Do not commit, push, run sync or native rebase manually".to_owned()
+    } else {
+        "resolve only the reported conflicting paths in the managed workspace, stage them, then run `cara repair continue --session <id>`; do not commit, update refs, or push manually".to_owned()
+    }
 }
 
 fn run_materialization_phase<T>(
@@ -1830,17 +1942,44 @@ fn run_targeted_validation(
         .collect()
 }
 
-/// Verify agent-owned conflict resolution, validate, publish under an exact
-/// force-with-lease, and resume sync.
-#[allow(clippy::too_many_lines)]
+/// Verify and publish under the session's durable policy. Non-force sessions
+/// never resume sync, which has separate source-rewrite authority.
 pub fn continue_session(
     context: &AppContext,
     input: &RepairContinueInput,
+) -> Result<RepairContinueOutput, AppError> {
+    continue_with_verifier(context, input, non_force::verify_provider)
+}
+
+#[allow(clippy::too_many_lines)]
+fn continue_with_verifier(
+    context: &AppContext,
+    input: &RepairContinueInput,
+    verify_generation: impl Fn(&RepairSession, &dyn CommandRunner) -> Result<(), AppError>,
 ) -> Result<RepairContinueOutput, AppError> {
     validate_session_id(&input.session)?;
     let paths = repair_paths_for_session(&context.repository_path, &input.session)?;
     let mut repair = read_manifest(&paths.manifest)?;
     require_session_match(&repair, &input.session)?;
+    if let Some(policy) = &repair.non_force {
+        policy.require_continue(input)?;
+        if policy.publication_attempted
+            && !input.validation_commands.is_empty()
+            && input
+                .validation_commands
+                .iter()
+                .map(|command| crate::membership::fnv1a64(command.as_bytes()))
+                .ne(repair
+                    .validation
+                    .iter()
+                    .map(|receipt| receipt.command_hash.clone()))
+        {
+            return Err(non_force::refusal(
+                "repair_non_force_validation_changed",
+                "publication readback reuses the recorded validation; it cannot execute or attest new validation commands",
+            ));
+        }
+    }
     if repair.state == RepairState::Preparing {
         let target = repair
             .target_pr
@@ -1852,7 +1991,7 @@ pub fn continue_session(
             Some(json!({
                 "repair": repair,
                 "workspace_preserved": paths.workspace.exists(),
-                "next": format!("rerun `cara repair start --pr {}{target}` to resume the exact preparing session, or inspect then confirm-abort it", repair.pr),
+                "next": format!("repeat the original `cara repair start --pr {}{target}` arguments, including recorded --non-force/--actor/--reason, to resume the exact preparing session; inspect status before confirmed local cleanup", repair.pr),
             })),
         ));
     }
@@ -1883,7 +2022,7 @@ pub fn continue_session(
                 target: repair.target.oid.clone(),
                 new_head,
                 parents: vec![repair.head.oid.clone(), repair.target.oid.clone()],
-                force: true,
+                force: repair.non_force.is_none(),
                 expected_remote_head: repair.head.oid.clone(),
                 remote_verified: true,
                 fresh_ci_required: true,
@@ -1894,6 +2033,12 @@ pub fn continue_session(
     }
 
     let mut lock = context.acquire_writer_operation("repair-continue")?;
+    if repair.non_force.is_some() && read_manifest(&paths.manifest)? != repair {
+        return Err(non_force::refusal(
+            "repair_non_force_session_changed",
+            "session changed while acquiring the writer; reread it without replaying an older publication intent",
+        ));
+    }
     lock.checkpoint(
         "repair_verification_in_flight",
         repair_lock_receipt(&repair)?,
@@ -1989,43 +2134,64 @@ pub fn continue_session(
         RepairState::Published => unreachable!("published state returned above"),
     };
 
-    let validation = run_targeted_validation(&runner, &input.validation_commands)?;
+    let attempted = repair
+        .non_force
+        .as_ref()
+        .is_some_and(|policy| policy.publication_attempted);
+    let validation = if attempted {
+        // A response-loss readback is not another validation or push attempt.
+        repair.validation.clone()
+    } else {
+        run_targeted_validation(&runner, &input.validation_commands)?
+    };
+    non_force::verify_workspace(&repair, &runner, &new_head)?;
 
     // The prepared merge is valid only for the exact target generation too.
     // A moved default/predecessor must be rediscovered rather than publishing
     // a repair against stale ancestry.
-    verify_remote_head(&runner, &repair.provider_git_url, &repair.target)?;
+    if repair.non_force.is_none() {
+        verify_remote_head(&runner, &repair.provider_git_url, &repair.target)?;
+    }
     let actual_remote = remote_head_oid(&runner, &repair.provider_git_url, &repair.head.name)?;
     if actual_remote == repair.head.oid {
+        if attempted {
+            return Err(non_force::refusal(
+                "repair_non_force_publication_unresolved",
+                "a prior publication intent is unresolved; an unchanged remote head is not proof of no write. Inspect repair status and original writer evidence; do not retry or discard this session",
+            ));
+        }
+        if repair.non_force.is_some() {
+            verify_remote_head(&runner, &repair.provider_git_url, &repair.target)?;
+        }
+        verify_generation(&repair, &runner)?;
+        if let Some(policy) = &mut repair.non_force {
+            policy.publication_attempted = true;
+            repair.validation.clone_from(&validation);
+            repair.updated_unix_ms = unix_ms();
+            write_manifest(&paths.manifest, &repair)?;
+        }
         lock.checkpoint(
             "repair_publication_in_flight",
             json!({
                 "repair": repair_lock_receipt(&repair)?,
                 "remote_expected_head": &repair.head.oid,
                 "new_head": &new_head,
-                "force_with_lease": format!("refs/heads/{}:{}", repair.head.name, repair.head.oid),
+                "publication_policy": if repair.non_force.is_some() { "non_force" } else { "force_with_lease" },
+                "force_with_lease": repair.non_force.is_none().then(|| format!("refs/heads/{}:{}", repair.head.name, repair.head.oid)),
             }),
             true,
         )?;
-        let destination = format!("HEAD:refs/heads/{}", repair.head.name);
-        let lease = format!(
-            "--force-with-lease=refs/heads/{}:{}",
-            repair.head.name, repair.head.oid
-        );
         require_success(
             &runner,
-            CommandSpec::new("git")
-                .args([
-                    "push",
-                    lease.as_str(),
-                    repair.provider_git_url.as_str(),
-                    destination.as_str(),
-                ])
-                .env("GIT_TERMINAL_PROMPT", "0")
-                .git_write(),
+            non_force::publication_command(&repair, &new_head),
             "repair_non_fast_forward",
-            "non-force repair publication failed; the provider branch may have moved",
+            "repair publication failed; preserve the publication intent and inspect the provider before continuing",
         )?;
+    } else if actual_remote == new_head && repair.non_force.is_some() && !attempted {
+        return Err(non_force::refusal(
+            "repair_non_force_unrecorded_successor",
+            "the exact successor is already present without this session's publication intent; do not invent authorship or publish again",
+        ));
     } else if actual_remote != new_head {
         return Err(AppError::structured(
             ErrorCategory::Validation,
@@ -2045,7 +2211,20 @@ pub fn continue_session(
         name: repair.head.name.clone(),
         oid: new_head.clone(),
     };
-    verify_remote_head(&runner, &repair.provider_git_url, &published)?;
+    verify_remote_head(&runner, &repair.provider_git_url, &published).map_err(|error| {
+        if repair.non_force.is_none() {
+            return error;
+        }
+        AppError::structured(
+            ErrorCategory::ExecutionFailure,
+            "repair_non_force_publication_unconfirmed",
+            "source publication was attempted but exact readback is unavailable; preserve the durable intent and never infer zero effects or push again",
+            Some(json!({
+                "source": error.details(), "repair": repair, "prepared_head": new_head,
+                "provider_mutation_possible": true, "workspace_preserved": true,
+            })),
+        )
+    })?;
     repair.validation.clone_from(&validation);
     let publication = RepairPublicationReceipt {
         pr: repair.pr,
@@ -2054,7 +2233,7 @@ pub fn continue_session(
         target: repair.target.oid.clone(),
         new_head: new_head.clone(),
         parents,
-        force: true,
+        force: repair.non_force.is_none(),
         expected_remote_head: repair.head.oid.clone(),
         remote_verified: true,
         fresh_ci_required: true,
@@ -2080,12 +2259,17 @@ fn resume_or_return(
     publication: Option<RepairPublicationReceipt>,
 ) -> Result<RepairContinueOutput, AppError> {
     if input.no_sync {
+        let non_force = repair.non_force.is_some();
         return Ok(RepairContinueOutput {
             repair,
             publication,
             sync: None,
             workspace_preserved: true,
-            next: "run `cara repair continue --session <id>` without --no-sync to resume `sync --all` from the clean managed workspace".to_owned(),
+            next: if non_force {
+                "non-force source continuation is published; fresh CI and queue/topology rediscovery belong to the existing authorized actor. This receipt never authorizes sync or native rebase".to_owned()
+            } else {
+                "run `cara repair continue --session <id>` without --no-sync to resume `sync --all` from the clean managed workspace".to_owned()
+            },
         });
     }
     // Keep the caller repository lock held while sync runs in the independent
@@ -2152,6 +2336,19 @@ pub fn abort(
     let repair = read_manifest(&paths.manifest)?;
     require_session_match(&repair, &input.session)?;
     let lock = context.acquire_writer_operation("repair-abort")?;
+    let repair = read_manifest(&paths.manifest)?;
+    require_session_match(&repair, &input.session)?;
+    if repair.state != RepairState::Published
+        && repair
+            .non_force
+            .as_ref()
+            .is_some_and(|policy| policy.publication_attempted)
+    {
+        return Err(non_force::refusal(
+            "repair_non_force_publication_unresolved",
+            "cannot delete unresolved publication evidence; inspect the original writer and provider through repair status/continue before any cleanup",
+        ));
+    }
     let workspace_removed = paths.session_root.exists();
     if workspace_removed {
         fs::remove_dir_all(&paths.session_root).map_err(|error| {
@@ -2184,6 +2381,7 @@ fn repair_status_output(repair: &RepairSession) -> Result<RepairStatusOutput, Ap
     })?;
     Ok(RepairStatusOutput {
         version: repair.version,
+        non_force: repair.non_force.clone(),
         session: repair.session.clone(),
         repository: repair.repository.clone(),
         pr: repair.pr,
@@ -3079,8 +3277,10 @@ fn git_common_dir(repository: &Path) -> Result<PathBuf, AppError> {
 }
 
 fn validate_manifest_path(paths: &RepairPaths, repair: &RepairSession) -> Result<(), AppError> {
-    if repair.version != REPAIR_VERSION
-        || repair.workspace != paths.workspace.display().to_string()
+    if !matches!(
+        (repair.version, repair.non_force.is_some()),
+        (REPAIR_VERSION, false) | (NON_FORCE_REPAIR_VERSION, true)
+    ) || repair.workspace != paths.workspace.display().to_string()
         || !paths.workspace.starts_with(&paths.root)
     {
         return Err(AppError::validation(
@@ -3289,7 +3489,15 @@ fn write_manifest(path: &Path, repair: &RepairSession) -> Result<(), AppError> {
         )
     })?;
     let temporary = path.with_extension("json.tmp");
-    let encoded = serde_json::to_vec_pretty(repair).map_err(|error| {
+    // Old cleanup paths ignore unknown fields and do not validate `version`.
+    // An unknown state discriminator makes them refuse BEFORE any write rather
+    // than silently treating a new non-force session as force-with-lease.
+    let mut wire = serde_json::to_value(repair).expect("repair session serializes");
+    if repair.non_force.is_some() {
+        wire["non_force_state"] = wire["state"].clone();
+        wire["state"] = json!(NON_FORCE_WIRE_STATE);
+    }
+    let encoded = serde_json::to_vec_pretty(&wire).map_err(|error| {
         AppError::structured(
             ErrorCategory::SerializationError,
             "repair_manifest_encode_failed",
@@ -3305,6 +3513,18 @@ fn write_manifest(path: &Path, repair: &RepairSession) -> Result<(), AppError> {
             &error,
         )
     })?;
+    if repair.non_force.is_some() {
+        fs::File::open(&temporary)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| {
+                repair_io_error(
+                    "repair_manifest_write_failed",
+                    "could not durably record non-force publication policy",
+                    &temporary,
+                    &error,
+                )
+            })?;
+    }
     fs::rename(&temporary, path).map_err(|error| {
         repair_io_error(
             "repair_manifest_write_failed",
@@ -3312,7 +3532,20 @@ fn write_manifest(path: &Path, repair: &RepairSession) -> Result<(), AppError> {
             path,
             &error,
         )
-    })
+    })?;
+    if repair.non_force.is_some() {
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                repair_io_error(
+                    "repair_manifest_write_failed",
+                    "could not durably publish non-force manifest directory entry",
+                    parent,
+                    &error,
+                )
+            })?;
+    }
+    Ok(())
 }
 
 fn read_manifest(path: &Path) -> Result<RepairSession, AppError> {
@@ -3324,14 +3557,50 @@ fn read_manifest(path: &Path) -> Result<RepairSession, AppError> {
             &error,
         )
     })?;
-    serde_json::from_slice(&bytes).map_err(|error| {
+    decode_manifest(&bytes).map_err(|message| {
         AppError::structured(
             ErrorCategory::SerializationError,
             "repair_manifest_invalid",
-            format!("could not decode repair manifest: {error}"),
+            message,
             Some(json!({"path": path})),
         )
     })
+}
+
+fn decode_manifest(bytes: &[u8]) -> Result<RepairSession, String> {
+    let mut wire: Value = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+    let non_force_wire = wire["state"] == NON_FORCE_WIRE_STATE;
+    if non_force_wire {
+        if wire["version"] != NON_FORCE_REPAIR_VERSION || wire["non_force"].is_null() {
+            return Err("non-force manifest lost its version or publication policy".to_owned());
+        }
+        wire["state"] = wire["non_force_state"].clone();
+    }
+    let repair: RepairSession = serde_json::from_value(wire).map_err(|error| error.to_string())?;
+    if repair.non_force.is_some() != non_force_wire
+        || repair.version
+            != if non_force_wire {
+                NON_FORCE_REPAIR_VERSION
+            } else {
+                REPAIR_VERSION
+            }
+    {
+        return Err(
+            "unsupported repair schema/publication policy; never relabel an existing session"
+                .to_owned(),
+        );
+    }
+    if repair
+        .non_force
+        .as_ref()
+        .is_some_and(|policy| !policy.matches_session(&repair))
+    {
+        return Err(
+            "non-force custody/generation/publication evidence no longer matches its session"
+                .to_owned(),
+        );
+    }
+    Ok(repair)
 }
 
 fn cleanup_workspace(paths: &RepairPaths) -> Result<(), AppError> {
@@ -3503,6 +3772,7 @@ fn repair_io_error(
 
 #[cfg(test)]
 mod tests {
+    mod non_force;
     use std::collections::BTreeSet;
     use std::process::Command;
 

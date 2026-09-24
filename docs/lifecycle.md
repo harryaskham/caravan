@@ -247,13 +247,22 @@ cara evict --pr N --reason "..."
   └── --cascade / --all→ bounded tail-first removals, never a graph rewrite
 ```
 
-Eviction refuses only if it *introduces* a problem the fleet did not already
-have. A tail eviction re-links no edge, so it can never introduce one and is
-always allowed.
+A pure tail eviction re-links no descendant edge, so compatibility alone does
+not block it. That is not universal permission: native generation, ownership,
+lock and authority preflight can still refuse. There is no standalone sealed
+tail-eviction preview CLI; `cara evict` is a mutation, not an inspection command.
 
 Every descendant rewrite is proven before any is published: a descendant that
 cannot be unwound cleanly leaves the whole stack untouched rather than half
 unwound.
+
+For an authorized source owner under a no-force constraint, use
+`cara repair start --pr N [--target-pr P] --non-force --actor A --reason R`, then
+`cara repair continue --session ID --actor A --no-sync`. This preserves authored
+history in an exact merge and publishes only by fast-forward. It does not grant
+queue custody or resolve earlier uncertain operations. Explicit/automatic native
+rebase and legacy repair still use force-with-lease; `rebase_on_join: false` does
+not disable those paths. See the [owner continuation contract](../.agents/skills/cara-operator/references/history-preserving-repair.md).
 
 ---
 

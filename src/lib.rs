@@ -379,8 +379,11 @@ GITHUB NATIVE STACKS (EXPLICIT OPT-IN)
   contains its predecessor head; base-ref linkage without commit ancestry is
   `native_stack_rebase_required`, never a mergeable Stack. Use reviewed
   `native-stack rebase-preview` then `rebase-apply` to prepare the complete
-  suffix and atomically publish exact leased heads; every changed generation
-  must pass fresh CI. Sync lands the longest contiguous ready prefix under a
+  suffix and atomically publish force-with-lease heads; automatic native
+  convergence uses that same forceful publisher, independently of rebase_on_join.
+  Under no-force authority use the authorized owner's `repair start --non-force`
+  and `repair continue --no-sync`, not either native rebase path. Every changed
+  generation must pass fresh CI. Sync lands the longest contiguous ready prefix under a
   complete-Stack lock, receipts any provider-rewritten suffix generations, and
   requires fresh CI before continuing; it never uses a scheduler force-push to
   manufacture readiness.
@@ -395,9 +398,10 @@ GITHUB NATIVE STACKS (EXPLICIT OPT-IN)
   outranks the opt-in and is never treated as an absent Stack.
 
 VIRTUAL CHAINS (SAFE DEFAULT)
-With `rebase_on_join: false` or an absent setting, Caravan does not rewrite PR
-history. It maintains the chain through PR base refs and proves mechanical
-compatibility. If a parent head changes and a child no longer applies, sync
+With `rebase_on_join: false` or an absent setting, virtual-chain membership does
+not rewrite PR history. This is not a global no-force switch: native convergence
+and legacy repair still publish force-with-lease. Virtual membership maintains
+the chain through PR base refs and proves mechanical compatibility. If a parent head changes and a child no longer applies, sync
 returns a typed conflict and explicitly reports `rebase_on_join=disabled` plus
 the exact config action. This mode is appropriate when force-pushing agent
 branches is not authorized.
@@ -521,14 +525,25 @@ actor and records complete path/staged-index/diff fingerprints. Secret-like,
 symlink/gitlink, unstaged/untracked, out-of-scope, and drifted edits fail closed.
 `repair revoke-grant` restores recorded pre-grant blobs. Stage reviewed changes
 and run `cara repair continue --session ID [--actor A]`: it verifies the session,
-uses an exact old-head force-with-lease publication, runs reviewed targeted validation, requires fresh CI, and resumes sync-all. For human
-flow testing, `cara loop --manual [--shell 'zsh -i']` opens a real TTY only at
+uses an exact old-head force-with-lease publication, runs reviewed targeted validation, requires fresh CI, and resumes sync-all.
+For history-preserving no-force continuation, explicitly start with `--non-force
+--actor A --reason R`, then continue with that same `--actor A --no-sync`.
+The durable session binds custody/generation; the exact two-parent merge retains
+all old source history and publishes with `git push --no-force`. A publication
+intent fences uncertain retries/cleanup. Fresh provider facts, parent/ref/config
+checks, writer guards, edit scopes, and fresh CI remain mandatory. Legacy receipts
+cannot be relabelled non-force. No automatic sync, queue mutation, or source
+ownership transfer is granted; a parent's old receipt is not its child's lease.
+For human flow testing, `cara loop --manual [--shell 'zsh -i']` opens a real TTY only at
 external decisions, exports a private `CARA_DECISION_FILE`, releases the lock,
 and always rediscovers after shell success; it is never JSON/MCP/hook behavior.
 Use `repair abort` only to remove a reviewed local session. Never create nested raw worktrees, call
 `update-ref`, merge behind Cara, or force-push a repair branch.
 
 RESHAPING AND EXPLICIT INTENT
+- There is no standalone sealed tail-eviction preview CLI; `plan` provides
+  sync/concat and `evict` is a mutation with internal preflight, not a dry-run.
+  A sealed partial-prefix decision is not a reusable preview or authorization.
 - `cara evict --pr N --reason ...` removes a member and reconnects its child only
   after exact compatibility proof. `split` makes the selected PR a new head.
   `renew` and `rejoin` re-evaluate an evicted PR from fresh facts.
@@ -1421,7 +1436,7 @@ pub fn help_for_context(context: &AppContext) -> HelpOutput {
     advice.push(if config.rebase_on_join {
         "rebase_on_join=true authorizes exact-leased owned-branch rewrites; inspect patch/tree receipts and never force-push without the typed lease.".to_owned()
     } else {
-        "rebase_on_join=false keeps source history immutable; resolve incompatibility by owner repair, explicit eviction/reshape, or a reviewed config change.".to_owned()
+        "rebase_on_join=false disables join rewrites, not native convergence or legacy repair force-with-lease. No-force owner continuation requires repair start --non-force and repair continue --no-sync; queue mutations need separate current authority.".to_owned()
     });
     advice.push(match config.writer.mode {
         WriterMode::ReadOnly => "writer.mode=read_only: all provider mutations are refused; use status/plan evidence or switch only through reviewed repository policy.".to_owned(),
@@ -1699,7 +1714,7 @@ pub fn build_router() -> ToolRouter<AppContext> {
     );
     router.add_typed_tool_with_output_schema(
         "native_stack_rebase_apply",
-        "Independently rediscover one reviewed native Stack rebase plan, prepare every descendant before the first write, atomically publish all changed branches under exact leases, and require linear provider postconditions plus fresh CI.",
+        "Independently rediscover a reviewed native Stack plan and atomically force-with-lease publish changed branches. This is not a non-force route; require linear postconditions and fresh CI.",
         |context: &AppContext, input: native_stack_rebase::NativeStackRebaseApplyInput| {
             native_stack_rebase::apply(context, &input)
         },
@@ -1777,6 +1792,11 @@ pub fn build_router() -> ToolRouter<AppContext> {
         |context: &AppContext, input: repair::RepairStartInput| repair::start(context, &input),
     );
     router.add_typed_tool_with_output_schema(
+        "repair_start_non_force",
+        "Create an explicit history-preserving non-force source session. Binds actor/reason and fresh generations; continue requires the same actor and no_sync. Unknown older servers must refuse this distinct tool, never fall back to legacy repair_start.",
+        |context: &AppContext, input: repair::NonForceRepairStartInput| repair::start_non_force(context, input),
+    );
+    router.add_typed_tool_with_output_schema(
         "repair_authorize_agent_edits",
         "Authorize one exact agent identity to make bounded arbitrary repository-content edits in an exact resolving session. Binds repository/PR/head/target/config/session/actor/reason/expiry, never mutates provider state, and requires complete staged diff receipts at continue.",
         |context: &AppContext, input: repair::RepairAuthorizeAgentEditsInput| {
@@ -1799,7 +1819,7 @@ pub fn build_router() -> ToolRouter<AppContext> {
     );
     router.add_typed_tool_with_output_schema(
         "repair_continue",
-        "Verify staged conflict resolution stayed inside the typed path scope, run reviewed targeted validation, recheck the exact provider head, create an exact-parent merge commit, publish under the exact old-head force-with-lease, and resume sync-all from the isolated workspace.",
+        "Verify scoped edits and exact-parent merge, then publish using the persisted session policy. Legacy uses force-with-lease and may resume sync; explicit non-force requires the same actor and no_sync, durably fences uncertainty, and never mutates queue topology.",
         |context: &AppContext, input: repair::RepairContinueInput| repair::continue_session(context, &input),
     );
     router.add_typed_tool_with_output_schema(
