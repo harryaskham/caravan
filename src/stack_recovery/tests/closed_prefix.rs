@@ -221,7 +221,8 @@ fn closed_prefix_auto_rejects_fresh_history_identity_and_base_races() {
         let mut f = fixture(1, 1);
         match mutation {
             0 => {
-                f.provider.rows.topology.entries[0].head.oid = CommitOid("moved-history".to_owned())
+                f.provider.rows.topology.entries[0].head.oid =
+                    CommitOid("moved-history".to_owned());
             }
             1 => f.provider.rows.node_id.push_str("-replacement"),
             2 => f.provider.rows.topology.entries[0].merged_at = Some("changed".to_owned()),

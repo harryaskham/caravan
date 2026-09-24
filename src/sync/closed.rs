@@ -92,10 +92,10 @@ fn lifecycle_action(pr: &crate::model::PullRequestSnapshot) -> SyncPlanAction {
     SyncPlanAction {
         order: 0,
         phase: SyncPlanPhase::ProviderConvergence,
-        state: if labels != pr.labels {
-            SyncPlanActionState::WouldMutate
-        } else {
+        state: if labels == pr.labels {
             SyncPlanActionState::AlreadySatisfied
+        } else {
+            SyncPlanActionState::WouldMutate
         },
         kind: "reconcile_closed_member_labels".to_owned(),
         pr: Some(pr.number),
