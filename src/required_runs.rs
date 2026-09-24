@@ -1155,6 +1155,8 @@ const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 
 #[cfg(test)]
 mod effective_policy_tests;
+#[cfg(test)]
+mod readiness_contract_tests;
 /// Exact provider lineage can retire an old row while its replacement has no
 /// jobs yet, but a workflow conclusion can never manufacture a passing check.
 fn superseded_by_exact_lineage(

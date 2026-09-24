@@ -1039,6 +1039,19 @@ or unknown required evidence cannot authorize an ordinary or native merge.
 The existing admission wait and exact deferred-unjoined exemption remain separate
 from merge readiness; neither grants a green merge verdict.
 
+A same-context/App/head readiness success in a **different workflow** does not
+supersede an earlier required failure. Both workflow identities stay current;
+provider text, a fixture decision, and later timestamps are not cross-workflow
+replacement authority. GitHub documents duplicate required job names across
+workflows as potentially ambiguous. The supported producer direction is one cheap
+protected membership reporter for source and readiness events, while retaining
+independent source checks and generations. Existing same-workflow ordering rules
+remain unchanged; without positive ordering, both rows remain current. See
+[the readiness selection contract](docs/readiness-required-selection.md) and its
+executable synthetic-pair/required-failure controls. This does not certify a
+historical head, implement the producer, or authorize live admission/protection
+changes.
+
 Required-run receipts bind the complete normalized policy as well as the exact
 PR head/base. Ordinary merge rereads policy and checks during root preflight and
 requires unchanged complete policy after the audit, before squash submission.
