@@ -3858,6 +3858,7 @@ fn prepare_physical_chains(
                 target,
                 &status.analysis.fleet.default_branch,
                 crate::physical_rebase::RebaseExecutionBudget::new(timeout)
+                    .with_operation_id(progress.operation_id.clone())
                     .with_deadline(precommit_deadline)
                     .with_writer_fence(writer_guard.remote_fence())
                     .because(if index == 0 {
