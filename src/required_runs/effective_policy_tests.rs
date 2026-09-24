@@ -149,7 +149,7 @@ fn effective_policy_never_proves_a_truncated_or_unavailable_required_set() {
     policy.complete = false;
     let green = observation("gate", 15368, "head", CheckState::Success);
     assert_eq!(
-        evaluate(&policy, &[green.clone()]).status,
+        evaluate(&policy, std::slice::from_ref(&green)).status,
         RequiredRunsStatus::UnknownProviderState
     );
     assert_eq!(

@@ -9310,9 +9310,7 @@ fn ci_generation_evidence(
                 app_id,
                 check_suite_id: Some(suite.id),
                 head_oid: Some(crate::model::CommitOid(head_oid.to_owned())),
-                started_at: None,
-                completed_at: None,
-                superseded: false,
+                ..CheckSnapshot::default()
             });
         }
         evidence.selected_generations.push(CiGenerationSelection {
@@ -9437,11 +9435,32 @@ fn observation_has_proven_deferred_gate(
         })
 }
 
-fn required_ci_disposition(status: RequiredRunsStatus, forced: bool) -> CiDisposition {
+fn required_ci_disposition(
+    assessment: &crate::required_runs::RequiredRunsAssessment,
+    forced: bool,
+) -> CiDisposition {
     if forced {
         return CiDisposition::Forced;
     }
-    match status {
+    // Missing coverage must not suppress a known current required failure (and
+    // its deferred-gate diagnostic). Historical names are not current reports.
+    if assessment
+        .required_policy
+        .as_ref()
+        .is_some_and(|policy| policy.complete)
+        && assessment.coverage.iter().any(|coverage| {
+            !coverage.current_reporting_checks.is_empty()
+                && matches!(
+                    coverage.state,
+                    crate::required_runs::RequiredContextState::Failing
+                        | crate::required_runs::RequiredContextState::CancelledSuperseded
+                        | crate::required_runs::RequiredContextState::Unknown
+                )
+        })
+    {
+        return CiDisposition::Failed;
+    }
+    match assessment.status {
         RequiredRunsStatus::Satisfied | RequiredRunsStatus::NotRequired => CiDisposition::Passing,
         RequiredRunsStatus::Failing | RequiredRunsStatus::CancelledSuperseded => {
             CiDisposition::Failed
@@ -10626,8 +10645,7 @@ impl SyncProgress {
             number,
         )?;
         let mut disposition = required_ci_disposition(
-            self.assess_with_lineage(&current, &policy, None, &current.checks)
-                .status,
+            &self.assess_with_lineage(&current, &policy, None, &current.checks),
             forced,
         );
         let mut lineage = None;
@@ -10638,8 +10656,7 @@ impl SyncProgress {
         if disposition == CiDisposition::Failed {
             current = self.refetch_ci_snapshot(provider, repository, number)?;
             disposition = required_ci_disposition(
-                self.assess_with_lineage(&current, &policy, None, &current.checks)
-                    .status,
+                &self.assess_with_lineage(&current, &policy, None, &current.checks),
                 forced,
             );
             if disposition == CiDisposition::Failed {
@@ -10661,8 +10678,7 @@ impl SyncProgress {
         // Whole-workflow conclusions are diagnostics, not substitutes for
         // individual required checks (an optional job can fail the workflow).
         disposition = required_ci_disposition(
-            self.assess_with_lineage(&current, &policy, lineage.as_ref(), &current.checks)
-                .status,
+            &self.assess_with_lineage(&current, &policy, lineage.as_ref(), &current.checks),
             forced,
         );
         let mut failed_runs =
@@ -10696,11 +10712,6 @@ impl SyncProgress {
                 .collect::<Vec<_>>()
         };
         reduce_proven_deferred_generations(&mut generation, &required_checks, &failure_diagnostics);
-        disposition = required_ci_disposition(
-            self.assess_with_lineage(&current, &policy, lineage.as_ref(), &current.checks)
-                .status,
-            forced,
-        );
         let mut rerunnable_run_ids = failure_diagnostics
             .iter()
             .filter(|diagnostic| diagnostic.action == WorkflowFailureAction::RerunFailedJobs)

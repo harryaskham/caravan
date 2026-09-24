@@ -2,7 +2,11 @@
 //! organization rulesets. A refused, malformed or bounded read is never empty
 //! policy. This reader performs no provider mutations.
 
-use super::*;
+use super::{
+    BranchProtectionJson, BranchSettingsJson, CommandRunner, CommandSpec, Deserialize,
+    DiscoveryError, GitHubMutationAdapter, MutationError, RepositoryId, branch_protection_command,
+    branch_settings_command, encode_path_segment,
+};
 use crate::required_runs::{RequiredCheck, RequiredContextsRead};
 
 #[derive(Deserialize)]
@@ -30,18 +34,18 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
         &self,
         repository: &RepositoryId,
         branch: &str,
-    ) -> Result<RequiredContextsRead, MutationError> {
+    ) -> RequiredContextsRead {
         let Ok(settings) =
             self.json::<BranchSettingsJson>(branch_settings_command(repository, branch))
         else {
-            return Ok(RequiredContextsRead::partial(branch));
+            return RequiredContextsRead::partial(branch);
         };
         // This endpoint returns the active rules applying to this exact branch,
         // including organization rulesets. A repository-ruleset listing alone
         // does not establish effective policy.
         let Ok(pages) = self.json::<Vec<Vec<BranchRule>>>(branch_rules_command(repository, branch))
         else {
-            return Ok(RequiredContextsRead::partial(branch));
+            return RequiredContextsRead::partial(branch);
         };
         let complete_pages = !pages.is_empty();
         let rules = pages.into_iter().flatten().collect::<Vec<_>>();
@@ -105,13 +109,13 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
                 };
                 let app_id = match check.get("integration_id") {
                     None | Some(serde_json::Value::Null) => None,
-                    Some(value) => match value.as_u64().filter(|id| *id > 0) {
-                        Some(id) => Some(id),
-                        None => {
+                    Some(value) => {
+                        let app_id = value.as_u64().filter(|id| *id > 0);
+                        if app_id.is_none() {
                             result.complete = false;
-                            None
                         }
-                    },
+                        app_id
+                    }
                 };
                 result.checks.push(RequiredCheck {
                     context: context.to_owned(),
@@ -119,7 +123,7 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
                 });
             }
         }
-        Ok(result.normalized())
+        result.normalized()
     }
 }
 

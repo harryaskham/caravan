@@ -301,6 +301,10 @@ pub struct RequiredContextCoverage {
     /// Reporting check names observed on the exact head, if any.
     #[serde(default)]
     pub reporting_checks: Vec<String>,
+    /// Current reporting rows, excluding positively superseded history. This
+    /// distinguishes an observed unknown state from missing/incomplete coverage.
+    #[serde(default)]
+    pub current_reporting_checks: Vec<String>,
     /// Exact provider state retained when normalization yields `unknown`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_state: Option<String>,
@@ -658,6 +662,11 @@ pub fn assess(input: &RequiredRunsInput<'_>) -> RequiredRunsAssessment {
             app_id: required.app_id,
             state,
             reporting_checks,
+            current_reporting_checks: current_matching
+                .iter()
+                .filter(|check| check.state != CheckState::Expected)
+                .map(|check| check.name.clone())
+                .collect(),
             provider_state,
         });
     }

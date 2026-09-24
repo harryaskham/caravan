@@ -382,13 +382,28 @@ fn deferred_admission_negative_evidence_never_grants_admission() {
 #[test]
 fn effective_policy_deferred_gate_cannot_waive_a_foreign_app_or_borrow_its_proof() {
     use crate::required_runs::RequiredCheck;
-    for case in ["exact", "two-apps", "borrowed-proof", "missing-suite"] {
-        let (mut candidate, diagnostics, lineage) = fixture();
+    for case in [
+        "exact",
+        "missing-heavy",
+        "missing-heavy-no-clock",
+        "two-apps",
+        "borrowed-proof",
+        "missing-suite",
+    ] {
+        let (mut candidate, diagnostics, mut lineage) = fixture();
         let suite_id = lineage.workflow_runs[0].check_suite_id;
         for check in &mut candidate.checks {
             check.app_id = Some(77);
             check.check_suite_id = Some(suite_id);
             check.head_oid = Some(candidate.head.oid.clone());
+        }
+        if case == "missing-heavy" {
+            lineage.head_committed_at = Some(PUBLISHED_AT.to_owned());
+        }
+        if matches!(case, "missing-heavy" | "missing-heavy-no-clock") {
+            candidate
+                .checks
+                .retain(|check| check.name == gate().context);
         }
         let gate_check = candidate
             .checks
@@ -448,7 +463,7 @@ fn effective_policy_deferred_gate_cannot_waive_a_foreign_app_or_borrow_its_proof
         );
         assert_eq!(
             matches!(outcome, Ok(None)),
-            case == "exact",
+            matches!(case, "exact" | "missing-heavy"),
             "{case}: {outcome:?}"
         );
         assert!(provider.calls.borrow().is_empty());

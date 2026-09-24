@@ -1,4 +1,7 @@
 use super::*;
+use crate::command::{CommandOutput, CommandRunError};
+use crate::github::{CheckJson, OPEN_PR_PAGE_QUERY, pull_request_command};
+use crate::model::CommitOid;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 

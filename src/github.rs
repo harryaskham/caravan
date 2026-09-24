@@ -1486,7 +1486,7 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
         repository: &RepositoryId,
         branch: &str,
     ) -> Result<crate::required_runs::RequiredContextsRead, MutationError> {
-        self.effective_required_checks(repository, branch)
+        Ok(self.effective_required_checks(repository, branch))
     }
 
     /// Check-suite and workflow-run lineage for the exact verified PR head.
