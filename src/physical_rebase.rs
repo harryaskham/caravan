@@ -132,6 +132,8 @@ pub struct RebaseExecutionBudget {
     pub rewrite_reason: BranchRewriteReason,
     /// Operation-scoped remote fence retained through preparation and push.
     pub writer_fence: Option<Arc<RemoteLeaseGuard>>,
+    /// Existing caller operation identity, never inferred from later status.
+    pub operation_id: Option<crate::model::OperationId>,
 }
 
 impl RebaseExecutionBudget {
@@ -145,7 +147,14 @@ impl RebaseExecutionBudget {
             replay_upstream: None,
             rewrite_reason: BranchRewriteReason::Unspecified,
             writer_fence: None,
+            operation_id: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_operation_id(mut self, operation_id: crate::model::OperationId) -> Self {
+        self.operation_id = Some(operation_id);
+        self
     }
 
     /// Timeout for creating the isolated worktree.
@@ -478,10 +487,91 @@ fn historical_parent_lease_matches(
             || (current.name == target.name && matches!(new_base, PlannedBase::Simulated(_))))
 }
 
+/// Historical preparation evidence, not a lease or authority to write.
+///
+/// `not_attempted` applies ONLY to this preparation: an enclosing operation may
+/// already have provider receipts. Its authenticated actor identity stays in the
+/// enclosing event; `operation_id` is the supplied Cara caller identity, if any.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RebaseFailureGeneration {
+    pub schema_version: u32,
+    pub repository: RepositoryId,
+    pub pr: PrNumber,
+    pub original_head: BranchSnapshot,
+    pub original_base: BranchSnapshot,
+    pub attempted_target: PlannedBase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<crate::model::OperationId>,
+    pub mutation_scope: PreparationMutationScope,
+    pub provider_mutation_outcome: PreparationMutationOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PreparationMutationScope {
+    PrepareCandidate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PreparationMutationOutcome {
+    NotAttempted,
+}
+
 /// Materialize one exact rebase generation and retain its worktree through apply.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_candidate(
+    repository_path: &Path,
+    repository: &RepositoryId,
+    candidate: &PullRequestSnapshot,
+    range_source: PlannedRangeBase,
+    new_base: PlannedBase,
+    workflow_source: &BranchSnapshot,
+    budget: RebaseExecutionBudget,
+) -> Result<PreparedRebase, AppError> {
+    let evidence = RebaseFailureGeneration {
+        schema_version: 1,
+        repository: repository.clone(),
+        pr: candidate.number,
+        original_head: candidate.head.clone(),
+        original_base: candidate.base.clone(),
+        attempted_target: new_base.clone(),
+        operation_id: budget.operation_id.clone(),
+        mutation_scope: PreparationMutationScope::PrepareCandidate,
+        provider_mutation_outcome: PreparationMutationOutcome::NotAttempted,
+    };
+    prepare_candidate_inner(
+        repository_path,
+        repository,
+        candidate,
+        range_source,
+        new_base,
+        workflow_source,
+        budget,
+    )
+    .map_err(|error| {
+        if !matches!(
+            error.code().as_str(),
+            "rebase_conflict" | "rebase_merge_replay_conflict" | "rebase_merge_tree_conflict"
+        ) {
+            return error;
+        }
+        let mut details = error.details().unwrap_or_else(|| json!({}));
+        if let Some(object) = details.as_object_mut() {
+            object.insert("failure_generation".to_owned(), json!(evidence));
+        }
+        AppError::structured(
+            error.category(),
+            error.code(),
+            error.message(),
+            Some(details),
+        )
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::needless_pass_by_value)]
-pub fn prepare_candidate(
+fn prepare_candidate_inner(
     repository_path: &Path,
     repository: &RepositoryId,
     candidate: &PullRequestSnapshot,
@@ -3175,7 +3265,11 @@ mod tests {
             range_base_for_remote_target(&candidate, &target),
             PlannedBase::Remote(target.clone()),
             &target,
-            RebaseExecutionBudget::new(TEST_REBASE_BUDGET).with_squash_reconciliation(reconcile),
+            RebaseExecutionBudget::new(TEST_REBASE_BUDGET)
+                .with_operation_id(crate::model::OperationId(
+                    "test-existing-operation".to_owned(),
+                ))
+                .with_squash_reconciliation(reconcile),
         )
     }
 
@@ -3190,6 +3284,35 @@ mod tests {
         assert_eq!(error.code(), "rebase_conflict");
         let details = error.details().unwrap();
         assert_eq!(details["conflicting_paths"][0], "app.rs");
+        let captured = details["failure_generation"].clone();
+        let evidence: RebaseFailureGeneration = serde_json::from_value(captured.clone()).unwrap();
+        assert_eq!(evidence.repository, fixture.repository);
+        assert_eq!(evidence.pr, PrNumber(2227));
+        assert_eq!(evidence.original_head.oid, fixture.feature);
+        assert_eq!(evidence.original_base.oid, fixture.old_main);
+        assert_eq!(
+            evidence.attempted_target,
+            PlannedBase::Remote(branch(&fixture.repository, "main", &fixture.new_main,))
+        );
+        assert_eq!(evidence.operation_id.unwrap().0, "test-existing-operation");
+        assert_eq!(
+            evidence.mutation_scope,
+            PreparationMutationScope::PrepareCandidate
+        );
+        assert_eq!(
+            evidence.provider_mutation_outcome,
+            PreparationMutationOutcome::NotAttempted
+        );
+        // A later observation cannot rewrite the historical failed tuple. Replay
+        // carries the same bytes; neither delivery nor this evidence grants a lease.
+        let mut later = stacked_candidate(&fixture);
+        later.head.oid = fixture.new_main.clone();
+        assert_ne!(captured["original_head"]["oid"], json!(later.head.oid));
+        assert_eq!(error.details().unwrap()["failure_generation"], captured);
+        // Unknown/indeterminate outcomes cannot silently deserialize as no writes.
+        let mut unknown = captured;
+        unknown["provider_mutation_outcome"] = json!("indeterminate");
+        assert!(serde_json::from_value::<RebaseFailureGeneration>(unknown).is_err());
         // Detection alone never rewrites: the branch is untouched.
         assert_eq!(
             git(

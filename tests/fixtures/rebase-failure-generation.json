@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "repository": { "owner": "example", "name": "project" },
+  "pr": 42,
+  "original_head": {
+    "repository": { "owner": "example", "name": "project" },
+    "name": "feature",
+    "oid": "1111111111111111111111111111111111111111"
+  },
+  "original_base": {
+    "repository": { "owner": "example", "name": "project" },
+    "name": "parent",
+    "oid": "2222222222222222222222222222222222222222"
+  },
+  "attempted_target": {
+    "kind": "simulated",
+    "branch": {
+      "repository": { "owner": "example", "name": "project" },
+      "name": "parent",
+      "oid": "3333333333333333333333333333333333333333"
+    }
+  },
+  "operation_id": "existing-cara-operation",
+  "mutation_scope": "prepare_candidate",
+  "provider_mutation_outcome": "not_attempted"
+}
