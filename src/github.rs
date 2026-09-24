@@ -1500,42 +1500,45 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
     ) -> Result<crate::required_runs::HeadRunLineage, MutationError> {
         let before = self.verify_precondition_with_checks(repository, expected)?;
         let head_sha = before.head.oid.0.clone();
-        let mut complete = true;
-        let check_suites = self
+        let (check_suites, suites_complete) = self
             .json::<CheckSuiteListJson>(check_suites_command(repository, head_sha.as_str()))
-            .map_or_else(
-                |_| {
-                    complete = false;
-                    Vec::new()
-                },
-                |list| {
+            .map(|list| {
+                let complete = list
+                    .total_count
+                    .map_or(list.check_suites.len() < 100, |total| {
+                        total == list.check_suites.len()
+                    });
+                (
                     list.check_suites
                         .into_iter()
                         .map(Into::into)
-                        .collect::<Vec<_>>()
-                },
-            );
-        let workflow_runs = self
+                        .collect::<Vec<_>>(),
+                    complete,
+                )
+            })
+            .unwrap_or_default();
+        let (workflow_runs, runs_complete) = self
             .json::<WorkflowRunListJson>(head_runs_command(repository, head_sha.as_str()))
-            .map_or_else(
-                |_| {
-                    complete = false;
-                    Vec::new()
-                },
-                |list| {
+            .map(|list| {
+                let complete = list
+                    .total_count
+                    .map_or(list.workflow_runs.len() < 100, |total| {
+                        total == list.workflow_runs.len()
+                    });
+                (
                     list.workflow_runs
                         .into_iter()
                         .map(Into::into)
-                        .collect::<Vec<_>>()
-                },
-            );
+                        .collect::<Vec<_>>(),
+                    complete,
+                )
+            })
+            .unwrap_or_default();
         let head_committed_at = self
             .json::<CommitDetailJson>(commit_command(repository, head_sha.as_str()))
             .ok()
             .map(|commit| commit.commit.committer.date);
-        if head_committed_at.is_none() {
-            complete = false;
-        }
+        let complete = suites_complete && runs_complete && head_committed_at.is_some();
         Ok(crate::required_runs::HeadRunLineage {
             head_sha,
             check_suites,
@@ -1570,6 +1573,91 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
         let after = self.refetch_pull_request(repository, expected.number)?;
         Ok(GitHubMutationReceipt {
             kind: MutationKind::RequestCheckSuite,
+            before: Some(before),
+            after,
+            provider_output: trimmed_provider_output(&output),
+        })
+    }
+
+    /// Restart a proved applicable Actions execution, never a guessed suite or
+    /// a fallback from another App's endpoint. The caller persists intent first.
+    pub fn restart_ci_execution(
+        &self,
+        repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+        selected: &crate::ci_dispatch::CiExecution,
+    ) -> Result<GitHubMutationReceipt, crate::AppError> {
+        let provider_error = |error: MutationError, attempted: bool| {
+            crate::AppError::structured(
+                crate::ErrorCategory::ExecutionFailure,
+                "ci_execution_provider_error",
+                error.to_string(),
+                Some(
+                    serde_json::json!({"execution": selected, "provider_write_attempted": attempted}),
+                ),
+            )
+        };
+        let before = self
+            .verify_precondition_with_checks(repository, expected)
+            .map_err(|error| provider_error(error, false))?;
+        let raw: CheckSuiteJson = self
+            .json(check_suite_command(repository, selected.check_suite_id))
+            .map_err(|error| provider_error(error, false))?;
+        let app = raw.app.as_ref().and_then(|app| app.id);
+        let suite = raw.into();
+        let run = self
+            .json::<HeadWorkflowRunJson>(workflow_run_command(repository, selected.run_id))
+            .map_err(|error| provider_error(error, false))?
+            .into();
+        let fresh = crate::ci_dispatch::CiExecution::from_run(
+            &before,
+            &run,
+            &suite,
+            selected.app_id,
+            &selected.contexts,
+        )
+        .map_err(|error| {
+            crate::AppError::structured(
+                crate::ErrorCategory::Validation,
+                "ci_execution_precondition_changed",
+                error.to_string(),
+                Some(serde_json::json!({"execution": selected, "provider_write_attempted": false})),
+            )
+        })?;
+        let reporting = before.checks.iter().any(|check| {
+            check.provider_kind.as_deref() == Some("CheckRun")
+                && check.app_id == Some(selected.app_id)
+                && check.check_suite_id == Some(selected.check_suite_id)
+                && check.head_oid.as_ref() == Some(&before.head.oid)
+                && check.workflow_name.as_deref() == Some(selected.workflow_name.as_str())
+        });
+        if app != Some(selected.app_id) || &fresh != selected || !fresh.requestable() || !reporting
+        {
+            return Err(crate::AppError::structured(
+                crate::ErrorCategory::Validation,
+                "ci_execution_precondition_changed",
+                "exact App/workflow/run/attempt/suite or reporting identity changed before CI start",
+                Some(
+                    serde_json::json!({"expected": selected, "actual": fresh, "mutated": false, "provider_write_attempted": false}),
+                ),
+            ));
+        }
+        let output = self
+            .checked(rerun_workflow_command(repository, selected.run_id))
+            .map_err(|error| provider_error(error, true))?;
+        let after = self
+            .refetch_pull_request(repository, expected.number)
+            .map_err(|error| provider_error(error, true))?;
+        if !PullRequestPrecondition::from(&after).mutation_identity_eq(expected) {
+            return Err(crate::AppError::structured(
+                crate::ErrorCategory::ExecutionFailure,
+                "ci_execution_readback_drift",
+                "CI start was accepted but PR facts changed during readback; preserve the intent and do not repeat the write",
+                Some(serde_json::json!({"execution": selected, "provider_write_accepted": true})),
+            ));
+        }
+        Ok(GitHubMutationReceipt {
+            kind: MutationKind::RerunChecks,
             before: Some(before),
             after,
             provider_output: trimmed_provider_output(&output),
@@ -3645,6 +3733,8 @@ mod tests {
     use super::*;
     use crate::command::CommandOutput;
     use crate::model::AutoMergeState;
+
+    mod ci_dispatch;
 
     struct FakeRunner {
         calls: RefCell<VecDeque<(CommandSpec, CommandOutput)>>,
@@ -6276,11 +6366,12 @@ mod tests {
             Some("2026-07-26T15:27:43Z"),
             "a rebase can preserve the original commit date"
         );
-        // The provider's own `rerequestable` flag is authoritative and the
-        // lowest rerequestable suite on the exact head is selected.
+        // Rerequestability alone cannot establish which App/workflow applies.
+        // The legacy missing-run path must not guess Cursor by lowest ID;
+        // exact CI-dispatch fixtures separately prove the applicable Actions run.
         assert_eq!(
             crate::required_runs::rerequestable_suite(Some(&lineage), "head-12"),
-            Some(81_895_334_808)
+            None
         );
         assert!(
             !lineage.check_suites[2].rerequestable,

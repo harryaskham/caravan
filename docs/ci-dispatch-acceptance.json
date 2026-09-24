@@ -1,0 +1,14 @@
+{
+  "bead": "bd-720f37",
+  "scope": "source and hermetic provider/transaction tests; not deployed-runtime acceptance",
+  "requirements": [
+    {"id": "CI-01", "requirement": "Reuse applicable active attempts 1 and 2 despite an earlier unrelated queued suite", "tests": ["ci_dispatch_reuses_active_first_and_replacement_attempt_without_cursor_request", "ci_dispatch_membership_and_active_actions_are_preserved_without_an_extra_start"]},
+    {"id": "CI-02", "requirement": "Refuse wrong App/workflow/attempt/suite/head/base and incomplete or synthetic evidence", "tests": ["ci_dispatch_refuses_wrong_app_suite_workflow_attempt_base_head_and_partial_evidence", "ci_dispatch_provider_rechecks_app_workflow_attempt_suite_and_base_with_zero_writes", "ci_dispatch_provider_truncated_lists_never_prove_execution_completeness"]},
+    {"id": "CI-03", "requirement": "Preserve required third-party failures and do not infer universal Actions applicability or optional-failure restart authority", "tests": ["ci_dispatch_preserves_required_third_party_failure_and_does_not_assume_actions_required", "ci_dispatch_optional_workflow_failure_cannot_authorize_a_restart"]},
+    {"id": "CI-04", "requirement": "A legitimate completed restart uses a revalidated Actions-only endpoint and has one durable request", "tests": ["ci_dispatch_provider_binds_execution_before_actions_only_restart_and_readback", "ci_dispatch_accepted_completed_restart_has_one_durable_request", "queue_owned_base_change_dispatches_ci_for_exact_tuple_once"]},
+    {"id": "CI-05", "requirement": "Response or readback loss preserves membership and fences duplicate starts across restart", "tests": ["ci_dispatch_provider_response_or_readback_loss_never_repeats_a_write", "ci_dispatch_lost_response_retains_membership_receipt_and_restart_does_not_replay", "ci_dispatch_response_loss_is_fenced_across_restart_until_successor_is_observed"]},
+    {"id": "CI-06", "requirement": "Definite no-write refusals can retry; budget and storage failures precede provider effects", "tests": ["ci_dispatch_definite_prewrite_rejection_allows_fresh_retry_with_archived_evidence", "ci_dispatch_budget_refusal_precedes_intent_and_old_gate_rows_do_not_restart_new_attempts", "ci_dispatch_storage_failure_prevents_provider_write_and_truncation_is_not_complete"]},
+    {"id": "CI-07", "requirement": "Reuse is durable without inventing a passing verdict or acknowledgement; observations do not regress", "tests": ["ci_dispatch_reuse_stays_zero_write_after_that_execution_fails", "ci_dispatch_successor_status_progresses_but_attempt_observation_cannot_regress", "ci_dispatch_newest_workflow_is_not_an_older_valid_run_fallback"]},
+    {"id": "CI-08", "requirement": "Draft, parked, evicted and closed members do not receive post-mutation starts", "tests": ["ci_dispatch_respects_drafts_parking_and_inactive_membership"]}
+  ]
+}

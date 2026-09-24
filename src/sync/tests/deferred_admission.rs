@@ -57,6 +57,7 @@ pub(super) fn fixture() -> (
             run_id: RUN,
             check_suite_id: 96_192_279_727,
             workflow_name: "CI".to_owned(),
+            execution: None,
             head_sha: candidate.head.oid.0.clone(),
             status: "completed".to_owned(),
             conclusion: "failure".to_owned(),
