@@ -66,6 +66,7 @@ struct FakeProvider {
     rerequests: RefCell<Vec<(PrNumber, u64)>>,
     /// Complete GitHub Actions workflow reruns observed, in order.
     workflow_reruns: RefCell<Vec<(PrNumber, u64)>>,
+    ci_start_response_loss: RefCell<bool>,
     /// Optional exact native Stack generation for sync integration tests.
     native_stack: RefCell<Option<crate::github::GitHubStackGeneration>>,
     native_stack_reads: RefCell<u32>,
@@ -81,6 +82,7 @@ struct FakeProvider {
     released_reobservations: RefCell<u32>,
 }
 
+mod ci_dispatch;
 mod closed_reformation;
 mod deferred_admission;
 mod effective_policy;
@@ -141,6 +143,7 @@ impl FakeProvider {
             rerequestable_suites: RefCell::new(BTreeMap::new()),
             rerequests: RefCell::new(Vec::new()),
             workflow_reruns: RefCell::new(Vec::new()),
+            ci_start_response_loss: RefCell::new(false),
             native_stack: RefCell::new(None),
             native_stack_reads: RefCell::new(0),
             native_stack_intersections: RefCell::new(None),
@@ -965,6 +968,27 @@ impl SyncProvider for FakeProvider {
         }
     }
 
+    fn restart_ci_execution(
+        &self,
+        _repository: &RepositoryId,
+        expected: &PullRequestPrecondition,
+        selected: &crate::ci_dispatch::CiExecution,
+    ) -> Result<GitHubMutationReceipt, AppError> {
+        let receipt = self
+            .mutate(expected, MutationKind::RerunChecks, |_| {})
+            .map_err(|error| AppError::validation("fake_ci_start_failure", error.to_string()))?;
+        self.workflow_reruns
+            .borrow_mut()
+            .push((expected.number, selected.run_id));
+        if *self.ci_start_response_loss.borrow() {
+            return Err(AppError::validation(
+                "fake_ci_response_loss",
+                "write accepted; response lost",
+            ));
+        }
+        Ok(receipt)
+    }
+
     fn rerequest_check_suite(
         &self,
         _repository: &RepositoryId,
@@ -1541,27 +1565,17 @@ fn root_stalled_chain() -> Vec<PullRequestSnapshot> {
 
 #[test]
 fn queue_owned_base_change_dispatches_ci_for_exact_tuple_once() {
-    let pull = caravan_member(40, "feature", "main");
+    let mut pull = caravan_member(40, "feature", "main");
+    let (policy, lineage) =
+        crate::ci_dispatch::tests::evidence(&mut pull, 1, "completed", "failure");
     let status = caravan_status(vec![pull.clone()], Some(PrNumber(40)), true);
     let provider = FakeProvider::with_pull_requests(vec![pull.clone()]);
-    provider.serve_lineage(
-        PrNumber(40),
-        HeadRunLineage {
-            head_sha: pull.head.oid.0.clone(),
-            check_suites: vec![crate::required_runs::CheckSuiteLineage {
-                id: 4040,
-                head_sha: pull.head.oid.0.clone(),
-                status: "completed".to_owned(),
-                conclusion: "success".to_owned(),
-                app_slug: "github-actions".to_owned(),
-                rerequestable: true,
-            }],
-            workflow_runs: Vec::new(),
-            head_committed_at: Some(PUBLISHED_AT.to_owned()),
-            complete: true,
-        },
-    );
-    provider.allow_rerequest(4040, &pull.head.oid.0);
+    provider
+        .required_contexts
+        .borrow_mut()
+        .insert("main".into(), policy);
+    provider.serve_lineage(pull.number, lineage);
+    let directory = crate::ci_dispatch::tests::repository();
     let mut progress = SyncProgress::new(&status, vec![PrNumber(40)], 10);
     progress.steps.push(MutationStep {
         kind: MutationKind::SetBase,
@@ -1570,8 +1584,10 @@ fn queue_owned_base_change_dispatches_ci_for_exact_tuple_once() {
         summary: "promoted root".to_owned(),
     });
 
-    dispatch_exact_ci_after_queue_mutations(&provider, &mut progress, &status).unwrap();
-    dispatch_exact_ci_after_queue_mutations(&provider, &mut progress, &status).unwrap();
+    dispatch_exact_ci_after_queue_mutations(directory.path(), &provider, &mut progress, &status)
+        .unwrap();
+    dispatch_exact_ci_after_queue_mutations(directory.path(), &provider, &mut progress, &status)
+        .unwrap();
 
     assert_eq!(progress.ci_generation_dispatches.len(), 1);
     let dispatch = &progress.ci_generation_dispatches[0];
@@ -1579,12 +1595,12 @@ fn queue_owned_base_change_dispatches_ci_for_exact_tuple_once() {
     assert_eq!(dispatch.head_oid, pull.head.oid);
     assert_eq!(dispatch.base_oid, pull.base.oid);
     assert_eq!(dispatch.caravan_members, [PrNumber(40)]);
-    assert_eq!(dispatch.check_suite_id, 4040);
+    assert_eq!(dispatch.check_suite_id, 97_044_911_496);
     assert_eq!(
         progress
             .provider_receipts
             .iter()
-            .filter(|receipt| receipt.kind == MutationKind::RequestCheckSuite)
+            .filter(|receipt| receipt.kind == MutationKind::RerunChecks)
             .count(),
         1
     );
@@ -3782,6 +3798,7 @@ fn deferred_gate_uses_canonical_exact_head_generation_vote() {
                 run_id: 10,
                 check_suite_id: 77,
                 workflow_name: "CI".to_owned(),
+                execution: None,
                 head_sha: candidate.head.oid.0.clone(),
                 status: "completed".to_owned(),
                 conclusion: "failure".to_owned(),
@@ -3873,6 +3890,7 @@ fn deferred_gate_maps_to_one_exact_rerequestable_suite() {
                 run_id: 10,
                 check_suite_id: 77,
                 workflow_name: "Caravan Gate".to_owned(),
+                execution: None,
                 head_sha: candidate.head.oid.0.clone(),
                 status: "completed".to_owned(),
                 conclusion: "failure".to_owned(),
@@ -3910,6 +3928,7 @@ fn deferred_gate_reuses_pending_or_newer_run_instead_of_replaying() {
         run_id: 10,
         check_suite_id: 77,
         workflow_name: "CI".to_owned(),
+        execution: None,
         head_sha: "head".to_owned(),
         status: "completed".to_owned(),
         conclusion: "failure".to_owned(),
@@ -4018,6 +4037,7 @@ fn enrolled_deferred_gate_resumes_with_exact_actions_workflow_rerun() {
                 run_id: 10,
                 check_suite_id: 77,
                 workflow_name: "CI".to_owned(),
+                execution: None,
                 head_sha: member.head.oid.0.clone(),
                 status: "completed".to_owned(),
                 conclusion: "failure".to_owned(),
@@ -8382,6 +8402,7 @@ fn head_run(run_id: u64, head_sha: &str, status: &str, conclusion: &str) -> Work
         run_id,
         check_suite_id: run_id,
         workflow_name: "CI".to_owned(),
+        execution: None,
         head_sha: head_sha.to_owned(),
         status: status.to_owned(),
         conclusion: conclusion.to_owned(),

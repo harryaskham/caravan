@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub mod admission;
 pub mod ci;
 pub mod ci_admission_gate;
+pub mod ci_dispatch;
 pub mod ci_gate;
 pub mod command;
 pub mod compatibility;

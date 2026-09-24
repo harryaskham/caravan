@@ -207,6 +207,8 @@ pub(super) struct BranchSettingsJson {
 #[derive(Debug, Deserialize)]
 pub(super) struct CheckSuiteListJson {
     #[serde(default)]
+    pub(super) total_count: Option<usize>,
+    #[serde(default)]
     pub(super) check_suites: Vec<CheckSuiteJson>,
 }
 
@@ -226,6 +228,8 @@ pub(super) struct CheckSuiteJson {
 
 #[derive(Debug, Deserialize)]
 pub(super) struct CheckSuiteAppJson {
+    #[serde(default)]
+    pub(super) id: Option<u64>,
     #[serde(default)]
     pub(super) slug: String,
 }
@@ -250,6 +254,8 @@ impl From<CheckSuiteJson> for crate::required_runs::CheckSuiteLineage {
 #[derive(Debug, Deserialize)]
 pub(super) struct WorkflowRunListJson {
     #[serde(default)]
+    pub(super) total_count: Option<usize>,
+    #[serde(default)]
     pub(super) workflow_runs: Vec<HeadWorkflowRunJson>,
 }
 
@@ -258,6 +264,12 @@ pub(super) struct HeadWorkflowRunJson {
     pub(super) id: u64,
     #[serde(default)]
     pub(super) check_suite_id: u64,
+    #[serde(default)]
+    pub(super) workflow_id: Option<u64>,
+    #[serde(default)]
+    pub(super) run_attempt: Option<u64>,
+    #[serde(default)]
+    pub(super) pull_requests: Vec<WorkflowPullRequestJson>,
     #[serde(default)]
     pub(super) name: String,
     pub(super) head_sha: String,
@@ -269,9 +281,45 @@ pub(super) struct HeadWorkflowRunJson {
     pub(super) event: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub(super) struct WorkflowPullRequestJson {
+    number: u64,
+    head: WorkflowRefJson,
+    base: WorkflowRefJson,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkflowRefJson {
+    sha: String,
+    #[serde(rename = "ref")]
+    reference: String,
+}
+
 impl From<HeadWorkflowRunJson> for crate::required_runs::WorkflowRunLineage {
     fn from(run: HeadWorkflowRunJson) -> Self {
+        let execution = run
+            .workflow_id
+            .zip(run.run_attempt)
+            .filter(|(workflow, attempt)| *workflow > 0 && *attempt > 0)
+            .map(
+                |(workflow_id, run_attempt)| crate::required_runs::WorkflowExecutionIdentity {
+                    workflow_id,
+                    run_attempt,
+                    pull_requests: run
+                        .pull_requests
+                        .into_iter()
+                        .map(|pr| crate::required_runs::WorkflowPullRequestBinding {
+                            number: model::PrNumber(pr.number),
+                            head_sha: pr.head.sha,
+                            head_ref: pr.head.reference,
+                            base_sha: pr.base.sha,
+                            base_ref: pr.base.reference,
+                        })
+                        .collect(),
+                },
+            );
         Self {
+            execution,
             run_id: run.id,
             check_suite_id: run.check_suite_id,
             workflow_name: run.name,

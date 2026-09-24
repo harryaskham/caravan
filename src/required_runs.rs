@@ -193,12 +193,32 @@ pub struct CheckSuiteLineage {
     pub rerequestable: bool,
 }
 
+/// Provider-reported PR generation associated with a workflow execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WorkflowPullRequestBinding {
+    pub number: PrNumber,
+    pub head_sha: String,
+    pub head_ref: String,
+    pub base_sha: String,
+    pub base_ref: String,
+}
+
+/// Actual execution identity, never inferred from a workflow display name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WorkflowExecutionIdentity {
+    pub workflow_id: u64,
+    pub run_attempt: u64,
+    pub pull_requests: Vec<WorkflowPullRequestBinding>,
+}
+
 /// One workflow run observed for a commit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct WorkflowRunLineage {
     pub run_id: u64,
     pub check_suite_id: u64,
     pub workflow_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<WorkflowExecutionIdentity>,
     pub head_sha: String,
     pub status: String,
     pub conclusion: String,
@@ -227,6 +247,25 @@ impl HeadRunLineage {
     /// evidence that decided the current verdict.
     #[must_use]
     pub fn bounded(mut self) -> Self {
+        if self.check_suites.len() > MAX_REPORTED_LINEAGE
+            || self.workflow_runs.len() > MAX_REPORTED_LINEAGE
+            || self
+                .check_suites
+                .iter()
+                .map(|suite| suite.id)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != self.check_suites.len()
+            || self
+                .workflow_runs
+                .iter()
+                .map(|run| run.run_id)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != self.workflow_runs.len()
+        {
+            self.complete = false;
+        }
         self.check_suites
             .sort_by_key(|suite| std::cmp::Reverse(suite.id));
         self.check_suites.dedup_by_key(|suite| suite.id);
@@ -573,16 +612,17 @@ fn lineage_counts(lineage: Option<&HeadRunLineage>, head_sha: &str) -> (usize, u
 
 /// The single suite this policy is willing to rerequest on the unchanged head.
 ///
-/// Deterministic (lowest ID) so a retry addresses the same suite, and strictly
-/// scoped to the exact head so a superseded generation is never touched.
+/// Legacy missing-run recovery has no workflow applicability proof. It may
+/// address an unambiguous suite, never choose an App by discovery/ID ordering.
 #[must_use]
 pub fn rerequestable_suite(lineage: Option<&HeadRunLineage>, head_sha: &str) -> Option<u64> {
-    lineage?
+    let lineage = lineage.filter(|lineage| lineage.complete && lineage.head_sha == head_sha)?;
+    let mut suites = lineage
         .check_suites
         .iter()
-        .filter(|suite| suite.head_sha == head_sha && suite.rerequestable)
-        .map(|suite| suite.id)
-        .min()
+        .filter(|suite| suite.head_sha == head_sha && suite.rerequestable);
+    let only = suites.next()?;
+    suites.next().is_none().then_some(only.id)
 }
 
 /// Assess required-run coverage for one PR against one exact head.
