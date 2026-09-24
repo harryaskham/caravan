@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "bead": "bd-cd14df",
+  "scope": "source-only; no live queue or runtime mutation",
+  "requirements": [
+    {
+      "id": "CLOSED-01",
+      "contract": "Root, middle, tail, multiple and merged closures do not remain active; lifecycle-only cleanup precedes native gates and preserves source and unrelated labels.",
+      "tests": [
+        "closed_reformation_lifecycle_handles_root_middle_tail_multiple_and_merged_history",
+        "closed_reformation_routes_lifecycle_before_native_mutation_and_health_gates"
+      ]
+    },
+    {
+      "id": "CLOSED-02",
+      "contract": "Complete current provider facts authorize exact missing-suffix reformation after a retained merged prefix without fabricating an earlier checkpoint; raw history survives and repeated complete observations are no-ops.",
+      "tests": [
+        "closed_prefix_same_raw_and_logical_count_recovers_one_missing_tail",
+        "closed_prefix_auto_reforms_multiple_closures_and_partial_suffix_without_checkpoint"
+      ]
+    },
+    {
+      "id": "CLOSED-03",
+      "contract": "Changed Stack/history/head/base/merge state, unknown/interleaved history, intersecting mappings and truncated inventory never authorize automatic reformation or force rebase.",
+      "tests": [
+        "closed_prefix_auto_rejects_fresh_history_identity_and_base_races",
+        "closed_prefix_auto_refuses_closed_middle_tail_unmerged_and_reopened_history",
+        "closed_prefix_auto_refuses_history_intersection_and_truncated_inventory",
+        "closed_prefix_recovery_refuses_source_rewrite_before_post"
+      ]
+    },
+    {
+      "id": "CLOSED-04",
+      "contract": "Partial label progress and lost provider responses preserve receipts and never authorize replaying a completed transition.",
+      "tests": [
+        "closed_reformation_partial_failure_keeps_completed_receipts_and_resumes_without_replay",
+        "recovery_add_preserves_history_and_recovers_lost_response",
+        "retained_suffix_plan_replays_with_the_original_hash"
+      ]
+    },
+    {
+      "id": "CLOSED-05",
+      "contract": "The existing explicitly scoped cleanup keeps its no-admission/no-source-write boundary and fresh race guards.",
+      "tests": [
+        "scoped_closed_cleanup_ignores_unrelated_native_failure_and_is_idempotent",
+        "scoped_closed_cleanup_refuses_nonclosed_or_wrong_head_and_invalid_input",
+        "scoped_closed_cleanup_fences_reopen_head_and_label_races"
+      ]
+    }
+  ],
+  "delivery": "Focused hermetic tests answer the changed-path uncertainties; required hosted CI owns final broad validation. Publication is not installation or live acceptance."
+}

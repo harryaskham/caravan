@@ -192,6 +192,14 @@ passing run emits no feedback event. Manual runs may set `force_failure=true`
 to exercise the same visible failure/reporting path without weakening either
 test assertion.
 
+Closed PRs are excluded from active membership. Ordinary `sync` settles their
+lifecycle labels before native topology work, preserving history and source.
+A retained merged prefix with an exact open prefix can automatically acquire
+its missing accepted suffix; it does not need a fabricated old checkpoint.
+Interleaved/unmerged history and source-rewrite requirements are explicit
+refusals, not permission to force-rebase or erase retained rows. A recovery
+receipt is not CI qualification or a merge receipt.
+
 Domain surface:
 
 ```text
