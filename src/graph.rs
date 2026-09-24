@@ -21,6 +21,10 @@ use crate::squash_equivalence::SquashEquivalenceReport;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct GraphAnalysis {
     pub fleet: CaravanFleet,
+    /// Effective landing-target CI policy. Absent only in legacy/read-only
+    /// projections; mutation paths must always acquire fresh provider policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_policy: Option<crate::required_runs::RequiredContextsRead>,
     /// Canonical PR facts keyed by PR number for rendering and follow-up checks.
     pub pull_requests: BTreeMap<PrNumber, PullRequestSnapshot>,
     /// Exact compatibility evidence collected while validating current chains.
@@ -764,6 +768,7 @@ pub fn derive_for_actor(snapshot: &RepositorySnapshot, actor: HeadMergeActor) ->
     };
 
     GraphAnalysis {
+        required_policy: None,
         fleet: CaravanFleet {
             repository: snapshot.repository.clone(),
             default_branch: snapshot.default_branch.clone(),

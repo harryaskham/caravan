@@ -251,7 +251,12 @@ fn production_deferred_admission_is_unevaluated_not_source_failure() {
         .observe_ci(&provider, &repository(), candidate.number)
         .unwrap();
     assert_eq!(ci.disposition, CiDisposition::Waiting);
-    assert_eq!(ci.effective_checks.len(), 12);
+    assert_eq!(
+        ci.effective_checks.len(),
+        3,
+        "only the three declared requirements vote; all twelve raw observations remain diagnostic"
+    );
+    assert_eq!(ci.checks.len(), 12);
     assert!(
         ci.effective_checks
             .iter()
@@ -341,6 +346,15 @@ fn deferred_admission_negative_evidence_never_grants_admission() {
             _ => unreachable!(),
         }
         let provider = setup(&candidate, diagnostics, lineage);
+        if matches!(case, "source" | "other_workflow" | "unknown") {
+            let mut names = vec!["cara-admission", "Check & Lint", "Fast Tests (unit)"];
+            names.push(match case {
+                "source" => "independent source test",
+                "other_workflow" => "independent workflow",
+                _ => "unknown job",
+            });
+            provider.require_contexts("main", &names);
+        }
         let observed = status(vec![candidate.clone()], Some(candidate.number), &clean);
         let mut progress = SyncProgress::new(&observed, Vec::new(), u32::MAX);
         assert!(
@@ -362,6 +376,82 @@ fn deferred_admission_negative_evidence_never_grants_admission() {
                 .contains(&candidate.number),
             "{case}"
         );
+    }
+}
+
+#[test]
+fn effective_policy_deferred_gate_cannot_waive_a_foreign_app_or_borrow_its_proof() {
+    use crate::required_runs::RequiredCheck;
+    for case in ["exact", "two-apps", "borrowed-proof", "missing-suite"] {
+        let (mut candidate, diagnostics, lineage) = fixture();
+        let suite_id = lineage.workflow_runs[0].check_suite_id;
+        for check in &mut candidate.checks {
+            check.app_id = Some(77);
+            check.check_suite_id = Some(suite_id);
+            check.head_oid = Some(candidate.head.oid.clone());
+        }
+        let gate_check = candidate
+            .checks
+            .iter()
+            .find(|check| check.name == gate().context)
+            .unwrap()
+            .clone();
+        if matches!(case, "two-apps" | "borrowed-proof") {
+            candidate.checks.push(CheckSnapshot {
+                app_id: Some(88),
+                check_suite_id: Some(999),
+                ..gate_check
+            });
+        } else if case == "missing-suite" {
+            candidate
+                .checks
+                .iter_mut()
+                .find(|check| check.name == gate().context)
+                .unwrap()
+                .check_suite_id = None;
+        }
+        let provider = setup(&candidate, diagnostics, lineage);
+        let mut policy = provider.required_contexts.borrow()["main"].clone();
+        policy.checks = policy
+            .contexts
+            .iter()
+            .map(|context| RequiredCheck {
+                context: context.clone(),
+                app_id: Some(77),
+            })
+            .collect();
+        if case == "two-apps" {
+            policy.checks.push(RequiredCheck {
+                context: gate().context,
+                app_id: Some(88),
+            });
+        } else if case == "borrowed-proof" {
+            policy
+                .checks
+                .iter_mut()
+                .find(|check| check.context == gate().context)
+                .unwrap()
+                .app_id = Some(88);
+        }
+        provider
+            .required_contexts
+            .borrow_mut()
+            .insert("main".into(), policy.normalized());
+        let observed = status(vec![candidate.clone()], Some(candidate.number), &clean);
+        let mut progress = SyncProgress::new(&observed, Vec::new(), u32::MAX);
+        let outcome = candidate_local_admission_refusal(
+            &provider,
+            &mut progress,
+            &repository(),
+            candidate.number,
+            Some(&gate()),
+        );
+        assert_eq!(
+            matches!(outcome, Ok(None)),
+            case == "exact",
+            "{case}: {outcome:?}"
+        );
+        assert!(provider.calls.borrow().is_empty());
     }
 }
 

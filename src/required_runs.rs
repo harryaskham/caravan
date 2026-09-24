@@ -9,7 +9,7 @@
 //! This module owns the exact facts needed to tell that state apart from honest
 //! CI latency, and it deliberately consumes provider evidence only:
 //!
-//! - the required contexts declared by protection on the *exact base branch*;
+//! - the complete effective context/App policy of the *actual landing branch*;
 //! - the check-suite and workflow-run lineage observed on the *exact head OID*,
 //!   so a run belonging to a superseded generation never counts as coverage;
 //! - a bounded grace period measured from the latest provider timestamp that
@@ -61,7 +61,29 @@ pub const REQUIRED_RUNS_COMPONENT: &str = "cara sync";
 /// head/base/branch/membership exactly.
 pub const REVIEWED_MANUAL_RECOVERY: &str = "reviewed manual recovery: close and immediately reopen the exact PR to make GitHub queue a `pull_request` run on the unchanged head; never push an empty commit, force-push, retarget, or broadly rerun another generation";
 
-/// Exact protection-declared required contexts for one base branch.
+/// One effective required context, optionally bound to a specific GitHub App.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+pub struct RequiredCheck {
+    pub context: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_id: Option<u64>,
+}
+
+impl RequiredCheck {
+    /// A workflow aggregate is not a check run. A same-named foreign App or
+    /// stale commit cannot satisfy (or fail) this requirement.
+    #[must_use]
+    pub fn matches(&self, check: &CheckSnapshot, head: &crate::model::CommitOid) -> bool {
+        check.name == self.context
+            && check.provider_kind.as_deref() != Some("WorkflowRunLineage")
+            && check.head_oid.as_ref().is_none_or(|oid| oid == head)
+            && self.app_id.is_none_or(|app| {
+                check.app_id == Some(app) && check.head_oid.as_ref() == Some(head)
+            })
+    }
+}
+
+/// Complete effective required contexts for the actual landing branch.
 ///
 /// `complete` is false when the provider refused or truncated the protection
 /// read. A partial read can never prove a context is missing.
@@ -71,6 +93,9 @@ pub struct RequiredContextsRead {
     pub protected: bool,
     #[serde(default)]
     pub contexts: Vec<String>,
+    /// App-bound requirements. Legacy name-only contexts remain supported.
+    #[serde(default)]
+    pub checks: Vec<RequiredCheck>,
     pub complete: bool,
 }
 
@@ -82,6 +107,7 @@ impl RequiredContextsRead {
             branch: branch.to_owned(),
             protected: false,
             contexts: Vec::new(),
+            checks: Vec::new(),
             complete: true,
         }
     }
@@ -93,6 +119,7 @@ impl RequiredContextsRead {
             branch: branch.to_owned(),
             protected: true,
             contexts: Vec::new(),
+            checks: Vec::new(),
             complete: false,
         }
     }
@@ -100,10 +127,56 @@ impl RequiredContextsRead {
     /// Deterministically ordered, deduplicated, bounded contexts.
     #[must_use]
     pub fn normalized(mut self) -> Self {
+        // GitHub returns legacy declarations in both `contexts` and `checks`.
+        // A typed declaration refines that legacy name. Distinct Apps remain
+        // distinct requirements; diagnostic bounds never prove completeness.
+        for context in &self.contexts {
+            if !self.checks.iter().any(|check| &check.context == context) {
+                self.checks.push(RequiredCheck {
+                    context: context.clone(),
+                    app_id: None,
+                });
+            }
+        }
+        self.checks.sort();
+        self.checks.dedup();
+        self.contexts = self
+            .checks
+            .iter()
+            .map(|check| check.context.clone())
+            .collect();
         self.contexts.sort();
         self.contexts.dedup();
+        if self.checks.len() > MAX_REPORTED_CONTEXTS
+            || self
+                .checks
+                .iter()
+                .any(|check| check.context.is_empty() || check.app_id == Some(0))
+        {
+            self.complete = false;
+        }
+        self.checks.truncate(MAX_REPORTED_CONTEXTS);
         self.contexts.truncate(MAX_REPORTED_CONTEXTS);
         self
+    }
+
+    #[must_use]
+    pub fn required_checks<'a>(
+        &self,
+        checks: &'a [CheckSnapshot],
+        head: &crate::model::CommitOid,
+    ) -> Vec<&'a CheckSnapshot> {
+        let normalized = self.clone().normalized();
+        crate::model::latest_checks_per_identity(checks)
+            .0
+            .into_iter()
+            .filter(|check| {
+                normalized
+                    .checks
+                    .iter()
+                    .any(|required| required.matches(check, head))
+            })
+            .collect()
     }
 }
 
@@ -222,6 +295,8 @@ pub enum RequiredContextState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RequiredContextCoverage {
     pub context: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_id: Option<u64>,
     pub state: RequiredContextState,
     /// Reporting check names observed on the exact head, if any.
     #[serde(default)]
@@ -237,7 +312,7 @@ pub struct RequiredContextCoverage {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum RequiredRunsStatus {
-    /// The exact base branch declares no required context.
+    /// The actual landing branch declares no required context.
     NotRequired,
     /// Every required context reported a passing verdict.
     Satisfied,
@@ -345,6 +420,9 @@ pub struct RequiredRunsAssessment {
     pub status: RequiredRunsStatus,
     #[serde(default)]
     pub required_contexts: Vec<String>,
+    /// Complete policy identity, sealed into the receipt for drift detection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_policy: Option<RequiredContextsRead>,
     #[serde(default)]
     pub coverage: Vec<RequiredContextCoverage>,
     /// Exact contexts with zero reporting lineage on the exact head.
@@ -507,6 +585,7 @@ pub fn rerequestable_suite(lineage: Option<&HeadRunLineage>, head_sha: &str) -> 
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn assess(input: &RequiredRunsInput<'_>) -> RequiredRunsAssessment {
+    let policy = input.contexts.clone().normalized();
     let head_sha = input.head.oid.0.clone();
     let (observed_check_suites, observed_runs, stale_head_runs) =
         lineage_counts(input.lineage, &head_sha);
@@ -519,13 +598,14 @@ pub fn assess(input: &RequiredRunsInput<'_>) -> RequiredRunsAssessment {
         .map(|published| input.clock.now_unix.saturating_sub(published));
     let grace_elapsed = head_age_secs.is_some_and(|age| age >= input.clock.grace_secs);
 
-    if input.contexts.contexts.is_empty() && input.contexts.complete {
+    if policy.checks.is_empty() && policy.complete {
         return RequiredRunsAssessment {
             pr: input.pr,
             head: input.head.clone(),
             base: input.base.clone(),
             status: RequiredRunsStatus::NotRequired,
             required_contexts: Vec::new(),
+            required_policy: Some(policy.clone()),
             coverage: Vec::new(),
             missing_contexts: Vec::new(),
             observed_check_suites,
@@ -537,8 +617,8 @@ pub fn assess(input: &RequiredRunsInput<'_>) -> RequiredRunsAssessment {
             grace_elapsed,
             recovery: RequiredRunsRecovery::None,
             reason: format!(
-                "base branch `{}` declares no required status check; required-run coverage cannot stall this head",
-                input.base.name
+                "landing branch `{}` declares no required status check; required-run coverage cannot stall this head",
+                policy.branch
             ),
         };
     }
@@ -552,16 +632,17 @@ pub fn assess(input: &RequiredRunsInput<'_>) -> RequiredRunsAssessment {
     let (current_checks, _superseded_checks) =
         crate::model::latest_checks_per_identity(input.checks);
     let mut coverage = Vec::new();
-    for context in &input.contexts.contexts {
+    for required in &policy.checks {
         let matching = input
             .checks
             .iter()
-            .filter(|check| check.name == *context)
+            .filter(|check| required.matches(check, &input.head.oid))
             .collect::<Vec<_>>();
         let current_matching = current_checks
             .iter()
             .copied()
-            .filter(|check| check.name == *context)
+            .filter(|check| required.matches(check, &input.head.oid))
+            .filter(|check| !superseded_by_exact_lineage(check, input.lineage, &head_sha))
             .collect::<Vec<_>>();
         let reporting_checks = matching
             .iter()
@@ -573,7 +654,8 @@ pub fn assess(input: &RequiredRunsInput<'_>) -> RequiredRunsAssessment {
             None => (state_from_lineage(input.lineage, &head_sha), None),
         };
         coverage.push(RequiredContextCoverage {
-            context: context.clone(),
+            context: required.context.clone(),
+            app_id: required.app_id,
             state,
             reporting_checks,
             provider_state,
@@ -587,7 +669,7 @@ pub fn assess(input: &RequiredRunsInput<'_>) -> RequiredRunsAssessment {
         .map(|item| item.context.clone())
         .collect::<Vec<_>>();
     let lineage_complete = input.lineage.is_none_or(|lineage| lineage.complete);
-    let provider_reads_complete = input.contexts.complete && lineage_complete;
+    let provider_reads_complete = policy.complete && lineage_complete;
     let has_unknown = coverage
         .iter()
         .any(|item| item.state == RequiredContextState::Unknown);
@@ -693,7 +775,8 @@ pub fn assess(input: &RequiredRunsInput<'_>) -> RequiredRunsAssessment {
         head: input.head.clone(),
         base: input.base.clone(),
         status,
-        required_contexts: input.contexts.contexts.clone(),
+        required_contexts: policy.contexts.clone(),
+        required_policy: Some(policy),
         coverage,
         missing_contexts,
         observed_check_suites,
@@ -1019,6 +1102,76 @@ const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
     let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
     era * 146_097 + day_of_era - 719_468
+}
+
+#[cfg(test)]
+mod effective_policy_tests;
+/// Exact provider lineage can retire an old row while its replacement has no
+/// jobs yet, but a workflow conclusion can never manufacture a passing check.
+fn superseded_by_exact_lineage(
+    check: &CheckSnapshot,
+    lineage: Option<&HeadRunLineage>,
+    head: &str,
+) -> bool {
+    let Some(lineage) = lineage.filter(|lineage| lineage.complete && lineage.head_sha == head)
+    else {
+        return false;
+    };
+    let Some(run_id) = check
+        .details_url
+        .as_deref()
+        .and_then(|url| url.split_once("/actions/runs/"))
+        .and_then(|(_, suffix)| suffix.split('/').next()?.parse::<u64>().ok())
+    else {
+        return false;
+    };
+    if lineage
+        .workflow_runs
+        .iter()
+        .map(|run| run.run_id)
+        .collect::<BTreeSet<_>>()
+        .len()
+        != lineage.workflow_runs.len()
+        || lineage
+            .check_suites
+            .iter()
+            .map(|suite| suite.id)
+            .collect::<BTreeSet<_>>()
+            .len()
+            != lineage.check_suites.len()
+    {
+        return false;
+    }
+    let Some(old) = lineage
+        .workflow_runs
+        .iter()
+        .find(|run| run.run_id == run_id && run.head_sha == head && !run.workflow_name.is_empty())
+    else {
+        return false;
+    };
+    let Some(old_suite) = lineage
+        .check_suites
+        .iter()
+        .find(|suite| suite.id == old.check_suite_id && suite.head_sha == head)
+    else {
+        return false;
+    };
+    if check.app_id.is_some()
+        && (check.check_suite_id != Some(old_suite.id)
+            || check.head_oid.as_ref().is_none_or(|oid| oid.0 != head))
+    {
+        return false;
+    }
+    lineage.workflow_runs.iter().any(|new| {
+        new.run_id > old.run_id
+            && new.head_sha == head
+            && new.workflow_name == old.workflow_name
+            && lineage.check_suites.iter().any(|suite| {
+                suite.id == new.check_suite_id
+                    && suite.head_sha == head
+                    && suite.app_slug == old_suite.app_slug
+            })
+    })
 }
 
 #[cfg(test)]

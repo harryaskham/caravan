@@ -2388,6 +2388,13 @@ fn status_with_discovery_options(
         stack_backend.mutation_support = StackMutationSupport::NativeStack;
     }
     apply_stack_backend_mutation_policy(&context.config, &stack_backend, &mut initialization);
+    analysis.required_policy = Some(
+        label_provider
+            .branch_required_contexts(&snapshot.repository, &snapshot.default_branch.name)
+            .unwrap_or_else(|_| {
+                crate::required_runs::RequiredContextsRead::partial(&snapshot.default_branch.name)
+            }),
+    );
     let admission = resolve_admission_with_generation_and_gate(
         &analysis,
         &context.config.agent_priority_labels,
@@ -2797,10 +2804,25 @@ fn resolve_admission_with_generation_and_gate(
         // called it ineligible, and the two surfaces disagreed about the same PR
         // (observed on cacophony PR 2276).
         let has_unjoined_descendants = unjoined_parent_dependencies.contains(number);
+        let ci_candidate = required_check_snapshot(pull_request, analysis.required_policy.as_ref());
+        if analysis.required_policy.as_ref().is_some_and(|policy| {
+            !policy.complete
+                || ci_candidate
+                    .checks
+                    .iter()
+                    .any(|check| check.state == crate::model::CheckState::Unknown)
+        }) {
+            rejected.push(RejectedAdmissionCandidate {
+                pr: *number, priority_rank: configured.first().map(|(_, rank)| rank + 1),
+                created_at, blocks_order: true,
+                reason: "effective landing-target required-check policy or a required provider state is unknown".to_owned(),
+            });
+            continue;
+        }
         if !pull_request.has_label("caravan-force")
-            && has_failing_check(pull_request)
+            && has_failing_check(&ci_candidate)
             && !admission_gate
-                .is_some_and(|gate| candidate_may_have_deferred_gate(pull_request, gate))
+                .is_some_and(|gate| candidate_may_have_deferred_gate(&ci_candidate, gate))
         {
             if has_unjoined_descendants {
                 rejected.push(RejectedAdmissionCandidate {
@@ -3586,10 +3608,11 @@ fn check_analysis_with_recommendation(
         .cloned()
         .collect::<Vec<_>>();
     let mut ordering_note: Option<String> = None;
-    validate_candidate(
+    validate_candidate_with_policy(
         pull_request,
         &mut problems,
         status.auto_admission.admission_gate.as_ref(),
+        status.analysis.required_policy.as_ref(),
     );
     // In physical membership mode the provider's synthetic merge ref is
     // advisory only: prepare/apply independently fetch and verify the exact PR
@@ -4134,12 +4157,51 @@ fn resolve_target_caravan<'a>(
     }
 }
 
+/// A temporary eligibility projection, never a replacement for raw diagnostics.
+pub(crate) fn required_check_snapshot(
+    pull: &PullRequestSnapshot,
+    policy: Option<&crate::required_runs::RequiredContextsRead>,
+) -> PullRequestSnapshot {
+    let mut projected = pull.clone();
+    if let Some(policy) = policy.filter(|policy| policy.complete) {
+        projected.checks = policy
+            .required_checks(&pull.checks, &pull.head.oid)
+            .into_iter()
+            .cloned()
+            .collect();
+    }
+    projected
+}
+
+#[cfg(test)]
 fn validate_candidate(
     pull_request: &PullRequestSnapshot,
     problems: &mut Vec<GraphProblem>,
     admission_gate: Option<&crate::config::CiAdmissionGateConfig>,
 ) {
+    validate_candidate_with_policy(pull_request, problems, admission_gate, None);
+}
+
+fn validate_candidate_with_policy(
+    pull_request: &PullRequestSnapshot,
+    problems: &mut Vec<GraphProblem>,
+    admission_gate: Option<&crate::config::CiAdmissionGateConfig>,
+    policy: Option<&crate::required_runs::RequiredContextsRead>,
+) {
+    let projected = required_check_snapshot(pull_request, policy);
+    let pull_request = &projected;
     let mut messages = BTreeSet::new();
+    if policy.is_some_and(|policy| !policy.complete) {
+        messages.insert("effective landing-target required-check policy is incomplete");
+    }
+    if policy.is_some()
+        && pull_request
+            .checks
+            .iter()
+            .any(|check| check.state == crate::model::CheckState::Unknown)
+    {
+        messages.insert("a required check has an unknown provider state");
+    }
     if pull_request.state != PullRequestState::Open {
         messages.insert("candidate PR is not open");
     }

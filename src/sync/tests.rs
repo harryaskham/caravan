@@ -54,6 +54,8 @@ struct FakeProvider {
     comments: RefCell<BTreeMap<PrNumber, Vec<String>>>,
     /// Protection-declared required contexts, keyed by branch name.
     required_contexts: RefCell<BTreeMap<String, RequiredContextsRead>>,
+    policy_reads: RefCell<Vec<String>>,
+    policy_overrides: RefCell<VecDeque<RequiredContextsRead>>,
     /// Head lineage served for a PR, keyed by PR number.
     head_lineage: RefCell<BTreeMap<PrNumber, VecDeque<HeadRunLineage>>>,
     /// Every PR whose head lineage was actually read, in order.
@@ -80,10 +82,26 @@ struct FakeProvider {
 }
 
 mod deferred_admission;
+mod effective_policy;
 use deferred_admission::prove_deferred;
 
 impl FakeProvider {
     fn with_pull_requests(pulls: Vec<PullRequestSnapshot>) -> Self {
+        // Historical CI fixtures intend their initial observations to be
+        // required. Declare that policy explicitly rather than relying on the
+        // removed production all-check gate. Optional-check tests override it.
+        let contexts = pulls
+            .iter()
+            .flat_map(|pull| pull.checks.iter().map(|check| check.name.clone()))
+            .collect();
+        let policy = RequiredContextsRead {
+            branch: "main".to_owned(),
+            protected: true,
+            contexts,
+            checks: Vec::new(),
+            complete: true,
+        }
+        .normalized();
         Self {
             allows_auto_merge: true,
             allows_squash_merge: true,
@@ -114,7 +132,9 @@ impl FakeProvider {
             branch_head: RefCell::new(branch("main").oid),
             audits: RefCell::new(Vec::new()),
             comments: RefCell::new(BTreeMap::new()),
-            required_contexts: RefCell::new(BTreeMap::new()),
+            required_contexts: RefCell::new(BTreeMap::from([("main".to_owned(), policy)])),
+            policy_reads: RefCell::new(Vec::new()),
+            policy_overrides: RefCell::new(VecDeque::new()),
             head_lineage: RefCell::new(BTreeMap::new()),
             lineage_reads: RefCell::new(Vec::new()),
             rerequestable_suites: RefCell::new(BTreeMap::new()),
@@ -139,6 +159,7 @@ impl FakeProvider {
                 branch: branch.to_owned(),
                 protected: true,
                 contexts: contexts.iter().map(|value| (*value).to_owned()).collect(),
+                checks: Vec::new(),
                 complete: true,
             }
             .normalized(),
@@ -894,6 +915,10 @@ impl SyncProvider for FakeProvider {
         _repository: &RepositoryId,
         branch: &str,
     ) -> Result<RequiredContextsRead, MutationError> {
+        self.policy_reads.borrow_mut().push(branch.to_owned());
+        if let Some(policy) = self.policy_overrides.borrow_mut().pop_front() {
+            return Ok(policy);
+        }
         Ok(self
             .required_contexts
             .borrow()
@@ -8415,7 +8440,11 @@ fn a_head_with_zero_required_runs_is_reported_instead_of_waiting_forever() {
     );
     assert_eq!(scheduler.disposition, SchedulerDisposition::OperatorAction);
     assert_eq!(scheduler.wake_class, SchedulerWakeClass::OperatorAction);
-    assert_eq!(scheduler.missing_required_runs.len(), 1);
+    assert_eq!(
+        scheduler.missing_required_runs.len(),
+        3,
+        "each member must meet the landing-target policy, not its intermediate parent policy"
+    );
 }
 
 #[test]
@@ -8885,7 +8914,7 @@ fn missing_required_run_hook_evidence_is_deduplicated_and_bounded() {
     let replay = execute(&status, &provider, false, false, false).expect("second pass");
     merge_sync_progress(&mut progress, replay);
 
-    assert_eq!(progress.missing_required_runs.len(), 1);
+    assert_eq!(progress.missing_required_runs.len(), 3);
     assert_eq!(
         progress
             .required_runs
@@ -8901,7 +8930,7 @@ fn missing_required_run_hook_evidence_is_deduplicated_and_bounded() {
         .filter(|event| event.kind == EventKind::RequiredRunsMissing)
         .count();
     assert_eq!(
-        emitted, 1,
+        emitted, 3,
         "two convergence passes over one member must not notify hooks twice"
     );
     let problem = &progress.missing_required_runs[0];
@@ -8943,16 +8972,18 @@ fn grace_starts_at_publication_not_at_a_preserved_commit_date() {
 
     // A tick two minutes after publication is still inside the default grace.
     let published_unix = crate::required_runs::rfc3339_to_unix_secs(PUBLISHED).expect("timestamp");
+    let required_contexts = RequiredContextsRead {
+        branch: "main".to_owned(),
+        protected: true,
+        contexts: vec![CHECK_LINT.to_owned(), FAST_TESTS.to_owned()],
+        checks: Vec::new(),
+        complete: true,
+    };
     let assessment = crate::required_runs::assess(&crate::required_runs::RequiredRunsInput {
         pr: pull_request.number,
         head: &pull_request.head,
         base: &pull_request.base,
-        contexts: &RequiredContextsRead {
-            branch: "main".to_owned(),
-            protected: true,
-            contexts: vec![CHECK_LINT.to_owned(), FAST_TESTS.to_owned()],
-            complete: true,
-        },
+        contexts: &required_contexts,
         lineage: Some(&lineage),
         checks: &pull_request.checks,
         head_published_at: head_published_at(&pull_request, Some(&lineage)).as_deref(),
@@ -8969,12 +9000,7 @@ fn grace_starts_at_publication_not_at_a_preserved_commit_date() {
         pr: pull_request.number,
         head: &pull_request.head,
         base: &pull_request.base,
-        contexts: &RequiredContextsRead {
-            branch: "main".to_owned(),
-            protected: true,
-            contexts: vec![CHECK_LINT.to_owned(), FAST_TESTS.to_owned()],
-            complete: true,
-        },
+        contexts: &required_contexts,
         lineage: Some(&lineage),
         checks: &pull_request.checks,
         head_published_at: head_published_at(&pull_request, Some(&lineage)).as_deref(),
@@ -11582,6 +11608,11 @@ fn native_sync_checkpoints_partial_prefix_before_lock_or_source_write() {
         },
     ];
 
+    // A passing diagnostic alone is no longer merge authority. Supply the
+    // explicit complete landing-target receipt for the ready root only.
+    progress
+        .verify_required_runs(&provider, &status.repository, caravan.id, PrNumber(1))
+        .unwrap();
     let error = progress
         .drain_native_stack(&provider, &status, &caravan, 42, &native)
         .expect_err("fake provider stops at native lock acquisition");

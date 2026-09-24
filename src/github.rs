@@ -29,8 +29,8 @@ const WORKFLOW_RUN_JSON_FIELDS: &str =
 /// observed returning 459 KiB for 53 rows before GitHub intermittently 504ed.
 const OPEN_PR_PAGE_SIZE: usize = 20;
 const OPEN_PR_SNAPSHOT_ATTEMPTS: usize = 2;
-const OPEN_PR_PAGE_QUERY: &str = r"query($owner:String!,$name:String!,$cursor:String,$pageSize:Int!){repository(owner:$owner,name:$name){pullRequests(states:OPEN,first:$pageSize,after:$cursor,orderBy:{field:CREATED_AT,direction:ASC}){nodes{number title body state isDraft mergeStateStatus headRefName headRefOid headRepository{name nameWithOwner} headRepositoryOwner{login} isCrossRepository baseRefName baseRefOid labels(first:100){nodes{name} pageInfo{hasNextPage}} autoMergeRequest{mergeMethod enabledBy{login}} statusCheckRollup{contexts(first:100){nodes{__typename ... on CheckRun{name status conclusion detailsUrl startedAt completedAt checkSuite{workflowRun{workflow{name}}}} ... on StatusContext{context state targetUrl createdAt}} pageInfo{hasNextPage}}} createdAt mergedAt url updatedAt} totalCount pageInfo{hasNextPage endCursor}}}}";
-const OPEN_PR_PAGE_JQ: &str = r".data.repository.pullRequests as $prs | {rows:[$prs.nodes[] | {number,title,body,state,isDraft,mergeStateStatus,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository,baseRefName,baseRefOid,labels:(.labels.nodes // []),labelsTruncated:(.labels.pageInfo.hasNextPage // false),autoMergeRequest,statusCheckRollup:((.statusCheckRollup.contexts.nodes // []) | map(. + {workflowName:(.checkSuite.workflowRun.workflow.name // null)} | del(.checkSuite))),checksTruncated:(.statusCheckRollup.contexts.pageInfo.hasNextPage // false),createdAt,mergedAt,url,updatedAt}],pageInfo:($prs.pageInfo + {totalCount:$prs.totalCount})}";
+const OPEN_PR_PAGE_QUERY: &str = r"query($owner:String!,$name:String!,$cursor:String,$pageSize:Int!){repository(owner:$owner,name:$name){pullRequests(states:OPEN,first:$pageSize,after:$cursor,orderBy:{field:CREATED_AT,direction:ASC}){nodes{number title body state isDraft mergeStateStatus headRefName headRefOid headRepository{name nameWithOwner} headRepositoryOwner{login} isCrossRepository baseRefName baseRefOid labels(first:100){nodes{name} pageInfo{hasNextPage}} autoMergeRequest{mergeMethod enabledBy{login}} statusCheckRollup{contexts(first:100){nodes{__typename ... on CheckRun{name status conclusion detailsUrl startedAt completedAt checkSuite{databaseId app{databaseId} commit{oid} workflowRun{workflow{name}}}} ... on StatusContext{context state targetUrl createdAt}} pageInfo{hasNextPage}}} createdAt mergedAt url updatedAt} totalCount pageInfo{hasNextPage endCursor}}}}";
+const OPEN_PR_PAGE_JQ: &str = r".data.repository.pullRequests as $prs | {rows:[$prs.nodes[] | {number,title,body,state,isDraft,mergeStateStatus,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository,baseRefName,baseRefOid,labels:(.labels.nodes // []),labelsTruncated:(.labels.pageInfo.hasNextPage // false),autoMergeRequest,statusCheckRollup:((.statusCheckRollup.contexts.nodes // []) | map(. + {workflowName:(.checkSuite.workflowRun.workflow.name // null),appId:(.checkSuite.app.databaseId // null),checkSuiteId:(.checkSuite.databaseId // null),headOid:(.checkSuite.commit.oid // null)} | del(.checkSuite))),checksTruncated:(.statusCheckRollup.contexts.pageInfo.hasNextPage // false),createdAt,mergedAt,url,updatedAt}],pageInfo:($prs.pageInfo + {totalCount:$prs.totalCount})}";
 /// Keeps JSON/MCP output and GraphQL cost bounded on pathological repositories.
 const MERGE_CANDIDATE_LIMIT: usize = 100;
 const PARKED_LABEL: &str = "caravan-parked";
@@ -1486,36 +1486,7 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
         repository: &RepositoryId,
         branch: &str,
     ) -> Result<crate::required_runs::RequiredContextsRead, MutationError> {
-        let settings: BranchSettingsJson =
-            match self.json::<BranchSettingsJson>(branch_settings_command(repository, branch)) {
-                Ok(settings) => settings,
-                Err(_) => return Ok(crate::required_runs::RequiredContextsRead::partial(branch)),
-            };
-        if !settings.protected {
-            return Ok(crate::required_runs::RequiredContextsRead::unprotected(
-                branch,
-            ));
-        }
-        let Ok(policy) =
-            self.json::<BranchProtectionJson>(branch_protection_command(repository, branch))
-        else {
-            return Ok(crate::required_runs::RequiredContextsRead::partial(branch));
-        };
-        let mut contexts = policy
-            .required_status_checks
-            .as_ref()
-            .map(|checks| checks.contexts.clone())
-            .unwrap_or_default();
-        if let Some(checks) = policy.required_status_checks.as_ref() {
-            contexts.extend(checks.checks.iter().map(|check| check.context.clone()));
-        }
-        Ok(crate::required_runs::RequiredContextsRead {
-            branch: branch.to_owned(),
-            protected: true,
-            contexts,
-            complete: true,
-        }
-        .normalized())
+        self.effective_required_checks(repository, branch)
     }
 
     /// Check-suite and workflow-run lineage for the exact verified PR head.
@@ -3066,6 +3037,25 @@ fn open_pr_page_command(
 }
 
 fn pull_request_command(repository: &RepositoryId, selector: &str) -> CommandSpec {
+    if let Ok(number) = selector.parse::<u64>() {
+        // gh pr view's fixed rollup projection omits the App/commit identity.
+        // Use the same complete projection as paged discovery for exact PRs.
+        let query = OPEN_PR_PAGE_QUERY
+            .replace("$cursor:String,$pageSize:Int!", "$number:Int!")
+            .replace("pullRequests(states:OPEN,first:$pageSize,after:$cursor,orderBy:{field:CREATED_AT,direction:ASC}){nodes{", "pullRequest(number:$number){")
+            .replace("} totalCount pageInfo{hasNextPage endCursor}", "");
+        let projection = OPEN_PR_PAGE_JQ.replace(
+            ".data.repository.pullRequests as $prs",
+            ".data.repository.pullRequest as $pr | {nodes:[$pr],pageInfo:{},totalCount:1} as $prs",
+        );
+        return CommandSpec::new("gh").args([
+            "api".to_owned(), "graphql".to_owned(), "-f".to_owned(), format!("query={query}"),
+            "-F".to_owned(), format!("owner={}", repository.owner),
+            "-F".to_owned(), format!("name={}", repository.name),
+            "-F".to_owned(), format!("number={number}"),
+            "--jq".to_owned(), format!("{projection} | .rows[0] | if .labelsTruncated or .checksTruncated then error(\"incomplete PR checks/labels\") else . end"),
+        ]);
+    }
     CommandSpec::new("gh").args([
         "pr",
         "view",
@@ -3630,6 +3620,7 @@ fn normalize_check_state(provider_state: Option<&str>) -> CheckState {
 }
 
 mod raw;
+mod required_policy;
 mod stack;
 mod stack_land;
 mod stack_lock;
@@ -5951,6 +5942,10 @@ mod tests {
                 CommandOutput::success(r#"{"protected":true}"#),
             ),
             (
+                required_policy::branch_rules_command(&repository, "main"),
+                CommandOutput::success("[[]]"),
+            ),
+            (
                 branch_protection_command(&repository, "main"),
                 CommandOutput::success(
                     r#"{"required_status_checks":{"strict":false,"contexts":["Check & Lint"],"checks":[{"context":"Fast Tests (unit)"},{"context":"Check & Lint"}]}}"#,
@@ -5975,10 +5970,16 @@ mod tests {
     #[test]
     fn an_unprotected_branch_is_a_complete_empty_requirement() {
         let repository = repository();
-        let runner = FakeRunner::new(vec![(
-            branch_settings_command(&repository, "caravan/2210"),
-            CommandOutput::success(r#"{"protected":false}"#),
-        )]);
+        let runner = FakeRunner::new(vec![
+            (
+                branch_settings_command(&repository, "caravan/2210"),
+                CommandOutput::success(r#"{"protected":false}"#),
+            ),
+            (
+                required_policy::branch_rules_command(&repository, "caravan/2210"),
+                CommandOutput::success("[[]]"),
+            ),
+        ]);
         let adapter = GitHubMutationAdapter::new(runner);
 
         let read = adapter
@@ -5998,6 +5999,10 @@ mod tests {
             (
                 branch_settings_command(&repository, "main"),
                 CommandOutput::success(r#"{"protected":true}"#),
+            ),
+            (
+                required_policy::branch_rules_command(&repository, "main"),
+                CommandOutput::success("[[]]"),
             ),
             (
                 branch_protection_command(&repository, "main"),

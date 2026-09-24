@@ -702,6 +702,7 @@ mod tests {
             "caravan-priority:low".to_owned(),
         ];
         let analysis = GraphAnalysis {
+            required_policy: None,
             fleet: CaravanFleet {
                 repository: repository.clone(),
                 default_branch: branch("main", "main-current"),

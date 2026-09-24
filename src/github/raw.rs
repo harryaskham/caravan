@@ -337,6 +337,8 @@ pub(super) struct RequiredStatusChecksJson {
 #[derive(Debug, Deserialize)]
 pub(super) struct RequiredCheckJson {
     pub(super) context: String,
+    #[serde(default)]
+    pub(super) app_id: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -614,7 +616,7 @@ impl PullRequestJson {
             head: BranchSnapshot {
                 repository: head_repository,
                 name: self.head_ref_name,
-                oid: CommitOid(self.head_ref_oid),
+                oid: CommitOid(self.head_ref_oid.clone()),
             },
             base: BranchSnapshot {
                 repository: base_repository.clone(),
@@ -629,7 +631,16 @@ impl PullRequestJson {
                 let mut checks = self
                     .status_check_rollup
                     .into_iter()
-                    .map(CheckJson::into_snapshot)
+                    .map(|check| {
+                        let mut check = check.into_snapshot();
+                        // The PR rollup is scoped by the provider to this head.
+                        // Preserve an explicit check-suite commit, including any
+                        // mismatch, rather than stamping over contrary evidence.
+                        check
+                            .head_oid
+                            .get_or_insert_with(|| CommitOid(self.head_ref_oid.clone()));
+                        check
+                    })
                     .collect::<Vec<_>>();
                 // bd-eff1dc: mark lineage once, here, so every reader shows the
                 // same history without re-deriving supersession per surface.
@@ -712,6 +723,12 @@ pub(super) struct CheckJson {
     pub(super) conclusion: Option<String>,
     pub(super) state: Option<String>,
     pub(super) workflow_name: Option<String>,
+    #[serde(default)]
+    pub(super) app_id: Option<u64>,
+    #[serde(default)]
+    pub(super) check_suite_id: Option<u64>,
+    #[serde(default)]
+    pub(super) head_oid: Option<CommitOid>,
     pub(super) details_url: Option<String>,
     pub(super) target_url: Option<String>,
     /// bd-eff1dc: run ordering. A rollup keeps every historical run of a
@@ -748,6 +765,9 @@ impl CheckJson {
             details_url: self.details_url.or(self.target_url),
             provider_kind: Some(self.kind).filter(|kind| !kind.is_empty()),
             workflow_name: self.workflow_name.filter(|name| !name.is_empty()),
+            app_id: self.app_id,
+            check_suite_id: self.check_suite_id,
+            head_oid: self.head_oid,
             started_at,
             completed_at: self.completed_at.filter(|stamp| !stamp.is_empty()),
             // Set by `mark_superseded_checks` once the whole rollup is known;

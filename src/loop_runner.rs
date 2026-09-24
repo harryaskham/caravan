@@ -429,6 +429,7 @@ mod tests {
                         next_candidate: None,
                     },
                     analysis: crate::graph::GraphAnalysis {
+                        required_policy: None,
                         fleet: CaravanFleet {
                             repository: repository.clone(),
                             default_branch: crate::model::BranchSnapshot {

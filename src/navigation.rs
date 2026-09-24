@@ -979,6 +979,7 @@ mod tests {
                 next_candidate: None,
             },
             analysis: GraphAnalysis {
+                required_policy: None,
                 fleet: CaravanFleet {
                     repository: repository(),
                     default_branch: branch("main", 99),

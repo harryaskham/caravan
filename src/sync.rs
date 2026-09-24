@@ -1340,7 +1340,7 @@ pub trait SyncProvider {
         expected: &PullRequestPrecondition,
     ) -> Result<Vec<WorkflowRunSnapshot>, MutationError>;
 
-    /// Exact protection-declared required contexts for one base branch.
+    /// Complete effective context/App policy of the actual landing branch.
     fn branch_required_contexts(
         &self,
         repository: &RepositoryId,
@@ -2977,6 +2977,12 @@ fn reconcile_terminal_red_parking(
         return Ok(ParkingReconciliation::default());
     }
     let mut output = ParkingReconciliation::default();
+    let target = &status.analysis.fleet.default_branch.name;
+    let mut policy = provider
+        .branch_required_contexts(&status.repository, target)
+        .unwrap_or_else(|_| RequiredContextsRead::partial(target))
+        .normalized();
+    policy.complete &= policy.branch == *target;
     for caravan in &status.analysis.fleet.caravans {
         let receipt_start = output.provider_receipts.len();
         let mut failures = Vec::new();
@@ -2988,28 +2994,50 @@ fn reconcile_terminal_red_parking(
                 .pull_requests
                 .get(number)
                 .expect("caravan member has provider facts");
-            let (current, superseded) =
+            // Supersession needs the complete provider rollup, including
+            // optional rows proving that a newer workflow generation exists.
+            let (latest, superseded) =
                 crate::model::latest_checks_per_identity(&pull_request.checks);
+            let current = latest
+                .into_iter()
+                .filter(|check| {
+                    policy
+                        .checks
+                        .iter()
+                        .any(|required| required.matches(check, &pull_request.head.oid))
+                })
+                .collect::<Vec<_>>();
+            let assessment = required_runs::assess(&RequiredRunsInput {
+                pr: *number,
+                head: &pull_request.head,
+                base: &pull_request.base,
+                contexts: &policy,
+                lineage: None,
+                checks: &pull_request.checks,
+                head_published_at: pull_request.updated_at.as_deref(),
+                clock: RequiredRunsClock {
+                    now_unix: now_unix(),
+                    grace_secs: 0,
+                },
+            });
             let terminal = current
                 .iter()
                 .filter(|check| {
-                    matches!(
-                        check.state,
-                        CheckState::Failure
-                            | CheckState::Cancelled
-                            | CheckState::TimedOut
-                            | CheckState::ActionRequired
-                    )
+                    policy.complete
+                        && matches!(
+                            check.state,
+                            CheckState::Failure
+                                | CheckState::Cancelled
+                                | CheckState::TimedOut
+                                | CheckState::ActionRequired
+                        )
                 })
                 .copied()
                 .collect::<Vec<_>>();
-            let member_green = !current.is_empty()
-                && current.iter().all(|check| {
-                    matches!(
-                        check.state,
-                        CheckState::Success | CheckState::Neutral | CheckState::Skipped
-                    )
-                });
+            let member_green = matches!(
+                assessment.status,
+                RequiredRunsStatus::Satisfied | RequiredRunsStatus::NotRequired
+            );
             all_members_green &= member_green;
             let classification = if !terminal.is_empty() {
                 parking_failure_classification(&current)
@@ -3029,6 +3057,8 @@ fn reconcile_terminal_red_parking(
                 "pr": number,
                 "head": pull_request.head.oid,
                 "checks": &current,
+                "all_checks": &pull_request.checks,
+                "required_runs": &assessment,
                 "superseded_checks": &superseded,
                 "classification": classification,
             }));
@@ -3160,6 +3190,31 @@ fn reconcile_terminal_red_parking(
             .map_err(|error| {
                 parking_mutation_error(&error, caravan, &failures, &output.provider_receipts)
             })?;
+        let fresh_policy = provider
+            .branch_required_contexts(&status.repository, target)
+            .unwrap_or_else(|_| RequiredContextsRead::partial(target))
+            .normalized();
+        if fresh_policy != policy || !fresh_policy.complete {
+            return Err(AppError::structured(
+                ErrorCategory::Validation,
+                "parking_required_policy_changed",
+                "landing-target required-check policy changed before parking transition",
+                Some(
+                    json!({"expected": policy, "actual": fresh_policy, "provider_receipts": output.provider_receipts}),
+                ),
+            ));
+        }
+        for number in &caravan.members {
+            let member = &status.analysis.pull_requests[number];
+            provider
+                .verify_pull_request_with_checks(
+                    &status.repository,
+                    &PullRequestPrecondition::from(member),
+                )
+                .map_err(|error| {
+                    parking_mutation_error(&error, caravan, &failures, &output.provider_receipts)
+                })?;
+        }
         let receipt = if should_park {
             provider.add_label(&status.repository, &expected, PARKED_LABEL)
         } else {
@@ -3244,20 +3299,17 @@ fn parking_required_runs_green(
     caravan: &Caravan,
     provider: &impl SyncProvider,
 ) -> Option<Vec<crate::required_runs::RequiredRunsAssessment>> {
-    let mut contexts_by_branch: BTreeMap<String, RequiredContextsRead> = BTreeMap::new();
+    let target = &status.analysis.fleet.default_branch.name;
+    let contexts = provider
+        .branch_required_contexts(&status.repository, target)
+        .ok()?
+        .normalized();
+    if !contexts.complete || contexts.branch != *target {
+        return None;
+    }
     let mut assessments = Vec::new();
     for number in &caravan.members {
         let pull = status.analysis.pull_requests.get(number)?;
-        let contexts = if let Some(contexts) = contexts_by_branch.get(&pull.base.name) {
-            contexts.clone()
-        } else {
-            let contexts = provider
-                .branch_required_contexts(&status.repository, &pull.base.name)
-                .ok()?
-                .normalized();
-            contexts_by_branch.insert(pull.base.name.clone(), contexts.clone());
-            contexts
-        };
         let assessment = required_runs::assess(&RequiredRunsInput {
             pr: pull.number,
             head: &pull.head,
@@ -6741,31 +6793,11 @@ fn candidate_local_admission_refusal(
     admission_gate: Option<&crate::config::CiAdmissionGateConfig>,
 ) -> Result<Option<AutoCandidateAdmissionRefusal>, AppError> {
     progress.deferred_admission_gates.remove(&candidate_pr);
-    let mut ci = progress.observe_ci(provider, repository, candidate_pr)?;
-    // `caravan-force` is member repair authority, not authority to enrol a
-    // known-red unjoined PR. Required CI is therefore never bypassed here.
-    ci.disposition = classify_checks(&ci.effective_checks, false);
-    let unknown_checks = crate::model::latest_checks_per_identity(&ci.checks)
-        .0
-        .into_iter()
-        .filter(|check| check.state == CheckState::Unknown)
-        .cloned()
-        .collect::<Vec<_>>();
-    if !unknown_checks.is_empty() {
-        return Err(AppError::structured(
-            ErrorCategory::ExecutionFailure,
-            "auto_admission_provider_state_unknown",
-            "automatic admission CI evidence contains an uninterpretable provider state, so candidate-local isolation is unsafe",
-            Some(json!({
-                "candidate_pr": candidate_pr,
-                "candidate_local": false,
-                "mutated": false,
-                "unknown_checks": unknown_checks,
-                "candidate_ci": ci,
-                "safe_next_action": "restore a supported provider check state and rerun the same sync tick; existing completed convergence receipts remain authoritative",
-            })),
-        ));
-    }
+    let ci = progress.observe_ci(provider, repository, candidate_pr)?;
+    // Only the effective landing-target requirements vote. Optional failures
+    // remain on `ci.checks`; they neither authorize repair nor block admission.
+    // Force is not authority to enrol a known-red unjoined PR: the independent
+    // required assessment below never consumes force intent.
     let gate_deferred = admission_gate.is_some_and(|gate| {
         // Gate policy must consume the same exact-head generation reducer that
         // classified CI. Raw provider rows may contain both a CheckRun and its
@@ -6773,34 +6805,6 @@ fn candidate_local_admission_refusal(
         // gates deadlocks admission despite one unambiguous failed sentinel.
         candidate_has_exact_deferred_gate(progress, candidate_pr, gate, &ci)
     });
-    if gate_deferred {
-        let gate = admission_gate.expect("checked as present");
-        let non_gate_checks = ci
-            .effective_checks
-            .iter()
-            .filter(|check| check.name != gate.context)
-            .cloned()
-            .collect::<Vec<_>>();
-        ci.disposition = classify_checks(&non_gate_checks, false);
-    }
-    if ci.disposition == CiDisposition::Failed {
-        let failed_checks = crate::model::latest_checks_per_identity(&ci.checks)
-            .0
-            .into_iter()
-            .filter(|check| check_is_failure(check))
-            .map(|check| format!("{}={:?}", check.name, check.state))
-            .collect::<Vec<_>>();
-        return Ok(Some(AutoCandidateAdmissionRefusal {
-            kind: AutoAdmissionRefusalKind::TerminalCi,
-            ci: Some(ci),
-            required_runs: None,
-            reasons: vec![format!(
-                "candidate #{candidate_pr} has terminal current CI: {}",
-                failed_checks.join(", "),
-            )],
-        }));
-    }
-
     let required_runs = progress.observe_required_runs(provider, repository, candidate_pr)?;
     if gate_deferred
         && gate_deferral_allows_required_runs(
@@ -6867,6 +6871,17 @@ fn gate_deferral_allows_required_runs(
                 "safe_next_action": "repair the canonical admission-gate workflow contract; do not guess from missing or unrelated CI",
             })),
         ));
+    }
+    // Two Apps requiring the same name are independent obligations. A single
+    // deferred-workflow proof cannot waive both, or a missing foreign report.
+    if required_runs
+        .coverage
+        .iter()
+        .filter(|coverage| coverage.context == gate.context)
+        .count()
+        > 1
+    {
+        return Ok(false);
     }
     Ok(required_runs.coverage.iter().all(|coverage| {
         coverage.context == gate.context
@@ -7318,6 +7333,7 @@ fn required_runs_generation_matches(
         && expected.base == observed.base
         && expected.status == observed.status
         && expected.required_contexts == observed.required_contexts
+        && expected.required_policy == observed.required_policy
         && expected.coverage == observed.coverage
         && expected.missing_contexts == observed.missing_contexts
         && expected.observed_check_suites == observed.observed_check_suites
@@ -8166,7 +8182,7 @@ fn reconcile_caravan(
         let observation = progress.observe_ci(provider, &status.repository, number)?;
         let disposition = observation.disposition;
         progress.upsert_ci_observation(observation.clone());
-        // Verify every member against its current promoted base before any CI
+        // Verify every member against the actual landing target before any CI
         // stop, so one failed or stalled member never suppresses another.
         if verify_required_runs_and_recover_gate(
             provider,
@@ -9246,7 +9262,7 @@ fn ci_generation_evidence(
         .map(|run| (run.run_id, run.workflow_name.as_str()))
         .collect::<BTreeMap<_, _>>();
     let mut effective = Vec::new();
-    let mut replacement_names: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+    let mut replacement_names: BTreeMap<&str, BTreeSet<(String, Option<u64>)>> = BTreeMap::new();
     for check in checks {
         let run_id = check.details_url.as_deref().and_then(workflow_run_id);
         let workflow_name = check
@@ -9261,7 +9277,7 @@ fn ci_generation_evidence(
                 replacement_names
                     .entry(workflow_name)
                     .or_default()
-                    .insert(check.name.clone());
+                    .insert((check.name.clone(), check.app_id));
             }
             if !evidence.superseded_checks.contains(check) {
                 evidence.superseded_checks.push(check.clone());
@@ -9275,10 +9291,10 @@ fn ci_generation_evidence(
 
     for (workflow_name, (run, suite)) in newest_by_workflow {
         let state = generation_check_state(run, suite);
-        let names = replacement_names
-            .remove(workflow_name)
-            .unwrap_or_else(|| BTreeSet::from([format!("workflow generation: {workflow_name}")]));
-        for name in names {
+        let names = replacement_names.remove(workflow_name).unwrap_or_else(|| {
+            BTreeSet::from([(format!("workflow generation: {workflow_name}"), None)])
+        });
+        for (name, app_id) in names {
             effective.push(CheckSnapshot {
                 name,
                 state,
@@ -9291,6 +9307,9 @@ fn ci_generation_evidence(
                 details_url: Some(format!("/actions/runs/{}", run.run_id)),
                 provider_kind: Some("WorkflowRunLineage".to_owned()),
                 workflow_name: Some(workflow_name.to_owned()),
+                app_id,
+                check_suite_id: Some(suite.id),
+                head_oid: Some(crate::model::CommitOid(head_oid.to_owned())),
                 started_at: None,
                 completed_at: None,
                 superseded: false,
@@ -9376,6 +9395,38 @@ fn observation_has_proven_deferred_gate(
             diagnostic.classification == WorkflowFailureClass::DeferredAdmission
                 && crate::ci::proven_deferred_job(&diagnostic.diagnostic)
                     .is_some_and(|job| job.name == gate.context)
+                && observation.checks.iter().any(|check| {
+                    check.name == gate.context
+                        && check.state == CheckState::Failure
+                        && observation.effective_checks.iter().any(|effective| {
+                            effective.name == check.name
+                                && effective.app_id == check.app_id
+                                && effective.provider_state.as_deref()
+                                    == Some("unevaluated: deferred_unjoined; awaiting membership")
+                        })
+                        && check.details_url.as_deref().and_then(workflow_run_id)
+                            == Some(diagnostic.diagnostic.run_id)
+                        && check.app_id.is_none_or(|_| {
+                            observation
+                                .generation_lineage
+                                .as_ref()
+                                .is_some_and(|lineage| {
+                                    lineage.workflow_runs.iter().any(|run| {
+                                        run.run_id == diagnostic.diagnostic.run_id
+                                            && check.check_suite_id == Some(run.check_suite_id)
+                                            && check
+                                                .head_oid
+                                                .as_ref()
+                                                .is_some_and(|head| head.0 == run.head_sha)
+                                            && lineage.check_suites.iter().any(|suite| {
+                                                suite.id == run.check_suite_id
+                                                    && suite.head_sha == run.head_sha
+                                                    && suite.app_slug == "github-actions"
+                                            })
+                                    })
+                                })
+                        })
+                })
                 && observation.effective_checks.iter().any(|check| {
                     check.name == gate.context
                         && check.provider_state.as_deref()
@@ -9386,6 +9437,20 @@ fn observation_has_proven_deferred_gate(
         })
 }
 
+fn required_ci_disposition(status: RequiredRunsStatus, forced: bool) -> CiDisposition {
+    if forced {
+        return CiDisposition::Forced;
+    }
+    match status {
+        RequiredRunsStatus::Satisfied | RequiredRunsStatus::NotRequired => CiDisposition::Passing,
+        RequiredRunsStatus::Failing | RequiredRunsStatus::CancelledSuperseded => {
+            CiDisposition::Failed
+        }
+        _ => CiDisposition::Waiting,
+    }
+}
+
+#[cfg(test)]
 fn root_checks_passing(observed: &PullRequestSnapshot) -> bool {
     // Merge authorization must use the exact root snapshot refreshed immediately
     // before the provider merge. The tick-level CI cache can predate a rerun or
@@ -10554,7 +10619,17 @@ impl SyncProgress {
     ) -> Result<CiObservation, AppError> {
         let mut current = self.refetch_ci_snapshot(provider, repository, number)?;
         let forced = current.has_label("caravan-force");
-        let mut disposition = classify_checks(&current.checks, forced);
+        let policy = self.discover_required_contexts(
+            provider,
+            repository,
+            &self.default_branch.clone(),
+            number,
+        )?;
+        let mut disposition = required_ci_disposition(
+            self.assess_with_lineage(&current, &policy, None, &current.checks)
+                .status,
+            forced,
+        );
         let mut lineage = None;
 
         // A red discovery is never event authority. Re-read once, then consult
@@ -10562,7 +10637,11 @@ impl SyncProgress {
         // supersede historical aggregate failures before any hook is emitted.
         if disposition == CiDisposition::Failed {
             current = self.refetch_ci_snapshot(provider, repository, number)?;
-            disposition = classify_checks(&current.checks, forced);
+            disposition = required_ci_disposition(
+                self.assess_with_lineage(&current, &policy, None, &current.checks)
+                    .status,
+                forced,
+            );
             if disposition == CiDisposition::Failed {
                 lineage = Some(
                     provider
@@ -10572,11 +10651,20 @@ impl SyncProgress {
             }
         }
 
+        let required_checks = policy
+            .required_checks(&current.checks, &current.head.oid)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
         let mut generation =
-            ci_generation_evidence(&current.checks, &current.head.oid.0, lineage.as_ref());
-        if !generation.selected_generations.is_empty() {
-            disposition = classify_checks(&generation.effective_checks, forced);
-        }
+            ci_generation_evidence(&required_checks, &current.head.oid.0, lineage.as_ref());
+        // Whole-workflow conclusions are diagnostics, not substitutes for
+        // individual required checks (an optional job can fail the workflow).
+        disposition = required_ci_disposition(
+            self.assess_with_lineage(&current, &policy, lineage.as_ref(), &current.checks)
+                .status,
+            forced,
+        );
         let mut failed_runs =
             if matches!(disposition, CiDisposition::Failed | CiDisposition::Forced) {
                 provider
@@ -10587,8 +10675,7 @@ impl SyncProgress {
             };
         failed_runs.sort_by_key(|run| run.database_id);
         failed_runs.dedup_by_key(|run| run.database_id);
-        let selected_run_ids =
-            select_rerunnable_run_ids(&generation.effective_checks, &failed_runs);
+        let selected_run_ids = select_rerunnable_run_ids(&required_checks, &failed_runs);
         let failure_diagnostics = if selected_run_ids.is_empty() {
             Vec::new()
         } else {
@@ -10608,8 +10695,12 @@ impl SyncProgress {
                 })
                 .collect::<Vec<_>>()
         };
-        reduce_proven_deferred_generations(&mut generation, &current.checks, &failure_diagnostics);
-        disposition = classify_checks(&generation.effective_checks, forced);
+        reduce_proven_deferred_generations(&mut generation, &required_checks, &failure_diagnostics);
+        disposition = required_ci_disposition(
+            self.assess_with_lineage(&current, &policy, lineage.as_ref(), &current.checks)
+                .status,
+            forced,
+        );
         let mut rerunnable_run_ids = failure_diagnostics
             .iter()
             .filter(|diagnostic| diagnostic.action == WorkflowFailureAction::RerunFailedJobs)
@@ -10619,6 +10710,17 @@ impl SyncProgress {
         rerunnable_run_ids.dedup();
         let cancellation =
             classify_cancellation(&generation.effective_checks, &failure_diagnostics);
+        if disposition == CiDisposition::Failed
+            && classify_checks(&generation.effective_checks, false) == CiDisposition::Waiting
+            && failure_diagnostics.iter().any(|diagnostic| {
+                diagnostic.classification == WorkflowFailureClass::DeferredAdmission
+            })
+        {
+            // A proved admission-only failure is unevaluated, never green or
+            // source-red. The configured gate and required policy are checked
+            // independently again before granting membership capability.
+            disposition = CiDisposition::Waiting;
+        }
         Ok(CiObservation {
             pr: number,
             disposition,
@@ -10659,8 +10761,12 @@ impl SyncProgress {
         number: PrNumber,
     ) -> Result<(), AppError> {
         let current = self.current.get(&number).expect("sync member").clone();
-        let contexts =
-            self.discover_required_contexts(provider, repository, &current.base.name, number)?;
+        let contexts = self.discover_required_contexts(
+            provider,
+            repository,
+            &self.default_branch.clone(),
+            number,
+        )?;
         let assessment = self.assess_required_runs(provider, repository, &current, &contexts)?;
 
         let outcome = match assessment.recovery {
@@ -10700,8 +10806,12 @@ impl SyncProgress {
         number: PrNumber,
     ) -> Result<crate::required_runs::RequiredRunsAssessment, AppError> {
         let current = self.current.get(&number).expect("sync member").clone();
-        let contexts =
-            self.discover_required_contexts(provider, repository, &current.base.name, number)?;
+        let contexts = self.discover_required_contexts(
+            provider,
+            repository,
+            &self.default_branch.clone(),
+            number,
+        )?;
         self.assess_required_runs(provider, repository, &current, &contexts)
     }
 
@@ -10716,10 +10826,13 @@ impl SyncProgress {
         if let Some(cached) = self.required_contexts.get(branch) {
             return Ok(cached.clone());
         }
-        let read = provider
+        let mut read = provider
             .branch_required_contexts(repository, branch)
             .map_err(|error| mutation_error(&error, self, Some(number)))?
             .normalized();
+        if read.branch != branch {
+            read.complete = false;
+        }
         self.required_contexts
             .insert(branch.to_owned(), read.clone());
         Ok(read)
@@ -10738,22 +10851,17 @@ impl SyncProgress {
         // can still report `failing` after CI correctly selected a newer
         // same-head pending/successful run.
         let observation = self.ci.iter().rev().find(|item| item.pr == current.number);
-        let checks = observation
-            .filter(|item| !item.effective_checks.is_empty())
-            .map_or(current.checks.as_slice(), |item| {
-                item.effective_checks.as_slice()
-            });
+        // Required context/App evidence comes from real provider check rows,
+        // never a synthesized conclusion for the entire owning workflow.
+        let checks = current.checks.as_slice();
         let observed_lineage = observation.and_then(|item| item.generation_lineage.as_ref());
         let (current_checks, _superseded_checks) = crate::model::latest_checks_per_identity(checks);
-        let reporting = current_checks
-            .into_iter()
-            .filter(|check| check.state != crate::model::CheckState::Expected)
-            .map(|check| check.name.as_str())
-            .collect::<BTreeSet<_>>();
-        let absent = contexts
-            .contexts
-            .iter()
-            .any(|context| !reporting.contains(context.as_str()));
+        let absent = contexts.clone().normalized().checks.iter().any(|required| {
+            !current_checks.iter().any(|check| {
+                required.matches(check, &current.head.oid)
+                    && check.state != crate::model::CheckState::Expected
+            })
+        });
         let lineage = if absent && contexts.complete && !contexts.contexts.is_empty() {
             match observed_lineage {
                 Some(lineage) => Some(lineage.clone()),
@@ -11238,6 +11346,57 @@ impl SyncProgress {
         Ok(())
     }
 
+    /// Refresh the landing-target policy and exact provider checks before any
+    /// unsubmitted native transaction advances. Submitted/uncertain UUIDs never
+    /// return through this path: their existing poll/reconcile contract wins.
+    fn native_required_ready(
+        &mut self,
+        provider: &impl SyncProvider,
+        status: &StatusOutput,
+        checkpoint: &crate::github::GitHubStackLandCheckpoint,
+    ) -> Result<bool, AppError> {
+        let target = &checkpoint.plan.before.topology.base.name;
+        if target != &self.default_branch {
+            return Ok(false);
+        }
+        let repository = &status.repository;
+        let policy = provider
+            .branch_required_contexts(repository, target)
+            .map_err(|error| mutation_error(&error, self, None))?
+            .normalized();
+        if !policy.complete || policy.branch != *target {
+            return Ok(false);
+        }
+        let held = crate::stack_policy::held_caravan_members(status);
+        for entry in &checkpoint.plan.selected {
+            let current = self.refetch_ci_snapshot(provider, repository, entry.pr)?;
+            if current.head != entry.head
+                || current.base != entry.base
+                || current.state != PullRequestState::Open
+                || current.draft
+                || !current.is_active_caravan_member()
+                || held.contains(&entry.pr)
+                || current.has_label("caravan-force")
+            {
+                return Ok(false);
+            }
+            let assessment = self.assess_required_runs(provider, repository, &current, &policy)?;
+            let green = matches!(
+                assessment.status,
+                RequiredRunsStatus::Satisfied | RequiredRunsStatus::NotRequired
+            );
+            self.push_required_runs(checkpoint.plan.selected[0].pr, assessment, None);
+            if !green {
+                return Ok(false);
+            }
+        }
+        let after = provider
+            .branch_required_contexts(repository, target)
+            .map_err(|error| mutation_error(&error, self, None))?
+            .normalized();
+        Ok(after.complete && after == policy)
+    }
+
     /// Land one fully ready native Stack under a complete-generation source-ref
     /// lock. The readiness planner still identifies a maximal prefix, but a
     /// blocked suffix requires typed reshape before submission because GitHub
@@ -11286,25 +11445,24 @@ impl SyncProgress {
                 held_members: &held,
             };
             let evidence = crate::stack_policy::stack_merge_evidence(facts, &stack, &|pr| {
-                let checks = self
-                    .ci
-                    .iter()
-                    .rev()
-                    .find(|observation| observation.pr == pr)
-                    .is_some_and(|observation| observation.disposition == CiDisposition::Passing);
-                let required = self
-                    .required_runs
-                    .iter()
-                    .rev()
-                    .find(|receipt| receipt.pr == pr)
-                    .is_none_or(|receipt| {
-                        matches!(
-                            receipt.assessment.status,
-                            crate::required_runs::RequiredRunsStatus::Satisfied
-                                | crate::required_runs::RequiredRunsStatus::NotRequired
-                        )
-                    });
-                if checks && required {
+                let required =
+                    self.required_runs
+                        .iter()
+                        .rev()
+                        .find(|receipt| receipt.pr == pr)
+                        .is_some_and(|receipt| {
+                            self.current.get(&pr).is_some_and(|current| {
+                                current.head == receipt.assessment.head
+                                    && current.base == receipt.assessment.base
+                            }) && receipt.assessment.required_policy.as_ref().is_some_and(
+                                |policy| policy.complete && policy.branch == self.default_branch,
+                            ) && matches!(
+                                receipt.assessment.status,
+                                crate::required_runs::RequiredRunsStatus::Satisfied
+                                    | crate::required_runs::RequiredRunsStatus::NotRequired
+                            )
+                        });
+                if required {
                     crate::stack_policy::StackEntryCi::Ready
                 } else {
                     crate::stack_policy::StackEntryCi::NotReady
@@ -11373,6 +11531,12 @@ impl SyncProgress {
             let before_phase = checkpoint.phase;
             checkpoint = match checkpoint.phase {
                 crate::github::GitHubStackLandPhase::Planned => {
+                    if !self.native_required_ready(provider, status, &checkpoint)? {
+                        self.native_stack_land.push(checkpoint);
+                        self.record_merge_wait(caravan.id, RootMergeBlock::RequiredRunsNotSatisfied,
+                            Some("fresh landing-target policy/checks no longer qualify the native plan".to_owned()));
+                        return Ok(());
+                    }
                     provider.native_stack_land_lock_for_sync(repository, &checkpoint)?
                 }
                 crate::github::GitHubStackLandPhase::Locked => {
@@ -11392,6 +11556,16 @@ impl SyncProgress {
                             &marker,
                             &body,
                         )?;
+                    }
+                    // Audit writes may start checks; requalify independently
+                    // after them, before persisting the irreversible marker.
+                    // On a wait the exact Locked checkpoint/lease stays visible;
+                    // never misrepresent this as a submitted or terminal UUID.
+                    if !self.native_required_ready(provider, status, &checkpoint)? {
+                        self.native_stack_land.push(checkpoint);
+                        self.record_merge_wait(caravan.id, RootMergeBlock::RequiredRunsNotSatisfied,
+                            Some("native pre-submit required policy/checks changed; preserved locked checkpoint, no submission".to_owned()));
+                        return Ok(());
                     }
                     submission_marked_now = true;
                     GitHubMutationAdapter::<crate::command::ProcessRunner>::native_stack_land_mark_submitting(
@@ -11653,21 +11827,23 @@ impl SyncProgress {
             }
             ancestor_containment.push(evidence);
         }
+        let root_policy = provider
+            .branch_required_contexts(&repository, &default_branch)
+            .map_err(|error| mutation_error(&error, self, Some(number)))?
+            .normalized();
+        let root_required =
+            self.assess_required_runs(provider, &repository, &observed, &root_policy)?;
+        let required_green = root_policy.complete
+            && root_policy.branch == default_branch
+            && matches!(
+                root_required.status,
+                RequiredRunsStatus::Satisfied | RequiredRunsStatus::NotRequired
+            );
+        self.push_required_runs(caravan_id, root_required, None);
         let facts = RootMergeFacts {
             default_branch: &default_branch,
-            checks_passing: root_checks_passing(&observed),
-            required_runs_satisfied: self
-                .required_runs
-                .iter()
-                .rev()
-                .find(|receipt| receipt.pr == number)
-                .is_none_or(|receipt| {
-                    matches!(
-                        receipt.assessment.status,
-                        crate::required_runs::RequiredRunsStatus::Satisfied
-                            | crate::required_runs::RequiredRunsStatus::NotRequired
-                    )
-                }),
+            checks_passing: required_green,
+            required_runs_satisfied: required_green,
             // An identical cumulative tree *is* mechanical proof of a clean
             // merge: `git merge-tree` cannot construct the candidate's own tree
             // from a conflicting merge. The discovery-time compatibility report
@@ -11826,6 +12002,15 @@ impl SyncProgress {
             .verify_branch_head(&repository, &default_branch, &default_before.oid)
             .map_err(|error| mutation_error(&error, self, Some(number)))?;
 
+        let final_policy = provider
+            .branch_required_contexts(&repository, &default_branch)
+            .map_err(|error| mutation_error(&error, self, Some(number)))?
+            .normalized();
+        if !final_policy.complete || final_policy != root_policy {
+            self.record_merge_wait(number, RootMergeBlock::RequiredRunsNotSatisfied,
+                Some("landing-target required policy changed during merge preflight; rediscover before submitting".to_owned()));
+            return Ok(false);
+        }
         self.ensure_mutation_capacity(1)?;
         let receipt = provider
             .squash_merge(&repository, &self.precondition(number))

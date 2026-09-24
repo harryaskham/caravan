@@ -1035,6 +1035,15 @@ and the delivery is forcibly best-effort even if configured as blocking. The
 hook may request a first-party repair; it is not itself authorized to merge,
 rebase, push, comment, or mutate topology.
 
+Cara evaluates the actual landing branch's complete required-check policy,
+including legacy protection and active rulesets. Contexts bound to a GitHub App
+must report from that App on the current head; an intermediate parent branch,
+foreign App, or optional red/pending job cannot change the merge verdict.
+Unknown/incomplete policy and missing/pending/failed required reports fail closed.
+Raw optional checks remain visible. Ordinary and native merges revalidate this
+policy before submission; source publication still requires a separate normal
+release/install step before consumers gain this behavior.
+
 `sync.terminal_red.action` configures deterministic latest-verdict liveness.
 `block` is the backward-compatible default: terminal red stops the tick. `park`
 adds `caravan-parked` to the exact caravan head, disables its auto-merge,
@@ -1042,8 +1051,8 @@ preserves every member/base/head, excludes it from active convergence/tail
 capacity, and allows independent green candidates to advance. Pending/running
 and superseded historical red never park. Once parked, queued, expected,
 running, unknown, or absent current evidence preserves the label without a
-provider write. Only a nonempty, fully green latest verdict for every member,
-with every protection-declared context proven satisfied, removes it and
+provider write. Only complete effective landing-target required-check evidence
+for every member (passing, or a proven empty required set) removes it and
 re-enters the caravan at its original FIFO age. A check-sensitive provider
 reread fences either label transition, so a new same-head check generation
 refuses before mutation. Hooks may repair parked work but are never required for
@@ -1054,7 +1063,7 @@ An explicit `ci.admission_gate` can defer heavy CI until membership without
 making an unjoined PR permanently inadmissible. Only the configured required
 context may fail as the exact `deferred_unjoined` sentinel; Cara still enforces
 priority/FIFO, generation integrity, capacity, holds, compatibility, and every
-unrelated terminal context. The exemption disappears as soon as the exact
+unrelated required terminal context. The exemption disappears as soon as the exact
 `caravan` member label exists. The canonical delivery model uses a code-event
 check suite plus an admission-owned exact-suite rerequest after membership;
 heavy CI must not subscribe to broad `labeled`/`unlabeled` events, because

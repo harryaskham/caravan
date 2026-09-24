@@ -883,14 +883,17 @@ or bases. Pending/running and superseded red remain active; a newer Actions run
 on the exact head supersedes terminal rows from its older workflow generation
 even before matching downstream job names materialize. Workflow-run evidence is
 authoritative only with its matching exact-head check suite. The newest matched
-generation votes pending until both rows complete; only then can its terminal
-success/failure/cancellation control. Older failures remain bounded diagnostics,
+generation can prove an older row superseded and a replacement pending; its
+aggregate conclusion never fabricates a passing required job. Only real current
+required-check reports decide merge readiness. Older failures remain bounded diagnostics,
 never current verdicts. Missing, incomplete, mismatched, or unparsable lineage
 fails closed by retaining the ordinary rollup verdict. Once parked,
 queued/expected/in-progress/unknown or absent current evidence preserves the
-label with zero provider writes. Only a nonempty, fully green latest verdict for
-every member with every protection-declared context proven satisfied removes
-the parked label; re-entry retains the root's immutable original FIFO age.
+label with zero provider writes. Only complete effective landing-target required-check evidence for
+every member (all required checks passing, or a proven empty required set) removes
+the parked label; optional red/pending checks remain diagnostic and never park
+or veto recovery. Required-check App/head identity and policy must remain unchanged
+through the label-write preflight; re-entry retains the root's immutable original FIFO age.
 Immediately before either label transition, a check-sensitive provider reread
 must still match the deciding observation; check drift refuses with zero writes.
 Park/unpark events bind exact ordering, member heads, current/superseded check
@@ -905,7 +908,9 @@ Explicit `ci.admission_gate` policy is the only pre-membership CI exemption.
 One exact configured required context may report a failing deferred-unjoined
 sentinel while heavy contexts have no lineage; the candidate still requires
 normal eligibility, priority/FIFO, generation, capacity, hold and compatibility
-proof, and any unrelated terminal/unknown context refuses. Membership removes
+proof, and any unrelated required terminal/unknown context refuses. The exemption
+cannot waive independent Apps requiring the same context; App-bound gate evidence
+must bind the reporting check suite to the proved exact-head workflow run. Membership removes
 the exemption immediately. The canonical workflow creates the exact-head suite
 from code-generation events and has the admission writer rerequest that suite
 after adding membership. Broad heavy-workflow `labeled`/`unlabeled` triggers are
@@ -939,8 +944,9 @@ membership generation, durable `caravan_parked` event fingerprint,
 `open_parked` provider state, actor, and reason. Under the ordinary writer guard
 and provider lease it freshly rediscovers provider and Cara truth, requires one
 open enrolled non-evicted parked head, no active explicit pause/recovery fence,
-and the newest authoritative check lineage to be safely green. It separately
-reads the protection-declared contexts on the exact base and requires every one
+and the newest authoritative required-check lineage to be safely green. It
+reads the complete effective policy of the actual landing target (never an
+intermediate stacked parent) and requires each context/App obligation
 to report success on the exact head, then performs a check-sensitive provider
 refetch before persisting mutation authority. Older same-head
 red/cancelled/synthetic rows are retained as superseded evidence but do not veto
@@ -981,6 +987,38 @@ For deterministic repair, conflicts and exact semantic grants remain narrow. For
 `repair continue` verifies the persistent manifest, merge target, baseline index, authorized scope, conflict markers, remote head, and exact merge parents before reviewed targeted validation and exact old-head force-with-lease publication. When a conflict-free mechanical merge is semantically incomplete, `repair grant` may add a bounded reviewed source patch: Cara computes a three-way result from current path/source-parent/source blobs, stages it itself, and binds the exact result OID. This never reclassifies mechanical compatibility and grants no authority beyond those exact paths; every granted path must equal its expected staged result. Grant revocation is local-only, authority-matched, and preflights the complete requested set before restoring exact pre-grant staged blobs. Grant and revoke reconcile persisted receipt/index pairs after interrupted manifest publication; successful revocation leaves bounded receipts so exact retries remain idempotent. It then rediscovers and resumes the stored `sync --all`; interruption after commit or push is idempotent and preserves the workspace until convergence.
 
 ## 7. CI and merging
+
+### Effective required-check policy
+
+Ordinary roots and native Stack members use the complete effective required set
+of their actual landing branch. Legacy protection (`contexts` plus typed
+`checks`) and all active branch-rule pages, including organization rulesets,
+are combined without losing GitHub App identity. Typed declarations refine the
+legacy duplicate name; requirements from distinct Apps remain distinct. Legacy
+any-App declarations stay supported. Policy read failure, truncation, malformed
+identities, or unsupported required-workflow rules are unknown, never an empty
+policy. Diagnostic limits must not silently truncate the authoritative set.
+
+Eligibility matches context, App (when bound), current head, and provider
+supersession evidence. A same-named foreign App or stale commit cannot satisfy,
+fail, or supersede a bound requirement. Whole-workflow success cannot invent a
+passing required job, and optional job failure cannot poison an otherwise green
+required context. Optional failed/pending checks remain visible in raw diagnostics
+but do not block merge/admission or cause parking/repair. Missing, pending, failed,
+or unknown required evidence cannot authorize an ordinary or native merge.
+The existing admission wait and exact deferred-unjoined exemption remain separate
+from merge readiness; neither grants a green merge verdict.
+
+Required-run receipts bind the complete normalized policy as well as the exact
+PR head/base. Ordinary merge rereads policy and checks during root preflight and
+requires unchanged complete policy after the audit, before squash submission.
+Native readiness requires an exact required-run receipt (absence is not green),
+then refreshes policy/checks before acquiring the lock and after audit before
+persisting the submission marker. A changed/unready pre-submit generation waits
+without submitting; any already-owned lock/checkpoint stays explicit and durable.
+Submitted or indeterminate native operations retain their existing poll/reconcile
+contract and are never replayed by policy revalidation. Drafts, explicit holds,
+ownership, provider protection and transaction fences remain independent gates.
 
 Normal behavior:
 

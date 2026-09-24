@@ -5383,6 +5383,7 @@ provider.wait()
                 next_candidate: None,
             },
             analysis: caravan::graph::GraphAnalysis {
+                required_policy: None,
                 fleet: caravan::model::CaravanFleet {
                     repository,
                     default_branch,
