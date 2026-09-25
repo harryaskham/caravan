@@ -199,3 +199,88 @@ fn effective_policy_foreign_newer_workflow_cannot_supersede_required_failure() {
         RequiredRunsStatus::Failing
     );
 }
+
+// bd-db8384: the recorded head checks qualify locally. This does not prove
+// which identity the native provider used for its historical rejection.
+#[test]
+fn historical_native_prefix_heads_qualify_without_synthetic_check_substitution() {
+    let repository = RepositoryId {
+        owner: "harryaskham".into(),
+        name: "cacophony".into(),
+    };
+    let mut required = policy();
+    required.contexts = vec!["cara-admission".into()];
+    required.checks[0].context = "cara-admission".into();
+    for (pr, head_oid, base_oid) in [
+        (
+            4040,
+            "46232ed0c7c58d1e3a168f8b87006544a5a0a23d",
+            "historical-default",
+        ),
+        (
+            4046,
+            "82654e547aca98fa0a490f9cfcc20c6e3681e28c",
+            "46232ed0c7c58d1e3a168f8b87006544a5a0a23d",
+        ),
+    ] {
+        let head = BranchSnapshot {
+            repository: repository.clone(),
+            name: format!("pr-{pr}"),
+            oid: CommitOid(head_oid.into()),
+        };
+        let base = BranchSnapshot {
+            repository: repository.clone(),
+            name: "historical-base".into(),
+            oid: CommitOid(base_oid.into()),
+        };
+        for event in ["pull_request", "workflow_dispatch"] {
+            let lineage = HeadRunLineage {
+                head_sha: head_oid.into(),
+                complete: true,
+                workflow_runs: vec![WorkflowRunLineage {
+                    run_id: 1,
+                    check_suite_id: 2,
+                    workflow_name: "historical fixture".into(),
+                    execution: None,
+                    head_sha: head_oid.into(),
+                    status: "completed".into(),
+                    conclusion: "success".into(),
+                    event: event.into(),
+                }],
+                ..HeadRunLineage::default()
+            };
+            for (app, reported_head, state, qualifies) in [
+                (15368, head_oid, CheckState::Success, true),
+                (44, head_oid, CheckState::Success, false),
+                (
+                    15368,
+                    "synthetic-merge-not-the-head",
+                    CheckState::Success,
+                    false,
+                ),
+                (15368, head_oid, CheckState::Cancelled, false),
+                (15368, head_oid, CheckState::Failure, false),
+            ] {
+                let checks = [observation("cara-admission", app, reported_head, state)];
+                let result = assess(&RequiredRunsInput {
+                    pr: PrNumber(pr),
+                    head: &head,
+                    base: &base,
+                    contexts: &required,
+                    lineage: Some(&lineage),
+                    checks: &checks,
+                    head_published_at: Some("2026-09-23T15:00:00Z"),
+                    clock: RequiredRunsClock {
+                        now_unix: 1_800_000_000,
+                        grace_secs: 1,
+                    },
+                });
+                assert_eq!(
+                    result.status == RequiredRunsStatus::Satisfied,
+                    qualifies,
+                    "PR {pr}, event {event}, app {app}, head {reported_head}, state {state:?}"
+                );
+            }
+        }
+    }
+}
