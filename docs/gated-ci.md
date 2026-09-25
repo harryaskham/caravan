@@ -54,6 +54,36 @@ cara --json ci-admission-gate \
 
 Membership evaluation is a four-call read: repository identity, default-branch tip, open `caravan` members, and the exact wake PR. It does not list merged history, does not download check rollups, and does not run compatibility analysis. Those remain `cara status` / sync costs. The gate may only ask whether that exact open PR is an active member.
 
+### Readiness is a membership observation, not another heavy-CI trigger
+
+The command also accepts the original `ready_for_review` event for a cheap
+membership reporter. It performs the same trusted-policy materialization and
+live repository/PR/head/base/state/draft checks, and retains `event_action` in
+its typed receipt and fingerprint. A still-draft, drifted, foreign, missing, or
+unavailable provider generation stays `run_unproven`; only exact unjoined
+membership emits positive `deferred_unjoined` evidence and sentinel 78.
+
+This engine support does not alter the heavy workflow's trigger list, request a
+run, add a label, or waive another protected context. Keep one protected
+membership reporter rather than two workflows publishing the same context.
+Do not rewrite readiness to `opened` to make an old binary accept it.
+
+The published 0.0.126 and 0.0.135 action predicates do **not** support readiness.
+A source change or a development binary still printing that package version is
+not proof that those release artifacts became compatible. Consumer pin changes
+need a real containing release and its verified artifact, separately from the
+reporter-topology change.
+
+`cargo test --test ci_admission_readiness --no-default-features` runs the actual
+built Cara executable and real temporary Git fetch/worktree policy materialization.
+Only the four read-only provider calls use hermetic fixtures; the CLI parser,
+event action, receipt calculation and Actions output are not mocked. Tests cover
+member/unjoined readiness, wrong head/base/PR/repository, still-draft/fork/closed
+state, unavailable provider and unsupported actions, plus caller/worktree cleanup.
+For an explicit local negative control, set `CARA_ADMISSION_BASELINE_BINARY` to a
+verified older Cara executable: the same original event must return unproven
+before membership lookup. CI never downloads a binary for that optional control.
+
 Heavy jobs use:
 
 ```yaml

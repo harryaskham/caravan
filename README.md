@@ -1092,9 +1092,10 @@ The trusted code-event workflow calls `cara ci-admission-gate --event
 "$GITHUB_EVENT_PATH" --github-output "$GITHUB_OUTPUT"` from a pinned Cara
 runtime. Before any deferral it source-fetches and materializes the exact
 provider default-branch policy without updating caller refs; explicit config or
-`sync.allow_fetch=false` safely emits `run_unproven`. The command accepts only `opened`,
-`synchronize`, and `reopened`, binds event repository/PR/head/base to complete
-live provider membership, and emits `run_member`, `deferred_unjoined`, or safe
+`sync.allow_fetch=false` safely emits `run_unproven`. The command accepts `opened`,
+`synchronize`, `reopened`, and `ready_for_review`, binds the original event's
+repository/PR/head/base to complete live provider membership, and emits
+`run_member`, `deferred_unjoined`, or safe
 `run_unproven`. Unknown/malformed/wrong-repository/wrong-generation/wake-versus-
 selected mismatch always sets `run_ci=true`; it can never create a false
 exemption. A valid deferred receipt exits the command successfully but emits
@@ -1109,8 +1110,12 @@ Admission and convergence use the byte-identical
 `cara-writer-${{ github.repository }}` concurrency key, so event bursts coalesce
 and no two writers overlap. JSON/MCP output includes exact policy, config,
 provider, head/base/default, membership/label, and receipt fingerprints without
-event payload or secrets. See [`docs/gated-ci.md`](docs/gated-ci.md) for the
-canonical workflow and Cacophony/Pi-Daemon adoption sequence.
+event payload or secrets. Readiness may wake the cheap membership reporter;
+this does not add a heavy-CI trigger or turn unknown membership into deferral.
+Released 0.0.126 and 0.0.135 reject readiness actions, so consumers must verify
+an actual containing release rather than rewrite the event. See
+[`docs/gated-ci.md`](docs/gated-ci.md) for the canonical workflow, real-command
+compatibility tests, and Cacophony/Pi-Daemon adoption sequence.
 
 If the same immutable parked head later becomes green but no normal sync tick can
 release it, use the reviewed `cara unpark` surface—not `resume`, `rejoin`, or a

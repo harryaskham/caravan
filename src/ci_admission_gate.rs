@@ -124,7 +124,7 @@ fn evaluate_trusted(
         context: policy.context,
         member_label: policy.member_label,
     };
-    if !is_code_generation_action(&event.action) {
+    if !is_membership_observation_action(&event.action) {
         return output(
             context,
             Some(&event),
@@ -363,8 +363,14 @@ fn trusted_default_policy(provenance: Option<&crate::config_provenance::ConfigPr
     })
 }
 
-fn is_code_generation_action(action: &str) -> bool {
-    matches!(action, "opened" | "synchronize" | "reopened")
+fn is_membership_observation_action(action: &str) -> bool {
+    // Readiness changes admission eligibility without changing source. Observe
+    // its original event through the same live identity/draft checks; this is
+    // not a new heavy-CI trigger or permission to manufacture membership.
+    matches!(
+        action,
+        "opened" | "synchronize" | "reopened" | "ready_for_review"
+    )
 }
 
 const fn membership_decision(
@@ -561,12 +567,19 @@ mod tests {
     }
 
     #[test]
-    fn only_code_generation_actions_can_reach_live_provider_evaluation() {
-        for action in ["opened", "synchronize", "reopened"] {
-            assert!(is_code_generation_action(action));
+    fn only_code_and_readiness_actions_can_reach_live_provider_evaluation() {
+        for action in ["opened", "synchronize", "reopened", "ready_for_review"] {
+            assert!(is_membership_observation_action(action));
         }
-        for action in ["edited", "labeled", "unlabeled", "closed"] {
-            assert!(!is_code_generation_action(action));
+        for action in [
+            "edited",
+            "labeled",
+            "unlabeled",
+            "closed",
+            "converted_to_draft",
+            "unknown",
+        ] {
+            assert!(!is_membership_observation_action(action));
         }
     }
 
