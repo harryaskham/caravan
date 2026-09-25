@@ -280,7 +280,8 @@ fn expected_admission_check_to_writer_source_base_default_and_membership_races_r
                     .insert("main".to_owned(), CommitOid("c".repeat(40)));
             }
             "default_ref" => {
-                *provider.admission_identity.borrow_mut() = Some((repository(), "other".to_owned()))
+                *provider.admission_identity.borrow_mut() =
+                    Some((repository(), "other".to_owned()));
             }
             "repository" => {
                 *provider.admission_identity.borrow_mut() = Some((
@@ -289,7 +290,7 @@ fn expected_admission_check_to_writer_source_base_default_and_membership_races_r
                         name: "repo".to_owned(),
                     },
                     "main".to_owned(),
-                ))
+                ));
             }
             "unavailable" => *provider.admission_identity.borrow_mut() = None,
             "native" => {
