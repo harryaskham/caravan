@@ -552,6 +552,17 @@ workspace before publication; the resulting command hashes and outcomes are
 receipted. Publication uses the exact recorded old head as a force-with-lease
 and explicitly requires fresh CI.
 
+Under no-force authority, explicitly select a new session with
+`cara repair start --pr N [--target-pr P] --non-force --actor A --reason R`, then
+`cara repair continue --session ID --actor A --no-sync`. This preserves all old
+source history in an exact merge and uses normal fast-forward publication only.
+It binds current provider generations and actor custody, persists publication
+intent before push, and refuses unresolved retries or cleanup. It never resumes
+sync, changes queue topology, or transfers source ownership. Existing legacy
+sessions cannot be relabelled non-force. Explicit/automatic native rebase and
+legacy repair remain force-with-lease paths, even with `rebase_on_join: false`.
+See the [owner continuation and refusal contract](.agents/skills/cara-operator/references/history-preserving-repair.md).
+
 A semantic grant is distinct from a mechanical conflict: it is bounded, expiring,
 and bound to session/repository/head/target, actor/reason, exact one-parent source
 commit, source/base blobs, source patch fingerprint, original index blob, and

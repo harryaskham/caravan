@@ -252,7 +252,9 @@ impl Default for CheckSnapshot {
 /// Identity of the required check a run belongs to.
 ///
 /// Deliberately excludes state and timestamps: this is the key that groups
-/// successive runs of the SAME check so the latest can win.
+/// successive runs of the SAME check so the latest can win. Workflow provenance
+/// is not erased for readiness reports: matching context/App/head alone cannot
+/// authorize replacement of a failed check from another workflow (bd-5d78d1).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CheckIdentity {
     pub name: String,

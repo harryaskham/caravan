@@ -1,0 +1,43 @@
+{
+  "schema": "cara_readiness_selection_contract/v1",
+  "provenance": {
+    "producer_repository": "harryaskham/cacophony",
+    "producer_pr": 4094,
+    "producer_head": "6612123f5d307425296bce00478647574964eb19",
+    "producer_fixture": "tests/fixtures/cara-readiness/cross-workflow.json",
+    "kind": "synthetic_source_traced_fixture_not_provider_receipt",
+    "provider_supersession_proven": false,
+    "live_gate_green_claimed": false
+  },
+  "repository": "fixture/repo",
+  "pr": 17,
+  "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "base": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "required": {"context": "Caravan admission gate", "app_id": 15368},
+  "checks": [
+    {
+      "name": "Caravan admission gate",
+      "state": "failure",
+      "provider_kind": "CheckRun",
+      "workflow_name": "CI",
+      "app_id": 15368,
+      "check_suite_id": 301,
+      "head_oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "started_at": "2026-09-24T10:00:00Z",
+      "details_url": "https://github.com/fixture/repo/actions/runs/100/job/201"
+    },
+    {
+      "name": "Caravan admission gate",
+      "state": "success",
+      "provider_kind": "CheckRun",
+      "workflow_name": "Caravan readiness membership refresh",
+      "app_id": 15368,
+      "check_suite_id": 302,
+      "head_oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "started_at": "2026-09-24T11:00:00Z",
+      "details_url": "https://github.com/fixture/repo/actions/runs/101/job/202"
+    }
+  ],
+  "expected_current_jobs": [201, 202],
+  "expected_status": "failing"
+}

@@ -465,6 +465,40 @@ fn read_postcondition(
     read::fleet_status(context, deadline, github_budget)
 }
 
+fn owner_continuation_refusal(
+    error: AppError,
+    plan: &NativeStackRebasePlan,
+    member: &NativeStackRebaseMemberPlan,
+) -> AppError {
+    if error.code() != "rebase_topology_changed" {
+        return error;
+    }
+    AppError::structured(
+        error.category(),
+        error.code(),
+        "source replay could not preserve topology; return this generation to its authorized source owner without relaxing the guard or retrying force publication",
+        Some(json!({
+            "source": error.details(),
+            "repository": plan.repository,
+            "stack": plan.stack,
+            "plan_hash": plan.plan_hash,
+            "member": member,
+            "this_attempt_source_published": false,
+            "prior_operation_outcomes": "unchanged; must be reconciled independently",
+            "owner_continuation": {
+                "tool": "repair_start_non_force",
+                "input": {"pr": member.pr, "target_pr": member.parent_pr},
+                "required_custody_fields": ["actor", "reason"],
+                "continue_requires": ["same actor", "--no-sync"],
+                "scope": "one authorized same-repository source owner; no source takeover or queue mutation",
+                "next": "reconcile previous uncertainty and establish custody first; start from fresh provider facts, preserve the old head in a merge, then rediscover the child after its parent changes. This handoff is not an apply lease",
+            },
+            "force_boundary": "explicit native rebase, automatic native convergence, and legacy repair use force-with-lease; none is a non-force fallback",
+            "queue_only_boundary": "there is no standalone sealed tail-eviction preview CLI; typed evict is a separate authorized mutation with its own preflight, not a command to inspect or a generic retry",
+        })),
+    )
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn apply_plan(
     context: &AppContext,
@@ -512,7 +546,8 @@ fn apply_plan(
                         parent_pr,
                     },
                 )),
-        )?;
+        )
+        .map_err(|error| owner_continuation_refusal(error, &plan, member))?;
         target = Some(crate::physical_rebase::PlannedBase::Simulated(
             BranchSnapshot {
                 repository: plan.repository.clone(),
@@ -1093,9 +1128,8 @@ mod tests {
         assert_eq!(automatic_rebase_stack(&mixed), None);
     }
 
-    #[test]
-    fn plan_hash_binds_every_member_generation_and_intent() {
-        let plan = NativeStackRebasePlan {
+    fn sample_plan() -> NativeStackRebasePlan {
+        NativeStackRebasePlan {
             schema_version: 1,
             repository: repository(),
             stack: 2818,
@@ -1117,7 +1151,56 @@ mod tests {
             config_fingerprint: "fnv1a64:config".to_owned(),
             plan_hash: String::new(),
         }
-        .seal();
+        .seal()
+    }
+
+    #[test]
+    fn topology_refusal_returns_non_force_owner_scope_without_replaying_history() {
+        let plan = sample_plan();
+        let original =
+            json!({"old": "authored-two-parent", "new": "collapsed-one-parent", "resumable": true});
+        let error = owner_continuation_refusal(
+            AppError::structured(
+                ErrorCategory::Validation,
+                "rebase_topology_changed",
+                "parent cardinality changed",
+                Some(original.clone()),
+            ),
+            &plan,
+            &plan.members[0],
+        );
+        assert_eq!(error.code(), "rebase_topology_changed");
+        let details = error.details().unwrap();
+        assert_eq!(details["source"], original);
+        assert_eq!(details["plan_hash"], plan.plan_hash);
+        assert_eq!(details["this_attempt_source_published"], false);
+        assert_eq!(
+            details["owner_continuation"]["tool"],
+            "repair_start_non_force"
+        );
+        assert_eq!(details["owner_continuation"]["input"]["pr"], 2817);
+        assert_eq!(details["owner_continuation"]["input"]["target_pr"], 2814);
+        assert_eq!(
+            details["owner_continuation"]["continue_requires"],
+            json!(["same actor", "--no-sync"])
+        );
+        assert!(
+            details["prior_operation_outcomes"]
+                .as_str()
+                .unwrap()
+                .contains("unchanged")
+        );
+        let unrelated = owner_continuation_refusal(
+            AppError::validation("different_guard", "leave this guard alone"),
+            &plan,
+            &plan.members[0],
+        );
+        assert_eq!(unrelated.code(), "different_guard");
+    }
+
+    #[test]
+    fn plan_hash_binds_every_member_generation_and_intent() {
+        let plan = sample_plan();
         assert!(plan.verify());
         let mut drifted = plan.clone();
         drifted.members[0].old_head =

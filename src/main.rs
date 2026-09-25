@@ -260,10 +260,10 @@ enum NativeStackCommand {
     /// Clear only a stale local checkpoint after proving zero provider intersection.
     #[command(name = "recovery-clear")]
     Clear(NativeStackRecoveryClearInput),
-    /// Build a no-write exact native Stack cascading-rebase plan.
+    /// Preview an exact native Stack force-with-lease plan without writing.
     #[command(name = "rebase-preview")]
     RebasePreview(NativeStackRebasePreviewInput),
-    /// Apply one reviewed native Stack rebase plan under exact leases.
+    /// Atomically force-with-lease publish a reviewed native Stack plan; not a non-force route.
     #[command(name = "rebase-apply")]
     RebaseApply(NativeStackRebaseApplyInput),
 }
