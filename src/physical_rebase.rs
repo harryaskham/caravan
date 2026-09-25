@@ -2075,6 +2075,15 @@ pub fn apply_prepared(prepared: &PreparedRebase) -> Result<RebaseReceipt, AppErr
 pub fn apply_prepared_with_telemetry(
     prepared: &PreparedRebase,
 ) -> Result<RebaseApplyResult, AppError> {
+    apply_prepared_with_admission_guard(prepared, || Ok(()))
+}
+
+/// Run caller admission revalidation after all potentially slow no-write
+/// preparation, immediately before the existing fenced source publication.
+pub(crate) fn apply_prepared_with_admission_guard(
+    prepared: &PreparedRebase,
+    before_push: impl FnOnce() -> Result<(), AppError>,
+) -> Result<RebaseApplyResult, AppError> {
     verify_prepared(prepared)?;
     let runner = process_runner(
         &prepared.worktree.path,
@@ -2087,6 +2096,7 @@ pub fn apply_prepared_with_telemetry(
             verify_remote_head(&runner, "origin", &target.name, &target.oid)?;
         }
     }
+    before_push()?;
     let receipt = push_prepared_with_runner(prepared, &runner)?;
     Ok(RebaseApplyResult {
         receipt,
@@ -3061,6 +3071,28 @@ mod tests {
             &branch(&repository, "different-parent", &CommitOid("a".repeat(40))),
             &PlannedBase::Simulated(target),
         ));
+    }
+
+    #[test]
+    fn expected_admission_barrier_runs_at_real_push_boundary_and_preserves_ref_on_refusal() {
+        let (fixture, parent, _child, _) = prepared_atomic_pair();
+        assert_ne!(parent.plan.old_head_oid, parent.plan.new_head_oid);
+        let called = std::cell::Cell::new(false);
+        let error = apply_prepared_with_admission_guard(&parent, || {
+            called.set(true);
+            Err(crate::expected_admission::refusal(
+                "expected_admission_drift",
+                "reviewed default moved during preparation",
+            ))
+        })
+        .unwrap_err();
+        assert!(called.get());
+        assert_eq!(error.code(), "expected_admission_drift");
+        assert_eq!(remote_branch(&fixture, "feature"), fixture.feature.0);
+        let receipt = apply_prepared_with_admission_guard(&parent, || Ok(()))
+            .unwrap()
+            .receipt;
+        assert_eq!(remote_branch(&fixture, "feature"), receipt.new_head_oid.0);
     }
 
     #[test]

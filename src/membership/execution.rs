@@ -8,6 +8,12 @@ use super::{
 };
 
 pub(super) struct ExecutionState {
+    pub(super) expected_admission: Option<crate::expected_admission::ExpectedAdmission>,
+    pub(super) native_admission: bool,
+    pub(super) admission_source_head: Option<crate::model::CommitOid>,
+    pub(super) admission_base: Option<crate::model::BranchSnapshot>,
+    pub(super) admission_target: Option<crate::model::BranchSnapshot>,
+    admission_enrolled: bool,
     pub(super) operation_id: OperationId,
     pub(super) operation: MembershipOperation,
     pub(super) steps: Vec<MutationStep>,
@@ -18,12 +24,50 @@ pub(super) struct ExecutionState {
 impl ExecutionState {
     pub(super) fn new(operation: MembershipOperation) -> Self {
         Self {
+            expected_admission: None,
+            native_admission: false,
+            admission_source_head: None,
+            admission_base: None,
+            admission_target: None,
+            admission_enrolled: false,
             operation_id: OperationId::new(),
             operation,
             steps: Vec::new(),
             provider_receipts: Vec::new(),
             current: None,
         }
+    }
+
+    pub(super) fn verify_admission(
+        &self,
+        provider: &impl MembershipProvider,
+        repository: &RepositoryId,
+    ) -> Result<(), AppError> {
+        if let Some(binding) = &self.expected_admission {
+            let current = self
+                .current
+                .as_ref()
+                .expect("guarded membership has current facts");
+            if self.admission_source_head.as_ref() != Some(&current.head.oid)
+                || current.head.name != binding.head_ref
+                || self.admission_base.as_ref() != Some(&current.base)
+                || current.has_label("caravan") != self.admission_enrolled
+            {
+                return Err(crate::expected_admission::refusal(
+                    "expected_admission_drift",
+                    "provider after-state changed source/base/membership outside the requested effect",
+                ));
+            }
+            binding.verify_provider(
+                provider,
+                repository,
+                self.current
+                    .as_ref()
+                    .expect("guarded membership has current facts"),
+                self.native_admission,
+            )?;
+        }
+        Ok(())
     }
 
     pub(super) fn operation_receipt(&self) -> OperationReceipt {
@@ -144,11 +188,15 @@ impl ExecutionState {
             );
             return Ok(());
         }
+        self.verify_admission(provider, repository)?;
         let receipt = provider
             .set_base(repository, &self.precondition(), base)
             .map_err(|error| mutation_error(&error, self))?;
         self.record(receipt, "changed PR base branch");
-        Ok(())
+        if self.expected_admission.is_some() {
+            self.admission_base.clone_from(&self.admission_target);
+        }
+        self.verify_admission(provider, repository)
     }
 
     pub(super) fn ensure_label_present(
@@ -164,11 +212,15 @@ impl ExecutionState {
             );
             return Ok(());
         }
+        self.verify_admission(provider, repository)?;
         let receipt = provider
             .add_label(repository, &self.precondition(), label)
             .map_err(|error| mutation_error(&error, self))?;
         self.record(receipt, &format!("added label `{label}`"));
-        Ok(())
+        if label == "caravan" {
+            self.admission_enrolled = true;
+        }
+        self.verify_admission(provider, repository)
     }
 
     pub(super) fn ensure_label_absent(
@@ -184,6 +236,7 @@ impl ExecutionState {
             );
             return Ok(());
         }
+        self.verify_admission(provider, repository)?;
         let receipt = provider
             .remove_label(repository, &self.precondition(), label)
             .map_err(|error| mutation_error(&error, self))?;
@@ -197,6 +250,7 @@ impl ExecutionState {
         repository: &RepositoryId,
         audit: &ControlLabelAudit,
     ) -> Result<(), AppError> {
+        self.verify_admission(provider, repository)?;
         let receipt = provider
             .ensure_control_label_comment(repository, &self.precondition(), audit)
             .map_err(|error| comment_error(&error, self))?;
@@ -231,6 +285,7 @@ impl ExecutionState {
             );
             return Ok(());
         }
+        self.verify_admission(provider, repository)?;
         let receipt = provider
             .enable_squash_auto_merge(repository, &self.precondition())
             .map_err(|error| mutation_error(&error, self))?;
@@ -256,6 +311,7 @@ impl ExecutionState {
             );
             return Ok(());
         }
+        self.verify_admission(provider, repository)?;
         let receipt = provider
             .disable_auto_merge(repository, &self.precondition())
             .map_err(|error| mutation_error(&error, self))?;

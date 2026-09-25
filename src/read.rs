@@ -1126,6 +1126,10 @@ pub enum AdmissionCompatibilityAuthorization {
 /// Successful read-only eligibility/health result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CheckOutput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_admission: Option<crate::expected_admission::ExpectedAdmission>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_admission_verified: Option<bool>,
     #[serde(default)]
     pub provider_api: crate::model::GitHubApiTelemetry,
     #[serde(default)]
@@ -3125,6 +3129,9 @@ pub fn show(context: &AppContext) -> Result<ShowOutput, AppError> {
 
 /// Check active health or proposed new/join eligibility without mutation.
 pub fn check(context: &AppContext, input: &CheckInput) -> Result<CheckOutput, AppError> {
+    if let Some(binding) = &input.expected_admission {
+        binding.validate(input.pr)?;
+    }
     if input.tail_pr.is_some() && input.head_pr.is_some() {
         return Err(AppError::validation(
             "ambiguous_target",
@@ -3138,7 +3145,23 @@ pub fn check(context: &AppContext, input: &CheckInput) -> Result<CheckOutput, Ap
     let checker = GitCompatibilityChecker::new(&context.repository_path, "origin").with_timeout(
         std::time::Duration::from_secs(context.config.command_timeout_secs),
     );
-    check_analysis(&status, input, &checker)
+    let mut output = check_analysis(&status, input, &checker)?;
+    if let Some(binding) = &input.expected_admission {
+        let runner = crate::command::ProcessRunner::in_directory(&context.repository_path)
+            .with_timeout(Duration::from_secs(context.config.command_timeout_secs))
+            .with_operation_deadline(
+                Instant::now() + Duration::from_secs(context.config.command_timeout_secs),
+            );
+        let provider = crate::github::GitHubMutationAdapter::new(runner.clone());
+        binding.verify_provider(
+            &provider,
+            &status.repository,
+            &output.candidate,
+            context.config.stack_type == crate::config::StackType::Github,
+        )?;
+        output.provider_api.merge(runner.github_api_telemetry());
+    }
+    Ok(output)
 }
 
 fn duration_millis(duration: std::time::Duration) -> u64 {
@@ -3436,7 +3459,16 @@ pub fn check_analysis(
     input: &CheckInput,
     checker: &impl CompatibilityChecker,
 ) -> Result<CheckOutput, AppError> {
-    check_analysis_with_recommendation(status, input, checker, true)
+    if let Some(binding) = &input.expected_admission {
+        binding.validate(input.pr)?;
+        binding.verify_snapshot(status, None)?;
+    }
+    let mut output = check_analysis_with_recommendation(status, input, checker, true)?;
+    if let Some(binding) = &input.expected_admission {
+        output.expected_admission = Some(binding.clone());
+        output.expected_admission_verified = Some(true);
+    }
+    Ok(output)
 }
 
 /// Prove the action the caller explicitly requested without inferring another
@@ -3537,6 +3569,8 @@ fn check_analysis_with_recommendation(
         );
         enrolled_intent.record_preflight(true, eligible);
         let output = CheckOutput {
+            expected_admission: None,
+            expected_admission_verified: None,
             provider_api: status.provider_api.clone(),
             rebase_on_join: status.rebase_on_join.clone(),
             mode: CheckMode::ActiveCaravan,
@@ -3579,6 +3613,7 @@ fn check_analysis_with_recommendation(
     {
         let tail = target_caravan.tail().expect("caravans are non-empty");
         let targeted = CheckInput {
+            expected_admission: None,
             pr: input.pr,
             tail_pr: Some(tail.0),
             head_pr: None,
@@ -3738,6 +3773,8 @@ fn check_analysis_with_recommendation(
         );
         return eligible_or_error(
             CheckOutput {
+                expected_admission: None,
+                expected_admission_verified: None,
                 provider_api: status.provider_api.clone(),
                 rebase_on_join: status.rebase_on_join.clone(),
                 mode: CheckMode::NewCaravan,
@@ -3866,6 +3903,8 @@ fn check_analysis_with_recommendation(
     );
     eligible_or_error(
         CheckOutput {
+            expected_admission: None,
+            expected_admission_verified: None,
             provider_api: status.provider_api.clone(),
             rebase_on_join: status.rebase_on_join.clone(),
             mode: CheckMode::JoinTail,
@@ -5252,6 +5291,7 @@ mod tests {
         let output = check_analysis(
             &status,
             &CheckInput {
+                expected_admission: None,
                 pr: None,
                 tail_pr: None,
                 head_pr: Some(1),
@@ -6808,6 +6848,7 @@ mod tests {
         let output = check_analysis(
             &status,
             &CheckInput {
+                expected_admission: None,
                 pr: Some(20),
                 tail_pr: None,
                 head_pr: None,
@@ -6866,6 +6907,7 @@ mod tests {
         let output = check_analysis(
             &status,
             &CheckInput {
+                expected_admission: None,
                 pr: Some(20),
                 tail_pr: Some(1),
                 head_pr: None,
@@ -6941,6 +6983,7 @@ mod tests {
         let output = check_analysis(
             &status,
             &CheckInput {
+                expected_admission: None,
                 pr: Some(20),
                 tail_pr: None,
                 head_pr: None,
@@ -6979,6 +7022,7 @@ mod tests {
         let output = check_analysis(
             &status,
             &CheckInput {
+                expected_admission: None,
                 pr: Some(9),
                 tail_pr: None,
                 head_pr: None,
@@ -7070,6 +7114,7 @@ mod tests {
         let output = check_analysis(
             &status,
             &CheckInput {
+                expected_admission: None,
                 pr: Some(2573),
                 tail_pr: Some(2575),
                 head_pr: None,
@@ -7099,6 +7144,7 @@ mod tests {
         let output = check_analysis(
             &status,
             &CheckInput {
+                expected_admission: None,
                 pr: Some(60),
                 tail_pr: None,
                 head_pr: None,
@@ -7164,6 +7210,7 @@ mod tests {
         let output = check_analysis(
             &status,
             &CheckInput {
+                expected_admission: None,
                 pr: Some(60),
                 tail_pr: None,
                 head_pr: None,
@@ -7312,6 +7359,7 @@ mod tests {
         let output = check_analysis(
             &status,
             &CheckInput {
+                expected_admission: None,
                 pr: Some(9),
                 tail_pr: None,
                 head_pr: None,
@@ -7349,6 +7397,7 @@ mod tests {
         let output = check_analysis(
             &status,
             &CheckInput {
+                expected_admission: None,
                 pr: Some(2179),
                 tail_pr: Some(1),
                 head_pr: None,
@@ -7390,6 +7439,7 @@ mod tests {
         let output = check_analysis(
             &status,
             &CheckInput {
+                expected_admission: None,
                 pr: Some(2179),
                 tail_pr: None,
                 head_pr: None,
@@ -7441,6 +7491,7 @@ mod tests {
         let output = check_analysis(
             &status,
             &CheckInput {
+                expected_admission: None,
                 pr: Some(2213),
                 tail_pr: None,
                 head_pr: None,
@@ -7482,6 +7533,7 @@ mod tests {
         for (input, expected_action, expected_mode) in [
             (
                 CheckInput {
+                    expected_admission: None,
                     pr: Some(2215),
                     tail_pr: None,
                     head_pr: None,
@@ -7491,6 +7543,7 @@ mod tests {
             ),
             (
                 CheckInput {
+                    expected_admission: None,
                     pr: Some(2215),
                     tail_pr: Some(1),
                     head_pr: None,
@@ -7537,6 +7590,7 @@ mod tests {
         let output = check_analysis(
             &status,
             &CheckInput {
+                expected_admission: None,
                 pr: Some(2179),
                 tail_pr: None,
                 head_pr: None,
@@ -7592,6 +7646,7 @@ mod tests {
         let output = check_analysis(
             &status,
             &CheckInput {
+                expected_admission: None,
                 pr: Some(2179),
                 tail_pr: Some(1),
                 head_pr: None,
@@ -7668,6 +7723,7 @@ mod tests {
         let conflicting = check_analysis(
             &status,
             &CheckInput {
+                expected_admission: None,
                 pr: Some(2227),
                 tail_pr: Some(1),
                 head_pr: None,
@@ -7689,6 +7745,7 @@ mod tests {
         let clean = check_analysis(
             &status,
             &CheckInput {
+                expected_admission: None,
                 pr: Some(2227),
                 tail_pr: Some(1),
                 head_pr: None,
@@ -7715,6 +7772,7 @@ mod tests {
         let error = check_analysis(
             &status,
             &CheckInput {
+                expected_admission: None,
                 pr: Some(2179),
                 tail_pr: Some(2113),
                 head_pr: None,
@@ -7761,6 +7819,7 @@ mod tests {
         let output = check_analysis(
             &status,
             &CheckInput {
+                expected_admission: None,
                 pr: Some(2179),
                 tail_pr: Some(1),
                 head_pr: None,
@@ -7802,6 +7861,7 @@ mod tests {
         let error = check_analysis(
             &status,
             &CheckInput {
+                expected_admission: None,
                 pr: Some(2179),
                 tail_pr: Some(1),
                 head_pr: None,
@@ -7821,6 +7881,7 @@ mod tests {
         let output = check_analysis(
             &status,
             &CheckInput {
+                expected_admission: None,
                 pr: Some(9),
                 tail_pr: None,
                 head_pr: None,

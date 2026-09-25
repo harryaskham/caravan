@@ -229,6 +229,8 @@ pub(super) fn preflight_eligibility(
             ));
         }
         return Ok(CheckOutput {
+            expected_admission: None,
+            expected_admission_verified: None,
             provider_api: status.provider_api.clone(),
             rebase_on_join: status.rebase_on_join.clone(),
             mode: if request.operation.is_join() {
@@ -286,6 +288,7 @@ pub(super) fn preflight_eligibility(
             .retain(|check| check.name != context);
     }
     let check_input = target.map_or_else(CheckInput::default, |target| CheckInput {
+        expected_admission: None,
         pr: None,
         tail_pr: target.caravan.tail().map(|number| number.0),
         head_pr: None,

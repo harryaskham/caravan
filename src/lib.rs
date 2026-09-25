@@ -15,6 +15,7 @@ pub mod ci_gate;
 pub mod command;
 pub mod compatibility;
 pub mod concat;
+pub mod expected_admission;
 pub mod force;
 pub mod force_intent;
 pub mod generation;
@@ -1096,6 +1097,11 @@ pub struct TargetInput {
 /// Input for `cara check`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Args)]
 pub struct CheckInput {
+    /// One JSON caller-reviewed source/base/default lease; requires an exact remote PR.
+    #[arg(long, value_name = "JSON", requires = "pr")]
+    #[serde(default)]
+    pub expected_admission: Option<expected_admission::ExpectedAdmission>,
+
     /// Exact remote candidate PR. When omitted, use the current checkout's PR.
     /// Without a target, check may recommend the canonical first active,
     /// unparked, unheld caravan; mutation commands retain their explicitly
@@ -1118,6 +1124,11 @@ pub struct CheckInput {
 /// Input for `new` and `renew`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Args)]
 pub struct CreateInput {
+    /// One JSON caller-reviewed admission lease. Supported for new --pr, not renewal.
+    #[arg(long, value_name = "JSON", requires = "pr")]
+    #[serde(default)]
+    pub expected_admission: Option<expected_admission::ExpectedAdmission>,
+
     /// Exact remote candidate PR for checkout-free root admission.
     #[arg(long, value_name = "PR", conflicts_with = "create_pr")]
     #[serde(default)]
@@ -1146,6 +1157,11 @@ pub struct CreateInput {
 /// Input for `join` and `rejoin`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Args)]
 pub struct JoinInput {
+    /// One JSON caller-reviewed admission lease. Supported for join --pr, not rejoin.
+    #[arg(long, value_name = "JSON", requires = "pr")]
+    #[serde(default)]
+    pub expected_admission: Option<expected_admission::ExpectedAdmission>,
+
     /// Exact remote candidate PR. Required for checkout-free atomic integration.
     #[arg(long, value_name = "PR", conflicts_with = "create_pr")]
     #[serde(default)]
