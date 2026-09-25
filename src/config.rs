@@ -916,7 +916,9 @@ impl CaravanConfig {
         }
     }
 
-    /// Whether Cara may ever rewrite a pull request's source branch.
+    /// Whether ordinary sync/membership/reshape may physically rewrite a
+    /// pull request's source branch. Explicit source-repair commands retain
+    /// their separate authority and publication contracts.
     ///
     /// Native GitHub Stack entries are immutable source generations. Keep this
     /// backend check at every physical-writer seam in addition to config

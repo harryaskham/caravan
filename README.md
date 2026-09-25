@@ -559,8 +559,9 @@ source history in an exact merge and uses normal fast-forward publication only.
 It binds current provider generations and actor custody, persists publication
 intent before push, and refuses unresolved retries or cleanup. It never resumes
 sync, changes queue topology, or transfers source ownership. Existing legacy
-sessions cannot be relabelled non-force. Explicit/automatic native rebase and
-legacy repair remain force-with-lease paths, even with `rebase_on_join: false`.
+sessions cannot be relabelled non-force. Explicit native rebase and legacy
+repair remain force-with-lease paths, even with `rebase_on_join: false`.
+Ordinary sync does not invoke native source rebasing automatically.
 See the [owner continuation and refusal contract](.agents/skills/cara-operator/references/history-preserving-repair.md).
 
 A semantic grant is distinct from a mechanical conflict: it is bounded, expiring,
@@ -863,11 +864,12 @@ one canonical candidate already visible as the provider Stack's extra tail,
 sync temporarily projects the proven provider prefix and reruns ordinary
 membership. Every candidate/base/label/compatibility lease remains intact and
 the Stack add resolves idempotently; foreign/multiple extras remain a decision.
-The receipt is exposed as `native_append_membership_recovery`. If complete
-provider truth then exposes exactly one Stack with only known adjacent ancestry
-divergence, ordinary sync automatically reuses the reviewed native-rebase
-planner, atomically publishes the complete exact-lease suffix, and returns for
-fresh CI. Multiple or mixed drift remains explicit.
+The receipt is exposed as `native_append_membership_recovery`. Known adjacent
+ancestry divergence remains a source-owner repair decision. Ordinary sync never
+invokes the explicit native-rebase publisher, selects source rewrite intent on
+an owner's behalf, or dispatches CI for a source generation it rewrote that way.
+It preserves every current source head and returns the existing typed backend
+diagnosis. Normal landing and membership recovery remain separate paths.
 
 `cara native-stack recovery-preview` followed by `recovery-apply` remains the
 explicit path for partial, ambiguous, or independently reviewed recovery shapes
@@ -878,11 +880,11 @@ terminal checks while still refusing pending or failing evidence. A provider
 Stack whose PR bases are linked but whose child commits do
 not contain their predecessors can be recovered explicitly through `cara
 native-stack rebase-preview --stack N --actor A --reason R` followed by
-`rebase-apply` with the reviewed plan hash. Ordinary sync performs the same
-operation automatically only for one unambiguous Stack whose entire backend
-problem set is `native_stack_rebase_required`; the apply prepares the complete
-divergent suffix before one atomic exact-lease push and requires linear provider
-rediscovery plus fresh CI. Apply independently revalidates ordered membership, immutable
+`rebase-apply` with the reviewed plan hash, only under explicit authority for
+force-with-lease source publication. This is not a non-force fallback; use the
+history-preserving owner repair path above under a no-force constraint. Ordinary
+sync does not call native rebase, even for one unambiguous divergent Stack.
+Native membership recovery independently revalidates ordered membership, immutable
 heads/bases, current CLEAN/green evidence, rollout capability, and complete
 mapping truth. A legacy first-child gap permits zero mappings; a checkpointed
 append permits only its exact provider prefix; a response-loss retry permits one

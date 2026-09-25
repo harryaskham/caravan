@@ -75,10 +75,17 @@ refspec or force-with-lease, and never pushes tags or submodule refs.
 
 ## What remains forceful or separately authorized
 
-**Explicit native `rebase-apply`, automatic `auto_apply_from_status`, and legacy
-`repair continue` publish force-with-lease.** `rebase_on_join: false` is not a global
-no-force switch for these paths. Do not invoke sync or these wrappers under a
-blanket no-force constraint; first-party names do not change their effect.
+**Explicit native `rebase-apply` and legacy `repair continue` publish
+force-with-lease.** `rebase_on_join: false` is not a global no-force switch for
+those explicit paths. They are not a non-force fallback; first-party names do
+not change their effect.
+
+Ordinary sync no longer invokes `auto_apply_from_status`: the automatic native
+source-rebase publisher was removed, not wrapped in another receipt or approval
+gate. Native ancestry drift preserves source heads and returns the existing
+backend diagnosis to the source owner. This source correction does not prove an
+older installed runtime has changed, erase earlier effects, or authorize replay
+of a historical operation. Normal landing and membership recovery remain separate.
 
 **There is no standalone sealed tail-eviction preview CLI.** `cara plan` exposes
 sync/concat, not an eviction preview, and `cara evict` has no dry-run flag. Some

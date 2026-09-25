@@ -45,8 +45,9 @@ Use the existing designated writer; a monitoring loop must not start a competing
 - source repair: route the exact candidate to its owner and use first-party Cara
   repair. For no-force authority use [history-preserving repair](references/history-preserving-repair.md):
   `repair start --non-force`, then the same actor's `repair continue --no-sync`.
-  Explicit/automatic native rebase and legacy repair still use force-with-lease;
-  never select them as a non-force fallback or synthesize a different suffix.
+  Explicit native rebase and legacy repair still use force-with-lease; never
+  select them as a non-force fallback or synthesize a different suffix.
+  Ordinary sync no longer invokes native source rebasing automatically.
 - timeout/transport failure: reread provider/main before retry. A failed caller
   receipt can follow a successful provider mutation.
 - terminal red: follow effective `terminal_red` policy and provenance. Never

@@ -31,6 +31,6 @@ ready PR `#73`, which merged as true-main `e0afb4a2` under operation
 This canary demonstrates diagnosis/delegation without unsafe direct rescue or a
 second queue writer.
 It is historical evidence, not a reusable operation receipt or permission to start a manual sync beside a configured scheduler.
-The sealed plan came from that specific partial-prefix decision. There is no standalone sealed tail-eviction preview CLI; `cara evict` is a mutating command, not a preview or reusable authority. Its current native-generation and writer preflight can refuse even a tail. See [history-preserving repair](history-preserving-repair.md) for the actual no-force source interface and explicit/automatic native rebase force boundary.
+The sealed plan came from that specific partial-prefix decision. There is no standalone sealed tail-eviction preview CLI; `cara evict` is a mutating command, not a preview or reusable authority. Its current native-generation and writer preflight can refuse even a tail. See [history-preserving repair](history-preserving-repair.md) for the actual no-force source interface, explicit native-rebase force boundary, and removal of sync's automatic source-rebase path.
 In a deployment with an existing designated writer, that actor performs the post-eviction rediscovery and landing; the monitor verifies its result.
 See [the monitoring guide](queue-monitoring.md) for owner acknowledgement, ready-prefix decisions, and bounded no-progress escalation.

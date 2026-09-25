@@ -1500,7 +1500,11 @@ pub(crate) fn require_native_stack_backend_healthy(status: &StatusOutput) -> Res
             "mutated": false,
             "provider_mutations": 0,
             "resumable": true,
-            "safe_next_action": "resume or reconcile the exact pending native-membership checkpoint; preserve every current head and never fall back to an ordinary squash merge",
+            "safe_next_action": if blocking.iter().any(|problem| problem.code == "native_stack_rebase_required") {
+                "preserve every current source head; route ancestry repair to its source owner using history-preserving non-force repair; ordinary sync never invokes native rebase automatically"
+            } else {
+                "resume or reconcile the exact pending native-membership checkpoint; preserve every current head and never fall back to an ordinary squash merge"
+            },
         })),
     ))
 }
@@ -4900,112 +4904,6 @@ fn native_membership_recovery_output(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn native_stack_rebase_output(
-    context: &AppContext,
-    input: &SyncInput,
-    provider: &impl SyncProvider,
-    started: Instant,
-    operation_deadline: Instant,
-    initial_status_elapsed: Duration,
-    rebase: &crate::native_stack_rebase::NativeStackRebaseOutput,
-    status: StatusOutput,
-    lock_recovery: Option<OperationLockRecovery>,
-    lock: &mut WriterOperationGuard,
-) -> Result<SyncOutput, AppError> {
-    lock.checkpoint(
-        "native_stack_auto_rebase_complete",
-        json!({
-            "plan": rebase.plan,
-            "physical": rebase.physical,
-            "status": status.stack_backend,
-        }),
-        false,
-    )?;
-    let changed = rebase.mutated;
-    let receipt = OperationReceipt {
-        operation_id: OperationId(format!("native-stack-rebase-{}", rebase.plan.plan_hash)),
-        operation: "sync-native-stack-rebase".to_owned(),
-        completed_steps: Vec::new(),
-        changed,
-    };
-    let mut scheduler_status =
-        successful_scheduler_status(&status, &[], &[], context.config.rebase_on_join, &[], &[]);
-    scheduler_status.disposition = SchedulerDisposition::WaitingCi;
-    scheduler_status.wake_class = SchedulerWakeClass::None;
-    format!(
-        "native Stack #{} ancestry converged atomically; waiting for fresh CI on rewritten heads",
-        rebase.plan.stack
-    )
-    .clone_into(&mut scheduler_status.reason);
-    let rebase_receipts = rebase
-        .physical
-        .as_ref()
-        .map(|physical| physical.receipts.clone())
-        .unwrap_or_default();
-    let mut ci_progress = SyncProgress::new(
-        &status,
-        vec![rebase.plan.root_pr],
-        context.config.sync.max_mutations_per_tick,
-    );
-    for member in &rebase.plan.members {
-        ci_progress.steps.push(MutationStep {
-            kind: MutationKind::NativeStackLand,
-            state: MutationStepState::Completed,
-            pr: Some(member.pr),
-            summary: "native Stack reconstruction requires exact-generation CI".to_owned(),
-        });
-    }
-    dispatch_exact_ci_after_queue_mutations(
-        &context.repository_path,
-        provider,
-        &mut ci_progress,
-        &status,
-    )?;
-    Ok(SyncOutput {
-        tick: SyncTickReceipt {
-            schema_version: 1,
-            verb: "sync".to_owned(),
-            caravans: status.analysis.fleet.caravans.len(),
-            unqueued: status.analysis.fleet.unqueued.len(),
-            synchronized: 1,
-            joins: 0,
-            changed,
-        },
-        receipt,
-        auto_admission: AutoAdmissionOutput::disabled(context, input.all),
-        scheduler_status,
-        timing: Some(SyncTiming {
-            deadline_ms: duration_millis(operation_deadline.saturating_duration_since(started)),
-            total_ms: duration_millis(started.elapsed()),
-            initial_status_ms: duration_millis(initial_status_elapsed),
-            provider_convergence_ms: duration_millis(started.elapsed()),
-            final_status_ms: 0,
-        }),
-        lock_recovery,
-        provider_receipts: ci_progress.provider_receipts,
-        closed_lifecycle_transitions: Vec::new(),
-        root_auto_merge: Vec::new(),
-        root_promotion: Vec::new(),
-        root_merge: Vec::new(),
-        ci_generation_dispatches: ci_progress.ci_generation_dispatches,
-        native_stack_land: Vec::new(),
-        native_membership_recovery: Vec::new(),
-        native_append_membership_recovery: Vec::new(),
-        required_runs: Vec::new(),
-        rebase_plans: Vec::new(),
-        rebase_receipts,
-        historical_predecessor: read::historical_predecessor(&status),
-        synchronized_caravans: vec![rebase.plan.root_pr],
-        paused_caravans: Vec::new(),
-        head_advancements: Vec::new(),
-        ci: Vec::new(),
-        events: Vec::new(),
-        hook_deliveries: Vec::new(),
-        status,
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
 fn native_append_membership_recovery_output(
     context: &AppContext,
     input: &SyncInput,
@@ -5313,31 +5211,10 @@ fn sync_with_lock(
         );
     }
 
-    // Native mode keeps source generations immutable during ordinary
-    // membership. When complete provider truth identifies exactly one Stack
-    // whose only defect is known adjacent ancestry divergence, reuse the typed
-    // native-rebase planner and atomic lease-fenced publisher, then return so
-    // fresh CI owns the rewritten generation before any queue work continues.
-    if let Some((rebase, recovered_status)) = crate::native_stack_rebase::auto_apply_from_status(
-        context,
-        &status,
-        &lock,
-        operation_deadline,
-        &github_budget,
-    )? {
-        return native_stack_rebase_output(
-            context,
-            input,
-            &provider,
-            started,
-            operation_deadline,
-            initial_status_elapsed,
-            &rebase,
-            recovered_status,
-            lock_recovery,
-            &mut lock,
-        );
-    }
+    // Ordinary native sync never invokes a source-history rewriter. Preserve
+    // divergent source heads and route their existing typed backend diagnosis
+    // to the source owner; a fresh snapshot or scheduler tick is not authority
+    // to run the explicitly requested native-rebase command.
     require_native_stack_backend_healthy(&status)?;
 
     // Root landing is the first active-fleet provider convergence action for
