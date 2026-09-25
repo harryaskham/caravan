@@ -7417,6 +7417,7 @@ fn evaluate_auto_candidate_bounded(
         let output = check_auto_target(
             &virtual_status,
             &CheckInput {
+                expected_admission: None,
                 pr: None,
                 tail_pr: Some(tail.tail_pr.0),
                 head_pr: None,

@@ -56,6 +56,7 @@ fn independent_admission_explicit_join_keeps_selected_tail_and_refusal() {
     let result = check_requested_action_analysis(
         &observed,
         &CheckInput {
+            expected_admission: None,
             pr: Some(9),
             tail_pr: Some(2),
             head_pr: None,

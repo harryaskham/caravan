@@ -8,8 +8,18 @@ use crate::model::{
     AutoMergeState, BranchSnapshot, CommitOid, CompatibilityOutcome, CompatibilityReport,
 };
 
+mod expected_admission;
+
 #[derive(Default)]
 struct FakeProvider {
+    admission_identity: RefCell<Option<(RepositoryId, String)>>,
+    native_unjoined: RefCell<bool>,
+    drift_default_after: RefCell<Option<MutationKind>>,
+    drift_source_after: RefCell<Option<MutationKind>>,
+    fail_after_effect: RefCell<Option<MutationKind>>,
+    effects: RefCell<Vec<MutationKind>>,
+    admission_identity_reads: std::cell::Cell<usize>,
+    drift_on_identity_read: RefCell<Option<usize>>,
     labels: BTreeSet<String>,
     allows_auto_merge: bool,
     branch_protected: bool,
@@ -25,6 +35,14 @@ struct FakeProvider {
 impl FakeProvider {
     fn with_pull_requests(pull_requests: Vec<PullRequestSnapshot>) -> Self {
         Self {
+            admission_identity: RefCell::new(Some((repository(), "main".to_owned()))),
+            native_unjoined: RefCell::new(true),
+            drift_default_after: RefCell::new(None),
+            drift_source_after: RefCell::new(None),
+            fail_after_effect: RefCell::new(None),
+            effects: RefCell::new(Vec::new()),
+            admission_identity_reads: std::cell::Cell::new(0),
+            drift_on_identity_read: RefCell::new(None),
             labels: REQUIRED_LABELS.into_iter().map(str::to_owned).collect(),
             allows_auto_merge: true,
             branch_protected: true,
@@ -69,6 +87,27 @@ impl FakeProvider {
         }
         let before = current.clone();
         update(current);
+        self.effects.borrow_mut().push(kind);
+        if self.drift_default_after.borrow().as_ref() == Some(&kind) {
+            self.branch_heads
+                .borrow_mut()
+                .insert("main".to_owned(), CommitOid("f".repeat(40)));
+        }
+        if self.drift_source_after.borrow().as_ref() == Some(&kind) {
+            current.head.oid = CommitOid("d".repeat(40));
+            self.branch_heads
+                .borrow_mut()
+                .insert(current.head.name.clone(), current.head.oid.clone());
+        }
+        if self.fail_after_effect.borrow().as_ref() == Some(&kind) {
+            return Err(MutationError::Provider(
+                crate::github::DiscoveryError::CommandFailed {
+                    command: CommandSpec::new("gh"),
+                    code: None,
+                    stderr: "response lost after provider effect".to_owned(),
+                },
+            ));
+        }
         Ok(GitHubMutationReceipt {
             kind,
             before: Some(before),
@@ -79,6 +118,27 @@ impl FakeProvider {
 }
 
 impl MembershipProvider for FakeProvider {
+    fn admission_repository_identity(
+        &self,
+    ) -> Result<Option<(RepositoryId, String)>, MutationError> {
+        let read = self.admission_identity_reads.get() + 1;
+        self.admission_identity_reads.set(read);
+        if *self.drift_on_identity_read.borrow() == Some(read) {
+            self.branch_heads
+                .borrow_mut()
+                .insert("main".to_owned(), CommitOid("f".repeat(40)));
+        }
+        Ok(self.admission_identity.borrow().clone())
+    }
+
+    fn admission_native_unjoined(
+        &self,
+        _: &RepositoryId,
+        _: PrNumber,
+    ) -> Result<bool, MutationError> {
+        Ok(*self.native_unjoined.borrow())
+    }
+
     fn open_generation_facts(
         &self,
         _repository: &RepositoryId,
@@ -166,7 +226,12 @@ impl MembershipProvider for FakeProvider {
     ) -> Result<GitHubMutationReceipt, MutationError> {
         self.mutate(expected, MutationKind::SetBase, |pull_request| {
             pull_request.base.name = base.to_owned();
-            pull_request.base.oid = CommitOid(format!("{base}-oid"));
+            pull_request.base.oid = self
+                .branch_heads
+                .borrow()
+                .get(base)
+                .cloned()
+                .unwrap_or_else(|| CommitOid(format!("{base}-oid")));
         })
     }
 
@@ -375,6 +440,8 @@ fn authorized_eligibility(candidate: &PullRequestSnapshot) -> CheckOutput {
         stale_reasons: Vec::new(),
     };
     CheckOutput {
+        expected_admission: None,
+        expected_admission_verified: None,
         provider_api: crate::model::GitHubApiTelemetry::default(),
         rebase_on_join: crate::read::RebaseOnJoinStatus::default(),
         mode: crate::read::CheckMode::NewCaravan,
@@ -459,6 +526,7 @@ pub(crate) fn apply_deferred_fixture(
         &clean,
         &provider,
         MembershipRequest {
+            expected_admission: None,
             operation: if tail.is_some() {
                 MembershipOperation::Join
             } else {
@@ -495,6 +563,7 @@ fn sync_proven_gate_capability_survives_membership_apply_preflight() {
         .pull_requests
         .insert(candidate.number, candidate.clone());
     let request = MembershipRequest {
+        expected_admission: None,
         operation: MembershipOperation::New,
         create_pr: false,
         tail_pr: None,
@@ -596,6 +665,7 @@ fn empty_native_fleet_admits_stale_base_without_rewriting_head() {
         &exact_native_clean,
         &provider,
         MembershipRequest {
+            expected_admission: None,
             operation: MembershipOperation::New,
             create_pr: false,
             tail_pr: None,
@@ -795,6 +865,7 @@ fn rewrite_required_join_rediscovery_and_membership_share_one_operation_budget()
         &clean,
         &provider,
         MembershipRequest {
+            expected_admission: None,
             operation: MembershipOperation::Join,
             create_pr: false,
             tail_pr: Some(tail.number.0),
@@ -882,6 +953,7 @@ fn join_failure_event_carries_target_fleet_and_error_code() {
     let candidate = pull_request(2, "two", "main", &[]);
     let status = status(candidate, vec![head]);
     let request = MembershipRequest {
+        expected_admission: None,
         operation: MembershipOperation::Join,
         create_pr: false,
         tail_pr: Some(1),
@@ -908,6 +980,7 @@ fn root_admission_never_treats_default_branch_as_empty_source() {
     discovered.current_pr = None;
     discovered.current_branch = Some("main".to_owned());
     let mut request = MembershipRequest {
+        expected_admission: None,
         operation: MembershipOperation::New,
         create_pr: false,
         tail_pr: None,
@@ -934,6 +1007,7 @@ fn join_refuses_stale_root_before_any_provider_mutation() {
     let candidate = pull_request(2, "two", "main", &[]);
     let status = status(candidate.clone(), vec![root]);
     let request = MembershipRequest {
+        expected_admission: None,
         operation: MembershipOperation::Join,
         create_pr: false,
         tail_pr: Some(1),
@@ -968,6 +1042,7 @@ fn join_root_check_progress_does_not_stale_mutation_identity() {
     let candidate = pull_request(2, "two", "main", &[]);
     let status = status(candidate.clone(), vec![root.clone()]);
     let request = MembershipRequest {
+        expected_admission: None,
         operation: MembershipOperation::Join,
         create_pr: false,
         tail_pr: Some(1),
@@ -992,6 +1067,7 @@ fn native_join_root_allows_unchanged_historical_base_but_keeps_identity_fences()
     let candidate = pull_request(2, "two", "main", &[]);
     let mut status = status(candidate.clone(), vec![root.clone()]);
     let request = MembershipRequest {
+        expected_admission: None,
         operation: MembershipOperation::Join,
         create_pr: false,
         tail_pr: Some(1),
@@ -1036,6 +1112,7 @@ fn join_root_drift_after_preview_fails_before_provider_mutation() {
     let candidate = pull_request(2, "two", "main", &[]);
     let status = status(candidate.clone(), vec![root.clone()]);
     let request = MembershipRequest {
+        expected_admission: None,
         operation: MembershipOperation::Join,
         create_pr: false,
         tail_pr: Some(1),
@@ -1075,6 +1152,7 @@ fn join_refuses_closed_tail_parent_before_any_provider_mutation() {
         vec![root.clone(), parent.clone(), tail.clone()],
     );
     let request = MembershipRequest {
+        expected_admission: None,
         operation: MembershipOperation::Join,
         create_pr: false,
         tail_pr: Some(3),
@@ -1111,6 +1189,7 @@ fn join_refuses_stale_parent_to_tail_lease_before_any_provider_mutation() {
         vec![root.clone(), parent.clone(), tail.clone()],
     );
     let request = MembershipRequest {
+        expected_admission: None,
         operation: MembershipOperation::Join,
         create_pr: false,
         tail_pr: Some(3),
@@ -1224,6 +1303,7 @@ fn empty_source_join_is_zero_mutation_with_exact_receipt() {
     let event = join_failed_event(
         &discovered,
         &MembershipRequest {
+            expected_admission: None,
             operation: MembershipOperation::Join,
             create_pr: false,
             tail_pr: Some(1),
@@ -1508,6 +1588,7 @@ fn atomic_new_and_renew_accept_exact_default_without_a_join_tail() {
             &clean,
             &provider,
             MembershipRequest {
+                expected_admission: None,
                 operation,
                 create_pr: false,
                 tail_pr: None,
@@ -1542,6 +1623,7 @@ fn atomic_new_rejects_head_default_and_membership_races_before_mutation() {
         &clean,
         &moved_provider,
         MembershipRequest {
+            expected_admission: None,
             operation: MembershipOperation::New,
             create_pr: false,
             tail_pr: None,
@@ -1569,6 +1651,7 @@ fn atomic_new_rejects_head_default_and_membership_races_before_mutation() {
         &clean,
         &default_provider,
         MembershipRequest {
+            expected_admission: None,
             operation: MembershipOperation::New,
             create_pr: false,
             tail_pr: None,
@@ -1591,6 +1674,7 @@ fn atomic_new_rejects_head_default_and_membership_races_before_mutation() {
         &clean,
         &enrolled_provider,
         MembershipRequest {
+            expected_admission: None,
             operation: MembershipOperation::New,
             create_pr: false,
             tail_pr: None,
@@ -1653,6 +1737,7 @@ fn atomic_join_rejects_live_tail_drift_after_physical_rebase() {
         &clean,
         &provider,
         MembershipRequest {
+            expected_admission: None,
             operation: MembershipOperation::Join,
             create_pr: false,
             tail_pr: Some(1),
@@ -1682,6 +1767,7 @@ fn join_receipt_proves_exact_tail_ancestry_and_durable_force_preservation() {
         &clean,
         &provider,
         MembershipRequest {
+            expected_admission: None,
             operation: MembershipOperation::Join,
             create_pr: false,
             tail_pr: Some(1),
@@ -1719,6 +1805,8 @@ fn join_receipt_proves_exact_tail_ancestry_and_durable_force_preservation() {
         &repository(),
         &before,
         JoinReceiptEvidence {
+            expected_admission: None,
+            immutable_ancestry_verified: false,
             predecessor: Some(JoinPredecessorReceipt {
                 pr: head.number,
                 branch: head.head.name.clone(),
@@ -1783,6 +1871,7 @@ fn created_root_receipt_falls_back_to_exact_provider_created_head() {
         &clean,
         &provider,
         MembershipRequest {
+            expected_admission: None,
             operation: MembershipOperation::New,
             create_pr: false,
             tail_pr: None,
@@ -1800,6 +1889,8 @@ fn created_root_receipt_falls_back_to_exact_provider_created_head() {
         &repository(),
         &before,
         JoinReceiptEvidence {
+            expected_admission: None,
+            immutable_ancestry_verified: false,
             predecessor: Some(JoinPredecessorReceipt {
                 pr: PrNumber(0),
                 branch: default.name,
@@ -1831,6 +1922,7 @@ fn root_new_receipt_uses_default_branch_predecessor_bd_d15ba3() {
         &clean,
         &provider,
         MembershipRequest {
+            expected_admission: None,
             operation: MembershipOperation::New,
             create_pr: false,
             tail_pr: None,
@@ -1869,6 +1961,8 @@ fn root_new_receipt_uses_default_branch_predecessor_bd_d15ba3() {
         &repository(),
         &before,
         JoinReceiptEvidence {
+            expected_admission: None,
+            immutable_ancestry_verified: false,
             predecessor: Some(JoinPredecessorReceipt {
                 pr: PrNumber(0),
                 branch: default.name.clone(),
@@ -1920,6 +2014,7 @@ fn a_root_admission_reports_the_caravans_it_declined_to_join() {
         &clean,
         &provider,
         MembershipRequest {
+            expected_admission: None,
             operation: MembershipOperation::New,
             create_pr: false,
             tail_pr: None,
@@ -1955,6 +2050,7 @@ fn a_root_admission_on_an_empty_fleet_reports_no_alternative() {
         &clean,
         &provider,
         MembershipRequest {
+            expected_admission: None,
             operation: MembershipOperation::New,
             create_pr: false,
             tail_pr: None,
@@ -2008,6 +2104,7 @@ fn independent_admission_new_write_preflight_matches_read_refusal_without_effect
         &clean,
         &provider,
         MembershipRequest {
+            expected_admission: None,
             operation: MembershipOperation::New,
             create_pr: false,
             tail_pr: None,
@@ -2031,6 +2128,7 @@ fn new_applies_active_label_and_squash_auto_merge() {
         &clean,
         &provider,
         MembershipRequest {
+            expected_admission: None,
             operation: MembershipOperation::New,
             create_pr: false,
             tail_pr: None,
@@ -2062,6 +2160,7 @@ fn new_with_one_visible_caravan_does_not_inherit_check_recommendation() {
         &clean,
         &provider,
         MembershipRequest {
+            expected_admission: None,
             operation: MembershipOperation::New,
             create_pr: false,
             tail_pr: None,
@@ -2094,6 +2193,7 @@ fn explicit_membership_consumes_advisory_auto_admission_skip() {
         &clean,
         &provider,
         MembershipRequest {
+            expected_admission: None,
             operation: MembershipOperation::New,
             create_pr: false,
             tail_pr: None,
@@ -2122,6 +2222,7 @@ fn join_infers_unique_tail_and_preserves_non_head_auto_merge_off() {
         &clean,
         &provider,
         MembershipRequest {
+            expected_admission: None,
             operation: MembershipOperation::Join,
             create_pr: false,
             tail_pr: None,
@@ -2156,6 +2257,7 @@ fn explicit_join_admits_ahead_of_older_unjoined_row_with_bound_provenance() {
         &clean,
         &provider,
         MembershipRequest {
+            expected_admission: None,
             operation: MembershipOperation::Join,
             create_pr: false,
             tail_pr: Some(1),
@@ -2198,6 +2300,7 @@ fn duplicate_explicit_join_retry_resumes_the_same_attach() {
         FakeProvider::with_pull_requests(vec![head.clone(), older.clone(), candidate.clone()]);
     *provider.fail_kind.borrow_mut() = Some(MutationKind::AddLabel);
     let request = MembershipRequest {
+        expected_admission: None,
         operation: MembershipOperation::Join,
         create_pr: false,
         tail_pr: Some(1),
@@ -2270,6 +2373,7 @@ fn explicit_new_membership_admits_ahead_of_an_older_unjoined_row() {
         &clean,
         &provider,
         MembershipRequest {
+            expected_admission: None,
             operation: MembershipOperation::New,
             create_pr: false,
             tail_pr: None,
@@ -2318,6 +2422,7 @@ fn targetless_join_selects_the_first_caravan() {
         &clean,
         &provider,
         MembershipRequest {
+            expected_admission: None,
             operation: MembershipOperation::Join,
             create_pr: false,
             tail_pr: None,
@@ -2351,6 +2456,7 @@ fn provider_failure_during_permitted_join_reports_partial_evidence() {
         &clean,
         &provider,
         MembershipRequest {
+            expected_admission: None,
             operation: MembershipOperation::Join,
             create_pr: false,
             tail_pr: Some(1),
@@ -2381,6 +2487,7 @@ fn routine_join_preserves_durable_force_intent() {
         &clean,
         &provider,
         MembershipRequest {
+            expected_admission: None,
             operation: MembershipOperation::Join,
             create_pr: false,
             tail_pr: None,
@@ -2412,6 +2519,7 @@ fn unprotected_default_branch_fails_before_head_mutation() {
         &clean,
         &provider,
         MembershipRequest {
+            expected_admission: None,
             operation: MembershipOperation::New,
             create_pr: false,
             tail_pr: None,
@@ -2455,6 +2563,7 @@ fn a_caravan_merge_actor_does_not_require_native_auto_merge() {
         &clean,
         &provider,
         MembershipRequest {
+            expected_admission: None,
             operation: MembershipOperation::New,
             create_pr: false,
             tail_pr: None,
@@ -2485,6 +2594,7 @@ fn disabled_repository_auto_merge_fails_before_head_mutation() {
         &clean,
         &provider,
         MembershipRequest {
+            expected_admission: None,
             operation: MembershipOperation::New,
             create_pr: false,
             tail_pr: None,
@@ -2520,6 +2630,7 @@ fn missing_labels_fail_before_provider_mutation() {
         &clean,
         &provider,
         MembershipRequest {
+            expected_admission: None,
             operation: MembershipOperation::New,
             create_pr: false,
             tail_pr: None,
@@ -2551,6 +2662,7 @@ fn partial_failure_rolls_back_membership_envelope_and_rerun_resumes() {
     let provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);
     *provider.fail_kind.borrow_mut() = Some(MutationKind::EnableAutoMerge);
     let request = MembershipRequest {
+        expected_admission: None,
         operation: MembershipOperation::New,
         create_pr: false,
         tail_pr: None,
@@ -2600,6 +2712,7 @@ fn explicit_membership_reason_must_not_be_whitespace() {
         &clean,
         &provider,
         MembershipRequest {
+            expected_admission: None,
             operation: MembershipOperation::New,
             create_pr: false,
             tail_pr: None,
@@ -2625,6 +2738,7 @@ fn comment_failure_rolls_back_membership_envelope() {
         &clean,
         &provider,
         MembershipRequest {
+            expected_admission: None,
             operation: MembershipOperation::New,
             create_pr: false,
             tail_pr: None,
@@ -2654,6 +2768,7 @@ fn explicit_priority_applies_configured_control_label() {
         &clean,
         &provider,
         MembershipRequest {
+            expected_admission: None,
             operation: MembershipOperation::New,
             create_pr: false,
             tail_pr: None,
@@ -2719,6 +2834,7 @@ fn rejoin_removes_evicted_but_preserves_durable_force_after_full_preflight() {
         &clean,
         &provider,
         MembershipRequest {
+            expected_admission: None,
             operation: MembershipOperation::Rejoin,
             create_pr: false,
             tail_pr: Some(1),
@@ -2778,6 +2894,7 @@ fn newer_same_stream_generation_appearing_after_discovery_stops_before_membershi
         &clean,
         &provider,
         MembershipRequest {
+            expected_admission: None,
             operation: MembershipOperation::New,
             create_pr: false,
             tail_pr: None,
@@ -2822,6 +2939,7 @@ fn generation_candidate_close_race_fails_before_any_membership_mutation() {
         &clean,
         &provider,
         MembershipRequest {
+            expected_admission: None,
             operation: MembershipOperation::New,
             create_pr: false,
             tail_pr: None,
@@ -2865,6 +2983,7 @@ fn same_bead_generation_from_unrelated_agent_does_not_block_membership() {
         &clean,
         &provider,
         MembershipRequest {
+            expected_admission: None,
             operation: MembershipOperation::New,
             create_pr: false,
             tail_pr: None,

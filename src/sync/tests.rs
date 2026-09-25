@@ -4571,6 +4571,7 @@ fn parked_repair_is_routed_without_poisoning_independent_admission() {
     let check = read::check_analysis(
         &fleet,
         &CheckInput {
+            expected_admission: None,
             pr: Some(candidate.number.0),
             tail_pr: None,
             head_pr: None,
@@ -4617,6 +4618,7 @@ fn parked_repair_is_routed_without_poisoning_independent_admission() {
     let active_check = read::check_analysis(
         &post_admission,
         &CheckInput {
+            expected_admission: None,
             pr: Some(candidate.number.0),
             tail_pr: None,
             head_pr: None,
@@ -4638,6 +4640,7 @@ fn parked_repair_is_routed_without_poisoning_independent_admission() {
     let follow_up = read::check_analysis(
         &post_admission,
         &CheckInput {
+            expected_admission: None,
             pr: Some(follower.number.0),
             tail_pr: None,
             head_pr: None,
@@ -4655,6 +4658,7 @@ fn parked_repair_is_routed_without_poisoning_independent_admission() {
     let parked_target = read::check_analysis(
         &fleet,
         &CheckInput {
+            expected_admission: None,
             pr: Some(candidate.number.0),
             tail_pr: None,
             head_pr: Some(parked_root.number.0),

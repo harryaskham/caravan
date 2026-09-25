@@ -105,6 +105,7 @@ impl MembershipOperation {
 /// Input normalized across the four membership commands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MembershipRequest {
+    pub expected_admission: Option<crate::expected_admission::ExpectedAdmission>,
     pub operation: MembershipOperation,
     pub create_pr: bool,
     pub tail_pr: Option<u64>,
@@ -154,6 +155,7 @@ pub struct JoinResultReceipt {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum JoinForceIntent {
+    #[serde(rename = "none", alias = "absent")]
     Absent,
     Preserved,
 }
@@ -161,6 +163,10 @@ pub enum JoinForceIntent {
 /// Versioned, additive contract consumed by Cacophony `pr_cara_join`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct JoinReceipt {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_admission: Option<crate::expected_admission::ExpectedAdmission>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_admission_verified: Option<bool>,
     pub schema_version: u32,
     pub operation_id: OperationId,
     pub repository: RepositoryId,
@@ -238,6 +244,22 @@ pub struct MembershipOutput {
 
 /// Provider operations required by membership policy.
 pub trait MembershipProvider {
+    /// Missing caller-lease capabilities fail closed; legacy unguarded callers
+    /// do not depend on them.
+    fn admission_repository_identity(
+        &self,
+    ) -> Result<Option<(RepositoryId, String)>, MutationError> {
+        Ok(None)
+    }
+
+    fn admission_native_unjoined(
+        &self,
+        _repository: &RepositoryId,
+        _pr: PrNumber,
+    ) -> Result<bool, MutationError> {
+        Ok(false)
+    }
+
     /// Fresh open generation facts used only by the membership domain's
     /// immediate pre-mutation generation guard.
     fn open_generation_facts(
@@ -343,6 +365,26 @@ pub trait MembershipProvider {
 }
 
 impl<R: crate::command::CommandRunner> MembershipProvider for GitHubMutationAdapter<R> {
+    fn admission_repository_identity(
+        &self,
+    ) -> Result<Option<(RepositoryId, String)>, MutationError> {
+        self.repository_identity().map(Some)
+    }
+
+    fn admission_native_unjoined(
+        &self,
+        repository: &RepositoryId,
+        pr: PrNumber,
+    ) -> Result<bool, MutationError> {
+        let Ok(inventory) = self.native_stack_inventory(repository) else {
+            return Ok(false); // Unavailable or incomplete inventory is never unjoined proof.
+        };
+        Ok(!inventory.truncated
+            && !inventory.stacks.iter().any(|stack| {
+                stack.open && stack.pull_requests.iter().any(|pull| pull.number == pr.0)
+            }))
+    }
+
     fn open_generation_facts(
         &self,
         repository: &RepositoryId,
@@ -473,6 +515,7 @@ pub fn new(context: &AppContext, input: &CreateInput) -> Result<MembershipOutput
         context,
         &MembershipRequest {
             operation: MembershipOperation::New,
+            expected_admission: input.expected_admission.clone(),
             create_pr: input.create_pr,
             tail_pr: None,
             head_pr: None,
@@ -490,6 +533,7 @@ pub fn renew(context: &AppContext, input: &CreateInput) -> Result<MembershipOutp
         context,
         &MembershipRequest {
             operation: MembershipOperation::Renew,
+            expected_admission: input.expected_admission.clone(),
             create_pr: input.create_pr,
             tail_pr: None,
             head_pr: None,
@@ -507,6 +551,7 @@ pub fn join(context: &AppContext, input: &JoinInput) -> Result<MembershipOutput,
         context,
         &MembershipRequest {
             operation: MembershipOperation::Join,
+            expected_admission: input.expected_admission.clone(),
             create_pr: input.create_pr,
             tail_pr: input.tail_pr,
             head_pr: input.head_pr,
@@ -524,6 +569,7 @@ pub fn rejoin(context: &AppContext, input: &JoinInput) -> Result<MembershipOutpu
         context,
         &MembershipRequest {
             operation: MembershipOperation::Rejoin,
+            expected_admission: input.expected_admission.clone(),
             create_pr: input.create_pr,
             tail_pr: input.tail_pr,
             head_pr: input.head_pr,
@@ -535,11 +581,48 @@ pub fn rejoin(context: &AppContext, input: &JoinInput) -> Result<MembershipOutpu
     )
 }
 
+fn validate_expected_admission_request(
+    request: &MembershipRequest,
+    candidate: Option<u64>,
+) -> Result<(), AppError> {
+    if let Some(binding) = &request.expected_admission {
+        binding.validate(candidate)?;
+        if request.create_pr || request.operation.is_renewal() {
+            return Err(crate::expected_admission::refusal(
+                "expected_admission_operation_unsupported",
+                "caller-reviewed admission supports only new/join of an existing unjoined --pr",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn guarded_partial_error(
+    source: AppError,
+    receipt: &OperationReceipt,
+    provider_receipts: &[GitHubMutationReceipt],
+) -> AppError {
+    if !receipt.changed && source.code().starts_with("expected_admission_") {
+        return source;
+    }
+    AppError::structured(
+        ErrorCategory::ExecutionFailure,
+        "expected_admission_partial",
+        "guarded admission stopped after completed or possible effects; preserve the exact operation rather than rolling back or retrying automatically",
+        Some(
+            json!({"source_code": source.code(), "source": source.details(), "receipt": receipt,
+            "provider_receipts": provider_receipts, "provider_mutation": "possible", "resumable": false,
+            "safe_next_action": "reconcile these exact effects; never remove the caller guard or replay the old admission"}),
+        ),
+    )
+}
+
 fn execute_live(
     context: &AppContext,
     request: &MembershipRequest,
     candidate_pr: Option<u64>,
 ) -> Result<MembershipOutput, AppError> {
+    validate_expected_admission_request(request, candidate_pr)?;
     let lock = context.acquire_writer_operation(request.operation.name())?;
     execute_locked(
         context,
@@ -576,6 +659,7 @@ pub(crate) fn auto_admit_locked(
     execute_locked(
         context,
         &MembershipRequest {
+            expected_admission: None,
             operation,
             create_pr: false,
             tail_pr: tail_pr.map(|number| number.0),
@@ -1429,6 +1513,7 @@ fn execute_locked(
     dispatch_hooks: bool,
     writer_guard: &crate::writer_guard::WriterOperationGuard,
 ) -> Result<MembershipOutput, AppError> {
+    validate_expected_admission_request(request, candidate_pr)?;
     let physical_branch_rewrites = context.config.physical_branch_rewrites_enabled();
     if candidate_pr.is_some() && request.create_pr {
         return Err(AppError::validation(
@@ -1514,6 +1599,15 @@ fn execute_locked(
     let provider_telemetry_runner = provider_runner.clone();
     let mut provider = GitHubMutationAdapter::new(writer_guard.runner(provider_runner));
     let mut physical_provider_api = crate::model::GitHubApiTelemetry::default();
+    if let Some(binding) = &request.expected_admission {
+        binding.verify_snapshot(&status, None)?;
+        binding.verify_provider(
+            &provider,
+            &status.repository,
+            &status.analysis.pull_requests[&PrNumber(binding.pr)],
+            context.config.stack_type == crate::config::StackType::Github,
+        )?;
+    }
     let repository = status.repository.clone();
     let failure_status = status.clone();
     let default_branch_oid = status.analysis.fleet.default_branch.oid.clone();
@@ -1886,7 +1980,18 @@ fn execute_locked(
         // Starting the push with almost no budget left produced a live
         // github_mutation_timeout *after* the remote branch had already moved.
         require_post_rewrite_budget(context, Some(operation_deadline), candidate.number)?;
-        let applied = crate::physical_rebase::apply_prepared_with_telemetry(&prepared)?;
+        let applied =
+            crate::physical_rebase::apply_prepared_with_admission_guard(&prepared, || {
+                if let Some(binding) = &request.expected_admission {
+                    binding.verify_provider(
+                        &provider,
+                        &repository,
+                        &candidate,
+                        context.config.stack_type == crate::config::StackType::Github,
+                    )?;
+                }
+                Ok(())
+            })?;
         physical_provider_api.merge(applied.provider_api);
         let receipt = applied.receipt;
         // GitHub is authoritative after a push. Never apply base/label changes
@@ -1938,6 +2043,19 @@ fn execute_locked(
                 ),
             ));
         }
+        if let Some(binding) = &request.expected_admission {
+            binding
+                .verify_snapshot(&status, Some(&receipt))
+                .and_then(|()| {
+                    binding.verify_provider(
+                        &provider,
+                        &repository,
+                        observed,
+                        context.config.stack_type == crate::config::StackType::Github,
+                    )
+                })
+                .map_err(|error| attach_rebase_receipt(error, Some(&receipt)))?;
+        }
         rewrite_comment_receipt =
             crate::sync::ensure_branch_rewrite_comment(&provider, &repository, observed, &receipt)
                 .map_err(|error| {
@@ -1957,7 +2075,32 @@ fn execute_locked(
         Some(context),
         proven_deferred_gate_context,
     )
-    .map_err(|error| attach_rebase_receipt(error, rebase_receipt.as_ref()));
+    .map_err(|error| {
+        let error = attach_rebase_receipt(error, rebase_receipt.as_ref());
+        if let Some(comment) = &rewrite_comment_receipt {
+            let mut details = error.details().unwrap_or_else(|| json!({}));
+            if !details.is_object() {
+                details = json!({"source_details": details});
+            }
+            details["rewrite_comment_receipt"] = json!(comment);
+            if !comment
+                .provider_output
+                .as_deref()
+                .is_some_and(|output| output.starts_with("existing GitHub comment"))
+            {
+                details["mutated"] = json!(true);
+                details["provider_mutation"] = json!("possible");
+            }
+            AppError::structured(
+                error.category(),
+                error.code(),
+                error.message(),
+                Some(details),
+            )
+        } else {
+            error
+        }
+    });
     let mut output = match execution {
         Ok(output) => output,
         Err(error) if request.operation.is_join() => {
@@ -2028,6 +2171,9 @@ fn execute_locked(
             &repository,
             &failure_status,
             JoinReceiptEvidence {
+                expected_admission: request.expected_admission.as_ref(),
+                immutable_ancestry_verified: request.expected_admission.is_some()
+                    && !physical_branch_rewrites,
                 predecessor: selected_predecessor,
                 candidate_source_head_oid,
                 source: join_source_receipt,
@@ -2064,6 +2210,13 @@ fn execute_locked(
         // instruction for a candidate that is now already enrolled.
         let native_checkpoint =
             crate::stack_membership::persist_pending(&context.repository_path, &native_plan)?;
+        if let Some(binding) = &request.expected_admission {
+            binding
+                .verify_provider(&provider, &repository, &output.pull_request, true)
+                .map_err(|error| {
+                    guarded_partial_error(error, &output.receipt, &output.provider_receipts)
+                })?;
+        }
         let native_receipt = match provider.converge_native_membership(&native_plan) {
             Ok(receipt) => receipt,
             Err(error) => {
@@ -2122,6 +2275,8 @@ fn execute_locked(
 }
 
 struct JoinReceiptEvidence<'a> {
+    expected_admission: Option<&'a crate::expected_admission::ExpectedAdmission>,
+    immutable_ancestry_verified: bool,
     predecessor: Option<JoinPredecessorReceipt>,
     candidate_source_head_oid: Option<crate::model::CommitOid>,
     source: Option<JoinSourceReceipt>,
@@ -2172,22 +2327,25 @@ fn build_join_receipt(
     } else {
         JoinForceIntent::Absent
     };
-    let ancestry_verified = evidence.rebase_receipt.is_some_and(|receipt| {
-        source.as_ref().is_some_and(|source| {
-            receipt.pr == output.pull_request.number
-                && receipt.old_head_oid == source.head_oid
-                && receipt.old_base_oid == source.parent.oid
-                && receipt.new_head_oid == output.pull_request.head.oid
-                && receipt.new_base_branch == predecessor.branch
-                && receipt.new_base_oid == predecessor.head_oid
-                && receipt.new_tree_oid == source.expected_result_tree_oid
-        })
-    });
+    let ancestry_verified = evidence.immutable_ancestry_verified
+        || evidence.rebase_receipt.is_some_and(|receipt| {
+            source.as_ref().is_some_and(|source| {
+                receipt.pr == output.pull_request.number
+                    && receipt.old_head_oid == source.head_oid
+                    && receipt.old_base_oid == source.parent.oid
+                    && receipt.new_head_oid == output.pull_request.head.oid
+                    && receipt.new_base_branch == predecessor.branch
+                    && receipt.new_base_oid == predecessor.head_oid
+                    && receipt.new_tree_oid == source.expected_result_tree_oid
+            })
+        });
     let membership_durable = output.pull_request.has_label(ACTIVE_LABEL)
         && output.pull_request.has_label(FORCE_LABEL) == force_was_present
         && output.pull_request.base.name == predecessor.branch
         && output.pull_request.base.oid == predecessor.head_oid;
     let mut receipt = JoinReceipt {
+        expected_admission: evidence.expected_admission.cloned(),
+        expected_admission_verified: evidence.expected_admission.map(|_| true),
         schema_version: 1,
         operation_id: output.receipt.operation_id.clone(),
         repository: repository.clone(),
@@ -2294,10 +2452,19 @@ fn attach_rebase_receipt(
     let mut details = error.details().unwrap_or_else(|| json!({}));
     if let Some(object) = details.as_object_mut() {
         object.insert("rebase_receipt".to_owned(), json!(receipt));
-        object.insert("resumable".to_owned(), json!(true));
+        if !receipt.already_satisfied {
+            object.insert("mutated".to_owned(), json!(true));
+            object.insert("provider_mutation".to_owned(), json!("possible"));
+        }
+        let guarded = error.code().starts_with("expected_admission_");
+        object.insert("resumable".to_owned(), json!(!guarded));
         object.insert(
             "next".to_owned(),
-            json!("rediscover provider state and rerun the same idempotent membership command"),
+            if guarded {
+                json!("preserve the source publication and reconcile exact effects; do not replay the old caller admission")
+            } else {
+                json!("rediscover provider state and rerun the same idempotent membership command")
+            },
         );
     }
     AppError::structured(
@@ -2406,6 +2573,10 @@ fn execute_with_rebase_guard_and_config(
     context: Option<&AppContext>,
     proven_deferred_gate_context: Option<&str>,
 ) -> Result<MembershipOutput, AppError> {
+    validate_expected_admission_request(&request, status.current_pr.map(|pr| pr.0))?;
+    if let Some(binding) = &request.expected_admission {
+        binding.verify_snapshot(&status, expected_rebase)?;
+    }
     if request
         .reason
         .as_deref()
@@ -2535,6 +2706,48 @@ fn execute_with_rebase_guard_and_config(
     {
         revalidate_membership_config(context)?;
     }
+    if let Some(binding) = &request.expected_admission {
+        binding.verify_provider(
+            provider,
+            &status.repository,
+            &candidate,
+            status.stack_backend.configured == crate::config::StackType::Github,
+        )?;
+        if expected_rebase.is_none() {
+            let predecessor = target
+                .as_ref()
+                .map_or(&status.analysis.fleet.default_branch, |target| {
+                    &target.tail.head
+                });
+            if !matches!(
+                provider.compare_generation_commits(
+                    &status.repository,
+                    &predecessor.oid,
+                    &candidate.head.oid
+                ),
+                Ok(crate::generation::CommitRelation::Ahead
+                    | crate::generation::CommitRelation::Identical)
+            ) {
+                return Err(crate::expected_admission::refusal(
+                    "expected_admission_ancestry_unproved",
+                    "immutable source does not provably contain its exact admission predecessor",
+                ));
+            }
+        }
+        state.expected_admission = Some(binding.clone());
+        state.admission_source_head = Some(candidate.head.oid.clone());
+        state.admission_base = Some(candidate.base.clone());
+        state.admission_target = Some(
+            target
+                .as_ref()
+                .map_or(&status.analysis.fleet.default_branch, |target| {
+                    &target.tail.head
+                })
+                .clone(),
+        );
+        state.native_admission =
+            status.stack_backend.configured == crate::config::StackType::Github;
+    }
     let before_labels = candidate.labels.clone();
     let admission_priority_basis = desired_priority_label.map_or_else(
         || {
@@ -2608,9 +2821,17 @@ fn execute_with_rebase_guard_and_config(
             admission_priority_basis,
             status.head_merge.actor,
         );
-        state.ensure_control_label_comment(provider, &status.repository, &audit)
+        state.ensure_control_label_comment(provider, &status.repository, &audit)?;
+        state.verify_admission(provider, &status.repository)
     })();
     if let Err(source) = mutation_result {
+        if request.expected_admission.is_some() {
+            return Err(guarded_partial_error(
+                source,
+                &state.operation_receipt(),
+                &state.provider_receipts,
+            ));
+        }
         let original_receipts = state.provider_receipts.clone();
         return match state.rollback_membership_envelope(provider, &status.repository) {
             Ok(rollback_receipts) => Err(AppError::structured(
