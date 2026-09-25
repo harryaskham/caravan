@@ -1973,6 +1973,56 @@ fn a_root_admission_on_an_empty_fleet_reports_no_alternative() {
 }
 
 #[test]
+fn independent_admission_new_write_preflight_matches_read_refusal_without_effects() {
+    let candidate = pull_request(9, "nine", "main", &[]);
+    let members = vec![
+        pull_request(1, "one", "main", &[ACTIVE_LABEL]),
+        pull_request(2, "two", "one", &[ACTIVE_LABEL]),
+    ];
+    let mut observed = status(candidate.clone(), members.clone());
+    observed
+        .analysis
+        .fleet
+        .problems
+        .push(crate::model::GraphProblem {
+            kind: crate::model::GraphProblemKind::Incompatible,
+            prs: vec![PrNumber(1), PrNumber(2)],
+            message: "existing active edge conflict".to_owned(),
+        });
+    observed.healthy = false;
+    let read = read::check_requested_action_analysis(
+        &observed,
+        &CheckInput {
+            pr: Some(9),
+            ..CheckInput::default()
+        },
+        &clean,
+    )
+    .unwrap();
+    assert!(!read.eligible);
+    let provider =
+        FakeProvider::with_pull_requests(members.into_iter().chain([candidate]).collect());
+    let before = provider.pull_requests.borrow().clone();
+    let result = execute(
+        observed,
+        &clean,
+        &provider,
+        MembershipRequest {
+            operation: MembershipOperation::New,
+            create_pr: false,
+            tail_pr: None,
+            head_pr: None,
+            reason: None,
+            priority_label: None,
+            agent_priority_labels: Vec::new(),
+        },
+    );
+    assert!(result.is_err());
+    assert_eq!(*provider.pull_requests.borrow(), before);
+    assert!(provider.audits.borrow().is_empty());
+}
+
+#[test]
 fn new_applies_active_label_and_squash_auto_merge() {
     let candidate = pull_request(1, "one", "main", &[]);
     let provider = FakeProvider::with_pull_requests(vec![candidate.clone()]);

@@ -3748,7 +3748,12 @@ fn check_analysis_with_recommendation(
                 admission_compatibility_authorization,
                 enrolled: false,
                 canonical_candidate,
-                admission_note: ordering_note.clone(),
+                admission_note: admission_blocker_note(
+                    status,
+                    current_pr,
+                    &problems,
+                    ordering_note.as_deref(),
+                ),
                 admission_intent: Some(admission_intent),
                 next_action,
                 caravan_id: Some(current_pr),
@@ -3871,7 +3876,12 @@ fn check_analysis_with_recommendation(
             admission_compatibility_authorization,
             enrolled: false,
             canonical_candidate,
-            admission_note: ordering_note.clone(),
+            admission_note: admission_blocker_note(
+                status,
+                current_pr,
+                &problems,
+                ordering_note.as_deref(),
+            ),
             admission_intent: Some(admission_intent),
             next_action,
             caravan_id: Some(target_caravan.id),
@@ -4422,6 +4432,51 @@ fn candidate_action(
     CandidateNextAction::Repair
 }
 
+/// Diagnostic only: do not turn a foreign mechanical conflict into a candidate
+/// source-repair claim, and do not relax any read/write eligibility predicate.
+fn admission_blocker_note(
+    status: &StatusOutput,
+    candidate: PrNumber,
+    problems: &[GraphProblem],
+    ordering_note: Option<&str>,
+) -> Option<String> {
+    let is_existing_edge = |problem: &GraphProblem| {
+        problem.kind == GraphProblemKind::Incompatible
+            && !problem.prs.is_empty()
+            && !problem.prs.contains(&candidate)
+            && problem.prs.iter().all(|pr| {
+                status
+                    .analysis
+                    .fleet
+                    .containing(*pr)
+                    .is_some_and(|caravan| !caravan.parked)
+            })
+    };
+    let blocked = problems
+        .iter()
+        .filter(|problem| is_existing_edge(problem))
+        .flat_map(|problem| problem.prs.iter().copied())
+        .collect::<BTreeSet<_>>();
+    if blocked.is_empty() {
+        return ordering_note.map(str::to_owned);
+    }
+    let exclusive = problems.iter().all(is_existing_edge);
+    let note = format!(
+        "blocked_by_existing_fleet: active mechanical conflict at PRs {}; {}. Existing owners and the configured actor retain repair authority; no independent-new bypass is enabled",
+        blocked
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", "),
+        if exclusive {
+            "this evidence does not identify a source defect in the candidate"
+        } else {
+            "candidate or global problems also remain and must be reviewed separately"
+        },
+    );
+    Some(ordering_note.map_or(note.clone(), |order| format!("{order}; {note}")))
+}
+
 fn eligible_or_error(
     output: CheckOutput,
     return_rejection_receipt: bool,
@@ -4643,6 +4698,7 @@ fn discovery_timeout_error(
 
 #[cfg(test)]
 mod tests {
+    mod independent_admission;
     use std::cell::RefCell;
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::sync::Arc;

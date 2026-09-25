@@ -164,6 +164,16 @@ Within one long-lived Cara process, exact prepared Git revisions are reusable ac
 
 The default branch may move independently. A caravan head that no longer merges cleanly into it is a decision point. A valid repair may change the PR, reshape the caravan, or land an outside-caravan fix on the default branch that restores compatibility without rerunning caravan PR CI.
 
+A clean unadmitted candidate can still be blocked by an unrelated active edge.
+Check/requested-new and membership preflight retain that conservative policy;
+`blocked_by_existing_fleet` in `admission_note` distinguishes an inherited active
+mechanical conflict from evidence of candidate source repair without changing
+eligibility, action, JOIN targets, capacity, or writer authority. Unknown/global
+or candidate-local problems remain separately visible. The [independent admission
+policy review](docs/independent-admission-policy.md) specifies scope, dependency,
+capacity, read/write parity and native/writer requirements for any future opt-in;
+it does not enable a bypass or make current repair/landing wait on that review.
+
 ### Squash-equivalent stacked history
 
 A landed member arrives on the default branch as **one** squash commit. Its
