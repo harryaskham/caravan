@@ -2197,8 +2197,17 @@ mod tests {
             .split("\n#[cfg(test)]\nmod tests")
             .next()
             .unwrap();
-        assert_eq!(repair.matches("\"push\"").count(), 1);
-        assert_eq!(repair.matches(".git_write()").count(), 1);
+        let publication = include_str!("repair/non_force.rs");
+        let production = format!("{repair}\n{publication}");
+        assert_eq!(production.matches("\"push\"").count(), 1);
+        assert_eq!(production.matches(".git_write()").count(), 1);
+        assert_eq!(
+            repair
+                .matches("non_force::publication_command(&repair, &new_head)")
+                .count(),
+            1
+        );
+        assert!(publication.contains("pub(super) fn publication_command("));
     }
 
     #[test]

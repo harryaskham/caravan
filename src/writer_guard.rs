@@ -689,7 +689,27 @@ mod tests {
         assert!(repair.contains("start_exact_with_writer_guard("));
         assert!(repair.contains("Some(&lock)"));
         assert!(repair.contains("repair_writer_runner("));
-        assert_eq!(repair.matches(".git_write()").count(), 1);
+        let publication = include_str!("repair/non_force.rs");
+        assert_eq!(
+            format!("{repair}\n{publication}")
+                .matches(".git_write()")
+                .count(),
+            1
+        );
+        assert_eq!(
+            repair
+                .matches("non_force::publication_command(&repair, &new_head)")
+                .count(),
+            1
+        );
+        assert!(repair.contains("let runner = lock.runner(ProcessRunner::in_directory(&paths.workspace).with_timeout(timeout));"));
+        assert!(repair.contains(
+            "require_success(\n            &runner,\n            non_force::publication_command("
+        ));
+        assert!(
+            !publication.contains("ProcessRunner"),
+            "the command builder must not spawn an unfenced runner"
+        );
     }
 
     #[test]

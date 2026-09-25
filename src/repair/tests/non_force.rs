@@ -162,6 +162,41 @@ fn non_force_preserves_authored_merge_after_parent_absorption() {
 }
 
 #[test]
+fn non_force_and_legacy_publication_commands_cannot_escape_write_fence() {
+    use crate::command::{CommandIntent, CommandMutationFence, FencedCommandRunner};
+
+    struct NeverSpawn;
+    impl CommandRunner for NeverSpawn {
+        fn run(&self, _: &CommandSpec) -> Result<CommandOutput, CommandRunError> {
+            panic!("a denied publication fence must stop before execution");
+        }
+    }
+    struct DeniedFence;
+    impl CommandMutationFence for DeniedFence {
+        fn before_write(&self, intent: CommandIntent) -> Result<(), String> {
+            assert_eq!(intent, CommandIntent::GitWrite);
+            Err("retained writer generation no longer owns publication".to_owned())
+        }
+    }
+    let f = source_fixture();
+    let mut repair = prepare(&f);
+    let runner = FencedCommandRunner::new(NeverSpawn, DeniedFence);
+    for legacy in [false, true] {
+        if legacy {
+            repair.non_force = None;
+        }
+        let command = policy::publication_command(&repair, &f.target.oid);
+        assert!(matches!(
+            runner.run(&command),
+            Err(CommandRunError::MutationFenceRefused {
+                intent: CommandIntent::GitWrite,
+                ..
+            })
+        ));
+    }
+}
+
+#[test]
 fn non_force_clean_merge_needs_no_edits_and_never_enters_sync() {
     let mut f = source_fixture();
     git(&f.clone, &["checkout", "main"]);
