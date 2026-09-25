@@ -61,7 +61,7 @@ A whole-caravan pause may freeze the ready prefix too, so verify the proposed is
 Never improvise a detach/rejoin sequence, strip control labels, enable another merge actor, or discard the suffix when the sealed route is unavailable.
 The [safe-path canary](safe-path-canary.md) illustrates owner-applied tail eviction, not blanket permission to repeat its commands or operate beside another scheduler.
 There is no standalone sealed tail-eviction preview CLI: a sealed partial-prefix decision is not a generally callable preview, and typed evict is a mutation with internal preflight.
-For a parent-collapse refusal under no-force authority, use the [history-preserving owner route](history-preserving-repair.md), not explicit/automatic native rebase or legacy repair; those publish force-with-lease even when `rebase_on_join` is false.
+For a parent-collapse refusal under no-force authority, use the [history-preserving owner route](history-preserving-repair.md), not explicit native rebase or legacy repair; those publish force-with-lease even when `rebase_on_join` is false. Ordinary sync no longer invokes native source rebasing automatically; do not assume that source change is already serving in an older runtime.
 
 ## Repeated refusal: change the disposition, not the polling frequency
 

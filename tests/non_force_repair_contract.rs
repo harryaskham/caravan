@@ -95,8 +95,12 @@ fn non_force_operator_contract_states_real_force_and_uncertainty_boundaries() {
     let canary = include_str!("../.agents/skills/cara-operator/references/safe-path-canary.md");
     assert!(canary.contains("There is no standalone sealed tail-eviction preview CLI"));
     let native = include_str!("../src/native_stack_rebase.rs");
-    assert!(native.contains("pub(crate) fn auto_apply_from_status"));
+    assert!(!native.contains("pub(crate) fn auto_apply_from_status"));
+    assert!(native.contains("pub fn apply("));
     assert!(native.contains("apply_prepared_atomically"));
+    let sync = include_str!("../src/sync.rs");
+    assert!(!sync.contains("native_stack_rebase::"));
+    assert!(!sync.contains("native Stack reconstruction requires exact-generation CI"));
     let physical = include_str!("../src/physical_rebase.rs");
     assert!(physical.contains("--force-with-lease=refs/heads/"));
 }

@@ -493,7 +493,7 @@ fn owner_continuation_refusal(
                 "scope": "one authorized same-repository source owner; no source takeover or queue mutation",
                 "next": "reconcile previous uncertainty and establish custody first; start from fresh provider facts, preserve the old head in a merge, then rediscover the child after its parent changes. This handoff is not an apply lease",
             },
-            "force_boundary": "explicit native rebase, automatic native convergence, and legacy repair use force-with-lease; none is a non-force fallback",
+            "force_boundary": "explicit native rebase and legacy repair use force-with-lease; neither is a non-force fallback, and ordinary sync never invokes native rebase automatically",
             "queue_only_boundary": "there is no standalone sealed tail-eviction preview CLI; typed evict is a separate authorized mutation with its own preflight, not a command to inspect or a generic retry",
         })),
     )
@@ -838,82 +838,6 @@ fn repairable_problem(
         || (active_prefix && problem.code == "github_stack_member_order_drift")
 }
 
-fn automatic_rebase_stack(backend: &crate::read::StackBackendStatus) -> Option<u64> {
-    if backend.provider_stacks_truncated
-        || backend.capability != crate::read::StackCapability::Available
-        || backend.mutation_support != crate::read::StackMutationSupport::NativeStack
-    {
-        return None;
-    }
-    if backend.problems.iter().any(|problem| {
-        !backend.native_stacks.iter().any(|native| {
-            let retained = proven_retained_closed_rows(native);
-            native.problems.iter().any(|native_problem| {
-                native_problem.code == problem.code
-                    && repairable_problem(native_problem, retained, false)
-            })
-        })
-    }) {
-        return None;
-    }
-    let mut divergent = backend
-        .native_stacks
-        .iter()
-        .filter(|native| {
-            let retained = proven_retained_closed_rows(native);
-            !native.problems.is_empty()
-                && native
-                    .problems
-                    .iter()
-                    .all(|problem| repairable_problem(problem, retained, false))
-        })
-        .map(|native| native.stack.number)
-        .collect::<Vec<_>>();
-    // One tick owns at most one exact Stack rewrite. Provider Stack numbers are
-    // immutable identities, so sorting them gives rediscovery a stable choice
-    // while the postcondition read leaves every remaining Stack for a later
-    // tick. Refusing cardinality >1 as retryable only repeats the same set
-    // forever (bd-b55412).
-    divergent.sort_unstable();
-    divergent.into_iter().next()
-}
-
-pub(crate) fn auto_apply_from_status(
-    context: &AppContext,
-    status: &StatusOutput,
-    writer: &crate::writer_guard::WriterOperationGuard,
-    deadline: std::time::Instant,
-    github_budget: &crate::command::GithubRequestBudget,
-) -> Result<Option<(NativeStackRebaseOutput, StatusOutput)>, AppError> {
-    let Some(stack) = automatic_rebase_stack(&status.stack_backend) else {
-        return Ok(None);
-    };
-    let intent = NativeStackRebasePreviewInput {
-        stack,
-        actor: "caravan-scheduler".to_owned(),
-        reason: "automatic exact native Stack ancestry convergence".to_owned(),
-    };
-    let plan = plan_from_status(context, status, &intent)?;
-    let key = receipt_key(&plan.plan_hash)?;
-    if let Some(output) =
-        crate::stack_checkpoint::load::<NativeStackRebaseOutput>(&context.repository_path, &key)?
-    {
-        let final_status = read_postcondition(context, deadline, Some(github_budget))?;
-        return Ok(Some((output, final_status)));
-    }
-    apply_plan(
-        context,
-        status,
-        plan,
-        stack,
-        &key,
-        writer,
-        deadline,
-        Some(github_budget),
-    )
-    .map(Some)
-}
-
 pub fn apply(
     context: &AppContext,
     input: &NativeStackRebaseApplyInput,
@@ -998,22 +922,6 @@ mod tests {
             caravan_id: Some(PrNumber(number)),
             consistency: StackConsistency::Drifted,
             ancestry: Vec::new(),
-            problems: vec![crate::read::StackBackendProblem {
-                code: "native_stack_rebase_required".to_owned(),
-                message: "diverged".to_owned(),
-            }],
-        }
-    }
-
-    fn backend(stacks: Vec<NativeStackStatus>) -> crate::read::StackBackendStatus {
-        crate::read::StackBackendStatus {
-            configured: crate::config::StackType::Github,
-            capability: crate::read::StackCapability::Available,
-            mutation_support: crate::read::StackMutationSupport::NativeStack,
-            native_stacks: stacks,
-            provider_stacks_truncated: false,
-            orphan_ancestry_reads_skipped: 0,
-            missing_caravans: Vec::new(),
             problems: vec![crate::read::StackBackendProblem {
                 code: "native_stack_rebase_required".to_owned(),
                 message: "diverged".to_owned(),
@@ -1106,26 +1014,29 @@ mod tests {
     }
 
     #[test]
-    fn automatic_rebase_selects_one_stable_stack_per_tick() {
-        assert_eq!(automatic_rebase_stack(&backend(Vec::new())), None);
-        assert_eq!(
-            automatic_rebase_stack(&backend(vec![divergent_stack(42)])),
-            Some(42)
+    fn ordinary_native_sync_has_no_rebase_publisher_entry() {
+        let sync = include_str!("sync.rs")
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+        assert!(!sync.contains("native_stack_rebase::"));
+        assert!(!sync.contains("NativeStackRebaseOutput"));
+        assert!(!sync.contains("native Stack reconstruction requires exact-generation CI"));
+        assert!(sync.contains("require_native_stack_backend_healthy(&status)?"));
+        let explicit = include_str!("native_stack_rebase.rs")
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+        assert!(!explicit.contains("auto_apply_from_status"));
+        assert!(!explicit.contains("caravan-scheduler"));
+        // One private definition and one call from the explicitly requested
+        // apply command. Ordinary sync cannot select or invoke this publisher.
+        assert_eq!(explicit.matches("fn apply_plan(").count(), 1);
+        assert_eq!(explicit.matches("    apply_plan(\n").count(), 1);
+        assert!(
+            explicit.contains("context.acquire_writer_operation(\"native-stack-rebase-apply\")")
         );
-        assert_eq!(
-            automatic_rebase_stack(&backend(vec![divergent_stack(43), divergent_stack(42)])),
-            Some(42),
-            "provider discovery order must not change the selected Stack"
-        );
-        let mut unavailable = backend(vec![divergent_stack(42)]);
-        unavailable.provider_stacks_truncated = true;
-        assert_eq!(automatic_rebase_stack(&unavailable), None);
-        let mut mixed = backend(vec![divergent_stack(42)]);
-        mixed.problems.push(crate::read::StackBackendProblem {
-            code: "github_stack_member_order_drift".to_owned(),
-            message: "mixed".to_owned(),
-        });
-        assert_eq!(automatic_rebase_stack(&mixed), None);
+        assert!(explicit.contains("plan.plan_hash != input.expected_plan_hash || !plan.verify()"));
     }
 
     fn sample_plan() -> NativeStackRebasePlan {

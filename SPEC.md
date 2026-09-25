@@ -1663,17 +1663,18 @@ and native add postconditions are all revalidated; the provider add is an
 idempotent already-satisfied write. Multiple/foreign extras, moved heads,
 noncanonical candidates, unrelated backend problems, or incomplete inventory
 never gain this authority. The resulting membership receipt is returned as
-`native_append_membership_recovery`. When complete provider truth identifies
-exactly one Stack whose only remaining defect is known adjacent ancestry
-divergence, ordinary sync reuses the native-rebase planner: it prepares the
-complete divergent suffix, atomically publishes exact force-with-lease updates,
-records the sealed plan/receipts, and returns immediately for fresh CI. Multiple
-Stacks, mixed drift, unknown ancestry, or incomplete inventory remain an
-explicit native-rebase decision before normal convergence.
+`native_append_membership_recovery`. Adjacent ancestry divergence, whether on
+one Stack or several, remains a source-owner repair decision. Ordinary sync
+must not invoke a native source-rebase publisher or synthesize owner rewrite
+intent from a status snapshot. It preserves current heads, returns the existing
+native-backend diagnosis, and creates no post-rewrite CI work. The former
+`auto_apply_from_status` path is removed rather than hidden behind a new receipt,
+flag or approval gate. Normal landing and membership recovery retain their
+existing controls; historical operation receipts remain untouched.
 
-This automatic path and explicit `native-stack rebase-apply` are forceful even
-when `rebase_on_join` is false. A parent-cardinality refusal must not relax that
-guard or discard authored history. It returns the exact source/member/plan and
+Explicit `native-stack rebase-apply` is still forceful even when
+`rebase_on_join` is false. It is not a non-force fallback. A parent-cardinality
+refusal must not relax that guard or discard authored history. It returns the exact source/member/plan and
 original failure evidence to the acknowledged source owner, who may use the
 explicit non-force repair session above after reconciling earlier uncertain
 operations. The new merge retains every old source object and parent edge;

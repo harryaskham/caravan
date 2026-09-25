@@ -260,9 +260,11 @@ For an authorized source owner under a no-force constraint, use
 `cara repair start --pr N [--target-pr P] --non-force --actor A --reason R`, then
 `cara repair continue --session ID --actor A --no-sync`. This preserves authored
 history in an exact merge and publishes only by fast-forward. It does not grant
-queue custody or resolve earlier uncertain operations. Explicit/automatic native
-rebase and legacy repair still use force-with-lease; `rebase_on_join: false` does
-not disable those paths. See the [owner continuation contract](../.agents/skills/cara-operator/references/history-preserving-repair.md).
+queue custody or resolve earlier uncertain operations. Explicit native rebase
+and legacy repair still use force-with-lease; `rebase_on_join: false` does not
+disable those explicitly requested paths. Ordinary sync no longer calls native
+source rebasing automatically; native drift preserves source heads for owner
+repair rather than silently forcing another history. See the [owner continuation contract](../.agents/skills/cara-operator/references/history-preserving-repair.md).
 
 ---
 

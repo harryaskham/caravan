@@ -11412,6 +11412,69 @@ fn enable_native_backend(status: &mut StatusOutput) {
     };
 }
 
+#[test]
+fn ordinary_native_sync_drift_preserves_sources_without_writes_or_ci_dispatch() {
+    for problem in [
+        "native_stack_rebase_required",
+        "native_stack_ancestry_unknown",
+        "github_stack_member_order_drift",
+    ] {
+        let pulls = linear_chain(2);
+        let mut snapshot = status(pulls.clone(), None, &clean);
+        enable_native_backend(&mut snapshot);
+        snapshot
+            .stack_backend
+            .problems
+            .push(crate::read::StackBackendProblem {
+                code: problem.to_owned(),
+                message: "preserve the exact current source histories".to_owned(),
+            });
+        let provider = FakeProvider::with_pull_requests(pulls);
+        let before = provider.pulls.borrow().clone();
+        let (_directory, config, native) = github_native_fixture();
+        let prefix = execute_native_stack_prefix_first(
+            &snapshot,
+            &provider,
+            true,
+            false,
+            64,
+            RequiredRunsPolicy::from_config(&config.sync),
+            Some(native.clone()),
+        )
+        .expect_err("native drift must not rewrite a source before landing");
+        let ordinary = execute_bounded_with_native(
+            &snapshot,
+            &provider,
+            true,
+            false,
+            false,
+            64,
+            &BTreeMap::new(),
+            RequiredRunsPolicy::from_config(&config.sync),
+            Some(native),
+        )
+        .expect_err("ordinary convergence must not invoke native rebase");
+        for error in [prefix, ordinary] {
+            assert_eq!(error.code(), "github_stack_backend_unhealthy");
+            assert_eq!(error.details().unwrap()["provider_mutations"], 0);
+            if problem == "native_stack_rebase_required" {
+                assert!(
+                    error.details().unwrap()["safe_next_action"]
+                        .as_str()
+                        .unwrap()
+                        .contains("source owner")
+                );
+            }
+        }
+        assert_eq!(*provider.pulls.borrow(), before);
+        assert!(provider.calls.borrow().is_empty());
+        assert!(provider.rerequests.borrow().is_empty());
+        assert!(provider.workflow_reruns.borrow().is_empty());
+        assert_eq!(*provider.native_stack_reads.borrow(), 0);
+        assert_eq!(*provider.native_stack_intersection_reads.borrow(), 0);
+    }
+}
+
 /// bd-3eae33: the executable sync seam reads one exact mapped Stack and feeds
 /// it through Cara readiness. A non-ready bottom entry waits without acquiring
 /// a ruleset or writing a durable landing checkpoint.
