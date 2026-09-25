@@ -1,7 +1,24 @@
 //! Opt-in, single-owner source continuation. This never performs queue recovery.
 
-use super::*;
-use crate::model::AutoMergeState;
+use std::collections::BTreeSet;
+
+use mcp_cli::ErrorCategory;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+
+use super::{
+    MAX_GRANT_ACTOR_BYTES, MAX_GRANT_REASON_BYTES, RepairContinueInput, RepairSession,
+    RepairStartInput, RepairState, commit_parents, require_exact_parents, require_owned_repair,
+    require_success, rev_parse,
+};
+use crate::{
+    AppError,
+    command::{CommandOutput, CommandRunError, CommandRunner, CommandSpec},
+    model::{
+        AutoMergeState, BranchSnapshot, CommitOid, PrNumber, PullRequestSnapshot, RepositoryId,
+    },
+};
 
 /// Exact provider incarnation and mutation-sensitive generation, excluding CI progress.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
