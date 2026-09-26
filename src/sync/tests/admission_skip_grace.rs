@@ -162,8 +162,8 @@ fn terminal_skip_survives_both_grace_crossings_after_own_metadata_writes() {
             "the regression must cross the boundary"
         );
         assert_eq!(
-            second.skips,
-            [receipt.clone()],
+            second.skips.as_slice(),
+            std::slice::from_ref(&receipt),
             "reuse the exact persisted receipt, not a new observation/hash"
         );
         assert_eq!(second.candidates_considered, 0);
