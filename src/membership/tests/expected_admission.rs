@@ -47,6 +47,41 @@ fn request(binding: ExpectedAdmission) -> MembershipRequest {
 }
 
 #[test]
+fn native_projection_proof_keeps_the_caller_base_lease_strict() {
+    let (mut snapshot, provider, mut binding) = fixture();
+    snapshot.stack_backend.configured = crate::config::StackType::Github;
+    let current_default = CommitOid("c".repeat(40));
+    snapshot.analysis.fleet.default_branch.oid = current_default.clone();
+    provider
+        .branch_heads
+        .borrow_mut()
+        .insert("main".to_owned(), current_default.clone());
+    binding.default_oid = current_default.0;
+    // The caller reviewed the old recorded base B and current default C. The
+    // same live ref cannot satisfy both leases, even with clean Git proof.
+    let candidate = &snapshot.analysis.pull_requests[&PrNumber(42)];
+    let mut identity = stale_native_identity(candidate);
+    identity.compared_base = Some(snapshot.analysis.fleet.default_branch.clone());
+    identity.synthetic.as_mut().unwrap().parents[0] =
+        snapshot.analysis.fleet.default_branch.oid.clone();
+    snapshot.merge_candidates = vec![identity];
+    let checked = read::check_analysis(
+        &snapshot,
+        &CheckInput {
+            pr: Some(42),
+            ..CheckInput::default()
+        },
+        &exact_native_clean,
+    )
+    .expect("unguarded exact-Git read policy permits projection recovery");
+    assert!(checked.admission_compatibility_authorization.is_some());
+    let error = execute(snapshot, &exact_native_clean, &provider, request(binding)).unwrap_err();
+    assert_eq!(error.code(), "expected_admission_drift");
+    assert!(provider.effects.borrow().is_empty());
+    assert!(provider.audits.borrow().is_empty());
+}
+
+#[test]
 fn expected_admission_actual_wire_check_and_nested_receipt_preserve_oid_case() {
     let (snapshot, provider, binding) = fixture();
     let wire = serde_json::to_value(&binding).unwrap();

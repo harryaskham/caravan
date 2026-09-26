@@ -93,14 +93,16 @@ today.
   receipt; unchanged generations are not retried, while candidate, default,
   tail, config, or heuristic changes invalidate the skip automatically. In
   immutable native-Stack mode, an empty fleet treats the exact current default
-  branch as the candidate's virtual tail. If GitHub leaves only the synthetic
-  first parent stale, Cara may create the new root without rewriting its source
-  head only after complete same-repository/two-parent identity, exact remote Git
+  branch as the candidate's virtual tail. If GitHub leaves the synthetic first
+  parent stale, or only the recorded PR base stale after the synthetic parents
+  catch up, Cara may create the new root without rewriting its source head
+  only after complete same-repository/two-parent identity, exact remote Git
   objects, and an independently clean candidate-to-current-default merge-tree
   proof. Stale heads, partial objects, conflicts, foreign repositories, or a
   moved candidate/default/config generation still refuse before provider
   mutation. Receipts distinguish current provider identity from the bounded
-  `exact_git_proof` stale-base recovery.
+  `exact_git_proof` stale-base recovery, retaining the stale observation even
+  for projection-only recovery. Caller-reviewed base/default leases stay strict.
 - Trusted sync terminalizes provider `CLOSED` rows with no merge timestamp before
   any active queue work: after a fresh authoritative eligibility read, one exact
   complete-label write adds `caravan-closed` while removing `caravan` and
