@@ -81,6 +81,8 @@ struct FakeProvider {
     refetches: RefCell<Vec<PrNumber>>,
     failures: RefCell<VecDeque<MutationKind>>,
     calls: RefCell<Vec<MutationKind>>,
+    /// Model provider metadata timestamps advanced by successful control writes.
+    mutation_updated_at: RefCell<Option<String>>,
     failed_runs: RefCell<BTreeMap<PrNumber, Vec<WorkflowRunSnapshot>>>,
     diagnostic_heads: RefCell<BTreeMap<PrNumber, CommitOid>>,
     diagnostic_overrides: RefCell<BTreeMap<PrNumber, WorkflowFailureDiagnostics>>,
@@ -120,6 +122,7 @@ struct FakeProvider {
     released_reobservations: RefCell<u32>,
 }
 
+mod admission_skip_grace;
 mod ci_dispatch;
 mod closed_reformation;
 mod deferred_admission;
@@ -164,6 +167,7 @@ impl FakeProvider {
             unpersisted_armings: RefCell::new(BTreeMap::new()),
             refetches: RefCell::new(Vec::new()),
             calls: RefCell::new(Vec::new()),
+            mutation_updated_at: RefCell::new(None),
             failed_runs: RefCell::new(BTreeMap::new()),
             diagnostic_heads: RefCell::new(BTreeMap::new()),
             diagnostic_overrides: RefCell::new(BTreeMap::new()),
@@ -331,6 +335,9 @@ impl FakeProvider {
         }
         let mut after = before.clone();
         change(&mut after);
+        if let Some(updated_at) = self.mutation_updated_at.borrow().as_ref() {
+            after.updated_at = Some(updated_at.clone());
+        }
         self.pulls.borrow_mut().insert(after.number, after.clone());
         Ok(GitHubMutationReceipt {
             kind,
