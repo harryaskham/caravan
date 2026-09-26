@@ -913,8 +913,12 @@ Unknown ancestry fails closed. A ready prefix with a blocked suffix is submitted
 as one atomic provider merge under a complete-Stack ref lock; Cara seals the
 entire suffix before submission, receipts GitHub's rewritten suffix heads/bases,
 and requires fresh CI before the next landing. Readiness binds each immutable
-source head to an exact two-parent candidate. The root uses current main; each
-native child may use either its predecessor source head or the exact selected
+source head to an exact two-parent candidate. The first Stack entry compares
+against the freshly read Stack base/current main, not its historical PR base
+projection. Raw PR/Stack generation leases and stale diagnostics remain intact;
+only exact current synthetic parents permit this root-only projection case, with
+CI, holds and provider drift still checked. Each native child may use either
+its predecessor source head or the exact selected
 predecessor synthetic candidate as first parent, while the second parent remains
 the child's source head. The latter is GitHub's stable cumulative Stack shape,
 not stale-base drift. Authority advances only through an already-accepted prior candidate in the same
