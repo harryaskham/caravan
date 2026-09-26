@@ -1831,8 +1831,14 @@ the complete Stack ref set remains locked while GitHub atomically lands the
 selected prefix; Cara seals the entire pre-submit suffix and accepts rewritten
 suffix generations only when order, PR/branch identity, base chain, and provider
 merge receipts match. Rewritten heads require fresh CI before later landing. Each readiness verdict
-also requires an exact two-parent synthetic merge candidate. The root candidate
-uses current main as first parent. A native Stack child may use either its
+also requires an exact two-parent synthetic merge candidate. The first Stack
+entry uses the freshly read Stack base (current main) as its comparison target
+and synthetic first parent, while retaining the raw PR/entry base projection
+in the complete generation lease. A same-ref historical root base may remain
+`stale_base` diagnostically only when both synthetic parents bind that live base
+and exact source head; it is not a waiver for stale synthetic lineage, CI, holds,
+or provider-generation drift. This root-only rule does not normalize stored
+candidate facts or extend to child base leases. A native Stack child may use either its
 predecessor source head (ordinary provider shape) or the exact selected
 predecessor synthetic-candidate OID (GitHub's stable cumulative Stack shape);
 its second parent must always equal the child's immutable source head.

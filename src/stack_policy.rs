@@ -154,7 +154,7 @@ fn entry_blockers(
         }
     }
 
-    if let Some(blocker) = synthetic_candidate_blocker(facts, entry, previous_candidate) {
+    if let Some(blocker) = synthetic_candidate_blocker(facts, stack, entry, previous_candidate) {
         blockers.push(blocker);
     }
     if facts.held_members.contains(&entry.pr) {
@@ -183,12 +183,13 @@ fn mechanically_blocked(facts: StackPolicyFacts<'_>, entry: &GitHubStackEntryGen
 }
 
 /// Require the exact current two-parent provider candidate for this immutable
-/// source generation. The first parent is the Stack entry's exact base (current
-/// main for the root, predecessor source head for a child); the second is the
-/// immutable source head. This is the cumulative CI identity. A stale/missing
-/// candidate waits for provider regeneration and never authorizes a source push.
+/// source generation. The root compares against the freshly observed Stack
+/// base, not its possibly historical PR base projection; raw entry identity is
+/// still retained and checked. Children use their exact base or the selected
+/// predecessor candidate. No stale/missing synthetic authorizes a source push.
 fn synthetic_candidate_blocker(
     facts: StackPolicyFacts<'_>,
+    stack: &GitHubStackGeneration,
     entry: &GitHubStackEntryGeneration,
     previous_candidate: Option<&crate::model::CommitOid>,
 ) -> Option<GitHubStackMergeBlocker> {
@@ -201,12 +202,30 @@ fn synthetic_candidate_blocker(
     let Some(synthetic) = candidate.synthetic.as_ref() else {
         return Some(GitHubStackMergeBlocker::SyntheticCandidateMissing);
     };
-    if candidate.stale_head || candidate.compared_base.as_ref() != Some(&entry.base) {
+    let is_root = entry.position == 0 && stack.topology.entries.first() == Some(entry);
+    let effective_base = if is_root {
+        let base = &stack.topology.base;
+        if entry.base.repository != base.repository || entry.base.name != base.name {
+            return Some(GitHubStackMergeBlocker::SyntheticCandidateStale);
+        }
+        base
+    } else {
+        &entry.base
+    };
+    if candidate.stale_head || candidate.compared_base.as_ref() != Some(effective_base) {
         return Some(GitHubStackMergeBlocker::SyntheticCandidateStale);
     }
     let ordinary_parents =
-        synthetic.parents.as_slice() == [entry.base.oid.clone(), entry.head.oid.clone()];
-    if ordinary_parents && candidate.freshness != MergeCandidateFreshness::Fresh {
+        synthetic.parents.as_slice() == [effective_base.oid.clone(), entry.head.oid.clone()];
+    // Discovery must retain the historical PR base, so a fully current root
+    // synthetic can still be StaleBase. Authorize only this exact projection
+    // shape; do not normalize the stored identity or loosen child freshness.
+    let projection_only = is_root
+        && entry.base.oid != effective_base.oid
+        && candidate.stale_base
+        && candidate.freshness == MergeCandidateFreshness::StaleBase;
+    if ordinary_parents && candidate.freshness != MergeCandidateFreshness::Fresh && !projection_only
+    {
         return Some(GitHubStackMergeBlocker::SyntheticCandidateStale);
     }
     let ordinary = ordinary_parents;
@@ -495,6 +514,8 @@ fn generation_refusal(
 
 #[cfg(test)]
 mod tests {
+    mod root_projection;
+
     use super::*;
     use crate::github::GitHubStackTopology;
     use crate::model::{
