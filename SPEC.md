@@ -130,8 +130,13 @@ required-run evidence when relevant, candidate head/base, default generation,
 every tested tail generation, config fingerprint, reasons, heuristic version,
 actor, and time. Unchanged evidence is not retried and emits no repeated hook;
 any bound candidate/check/default/tail/config/heuristic change invalidates and
-removes the skip. Explicit `new`/`join`/`rejoin` always consumes the advisory
-skip label.
+removes the skip. Identical, fully observed failing required-run coverage remains
+skipped across missing-run grace boundaries, including when our own control
+comments or labels advance the PR metadata timestamp. These clock-only changes
+cannot recover a terminal failure or authorize new admission writes. Missing-run
+grace remains effective for genuinely new publications, including old commits
+newly pushed; real coverage, policy, and recovery changes still invalidate stale
+evidence. Explicit `new`/`join`/`rejoin` always consumes the advisory skip label.
 
 Caravan v1 requires member head branches to exist in the base repository: GitHub cannot target a PR at a fork-only branch.
 

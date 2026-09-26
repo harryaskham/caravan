@@ -7316,8 +7316,10 @@ fn auto_admission_provider_state_unknown(
 }
 
 /// Compare policy/run generations while deliberately excluding elapsed wall
-/// time and rendered prose. An unchanged post-grace stall must stay stable;
-/// protection, coverage, lineage, or recovery changes must retry admission.
+/// time and rendered prose. An unchanged terminal failure cannot recover by
+/// crossing the missing-run grace boundary (including a PR timestamp advanced
+/// by our own skip writes). Keep grace-sensitive stalls and every real policy,
+/// coverage, lineage, or recovery change generation-bound.
 fn required_runs_generation_matches(
     expected: &crate::required_runs::RequiredRunsAssessment,
     observed: &crate::required_runs::RequiredRunsAssessment,
@@ -7335,7 +7337,8 @@ fn required_runs_generation_matches(
         && expected.stale_head_runs == observed.stale_head_runs
         && expected.provider_reads_complete == observed.provider_reads_complete
         && expected.grace_secs == observed.grace_secs
-        && expected.grace_elapsed == observed.grace_elapsed
+        && (expected.status == RequiredRunsStatus::Failing
+            || expected.grace_elapsed == observed.grace_elapsed)
         && expected.recovery == observed.recovery
 }
 
@@ -10375,6 +10378,9 @@ struct SyncProgress {
     required_contexts: BTreeMap<String, RequiredContextsRead>,
     /// Bounded required-run policy configuration for this tick.
     required_runs_grace_secs: u64,
+    /// Deterministic clock for multi-tick required-run regression fixtures.
+    #[cfg(test)]
+    required_runs_now_unix: Option<u64>,
     required_runs_retrigger_enabled: bool,
     rebase_plans: Vec<crate::physical_rebase::RebasePlan>,
     rebase_receipts: Vec<crate::physical_rebase::RebaseReceipt>,
@@ -10448,6 +10454,8 @@ impl SyncProgress {
             missing_required_runs: Vec::new(),
             required_contexts: BTreeMap::new(),
             required_runs_grace_secs: DEFAULT_MISSING_REQUIRED_RUNS_GRACE_SECS,
+            #[cfg(test)]
+            required_runs_now_unix: None,
             required_runs_retrigger_enabled: true,
             rebase_plans: Vec::new(),
             rebase_receipts: Vec::new(),
@@ -10891,6 +10899,9 @@ impl SyncProgress {
         checks: &[CheckSnapshot],
     ) -> crate::required_runs::RequiredRunsAssessment {
         let published = head_published_at(current, lineage);
+        let now_unix = now_unix();
+        #[cfg(test)]
+        let now_unix = self.required_runs_now_unix.unwrap_or(now_unix);
         required_runs::assess(&RequiredRunsInput {
             pr: current.number,
             head: &current.head,
@@ -10900,7 +10911,7 @@ impl SyncProgress {
             checks,
             head_published_at: published.as_deref(),
             clock: RequiredRunsClock {
-                now_unix: now_unix(),
+                now_unix,
                 grace_secs: self.required_runs_grace_secs,
             },
         })
