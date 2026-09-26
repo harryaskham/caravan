@@ -475,12 +475,15 @@ fleet models the exact current default branch as the new root's virtual tail;
 an ordinary join uses its selected live tail. Either path may accept only a
 two-parent synthetic candidate whose second parent is the exact immutable source
 head, whose compared base is the exact current default, and whose same-repository
-candidate/base/target identities are complete. A stale first parent then
+candidate/base/target identities are complete. Either an old synthetic first
+parent or an old recorded PR base with already-current synthetic parents
 requires complete unfiltered exact-remote Git objects and one independently
-clean merge-tree report from candidate to the real/virtual tail, with the
-report's merge base equal to that observed stale first parent. Immediately
-before mutation Cara re-reads the candidate, verifies the exact current default
-ref, and verifies the loaded native membership configuration fingerprint;
+clean merge-tree report from candidate to the real/virtual tail. Its concrete
+merge base may be historical; it need not equal the synthetic first parent.
+Projection-only staleness remains diagnostic evidence, not provider-current
+authority, and never relaxes an optional caller-reviewed base/default lease.
+Immediately before mutation Cara re-reads the candidate, verifies the exact
+current default ref, and verifies the loaded native membership configuration fingerprint;
 movement or configuration drift invalidates the proof. Stale heads, missing or
 partial objects, forks, conflicts, moved candidate/default generations,
 non-empty-fleet `new`, or native Stack mapping drift never gain this authority.

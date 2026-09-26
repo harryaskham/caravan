@@ -9,6 +9,7 @@ use crate::model::{
 };
 
 mod expected_admission;
+mod native_projection;
 
 #[derive(Default)]
 struct FakeProvider {

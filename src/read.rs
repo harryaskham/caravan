@@ -1108,9 +1108,9 @@ pub enum CandidateNextAction {
 /// Exact authority used to admit an immutable native-Stack join candidate.
 ///
 /// Provider identity is preferred. `ExactGitProof` is the bounded recovery for
-/// GitHub retaining an old first parent in `refs/pull/<n>/merge`; it preserves
-/// both the stale provider observation and the clean independently constructed
-/// candidate-to-tail merge so the decision is auditable.
+/// an old synthetic first parent or a stale recorded base with current synthetic
+/// parents. It preserves both the stale provider observation and the clean
+/// independently constructed candidate-to-tail merge so the decision is auditable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", tag = "authority")]
 pub enum AdmissionCompatibilityAuthorization {
@@ -4007,14 +4007,14 @@ fn native_admission_authorization(
         });
     }
 
-    // Native GitHub Stack mode is the only immutable-head lane. The fallback
-    // accepts exactly one provider defect: an old synthetic first parent. It
-    // cannot mask a stale head, missing lineage, a different repository, or a
-    // moved candidate/default/target generation.
+    // Native GitHub Stack mode is the only immutable-head lane. StaleBase can
+    // mean an old synthetic first parent OR only an old recorded PR base after
+    // the synthetic ref has caught up. Both require the same exact Git proof;
+    // neither becomes provider-current authority. Keep the stale identity in
+    // the receipt and never mask stale heads, incomplete lineage or drift.
     if identity.freshness != crate::model::MergeCandidateFreshness::StaleBase
         || !identity.stale_base
         || identity.stale_head
-        || synthetic.parents[0] == compared_base.oid
     {
         return None;
     }
