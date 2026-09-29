@@ -146,10 +146,30 @@ pub fn diagnose_failed_runs(
         .collect::<Vec<_>>();
     let mut runs = Vec::with_capacity(selected.len());
     for run_id in &selected {
-        let run: WorkflowRunApiJson =
-            checked_json(runner, workflow_run_command(repository, *run_id))?;
-        let jobs: WorkflowJobsApiJson =
-            checked_json(runner, workflow_jobs_command(repository, *run_id))?;
+        let run_command = workflow_run_command(repository, *run_id);
+        let run: WorkflowRunApiJson = checked_json(runner, run_command.clone())?;
+        if run.id == 0 || run.id != *run_id || run.run_attempt == 0 || run.head_sha.is_empty() {
+            return Err(invalid_identity(
+                run_command,
+                "workflow run identity or attempt is unproved",
+            ));
+        }
+        // The latest attempt can advance after the metadata read. Its jobs
+        // must never be spliced into this independently observed attempt.
+        let jobs_command = workflow_jobs_command(repository, *run_id, run.run_attempt);
+        let jobs: WorkflowJobsApiJson = checked_json(runner, jobs_command.clone())?;
+        let mut job_ids = BTreeSet::new();
+        if jobs.jobs.iter().any(|job| {
+            job.id == 0
+                || job.run_id != run.id
+                || !job.head_sha.eq_ignore_ascii_case(&run.head_sha)
+                || !job_ids.insert(job.id)
+        }) {
+            return Err(invalid_identity(
+                jobs_command,
+                "job identities do not match the observed workflow run",
+            ));
+        }
         let mut diagnostic = run.into_diagnostic(expected, jobs);
         enrich_lineage_receipts(runner, repository, &mut diagnostic);
         runs.push(diagnostic);
@@ -159,6 +179,17 @@ pub fn diagnose_failed_runs(
         runs,
         runs_truncated,
     })
+}
+
+fn invalid_identity(command: CommandSpec, message: &str) -> DiscoveryError {
+    DiscoveryError::InvalidJson {
+        command,
+        message: message.to_owned(),
+        evidence: Box::new(JsonDecodeEvidence {
+            stdout: String::new(),
+            stderr: String::new(),
+        }),
+    }
 }
 
 fn enrich_lineage_receipts(
@@ -461,14 +492,15 @@ fn workflow_run_command(repository: &RepositoryId, run_id: u64) -> CommandSpec {
     ])
 }
 
-fn workflow_jobs_command(repository: &RepositoryId, run_id: u64) -> CommandSpec {
+fn workflow_jobs_command(repository: &RepositoryId, run_id: u64, attempt: u64) -> CommandSpec {
     CommandSpec::new("gh").args([
         "api".to_owned(),
         "--method".to_owned(),
         "GET".to_owned(),
-        format!("repos/{}/actions/runs/{run_id}/jobs", repository.slug()),
-        "-f".to_owned(),
-        "filter=latest".to_owned(),
+        format!(
+            "repos/{}/actions/runs/{run_id}/attempts/{attempt}/jobs",
+            repository.slug()
+        ),
         "-f".to_owned(),
         "per_page=100".to_owned(),
     ])
@@ -494,7 +526,6 @@ fn failure_conclusion(conclusion: &str) -> bool {
 #[derive(Debug, Deserialize)]
 struct WorkflowRunApiJson {
     id: u64,
-    #[serde(default = "one")]
     run_attempt: u64,
     workflow_id: u64,
     check_suite_id: u64,
@@ -512,10 +543,6 @@ struct WorkflowRunApiJson {
     pull_requests: Vec<WorkflowRunPullRequestJson>,
 }
 
-const fn one() -> u64 {
-    1
-}
-
 impl WorkflowRunApiJson {
     fn into_diagnostic(
         self,
@@ -523,13 +550,15 @@ impl WorkflowRunApiJson {
         jobs: WorkflowJobsApiJson,
     ) -> WorkflowRunFailureDiagnostic {
         let jobs_total = usize::try_from(jobs.total_count).unwrap_or(usize::MAX);
+        let incomplete_inventory = jobs_total != jobs.jobs.len();
         let mut failed_jobs = jobs
             .jobs
             .into_iter()
             .filter(|job| failure_conclusion(job.conclusion.as_deref().unwrap_or("")))
             .map(WorkflowJobJson::into_diagnostic)
             .collect::<Vec<_>>();
-        let jobs_truncated = failed_jobs.len() > MAX_FAILED_JOBS || jobs_total > 100;
+        let jobs_truncated =
+            incomplete_inventory || failed_jobs.len() > MAX_FAILED_JOBS || jobs_total > 100;
         failed_jobs.truncate(MAX_FAILED_JOBS);
         WorkflowRunFailureDiagnostic {
             run_id: self.id,
@@ -589,6 +618,8 @@ struct WorkflowJobsApiJson {
 #[derive(Debug, Deserialize)]
 struct WorkflowJobJson {
     id: u64,
+    run_id: u64,
+    head_sha: String,
     #[serde(default)]
     name: String,
     #[serde(default)]
@@ -660,6 +691,8 @@ pub(crate) mod tests {
     use crate::command::{CommandOutput, CommandRunError, CommandRunner};
     use crate::model::{AutoMergeState, PullRequestState};
 
+    pub(crate) mod attempts;
+
     struct FakeRunner {
         calls: RefCell<VecDeque<(CommandSpec, CommandOutput)>>,
     }
@@ -688,10 +721,18 @@ pub(crate) mod tests {
         expected: &PullRequestPrecondition,
         log: &str,
     ) -> WorkflowFailureDiagnostics {
-        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        let mut fixture: serde_json::Value = serde_json::from_str(include_str!(
             "../tests/fixtures/deferred-admission-4014.json"
         ))
         .unwrap();
+        // Expand the historical cropped job fixture with the provider identity
+        // fields; production never synthesizes missing job identity this way.
+        let run_id = fixture["run"]["id"].clone();
+        let head_sha = fixture["run"]["head_sha"].clone();
+        for job in fixture["jobs"]["jobs"].as_array_mut().unwrap() {
+            job["run_id"].clone_from(&run_id);
+            job["head_sha"].clone_from(&head_sha);
+        }
         let repository = repository();
         let runner = FakeRunner::new(vec![
             (
@@ -699,7 +740,7 @@ pub(crate) mod tests {
                 CommandOutput::success(fixture["run"].to_string()),
             ),
             (
-                workflow_jobs_command(&repository, 35_526_976_658),
+                workflow_jobs_command(&repository, 35_526_976_658, 1),
                 CommandOutput::success(fixture["jobs"].to_string()),
             ),
             (
@@ -793,6 +834,8 @@ pub(crate) mod tests {
             "jobs": [
                 {
                     "id": 101,
+                    "run_id": run_id,
+                    "head_sha": "current-head",
                     "name": "check",
                     "status": "completed",
                     "conclusion": "failure",
@@ -804,8 +847,8 @@ pub(crate) mod tests {
                         {"number": 2, "name": "Verify exact CI ref lineage", "status": "completed", "conclusion": "failure"}
                     ]
                 },
-                {"id": 102, "name": "pass", "status": "completed", "conclusion": "success", "steps": []},
-                {"id": 103, "name": "skip", "status": "completed", "conclusion": "skipped", "steps": []}
+                {"id": 102, "run_id": run_id, "head_sha": "current-head", "name": "pass", "status": "completed", "conclusion": "success", "steps": []},
+                {"id": 103, "run_id": run_id, "head_sha": "current-head", "name": "skip", "status": "completed", "conclusion": "skipped", "steps": []}
             ]
         });
         let runner = FakeRunner::new(vec![
@@ -814,7 +857,7 @@ pub(crate) mod tests {
                 CommandOutput::success(run.to_string()),
             ),
             (
-                workflow_jobs_command(&repository, run_id),
+                workflow_jobs_command(&repository, run_id, 2),
                 CommandOutput::success(jobs.to_string()),
             ),
             (
@@ -855,6 +898,7 @@ pub(crate) mod tests {
             .flat_map(|run_id| {
                 let run = serde_json::json!({
                     "id": run_id,
+                    "run_attempt": 1,
                     "workflow_id": 7,
                     "check_suite_id": 8,
                     "head_sha": "current-head"
@@ -866,7 +910,7 @@ pub(crate) mod tests {
                         CommandOutput::success(run.to_string()),
                     ),
                     (
-                        workflow_jobs_command(&repository, run_id),
+                        workflow_jobs_command(&repository, run_id, 1),
                         CommandOutput::success(jobs.to_string()),
                     ),
                 ]
