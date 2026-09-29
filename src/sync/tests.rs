@@ -124,6 +124,7 @@ struct FakeProvider {
 
 mod admission_skip_grace;
 mod ci_dispatch;
+mod ci_source_precedence;
 mod closed_reformation;
 mod deferred_admission;
 mod effective_policy;

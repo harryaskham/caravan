@@ -1383,7 +1383,15 @@ fail closed. Exact selected commit/parents and current synthetic-candidate
 identity classify the run as stale generation, retryable infrastructure,
 source/test failure, cancelled, or unknown. Only current-generation
 infrastructure failures are rerunnable; stale or unproved lineage requires a
-fresh exact-candidate trigger.
+fresh exact-candidate trigger. After generation/deferred/lineage guards, an
+observed completed failing job and step takes precedence over infrastructure or
+cancellation conclusions in that run. Incomplete job/step inventories cannot
+prove pure infrastructure. A source/test failure or unknown failure diagnostic
+from another selected required workflow also vetoes infrastructure rerun IDs
+for the same PR observation. Optional checks remain diagnostic-only under the
+effective required-context/App policy; no required check is waived, no failure
+becomes success, and opt-in recovery uses the existing exact-run effect path.
+This precedence rule does not define or trust a producer-supplied origin ABI.
 
 A user/agent may use the managed repair workspace, rerun failed checks,
 evict/split, or arm a known acceptable failure with audited `cara force --pr N
