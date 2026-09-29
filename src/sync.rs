@@ -8888,6 +8888,10 @@ fn ci_decision_error(
     decision_error(&decision, progress)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "keep generation, evidence and failure-precedence guards in one ordered decision"
+)]
 fn classify_workflow_failure(
     diagnostic: WorkflowRunFailureDiagnostic,
     candidate: Option<&MergeCandidateIdentity>,
@@ -8960,11 +8964,28 @@ fn classify_workflow_failure(
             WorkflowFailureClass::Unknown,
             WorkflowFailureAction::FreshCandidateTrigger,
         )
+    } else if has_completed_failing_step(&diagnostic) {
+        reasons.push("a completed failing job/step vetoes infrastructure recovery".to_owned());
+        (
+            WorkflowFailureClass::SourceOrTestFailure,
+            WorkflowFailureAction::RepairSource,
+        )
     } else if diagnostic.conclusion.eq_ignore_ascii_case("cancelled") {
         reasons.push("current-generation run was cancelled".to_owned());
         (
             WorkflowFailureClass::Cancelled,
             WorkflowFailureAction::FreshCandidateTrigger,
+        )
+    } else if diagnostic.jobs_total == 0
+        || diagnostic.jobs_truncated
+        || diagnostic.failed_jobs.iter().any(|job| job.steps_truncated)
+    {
+        reasons.push(
+            "incomplete job/step evidence cannot prove pure infrastructure failure".to_owned(),
+        );
+        (
+            WorkflowFailureClass::Unknown,
+            WorkflowFailureAction::WaitOrInspect,
         )
     } else if retryable_infrastructure(&diagnostic) {
         reasons.push("structured job conclusion indicates retryable infrastructure".to_owned());
@@ -9083,6 +9104,17 @@ fn workflow_run_generation(
     (generation, reasons)
 }
 
+fn has_completed_failing_step(diagnostic: &WorkflowRunFailureDiagnostic) -> bool {
+    diagnostic.failed_jobs.iter().any(|job| {
+        job.status.eq_ignore_ascii_case("completed")
+            && job.conclusion.eq_ignore_ascii_case("failure")
+            && job.failed_steps.iter().any(|step| {
+                step.status.eq_ignore_ascii_case("completed")
+                    && step.conclusion.eq_ignore_ascii_case("failure")
+            })
+    })
+}
+
 fn retryable_infrastructure(diagnostic: &WorkflowRunFailureDiagnostic) -> bool {
     const INFRA_CONCLUSIONS: [&str; 6] = [
         "timed_out",
@@ -9092,6 +9124,9 @@ fn retryable_infrastructure(diagnostic: &WorkflowRunFailureDiagnostic) -> bool {
         "cancelled",
         "canceled",
     ];
+    if has_completed_failing_step(diagnostic) {
+        return false;
+    }
     // An aggregate that concluded `failure` while NO job failed did not run the
     // work it reports on. That is the shape of a gate short-circuiting because a
     // prerequisite never produced a result: `Check & Lint` going red in seconds
@@ -9536,6 +9571,27 @@ fn check_is_failure(check: &CheckSnapshot) -> bool {
 fn workflow_run_id(url: &str) -> Option<u64> {
     let suffix = url.split_once("/actions/runs/")?.1;
     suffix.split('/').next()?.parse().ok()
+}
+
+/// Select recovery only after applying the effective required-check policy.
+fn infrastructure_recovery_run_ids(diagnostics: &[ClassifiedWorkflowRunFailure]) -> Vec<u64> {
+    // A sibling required source failure (or unknown evidence that may hide one)
+    // cannot be repaired by rerunning otherwise retryable workflows.
+    if diagnostics.iter().any(|diagnostic| {
+        matches!(
+            diagnostic.classification,
+            WorkflowFailureClass::SourceOrTestFailure | WorkflowFailureClass::Unknown
+        )
+    }) {
+        return Vec::new();
+    }
+    diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.action == WorkflowFailureAction::RerunFailedJobs)
+        .map(|diagnostic| diagnostic.diagnostic.run_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn select_rerunnable_run_ids(checks: &[CheckSnapshot], runs: &[WorkflowRunSnapshot]) -> Vec<u64> {
@@ -10715,13 +10771,7 @@ impl SyncProgress {
                 .collect::<Vec<_>>()
         };
         reduce_proven_deferred_generations(&mut generation, &required_checks, &failure_diagnostics);
-        let mut rerunnable_run_ids = failure_diagnostics
-            .iter()
-            .filter(|diagnostic| diagnostic.action == WorkflowFailureAction::RerunFailedJobs)
-            .map(|diagnostic| diagnostic.diagnostic.run_id)
-            .collect::<Vec<_>>();
-        rerunnable_run_ids.sort_unstable();
-        rerunnable_run_ids.dedup();
+        let rerunnable_run_ids = infrastructure_recovery_run_ids(&failure_diagnostics);
         let cancellation =
             classify_cancellation(&generation.effective_checks, &failure_diagnostics);
         if disposition == CiDisposition::Failed
