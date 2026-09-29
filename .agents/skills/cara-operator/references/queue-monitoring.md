@@ -117,12 +117,21 @@ Optional artifact/evidence transport can be unavailable while required source ch
 | Observation | Bounded continuation |
 |---|---|
 | Admission-only deferral; heavy jobs skipped | Verify exact gate decision and full lineage; preserve it as unevaluated, never green. Let the existing admission actor perform any authorized membership-before-CI trigger once. |
+| Successful observer predates enrollment; admission-only gate still fails | Observer success is not fresh membership proof. For an already-authorized exact admission-only refresh, refresh the whole workflow including successful dependencies, never only the failed gate. Keep the assertion red until fresh evidence proves it. |
 | Required contexts have no reporting run | Distinguish missing execution from passing CI; inspect admission, trigger and concurrency receipts before requesting one supported start. |
 | Retargeted PR; old event/base metadata rejected | Route current-base evidence to the existing CI/queue owner. Repeatedly rerunning the stale event is not proof of valid new-base CI. |
 | Lock/hash, lint, compile, or assertion failure | Route exact logs and a bounded reproducer to the source owner. Preserve strict checks and invariants; do not mask it with skips, blanket reruns or wider timeouts. |
 | Runner/transport/resource preflight failure | Separate it from source failure. Seek an acknowledged infrastructure diagnosis and at most the authorized, generation-bound recovery. |
 | Queued workflow/job | Check workflow-level status, concurrency, exact superseded generations and matching runner evidence; PR check rollup alone may omit the pending run. |
 | Build passed but optional artifact upload/handoff failed | Report the handoff unavailable and device/emulator evidence unproven; do not promote optional transport into a merge/release gate. Do not invent artifact hashes, delete storage broadly, or call a successful build device acceptance. |
+
+Admission-only refresh and infrastructure failed-job recovery are different operations.
+The typed Actions admission/CI-start path uses the full workflow `/rerun` endpoint; do not replace it with `/rerun-failed-jobs`, a single-job rerun, or `gh run rerun --failed`.
+Verify the workflow really is admission-only as well as its protected context/App and exact repository/PR/head/base/workflow/run/attempt identity; a gate name alone is insufficient.
+Preserve required source-failure priority: this rule never authorizes broad source-suite reruns or treats a stale-observer assertion's exit 1 as proven deferred admission/exit 78.
+If the available receipt names only generic failed-job recovery, report the selection mismatch to the existing actor rather than inventing another command or writer.
+When investigating a past rerun, preserve the original invocation/selection receipt: reused jobs alone do not identify the caller, and an already-correct full-workflow builder must not be presented as a newly fixed runtime defect.
+See [gated CI](../../../../docs/gated-ci.md#refresh-the-observation-as-well-as-the-gate) for the observer/dependency contract.
 
 A proposed infrastructure retry requires fresh exact head/run/attempt evidence, owner/custody agreement, and reconciliation of competing or uncertain attempts.
 Do not carry an old retry authorization onto a new source generation.
