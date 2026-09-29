@@ -105,6 +105,31 @@ Caravan's checked-in `.github/workflows/ci.yml` is the canonical executable
 example and `tests/ci_workflow_contract.rs` prevents broad label triggers or
 loss of the fail-closed aggregate.
 
+### Refresh the observation as well as the gate
+
+In a separate admission-only workflow, an observer can finish successfully with
+`deferred_unjoined`, then enrollment can occur before a later gate attempt.
+GitHub's failed-jobs-only rerun can reuse that successful observer and its old
+outputs. A successful observer process therefore does not establish current
+admitted membership. Keep the downstream membership assertion strict; its exit 1
+is not the positive deferred-admission sentinel 78.
+
+When the existing actor is authorized to refresh that exact admission-only
+workflow, refresh the **whole selected workflow**, including its successful
+observer/dependencies. Cara's typed execution restart and Actions admission
+retrigger already use `POST /actions/runs/{run_id}/rerun`. Do not substitute
+`/rerun-failed-jobs`, a single-job rerun, or `gh run rerun --failed`. The generic
+infrastructure failed-job helper is a different recovery path, not an admission
+refresh command.
+
+Verify the actual workflow scope and protected context/App, repository, PR,
+head/base, workflow, run and attempt binding. A gate context alone does not prove
+that a workflow is admission-only. Do not broaden a cheap observer refresh into
+rerunning a source suite, waive source failures, replay membership, or create a
+second writer. Preserve accepted/indeterminate request receipts instead of
+repeating them. This is a constraint on an already-authorized operation, not a
+new CLI entrypoint or independent retry authority.
+
 ## Admission and convergence controllers
 
 Copy the reviewed bundle under [`examples/workflows/`](../examples/workflows/):

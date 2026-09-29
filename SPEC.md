@@ -1112,6 +1112,17 @@ attempt/suite and PR facts, then uses the Actions-specific whole-run endpoint,
 never a generic fallback from a foreign App's suite. Draft, parked, held and
 inactive members receive no post-mutation start.
 
+An authorized admission-only workflow refresh includes successful observer and
+prerequisite jobs, not only the failed gate. Observer process success is not
+proof that its membership observation is current; failed-only reruns can reuse
+outputs captured before enrollment. The exact selected workflow uses the full
+Actions `/rerun` endpoint, never `/rerun-failed-jobs` or `gh run rerun --failed`.
+This constrains an already-authorized refresh: a gate name alone does not prove
+that its workflow is admission-only, and the rule must not expand to source-suite
+reruns or override required source failures. A stale observer's downstream exit 1
+is still failure, not positive deferred-admission/exit-78 evidence. Generic
+infrastructure failed-job recovery remains a separate decision and command.
+
 The normal repository writer persists a secret-free common-Git checkpoint for
 both reuse and restart, binding repository, membership tuple, workflow and exact
 execution to the original operation. A reused run becoming red does not authorize

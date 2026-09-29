@@ -3,6 +3,8 @@ use crate::ci_dispatch::{CiExecution, DispatchBinding};
 use mcp_cli::StructuredError;
 use serde_json::{Value, json};
 
+mod admission_refresh;
+
 fn fixture() -> (Value, Value, Value, model::PullRequestSnapshot, CiExecution) {
     let mut pull: Value =
         serde_json::from_str(&pr_object_json(12, "feature/widget", "acme/widgets")).unwrap();
