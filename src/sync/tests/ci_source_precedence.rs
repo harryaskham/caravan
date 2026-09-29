@@ -169,7 +169,7 @@ fn source_failure_is_not_hidden_by_a_cancelled_run_conclusion() {
         vec![job("compile", "failure"), job("prepare", "cancelled")],
     )]);
     change_diagnostics(&provider, |response| {
-        response.runs[0].conclusion = "cancelled".into()
+        response.runs[0].conclusion = "cancelled".into();
     });
     provider
         .failed_runs
@@ -256,7 +256,7 @@ fn source_precedence_does_not_override_generation_or_lineage_refusals() {
                 "base" => run.pull_requests[0].base_oid = Some(CommitOid("old-base".into())),
                 "association" => run.pull_requests.clear(),
                 "lineage" => {
-                    run.failed_jobs[0].failed_steps[0].name = "Verify selected ref lineage".into()
+                    run.failed_jobs[0].failed_steps[0].name = "Verify selected ref lineage".into();
                 }
                 _ => unreachable!(),
             }
