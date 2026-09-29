@@ -1375,7 +1375,13 @@ scheduler status degrades instead. `missing_required_runs` in
 is never `healthy` while a caravan cannot start CI at all.
 
 A failed-CI decision contains bounded structured run, job, and failed-step
-facts. For an allowlisted lineage-verification step, Cara requests only the
+facts. Collection binds jobs to the independently observed positive Actions run
+attempt using its attempt-scoped endpoint, never a subsequent `latest` jobs read.
+Missing/mismatched run identity or attempt and foreign/duplicate job identities
+fail closed before job interpretation or log reads. A partial or contradictory
+job inventory remains incomplete; it cannot establish pure infrastructure.
+This binds collected evidence only, not trusted producer origin or cross-tick
+rerun authority. For an allowlisted lineage-verification step, Cara requests only the
 first 60 KiB of the job log and retains only a strict
 `ci-selected-ref-receipt`; all unrelated text, credentials, and raw log bytes
 are discarded. Missing, malformed, unavailable, or range-truncated receipts

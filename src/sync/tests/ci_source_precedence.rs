@@ -163,6 +163,42 @@ fn required_source_workflow_vetoes_sibling_infrastructure_rerun() {
 }
 
 #[test]
+fn collected_attempt_identity_preserves_source_veto_during_attempt_advance() {
+    let (status, provider) = fixture(vec![(99, vec![job("compile", "failure")])]);
+    let expected = PullRequestPrecondition::from(&provider.pulls.borrow()[&PrNumber(1)]);
+    let diagnostics = crate::ci::tests::attempts::advancing_attempt_diagnostics(&expected);
+    provider
+        .diagnostic_overrides
+        .borrow_mut()
+        .insert(PrNumber(1), diagnostics);
+    let ci = failed_ci(&status, &provider);
+    assert_eq!(ci["failure_diagnostics"][0]["diagnostic"]["attempt"], 2);
+    assert_eq!(
+        ci["failure_diagnostics"][0]["diagnostic"]["failed_jobs"][0]["job_id"],
+        201
+    );
+    assert_eq!(
+        ci["failure_diagnostics"][0]["classification"],
+        "source_or_test_failure"
+    );
+}
+
+#[test]
+fn collected_exact_attempt_infrastructure_preserves_existing_opt_in_effect() {
+    let (status, provider) = fixture(vec![(99, vec![job("compile", "timed_out")])]);
+    let expected = PullRequestPrecondition::from(&provider.pulls.borrow()[&PrNumber(1)]);
+    let diagnostics = crate::ci::tests::attempts::exact_attempt_diagnostics(&expected, "timed_out");
+    provider
+        .diagnostic_overrides
+        .borrow_mut()
+        .insert(PrNumber(1), diagnostics);
+    let progress = execute(&status, &provider, false, true, false).unwrap();
+    assert_eq!(*provider.calls.borrow(), vec![MutationKind::RerunChecks]);
+    assert_eq!(progress.provider_receipts.len(), 1);
+    assert_eq!(progress.ci[0].disposition, CiDisposition::Waiting);
+}
+
+#[test]
 fn source_failure_is_not_hidden_by_a_cancelled_run_conclusion() {
     let (status, provider) = fixture(vec![(
         10,
