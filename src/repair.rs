@@ -6,7 +6,8 @@
 //! evidence to verify an agent-owned conflict resolution and targeted validation
 //! before publication. Legacy sessions use force-with-lease and may resume
 //! `sync --all`. Explicit non-force sessions preserve the old head as a merge
-//! parent, publish only by fast-forward, and never enter sync implicitly.
+//! parent (or as the sole parent of an explicit semantic correction), publish
+//! only by fast-forward, and never enter sync implicitly.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -26,6 +27,7 @@ use crate::operation_lock::OperationLock;
 use crate::{AppContext, AppError, SyncInput};
 
 mod non_force;
+mod semantic_only;
 pub use non_force::NonForceRepair;
 
 #[derive(Default)]
@@ -37,6 +39,24 @@ struct RepairStartIntent {
 const REPAIR_VERSION: u32 = 1;
 const NON_FORCE_REPAIR_VERSION: u32 = 2;
 const NON_FORCE_WIRE_STATE: &str = "non_force_v1";
+const SEMANTIC_REPAIR_VERSION: u32 = 3;
+const SEMANTIC_WIRE_STATE: &str = "non_force_semantic_v1";
+
+fn repair_version(policy: Option<&NonForceRepair>) -> u32 {
+    match policy {
+        Some(policy) if policy.semantic_only => SEMANTIC_REPAIR_VERSION,
+        Some(_) => NON_FORCE_REPAIR_VERSION,
+        None => REPAIR_VERSION,
+    }
+}
+
+fn expected_parents(repair: &RepairSession) -> Vec<CommitOid> {
+    if semantic_only::enabled(repair) {
+        vec![repair.head.oid.clone()]
+    } else {
+        vec![repair.head.oid.clone(), repair.target.oid.clone()]
+    }
+}
 const REPAIR_GIT_NAME_CONFIG: &str = "user.name=Caravan Repair";
 const REPAIR_GIT_EMAIL_CONFIG: &str = "user.email=caravan-repair@users.noreply.github.com";
 const REPAIR_DIRECTORY: &str = "repair-workspaces";
@@ -64,6 +84,11 @@ pub struct RepairStartInput {
     #[arg(long)]
     #[serde(default)]
     pub non_force: bool,
+    /// Stage a semantic-only correction when the source already contains the target.
+    /// Requires --non-force and explicit grants or agent-edit authorization; never merges.
+    #[arg(long, requires = "non_force")]
+    #[serde(default)]
+    pub semantic_only: bool,
     /// Authorized source owner's audit identity, not a custody transfer.
     #[arg(long)]
     #[serde(default)]
@@ -97,6 +122,25 @@ pub fn start_non_force(
             pr: input.pr,
             target_pr: input.target_pr,
             non_force: true,
+            semantic_only: false,
+            actor: Some(input.actor),
+            reason: Some(input.reason),
+        },
+    )
+}
+
+/// Distinct semantic capability: never fall back to an older merge/force tool.
+pub fn start_semantic_non_force(
+    context: &AppContext,
+    input: NonForceRepairStartInput,
+) -> Result<RepairStartOutput, AppError> {
+    start(
+        context,
+        &RepairStartInput {
+            pr: input.pr,
+            target_pr: input.target_pr,
+            non_force: true,
+            semantic_only: true,
             actor: Some(input.actor),
             reason: Some(input.reason),
         },
@@ -618,11 +662,19 @@ fn start_exact_with_writer_guard(
         let mut existing_policy = existing.non_force.clone();
         if let Some(policy) = &mut existing_policy {
             policy.publication_attempted = false;
+            policy.prepared_tree = None;
         }
         if existing_policy != non_force {
-            return Err(non_force::refusal(
+            return Err(AppError::structured(
+                ErrorCategory::Validation,
                 "repair_publication_policy_changed",
                 "existing session custody/generation/publication policy differs; inspect it without upgrading or relabelling legacy evidence",
+                Some(json!({
+                    "provider_mutated_by_this_refusal": false,
+                    "workspace_preserved": true,
+                    "existing": repair_status_output(&existing)?,
+                    "next": "inspect this exact existing session; preserve unique work and use explicit owner-reviewed supported cleanup only when appropriate, never relabel its purpose",
+                })),
             ));
         }
         if existing.head == candidate.head && existing.target == *target {
@@ -721,11 +773,7 @@ fn start_exact_with_writer_guard(
     })?;
     let now = unix_ms();
     let repair = RepairSession {
-        version: if non_force.is_some() {
-            NON_FORCE_REPAIR_VERSION
-        } else {
-            REPAIR_VERSION
-        },
+        version: repair_version(non_force.as_ref()),
         non_force,
         session: format!(
             "pr-{}-{}",
@@ -897,6 +945,20 @@ fn materialize_repair(
             Ok(())
         },
     )?;
+    if semantic_only::enabled(&repair) {
+        if let Err(error) = semantic_only::verify_prepared(&workspace_runner, &repair) {
+            record_phase_error(
+                &mut repair,
+                paths,
+                RepairPhase::CheckingOut,
+                timeout,
+                0,
+                &error,
+            )?;
+            return Err(error);
+        }
+        return finish_materialization(paths, &workspace_runner, repair, resumed);
+    }
     let merge =
         run_materialization_phase(&mut repair, paths, RepairPhase::Merging, timeout, || {
             run(
@@ -962,7 +1024,16 @@ fn materialize_repair(
         ));
     }
     repair.conflicting_paths = conflicting_paths;
-    repair.baseline_index = staged_index(&workspace_runner)?;
+    finish_materialization(paths, &workspace_runner, repair, resumed)
+}
+
+fn finish_materialization(
+    paths: &RepairPaths,
+    runner: &impl CommandRunner,
+    mut repair: RepairSession,
+    resumed: bool,
+) -> Result<RepairStartOutput, AppError> {
+    repair.baseline_index = staged_index(runner)?;
     repair.state = RepairState::Resolving;
     repair.phase = RepairPhase::Resolving;
     repair.last_error = None;
@@ -977,7 +1048,9 @@ fn materialize_repair(
 }
 
 fn repair_continuation_next(repair: &RepairSession) -> String {
-    if repair.non_force.is_some() {
+    if semantic_only::enabled(repair) {
+        "apply explicit semantic grants or authorize/stage bounded agent edits in this workspace; continue with the recorded --actor and --no-sync to create one nonempty one-parent successor. Do not merge, commit, push or run sync manually".to_owned()
+    } else if repair.non_force.is_some() {
         "resolve/stage only authorized conflicts in the preserved workspace (a clean merge needs no edits); continue the exact session with the recorded --actor and --no-sync. Do not commit, push, run sync or native rebase manually".to_owned()
     } else {
         "resolve only the reported conflicting paths in the managed workspace, stage them, then run `cara repair continue --session <id>`; do not commit, update refs, or push manually".to_owned()
@@ -1130,6 +1203,7 @@ pub fn authorize_agent_edits(
         ProcessRunner::in_directory(&paths.workspace)
             .with_timeout(Duration::from_secs(context.config.command_timeout_secs)),
     );
+    semantic_only::verify_editable(&runner, &repair, &paths.manifest)?;
     verify_remote_head(&runner, &repair.provider_git_url, &repair.head)?;
     verify_remote_head(&runner, &repair.provider_git_url, &repair.target)?;
     let now = unix_ms();
@@ -1363,6 +1437,7 @@ pub fn grant_paths(
     )?;
     let timeout = Duration::from_secs(context.config.command_timeout_secs);
     let runner = lock.runner(ProcessRunner::in_directory(&paths.workspace).with_timeout(timeout));
+    semantic_only::verify_editable(&runner, &repair, &paths.manifest)?;
     verify_remote_head(&runner, &repair.provider_git_url, &repair.head)?;
     verify_remote_head(&runner, &repair.provider_git_url, &repair.target)?;
     let unmerged = require_success(
@@ -1631,6 +1706,7 @@ pub fn revoke_grants(
         ProcessRunner::in_directory(&paths.workspace)
             .with_timeout(Duration::from_secs(context.config.command_timeout_secs)),
     );
+    semantic_only::verify_editable(&runner, &repair, &paths.manifest)?;
     verify_remote_head(&runner, &repair.provider_git_url, &repair.head)?;
     verify_remote_head(&runner, &repair.provider_git_url, &repair.target)?;
     let unique = input.paths.iter().cloned().collect::<BTreeSet<_>>();
@@ -1991,7 +2067,7 @@ fn continue_with_verifier(
             Some(json!({
                 "repair": repair,
                 "workspace_preserved": paths.workspace.exists(),
-                "next": format!("repeat the original `cara repair start --pr {}{target}` arguments, including recorded --non-force/--actor/--reason, to resume the exact preparing session; inspect status before confirmed local cleanup", repair.pr),
+                "next": format!("repeat the original `cara repair start --pr {}{target}` arguments, including recorded --non-force/--semantic-only/--actor/--reason, to resume the exact preparing session; inspect status before confirmed local cleanup", repair.pr),
             })),
         ));
     }
@@ -2021,7 +2097,7 @@ fn continue_with_verifier(
                 old_head: repair.head.oid.clone(),
                 target: repair.target.oid.clone(),
                 new_head,
-                parents: vec![repair.head.oid.clone(), repair.target.oid.clone()],
+                parents: expected_parents(&repair),
                 force: repair.non_force.is_none(),
                 expected_remote_head: repair.head.oid.clone(),
                 remote_verified: true,
@@ -2046,12 +2122,17 @@ fn continue_with_verifier(
     )?;
     let timeout = Duration::from_secs(context.config.command_timeout_secs);
     let runner = lock.runner(ProcessRunner::in_directory(&paths.workspace).with_timeout(timeout));
-    let expected_parents = vec![repair.head.oid.clone(), repair.target.oid.clone()];
+    let expected_parents = expected_parents(&repair);
 
     let (new_head, parents) = match repair.state {
         RepairState::Preparing => unreachable!("preparing state returned above"),
         RepairState::Resolving => {
-            if try_rev_parse(&runner, "MERGE_HEAD")?.is_some() {
+            let needs_commit = if semantic_only::enabled(&repair) {
+                rev_parse(&runner, "HEAD")? == repair.head.oid
+            } else {
+                try_rev_parse(&runner, "MERGE_HEAD")?.is_some()
+            };
+            if needs_commit {
                 if let Some(receipt) = verify_resolution(&runner, &repair, input.actor.as_deref())?
                 {
                     repair.agent_edit_receipt = Some(receipt);
@@ -2067,6 +2148,7 @@ fn continue_with_verifier(
                         false,
                     )?;
                 }
+                semantic_only::record_prepared_tree(&runner, &mut repair, &paths.manifest)?;
                 verify_remote_head(&runner, &repair.provider_git_url, &repair.head)?;
                 require_success(
                     &runner,
@@ -2090,11 +2172,12 @@ fn continue_with_verifier(
                     "could not commit the verified repair resolution",
                 )?;
             }
-            // If the process died after commit but before the manifest update,
-            // exact parents recover that boundary without another commit.
+            // Semantic recovery also requires the authorized tree persisted before
+            // commit: parent shape alone cannot attest an unreviewed manual commit.
             let head = rev_parse(&runner, "HEAD")?;
             let found_parents = commit_parents(&runner, &head)?;
             require_exact_parents(&repair, &head, &found_parents, &expected_parents)?;
+            semantic_only::verify_committed(&runner, &repair, &head)?;
             repair.state = RepairState::Committed;
             repair.phase = RepairPhase::Committed;
             repair.last_error = None;
@@ -2146,7 +2229,7 @@ fn continue_with_verifier(
     };
     non_force::verify_workspace(&repair, &runner, &new_head)?;
 
-    // The prepared merge is valid only for the exact target generation too.
+    // The prepared correction is valid only for the exact target generation too.
     // A moved default/predecessor must be rediscovered rather than publishing
     // a repair against stale ancestry.
     if repair.non_force.is_none() {
@@ -2594,14 +2677,24 @@ fn verify_resolution(
     repair: &RepairSession,
     actor: Option<&str>,
 ) -> Result<Option<RepairAgentEditReceipt>, AppError> {
-    let merge_head = rev_parse(runner, "MERGE_HEAD")?;
-    if merge_head != repair.target.oid {
-        return Err(AppError::structured(
-            ErrorCategory::Validation,
-            "repair_merge_target_mismatch",
-            "repair workspace no longer contains the exact expected merge target",
-            Some(json!({"repair": repair, "actual_merge_head": merge_head})),
-        ));
+    if semantic_only::enabled(repair) {
+        semantic_only::verify_prepared(runner, repair)?;
+        if staged_paths(runner)?.is_empty() {
+            return Err(non_force::refusal(
+                "repair_semantic_no_changes",
+                "semantic-only repair requires a nonempty authorized source correction",
+            ));
+        }
+    } else {
+        let merge_head = rev_parse(runner, "MERGE_HEAD")?;
+        if merge_head != repair.target.oid {
+            return Err(AppError::structured(
+                ErrorCategory::Validation,
+                "repair_merge_target_mismatch",
+                "repair workspace no longer contains the exact expected merge target",
+                Some(json!({"repair": repair, "actual_merge_head": merge_head})),
+            ));
+        }
     }
     let unmerged = require_success(
         runner,
@@ -2900,7 +2993,7 @@ fn require_exact_parents(
     Err(AppError::structured(
         ErrorCategory::Validation,
         "repair_parent_mismatch",
-        "repair commit does not have the exact provider head and target parents",
+        "repair commit does not have the exact parent shape required by its persisted purpose",
         Some(json!({
             "repair": repair,
             "new_head": new_head,
@@ -3277,10 +3370,8 @@ fn git_common_dir(repository: &Path) -> Result<PathBuf, AppError> {
 }
 
 fn validate_manifest_path(paths: &RepairPaths, repair: &RepairSession) -> Result<(), AppError> {
-    if !matches!(
-        (repair.version, repair.non_force.is_some()),
-        (REPAIR_VERSION, false) | (NON_FORCE_REPAIR_VERSION, true)
-    ) || repair.workspace != paths.workspace.display().to_string()
+    if repair.version != repair_version(repair.non_force.as_ref())
+        || repair.workspace != paths.workspace.display().to_string()
         || !paths.workspace.starts_with(&paths.root)
     {
         return Err(AppError::validation(
@@ -3495,7 +3586,11 @@ fn write_manifest(path: &Path, repair: &RepairSession) -> Result<(), AppError> {
     let mut wire = serde_json::to_value(repair).expect("repair session serializes");
     if repair.non_force.is_some() {
         wire["non_force_state"] = wire["state"].clone();
-        wire["state"] = json!(NON_FORCE_WIRE_STATE);
+        wire["state"] = json!(if semantic_only::enabled(repair) {
+            SEMANTIC_WIRE_STATE
+        } else {
+            NON_FORCE_WIRE_STATE
+        });
     }
     let encoded = serde_json::to_vec_pretty(&wire).map_err(|error| {
         AppError::structured(
@@ -3569,21 +3664,21 @@ fn read_manifest(path: &Path) -> Result<RepairSession, AppError> {
 
 fn decode_manifest(bytes: &[u8]) -> Result<RepairSession, String> {
     let mut wire: Value = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
-    let non_force_wire = wire["state"] == NON_FORCE_WIRE_STATE;
+    let semantic_wire = wire["state"] == SEMANTIC_WIRE_STATE;
+    if semantic_wire && !wire["validation"].is_array() {
+        return Err("semantic manifest lost its validation evidence".to_owned());
+    }
+    let non_force_wire = semantic_wire || wire["state"] == NON_FORCE_WIRE_STATE;
     if non_force_wire {
-        if wire["version"] != NON_FORCE_REPAIR_VERSION || wire["non_force"].is_null() {
-            return Err("non-force manifest lost its version or publication policy".to_owned());
+        if wire["non_force"].is_null() {
+            return Err("non-force manifest lost its publication policy".to_owned());
         }
         wire["state"] = wire["non_force_state"].clone();
     }
     let repair: RepairSession = serde_json::from_value(wire).map_err(|error| error.to_string())?;
     if repair.non_force.is_some() != non_force_wire
-        || repair.version
-            != if non_force_wire {
-                NON_FORCE_REPAIR_VERSION
-            } else {
-                REPAIR_VERSION
-            }
+        || semantic_only::enabled(&repair) != semantic_wire
+        || repair.version != repair_version(repair.non_force.as_ref())
     {
         return Err(
             "unsupported repair schema/publication policy; never relabel an existing session"

@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "bead": "bd-ac737f",
+  "observed_at": "2026-09-30",
+  "scope": "Hermetic local Git commit/push boundaries with fake provider facts, plus CLI parsing and MCP inventory/schema contracts",
+  "before": {
+    "job": "tj-d29126e0",
+    "test": "non_force_semantic_prepares_contained_target_without_a_fake_merge",
+    "outcome": "compiled_then_expected_behavioral_failure",
+    "refusal": "repair_non_force_already_contains_target"
+  },
+  "after": [
+    {"job": "tj-7c3e4848", "suite": "repair::tests::non_force::", "passed": 30},
+    {"job": "tj-a50a9b6e", "suite": "non_force_repair_contract", "passed": 3},
+    {"job": "tj-849a8612", "suite": "repair::tests::non_force::semantic::", "passed": 13, "includes_final_refusal_and_wire_guards": true}
+  ],
+  "cases": [
+    {"id": "SEM-01", "test": "non_force_semantic_prepares_contained_target_without_a_fake_merge", "proves": "Actual target containment; no MERGE_HEAD, source rewrite or preparation push"},
+    {"id": "SEM-02", "test": "non_force_semantic_grants_publish_one_parent_and_replay_exact_receipt", "proves": "Reviewed grant bytes, exactly one original-head parent, immutable original merge, literal no-force push arguments, stored validation and exact successor readback"},
+    {"id": "SEM-03", "test": "non_force_semantic_agent_edits_produce_bounded_receipt", "proves": "Existing explicit agent-edit authority supports a new source file with bounded content/path receipt"},
+    {"id": "SEM-04", "test": "non_force_semantic_recovers_commit_boundary_only_with_authorized_tree", "proves": "Recorded-tree crash recovery succeeds; unrecorded or altered-tree manual commits refuse"},
+    {"id": "SEM-05", "test": "non_force_semantic_committed_bytes_cannot_be_edited_as_resolving_work", "proves": "Committed checkpoint and stale pre-lock session cannot be relabeled as editable work"},
+    {"id": "SEM-06", "test": "non_force_semantic_unchanged_remote_cannot_clear_uncertain_intent_or_abort", "proves": "Unchanged remote is not no-write evidence; uncertain intent cannot retry or delete its workspace"},
+    {"id": "SEM-07", "test": "non_force_semantic_rejects_redundant_merge_parent_even_with_authorized_tree", "proves": "An authorized tree cannot justify an invented redundant merge parent"},
+    {"id": "SEM-08", "test": "non_force_semantic_remote_race_preserves_other_writer_and_uncertain_intent", "proves": "A concurrent source update is not overwritten by publication"},
+    {"id": "SEM-09", "test": "non_force_semantic_rejects_divergence_and_missing_non_force", "proves": "No semantic opt-in on divergent target or force-capable policy"},
+    {"id": "SEM-10", "test": "non_force_semantic_does_not_convert_a_preserved_failed_merge_session", "proves": "Failed Preparing merge record and WIP survive; refusal returns its real session identity"},
+    {"id": "SEM-11", "test": "non_force_semantic_wire_refuses_old_readers_and_downgrades", "proves": "Version3/discriminator required; legacy/v2 reader and cleanup cannot decode; missing validation/policy/intent evidence refuses"},
+    {"id": "SEM-12", "test": "non_force_semantic_rejects_noop_ungranted_dirty_and_wrong_actor", "proves": "No-op, ungranted/extra path, unstaged/untracked, wrong grant bytes, actor and implicit sync refusals"},
+    {"id": "SEM-13", "test": "non_force_semantic_validation_and_fresh_generation_remain_required", "proves": "Failed or mutating validation, moved provider generation and moved live target stop publication"},
+    {"id": "SEM-14", "test": "semantic_only_cli_and_mcp_are_distinct_non_force_capabilities", "proves": "CLI requires non-force; actual router exposes distinct semantic tool, no request force/purpose toggle"},
+    {"id": "SEM-15", "suite": "repair::tests::non_force::", "proves": "Existing merge repair, two-parent authored-history preservation, writer fences and response-loss guards remain exercised"}
+  ],
+  "not_proved_by_this_artifact": [
+    "Final hosted CI qualification",
+    "Containing release or installed runtime capability",
+    "Consumer source publication, new-head CI, queue admission or merge"
+  ]
+}

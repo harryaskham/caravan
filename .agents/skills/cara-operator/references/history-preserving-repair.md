@@ -37,12 +37,54 @@ This is not a rebase, flattening, squash-equivalence rewrite, or guard relaxatio
 The publisher uses `git push --no-force` for one verified object/ref, never a plus
 refspec or force-with-lease, and never pushes tags or submodule refs.
 
+## Semantic-only correction of an already-contained target
+
+When a reviewed source correction is needed but the source **already contains**
+the current default/predecessor, explicitly select the distinct semantic purpose:
+
+```sh
+cara repair start --pr "$PR" --non-force --semantic-only \
+  --actor "$SOURCE_OWNER" --reason "apply reviewed source correction"
+# Use the exact returned session/workspace. Apply reviewed repair grant paths,
+# or authorize-agent-edits before staging bounded repository-content changes.
+cara repair continue --session "$SESSION" --actor "$SOURCE_OWNER" --no-sync \
+  --validate "$REVIEWED_TARGETED_CHECK"
+```
+
+Optional `--target-pr` still names the actual freshly observed predecessor; never
+invent one to make a merge possible. This mode proves target containment and
+starts **no merge**. Explicit semantic grants or existing agent-edit authorization
+are still required; the start actor/reason alone grants no content-edit scope.
+A nonempty authorized correction becomes a **one-parent** descendant of the exact
+old source head. The target is an ancestry/lease binding, not an invented second
+parent. Normal no-force publication and all continuation fences below still apply.
+
+MCP callers must use `repair_start_semantic_non_force` (`pr`, optional `target_pr`,
+`actor`, `reason`). There is no purpose/force toggle on that tool; never fall back
+to `repair_start_non_force` or `repair_start` on an older server. Check the installed
+CLI help or server tool inventory before using it: merged source is not installed
+capability. Version-3 semantic manifests use `non_force_semantic_v1`, which older
+merge-mode readers and cleanup cannot decode.
+
+Before committing, Cara durably records the **authorized tree** after scope/blob
+verification. Recovery after a commit/checkpoint interruption requires that exact
+nonempty tree and sole original-head parent; a manually created commit with merely
+the right parent is not proof of authorization. Changed bytes, empty corrections,
+ungranted paths, dirty files, stale generations and failed validation refuse.
+
+There is still one session directory per PR. A previous refused merge start can
+leave a preserved `Preparing` record even without a successful start receipt.
+A new semantic start must not relabel or overwrite it. Inspect the exact existing
+session and preserve unique work; use supported explicit owner-reviewed local
+cleanup only when appropriate before starting the new purpose. Never edit manifests,
+guess a new generation, or discard an unresolved publication intent.
+
 ## Boundaries and refusals
 
 - The durable session binds the exact actor/reason, repository/PR/ref, source and
   target generations, provider creation/update evidence, control metadata, config,
   workspace, and source-edit grants. Fresh source/parent/default observations,
-  exact live ref checks, merge-parent verification, and the existing local/remote
+  exact live ref checks, purpose-specific parent verification, and the existing local/remote
   writer guards remain mandatory. Changed/reopened/draft/foreign/unknown facts
   refuse; a blocked read is not permission to publish.
 - `continue` requires the same actor **and `--no-sync`**, including saved-output
@@ -65,10 +107,11 @@ refspec or force-with-lease, and never pushes tags or submodule refs.
   Version-2 manifests use an explicit wire-state discriminator so older readers,
   including cleanup paths, refuse rather than ignoring the policy. Never edit a
   manifest or replace it with status/API JSON to work around that refusal.
-- If the source already contains the target, no merge is needed: the precise
-  `repair_non_force_already_contains_target` refusal preserves the workspace and
-  routes current topology evidence back to the designated actor. Do not invent a
-  source rewrite to clear a stale provider representation.
+- Without `--semantic-only`, an already-contained target still returns
+  `repair_non_force_already_contains_target` and preserves the workspace. No merge
+  is needed. Return stale topology evidence to the designated actor; only an actual
+  reviewed semantic correction justifies the explicit semantic purpose above.
+  Do not invent a source rewrite to clear a stale provider representation.
 - After a parent changes, rediscover the child and its actual current parent.
   Neither a handoff fingerprint nor an old parent's successful receipt is a lease
   for the next child. Preserve held/unpublished work and independent operation history.

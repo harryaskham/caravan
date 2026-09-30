@@ -9,8 +9,8 @@ use serde_json::json;
 
 use super::{
     MAX_GRANT_ACTOR_BYTES, MAX_GRANT_REASON_BYTES, RepairContinueInput, RepairSession,
-    RepairStartInput, RepairState, commit_parents, require_exact_parents, require_owned_repair,
-    require_success, rev_parse,
+    RepairStartInput, RepairState, commit_parents, expected_parents, require_exact_parents,
+    require_owned_repair, require_success, rev_parse, semantic_only,
 };
 use crate::{
     AppError,
@@ -92,6 +92,13 @@ impl NonForceGeneration {
 /// a transfer of another source owner's authority or permission to bypass a hold.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct NonForceRepair {
+    /// Semantic-only purpose has its own version and wire-state discriminator.
+    #[serde(default)]
+    pub semantic_only: bool,
+    /// Authorized index tree, durably recorded before a semantic commit. An
+    /// unrecorded manual commit cannot masquerade as crash-boundary recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_tree: Option<CommitOid>,
     pub actor: String,
     pub reason: String,
     pub default_ref: String,
@@ -111,10 +118,10 @@ impl NonForceRepair {
         default_ref: &str,
     ) -> Result<Option<Self>, AppError> {
         if !input.non_force {
-            if input.actor.is_some() || input.reason.is_some() {
+            if input.semantic_only || input.actor.is_some() || input.reason.is_some() {
                 return Err(refusal(
                     "repair_non_force_input_invalid",
-                    "start actor/reason must accompany --non-force",
+                    "start semantic-only/actor/reason must accompany --non-force",
                 ));
             }
             return Ok(None);
@@ -154,6 +161,8 @@ impl NonForceRepair {
         }
         require_owned_repair(repository, candidate, &candidate.base)?;
         Ok(Some(Self {
+            semantic_only: input.semantic_only,
+            prepared_tree: None,
             actor: text(&input.actor, MAX_GRANT_ACTOR_BYTES)?,
             reason: text(&input.reason, MAX_GRANT_REASON_BYTES)?,
             default_ref: default_ref.to_owned(),
@@ -165,6 +174,13 @@ impl NonForceRepair {
 
     pub(super) fn matches_session(&self, repair: &RepairSession) -> bool {
         self.source.pr == repair.pr
+            && (self.semantic_only || self.prepared_tree.is_none())
+            && (!self.semantic_only
+                || !matches!(
+                    repair.state,
+                    RepairState::Committed | RepairState::Published
+                )
+                || self.prepared_tree.is_some())
             && self.source.head == repair.head
             && self.source.base == repair.old_base
             && self.source.head.repository == repair.repository
@@ -292,8 +308,9 @@ pub(super) fn verify_workspace(
         repair,
         head,
         &commit_parents(runner, head)?,
-        &[repair.head.oid.clone(), repair.target.oid.clone()],
-    )
+        &expected_parents(repair),
+    )?;
+    semantic_only::verify_committed(runner, repair, head)
 }
 
 pub(super) fn publication_command(repair: &RepairSession, head: &CommitOid) -> CommandSpec {

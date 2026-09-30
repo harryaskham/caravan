@@ -564,6 +564,14 @@ sync, changes queue topology, or transfers source ownership. Existing legacy
 sessions cannot be relabelled non-force. Explicit native rebase and legacy
 repair remain force-with-lease paths, even with `rebase_on_join: false`.
 Ordinary sync does not invoke native source rebasing automatically.
+If the source already contains its target but needs a reviewed semantic correction,
+add `--semantic-only` to that explicit non-force start. It starts no merge and
+requires semantic grants or agent-edit authorization for a nonempty **one-parent**
+successor. A durable authorized-tree checkpoint protects interrupted commits;
+old merge/legacy sessions cannot be converted. MCP uses the distinct
+`repair_start_semantic_non_force`, never an older-tool fallback. Check installed
+help/tool inventory: source publication, release, installation and new-head CI
+are separate proofs.
 See the [owner continuation and refusal contract](.agents/skills/cara-operator/references/history-preserving-repair.md).
 
 A semantic grant is distinct from a mechanical conflict: it is bounded, expiring,

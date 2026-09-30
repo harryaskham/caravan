@@ -535,6 +535,12 @@ intent fences uncertain retries/cleanup. Fresh provider facts, parent/ref/config
 checks, writer guards, edit scopes, and fresh CI remain mandatory. Legacy receipts
 cannot be relabelled non-force. No automatic sync, queue mutation, or source
 ownership transfer is granted; a parent's old receipt is not its child's lease.
+When the source already contains the target, an explicit --non-force --semantic-only
+start permits a reviewed semantic correction without a merge. Grants or agent-edit
+authorization remain required. It creates a nonempty one-parent descendant and records
+the authorized tree before commit. MCP uses repair_start_semantic_non_force, never a
+fallback to older tools. Version-3 semantic wire state rejects old readers/cleanup;
+existing per-PR merge/legacy sessions cannot be relabelled or overwritten.
 For human flow testing, `cara loop --manual [--shell 'zsh -i']` opens a real TTY only at
 external decisions, exports a private `CARA_DECISION_FILE`, releases the lock,
 and always rediscovers after shell success; it is never JSON/MCP/hook behavior.
@@ -1813,6 +1819,11 @@ pub fn build_router() -> ToolRouter<AppContext> {
         |context: &AppContext, input: repair::NonForceRepairStartInput| repair::start_non_force(context, input),
     );
     router.add_typed_tool_with_output_schema(
+        "repair_start_semantic_non_force",
+        "Create an explicit non-force semantic-only session when the source already contains the exact target. Requires grants or agent-edit authorization and produces one nonempty one-parent successor with the same actor/no_sync fences. Older servers must reject this distinct tool; never fall back to repair_start or repair_start_non_force.",
+        |context: &AppContext, input: repair::NonForceRepairStartInput| repair::start_semantic_non_force(context, input),
+    );
+    router.add_typed_tool_with_output_schema(
         "repair_authorize_agent_edits",
         "Authorize one exact agent identity to make bounded arbitrary repository-content edits in an exact resolving session. Binds repository/PR/head/target/config/session/actor/reason/expiry, never mutates provider state, and requires complete staged diff receipts at continue.",
         |context: &AppContext, input: repair::RepairAuthorizeAgentEditsInput| {
@@ -1835,7 +1846,7 @@ pub fn build_router() -> ToolRouter<AppContext> {
     );
     router.add_typed_tool_with_output_schema(
         "repair_continue",
-        "Verify scoped edits and exact-parent merge, then publish using the persisted session policy. Legacy uses force-with-lease and may resume sync; explicit non-force requires the same actor and no_sync, durably fences uncertainty, and never mutates queue topology.",
+        "Verify scoped edits and exact parent shape (two-parent merge or explicit one-parent semantic correction), then publish using the persisted session policy. Legacy uses force-with-lease and may resume sync; explicit non-force requires the same actor and no_sync, durably fences uncertainty, and never mutates queue topology.",
         |context: &AppContext, input: repair::RepairContinueInput| repair::continue_session(context, &input),
     );
     router.add_typed_tool_with_output_schema(

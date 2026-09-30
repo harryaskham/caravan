@@ -1,6 +1,8 @@
 use super::*;
 use crate::repair::non_force as policy;
 
+mod semantic;
+
 fn source_fixture() -> Fixture {
     let mut f = fixture();
     f.candidate.created_at = Some("2026-09-01T00:00:00Z".to_owned());
@@ -13,6 +15,7 @@ fn input(f: &Fixture) -> RepairStartInput {
         pr: f.candidate.number.0,
         target_pr: None,
         non_force: true,
+        semantic_only: false,
         actor: Some("source-owner".to_owned()),
         reason: Some("preserve authored merge history".to_owned()),
     }

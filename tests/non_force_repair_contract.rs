@@ -19,6 +19,7 @@ fn non_force_repair_interface_parses_actual_documented_flags() {
         .unwrap();
     let start = RepairStartInput::from_arg_matches(&matches).unwrap();
     assert!(start.non_force);
+    assert!(!start.semantic_only);
     assert_eq!(start.target_pr, Some(6));
     assert_eq!(start.actor.as_deref(), Some("source-owner"));
     let matches = RepairContinueInput::augment_args(Command::new("continue"))
@@ -58,6 +59,57 @@ fn non_force_repair_interface_parses_actual_documented_flags() {
 }
 
 #[test]
+fn semantic_only_cli_and_mcp_are_distinct_non_force_capabilities() {
+    let command = || RepairStartInput::augment_args(Command::new("start"));
+    let flags = [
+        "start",
+        "--pr",
+        "7",
+        "--semantic-only",
+        "--actor",
+        "owner",
+        "--reason",
+        "correction",
+    ];
+    assert!(command().try_get_matches_from(flags).is_err());
+    let matches = command()
+        .try_get_matches_from(flags.into_iter().chain(["--non-force"]))
+        .unwrap();
+    let input = RepairStartInput::from_arg_matches(&matches).unwrap();
+    assert!(input.semantic_only && input.non_force);
+    let tools = caravan::build_router().tool_metadata();
+    for name in [
+        "repair_start",
+        "repair_start_non_force",
+        "repair_start_semantic_non_force",
+    ] {
+        assert_eq!(tools.iter().filter(|tool| tool.name == name).count(), 1);
+    }
+    let request = serde_json::json!({"pr":7, "actor":"owner", "reason":"correction"});
+    assert!(
+        serde_json::from_value::<caravan::repair::NonForceRepairStartInput>(request.clone())
+            .is_ok()
+    );
+    for field in ["force", "non_force", "semantic_only"] {
+        let mut unknown = request.clone();
+        unknown[field] = serde_json::json!(false);
+        assert!(
+            serde_json::from_value::<caravan::repair::NonForceRepairStartInput>(unknown).is_err()
+        );
+    }
+    let source = include_str!("../src/repair.rs");
+    let handler = source
+        .split("pub fn start_semantic_non_force(")
+        .nth(1)
+        .unwrap()
+        .split("/// Verify, publish")
+        .next()
+        .unwrap();
+    assert!(handler.contains("non_force: true"));
+    assert!(handler.contains("semantic_only: true"));
+}
+
+#[test]
 fn non_force_operator_contract_states_real_force_and_uncertainty_boundaries() {
     let text = [
         include_str!("../.agents/skills/cara-operator/references/history-preserving-repair.md"),
@@ -76,6 +128,10 @@ fn non_force_operator_contract_states_real_force_and_uncertainty_boundaries() {
         "there is no standalone sealed tail-eviction preview CLI",
         "auto_apply_from_status",
         "repair_start_non_force",
+        "repair_start_semantic_non_force",
+        "--semantic-only",
+        "one-parent",
+        "authorized tree",
         "never fall back",
         "legacy",
         "force-with-lease",

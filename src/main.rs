@@ -358,7 +358,7 @@ enum RepairCommand {
     Grant(RepairGrantInput),
     /// Revoke semantic grants and restore their pre-grant staged blobs.
     RevokeGrant(RepairRevokeGrantInput),
-    /// Verify, non-force publish, and resume sync-all.
+    /// Verify and publish under the stored policy; explicit non-force never resumes sync.
     Continue(RepairContinueInput),
     /// Inspect persisted repair evidence without mutation.
     Status(RepairStatusInput),
