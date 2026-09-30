@@ -526,7 +526,12 @@ payload—still authorizes any `--webhook-sync` provider mutation.
 
 When sync returns a typed head or link conflict, do not create a nested
 worktree, update a local PR ref, or hand-push a guessed generation. Start an
-exact Cara-owned session instead:
+exact Cara-owned session instead. Explicit-target starts discover the candidate,
+target (even if inactive), current default and active topology—not every unrelated
+PR's full check rollup. Both exact subject reads must agree with active-member
+identity. The original total discovery budget is unchanged; a missing target is
+never silently replaced with main. A discovery refusal creates no new session,
+and a prior focused check or partial status is not a reusable start authorization.
 
 ```sh
 cara repair start --pr 1962                 # merge current default
