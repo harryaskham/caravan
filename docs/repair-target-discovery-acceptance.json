@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "bead": "bd-c6dadd",
+  "scope": "Explicit repair candidate + target discovery, with original total budget and existing publication/ownership policy",
+  "before": {
+    "job": "tj-1f1b3ec3",
+    "test": "explicit_target_public_start_fetches_inactive_target_without_unrelated_rollups",
+    "outcome": "compiled_then_behavioral_failure",
+    "observation": "Public repair start queried unrelated full GraphQL rollups before querying the explicit inactive target"
+  },
+  "after": [
+    {"job": "tj-5aacb22b", "suite": "focused_repair_discovery", "passed": 3},
+    {"job": "tj-1f40e4a8", "suite": "repair_target_discovery", "passed": 4}
+  ],
+  "cases": [
+    {"test": "focused_repair_discovery_fetches_inactive_or_active_target_and_keeps_topology", "proves": "Exact candidate and target queries, active topology/current default/lightweight lineage preserved, no unrelated full rollups"},
+    {"test": "focused_repair_discovery_rejects_orphan_target_before_any_provider_read", "proves": "A target cannot accidentally select unfocused full discovery"},
+    {"test": "focused_repair_discovery_refuses_changed_identity_but_not_check_progress", "proves": "Requested identity, source/base/repository/draft/state/control/incarnation drift refused; CI observation progress stays separate"},
+    {"test": "explicit_target_public_start_fetches_inactive_target_without_unrelated_rollups", "proves": "Actual CLI queries missing inactive target and refuses before session creation, never substitutes main"},
+    {"test": "explicit_target_public_start_materializes_exact_pair_and_preserves_caller", "proves": "Actual CLI and real isolated Git reach Resolving with exact candidate HEAD/target MERGE_HEAD, original actor/non-force/target identity and caller WIP preserved"},
+    {"test": "explicit_target_public_start_keeps_initialization_and_freshness_refusals", "proves": "Missing initialization labels or drifted target create no repair session"},
+    {"test": "explicit_target_public_start_does_not_reset_budget_after_discovery", "proves": "Controlled provider plus compatibility delays exhaust the original four-second fixture budget; no fresh candidate-check reserve or session"}
+  ],
+  "fixture_notes": [
+    "Every gh request is trapped by a protocol fixture; Git network reads are routed only to a private local bare repository; push is refused",
+    "Happy paths use the normal default command timeout; the separate budget-refusal case uses four seconds",
+    "An intermediate fixture-only missing Serialize conversion and too-short happy-path fixture window were corrected; neither changed production deadlines"
+  ],
+  "not_proved": ["Final hosted qualification", "Containing release", "Installed runtime", "Live PR4202 repair or publication"]
+}

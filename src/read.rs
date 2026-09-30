@@ -2041,6 +2041,34 @@ enum DiscoverySnapshotScope {
     ActiveOnly,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum DiscoveryFocus {
+    Candidate(PrNumber),
+    RepairPair {
+        candidate: PrNumber,
+        target: PrNumber,
+    },
+}
+
+impl DiscoveryFocus {
+    fn candidate(self) -> PrNumber {
+        match self {
+            Self::Candidate(candidate) | Self::RepairPair { candidate, .. } => candidate,
+        }
+    }
+
+    fn repair_target(self) -> Option<PrNumber> {
+        match self {
+            Self::Candidate(_) => None,
+            Self::RepairPair { target, .. } => Some(target),
+        }
+    }
+
+    fn reserves_candidate_budget(self) -> bool {
+        matches!(self, Self::Candidate(_))
+    }
+}
+
 impl DiscoverySnapshotScope {
     const fn includes_historical_pull_requests(self) -> bool {
         matches!(self, Self::FullLifecycle)
@@ -2115,7 +2143,7 @@ fn status_with_discovery_options(
     allow_unlabelled_historical_pr_creation: bool,
     require_current_pr_resolution: bool,
     expected_candidate_head: Option<&ExpectedCandidateHead>,
-    focus_pr: Option<PrNumber>,
+    focus: Option<DiscoveryFocus>,
     snapshot_scope: DiscoverySnapshotScope,
     bounded_compatibility: bool,
 ) -> Result<StatusOutput, AppError> {
@@ -2124,6 +2152,7 @@ fn status_with_discovery_options(
     let started = std::time::Instant::now();
     let operation_budget = operation_deadline.saturating_duration_since(started);
     let child_timeout = std::time::Duration::from_secs(context.config.command_timeout_secs);
+    let focus_pr = focus.map(DiscoveryFocus::candidate);
     let provider_runner = crate::command::ProcessRunner::in_directory(&context.repository_path)
         .with_timeout(child_timeout)
         .with_operation_deadline(operation_deadline);
@@ -2135,6 +2164,7 @@ fn status_with_discovery_options(
             allow_unlabelled_historical_pr_creation,
             require_current_pr_resolution,
             focus_pr,
+            repair_target_pr: focus.and_then(DiscoveryFocus::repair_target),
             include_historical_pull_requests: snapshot_scope.includes_historical_pull_requests(),
             repository: context.config.repository.clone(),
             ..crate::github::DiscoveryOptions::default()
@@ -2253,8 +2283,15 @@ fn status_with_discovery_options(
     // Give that proof one fresh child-command budget rather than whatever crumbs
     // remain from discovery in a large repository. This is scoped to explicit
     // `focus_pr`; fleet status and mutation capacity are unchanged.
-    let focused_compatibility_reserve = focus_pr.map(|_| child_timeout).unwrap_or_default();
-    let post_discovery_deadline = if focus_pr.is_some() {
+    // Repair pairs narrow the work, not the original total deadline. Existing
+    // remote-candidate checks keep their independently reserved proof budget.
+    let reserve_candidate_budget = focus.is_some_and(DiscoveryFocus::reserves_candidate_budget);
+    let focused_compatibility_reserve = if reserve_candidate_budget {
+        child_timeout
+    } else {
+        Duration::ZERO
+    };
+    let post_discovery_deadline = if reserve_candidate_budget {
         std::time::Instant::now()
             .checked_add(child_timeout)
             .unwrap_or(operation_deadline)
@@ -3203,7 +3240,7 @@ pub(crate) fn status_after_branch_rewrite_with_deadline(
         false,
         true,
         Some(&expected),
-        Some(number),
+        Some(DiscoveryFocus::Candidate(number)),
         DiscoverySnapshotScope::ActiveOnly,
         false,
     )?;
@@ -3268,6 +3305,27 @@ pub(crate) fn admission_membership(
     })
 }
 
+/// Discover one repair pair plus active topology under the original single
+/// discovery deadline. This does not borrow the candidate-check budget reserve.
+pub(crate) fn status_for_explicit_repair(
+    context: &AppContext,
+    candidate: PrNumber,
+    target: PrNumber,
+) -> Result<StatusOutput, AppError> {
+    let deadline = Instant::now() + Duration::from_secs(context.config.command_timeout_secs);
+    status_with_discovery_options(
+        context,
+        deadline,
+        None,
+        false,
+        false,
+        None,
+        Some(DiscoveryFocus::RepairPair { candidate, target }),
+        DiscoverySnapshotScope::ActiveOnly,
+        false,
+    )
+}
+
 /// Discover the fleet and bind one exact remote candidate without checkout mutation.
 pub(crate) fn status_for_remote_candidate(
     context: &AppContext,
@@ -3292,7 +3350,7 @@ pub(crate) fn status_for_remote_candidate_with_deadline(
         false,
         false,
         None,
-        Some(number),
+        Some(DiscoveryFocus::Candidate(number)),
         DiscoverySnapshotScope::ActiveOnly,
         false,
     )?;
@@ -4639,6 +4697,8 @@ fn discovery_error(error: &DiscoveryError) -> AppError {
         | DiscoveryError::HistoricalCurrentPullRequest { .. }
         | DiscoveryError::ForkOnlyHead { .. }
         | DiscoveryError::InvalidLimit(_)
+        | DiscoveryError::InvalidRepairFocus
+        | DiscoveryError::RepairFocusChanged { .. }
         | DiscoveryError::InvalidRepositorySlug(_)
         | DiscoveryError::MissingDefaultBranch
         | DiscoveryError::MissingHeadRepository { .. } => ErrorCategory::Validation,

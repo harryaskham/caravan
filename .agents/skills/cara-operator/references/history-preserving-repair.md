@@ -25,8 +25,15 @@ For MCP, use the distinct `repair_start_non_force` tool with `pr`, optional
 back to sending an unfamiliar flag to legacy `repair_start`, which old decoders
 may ignore. There is no force switch on the distinct tool.
 
-Omit `--target-pr` to merge the freshly observed default branch. Obtain session and
-workspace from the actual start receipt; the example variables are not a plan.
+Omit `--target-pr` to merge the freshly observed default branch. When specified,
+the target is fetched explicitly even if inactive; discovery keeps both exact
+subjects and active topology within the original single deadline. It does not
+scan unrelated full PR rollups, increase the deadline, or swap an unavailable
+target to main. A focused check or partial status does not supply a reusable
+repair-start lease. Older installed versions may still use full-fleet discovery
+for explicit targets; source publication alone does not establish runtime adoption.
+Obtain session and workspace from the actual start receipt; the example variables
+are not a plan.
 Resolve and stage only authorized conflicts in that workspace. A clean merge needs
 no edits. Do not commit, update refs, or push the managed workspace manually.
 Semantic grants and broader agent edits still need their existing explicit authority.

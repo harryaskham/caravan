@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use crate::command::{CommandOutput, CommandRunError, CommandRunner, CommandSpec, ProcessRunner};
 use crate::model::{
     self, BranchSnapshot, CheckState, CommitOid, MergeMethod, MutationKind, PrNumber,
-    PullRequestPrecondition, RepositoryId,
+    PullRequestPrecondition, PullRequestSnapshot, PullRequestState, RepositoryId,
 };
 
 const PR_JSON_FIELDS: &str = "number,title,body,state,isDraft,mergeStateStatus,headRefName,headRefOid,headRepository,headRepositoryOwner,isCrossRepository,baseRefName,baseRefOid,labels,autoMergeRequest,statusCheckRollup,createdAt,mergedAt,url,updatedAt";
@@ -67,6 +67,9 @@ pub struct DiscoveryOptions {
     /// Exact admission must not pay for full check-rollup discovery across an
     /// unrelated open-PR fleet (bd-b915a6).
     pub focus_pr: Option<PrNumber>,
+    /// Explicit repair target, fetched even when unlabelled. Requires focus_pr;
+    /// the two exact reads must agree with any active-member observations.
+    pub repair_target_pr: Option<PrNumber>,
     /// Include merged/closed lifecycle snapshots in the returned graph. Human
     /// status and cleanup reads need them; a mutating sync hot pass defers them
     /// so historical rows cannot starve known active work (bd-488224).
@@ -88,6 +91,7 @@ impl Default for DiscoveryOptions {
             // fleet-level read keeps the precise historical diagnostics.
             require_current_pr_resolution: true,
             focus_pr: None,
+            repair_target_pr: None,
             include_historical_pull_requests: true,
             repository: None,
         }
@@ -249,6 +253,10 @@ pub enum DiscoveryError {
     },
     /// A query limit was zero.
     InvalidLimit(&'static str),
+    /// A repair target cannot select an unbounded, unfocused discovery.
+    InvalidRepairFocus,
+    /// Exact repair read disagreed with the requested identity or active snapshot.
+    RepairFocusChanged { pr: u64 },
     /// The caller's open-PR cap was reached before the provider's final page.
     OpenPullRequestsTruncated { limit: usize },
     /// A nested GraphQL connection exceeded the bounded per-PR projection.
@@ -308,6 +316,14 @@ impl std::fmt::Display for DiscoveryError {
             Self::InvalidLimit(name) => {
                 write!(formatter, "discovery limit `{name}` must be positive")
             }
+            Self::InvalidRepairFocus => write!(
+                formatter,
+                "explicit repair target requires an exact candidate focus"
+            ),
+            Self::RepairFocusChanged { pr } => write!(
+                formatter,
+                "repair PR #{pr} is non-open or changed identity during focused discovery"
+            ),
             Self::OpenPullRequestsTruncated { limit } => write!(
                 formatter,
                 "open pull request discovery exceeded its complete {limit}-row bound"
@@ -1966,6 +1982,9 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
     /// Run a complete, internally consistent read-only discovery pass.
     #[allow(clippy::too_many_lines)]
     pub fn discover(&self) -> Result<model::RepositorySnapshot, DiscoveryError> {
+        if self.options.repair_target_pr.is_some() && self.options.focus_pr.is_none() {
+            return Err(DiscoveryError::InvalidRepairFocus);
+        }
         if self.options.open_limit == 0 {
             return Err(DiscoveryError::InvalidLimit("open_limit"));
         }
@@ -2009,7 +2028,14 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
             let exact: PullRequestJson =
                 self.json(pull_request_command(&repository, &focus_pr.0.to_string()))?;
             let exact = exact.into_snapshot(&repository)?;
-            if !active
+            if let Some(target) = self.options.repair_target_pr {
+                merge_repair_focus(&mut active, focus_pr, exact)?;
+                if target != focus_pr {
+                    let exact: PullRequestJson =
+                        self.json(pull_request_command(&repository, &target.0.to_string()))?;
+                    merge_repair_focus(&mut active, target, exact.into_snapshot(&repository)?)?;
+                }
+            } else if !active
                 .iter()
                 .any(|pull_request| pull_request.number == focus_pr)
             {
@@ -3124,6 +3150,35 @@ fn open_pr_page_command(
     command.args(["--jq".to_owned(), OPEN_PR_PAGE_JQ.to_owned()])
 }
 
+/// Keep active graph identity coherent while refreshing the explicit repair
+/// pair. CI progress may advance; source/base/control/incarnation may not.
+fn merge_repair_focus(
+    active: &mut Vec<PullRequestSnapshot>,
+    number: PrNumber,
+    exact: PullRequestSnapshot,
+) -> Result<(), DiscoveryError> {
+    if exact.number != number || exact.state != PullRequestState::Open {
+        return Err(DiscoveryError::RepairFocusChanged { pr: number.0 });
+    }
+    if let Some(previous) = active.iter_mut().find(|pull| pull.number == number) {
+        if previous.head != exact.head
+            || previous.base != exact.base
+            || previous.draft != exact.draft
+            || previous.cross_repository != exact.cross_repository
+            || previous.created_at != exact.created_at
+            || previous.updated_at != exact.updated_at
+            || !PullRequestPrecondition::from(&*previous)
+                .mutation_identity_eq(&PullRequestPrecondition::from(&exact))
+        {
+            return Err(DiscoveryError::RepairFocusChanged { pr: number.0 });
+        }
+        *previous = exact;
+    } else {
+        active.push(exact);
+    }
+    Ok(())
+}
+
 fn pull_request_command(repository: &RepositoryId, selector: &str) -> CommandSpec {
     if let Ok(number) = selector.parse::<u64>() {
         // gh pr view's fixed rollup projection omits the App/commit identity.
@@ -3735,6 +3790,7 @@ mod tests {
     use crate::model::AutoMergeState;
 
     mod ci_dispatch;
+    mod repair_discovery;
 
     struct FakeRunner {
         calls: RefCell<VecDeque<(CommandSpec, CommandOutput)>>,
