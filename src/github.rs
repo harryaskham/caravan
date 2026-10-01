@@ -3762,6 +3762,7 @@ fn normalize_check_state(provider_state: Option<&str>) -> CheckState {
     }
 }
 
+mod pr_close;
 mod raw;
 mod required_policy;
 mod stack;

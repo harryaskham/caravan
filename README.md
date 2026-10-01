@@ -362,6 +362,17 @@ large syncs retain schema-versioned counts, deterministic hashes, and bounded
 first/last samples instead of copying full plan/receipt/event histories into the
 lock; GitHub rediscovery remains recovery authority.
 
+### Exact non-member close
+
+`cara pr-close apply` (MCP `pr_close_apply`) closes one explicitly confirmed,
+already-represented non-member under the configured writer fence. It requires
+exact source/base/main identities and persists intent before a single provider
+close. Same-key retries reconcile rather than send another close. It never
+implicitly evicts, changes labels or refs, merges, or publishes a replacement.
+`cara pr-close status --operation-key KEY` reads the retained local receipt.
+See [the complete input, proof and retry contract](docs/exact-nonmember-close.md),
+including the limits of local locks and GitHub's lack of head-conditional close.
+
 ## Built-in web dashboard
 
 `cara web` serves the primary visual operations surface directly from the Cara

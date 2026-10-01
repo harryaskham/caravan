@@ -106,6 +106,9 @@ enum Command {
     /// Set or clear audited automatic-admission priority metadata.
     #[command(subcommand)]
     Priority(PriorityCommand),
+    /// Close an exact already-represented non-member or inspect its retained receipt.
+    #[command(subcommand)]
+    PrClose(PrCloseCommand),
     /// Show the current branch's whole caravan and position.
     Show,
     /// Check out the next PR toward the current caravan tail.
@@ -200,6 +203,14 @@ enum LogSubcommand {
 enum ConfigCommand {
     /// Strictly parse config and verify its declared Cara reader floor.
     Check,
+}
+
+#[derive(Debug, Subcommand)]
+enum PrCloseCommand {
+    /// Perform one confirmed close; same-key retries only reconcile after intent.
+    Apply(Box<caravan::pr_close::PrCloseInput>),
+    /// Read historical receipt state without provider access or mutation.
+    Status(caravan::pr_close::PrCloseStatusInput),
 }
 
 #[derive(Debug, Subcommand)]
@@ -490,6 +501,7 @@ fn run(cli: &Cli) -> Result<(), i32> {
             run_membership(cli, |context| caravan::membership::rejoin(context, input))
         }
         Command::Priority(command) => run_priority(cli, command),
+        Command::PrClose(command) => run_pr_close(cli, command),
         Command::Show => run_show(cli),
         Command::Next => run_navigation(
             cli,
@@ -1895,6 +1907,54 @@ fn run_reviewed_force_intent(cli: &Cli, command: &ReviewedForceIntentCommand) ->
             Ok(())
         }
         Err(error) => emit_human_error(error),
+    }
+}
+
+fn run_pr_close(cli: &Cli, command: &PrCloseCommand) -> Result<(), i32> {
+    match command {
+        PrCloseCommand::Apply(input) => {
+            let context = load_context(cli)?;
+            let result = caravan::pr_close::apply(&context, input);
+            if cli.json {
+                return emit_result(true, result);
+            }
+            match result {
+                Ok(output) => {
+                    println!(
+                        "close #{}: {:?} — {}",
+                        input.pr, output.outcome, output.next
+                    );
+                    Ok(())
+                }
+                Err(error) => emit_human_error(error),
+            }
+        }
+        PrCloseCommand::Status(input) => {
+            let loaded = match cli.repo.as_deref() {
+                Some(directory) => AppContext::load_for_receipt_read_from_directory(
+                    directory,
+                    cli.config.as_deref(),
+                ),
+                None => AppContext::load_for_receipt_read(cli.config.as_deref()),
+            };
+            let context = emit_context_error(cli, loaded)?;
+            let result = caravan::pr_close::status(&context, input);
+            if cli.json {
+                return emit_result(true, result);
+            }
+            match result {
+                Ok(record) => {
+                    println!(
+                        "close {}: intent={} result={:?}",
+                        input.operation_key,
+                        record.intent.is_some(),
+                        record.latest_result.map(|result| result.outcome)
+                    );
+                    Ok(())
+                }
+                Err(error) => emit_human_error(error),
+            }
+        }
     }
 }
 

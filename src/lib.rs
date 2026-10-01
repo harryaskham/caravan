@@ -34,6 +34,7 @@ pub mod next;
 pub mod operation_lock;
 pub mod pause;
 pub mod physical_rebase;
+pub mod pr_close;
 pub mod priority;
 pub mod read;
 pub mod recovery_ledger;
@@ -227,6 +228,21 @@ CORE MODEL AND INVARIANTS
   Different agents and declared stack parent/child slots are independent. Every
   membership path re-lists exact generation facts immediately before mutation;
   Cara reports safe owner close/reflect actions but never auto-closes a PR.
+- An explicit `pr-close apply` / `pr_close_apply` transaction may close one
+  already-represented non-member. Supply exact repository/PR/head/base/default
+  identities, main-contained representation commit and ancestor/same-tree proof,
+  non-secret actor/custody references, reason, stable operation key and confirmed
+  intent. Caco authenticates owner/assignment/generation; reference text is not
+  authority. The configured writer fence, complete native non-membership and
+  fresh source/main/policy checks remain mandatory. Active/parked/native members
+  refuse; this never implicitly evicts, merges or changes labels/refs. A private
+  Git-common-directory journal flushes intent before the sole close attempt.
+  Same-key retries after intent only reconcile. `pr-close status` /
+  `pr_close_status` reads retained local evidence without provider access.
+  Remote fencing does not replicate that journal, local locks do not fence other
+  clones, and GitHub close has no head-CAS guarantee. Refusal, read unavailability,
+  external completion and indeterminate effects remain distinct; never reopen or
+  resend a close to manufacture a receipt.
 
 FIRST USE AND EVERY SAFE TICK
 Cara resolves one exact Git worktree root before config or mutation, so nested
@@ -847,6 +863,25 @@ impl AppContext {
         path: Option<&Path>,
     ) -> Result<Self, ConfigError> {
         Self::load_from_directory_with_runtime_validation(invocation_directory, path, false)
+    }
+
+    /// Load local receipt policy without requiring a provider credential runtime.
+    pub fn load_for_receipt_read(path: Option<&Path>) -> Result<Self, ConfigError> {
+        let directory =
+            std::env::current_dir().map_err(|error| ConfigError::RepositoryNotFound {
+                path: PathBuf::from("."),
+                message: error.to_string(),
+            })?;
+        Self::load_for_receipt_read_from_directory(&directory, path)
+    }
+
+    /// Load policy for local receipt inspection only, without a provider runtime.
+    /// The local receipt handler performs no provider reads or mutations.
+    pub fn load_for_receipt_read_from_directory(
+        directory: &Path,
+        path: Option<&Path>,
+    ) -> Result<Self, ConfigError> {
+        Self::load_from_directory_with_runtime_validation(directory, path, false)
     }
 
     fn load_from_directory_with_runtime_validation(
@@ -1626,6 +1661,16 @@ pub fn build_router() -> ToolRouter<AppContext> {
         |context: &AppContext, input: priority::PriorityClearInput| {
             priority::clear(context, &input)
         },
+    );
+    router.add_typed_tool_with_output_schema(
+        "pr_close_apply",
+        "Close one confirmed exact already-represented non-member PR under the configured writer fence. Persist intent before the sole close attempt; same-key retries reconcile without replay. Caco owns caller/custody authorization. Never evicts, merges, changes labels/refs, or claims provider head-CAS.",
+        |context: &AppContext, input: pr_close::PrCloseInput| pr_close::apply(context, &input),
+    );
+    router.add_typed_tool_with_output_schema(
+        "pr_close_status",
+        "Read one retained non-member close receipt by operation key. Local historical evidence only, with no provider access or mutation.",
+        |context: &AppContext, input: pr_close::PrCloseStatusInput| pr_close::status(context, &input),
     );
     router.add_typed_tool_with_output_schema(
         "show",

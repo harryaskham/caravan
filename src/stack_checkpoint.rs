@@ -91,6 +91,67 @@ pub(crate) fn write<T: Serialize>(repository: &Path, key: &str, value: &T) -> Re
     })
 }
 
+/// Persist a close intent privately and flush it before a provider write can start.
+/// Reuses the bounded common-directory store without changing existing callers.
+pub(crate) fn write_private<T: Serialize>(
+    repository: &Path,
+    key: &str,
+    value: &T,
+) -> Result<(), AppError> {
+    use std::io::Write;
+
+    let path = checkpoint_path(repository, key)?;
+    let bytes = serde_json::to_vec_pretty(value).map_err(|error| {
+        storage_error(
+            "transaction_checkpoint_encode_failed",
+            &error.to_string(),
+            &path,
+        )
+    })?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_CHECKPOINT_BYTES {
+        return Err(storage_error(
+            "transaction_checkpoint_too_large",
+            "transaction exceeds the 1 MiB bound",
+            &path,
+        ));
+    }
+    let parent = path.parent().expect("checkpoint parent");
+    fs::create_dir_all(parent).map_err(|error| {
+        storage_error(
+            "transaction_checkpoint_write_failed",
+            &error.to_string(),
+            &path,
+        )
+    })?;
+    let temporary = path.with_extension(format!("json.tmp-{}", uuid::Uuid::now_v7()));
+    let result = (|| -> std::io::Result<()> {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, &path)?;
+        #[cfg(unix)]
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temporary);
+        return Err(storage_error(
+            "transaction_checkpoint_write_failed",
+            &error.to_string(),
+            &path,
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn remove(repository: &Path, key: &str) -> Result<(), AppError> {
     let path = checkpoint_path(repository, key)?;
     match fs::remove_file(&path) {

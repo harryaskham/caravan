@@ -556,6 +556,32 @@ heuristic, and ignores a declaration written for a different head. This replaces
 the previous recovery path, where a dead-ended diverged stream could only be
 resolved by publishing a hand-crafted containment merge.
 
+### Exact already-represented non-member close
+
+`pr-close apply` / `pr_close_apply` is one explicit, fenced provider-close
+transaction, not an eviction or merge. It binds the full repository/PR/head/base/
+default identities, a main-contained representation commit, an ancestry or
+complete-tree proof, caller audit/custody references, policy fingerprint and
+operation key. Cacophony authenticates owner, assignment, generation and intent;
+reference strings are not grants. Active/parked/control ownership, native
+membership or unavailable native inventory, draft/fork/auto-merge state,
+insufficient permission and identity/policy drift prevent the close.
+
+The production writer guard serializes preflight and the marked provider write.
+Intent is privately persisted and flushed before the sole close attempt. After
+intent, same-key calls re-observe provider state without sending another close;
+changed request or policy identity refuses. Outcomes distinguish confirmed,
+reconciled and external terminal states, pre-write refusal/unavailability, and
+post-intent indeterminacy. No automatic reopen, label/ref edit, source rewrite,
+queue convergence, replacement PR or release action occurs. `pr-close status` /
+`pr_close_status` reads retained historical state without provider access.
+
+The Git-common-directory journal is not replicated by a remote lease. A local
+lock does not fence another clone, and GitHub close is not a head-CAS operation.
+The API reports those limits, preserves pre-write fence fingerprints and actual
+readback, and never presents two observations as provider atomicity. Full wire,
+retry and deployment requirements are in [the close contract](docs/exact-nonmember-close.md).
+
 Every check receipt and every membership receipt carries a typed
 `admission_intent` decision recording selection, intent, resolved target caravan
 and tail, the canonical candidate at decision time, each ordered row ahead with
