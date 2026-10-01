@@ -124,8 +124,8 @@ fn focused_repair_discovery_refuses_changed_identity_but_not_check_progress() {
             DiscoveryError::RepairFocusChanged { pr: 3 }
         );
         assert_eq!(
-            active,
-            [original.clone()],
+            active.as_slice(),
+            std::slice::from_ref(&original),
             "case {case} must preserve snapshot on refusal"
         );
     }
