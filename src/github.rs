@@ -67,7 +67,7 @@ pub struct DiscoveryOptions {
     /// Exact admission must not pay for full check-rollup discovery across an
     /// unrelated open-PR fleet (bd-b915a6).
     pub focus_pr: Option<PrNumber>,
-    /// Explicit repair target, fetched even when unlabelled. Requires focus_pr;
+    /// Explicit repair target, fetched even when unlabelled. Requires `focus_pr`;
     /// the two exact reads must agree with any active-member observations.
     pub repair_target_pr: Option<PrNumber>,
     /// Include merged/closed lifecycle snapshots in the returned graph. Human
