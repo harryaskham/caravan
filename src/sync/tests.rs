@@ -1630,10 +1630,22 @@ fn queue_owned_base_change_dispatches_ci_for_exact_tuple_once() {
         summary: "promoted root".to_owned(),
     });
 
-    dispatch_exact_ci_after_queue_mutations(directory.path(), &provider, &mut progress, &status)
-        .unwrap();
-    dispatch_exact_ci_after_queue_mutations(directory.path(), &provider, &mut progress, &status)
-        .unwrap();
+    dispatch_exact_ci_after_queue_mutations(
+        directory.path(),
+        &provider,
+        &mut progress,
+        &status,
+        "post_convergence_ci_dispatch",
+    )
+    .unwrap();
+    dispatch_exact_ci_after_queue_mutations(
+        directory.path(),
+        &provider,
+        &mut progress,
+        &status,
+        "post_convergence_ci_dispatch",
+    )
+    .unwrap();
 
     assert_eq!(progress.ci_generation_dispatches.len(), 1);
     let dispatch = &progress.ci_generation_dispatches[0];

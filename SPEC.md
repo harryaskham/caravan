@@ -1105,6 +1105,15 @@ and workflow. Truncated, duplicated, unknown, wrong-App or stale evidence refuse
 before any CI write. A historical report may identify the workflow, but cannot
 supply the current execution's base binding.
 
+Selection refusal preserves the original category, code and message inside a
+caller-generation envelope: exact PR/head/base, `ci_execution_selection` stage,
+`post_convergence_ci_dispatch` or `post_admission_ci_dispatch` phase, triggering
+mutation kinds and already-completed operation/provider/CI-dispatch receipts.
+The original selection details remain nested as `source`. `selection_mutated:
+false` describes only this selector; it is never a claim of zero earlier queue
+effects. Membership replay remains forbidden. This is diagnostic evidence, not
+new selection, admission, retry or cleanup authority.
+
 Existing active executions, or completed executions with no failed applicable
 context, are reused without a provider write. Optional workflow failure does not
 authorize a restart. A legitimate completed restart rechecks App/workflow/run/

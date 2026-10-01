@@ -31,6 +31,7 @@ fn ci_dispatch_membership_and_active_actions_are_preserved_without_an_extra_star
             &provider,
             &mut progress,
             &status,
+            "post_convergence_ci_dispatch",
         )
         .unwrap();
         assert!(provider.calls.borrow().is_empty());
@@ -87,6 +88,7 @@ fn ci_dispatch_respects_drafts_parking_and_inactive_membership() {
             &provider,
             &mut progress,
             &status,
+            "post_convergence_ci_dispatch",
         )
         .unwrap();
         assert!(provider.calls.borrow().is_empty(), "{case}");
@@ -118,9 +120,14 @@ fn ci_dispatch_lost_response_retains_membership_receipt_and_restart_does_not_rep
     let directory = test_repository();
     let mut first = SyncProgress::new(&status, vec![pull.number], 10);
     first.record(membership.clone(), "membership accepted");
-    let error =
-        dispatch_exact_ci_after_queue_mutations(directory.path(), &provider, &mut first, &status)
-            .unwrap_err();
+    let error = dispatch_exact_ci_after_queue_mutations(
+        directory.path(),
+        &provider,
+        &mut first,
+        &status,
+        "post_admission_ci_dispatch",
+    )
+    .unwrap_err();
     assert_eq!(error.code(), "fake_ci_response_loss");
     assert!(
         error
@@ -140,6 +147,7 @@ fn ci_dispatch_lost_response_retains_membership_receipt_and_restart_does_not_rep
         &provider,
         &mut restarted,
         &status,
+        "post_admission_ci_dispatch",
     )
     .unwrap_err();
     assert_eq!(error.code(), "ci_dispatch_indeterminate");
@@ -159,14 +167,21 @@ fn ci_dispatch_lost_response_retains_membership_receipt_and_restart_does_not_rep
             directory.path(),
             &provider,
             &mut restarted,
-            &status
+            &status,
+            "post_admission_ci_dispatch",
         )
         .unwrap_err()
         .code(),
         "ci_dispatch_indeterminate"
     );
-    dispatch_exact_ci_after_queue_mutations(directory.path(), &provider, &mut restarted, &status)
-        .unwrap();
+    dispatch_exact_ci_after_queue_mutations(
+        directory.path(),
+        &provider,
+        &mut restarted,
+        &status,
+        "post_admission_ci_dispatch",
+    )
+    .unwrap();
     assert_eq!(
         restarted.ci_generation_dispatches[0].disposition,
         DispatchDisposition::SuccessorObserved
@@ -181,4 +196,102 @@ fn ci_dispatch_lost_response_retains_membership_receipt_and_restart_does_not_rep
         "no Cursor suite request or suite fallback"
     );
     assert!(provider.pulls.borrow()[&pull.number].is_active_caravan_member());
+}
+
+#[test]
+fn ci_selection_failure_retains_exact_caller_phase_and_completed_effects() {
+    for phase in ["post_convergence_ci_dispatch", "post_admission_ci_dispatch"] {
+        for case in ["absent", "wrong_app", "stale_head", "aggregate"] {
+            let mut pull = caravan_member(257, "disposable", "main");
+            let (policy, lineage) = evidence(&mut pull, 1, "completed", "failure");
+            match case {
+                "absent" => pull.checks.clear(),
+                "wrong_app" => pull.checks[0].app_id = Some(88),
+                "stale_head" => pull.checks[0].head_oid = Some(CommitOid("stale".into())),
+                "aggregate" => pull.checks[0].provider_kind = Some("WorkflowRunLineage".into()),
+                _ => unreachable!(),
+            }
+            let status = caravan_status(vec![pull.clone()], Some(pull.number), true);
+            let expected_source = crate::ci_dispatch::select(&pull, &policy, None, &lineage)
+                .unwrap_err()
+                .details()
+                .unwrap();
+            let provider = FakeProvider::with_pull_requests(vec![pull.clone()]);
+            provider
+                .required_contexts
+                .borrow_mut()
+                .insert("main".into(), policy);
+            provider.serve_lineage(pull.number, lineage);
+            let mut progress = SyncProgress::new(&status, vec![pull.number], 10);
+            let mut unjoined = pull.clone();
+            unjoined.labels.remove("caravan");
+            progress.record(
+                GitHubMutationReceipt {
+                    kind: MutationKind::AddLabel,
+                    before: Some(unjoined),
+                    after: pull.clone(),
+                    provider_output: None,
+                },
+                "already completed membership",
+            );
+            let mut old_base = pull.clone();
+            old_base.base.name = "previous".into();
+            progress.record(
+                GitHubMutationReceipt {
+                    kind: MutationKind::SetBase,
+                    before: Some(old_base),
+                    after: pull.clone(),
+                    provider_output: None,
+                },
+                "already completed retarget",
+            );
+            let expected_operation = serde_json::to_value(progress.operation_receipt()).unwrap();
+            let expected_receipts = serde_json::to_value(&progress.provider_receipts).unwrap();
+            let directory = test_repository();
+            let error = dispatch_exact_ci_after_queue_mutations(
+                directory.path(),
+                &provider,
+                &mut progress,
+                &status,
+                phase,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.code(),
+                "post_mutation_ci_dispatch_unavailable",
+                "{case}"
+            );
+            assert_eq!(error.category(), ErrorCategory::ExecutionFailure);
+            assert_eq!(
+                error.message(),
+                "applicable context has no current reporting identity"
+            );
+            let details = error.details().unwrap();
+            assert_eq!(details["pr"], pull.number.0);
+            assert_eq!(details["head_oid"], pull.head.oid.0);
+            assert_eq!(details["base_oid"], pull.base.oid.0);
+            assert_eq!(details["phase"], phase);
+            assert_eq!(details["stage"], "ci_execution_selection");
+            assert_eq!(details["operation_receipt"], expected_operation);
+            assert_eq!(details["provider_receipts"], expected_receipts);
+            assert_eq!(details["operation_receipt"]["changed"], true);
+            assert_eq!(details["selection_mutated"], false);
+            assert_eq!(details["membership_replay_allowed"], false);
+            assert_eq!(details["source"], expected_source);
+            assert_eq!(details["source"]["mutated"], false);
+            assert!(
+                details.get("mutated").is_none(),
+                "inner no-selection-write is not a global no-effects claim"
+            );
+            assert!(provider.calls.borrow().is_empty());
+            assert!(provider.workflow_reruns.borrow().is_empty());
+            assert!(provider.rerequests.borrow().is_empty());
+            assert!(progress.ci_generation_dispatches.is_empty());
+            assert_eq!(
+                serde_json::to_value(progress.operation_receipt()).unwrap(),
+                expected_operation
+            );
+            assert_eq!(provider.pulls.borrow()[&pull.number], pull);
+        }
+    }
 }

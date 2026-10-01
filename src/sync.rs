@@ -5607,6 +5607,7 @@ fn sync_with_lock(
         &provider,
         &mut progress,
         &final_status,
+        "post_convergence_ci_dispatch",
     )?;
     if let Some(problem) =
         first_blocking_completion_problem(&final_status, &progress, context.config.force_merge)
@@ -5688,6 +5689,7 @@ fn sync_with_lock(
                 &provider,
                 &mut progress,
                 &final_status,
+                "post_admission_ci_dispatch",
             )?;
             if let Some(problem) = first_blocking_completion_problem(
                 &final_status,
@@ -6982,6 +6984,7 @@ fn dispatch_exact_ci_after_queue_mutations(
     provider: &impl SyncProvider,
     progress: &mut SyncProgress,
     status: &StatusOutput,
+    phase: &str,
 ) -> Result<(), AppError> {
     let mut triggers = BTreeMap::<PrNumber, Vec<MutationKind>>::new();
     for step in &progress.steps {
@@ -7038,6 +7041,7 @@ fn dispatch_exact_ci_after_queue_mutations(
             status,
             current,
             &mutation_kinds,
+            phase,
         )?;
     }
     Ok(())
@@ -7050,6 +7054,7 @@ fn dispatch_ci_for_member(
     status: &StatusOutput,
     current: &PullRequestSnapshot,
     mutation_kinds: &[MutationKind],
+    phase: &str,
 ) -> Result<(), AppError> {
     let pr = current.number;
     let caravan_members = status
@@ -7075,7 +7080,29 @@ fn dispatch_ci_for_member(
         .admission_gate
         .as_ref()
         .map(|gate| gate.context.as_str());
-    for execution in crate::ci_dispatch::select(current, &policy, gate, &lineage)? {
+    let selected =
+        crate::ci_dispatch::select(current, &policy, gate, &lineage).map_err(|error| {
+            AppError::structured(
+                error.category(),
+                error.code(),
+                error.message(),
+                Some(json!({
+                    "source": error.details(),
+                    "phase": phase,
+                    "stage": "ci_execution_selection",
+                    "pr": pr,
+                    "head_oid": current.head.oid,
+                    "base_oid": current.base.oid,
+                    "mutation_kinds": mutation_kinds,
+                    "operation_receipt": progress.operation_receipt(),
+                    "provider_receipts": progress.provider_receipts,
+                    "ci_generation_dispatches": progress.ci_generation_dispatches,
+                    "selection_mutated": false,
+                    "membership_replay_allowed": false,
+                })),
+            )
+        })?;
+    for execution in selected {
         if progress.ci_generation_dispatches.iter().any(|dispatch| {
             dispatch.pr == pr
                 && dispatch.caravan_members == caravan_members
