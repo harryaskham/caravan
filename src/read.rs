@@ -3616,8 +3616,7 @@ fn check_analysis_with_recommendation(
                 format!("PR #{current_pr} was not included in discovery"),
             )
         })?;
-    let canonical_candidate = status.admission.next_candidate == Some(current_pr)
-        || (input.pr.is_some() && pull_request.draft && status.admission.next_candidate.is_none());
+    let canonical_candidate = status.admission.next_candidate == Some(current_pr);
     let admission_rejection = status
         .admission
         .rejected
@@ -7105,6 +7104,80 @@ mod tests {
         .expect("rejection remains an inspectable receipt");
         assert!(!output.eligible);
         assert_ne!(output.next_action, CandidateNextAction::New);
+    }
+
+    #[test]
+    fn sole_draft_is_not_a_canonical_admission_candidate() {
+        let mut draft = pr(9, "draft", "main", false);
+        draft.draft = true;
+        let status = status(draft, Vec::new());
+        assert!(status.admission.next_candidate.is_none());
+        let before = status.admission.clone();
+        let input = CheckInput {
+            pr: Some(9),
+            ..CheckInput::default()
+        };
+
+        for output in [
+            check_analysis(&status, &input, &clean_checker).unwrap(),
+            check_requested_action_analysis(&status, &input, &clean_checker).unwrap(),
+        ] {
+            assert!(output.candidate.draft);
+            assert!(!output.eligible);
+            assert!(!output.enrolled);
+            assert!(!output.canonical_candidate);
+            assert_ne!(output.next_action, CandidateNextAction::New);
+            assert!(
+                output
+                    .problems
+                    .iter()
+                    .any(|problem| { problem.message.contains("draft") })
+            );
+            let intent = output.admission_intent.as_ref().unwrap();
+            assert!(!intent.order_permits_admission());
+            assert!(!intent.provider_mutated);
+            let json = serde_json::to_value(&output).unwrap();
+            assert_eq!(json["canonical_candidate"], false);
+            assert_eq!(json["eligible"], false);
+        }
+        assert_eq!(status.admission, before);
+    }
+
+    #[test]
+    fn sole_eligible_candidate_keeps_canonical_projection() {
+        let status = status(pr(9, "candidate", "main", false), Vec::new());
+        assert_eq!(status.admission.next_candidate, Some(PrNumber(9)));
+        let output = check_analysis(
+            &status,
+            &CheckInput {
+                pr: Some(9),
+                ..CheckInput::default()
+            },
+            &clean_checker,
+        )
+        .unwrap();
+        assert!(output.eligible);
+        assert!(output.canonical_candidate);
+        assert_eq!(output.next_action, CandidateNextAction::New);
+    }
+
+    #[test]
+    fn active_member_is_not_a_new_canonical_candidate() {
+        let status = status(pr(9, "active", "main", true), Vec::new());
+        assert!(status.admission.next_candidate.is_none());
+        let output = check_analysis(
+            &status,
+            &CheckInput {
+                pr: Some(9),
+                ..CheckInput::default()
+            },
+            &clean_checker,
+        )
+        .unwrap();
+        assert!(output.enrolled);
+        assert!(!output.canonical_candidate);
+        assert_eq!(output.mode, CheckMode::ActiveCaravan);
+        assert_eq!(output.next_action, CandidateNextAction::Wait);
     }
 
     #[test]
