@@ -3863,6 +3863,7 @@ fn check_analysis_with_recommendation(
                     ActionEligibility::Ineligible
                 },
                 target: ActionTarget::New,
+                wait_for_draft_readiness: remote && status.admission.next_candidate.is_none(),
                 order: if order_admits {
                     ActionOrder::Canonical
                 } else {
@@ -3993,6 +3994,7 @@ fn check_analysis_with_recommendation(
                 ActionEligibility::Ineligible
             },
             target: ActionTarget::Join,
+            wait_for_draft_readiness: remote && status.admission.next_candidate.is_none(),
             order: if order_admits {
                 ActionOrder::Canonical
             } else {
@@ -4540,6 +4542,9 @@ enum CandidateFreshness {
 struct CandidateActionContext {
     eligibility: ActionEligibility,
     target: ActionTarget,
+    // Preserve the sole explicit draft's readiness receipt without pretending
+    // it is canonical or allowing it into the filtered admission order.
+    wait_for_draft_readiness: bool,
     order: ActionOrder,
     admission: AdmissionDecision,
     freshness: CandidateFreshness,
@@ -4550,6 +4555,9 @@ fn candidate_action(
     reports: &[CompatibilityReport],
     context: &CandidateActionContext,
 ) -> CandidateNextAction {
+    if candidate.draft && context.wait_for_draft_readiness {
+        return CandidateNextAction::Wait;
+    }
     if context.order == ActionOrder::NonCanonical {
         return CandidateNextAction::Reject;
     }
@@ -7103,7 +7111,8 @@ mod tests {
         )
         .expect("rejection remains an inspectable receipt");
         assert!(!output.eligible);
-        assert_ne!(output.next_action, CandidateNextAction::New);
+        assert!(!output.canonical_candidate);
+        assert_eq!(output.next_action, CandidateNextAction::Reject);
     }
 
     #[test]
@@ -7126,7 +7135,7 @@ mod tests {
             assert!(!output.eligible);
             assert!(!output.enrolled);
             assert!(!output.canonical_candidate);
-            assert_ne!(output.next_action, CandidateNextAction::New);
+            assert_eq!(output.next_action, CandidateNextAction::Wait);
             assert!(
                 output
                     .problems
@@ -8075,6 +8084,7 @@ mod tests {
         )
         .expect("remote draft rejection is an inspectable receipt");
         assert!(!output.eligible);
+        assert!(!output.canonical_candidate);
         assert_eq!(output.next_action, CandidateNextAction::Wait);
         assert_eq!(output.candidate.number, PrNumber(9));
     }
