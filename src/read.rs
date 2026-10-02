@@ -93,12 +93,64 @@ fn rebase_on_join_status(context: &AppContext) -> RebaseOnJoinStatus {
             "disabled"
         }
         .to_owned(),
-        required_action: (!context.config.rebase_on_join).then(|| {
-            format!(
-                "set `rebase_on_join: true` in {config_path}, commit it, then run `cara check` and `cara sync --all`"
-            )
-        }),
+        required_action: (!context.config.rebase_on_join
+            && context.config.stack_type == crate::config::StackType::Caravan)
+            .then(|| {
+                format!(
+                    "set `rebase_on_join: true` in {config_path}, commit it, then run `cara check` and `cara sync --all`"
+                )
+            }),
         config_path,
+    }
+}
+
+#[cfg(test)]
+mod rebase_on_join_status_tests {
+    use super::rebase_on_join_status;
+    use crate::AppContext;
+    use crate::config::{CaravanConfig, StackType};
+
+    fn context(stack_type: StackType, enabled: bool) -> AppContext {
+        AppContext {
+            repository_path: ".".into(),
+            config_path: "reviewed/config.yaml".into(),
+            config_existed: true,
+            config: CaravanConfig {
+                stack_type,
+                rebase_on_join: enabled,
+                ..CaravanConfig::default()
+            },
+        }
+    }
+
+    #[test]
+    fn native_stack_status_never_recommends_forbidden_join_rebasing() {
+        let status = rebase_on_join_status(&context(StackType::Github, false));
+        assert!(!status.enabled);
+        assert_eq!(status.state, "disabled");
+        assert_eq!(status.config_path, "reviewed/config.yaml");
+        assert!(status.required_action.is_none());
+        let json = serde_json::to_value(status).unwrap();
+        assert!(json.get("required_action").is_none());
+    }
+
+    #[test]
+    fn virtual_disabled_status_retains_explicit_opt_in_advice() {
+        let status = rebase_on_join_status(&context(StackType::Caravan, false));
+        assert_eq!(
+            status.required_action.as_deref(),
+            Some(
+                "set `rebase_on_join: true` in reviewed/config.yaml, commit it, then run `cara check` and `cara sync --all`"
+            )
+        );
+    }
+
+    #[test]
+    fn enabled_virtual_status_does_not_request_another_opt_in() {
+        let status = rebase_on_join_status(&context(StackType::Caravan, true));
+        assert!(status.enabled);
+        assert_eq!(status.state, "enabled");
+        assert!(status.required_action.is_none());
     }
 }
 
