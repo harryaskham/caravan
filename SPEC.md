@@ -1724,9 +1724,8 @@ queue-only route is available, return its precise refusal and bounded custody or
 capability decision to the existing actor; never invent another merge writer.
 
 `native-stack recovery-preview` seals
-current repository, ordered membership, immutable head/base generations,
-CLEAN-or-policy-BLOCKED current checks (Success, Neutral, and Skipped are
-non-failing), rollout configuration, complete provider inventory,
+current repository, ordered accepted membership, immutable head/base generations,
+observed check evidence, rollout configuration, complete provider inventory,
 and any continuation into a plan hash for the remaining explicitly reviewed
 recovery shapes. `recovery-apply` requires that hash, independently
 rediscovers the same evidence, and accepts only the mapping shape authorized by
@@ -1734,9 +1733,23 @@ the action: zero for legacy create, the exact checkpointed provider prefix for
 append, or one exact desired mapping on an idempotent lost-response retry. It
 then calls the corresponding exact Stack create/add adapter.
 
+Projection is not source qualification or landing. An admission check may leave
+an already-accepted member `UNSTABLE`; failed admission/source checks and skipped
+source jobs remain unqualified evidence, never passing checks or a merge grant.
+Known CLEAN, policy-BLOCKED or CI-UNSTABLE rollups can represent membership;
+DIRTY, UNKNOWN and other unproven structural states still refuse. Actual native
+landing independently requires its unchanged exact required-context/App/head/base
+and topology proof. No rollout, physical rebuilding, apply reserve, capacity or
+writer authority is enabled or enlarged by projection recovery.
+
 A recovery-only `RecoveryAdd` action may reconstruct a contiguous accepted
-logical suffix on one existing partial Stack while retaining closed rows in
-place. Preview binds the complete raw Stack identity/order, independently
+logical suffix on one existing all-open or retained-history partial Stack.
+This includes native two/logical eight without repeating ordinary joins.
+A valid original pending action may cover an unchanged prefix of the current
+accepted group; its source/control identity and original Stack lease remain
+exact, its evidence hash remains linked, and later ordinary effects are preserved.
+The original continuation is cleared only after full representation and independent
+postconditions succeed. Preview binds the complete raw Stack identity/order, independently
 refetches every row's PR state/head/base, and rereads the raw Stack to reject
 observation races. The open rows must equal the exact logical prefix; closed
 history is never membership authority. Only missing-discovery diagnostics for
@@ -1747,12 +1760,23 @@ Apply persists the original sealed plan before any write, checks the complete
 raw generation twice, and appends only the accepted suffix. Exact readback
 recovers a lost response; an already-satisfied replay writes nothing and retains
 the original plan hash. Retained history and all source generations must remain
-unchanged. Ordinary append validation still requires a merged historical prefix;
-this exception is confined to explicit reviewed recovery.
+unchanged. Check-only progress cannot replace an already-recorded reviewed
+intent after response loss; exact already-converged provider truth may retain its
+original checkpoint link after successful local clearance. Source/control/config
+changes still refuse the original hash. Ordinary append validation still requires
+a merged historical prefix; broader suffix completion is confined to the existing
+reviewed or scheduler-owned projection recovery transaction.
+
+An incompletely represented caravan cannot acquire another ordinary tail before
+projection is exact. This is a per-target pre-write fence, not a global green hold.
+Automatic target enumeration excludes topology quarantine and preserves dependent
+candidate intent instead of silently retargeting it; unrelated work retains normal
+policy and configured capacity. Quarantine diagnostics are not native landing or
+convergence receipts, and no current-call zero-effect flag erases prior effects.
 
 Truncated inventory,
-singleton input, pauses/parking, non-green
-or changed generations, missing capability/opt-in, and multiple/partial/drifted
+singleton input, pauses/parking, conflicting or changed generations,
+missing capability/opt-in, and multiple/non-prefix/drifted
 mappings refuse before mutation. Its postcondition rereads every source PR and
 proves no head, base, state, label, or auto-merge identity changed. A stale
 zero-write continuation is removable only through `native-stack recovery-clear`

@@ -24,8 +24,8 @@ use crate::github::{
     GitHubStackMutationError, GitHubStackMutationReceipt, GitHubStackTopology, MutationError,
 };
 use crate::model::{
-    BranchSnapshot, Caravan, CheckSnapshot, CheckState, PrNumber, PullRequestPrecondition,
-    PullRequestSnapshot, PullRequestState, RepositoryId,
+    BranchSnapshot, Caravan, CheckSnapshot, PrNumber, PullRequestPrecondition, PullRequestSnapshot,
+    PullRequestState, RepositoryId,
 };
 use crate::pause::PauseStatus;
 use crate::read::{
@@ -131,7 +131,8 @@ pub struct NativeStackRecoveryMember {
     pub draft: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_state_status: Option<String>,
-    /// Current, identity-deduplicated checks; all are successful.
+    /// Current checks retained as qualification evidence, never a projection grant.
+    /// Skipped source jobs remain unevaluated; failing checks still block landing.
     pub authoritative_checks: Vec<CheckSnapshot>,
     /// Older check generations retained only as bounded audit evidence.
     #[serde(default)]
@@ -627,7 +628,7 @@ pub fn apply(
     });
     let mut facts = RecoveryFacts::from_status(&status);
     facts.recovery_rows = original_rows.or(rows.as_ref());
-    let (plan, observation) = build_plan(
+    let (fresh_plan, observation) = build_plan(
         &context.config,
         &facts,
         root,
@@ -635,6 +636,8 @@ pub fn apply(
         &input.reason,
         pending.as_ref(),
     )?;
+    let plan =
+        resume_reviewed_projection(fresh_plan, saved.as_ref(), observation, pending.is_none());
     if plan.plan_hash != input.plan_hash {
         return Err(refusal(
             "github_stack_recovery_plan_stale",
@@ -827,10 +830,9 @@ fn needs_auto_recovery(backend: &StackBackendStatus, caravan: &Caravan) -> bool 
             .filter(|entry| entry.state.eq_ignore_ascii_case("open"))
             .map(|entry| PrNumber(entry.number))
             .collect::<Vec<_>>();
-        let retained_history = native.stack.pull_requests.len() != open_members.len();
-        return !open_members.is_empty()
+        return native.stack.open
+            && !open_members.is_empty()
             && open_members.len() < caravan.members.len()
-            && (retained_history || open_members.len() + 1 == caravan.members.len())
             && caravan.members.starts_with(&open_members);
     };
     true
@@ -902,7 +904,7 @@ fn apply_with_provider(
     observation: NativeStackRecoveryObservation,
     provider: &impl NativeStackRecoveryProvider,
 ) -> Result<NativeStackRecoveryOutput, AppError> {
-    apply_plan_with_provider(context, plan, observation, provider, true)
+    apply_plan_with_provider(context, plan, observation, provider, false)
 }
 
 fn fresh_members_for_plan(
@@ -919,12 +921,54 @@ fn fresh_members_for_plan(
                 provider.verify_precondition(&plan.repository, &member.expected)
             }
             .map_err(|error| provider_refusal("fresh_member_preflight", &error, plan))?;
-            if require_green {
-                require_member_green(&pull)?;
-            }
+            require_projection_member(&pull)?;
             Ok(pull)
         })
         .collect()
+}
+
+fn resume_reviewed_projection(
+    mut fresh: NativeStackRecoveryPlan,
+    saved: Option<&NativeStackRecoveryPlan>,
+    observation: NativeStackRecoveryObservation,
+    pending_absent: bool,
+) -> NativeStackRecoveryPlan {
+    let Some(saved) = saved.filter(|saved| saved.verify()) else {
+        return fresh;
+    };
+    // Successful pending clearance is not loss of authorization. Only exact
+    // already-converged provider truth can reuse that retained checkpoint link.
+    let original_pending_hash = fresh.pending_membership_checkpoint_hash.clone();
+    if pending_absent && observation == NativeStackRecoveryObservation::ExactAlreadySatisfied {
+        fresh
+            .pending_membership_checkpoint_hash
+            .clone_from(&saved.pending_membership_checkpoint_hash);
+    }
+    let identity = |plan: &NativeStackRecoveryPlan| {
+        let mut plan = plan.clone();
+        plan.plan_hash.clear();
+        for member in &mut plan.members {
+            member.expected.checks.clear();
+            member.merge_state_status = None;
+            member.authoritative_checks.clear();
+            member.superseded_checks.clear();
+        }
+        if let NativeMembershipPlan::Add { candidate, .. } = &mut plan.action {
+            candidate.checks.clear();
+            candidate.merge_state_status = None;
+            candidate.updated_at = None;
+        }
+        plan
+    };
+    // Fresh structural/control/source leases have already been validated. Check
+    // churn alone must not mint another reviewed generation after response loss.
+    // Return the ORIGINAL sealed plan, retaining its original audit observations.
+    if identity(&fresh) == identity(saved) {
+        saved.clone()
+    } else {
+        fresh.pending_membership_checkpoint_hash = original_pending_hash;
+        fresh.seal()
+    }
 }
 
 fn persist_reviewed_plan(
@@ -1076,7 +1120,7 @@ fn build_plan(
     reason: &str,
     pending: Option<&NativeMembershipCheckpoint>,
 ) -> Result<(NativeStackRecoveryPlan, NativeStackRecoveryObservation), AppError> {
-    build_plan_with_policy(config, facts, root, actor, reason, pending, true)
+    build_plan_with_policy(config, facts, root, actor, reason, pending, false)
 }
 
 fn require_recovery_caravan<'a>(
@@ -1134,6 +1178,85 @@ fn require_recovery_caravan<'a>(
     Ok(caravan)
 }
 
+fn pending_prefix_hash(
+    pending: Option<&NativeMembershipCheckpoint>,
+    caravan: &Caravan,
+    desired: &GitHubStackTopology,
+    pulls: &[&PullRequestSnapshot],
+    before: &crate::github::GitHubStackGeneration,
+) -> Result<Option<String>, AppError> {
+    let Some(pending) = pending else {
+        return Ok(None);
+    };
+    if !pending.verify() || pending.caravan_id != caravan.id {
+        return Err(refusal(
+            "github_stack_recovery_checkpoint_invalid",
+            "pending native membership checkpoint does not match this caravan",
+            json!({"root": caravan.id, "mutated": false}),
+        ));
+    }
+    // Later ordinary effects are evidence to preserve, not permission to replay
+    // admission or erase the original continuation. Lease its exact accepted
+    // prefix and retain its hash in the new raw-provider projection plan.
+    let matches = match &pending.plan {
+        NativeMembershipPlan::Create { plan } => {
+            plan.desired.base == desired.base && desired.entries.starts_with(&plan.desired.entries)
+        }
+        NativeMembershipPlan::RecoveryAdd { plan, accepted } => {
+            plan.before.id == before.id
+                && plan.before.number == before.number
+                && plan.before.node_id == before.node_id
+                && plan.before.created_at == before.created_at
+                && before
+                    .topology
+                    .entries
+                    .starts_with(&plan.before.topology.entries)
+                && plan
+                    .before
+                    .recovery_suffix_target(&desired.base.repository, accepted)
+                    .is_ok_and(|target| target == plan.desired)
+                && accepted.base == desired.base
+                && desired.entries.starts_with(&accepted.entries)
+        }
+        NativeMembershipPlan::Add {
+            repository,
+            stack_number,
+            expected_members,
+            candidate,
+            ..
+        } => {
+            let prefix = expected_members
+                .iter()
+                .copied()
+                .chain(std::iter::once(candidate.number))
+                .collect::<Vec<_>>();
+            repository == &desired.base.repository
+                && *stack_number == before.number
+                && expected_members.len() >= 2
+                && caravan.members.starts_with(&prefix)
+                && pulls
+                    .get(prefix.len().saturating_sub(1))
+                    .is_some_and(|current| {
+                        candidate.number == current.number
+                            && candidate.head.name == current.head.name
+                            && candidate.draft == current.draft
+                            && PullRequestPrecondition::from(candidate.as_ref())
+                                .mutation_identity_eq(&PullRequestPrecondition::from(*current))
+                    })
+        }
+        NativeMembershipPlan::AbsentSingleton { .. } => false,
+    };
+    if !matches {
+        return Err(refusal(
+            "github_stack_recovery_checkpoint_drifted",
+            "the original accepted checkpoint is not an unchanged prefix of current membership",
+            json!({"root": caravan.id, "checkpoint": pending,
+                "current_members": caravan.members, "mutated": false}),
+        ));
+    }
+    Ok(Some(pending.evidence_hash.clone()))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_plan_with_policy(
     config: &CaravanConfig,
@@ -1181,32 +1304,31 @@ fn build_plan_with_policy(
     let operation_id = format!("native-stack-recovery-{}-{topology_hash}", root.0);
     // Fresh provider evidence is sufficient authority for a new plan. Do not
     // manufacture a historical membership checkpoint or claim its hash exists.
-    let (pending_hash, action) =
-        if let Some(before) = facts.recovery_rows.filter(|_| pending.is_none()) {
-            (
-                None,
-                NativeMembershipPlan::RecoveryAdd {
-                    plan: Box::new(crate::github::GitHubStackAddPlan {
-                        operation_id: operation_id.clone(),
-                        actor: actor.to_owned(),
-                        before: before.clone(),
-                        desired: closed_prefix::target(before, &desired)?,
-                    }),
-                    accepted: Box::new(desired.clone()),
-                },
-            )
-        } else {
-            recovery_action(
-                pending,
-                facts.repository,
-                facts.backend,
-                caravan,
-                &desired,
-                &pulls,
-                &operation_id,
-                actor,
-            )?
-        };
+    let (pending_hash, action) = if let Some(before) = facts.recovery_rows {
+        (
+            pending_prefix_hash(pending, caravan, &desired, &pulls, before)?,
+            NativeMembershipPlan::RecoveryAdd {
+                plan: Box::new(crate::github::GitHubStackAddPlan {
+                    operation_id: operation_id.clone(),
+                    actor: actor.to_owned(),
+                    before: before.clone(),
+                    desired: closed_prefix::target(before, &desired)?,
+                }),
+                accepted: Box::new(desired.clone()),
+            },
+        )
+    } else {
+        recovery_action(
+            pending,
+            facts.repository,
+            facts.backend,
+            caravan,
+            &desired,
+            &pulls,
+            &operation_id,
+            actor,
+        )?
+    };
     let observation = mapping_observation(facts.backend, &caravan.members, &action, &desired)?;
     let plan = NativeStackRecoveryPlan {
         schema_version: 1,
@@ -1232,7 +1354,7 @@ fn build_plan_with_policy(
 fn collect_member_evidence<'a>(
     facts: &RecoveryFacts<'a>,
     caravan: &Caravan,
-    require_green: bool,
+    _require_green: bool,
 ) -> Result<(Vec<&'a PullRequestSnapshot>, Vec<NativeStackRecoveryMember>), AppError> {
     let mut pulls: Vec<&PullRequestSnapshot> = Vec::with_capacity(caravan.members.len());
     let mut members = Vec::with_capacity(caravan.members.len());
@@ -1244,9 +1366,7 @@ fn collect_member_evidence<'a>(
                 json!({"root": caravan.id, "member": number, "mutated": false}),
             )
         })?;
-        if require_green {
-            require_member_green(pull)?;
-        }
+        require_projection_member(pull)?;
         let expected_base = if position == 0 {
             if pull.base.repository != facts.default_branch.repository
                 || pull.base.name != facts.default_branch.name
@@ -1413,7 +1533,7 @@ fn retained_closed_rows(backend: &StackBackendStatus) -> Vec<serde_json::Value> 
         .collect()
 }
 
-fn require_member_green(pull: &PullRequestSnapshot) -> Result<(), AppError> {
+fn require_projection_member(pull: &PullRequestSnapshot) -> Result<(), AppError> {
     if pull.state != PullRequestState::Open || pull.draft || pull.merged_at.is_some() {
         return Err(refusal(
             "github_stack_recovery_member_ineligible",
@@ -1430,11 +1550,11 @@ fn require_member_green(pull: &PullRequestSnapshot) -> Result<(), AppError> {
     }
     if !matches!(
         pull.merge_state_status.as_deref(),
-        Some("CLEAN" | "BLOCKED")
+        Some("CLEAN" | "BLOCKED" | "UNSTABLE")
     ) {
         return Err(refusal(
             "github_stack_recovery_member_not_clean",
-            "every member must have exact CLEAN or policy-BLOCKED provider mergeability",
+            "projection requires known non-conflicting provider topology; CI readiness is checked separately for landing",
             json!({
                 "pr": pull.number,
                 "merge_state_status": pull.merge_state_status,
@@ -1442,21 +1562,11 @@ fn require_member_green(pull: &PullRequestSnapshot) -> Result<(), AppError> {
             }),
         ));
     }
-    let (current, _) = crate::model::latest_checks_per_identity(&pull.checks);
-    if current.is_empty()
-        || current.iter().any(|check| {
-            !matches!(
-                check.state,
-                CheckState::Success | CheckState::Neutral | CheckState::Skipped
-            )
-        })
-    {
-        return Err(refusal(
-            "github_stack_recovery_checks_not_green",
-            "every current exact-head check must be successful before recovery",
-            json!({"pr": pull.number, "checks": current, "mutated": false}),
-        ));
-    }
+    // UNSTABLE is a check verdict, not authority to rewrite or merge source.
+    // Represent already-accepted membership without turning a failed admission
+    // gate or skipped source job into a passing qualification. DIRTY/UNKNOWN
+    // and other unproven structural states above remain refused. Native landing
+    // independently requires its exact current required-check/App/head/base proof.
     Ok(())
 }
 
@@ -1868,7 +1978,7 @@ mod tests {
     use super::*;
     use crate::config::StackRolloutConfig;
     use crate::github::{GitHubStackBase, GitHubStackSnapshot};
-    use crate::model::{AutoMergeState, CommitOid};
+    use crate::model::{AutoMergeState, CheckState, CommitOid};
     use crate::read::{StackBackendProblem, StackConsistency};
     use mcp_cli::StructuredError;
 
@@ -2248,7 +2358,7 @@ mod tests {
             },
         ];
         member.merge_state_status = Some("BLOCKED".to_owned());
-        require_member_green(&member)
+        require_projection_member(&member)
             .expect("policy-blocked mergeability with non-failing terminal checks is recoverable");
     }
 
@@ -2294,11 +2404,11 @@ mod tests {
     }
 
     #[test]
-    fn non_green_or_changed_base_refuses_before_provider_mutation() {
+    fn structural_conflict_or_changed_base_refuses_before_provider_mutation() {
         let main = branch("main", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         let root = pull(101, main.clone());
         let mut child = pull(102, root.head.clone());
-        child.checks[0].state = CheckState::Failure;
+        child.merge_state_status = Some("DIRTY".to_owned());
         let caravans = vec![Caravan::new(vec![PrNumber(101), PrNumber(102)]).unwrap()];
         let pulls = BTreeMap::from([(root.number, root.clone()), (child.number, child.clone())]);
         let backend = stack_backend_fixture(Vec::new());
@@ -2313,10 +2423,10 @@ mod tests {
             )
             .unwrap_err()
             .code(),
-            "github_stack_recovery_checks_not_green"
+            "github_stack_recovery_member_not_clean"
         );
 
-        child.checks[0].state = CheckState::Success;
+        child.merge_state_status = Some("CLEAN".to_owned());
         child.base = main.clone();
         let pulls = BTreeMap::from([(root.number, root), (child.number, child)]);
         assert_eq!(

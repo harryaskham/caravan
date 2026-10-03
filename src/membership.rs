@@ -681,6 +681,59 @@ pub(crate) fn auto_admit_locked(
     )
 }
 
+fn require_exact_native_join_projection(
+    context: &AppContext,
+    status: &StatusOutput,
+    target: &JoinTarget,
+) -> Result<(), AppError> {
+    if context.config.stack_type != crate::config::StackType::Github
+        || target.caravan.members.len() < 2
+        || status
+            .current_pr
+            .is_some_and(|pr| target.caravan.members.contains(&pr))
+    {
+        return Ok(());
+    }
+    let mapped = status
+        .stack_backend
+        .native_stacks
+        .iter()
+        .filter(|native| native.caravan_id == Some(target.caravan.id))
+        .collect::<Vec<_>>();
+    if let [native] = mapped.as_slice()
+        && native.stack.open
+        && native.consistency == crate::read::StackConsistency::Exact
+        && !status.stack_backend.provider_stacks_truncated
+    {
+        return Ok(());
+    }
+    // Preserve the already-supported, exact provider-visible tail completion.
+    // It finishes ordinary membership once; it is not admission of another tail
+    // to a logically longer, incompletely represented caravan.
+    if let Some(recovery) = crate::stack_recovery::project_provider_visible_append(status)?
+        && recovery.tail == target.tail.number
+        && status.current_pr == Some(recovery.candidate)
+    {
+        return Ok(());
+    }
+    Err(AppError::structured(
+        ErrorCategory::Validation,
+        "github_stack_membership_repair_required",
+        "finish this caravan's native projection before extending ordinary membership",
+        Some(json!({
+            "caravan": target.caravan,
+            "provider_stacks": mapped,
+            "membership_preflight_mutated": false,
+            "mutation_scope": "this membership preflight only; prior effects are preserved",
+            "membership_replay_allowed": false,
+            "safe_next_action": format!(
+                "use native-stack recovery-preview --root {} with the existing actor and apply only its exact reviewed plan hash; preserve existing partial membership receipts",
+                target.caravan.id
+            ),
+        })),
+    ))
+}
+
 fn require_current_join_root(status: &StatusOutput, target: &JoinTarget) -> Result<(), AppError> {
     let root_number = target.caravan.head().ok_or_else(|| {
         AppError::validation("join_target_empty", "selected join caravan has no root")
@@ -1620,6 +1673,9 @@ fn execute_locked(
         .is_join()
         .then(|| resolve_join_target(&status, request))
         .transpose()?;
+    if let Some(target) = &initial_join_target {
+        require_exact_native_join_projection(context, &status, target)?;
+    }
     let selected_predecessor = initial_join_target.as_ref().map_or_else(
         || {
             Some(JoinPredecessorReceipt {

@@ -12020,6 +12020,39 @@ fn sync_all_quarantines_member_order_drift_and_lands_independent_root() {
         problems: vec![drift.clone()],
     }];
     status.stack_backend.problems = vec![drift];
+    let tails = current_tail_generations_bounded(&status, Some(8));
+    assert_eq!(
+        tails.iter().map(|tail| tail.caravan_id).collect::<Vec<_>>(),
+        vec![PrNumber(4)]
+    );
+    assert_eq!(
+        read::first_available_join_caravan(&status).unwrap().id,
+        PrNumber(4)
+    );
+    // Preserve a quarantined dependency, rather than silently using the healthy
+    // independent tail or forming a different root for the same cumulative source.
+    let mut candidate = caravan_member(5, "candidate", "missing-tail");
+    candidate.labels.clear();
+    candidate.base = status.analysis.pull_requests[&PrNumber(3)].head.clone();
+    let mut admission = status.clone();
+    admission.current_pr = Some(candidate.number);
+    admission
+        .analysis
+        .pull_requests
+        .insert(candidate.number, candidate.clone());
+    let never_check = |_: &BranchSnapshot,
+                       _: &BranchSnapshot|
+     -> Result<CompatibilityReport, AppError> {
+        panic!("quarantined dependency must be fenced before compatibility or ordinary admission")
+    };
+    let blocked = evaluate_auto_candidate(&admission, &candidate, &never_check).unwrap();
+    assert_eq!(blocked.target, AutoCandidateTarget::Skip);
+    assert!(
+        blocked
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("native projection recovery"))
+    );
     let provider = FakeProvider::with_pull_requests(pulls);
     let (_directory, config, native) = github_native_fixture();
 

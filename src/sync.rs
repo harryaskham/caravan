@@ -1443,7 +1443,7 @@ fn native_prefix_waits_for_provider_regeneration(
         })
 }
 
-fn quarantined_native_caravan_ids(status: &StatusOutput) -> BTreeSet<PrNumber> {
+pub(crate) fn quarantined_native_caravan_ids(status: &StatusOutput) -> BTreeSet<PrNumber> {
     status
         .stack_backend
         .native_stacks
@@ -7383,6 +7383,26 @@ fn evaluate_auto_candidate_bounded(
         }
     }
     let tails = current_tail_generations_bounded(status, batch_bound);
+    let quarantined = quarantined_native_caravan_ids(status);
+    if let Some(caravan) = status.analysis.fleet.caravans.iter().find(|caravan| {
+        quarantined.contains(&caravan.id)
+            && caravan.members.iter().any(|member| {
+                status
+                    .analysis
+                    .pull_requests
+                    .get(member)
+                    .is_some_and(|pull| pull.head == candidate.base)
+            })
+    }) {
+        return Ok(AutoCandidateEvaluation {
+            target: AutoCandidateTarget::Skip,
+            tested_tails: tails,
+            reasons: vec![format!(
+                "caravan #{} requires native projection recovery; preserve the candidate's dependency rather than extending or silently retargeting it",
+                caravan.id
+            )],
+        });
+    }
     if tails.is_empty() {
         let output = check_auto_target(&virtual_status, &CheckInput::default(), checker)?;
         if output.eligible {
@@ -7517,12 +7537,13 @@ fn current_tail_generations_bounded(
     status: &StatusOutput,
     batch_bound: Option<u64>,
 ) -> Vec<AutoAdmissionTailGeneration> {
+    let quarantined = quarantined_native_caravan_ids(status);
     status
         .analysis
         .fleet
         .caravans
         .iter()
-        .filter(|caravan| !caravan.parked)
+        .filter(|caravan| !caravan.parked && !quarantined.contains(&caravan.id))
         .filter_map(|caravan| {
             let tail_pr = caravan.tail()?;
             let tail = status.analysis.pull_requests.get(&tail_pr)?;

@@ -1,5 +1,6 @@
-//! Automatic reformation uses active membership, never the retained row count.
-//! Raw history remains an exact provider lease, not a fabricated old checkpoint.
+//! Projection recovery uses accepted membership, never the retained row count.
+//! An all-open or retained-history prefix is leased as a complete raw generation;
+//! it is not a fabricated historical checkpoint or authority for source landing.
 
 use super::{
     AppError, Caravan, GitHubStackTopology, NativeStackRecoveryProvider, RecoveryFacts,
@@ -79,7 +80,7 @@ pub(super) fn observe(
     let [native] = intersecting.as_slice() else {
         return Ok(None); // The normal planner diagnoses absence/ambiguity.
     };
-    let Some(prefix) = merged_prefix_len(&native.stack).filter(|prefix| *prefix > 0) else {
+    let Some(prefix) = merged_prefix_len(&native.stack) else {
         return Ok(None);
     };
     let active = &native.stack.pull_requests[prefix..];

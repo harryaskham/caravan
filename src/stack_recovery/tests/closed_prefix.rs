@@ -1,3 +1,5 @@
+mod projection_stage;
+
 use super::*;
 use crate::github::{GitHubStackEntryGeneration, GitHubStackGeneration};
 

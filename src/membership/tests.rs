@@ -2,6 +2,8 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
+mod projection_stage;
+
 use super::*;
 use crate::graph::analyze;
 use crate::model::{

@@ -4230,8 +4230,10 @@ fn check_new(
 /// discovery order. Parked and effectively held caravans remain visible repair
 /// evidence but cannot be selected by an implicit mutation.
 pub(crate) fn first_available_join_caravan(status: &StatusOutput) -> Option<&Caravan> {
+    let quarantined = crate::sync::quarantined_native_caravan_ids(status);
     status.analysis.fleet.caravans.iter().find(|caravan| {
         !caravan.parked
+            && !quarantined.contains(&caravan.id)
             && !status
                 .pauses
                 .iter()
