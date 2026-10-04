@@ -117,9 +117,29 @@ fn immutable_legacy_join_without_batch_bound_keeps_existing_behavior() {
 }
 
 #[test]
-fn already_enrolled_retry_is_not_a_new_batch_row() {
-    let (mut before, mut provider, mut request, context) = fixture(8, MembershipOperation::Join);
+fn an_enrolled_member_cannot_use_a_former_predecessor_as_a_current_tail() {
+    let (before, provider, mut request, context) = fixture(8, MembershipOperation::Join);
     let member = before.analysis.pull_requests[&PrNumber(8)].clone();
+    let chain = before
+        .analysis
+        .pull_requests
+        .values()
+        .filter(|pull| pull.number != PrNumber(60))
+        .cloned()
+        .collect();
+    let before = status(member, chain);
+    request.tail_pr = Some(7);
+    let error = apply(before, &provider, request, &context)
+        .expect_err("capacity idempotency cannot override exact target selection");
+    assert_eq!(error.code(), "caravan_tail_not_found");
+    assert!(provider.effects.borrow().is_empty());
+    assert!(provider.audits.borrow().is_empty());
+}
+
+#[test]
+fn already_enrolled_root_retry_is_not_a_new_batch_row() {
+    let (mut before, mut provider, mut request, context) = fixture(8, MembershipOperation::Join);
+    let member = before.analysis.pull_requests[&PrNumber(1)].clone();
     let chain = before
         .analysis
         .pull_requests
@@ -130,10 +150,24 @@ fn already_enrolled_retry_is_not_a_new_batch_row() {
     before = status(member, chain);
     before.stack_backend.configured = crate::config::StackType::Github;
     provider.pull_requests = RefCell::new(before.analysis.pull_requests.clone());
-    request.tail_pr = Some(7);
+    // A member already appended to the chain cannot name its former
+    // predecessor as a current tail. Exercise the supported active-root
+    // continuation instead of fabricating a Join target that policy rejects.
+    request.operation = MembershipOperation::New;
+    request.tail_pr = None;
+    let original = provider.pull_requests.borrow().clone();
     let output = apply(before, &provider, request, &context)
-        .expect("an exact enrolled retry preserves the existing full batch");
+        .expect("an exact enrolled root retry preserves the existing full batch");
     assert!(output.pull_request.has_label(ACTIVE_LABEL));
-    assert_eq!(output.pull_request.base.name, "member-7");
-    assert!(provider.effects.borrow().is_empty());
+    assert_eq!(output.pull_request.base.name, "main");
+    assert_eq!(*provider.pull_requests.borrow(), original);
+    assert_eq!(provider.pull_requests.borrow().len(), 8);
+    assert!(
+        provider
+            .effects
+            .borrow()
+            .iter()
+            .all(|effect| *effect == MutationKind::Comment),
+        "the normal audit may be refreshed, but membership and source stay unchanged"
+    );
 }
