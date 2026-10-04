@@ -2631,6 +2631,28 @@ fn execute_with_rebase_guard_and_config(
     if let Some(rebase) = expected_rebase {
         validate_post_rebase_target(&status, &request, target.as_ref(), rebase)?;
     }
+    // Batch capacity is membership policy, not source-rewrite policy. Keep the
+    // physical path's early pre-rewrite fence, but also guard this shared
+    // provider boundary so immutable native/virtual joins cannot bypass it.
+    // A retry for a member already in this exact target chain adds no row.
+    if let Some(context) = context
+        && let Some(target) = target.as_ref()
+        && !status.current_pr.is_some_and(|candidate| {
+            status
+                .analysis
+                .fleet
+                .containing(target.tail.number)
+                .is_some_and(|caravan| caravan.members.contains(&candidate))
+        })
+        && let Some(refusal) = crate::sync::caravan_capacity_refusal(
+            context,
+            &status,
+            status.current_pr.unwrap_or(PrNumber(0)),
+            Some(target.tail.number),
+        )
+    {
+        return Err(crate::sync::caravan_capacity_error(&refusal));
+    }
     let desired_base = target.as_ref().map_or_else(
         || status.default_branch.clone(),
         |target| target.tail.head.name.clone(),
