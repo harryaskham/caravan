@@ -8,6 +8,7 @@ use crate::model::{
     AutoMergeState, BranchSnapshot, CommitOid, CompatibilityOutcome, CompatibilityReport,
 };
 
+mod batch_capacity;
 mod expected_admission;
 mod native_projection;
 
