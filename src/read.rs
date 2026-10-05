@@ -139,7 +139,9 @@ mod rebase_on_join_status_tests {
         let status = rebase_on_join_status(&context(StackType::Caravan, false));
         assert_eq!(
             status.required_action.as_deref(),
-            Some("set `rebase_on_join: true` in reviewed/config.yaml, commit it, then run `cara check` and `cara sync --all`")
+            Some(
+                "set `rebase_on_join: true` in reviewed/config.yaml, commit it, then run `cara check` and `cara sync --all`"
+            )
         );
     }
 
