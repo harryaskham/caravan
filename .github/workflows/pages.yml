@@ -1,48 +1,23 @@
 name: Pages
 
+# Shared self-hosted publisher (harryaskham.github.io publish-pages.yml).
 on:
   push:
     branches: [main]
     paths:
-      - "site/**"
-      - "scripts/check-site.py"
-      - ".github/workflows/pages.yml"
+      - site/**
+      - scripts/check-site.py
+      - .github/workflows/pages.yml
   workflow_dispatch:
 
-concurrency:
-  group: pages
-  cancel-in-progress: false
+permissions:
+  contents: read
+  pages: write
+  id-token: write
 
 jobs:
-  build:
-    name: Check and package site
-    runs-on: [self-hosted, nix, Linux, X64]
-    permissions:
-      contents: read
-      pages: write
-    steps:
-      - name: Check out source
-        uses: actions/checkout@v4
-      - name: Configure GitHub Pages
-        uses: actions/configure-pages@v5
-      - name: Check internal links and assets
-        run: nix develop --command python3 scripts/check-site.py
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: site
-
-  deploy:
-    name: Deploy site
-    needs: build
-    runs-on: [self-hosted, nix, Linux, X64]
-    permissions:
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+  pages:
+    uses: harryaskham/harryaskham.github.io/.github/workflows/publish-pages.yml@main
+    with:
+      path: site
+      build: nix develop --command python3 scripts/check-site.py
