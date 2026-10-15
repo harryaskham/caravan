@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /caravan/
+
+Sitemap: https://a.skh.am/caravan/sitemap.xml
