@@ -1,6 +1,6 @@
 name: Pages
 
-# Shared self-hosted publisher (harryaskham.github.io publish-pages.yml).
+# Shared self-hosted gh-pages publisher (harryaskham.github.io publish-pages.yml).
 on:
   push:
     branches: [main]
@@ -11,9 +11,8 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
-  pages: write
-  id-token: write
+  contents: write # push gh-pages
+  pages: write    # request the Pages build
 
 jobs:
   pages:
