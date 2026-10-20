@@ -28,6 +28,7 @@ pub mod initialization;
 pub mod journal;
 pub mod loop_runner;
 pub mod membership;
+pub mod membership_proof;
 pub mod native_stack_rebase;
 pub mod navigation;
 pub mod next;
@@ -1587,6 +1588,13 @@ pub fn build_router() -> ToolRouter<AppContext> {
         "queue",
         "Report the next pull request at a requested queue position (ready, skipped, conflict, evicted) and optionally check it out. Selection is not compatibility proof: run check/new preflight before acting. Nothing matching is an ordinary payload, never an error, so an empty queue is distinguishable from a provider outage.",
         |context: &AppContext, input: NextInput| next::next(context, &input),
+    );
+    router.add_typed_tool_with_output_schema(
+        "membership_proof",
+        "Provider-truth verdict for one exact PR generation: enrolled, merged, unjoined, closed_unmerged or inconsistent, with `succeeded` true only when the exact expected head is enrolled without force intent or merged. Read-only, four light provider reads, no receipts consulted. Use this, not receipt fields, to decide whether publication, join, admission or merge happened.",
+        |context: &AppContext, input: membership_proof::MembershipProofInput| {
+            membership_proof::prove(context, &input)
+        },
     );
     router.add_typed_tool_with_output_schema(
         "check",
@@ -3192,6 +3200,7 @@ mod tests {
             "status",
             "queue",
             "check",
+            "membership_proof",
             "new",
             "renew",
             "join",

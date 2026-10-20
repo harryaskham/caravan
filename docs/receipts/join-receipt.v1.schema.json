@@ -1,0 +1,1299 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "JoinReceipt",
+  "description": "Versioned, additive contract consumed by Cacophony `pr_cara_join`.",
+  "type": "object",
+  "properties": {
+    "ancestry_verified": {
+      "type": "boolean"
+    },
+    "candidate_pr": {
+      "$ref": "#/$defs/PrNumber"
+    },
+    "candidate_source_head_oid": {
+      "$ref": "#/$defs/CommitOid"
+    },
+    "caravan_id": {
+      "$ref": "#/$defs/PrNumber"
+    },
+    "config_fingerprint": {
+      "type": "string"
+    },
+    "default_branch_oid": {
+      "$ref": "#/$defs/CommitOid"
+    },
+    "expected_admission": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ExpectedAdmission"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "expected_admission_verified": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "force_intent": {
+      "$ref": "#/$defs/JoinForceIntent"
+    },
+    "membership_durable": {
+      "type": "boolean"
+    },
+    "operation_id": {
+      "$ref": "#/$defs/OperationId"
+    },
+    "predecessor": {
+      "$ref": "#/$defs/JoinPredecessorReceipt"
+    },
+    "provider_receipts": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/GitHubMutationReceipt"
+      }
+    },
+    "rebase_on_join": {
+      "type": "boolean"
+    },
+    "rebase_receipt": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RebaseReceipt"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "receipt_hash": {
+      "description": "Deterministic process-independent hash of this receipt with this field omitted.",
+      "type": "string"
+    },
+    "repository": {
+      "$ref": "#/$defs/RepositoryId"
+    },
+    "result": {
+      "$ref": "#/$defs/JoinResultReceipt"
+    },
+    "schema_version": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "source": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/JoinSourceReceipt"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "required": [
+    "schema_version",
+    "operation_id",
+    "repository",
+    "caravan_id",
+    "candidate_pr",
+    "candidate_source_head_oid",
+    "predecessor",
+    "default_branch_oid",
+    "result",
+    "rebase_on_join",
+    "ancestry_verified",
+    "membership_durable",
+    "force_intent",
+    "config_fingerprint"
+  ],
+  "$defs": {
+    "AnalyzedCommit": {
+      "description": "One analyzed candidate-only commit and its reconciliation disposition.",
+      "type": "object",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/ReconciliationAction"
+        },
+        "oid": {
+          "$ref": "#/$defs/CommitOid"
+        },
+        "paths": {
+          "description": "Paths this exact commit changed relative to its parent. Evidence only;\nauthority comes from the cumulative per-path proof.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "tree_oid": {
+          "$ref": "#/$defs/CommitOid"
+        }
+      },
+      "required": [
+        "oid",
+        "tree_oid",
+        "action"
+      ]
+    },
+    "AutoMergeState": {
+      "description": "Exact observed auto-merge state.",
+      "type": "object",
+      "properties": {
+        "actor": {
+          "description": "Provider actor that enabled native auto-merge, when exposed by GitHub.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "merge_method": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MergeMethod"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "enabled"
+      ]
+    },
+    "BranchRewriteReason": {
+      "description": "Why Caravan is authorized to replace one exact branch generation.\n\nSelected before the rewrite and retained in the immutable plan/receipt, so\nthe GitHub-visible reason cannot be inferred incorrectly after publication\n(bd-8e97bf).",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "unspecified"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "current_default_advanced"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "parent_advanced"
+            },
+            "parent_pr": {
+              "$ref": "#/$defs/PrNumber"
+            }
+          },
+          "required": [
+            "kind",
+            "parent_pr"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "joined_caravan"
+            },
+            "parent_pr": {
+              "$ref": "#/$defs/PrNumber"
+            }
+          },
+          "required": [
+            "kind",
+            "parent_pr"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "parent_evicted"
+            },
+            "parent_pr": {
+              "$ref": "#/$defs/PrNumber"
+            }
+          },
+          "required": [
+            "kind",
+            "parent_pr"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "caravan_reshaped"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "reviewed_repair"
+            },
+            "operation_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "operation_id"
+          ]
+        }
+      ]
+    },
+    "BranchSnapshot": {
+      "description": "A named branch at an exact revision in an exact repository.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "oid": {
+          "$ref": "#/$defs/CommitOid"
+        },
+        "repository": {
+          "$ref": "#/$defs/RepositoryId"
+        }
+      },
+      "required": [
+        "repository",
+        "name",
+        "oid"
+      ]
+    },
+    "CheckSnapshot": {
+      "description": "One observed status/check result.\n\nA rollup is a LINEAGE, not a set of simultaneous verdicts: retried and\ncancelled runs of the same required check stay on the same head forever, so\nthe snapshot must carry enough identity and ordering to tell a superseded\nobservation from the current one (bd-eff1dc).",
+      "type": "object",
+      "properties": {
+        "app_id": {
+          "description": "Numeric GitHub App identity; never infer it from a workflow name or URL.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "check_suite_id": {
+          "description": "Provider suite identity binds a deferred gate to real workflow lineage.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "completed_at": {
+          "description": "Provider completion timestamp, absent while a run is still going.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "details_url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "head_oid": {
+          "description": "Commit to which the provider bound this observation.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CommitOid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "provider_kind": {
+          "description": "Provider object kind (`CheckRun`, `StatusContext`, ...). Part of check\nidentity so a same-named check from a different provider is never\ncollapsed into another provider's lineage.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider_state": {
+          "description": "Exact provider value when available, especially when normalization yields\n`unknown`; policy must never guess from an unrecognized value.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "started_at": {
+          "description": "Provider start timestamp (`startedAt`, else `createdAt`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/CheckState"
+        },
+        "superseded": {
+          "description": "Marked at discovery when a later run of this required check, or a newer\ngeneration of its owning workflow, exists on this exact head.\n\nDIAGNOSTIC ONLY. Policy never reads this flag: admission and CI\ndisposition recompute supersession from timestamps through\n[`latest_checks_per_identity`], so a hand-built snapshot can never be\nmade to look green by setting a boolean. It exists so status and web\nsurfaces can show the full lineage while making clear which rows are\nhistory rather than current verdicts (bd-eff1dc).",
+          "type": "boolean"
+        },
+        "workflow_name": {
+          "description": "Owning workflow, when the provider reports one. Also identity: two\nworkflows may legitimately publish the same job name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "state"
+      ]
+    },
+    "CheckState": {
+      "description": "A normalized GitHub check state. Unknown provider values stay unknown rather\nthan being collapsed into success or failure policy.",
+      "type": "string",
+      "enum": [
+        "expected",
+        "queued",
+        "in_progress",
+        "success",
+        "failure",
+        "neutral",
+        "skipped",
+        "cancelled",
+        "timed_out",
+        "action_required",
+        "unknown"
+      ]
+    },
+    "CommitOid": {
+      "description": "Exact Git object identity. Discovery keeps the provider's full OID string.",
+      "type": "string"
+    },
+    "CompatibilityOutcome": {
+      "description": "Outcome of one isolated Git compatibility test.",
+      "type": "string",
+      "enum": [
+        "clean",
+        "conflict",
+        "unknown"
+      ]
+    },
+    "ExpectedAdmission": {
+      "description": "Version-one Cacophony caller ABI. Keep the original strings, including OID\ncase, for exact JSON value equality in both check and mutation receipts.",
+      "type": "object",
+      "properties": {
+        "base_oid": {
+          "type": "string"
+        },
+        "base_ref": {
+          "type": "string"
+        },
+        "default_oid": {
+          "type": "string"
+        },
+        "default_ref": {
+          "type": "string"
+        },
+        "head_oid": {
+          "type": "string"
+        },
+        "head_ref": {
+          "type": "string"
+        },
+        "pr": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "pr_url": {
+          "type": "string"
+        },
+        "repository": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "unjoined": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "repository",
+        "pr",
+        "pr_url",
+        "head_ref",
+        "head_oid",
+        "base_ref",
+        "base_oid",
+        "default_ref",
+        "default_oid",
+        "unjoined"
+      ]
+    },
+    "GitHubMutationReceipt": {
+      "description": "Exact provider receipt for one primitive PR mutation.",
+      "type": "object",
+      "properties": {
+        "after": {
+          "description": "Exact PR facts refetched after the provider command completed.",
+          "$ref": "#/$defs/PullRequestSnapshot"
+        },
+        "before": {
+          "description": "Exact PR facts immediately before mutation; absent only for creation.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PullRequestSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "kind": {
+          "description": "Primitive provider operation performed.",
+          "$ref": "#/$defs/MutationKind"
+        },
+        "provider_output": {
+          "description": "Trimmed non-secret provider output, when present.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "after"
+      ]
+    },
+    "JoinForceIntent": {
+      "description": "Durable PR-scoped force intent is preserved across membership and Cara-owned\nhistory rewrites until explicit revoke, eviction, or successful merge.",
+      "type": "string",
+      "enum": [
+        "none",
+        "preserved"
+      ]
+    },
+    "JoinPredecessorReceipt": {
+      "description": "Exact predecessor selected from the serialized live-tail snapshot.",
+      "type": "object",
+      "properties": {
+        "branch": {
+          "type": "string"
+        },
+        "head_oid": {
+          "$ref": "#/$defs/CommitOid"
+        },
+        "pr": {
+          "$ref": "#/$defs/PrNumber"
+        }
+      },
+      "required": [
+        "pr",
+        "branch",
+        "head_oid"
+      ]
+    },
+    "JoinResultReceipt": {
+      "description": "Final exact candidate state after physical rewrite and provider admission.",
+      "type": "object",
+      "properties": {
+        "base_oid": {
+          "$ref": "#/$defs/CommitOid"
+        },
+        "base_ref": {
+          "type": "string"
+        },
+        "head_oid": {
+          "$ref": "#/$defs/CommitOid"
+        },
+        "state": {
+          "$ref": "#/$defs/PullRequestState"
+        }
+      },
+      "required": [
+        "head_oid",
+        "base_ref",
+        "base_oid",
+        "state"
+      ]
+    },
+    "JoinSourceReceipt": {
+      "description": "Exact source patch and target generation bound before any provider mutation.",
+      "type": "object",
+      "properties": {
+        "already_landed_commits": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/CommitOid"
+          }
+        },
+        "branch": {
+          "type": "string"
+        },
+        "effective_patch_fingerprint": {
+          "type": "string"
+        },
+        "expected_result_tree_oid": {
+          "$ref": "#/$defs/CommitOid"
+        },
+        "head_oid": {
+          "$ref": "#/$defs/CommitOid"
+        },
+        "parent": {
+          "$ref": "#/$defs/BranchSnapshot"
+        },
+        "patch_fingerprint": {
+          "type": "string"
+        },
+        "selected_tail": {
+          "$ref": "#/$defs/JoinPredecessorReceipt"
+        },
+        "source_commits": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/CommitOid"
+          }
+        },
+        "source_title": {
+          "type": "string"
+        },
+        "tree_oid": {
+          "$ref": "#/$defs/CommitOid"
+        }
+      },
+      "required": [
+        "branch",
+        "head_oid",
+        "parent",
+        "tree_oid",
+        "patch_fingerprint",
+        "effective_patch_fingerprint",
+        "source_title",
+        "selected_tail",
+        "expected_result_tree_oid"
+      ]
+    },
+    "MergeEvidence": {
+      "description": "Exact merge evidence for one three-way construction.",
+      "type": "object",
+      "properties": {
+        "conflicting_paths": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "merge_base": {
+          "description": "Merge base used for the construction.",
+          "$ref": "#/$defs/CommitOid"
+        },
+        "outcome": {
+          "$ref": "#/$defs/CompatibilityOutcome"
+        },
+        "result_tree": {
+          "description": "Cumulative tree `git merge-tree` constructed for this base.",
+          "$ref": "#/$defs/CommitOid"
+        }
+      },
+      "required": [
+        "merge_base",
+        "outcome",
+        "result_tree"
+      ]
+    },
+    "MergeMethod": {
+      "description": "Squash is the only merge method Caravan may enable or execute.",
+      "type": "string",
+      "enum": [
+        "squash"
+      ]
+    },
+    "MergePreservingTopology": {
+      "description": "Complete merge-preserving proof retained in plan and apply receipt.",
+      "type": "object",
+      "properties": {
+        "elided_target_merges": {
+          "description": "Source merges Git safely elided because every external parent was already\nin exact target ancestry and the independently proven final tree still\nmatched. This is explicit in the receipt rather than hidden as a changed\ncommit count (bd-a720be).",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CommitOid"
+          }
+        },
+        "expected_merge_tree_oid": {
+          "$ref": "#/$defs/CommitOid"
+        },
+        "mapping": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/RebaseTopologyMapping"
+          }
+        },
+        "new_commits": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/RebaseTopologyCommit"
+          }
+        },
+        "old_commits": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/RebaseTopologyCommit"
+          }
+        },
+        "parent_replacement": {
+          "description": "Exact provider base replaced by the retained simulated parent in this\nsame globally verified batch. Absent for ordinary remote targets.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RebaseTopologyParentReplacement"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "resolution": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReplayedMergeResolution"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "strategy": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "strategy",
+        "expected_merge_tree_oid"
+      ]
+    },
+    "MutationKind": {
+      "description": "Remote mutation kinds recorded step by step.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "create_pull_request",
+            "set_base",
+            "add_label",
+            "remove_label",
+            "enable_auto_merge",
+            "disable_auto_merge",
+            "rerun_checks",
+            "squash_merge",
+            "checkout"
+          ]
+        },
+        {
+          "description": "One exact provider write replacing the complete label set. Used where a\nmulti-label lifecycle transition must never expose a partially applied\nadd/remove sequence.",
+          "type": "string",
+          "const": "set_labels"
+        },
+        {
+          "description": "One reviewed provider transaction coupling exact-head force intent with\nthe requested queue-owned squash auto-merge postcondition.",
+          "type": "string",
+          "const": "force_intent_transaction"
+        },
+        {
+          "description": "Durable GitHub-visible explanation of a control-label transition.",
+          "type": "string",
+          "const": "comment"
+        },
+        {
+          "description": "Exact planned branch generation pushed under force-with-lease.",
+          "type": "string",
+          "const": "rebase_branch"
+        },
+        {
+          "description": "One auditable check-suite rerequest against an unchanged head, used only\nto recover required contexts that never started a run.",
+          "type": "string",
+          "const": "request_check_suite"
+        },
+        {
+          "description": "One phase of the exact lock-fenced native Stack landing transaction.",
+          "type": "string",
+          "const": "native_stack_land"
+        }
+      ]
+    },
+    "OperationId": {
+      "description": "Unique operation identifier shared by receipts and emitted events.",
+      "type": "string"
+    },
+    "PrNumber": {
+      "description": "A GitHub pull-request number.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "PullRequestSnapshot": {
+      "description": "Canonical PR fact snapshot. Discovery owns provider conversion; graph and\nmutation layers consume this without reaching back into raw GraphQL JSON.",
+      "type": "object",
+      "properties": {
+        "auto_merge": {
+          "$ref": "#/$defs/AutoMergeState"
+        },
+        "base": {
+          "$ref": "#/$defs/BranchSnapshot"
+        },
+        "checks": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/CheckSnapshot"
+          }
+        },
+        "created_at": {
+          "description": "Immutable provider creation time used for FIFO admission ordering.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cross_repository": {
+          "type": "boolean"
+        },
+        "draft": {
+          "type": "boolean",
+          "default": false
+        },
+        "head": {
+          "$ref": "#/$defs/BranchSnapshot"
+        },
+        "labels": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        },
+        "merge_state_status": {
+          "description": "The forge's own verdict on whether this pull request can merge.\n\nUsed only as a **merge-time** cross-check, never for admission. Measured\non live cacophony, `BLOCKED` does not distinguish red from clean: a PR\nwhose required checks are merely still running reports `BLOCKED` exactly\nlike one whose checks failed, so refusing admission on it would stall\nevery candidate. At merge time the required checks must already be green,\nso a forge that still refuses is telling us something we do not know.\n\n`None` means the field was not fetched or the forge had not computed it\n(`UNKNOWN`), which is neither permission nor refusal.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "merged_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "number": {
+          "$ref": "#/$defs/PrNumber"
+        },
+        "state": {
+          "$ref": "#/$defs/PullRequestState"
+        },
+        "title": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "number",
+        "title",
+        "url",
+        "state",
+        "head",
+        "base",
+        "cross_repository",
+        "auto_merge"
+      ]
+    },
+    "PullRequestState": {
+      "description": "Provider-level PR state normalized for Caravan.",
+      "type": "string",
+      "enum": [
+        "open",
+        "closed",
+        "merged"
+      ]
+    },
+    "RebaseReceipt": {
+      "description": "Auditable receipt for one physical branch rewrite.",
+      "type": "object",
+      "properties": {
+        "already_satisfied": {
+          "description": "True when no push was needed because the exact ancestry already held.",
+          "type": "boolean"
+        },
+        "branch": {
+          "type": "string"
+        },
+        "ci_trigger_workflows": {
+          "description": "Exact-default workflow files proven able to run for this PR base on\nboth force-push (`synchronize`) and base edit (`edited`).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "commit_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "lease": {
+          "description": "The exact optimistic lease passed to Git.",
+          "type": "string"
+        },
+        "merge_topology": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MergePreservingTopology"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "new_base_branch": {
+          "type": "string"
+        },
+        "new_base_oid": {
+          "$ref": "#/$defs/CommitOid"
+        },
+        "new_head_oid": {
+          "$ref": "#/$defs/CommitOid"
+        },
+        "new_tree_oid": {
+          "$ref": "#/$defs/CommitOid"
+        },
+        "old_base_oid": {
+          "$ref": "#/$defs/CommitOid"
+        },
+        "old_head_oid": {
+          "$ref": "#/$defs/CommitOid"
+        },
+        "pr": {
+          "$ref": "#/$defs/PrNumber"
+        },
+        "rewrite_reason": {
+          "$ref": "#/$defs/BranchRewriteReason",
+          "default": {
+            "kind": "unspecified"
+          }
+        },
+        "squash_reconciliation": {
+          "description": "Exact proof for any stacked history this rewrite reconciled away.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SquashEquivalenceReport"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "pr",
+        "branch",
+        "old_head_oid",
+        "new_head_oid",
+        "old_base_oid",
+        "new_base_branch",
+        "new_base_oid",
+        "new_tree_oid",
+        "commit_count",
+        "ci_trigger_workflows",
+        "lease",
+        "already_satisfied"
+      ]
+    },
+    "RebaseTopologyCommit": {
+      "description": "One exact commit and parent set in a retained nonlinear candidate range.",
+      "type": "object",
+      "properties": {
+        "oid": {
+          "$ref": "#/$defs/CommitOid"
+        },
+        "parents": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/CommitOid"
+          }
+        },
+        "tree_oid": {
+          "$ref": "#/$defs/CommitOid"
+        }
+      },
+      "required": [
+        "oid",
+        "tree_oid"
+      ]
+    },
+    "RebaseTopologyMapping": {
+      "description": "Deterministic old→new topology mapping for one replayed commit.",
+      "type": "object",
+      "properties": {
+        "new_oid": {
+          "$ref": "#/$defs/CommitOid"
+        },
+        "new_parents": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/CommitOid"
+          }
+        },
+        "old_oid": {
+          "$ref": "#/$defs/CommitOid"
+        },
+        "old_parents": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/CommitOid"
+          }
+        }
+      },
+      "required": [
+        "old_oid",
+        "new_oid"
+      ]
+    },
+    "RebaseTopologyParentReplacement": {
+      "description": "One exact old parent generation replaced by its same-batch planned successor.",
+      "type": "object",
+      "properties": {
+        "new_parent": {
+          "$ref": "#/$defs/CommitOid"
+        },
+        "old_parent": {
+          "$ref": "#/$defs/CommitOid"
+        }
+      },
+      "required": [
+        "old_parent",
+        "new_parent"
+      ]
+    },
+    "ReconciliationAction": {
+      "description": "What reconciliation would do with one analyzed candidate-only commit.",
+      "oneOf": [
+        {
+          "description": "Proven already represented on the target; dropped from the replay.",
+          "type": "string",
+          "const": "dropped"
+        },
+        {
+          "description": "Kept and replayed. Genuinely new content is always retained.",
+          "type": "string",
+          "const": "retained"
+        }
+      ]
+    },
+    "ReplayedMergeResolution": {
+      "description": "Exact terminal merge resolution delta reapplied after sequencer replay.",
+      "type": "object",
+      "properties": {
+        "automatic_merge_tree": {
+          "$ref": "#/$defs/CommitOid"
+        },
+        "patch_oid": {
+          "$ref": "#/$defs/CommitOid"
+        },
+        "replay_tree": {
+          "$ref": "#/$defs/CommitOid"
+        },
+        "source_merge": {
+          "$ref": "#/$defs/CommitOid"
+        },
+        "source_tree": {
+          "$ref": "#/$defs/CommitOid"
+        }
+      },
+      "required": [
+        "source_merge",
+        "automatic_merge_tree",
+        "source_tree",
+        "replay_tree",
+        "patch_oid"
+      ]
+    },
+    "RepositoryId": {
+      "description": "A GitHub repository identity.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "owner": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "owner",
+        "name"
+      ]
+    },
+    "RepresentedPath": {
+      "description": "Exact per-path proof that the target already holds the prefix's content.",
+      "type": "object",
+      "properties": {
+        "blob": {
+          "description": "Blob object at the proven boundary commit; identical on the target.",
+          "type": "string"
+        },
+        "deleted": {
+          "description": "Whether the prefix's cumulative effect on this path is a deletion which\nthe target already performed.",
+          "type": "boolean"
+        },
+        "mode": {
+          "description": "File mode at the proven boundary commit; identical on the target.",
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "mode",
+        "blob",
+        "deleted"
+      ]
+    },
+    "SquashEquivalenceOutcome": {
+      "description": "Whether a proven reconciliation exists for this exact candidate/target pair.",
+      "oneOf": [
+        {
+          "description": "No stacked prefix is represented on the target with exact proof.",
+          "type": "string",
+          "const": "no_equivalence"
+        },
+        {
+          "description": "A proven prefix exists and the retained commits merge cleanly against it.",
+          "type": "string",
+          "const": "reconcilable"
+        },
+        {
+          "description": "A proven prefix exists, but the retained commits still conflict against\nthe target. This is ordinary semantic divergence after the equality\npoint and is never reconciled automatically.",
+          "type": "string",
+          "const": "residual_conflict"
+        },
+        {
+          "description": "The range cannot be evaluated exactly (absent/ambiguous merge base,\nnon-linear boundary, non-representable path, or bound exceeded).",
+          "type": "string",
+          "const": "indeterminate"
+        }
+      ]
+    },
+    "SquashEquivalenceReport": {
+      "description": "Complete auditable receipt for one squash-equivalence evaluation.",
+      "type": "object",
+      "properties": {
+        "after": {
+          "description": "Cumulative merge evidence after reconciliation, when a proven boundary\nexists. Present for both `reconcilable` and `residual_conflict`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MergeEvidence"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "analyzed_prefix_complete": {
+          "description": "Whether the analyzed linear prefix covered the whole candidate range.",
+          "type": "boolean",
+          "default": false
+        },
+        "before": {
+          "description": "Cumulative merge evidence before reconciliation.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MergeEvidence"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "boundary_tree": {
+          "description": "Tree of the proven boundary commit.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CommitOid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "candidate": {
+          "$ref": "#/$defs/BranchSnapshot"
+        },
+        "candidate_commit_count": {
+          "description": "Total candidate-only commits observed in this range.",
+          "type": "integer",
+          "format": "uint",
+          "default": 0,
+          "minimum": 0
+        },
+        "candidate_oid": {
+          "$ref": "#/$defs/CommitOid"
+        },
+        "commits": {
+          "description": "Analyzed linear prefix commits with their dispositions.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/AnalyzedCommit"
+          }
+        },
+        "evaluated_boundaries": {
+          "description": "Prefix boundaries actually proven, and whether that hit the audited bound.",
+          "type": "integer",
+          "format": "uint",
+          "default": 0,
+          "minimum": 0
+        },
+        "evaluation_bounded": {
+          "type": "boolean",
+          "default": false
+        },
+        "merge_base": {
+          "description": "Natural merge base of candidate and target, when one exists uniquely.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CommitOid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "outcome": {
+          "$ref": "#/$defs/SquashEquivalenceOutcome"
+        },
+        "policy": {
+          "type": "string"
+        },
+        "proven_boundary": {
+          "description": "Proven boundary commit, i.e. the reconciled replay base. Present\nwhenever a prefix was proven, even if the residual replay conflicts.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CommitOid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reason": {
+          "type": "string"
+        },
+        "represented_paths": {
+          "description": "Exact per-path equality proof backing the dropped prefix.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/RepresentedPath"
+          }
+        },
+        "represented_paths_truncated": {
+          "description": "Whether path evidence was bounded for receipt size.",
+          "type": "boolean",
+          "default": false
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "target": {
+          "$ref": "#/$defs/BranchSnapshot"
+        },
+        "target_oid": {
+          "$ref": "#/$defs/CommitOid"
+        },
+        "target_tree": {
+          "description": "Tree of the exact target tip which supplied the equality proof.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CommitOid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "schema_version",
+        "candidate",
+        "target",
+        "candidate_oid",
+        "target_oid",
+        "outcome",
+        "reason",
+        "policy"
+      ]
+    }
+  }
+}

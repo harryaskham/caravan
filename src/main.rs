@@ -95,6 +95,11 @@ enum Command {
     CiAdmissionGate(caravan::CiAdmissionGateInput),
     /// Validate current or proposed caravan state without mutation.
     Check(CheckInput),
+    /// Provider-truth verdict: is this exact PR generation enrolled or merged?
+    ///
+    /// Read-only and receipt-free. `succeeded` is true only when the exact
+    /// expected head is an enrolled member without force intent, or merged.
+    MembershipProof(caravan::membership_proof::MembershipProofInput),
     /// Create a one-PR caravan from the current branch.
     New(CreateInput),
     /// Reevaluate an evicted PR as a new caravan.
@@ -481,6 +486,7 @@ fn run(cli: &Cli) -> Result<(), i32> {
         Command::CiGate(input) => run_ci_gate(cli, input),
         Command::CiAdmissionGate(input) => run_ci_admission_gate(cli, input),
         Command::Check(input) => run_check(cli, input),
+        Command::MembershipProof(input) => run_membership_proof(cli, input),
         Command::New(input) => run_with_log_flush(cli, "new", || run_create_membership(cli, input)),
         Command::Renew(input) => {
             run_membership(cli, |context| caravan::membership::renew(context, input))
@@ -1480,6 +1486,34 @@ fn run_ci_gate(cli: &Cli, input: &caravan::CiGateInput) -> Result<(), i32> {
     match result {
         Ok(output) => {
             println!("{} run_ci={}", output.decision_code, output.run_ci);
+            println!("  {}", output.reason);
+            Ok(())
+        }
+        Err(error) => emit_human_error(error),
+    }
+}
+
+fn run_membership_proof(
+    cli: &Cli,
+    input: &caravan::membership_proof::MembershipProofInput,
+) -> Result<(), i32> {
+    let context = load_context(cli)?;
+    let result = caravan::membership_proof::prove(&context, input);
+    if cli.json {
+        return emit_result(true, result);
+    }
+    match result {
+        Ok(output) => {
+            println!(
+                "PR #{} {} succeeded={}",
+                output.pr, output.outcome_code, output.succeeded
+            );
+            for mismatch in &output.mismatches {
+                println!(
+                    "  mismatch {}: expected {} observed {}",
+                    mismatch.field, mismatch.expected, mismatch.observed
+                );
+            }
             println!("  {}", output.reason);
             Ok(())
         }
