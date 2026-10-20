@@ -858,6 +858,11 @@ pub struct StatusReadReceipt {
     pub output: StatusOutput,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_partial: Option<StatusPartial>,
+    /// Typed counts and recent examples of journalled failures, with
+    /// process-only refusals flagged from this status's provider facts
+    /// (bd-7e0aa1). Zero provider cost; absent when the journal is unreadable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_outcomes: Option<crate::failure_outcome::FailureSummary>,
 }
 
 /// Timing and bounded-analysis evidence for one read-only status operation.
@@ -1683,6 +1688,7 @@ fn recover_partial_status(
     output.healthy = false;
     StatusReadReceipt {
         output,
+        failure_outcomes: None,
         status_partial: Some(StatusPartial {
             schema_version: 1,
             code: "status_partial".to_owned(),
@@ -1772,6 +1778,7 @@ fn current_checkpoint_status(
     };
     StatusReadReceipt {
         output,
+        failure_outcomes: None,
         status_partial: Some(StatusPartial {
             schema_version: 2,
             code: "status_partial".to_owned(),
@@ -1853,6 +1860,7 @@ fn recover_current_partial_status(
     let attempt_provider_api = output.provider_api.clone();
     StatusReadReceipt {
         output,
+        failure_outcomes: None,
         status_partial: Some(StatusPartial {
             schema_version: 2,
             code: "status_partial".to_owned(),
@@ -1878,6 +1886,14 @@ fn recover_current_partial_status(
 /// Slow local compatibility yields a useful current-evidence partial even on a
 /// first-ever call. Other timeouts retain the config-matched last-good fallback.
 pub fn status_resilient(context: &AppContext) -> Result<StatusReadReceipt, AppError> {
+    status_resilient_without_failures(context).map(|mut receipt| {
+        receipt.failure_outcomes =
+            crate::failure_outcome::journal_summary(context, Some(&receipt.output));
+        receipt
+    })
+}
+
+fn status_resilient_without_failures(context: &AppContext) -> Result<StatusReadReceipt, AppError> {
     let started = Instant::now();
     let budget = STATUS_READ_BUDGET;
     let operation_budget = budget.saturating_sub(STATUS_COMPLETION_RESERVE);
@@ -1894,6 +1910,7 @@ pub fn status_resilient(context: &AppContext) -> Result<StatusReadReceipt, AppEr
             persist_last_good(context, &output);
             Ok(StatusReadReceipt {
                 output,
+                failure_outcomes: None,
                 status_partial: None,
             })
         }
@@ -5978,6 +5995,7 @@ mod tests {
         let output = status(pr(9, "nine", "main", false), Vec::new());
         let receipt = StatusReadReceipt {
             output,
+            failure_outcomes: None,
             status_partial: Some(StatusPartial {
                 schema_version: 2,
                 code: "status_partial".to_owned(),

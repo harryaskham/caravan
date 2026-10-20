@@ -1,0 +1,1 @@
+{"status":"error","meta":{"schema_version":1},"error":{"category":"execution_failure","code":"membership_envelope_rolled_back","message":"membership envelope rolled back after a partial provider write","details":{"mutated":true}}}

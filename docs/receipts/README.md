@@ -65,3 +65,29 @@ called out in the release notes Cacophony adopts.
   durable PR-scoped force intent). Readers accept the historical `absent` as
   `none`. Any other value is invalid, never silently mapped. Ordinary
   completion refuses `preserved`.
+
+## Failure outcomes (`cara failures`, `cara failure-classify`)
+
+Every journalled sync, join, admission, eviction and CI failure is classified
+into one stable class: `provider_error`, `budget_refusal`, `timeout`,
+`conflict_or_test_failure`, `process_refusal` (a receipt, invariant or
+bookkeeping step refused) or `unknown`. Each outcome names the exact
+`refusing_step` when one exists (for example `force_intent`,
+`deferred_label_absent`, `repository_probe`), whether a later retry is useful,
+and the tracking `bug` for known failure modes. A process refusal with no known
+bug sets `needs_bug: true`.
+
+- `cara status --json` adds `failure_outcomes`: counts per class and per
+  `surface/class/code[/step]`, plus the ten newest examples. `process_only` is
+  set from the same status's provider facts: `true` when the PR is enrolled or
+  merged although the refusal fired.
+- `cara failures` returns the same summary from the local journal only.
+- `cara failure-classify --error-file PATH [--surface S] [--pr N --expected-head OID]`
+  classifies an external envelope, such as a Caco reintegration or dead-letter
+  record. With `--pr`, provider truth from `membership-proof` sets
+  `process_only` for process refusals.
+
+Outcomes contain only allowlisted identifiers, PR numbers and timestamps; never
+messages, argv, environment, provider bodies or tokens. Fixtures for every
+class, including Caravan PR #268's 2026-10-20 `force_intent` dead letter, live in
+`tests/fixtures/failures/`.
