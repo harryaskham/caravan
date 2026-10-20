@@ -1958,6 +1958,7 @@ mod tests {
             provider_stacks_truncated: false,
             orphan_ancestry_reads_skipped: 0,
             missing_caravans: Vec::new(),
+            quarantined_caravans: Vec::new(),
             problems: Vec::new(),
         };
         let prepared = prepare_reshape(

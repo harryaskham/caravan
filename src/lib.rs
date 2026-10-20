@@ -384,6 +384,14 @@ GITHUB NATIVE STACKS (EXPLICIT OPT-IN)
   `native-stack rebase-preview` then `rebase-apply` to prepare the complete
   suffix and atomically publish force-with-lease heads; automatic native
   convergence uses that same forceful publisher, independently of rebase_on_join.
+  Caravan-local Stack drift (ancestry, member order, PR base/head
+  representation) quarantines only its own caravan: it keeps its members and
+  labels, leaves convergence and `sync.max_caravans` capacity, and escalates as
+  an external decision listing `quarantined_caravans` with the exact recovery
+  command, while independent caravans and admission keep moving. A zero-write
+  automatic recovery refusal for such a caravan is contained the same way.
+  Provider-unknown ancestry or inventory problems still fail the whole backend
+  closed.
   Under no-force authority use the authorized owner's `repair start --non-force`
   and `repair continue --no-sync`, not either native rebase path. Every changed
   generation must pass fresh CI. Sync lands the longest contiguous ready prefix under a

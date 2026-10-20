@@ -377,6 +377,7 @@ mod tests {
                     held_caravans: Vec::new(),
                     missing_required_runs: Vec::new(),
                     head_of_line: Vec::new(),
+                    quarantined_caravans: Vec::new(),
                     reason: "test fixture converged".to_owned(),
                 },
                 timing: None,
