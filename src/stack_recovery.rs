@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use clap::Args;
-use mcp_cli::ErrorCategory;
+use mcp_cli::{ErrorCategory, StructuredError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -876,24 +876,44 @@ fn auto_recover_from_facts(
             }),
         ));
     };
-    let pending = crate::stack_membership::load_pending(&context.repository_path, caravan.id)?;
-    let actor = "caravan-scheduler";
-    let reason = "stateless sync recovery from complete provider Stack inventory";
-    let rows = closed_prefix::observe(facts, caravan, provider)?;
-    let exact = RecoveryFacts {
-        recovery_rows: rows.as_ref(),
-        ..*facts
+    let caravan_id = caravan.id;
+    let recover = || {
+        let pending = crate::stack_membership::load_pending(&context.repository_path, caravan.id)?;
+        let actor = "caravan-scheduler";
+        let reason = "stateless sync recovery from complete provider Stack inventory";
+        let rows = closed_prefix::observe(facts, caravan, provider)?;
+        let exact = RecoveryFacts {
+            recovery_rows: rows.as_ref(),
+            ..*facts
+        };
+        let (plan, observation) = build_plan_with_policy(
+            &context.config,
+            &exact,
+            caravan.id,
+            actor,
+            reason,
+            pending.as_ref(),
+            false,
+        )?;
+        apply_plan_with_provider(context, plan, observation, provider, false).map(Some)
     };
-    let (plan, observation) = build_plan_with_policy(
-        &context.config,
-        &exact,
-        caravan.id,
-        actor,
-        reason,
-        pending.as_ref(),
-        false,
-    )?;
-    apply_plan_with_provider(context, plan, observation, provider, false).map(Some)
+    // Name the one caravan whose automatic recovery refused, so sync can
+    // quarantine exactly that caravan instead of failing the queue (bd-4d4621).
+    recover().map_err(|error| with_recovery_caravan(error, caravan_id))
+}
+
+fn with_recovery_caravan(error: AppError, caravan_id: PrNumber) -> AppError {
+    let mut details = error.details().unwrap_or_else(|| json!({}));
+    let Some(object) = details.as_object_mut() else {
+        return error;
+    };
+    object.insert("recovery_caravan_id".to_owned(), json!(caravan_id));
+    AppError::structured(
+        error.category(),
+        error.code(),
+        error.message(),
+        Some(details),
+    )
 }
 
 fn apply_with_provider(
@@ -1933,6 +1953,7 @@ mod tests {
             provider_stacks_truncated: false,
             orphan_ancestry_reads_skipped: 0,
             missing_caravans: vec![PrNumber(101)],
+            quarantined_caravans: Vec::new(),
             problems: vec![StackBackendProblem {
                 code: "github_stack_absent".to_owned(),
                 message: "missing".to_owned(),
@@ -2087,6 +2108,7 @@ mod tests {
             provider_stacks_truncated: false,
             orphan_ancestry_reads_skipped: 0,
             missing_caravans: Vec::new(),
+            quarantined_caravans: Vec::new(),
             problems: vec![StackBackendProblem {
                 code: "github_stack_member_order_drift".to_owned(),
                 message: "provider Stack is one exact logical tail short".to_owned(),
@@ -2186,6 +2208,7 @@ mod tests {
             provider_stacks_truncated: false,
             orphan_ancestry_reads_skipped: 0,
             missing_caravans: Vec::new(),
+            quarantined_caravans: Vec::new(),
             problems: vec![
                 StackBackendProblem {
                     code: "github_stack_member_order_drift".to_owned(),

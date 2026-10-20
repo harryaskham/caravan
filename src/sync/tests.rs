@@ -128,6 +128,7 @@ mod ci_source_precedence;
 mod closed_reformation;
 mod deferred_admission;
 mod effective_policy;
+mod native_quarantine;
 use deferred_admission::prove_deferred;
 
 impl FakeProvider {
@@ -11420,6 +11421,7 @@ fn enable_native_backend(status: &mut StatusOutput) {
         provider_stacks_truncated: false,
         orphan_ancestry_reads_skipped: 0,
         missing_caravans: Vec::new(),
+        quarantined_caravans: Vec::new(),
         problems: Vec::new(),
     };
 }
@@ -11857,6 +11859,7 @@ fn native_singleton_tail_without_stack_lands_and_retries_idempotently() {
         provider_stacks_truncated: false,
         orphan_ancestry_reads_skipped: 0,
         missing_caravans: Vec::new(),
+        quarantined_caravans: Vec::new(),
         problems: Vec::new(),
     };
     assert_eq!(status.analysis.fleet.caravans.len(), 1);

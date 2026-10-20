@@ -265,8 +265,25 @@ pub struct StackBackendStatus {
     pub orphan_ancestry_reads_skipped: usize,
     #[serde(default)]
     pub missing_caravans: Vec<PrNumber>,
+    /// Caravans whose native Stack needs repair that automatic sync will not
+    /// perform this tick. They keep their members and labels but are excluded
+    /// from active convergence and `sync.max_caravans` capacity, so one stuck
+    /// Stack cannot starve independent work (bd-4d4621). Recomputed every tick
+    /// from provider truth; never persisted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quarantined_caravans: Vec<QuarantinedCaravan>,
     #[serde(default)]
     pub problems: Vec<StackBackendProblem>,
+}
+
+/// One caravan excluded from active convergence and capacity this tick.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct QuarantinedCaravan {
+    pub caravan_id: PrNumber,
+    /// Exact refusal or problem code that sync could not resolve itself.
+    pub code: String,
+    /// The exact command a source owner or operator runs to repair it.
+    pub recovery: String,
 }
 
 impl Default for StackBackendStatus {
@@ -279,6 +296,7 @@ impl Default for StackBackendStatus {
             provider_stacks_truncated: false,
             orphan_ancestry_reads_skipped: 0,
             missing_caravans: Vec::new(),
+            quarantined_caravans: Vec::new(),
             problems: Vec::new(),
         }
     }
@@ -720,11 +738,17 @@ fn stack_backend_status(
             .map(|caravan| caravan.id)
             .collect::<Vec<_>>()
     };
+    let quarantined_caravans = native_stacks
+        .iter()
+        .filter_map(quarantined_caravan)
+        .collect::<Vec<_>>();
     let mut problems = native_stacks
         .iter()
         // Closed Stacks are historical audit rows; missing old PR snapshots do
         // not authorize or block current queue work. Every open Stack problem
         // is live mutation authority and must fail the whole backend closed.
+        // Quarantined caravans' problems stay listed here but are isolated
+        // from the fleet by `blocking_native_stack_problems` in sync.
         .filter(|native| native.stack.open)
         .flat_map(|native| native.problems.iter().cloned())
         .collect::<Vec<_>>();
@@ -746,8 +770,66 @@ fn stack_backend_status(
         provider_stacks_truncated: inventory.truncated,
         orphan_ancestry_reads_skipped,
         missing_caravans,
+        quarantined_caravans,
         problems,
     }
+}
+
+/// Native Stack problems that repair only the owner, `native-stack
+/// rebase-apply` or the queue's own automatic drift repair can resolve. They
+/// concern one caravan's representation or ancestry, never the provider
+/// inventory, so they must not stop every other caravan (bd-4d4621).
+pub(crate) const QUARANTINABLE_STACK_PROBLEMS: [&str; 4] = [
+    "github_stack_member_order_drift",
+    "native_stack_rebase_required",
+    "github_stack_pr_base_drift",
+    "github_stack_head_drift",
+];
+
+/// Whether one open mapped Stack has only caravan-local repairable problems.
+pub(crate) fn native_stack_quarantinable(native: &NativeStackStatus) -> bool {
+    native.stack.open
+        && native.caravan_id.is_some()
+        && !native.problems.is_empty()
+        && native
+            .problems
+            .iter()
+            .all(|problem| QUARANTINABLE_STACK_PROBLEMS.contains(&problem.code.as_str()))
+}
+
+/// Derived every read from provider truth, so it survives every re-read in a
+/// tick and clears itself as soon as the Stack is repaired.
+pub(crate) fn quarantined_caravan(native: &NativeStackStatus) -> Option<QuarantinedCaravan> {
+    if !native_stack_quarantinable(native) {
+        return None;
+    }
+    let caravan_id = native.caravan_id?;
+    let order_only = native
+        .problems
+        .iter()
+        .all(|problem| problem.code == "github_stack_member_order_drift");
+    let code = native
+        .problems
+        .iter()
+        .map(|problem| problem.code.as_str())
+        .find(|code| *code != "github_stack_member_order_drift")
+        .unwrap_or("github_stack_member_order_drift")
+        .to_owned();
+    let recovery = if order_only {
+        format!(
+            "cara native-stack recovery-preview --root {caravan_id} --actor <actor> --reason <reason>, then recovery-apply with its exact plan hash; or cara evict the diverged member"
+        )
+    } else {
+        format!(
+            "cara native-stack rebase-preview --stack {} --actor <actor> --reason <reason>, then rebase-apply with its exact plan hash; or the source owner's repair start --non-force; or cara evict the diverged member",
+            native.stack.number
+        )
+    };
+    Some(QuarantinedCaravan {
+        caravan_id,
+        code,
+        recovery,
+    })
 }
 
 /// Repository-wide live Caravan status.

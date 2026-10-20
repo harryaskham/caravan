@@ -383,11 +383,20 @@ pub(super) fn successful_scheduler_status(
         .any(|problem| problem.operator_action_required);
     let head_of_line = head_of_line_stalls(status, ci, missing_required_runs);
     let unknown_provider_state = !missing_required_runs.is_empty() && !operator_action;
+    let quarantined_caravans = status.stack_backend.quarantined_caravans.clone();
     let (disposition, wake_class, reason) = if operator_action {
         (
             SchedulerDisposition::OperatorAction,
             SchedulerWakeClass::OperatorAction,
             "one or more caravan members have required contexts with no reporting run on their exact current head; this never resolves by waiting",
+        )
+    } else if !quarantined_caravans.is_empty() {
+        // Ticking again cannot repair a quarantined Stack, and the rest of the
+        // queue already moves around it; wake the owner with the exact command.
+        (
+            SchedulerDisposition::ExternalDecision,
+            SchedulerWakeClass::ExternalDecision,
+            "one or more caravans are quarantined: their native Stack needs repair automatic sync will not perform; other caravans and admission continue, and quarantined_caravans names the exact recovery command",
         )
     } else if unknown_provider_state {
         (
@@ -433,6 +442,7 @@ pub(super) fn successful_scheduler_status(
         held_caravans,
         missing_required_runs: missing_required_runs.to_vec(),
         head_of_line,
+        quarantined_caravans,
         reason: reason.to_owned(),
     }
 }
@@ -490,6 +500,9 @@ pub(super) fn scheduler_failure_status(error: &AppError) -> SyncFailureScheduler
                 | "github_stack_generation_drifted"
                 | "github_stack_routing_read_refused"
                 | "github_stack_membership_detected_during_owned_merge"
+                | "github_stack_auto_recovery_ambiguous"
+                | "github_stack_recovery_source_rewrite_required"
+                | "github_stack_recovery_backend_unhealthy"
         ) =>
         {
             (

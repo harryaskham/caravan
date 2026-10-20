@@ -411,6 +411,12 @@ pub struct SyncSchedulerStatus {
     /// means the tick is genuinely idle rather than silently stuck.
     #[serde(default)]
     pub head_of_line: Vec<HeadOfLineStall>,
+    /// Caravans excluded from convergence and capacity because their native
+    /// Stack needs repair sync will not perform, each with its exact recovery
+    /// command. Non-empty always escalates to an external decision instead of
+    /// a silent retry (bd-4d4621).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quarantined_caravans: Vec<crate::read::QuarantinedCaravan>,
     pub reason: String,
 }
 
@@ -1443,38 +1449,46 @@ fn native_prefix_waits_for_provider_regeneration(
         })
 }
 
+/// A zero-write automatic recovery refusal for one caravan whose Stack is
+/// already quarantined for caravan-local drift is that caravan's problem, not
+/// the queue's. On 2026-10-12 this refusal (`#4445 does not provably contain
+/// predecessor #4444`) failed every tick for 4.5 hours while three
+/// independent PRs waited at capacity (bd-4d4621). Indeterminate or written
+/// outcomes still fail the tick so they are reconciled, never skipped.
+fn contained_recovery_refusal(status: &StatusOutput, error: &AppError) -> bool {
+    let Some(details) = error.details() else {
+        return false;
+    };
+    let zero_write = details.get("mutated").and_then(Value::as_bool) == Some(false)
+        && details.get("mutation_outcome").and_then(Value::as_str) != Some("indeterminate");
+    let Some(caravan_id) = details
+        .get("recovery_caravan_id")
+        .and_then(|value| serde_json::from_value::<PrNumber>(value.clone()).ok())
+    else {
+        return false;
+    };
+    zero_write && quarantined_native_caravan_ids(status).contains(&caravan_id)
+}
+
 fn quarantined_native_caravan_ids(status: &StatusOutput) -> BTreeSet<PrNumber> {
     status
         .stack_backend
         .native_stacks
         .iter()
-        .filter(|native| {
-            native.stack.open
-                && native.caravan_id.is_some()
-                && !native.problems.is_empty()
-                && native
-                    .problems
-                    .iter()
-                    .all(|problem| problem.code == "github_stack_member_order_drift")
-        })
+        .filter(|native| read::native_stack_quarantinable(native))
         .filter_map(|native| native.caravan_id)
         .collect()
 }
 
 fn blocking_native_stack_problems(status: &StatusOutput) -> Vec<&crate::read::StackBackendProblem> {
+    // Caravan-local drift quarantines only its own caravan (bd-4d4621). It is
+    // excluded from convergence and capacity and escalated to its owner, while
+    // every other caravan and admission keeps moving.
     let isolated = status
         .stack_backend
         .native_stacks
         .iter()
-        .filter(|native| {
-            native.stack.open
-                && native.caravan_id.is_some()
-                && !native.problems.is_empty()
-                && native
-                    .problems
-                    .iter()
-                    .all(|problem| problem.code == "github_stack_member_order_drift")
-        })
+        .filter(|native| read::native_stack_quarantinable(native))
         .flat_map(|native| native.problems.iter())
         .collect::<Vec<_>>();
     status
@@ -1501,7 +1515,7 @@ pub(crate) fn require_native_stack_backend_healthy(status: &StatusOutput) -> Res
             "provider_mutations": 0,
             "resumable": true,
             "safe_next_action": if blocking.iter().any(|problem| problem.code == "native_stack_rebase_required") {
-                "preserve every current source head; route ancestry repair to its source owner using history-preserving non-force repair; ordinary sync never invokes native rebase automatically"
+                "preserve every current source head; route ancestry repair to its source owner (native-stack rebase-preview/apply or history-preserving non-force repair); sync repairs drift automatically only for mapped, caravan-local Stacks under reviewed Stack mutation opt-in"
             } else {
                 "resume or reconcile the exact pending native-membership checkpoint; preserve every current head and never fall back to an ordinary squash merge"
             },
@@ -5189,9 +5203,21 @@ fn sync_with_lock(
 
     // Complete provider inventory is authority for missing native membership.
     // A local checkpoint may strengthen/replay the plan but is never required.
-    if let Some(recovery) =
-        crate::stack_recovery::auto_recover_missing(context, &status, &provider)?
-    {
+    let recovered = match crate::stack_recovery::auto_recover_missing(context, &status, &provider) {
+        Ok(recovered) => recovered,
+        Err(error) if contained_recovery_refusal(&status, &error) => {
+            progress::emit(
+                "native_recovery_quarantined",
+                format!(
+                    "automatic Stack recovery refused with {} for one caravan already quarantined for caravan-local drift; continuing with the rest of the queue",
+                    error.code()
+                ),
+            );
+            None
+        }
+        Err(error) => return Err(error),
+    };
+    if let Some(recovery) = recovered {
         let mut recovered_status =
             read::fleet_status_for_sync(context, operation_deadline, Some(&github_budget))?;
         if let Some(authority) = authority {
@@ -6473,12 +6499,16 @@ pub(crate) fn caravan_fleet_capacity_refusal(
     status: &StatusOutput,
     candidate_pr: PrNumber,
 ) -> Option<CaravanFleetCapacityRefusal> {
+    // A quarantined caravan needs owner repair automatic sync will not perform;
+    // like a parked one it keeps its topology but releases capacity, so a sole
+    // stuck caravan can never starve independent roots (bd-4d4621).
+    let quarantined = quarantined_native_caravan_ids(status);
     let active_caravan_ids = status
         .analysis
         .fleet
         .caravans
         .iter()
-        .filter(|caravan| !caravan.parked)
+        .filter(|caravan| !caravan.parked && !quarantined.contains(&caravan.id))
         .map(|caravan| caravan.id)
         .collect::<Vec<_>>();
     let parked_caravan_ids = status
@@ -6486,7 +6516,7 @@ pub(crate) fn caravan_fleet_capacity_refusal(
         .fleet
         .caravans
         .iter()
-        .filter(|caravan| caravan.parked)
+        .filter(|caravan| caravan.parked || quarantined.contains(&caravan.id))
         .map(|caravan| caravan.id)
         .collect::<Vec<_>>();
     let active_caravans = active_caravan_ids.len();
