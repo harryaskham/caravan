@@ -193,6 +193,9 @@
             rust-analyzer
             git
             gh
+            # The reference readiness step (examples/workflows/
+            # cara-readiness-membership.sh) is exercised by hermetic tests.
+            jq
             actionlint
             shellcheck
           ];

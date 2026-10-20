@@ -65,11 +65,47 @@ pub enum LineageEvidenceStatus {
 }
 
 /// Exact generation carried by the deferred sentinel's bounded log evidence.
+///
+/// Every reason means the same thing to the queue: this gate run did not
+/// evaluate the current generation, so it is neither a source verdict nor a
+/// red member. A labelled member's unevaluated gate is rerun once.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct DeferredAdmissionReceipt {
     pub pr: PrNumber,
     pub head_oid: CommitOid,
     pub base_oid: CommitOid,
+    #[serde(default, skip_serializing_if = "DeferredAdmissionReason::is_unjoined")]
+    pub reason: DeferredAdmissionReason,
+}
+
+/// Why one admission-gate run is unevaluated (bd-06e059).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DeferredAdmissionReason {
+    /// Exact unjoined generation: heavy CI waits for membership.
+    #[default]
+    Unjoined,
+    /// Provider membership (the member label) changed between the membership
+    /// observation and the gate's fresh provider read, so the observation was
+    /// stale. Strict label checks still refuse to report it as either state.
+    MembershipChanged,
+    /// The exact generation was a draft; readiness reruns the gate.
+    Draft,
+}
+
+impl DeferredAdmissionReason {
+    #[must_use]
+    pub const fn is_unjoined(&self) -> bool {
+        matches!(self, Self::Unjoined)
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "membership_changed" => Some(Self::MembershipChanged),
+            "draft" => Some(Self::Draft),
+            _ => None,
+        }
+    }
 }
 
 /// One failed/cancelled/timed-out Actions job and its bounded failed steps.
@@ -271,13 +307,20 @@ fn parse_deferred_admission_receipt(output: &str) -> Option<DeferredAdmissionRec
     if !lines.contains(&"##[error]Process completed with exit code 78.") {
         return None;
     }
-    let receipts = lines
+    let deferred = lines
         .iter()
         .filter_map(|line| line.strip_prefix("cara-deferred-admission "))
         .collect::<Vec<_>>();
-    if !receipts.is_empty() {
-        let [receipt] = receipts.as_slice() else {
-            return None;
+    let unevaluated = lines
+        .iter()
+        .filter_map(|line| line.strip_prefix("cara-admission-unevaluated "))
+        .collect::<Vec<_>>();
+    if !deferred.is_empty() || !unevaluated.is_empty() {
+        // Exactly one receipt of exactly one kind; anything else is ambiguous.
+        let (receipt, unevaluated) = match (deferred.as_slice(), unevaluated.as_slice()) {
+            ([receipt], []) => (*receipt, false),
+            ([], [receipt]) => (*receipt, true),
+            _ => return None,
         };
         let fields = receipt
             .split_ascii_whitespace()
@@ -288,14 +331,22 @@ fn parse_deferred_admission_receipt(output: &str) -> Option<DeferredAdmissionRec
                 .iter()
                 .find_map(|(name, value)| (*name == key).then_some(*value))
         };
-        if fields.len() != 5 || field("decision")? != "deferred_unjoined" || field("exit")? != "78"
-        {
+        let reason = if unevaluated {
+            DeferredAdmissionReason::parse(field("reason")?)?
+        } else {
+            if field("decision")? != "deferred_unjoined" {
+                return None;
+            }
+            DeferredAdmissionReason::Unjoined
+        };
+        if fields.len() != 5 || field("exit")? != "78" {
             return None;
         }
         return Some(DeferredAdmissionReceipt {
             pr: PrNumber(field("pr")?.parse().ok()?),
             head_oid: parse_oid(field("head")?)?,
             base_oid: parse_oid(field("base")?)?,
+            reason,
         });
     }
     // Compatibility with the deployed Cacophony sentinel, before the compact
@@ -323,6 +374,7 @@ fn parse_deferred_admission_receipt(output: &str) -> Option<DeferredAdmissionRec
         pr: PrNumber(value("CACO_CI_PR_NUMBER: ")?.parse().ok()?),
         head_oid: parse_oid(value("CACO_CI_EXPECTED_HEAD: ")?)?,
         base_oid: parse_oid(value("CACO_CI_EXPECTED_BASE: ")?)?,
+        reason: DeferredAdmissionReason::Unjoined,
     })
 }
 
@@ -806,6 +858,312 @@ pub(crate) mod tests {
             parse_deferred_admission_receipt(&body.replace("exit code 78", "exit code 1"))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn unevaluated_admission_receipt_is_exact_and_allowlisted() {
+        let line = |reason: &str| {
+            format!(
+                "cara-admission-unevaluated pr=4575 head={} base={} reason={reason} exit=78",
+                "a".repeat(40),
+                "b".repeat(40)
+            )
+        };
+        let body = |line: &str| format!("{line}\n##[error]Process completed with exit code 78.\n");
+        for (reason, expected) in [
+            (
+                "membership_changed",
+                DeferredAdmissionReason::MembershipChanged,
+            ),
+            ("draft", DeferredAdmissionReason::Draft),
+        ] {
+            let receipt = parse_deferred_admission_receipt(&body(&line(reason))).unwrap();
+            assert_eq!(receipt.pr, PrNumber(4575));
+            assert_eq!(receipt.reason, expected);
+            assert_eq!(
+                serde_json::to_value(&receipt).unwrap()["reason"],
+                reason,
+                "reason is visible on the wire"
+            );
+        }
+        // Unknown reasons, wrong exits, echoed source and mixed kinds refuse.
+        assert!(parse_deferred_admission_receipt(&body(&line("label_absent"))).is_none());
+        assert!(
+            parse_deferred_admission_receipt(
+                &body(&line("draft")).replace("exit code 78", "exit code 1")
+            )
+            .is_none()
+        );
+        assert!(
+            parse_deferred_admission_receipt(&body(&line("draft").replace("exit=78", "exit=1")))
+                .is_none()
+        );
+        assert!(
+            parse_deferred_admission_receipt(&body(&format!("echo {}", line("draft")))).is_none()
+        );
+        let deferred = format!(
+            "cara-deferred-admission pr=4575 head={} base={} decision=deferred_unjoined exit=78",
+            "a".repeat(40),
+            "b".repeat(40)
+        );
+        assert!(
+            parse_deferred_admission_receipt(&body(&format!(
+                "{deferred}\n{}",
+                line("membership_changed")
+            )))
+            .is_none()
+        );
+        // The historical deferred receipt keeps its exact wire (no reason).
+        let receipt = parse_deferred_admission_receipt(&body(&deferred)).unwrap();
+        assert_eq!(receipt.reason, DeferredAdmissionReason::Unjoined);
+        assert!(
+            serde_json::to_value(&receipt)
+                .unwrap()
+                .get("reason")
+                .is_none()
+        );
+    }
+
+    /// Hermetic harness for the reference readiness membership step.
+    #[cfg(unix)]
+    mod readiness_step {
+        use super::*;
+        use serde_json::json;
+        use std::os::unix::fs::PermissionsExt;
+
+        const SCRIPT: &str = include_str!("../examples/workflows/cara-readiness-membership.sh");
+        const HEAD: &str = "1111111111111111111111111111111111111111";
+        const BASE: &str = "2222222222222222222222222222222222222222";
+        const REPO: &str = "owner/example";
+        const RUN_ID: u64 = 4242;
+        const CHECK_ID: u64 = 9090;
+
+        /// Observation outputs from `cara ci-admission-gate`.
+        #[derive(Clone, Copy)]
+        enum Observation {
+            Member,
+            Deferred,
+            Unknown,
+        }
+
+        struct Outcome {
+            code: Option<i32>,
+            stdout: String,
+            stderr: String,
+        }
+
+        impl Outcome {
+            /// Cara parses the bounded job log, which carries the step's stdout
+            /// followed by the runner's own exit line.
+            fn receipt(&self) -> Option<DeferredAdmissionReceipt> {
+                parse_deferred_admission_receipt(&format!(
+                    "{}##[error]Process completed with exit code {}.\n",
+                    self.stdout,
+                    self.code.unwrap_or(-1)
+                ))
+            }
+        }
+
+        fn run(
+            action: &str,
+            event_draft: bool,
+            observation: Observation,
+            labels: &[&str],
+            provider_head: &str,
+        ) -> Outcome {
+            let root = tempfile::tempdir().unwrap();
+            let bin = root.path().join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let pull_request = |draft: bool, head: &str| {
+                json!({
+                    "number": 4575,
+                    "state": "open",
+                    "draft": draft,
+                    "head": {"sha": head, "ref": "agent/x", "repo": {"full_name": REPO}},
+                    "base": {"sha": BASE, "ref": "main", "repo": {"full_name": REPO}},
+                    "labels": labels.iter().map(|name| json!({"name": name})).collect::<Vec<_>>(),
+                })
+            };
+            let event = json!({
+                "action": action,
+                "repository": {"full_name": REPO},
+                "pull_request": pull_request(event_draft, HEAD),
+            });
+            let event_path = root.path().join("event.json");
+            std::fs::write(&event_path, event.to_string()).unwrap();
+            std::fs::write(
+                root.path().join("provider.json"),
+                pull_request(false, provider_head).to_string(),
+            )
+            .unwrap();
+            std::fs::write(
+                root.path().join("jobs.json"),
+                json!({"jobs": [{
+                    "name": "Caravan admission gate", "head_sha": HEAD, "run_id": RUN_ID,
+                    "check_run_url": format!("https://api.github.com/repos/{REPO}/check-runs/{CHECK_ID}"),
+                }]})
+                .to_string(),
+            )
+            .unwrap();
+            std::fs::write(
+                root.path().join("check.json"),
+                json!({"id": CHECK_ID, "name": "Caravan admission gate", "head_sha": HEAD,
+                       "app": {"id": 15368}, "status": "in_progress"})
+                .to_string(),
+            )
+            .unwrap();
+            let fixtures = root.path().display().to_string();
+            std::fs::write(
+                bin.join("gh"),
+                format!(
+                    "#!/bin/sh\ncase \"$4\" in\n  repos/{REPO}/pulls/4575) cat '{fixtures}/provider.json' ;;\n  repos/{REPO}/actions/runs/{RUN_ID}/jobs*) cat '{fixtures}/jobs.json' ;;\n  repos/{REPO}/check-runs/{CHECK_ID}) cat '{fixtures}/check.json' ;;\n  *) echo \"unexpected gh $*\" >&2; exit 9 ;;\nesac\n"
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            let script = root.path().join("step.sh");
+            std::fs::write(&script, SCRIPT).unwrap();
+            let (state, decision, run_ci, deferred) = match observation {
+                Observation::Member => ("member", "run_member", "true", "false"),
+                Observation::Deferred => ("deferred", "deferred_unjoined", "false", "true"),
+                Observation::Unknown => ("unknown", "run_unproven", "true", "false"),
+            };
+            let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            )))
+            .unwrap();
+            let output = std::process::Command::new("bash")
+                .arg(&script)
+                .env_clear()
+                .env("PATH", path)
+                .env("GITHUB_EVENT_NAME", "pull_request")
+                .env("GITHUB_EVENT_PATH", &event_path)
+                .env("GITHUB_REPOSITORY", REPO)
+                .env("GITHUB_RUN_ID", RUN_ID.to_string())
+                .env("RUNNER_TEMP", root.path())
+                .env("ADMISSION_RESULT", "success")
+                .env("MEMBERSHIP_STATE", state)
+                .env("ADMISSION_DECISION", decision)
+                .env("RUN_CI", run_ci)
+                .env("DEFERRED_UNJOINED", deferred)
+                .env("OBSERVED_HEAD", HEAD)
+                .env("OBSERVED_BASE", BASE)
+                .env("OBSERVED_PR", "4575")
+                .env("MEMBERSHIP_LABEL", "caravan")
+                .output()
+                .expect("bash runs the reference readiness step");
+            Outcome {
+                code: output.status.code(),
+                stdout: String::from_utf8(output.stdout).unwrap(),
+                stderr: String::from_utf8(output.stderr).unwrap(),
+            }
+        }
+
+        #[test]
+        fn label_before_gate_is_a_proven_member() {
+            let outcome = run(
+                "synchronize",
+                false,
+                Observation::Member,
+                &["caravan"],
+                HEAD,
+            );
+            assert_eq!(outcome.code, Some(0), "{}", outcome.stderr);
+            assert!(outcome.stdout.contains("membership proven"));
+            assert!(outcome.receipt().is_none());
+        }
+
+        #[test]
+        fn unjoined_generation_is_an_exact_deferral() {
+            let outcome = run("opened", false, Observation::Deferred, &[], HEAD);
+            assert_eq!(outcome.code, Some(78), "{}", outcome.stderr);
+            assert!(outcome.stderr.is_empty(), "{}", outcome.stderr);
+            let receipt = outcome.receipt().expect("Cara parses the deferral");
+            assert_eq!(receipt.reason, DeferredAdmissionReason::Unjoined);
+            assert_eq!(receipt.pr, PrNumber(4575));
+            assert_eq!(receipt.head_oid.0, HEAD);
+            assert_eq!(receipt.base_oid.0, BASE);
+        }
+
+        #[test]
+        fn label_after_gate_is_unevaluated_not_red() {
+            // PR4575, 2026-10-20: observation said deferred, the fresh provider
+            // read already carried the label. Previously exit 1 (red).
+            let outcome = run("opened", false, Observation::Deferred, &["caravan"], HEAD);
+            assert_eq!(outcome.code, Some(78), "{}", outcome.stderr);
+            assert!(outcome.stderr.is_empty(), "{}", outcome.stderr);
+            assert!(!outcome.stdout.contains("cara-deferred-admission"));
+            let receipt = outcome
+                .receipt()
+                .expect("Cara parses the unevaluated receipt");
+            assert_eq!(receipt.reason, DeferredAdmissionReason::MembershipChanged);
+            assert_eq!(receipt.head_oid.0, HEAD);
+        }
+
+        #[test]
+        fn label_removed_after_member_observation_is_unevaluated() {
+            let outcome = run("synchronize", false, Observation::Member, &[], HEAD);
+            assert_eq!(outcome.code, Some(78), "{}", outcome.stderr);
+            assert!(!outcome.stdout.contains("membership proven"));
+            assert_eq!(
+                outcome.receipt().unwrap().reason,
+                DeferredAdmissionReason::MembershipChanged
+            );
+        }
+
+        #[test]
+        fn draft_then_ready_converges() {
+            let draft = run("opened", true, Observation::Unknown, &[], HEAD);
+            assert_eq!(draft.code, Some(78), "{}", draft.stderr);
+            assert_eq!(
+                draft.receipt().unwrap().reason,
+                DeferredAdmissionReason::Draft
+            );
+            let ready = run("ready_for_review", false, Observation::Deferred, &[], HEAD);
+            assert_eq!(ready.code, Some(78), "{}", ready.stderr);
+            assert_eq!(
+                ready.receipt().unwrap().reason,
+                DeferredAdmissionReason::Unjoined
+            );
+            let joined = run(
+                "ready_for_review",
+                false,
+                Observation::Member,
+                &["caravan"],
+                HEAD,
+            );
+            assert_eq!(joined.code, Some(0), "{}", joined.stderr);
+        }
+
+        #[test]
+        fn identity_drift_still_refuses_without_any_receipt() {
+            let outcome = run(
+                "synchronize",
+                false,
+                Observation::Deferred,
+                &["caravan"],
+                "9999999999999999999999999999999999999999",
+            );
+            assert_eq!(outcome.code, Some(1));
+            assert!(
+                outcome
+                    .stderr
+                    .contains("cara-readiness-refused predicate=provider_tuple exit=1"),
+                "{}",
+                outcome.stderr
+            );
+            assert!(outcome.receipt().is_none());
+            let unknown = run(
+                "synchronize",
+                false,
+                Observation::Unknown,
+                &["caravan"],
+                HEAD,
+            );
+            assert_eq!(unknown.code, Some(1));
+            assert!(unknown.stderr.contains("predicate=member_state"));
+        }
     }
 
     #[test]
