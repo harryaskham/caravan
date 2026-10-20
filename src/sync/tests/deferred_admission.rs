@@ -82,6 +82,7 @@ pub(super) fn prove_deferred(provider: &FakeProvider, candidate: &PullRequestSna
         pr: candidate.number,
         head_oid: candidate.head.oid.clone(),
         base_oid: candidate.base.oid.clone(),
+        reason: crate::ci::DeferredAdmissionReason::Unjoined,
     });
     lineage.head_sha = candidate.head.oid.0.clone();
     lineage.head_committed_at = Some(PUBLISHED_AT.to_owned());
@@ -564,5 +565,95 @@ fn deferred_admission_log_parser_requires_complete_actual_output() {
         let response =
             crate::ci::tests::deferred_fixture(&PullRequestPrecondition::from(&candidate), &log);
         assert!(crate::ci::proven_deferred_job(&response.runs[0]).is_none());
+    }
+}
+
+/// bd-06e059: the gate's membership observation said "deferred", but by the
+/// time its strict fresh provider read ran the member label was present (Cara
+/// joined the PR mid-run). The gate refuses to report either state and emits a
+/// typed unevaluated receipt instead of a bare exit 1. Cara must treat that run
+/// as unevaluated, never red, and rerun the exact gate once for the member;
+/// before membership it is an ordinary deferral. The same holds for a draft
+/// generation that later became ready.
+#[test]
+fn unevaluated_gate_receipts_converge_instead_of_leaving_a_red_member() {
+    for (reason, labelled) in [
+        ("membership_changed", true),
+        ("membership_changed", false),
+        ("draft", false),
+    ] {
+        let (mut candidate, _, lineage) = fixture();
+        let receipt = format!(
+            "cara-admission-unevaluated pr={} head={} base={} reason={reason} exit=78",
+            candidate.number, candidate.head.oid.0, candidate.base.oid.0
+        );
+        let log = LOG.replace(
+            "Caravan admission deferred until exact PR membership (decision=deferred_unjoined)",
+            &receipt,
+        );
+        let diagnostics =
+            crate::ci::tests::deferred_fixture(&PullRequestPrecondition::from(&candidate), &log);
+        let job = crate::ci::proven_deferred_job(&diagnostics.runs[0])
+            .expect("a typed unevaluated receipt proves an unevaluated gate run");
+        assert_eq!(
+            serde_json::to_value(&job.deferred_admission).unwrap()["reason"],
+            reason
+        );
+        if labelled {
+            candidate.labels.insert("caravan".to_owned());
+        }
+        let provider = setup(&candidate, diagnostics, lineage);
+        let observed = status(vec![candidate.clone()], Some(candidate.number), &clean);
+        let mut progress = SyncProgress::new(&observed, Vec::new(), u32::MAX);
+        let ci = progress
+            .observe_ci(&provider, &repository(), candidate.number)
+            .unwrap();
+        assert_eq!(
+            ci.disposition,
+            CiDisposition::Waiting,
+            "{reason}: never red"
+        );
+        assert_eq!(
+            ci.failure_diagnostics[0].classification,
+            WorkflowFailureClass::DeferredAdmission,
+            "{reason}"
+        );
+        assert!(
+            observation_has_proven_deferred_gate(&gate(), &ci),
+            "{reason}"
+        );
+        if labelled {
+            // Enrolled member: rerun the exact gate once; no other write.
+            let trigger =
+                admission_gate_retrigger(&provider, &repository(), &candidate, &gate()).unwrap();
+            perform_admission_gate_retrigger(
+                &provider,
+                &mut progress,
+                &repository(),
+                candidate.number,
+                trigger,
+            )
+            .unwrap();
+            assert_eq!(
+                provider.workflow_reruns.borrow().as_slice(),
+                [(candidate.number, RUN)]
+            );
+            assert!(provider.rerequests.borrow().is_empty());
+        } else {
+            // Unjoined: an unevaluated gate never refuses admission.
+            assert!(
+                candidate_local_admission_refusal(
+                    &provider,
+                    &mut progress,
+                    &repository(),
+                    candidate.number,
+                    Some(&gate())
+                )
+                .unwrap()
+                .is_none(),
+                "{reason}"
+            );
+            assert!(provider.workflow_reruns.borrow().is_empty());
+        }
     }
 }

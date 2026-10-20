@@ -1130,6 +1130,18 @@ an actual containing release rather than rewrite the event. See
 [`docs/gated-ci.md`](docs/gated-ci.md) for the canonical workflow, real-command
 compatibility tests, and Cacophony/Pi-Daemon adoption sequence.
 
+A consumer's separate required readiness reporter re-reads the provider after
+the observation job, so membership can change between the two. The reference
+step [`examples/workflows/cara-readiness-membership.sh`](examples/workflows/cara-readiness-membership.sh)
+keeps its label checks strict (never a deferral while the label is present,
+never membership while it is absent) and, instead of a red exit 1, ends that
+race or a draft generation with exit 78 and one
+`cara-admission-unevaluated pr=N head=H base=B reason=membership_changed|draft exit=78`
+line. Cara parses it like the deferral receipt: the run is unevaluated, never a
+source verdict or a red member, and an enrolled member's exact gate is rerun
+once. Identity, provider and reporting failures still exit 1 with
+`cara-readiness-refused predicate=<name>`.
+
 If the same immutable parked head later becomes green but no normal sync tick can
 release it, use the reviewed `cara unpark` surface—not `resume`, `rejoin`, or a
 raw label edit. It requires exact repository/PR/head/base, current Caravan
