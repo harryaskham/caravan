@@ -573,6 +573,14 @@ pub struct StackRolloutConfig {
     /// Non-secret reviewer/ticket identity recorded with the opt-in.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub reviewed_by: String,
+    /// Keep the pre-bd-7ff76d policy: never repair routine native Stack drift
+    /// automatically; quarantine the caravan and route it to its owner.
+    /// Default `false`: under the reviewed opt-in above, sync repairs a
+    /// caravan-local drifted Stack itself with one lease-guarded, audited
+    /// rebase and fresh CI. Omitted when false so existing fingerprints are
+    /// unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub manual_drift_repair: bool,
 }
 
 /// Dedicated bounds for network-heavy isolated repair materialization.

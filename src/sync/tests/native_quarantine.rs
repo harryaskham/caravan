@@ -255,3 +255,102 @@ fn status_derives_quarantine_and_recovery_command_from_provider_truth() {
     closed.stack.open = false;
     assert!(crate::read::quarantined_caravan(&closed).is_none());
 }
+
+fn drift_repair_context(manual: bool, opt_in: bool) -> AppContext {
+    let mut context = AppContext::default();
+    context.config.stack_type = crate::config::StackType::Github;
+    context.config.stack_rollout.mutations_opt_in = opt_in;
+    context.config.stack_rollout.reviewed_by = "operator".to_owned();
+    context.config.stack_rollout.manual_drift_repair = manual;
+    context
+}
+
+/// bd-7ff76d: the queue plans routine drift repair itself, with the sealed
+/// planner an owner would review, but only where policy and facts allow.
+#[test]
+fn queue_plans_routine_drift_repair_only_under_reviewed_opt_in() {
+    let pulls = vec![
+        caravan_member(1, "root", "main"),
+        caravan_member(2, "child", "root"),
+    ];
+    let mut status = caravan_status(pulls, Some(PrNumber(1)), true);
+    enable_native_backend(&mut status);
+    quarantine(&mut status, &["native_stack_rebase_required"]);
+
+    let plans =
+        crate::native_stack_rebase::drift_repair_plans(&drift_repair_context(false, true), &status);
+    assert_eq!(plans.len(), 1);
+    let plan = &plans[0].1;
+    assert!(plan.verify());
+    assert_eq!(plan.stack, 42);
+    assert_eq!(plan.root_pr, PrNumber(1));
+    assert_eq!(
+        plan.actor,
+        crate::native_stack_rebase::SYNC_DRIFT_REPAIR_ACTOR
+    );
+    // Only the diverged child is replayed onto its parent's exact head.
+    assert_eq!(plan.members.len(), 1);
+    assert_eq!(plan.members[0].pr, PrNumber(2));
+    assert_eq!(plan.members[0].parent_pr, Some(PrNumber(1)));
+    assert_eq!(
+        plan.members[0].parent_head,
+        status.analysis.pull_requests[&PrNumber(1)].head.oid
+    );
+
+    // Repository chose owner-only repair, or never opted into Stack mutation.
+    for context in [
+        drift_repair_context(true, true),
+        drift_repair_context(false, false),
+    ] {
+        assert!(crate::native_stack_rebase::drift_repair_plans(&context, &status).is_empty());
+    }
+
+    // Membership-only drift belongs to automatic recovery, and unknown
+    // ancestry is never authority for a rewrite.
+    for codes in [
+        &["github_stack_member_order_drift"][..],
+        &["github_stack_ancestry_unknown"][..],
+    ] {
+        let mut other = status.clone();
+        quarantine(&mut other, codes);
+        assert!(
+            crate::native_stack_rebase::drift_repair_plans(
+                &drift_repair_context(false, true),
+                &other
+            )
+            .is_empty(),
+            "{codes:?}"
+        );
+    }
+
+    // A parked caravan stays outside automatic writes.
+    let mut parked = status.clone();
+    parked.analysis.fleet.caravans[0].parked = true;
+    assert!(
+        crate::native_stack_rebase::drift_repair_plans(&drift_repair_context(false, true), &parked)
+            .is_empty()
+    );
+}
+
+/// A root merged out of band leaves the child based on a stale branch; the
+/// queue's plan replays the child onto the exact default branch instead of
+/// waiting for an operator.
+#[test]
+fn queue_plans_child_retarget_when_its_root_is_stale() {
+    let pulls = vec![
+        caravan_member(1, "root", "main"),
+        caravan_member(2, "child", "root"),
+    ];
+    let mut status = caravan_status(pulls, Some(PrNumber(1)), true);
+    enable_native_backend(&mut status);
+    quarantine(&mut status, &["native_stack_rebase_required"]);
+    status.analysis.fleet.default_branch.oid = CommitOid("f".repeat(40));
+    let plans =
+        crate::native_stack_rebase::drift_repair_plans(&drift_repair_context(false, true), &status);
+    assert_eq!(plans.len(), 1);
+    let plan = &plans[0].1;
+    assert_eq!(plan.members[0].pr, PrNumber(1));
+    assert_eq!(plan.members[0].parent_pr, None);
+    assert_eq!(plan.members[0].parent_head.0, "f".repeat(40));
+    assert_eq!(plan.members.len(), 2, "the whole suffix follows its root");
+}
