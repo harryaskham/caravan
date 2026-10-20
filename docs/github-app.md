@@ -60,6 +60,29 @@ the first principal for the process lifetime; caches only a usable short-lived
 token; single-flights refresh; and retries one authentication failure. Invalid
 or incomplete App mode fails closed and never falls back to a human account.
 
+The broker child and the exact-repository access probe honour the caller's
+configured `command_timeout_secs` and any shared operation deadline; there is no
+separate fixed probe bound. A started child that times out, or a probe that
+meets a transient provider gateway failure (HTTP 502/503/504, reset), is retried
+up to three attempts with 0.5 s then 1.5 s backoff, only while another attempt
+still fits inside the operation deadline. Grant, rename, token and broker
+configuration verdicts are never retried.
+
+Every refusal is typed and secret-free. Errors and `provider_api` telemetry
+carry `github_app_refusal` with an allowlisted `stage` (`configuration`,
+`repository_resolution`, `credential_broker`, `credential_validation`,
+`principal_binding`, `repository_probe`, `git_transport`), `category`
+(`configuration`, `spawn_or_io`, `timeout`, `deadline_exhausted`,
+`output_limit`, `invalid_utf8`, `request_budget`, `nonzero_exit`,
+`invalid_json`, `invalid_credential`, `identity_mismatch`,
+`repository_not_found`, `repository_forbidden`, `token_rejected`,
+`provider_unavailable`, `provider_unclassified`), `attempts`, `timeout_ms` for
+timeouts, and `retryable`. Only `timeout`, `deadline_exhausted`,
+`request_budget` and `provider_unavailable` are retryable by a later operation.
+`spawn_or_io` is not proof that the broker never started: launch, wait, reap
+and stdin failures share it. Argv, environment, stdout, stderr and token bytes
+are never part of a refusal.
+
 ## Repository permissions
 
 Install the App only on repositories Caravan operates. Start with this baseline:

@@ -4650,6 +4650,31 @@ fn eligible_or_error(
 
 #[allow(clippy::too_many_lines)]
 fn discovery_error(error: &DiscoveryError) -> AppError {
+    // An explicit GitHub App refusal carries a typed, allowlisted category.
+    // Report it instead of the generic Debug dump so callers can retry a
+    // transient refusal with backoff and fix a real grant/configuration one,
+    // rather than dead-lettering both identically (bd-096b1e). The code stays
+    // `github_discovery_failed` for existing consumers.
+    if let DiscoveryError::Runner(runner_error) = error
+        && let Some(refusal) = runner_error.github_app_refusal()
+    {
+        return AppError::structured(
+            ErrorCategory::ExecutionFailure,
+            "github_discovery_failed",
+            error.to_string(),
+            Some(json!({
+                "stage": "github_app_auth",
+                "github_app_refusal": refusal,
+                "retryable": refusal.retryable,
+                "mutated": false,
+                "safe_next_action": if refusal.retryable {
+                    "retry the same read-only operation with backoff; this refusal names no credential, grant or repository verdict"
+                } else {
+                    "fix the named App broker, grant or configuration stage; retrying unchanged cannot succeed"
+                },
+            })),
+        );
+    }
     if let DiscoveryError::Runner(CommandRunError::OutputLimit {
         command,
         code,
@@ -5473,6 +5498,53 @@ mod tests {
         assert_eq!(details["streams_combined"], false);
         assert_eq!(details["stderr"], "wrapper diagnostic\u{1}");
         assert!(details["stdout"].as_str().unwrap().contains("bad"));
+    }
+
+    #[test]
+    fn github_app_refusal_is_typed_retryable_and_never_a_debug_dump() {
+        use crate::command::{GithubAppRefusal, GithubAppRefusalCategory, GithubAppRefusalStage};
+        let error = discovery_error(&DiscoveryError::Runner(
+            CommandRunError::GithubAppAuthRefused {
+                command: crate::command::CommandSpec::new("gh")
+                    .args(["repo", "view", "owner/repo"])
+                    .env("GH_TOKEN", "ghs_never_render"),
+                refusal: GithubAppRefusal::new(
+                    GithubAppRefusalStage::RepositoryProbe,
+                    GithubAppRefusalCategory::Timeout,
+                    "GitHub App exact-repository access probe exceeded its deadline and was terminated",
+                ),
+            },
+        ));
+        assert_eq!(
+            mcp_cli::StructuredError::code(&error),
+            "github_discovery_failed"
+        );
+        let details = mcp_cli::StructuredError::details(&error).unwrap();
+        assert_eq!(details["stage"], "github_app_auth");
+        assert_eq!(details["retryable"], true);
+        assert_eq!(details["mutated"], false);
+        assert_eq!(details["github_app_refusal"]["stage"], "repository_probe");
+        assert_eq!(details["github_app_refusal"]["category"], "timeout");
+        assert!(details.get("error").is_none());
+        assert!(!details.to_string().contains("ghs_never_render"));
+        assert!(!error.to_string().contains("ghs_never_render"));
+
+        let forbidden = discovery_error(&DiscoveryError::Runner(
+            CommandRunError::GithubAppAuthRefused {
+                command: crate::command::CommandSpec::new("gh").args(["repo", "view"]),
+                refusal: GithubAppRefusal::new(
+                    GithubAppRefusalStage::RepositoryProbe,
+                    GithubAppRefusalCategory::RepositoryForbidden,
+                    "selected GitHub App installation lacks an exact repository grant",
+                ),
+            },
+        ));
+        let details = mcp_cli::StructuredError::details(&forbidden).unwrap();
+        assert_eq!(details["retryable"], false);
+        assert_eq!(
+            details["github_app_refusal"]["category"],
+            "repository_forbidden"
+        );
     }
 
     #[test]

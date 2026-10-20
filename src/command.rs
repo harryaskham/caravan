@@ -24,7 +24,13 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_STDOUT_CAPTURE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_STDERR_CAPTURE_BYTES: usize = 64 * 1024;
 const OUTPUT_LIMIT_EVIDENCE_BYTES: usize = 4 * 1024;
-const GITHUB_AUTH_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Per-child bound for ambient multi-account discovery probes.
+const GITHUB_ACCOUNT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Attempts for one transient App broker/probe failure inside the operation
+/// deadline (bd-096b1e).
+const GITHUB_APP_PROBE_ATTEMPTS: u32 = 3;
+const GITHUB_APP_PROBE_BACKOFF: [Duration; 2] =
+    [Duration::from_millis(500), Duration::from_millis(1_500)];
 const GITHUB_APP_GIT_TOKEN_ENV: &str = "CARA_GITHUB_APP_GIT_TOKEN";
 const GITHUB_APP_GIT_CREDENTIAL_HELPER: &str = "!f() { if test \"$1\" = get; then printf '%s\\n' 'username=x-access-token' \"password=$CARA_GITHUB_APP_GIT_TOKEN\"; fi; }; f";
 
@@ -72,7 +78,7 @@ enum GithubAuthSelection {
     Ambient,
     Token(String),
     AppInstallation(GithubAppCredential),
-    Refused(String),
+    Refused(GithubAppRefusal),
 }
 
 #[derive(Clone)]
@@ -420,13 +426,15 @@ pub enum CommandRunError {
     /// installation credential. It never falls back to ambient user auth.
     GithubAppAuthRefused {
         command: CommandSpec,
-        message: String,
+        /// Typed, allowlisted and secret-free refusal (bd-096b1e).
+        refusal: GithubAppRefusal,
     },
     /// App mode could not bind remote Git transport to the same exact HTTPS
     /// repository and installation credential as provider API operations.
     GithubAppGitTransportRefused {
         command: CommandSpec,
-        message: String,
+        /// Typed, allowlisted and secret-free refusal (bd-096b1e).
+        refusal: GithubAppRefusal,
     },
     /// A marked write lost or could not prove its remote fencing token before
     /// any subprocess was spawned.
@@ -489,14 +497,14 @@ impl std::fmt::Display for CommandRunError {
                 "`{}` would exceed the GitHub request budget ({used}/{limit} already used)",
                 command.display()
             ),
-            Self::GithubAppAuthRefused { command, message } => write!(
+            Self::GithubAppAuthRefused { command, refusal } => write!(
                 formatter,
-                "GitHub App authentication refused `{}`: {message}",
+                "GitHub App authentication refused `{}`: {refusal}",
                 command.display()
             ),
-            Self::GithubAppGitTransportRefused { command, message } => write!(
+            Self::GithubAppGitTransportRefused { command, refusal } => write!(
                 formatter,
-                "GitHub App git transport refused `{}`: {message}",
+                "GitHub App git transport refused `{}`: {refusal}",
                 command.display()
             ),
             Self::MutationFenceRefused {
@@ -552,6 +560,241 @@ impl std::fmt::Display for CommandRunError {
 }
 
 impl std::error::Error for CommandRunError {}
+
+impl CommandRunError {
+    /// Typed explicit GitHub App refusal carried by this error, if any.
+    #[must_use]
+    pub const fn github_app_refusal(&self) -> Option<&GithubAppRefusal> {
+        match self {
+            Self::GithubAppAuthRefused { refusal, .. }
+            | Self::GithubAppGitTransportRefused { refusal, .. } => Some(refusal),
+            _ => None,
+        }
+    }
+}
+
+/// Stage of explicit GitHub App credential resolution that refused.
+///
+/// Stable, allowlisted and secret-free: callers branch on it to decide whether
+/// a later bounded retry is useful (bd-096b1e).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GithubAppRefusalStage {
+    /// `CARA_GITHUB_AUTH_MODE` and its companion settings.
+    Configuration,
+    /// The exact repository could not be named from the request or checkout.
+    RepositoryResolution,
+    /// The configured credential broker subprocess.
+    CredentialBroker,
+    /// Validation of the broker's typed response.
+    CredentialValidation,
+    /// Binding of the App installation principal across refreshes.
+    PrincipalBinding,
+    /// Exact-repository access probe with the minted installation token.
+    RepositoryProbe,
+    /// Remote Git transport binding to the exact HTTPS repository.
+    GitTransport,
+}
+
+impl GithubAppRefusalStage {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Configuration => "configuration",
+            Self::RepositoryResolution => "repository_resolution",
+            Self::CredentialBroker => "credential_broker",
+            Self::CredentialValidation => "credential_validation",
+            Self::PrincipalBinding => "principal_binding",
+            Self::RepositoryProbe => "repository_probe",
+            Self::GitTransport => "git_transport",
+        }
+    }
+}
+
+/// Allowlisted category of one explicit GitHub App credential refusal.
+///
+/// Categories never carry argv, environment, stdout, stderr or token bytes; the
+/// broker response can contain credentials (bd-096b1e).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GithubAppRefusalCategory {
+    /// Static configuration or request shape refused before any subprocess.
+    Configuration,
+    /// Launch, wait, reap, stdin or capture I/O failed. This is not proof the
+    /// child never ran: the runner uses one variant for all of these.
+    SpawnOrIo,
+    /// A started child exceeded its hard deadline and was terminated.
+    Timeout,
+    /// The shared operation deadline was exhausted before the child launched.
+    DeadlineExhausted,
+    /// The child exited but its output exceeded the capture bound.
+    OutputLimit,
+    /// The child emitted bytes that were not UTF-8.
+    InvalidUtf8,
+    /// The shared authenticated GitHub request budget was exhausted.
+    RequestBudget,
+    /// The broker exited with a nonzero status.
+    NonzeroExit,
+    /// The broker's stdout was not the typed JSON response.
+    InvalidJson,
+    /// The typed response was empty, for another repository or near expiry.
+    InvalidCredential,
+    /// The response named another App slug/installation or changed principal.
+    IdentityMismatch,
+    /// The exact repository is absent, renamed or not granted (HTTP 404).
+    RepositoryNotFound,
+    /// The installation lacks the exact grant or metadata permission (HTTP 403).
+    RepositoryForbidden,
+    /// The provider rejected the installation token (HTTP 401).
+    TokenRejected,
+    /// A transient provider gateway/transport failure (HTTP 5xx, reset).
+    ProviderUnavailable,
+    /// Any other unsuccessful provider response.
+    ProviderUnclassified,
+}
+
+impl GithubAppRefusalCategory {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Configuration => "configuration",
+            Self::SpawnOrIo => "spawn_or_io",
+            Self::Timeout => "timeout",
+            Self::DeadlineExhausted => "deadline_exhausted",
+            Self::OutputLimit => "output_limit",
+            Self::InvalidUtf8 => "invalid_utf8",
+            Self::RequestBudget => "request_budget",
+            Self::NonzeroExit => "nonzero_exit",
+            Self::InvalidJson => "invalid_json",
+            Self::InvalidCredential => "invalid_credential",
+            Self::IdentityMismatch => "identity_mismatch",
+            Self::RepositoryNotFound => "repository_not_found",
+            Self::RepositoryForbidden => "repository_forbidden",
+            Self::TokenRejected => "token_rejected",
+            Self::ProviderUnavailable => "provider_unavailable",
+            Self::ProviderUnclassified => "provider_unclassified",
+        }
+    }
+
+    /// Whether a later operation may retry the same read with backoff.
+    ///
+    /// Only failures that say nothing about credentials or grants qualify.
+    /// `spawn_or_io` stays false: it can mean a missing executable as easily as
+    /// a transient wait failure, and retrying a misconfiguration only hides it.
+    #[must_use]
+    pub const fn retryable(self) -> bool {
+        matches!(
+            self,
+            Self::Timeout
+                | Self::DeadlineExhausted
+                | Self::RequestBudget
+                | Self::ProviderUnavailable
+        )
+    }
+}
+
+/// Typed, secret-free explicit GitHub App credential refusal.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GithubAppRefusal {
+    pub stage: GithubAppRefusalStage,
+    pub category: GithubAppRefusalCategory,
+    /// Static, allowlisted explanation. Never subprocess output.
+    pub message: String,
+    pub retryable: bool,
+    /// Attempts made at the refusing stage, including bounded retries.
+    pub attempts: u32,
+    /// Hard deadline applied to the refusing child, when it was a timeout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+impl GithubAppRefusal {
+    pub(crate) fn new(
+        stage: GithubAppRefusalStage,
+        category: GithubAppRefusalCategory,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            stage,
+            category,
+            message: message.into(),
+            retryable: category.retryable(),
+            attempts: 1,
+            timeout_ms: None,
+        }
+    }
+
+    fn configuration(stage: GithubAppRefusalStage, message: impl Into<String>) -> Self {
+        Self::new(stage, GithubAppRefusalCategory::Configuration, message)
+    }
+
+    /// Classify one runner failure without retaining any of its text.
+    fn from_runner_error(stage: GithubAppRefusalStage, error: &CommandRunError) -> Self {
+        use GithubAppRefusalCategory as Category;
+        let (category, timeout_ms) = match error {
+            CommandRunError::GithubAppAuthRefused { refusal, .. }
+            | CommandRunError::GithubAppGitTransportRefused { refusal, .. } => {
+                return refusal.clone();
+            }
+            CommandRunError::Timeout {
+                process_group_id: None,
+                timeout_ms,
+                ..
+            } => (Category::DeadlineExhausted, Some(*timeout_ms)),
+            CommandRunError::Timeout { timeout_ms, .. } => (Category::Timeout, Some(*timeout_ms)),
+            CommandRunError::GithubRequestBudgetExceeded { .. } => (Category::RequestBudget, None),
+            CommandRunError::OutputLimit { .. } => (Category::OutputLimit, None),
+            CommandRunError::InvalidUtf8 { .. } => (Category::InvalidUtf8, None),
+            CommandRunError::Spawn { .. } | CommandRunError::MutationFenceRefused { .. } => {
+                (Category::SpawnOrIo, None)
+            }
+        };
+        let subject = match stage {
+            GithubAppRefusalStage::CredentialBroker => "credential broker",
+            _ => "GitHub App exact-repository access probe",
+        };
+        let message = match category {
+            Category::Timeout => format!("{subject} exceeded its deadline and was terminated"),
+            Category::DeadlineExhausted => {
+                format!("{subject} was not started: the operation deadline was exhausted")
+            }
+            Category::RequestBudget => {
+                format!("{subject} would exceed the GitHub request budget")
+            }
+            Category::OutputLimit => format!("{subject} exceeded its output capture bound"),
+            Category::InvalidUtf8 => format!("{subject} emitted invalid UTF-8"),
+            _ if stage == GithubAppRefusalStage::CredentialBroker => {
+                "credential broker could not be executed".to_owned()
+            }
+            _ => "GitHub App exact-repository access probe hit a transport failure".to_owned(),
+        };
+        let mut refusal = Self::new(stage, category, message);
+        refusal.timeout_ms = timeout_ms;
+        refusal
+    }
+
+    fn with_attempts(mut self, attempts: u32) -> Self {
+        self.attempts = self.attempts.max(attempts);
+        self
+    }
+}
+
+impl std::fmt::Display for GithubAppRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} (stage={}, category={}, attempts={}",
+            self.message,
+            self.stage.as_str(),
+            self.category.as_str(),
+            self.attempts
+        )?;
+        if let Some(timeout_ms) = self.timeout_ms {
+            write!(formatter, ", timeout_ms={timeout_ms}")?;
+        }
+        write!(formatter, ", retryable={})", self.retryable)
+    }
+}
 
 /// Injectable command execution interface.
 pub trait CommandRunner {
@@ -774,7 +1017,7 @@ impl ProcessRunner {
             return None;
         }
         let cwd = self.cwd.as_deref().unwrap_or_else(|| Path::new("."));
-        let runner = auth_probe_runner(cwd, self.operation_deadline);
+        let runner = auth_probe_runner(cwd, self.timeout, self.operation_deadline);
         let runner = self
             .github_request_budget
             .as_ref()
@@ -784,13 +1027,16 @@ impl ProcessRunner {
         let repository =
             explicit_gh_repository(request).or_else(|| discover_github_repository(&runner, cwd));
         match github_app_mode() {
-            Err(message) => Some(GithubAuthSelection::Refused(message)),
+            Err(message) => Some(GithubAuthSelection::Refused(
+                GithubAppRefusal::configuration(GithubAppRefusalStage::Configuration, message),
+            )),
             Ok(Some(_)) => repository
                 .and_then(|repository| resolve_github_auth_for_repository(&runner, &repository))
                 .or_else(|| {
-                    Some(GithubAuthSelection::Refused(
-                        "App mode could not resolve the exact repository from the request or checkout".to_owned(),
-                    ))
+                    Some(GithubAuthSelection::Refused(GithubAppRefusal::configuration(
+                        GithubAppRefusalStage::RepositoryResolution,
+                        "App mode could not resolve the exact repository from the request or checkout",
+                    )))
                 }),
             Ok(None) => repository
                 .and_then(|repository| resolve_github_auth_for_repository(&runner, &repository)),
@@ -800,33 +1046,46 @@ impl ProcessRunner {
     fn inferred_github_app_git_auth(
         &self,
         request: &CommandSpec,
-    ) -> Result<Option<GithubAppGitAuth>, String> {
+    ) -> Result<Option<GithubAppGitAuth>, GithubAppRefusal> {
         if !self.infer_github_auth || !is_remote_git_request(request) {
             return Ok(None);
         }
-        if github_app_mode()?.is_none() {
+        let transport = |message: String| {
+            GithubAppRefusal::configuration(GithubAppRefusalStage::GitTransport, message)
+        };
+        if github_app_mode()
+            .map_err(|message| {
+                GithubAppRefusal::configuration(GithubAppRefusalStage::Configuration, message)
+            })?
+            .is_none()
+        {
             return Ok(None);
         }
         let cwd = self.cwd.as_deref().unwrap_or_else(|| Path::new("."));
-        let runner = auth_probe_runner(cwd, self.operation_deadline);
+        let runner = auth_probe_runner(cwd, self.timeout, self.operation_deadline);
         let origin = discover_github_repository(&runner, cwd);
-        let explicit = explicit_github_repository(request)?;
+        let explicit = explicit_github_repository(request).map_err(transport)?;
         // An explicit HTTPS URL is the command's exact transport authority. If
         // the command names only `origin`, the checkout's single remote remains
         // repository identity and an SSH origin is overlaid to exact HTTPS for
         // this child below; no on-disk Git config is rewritten.
-        let repository = explicit
-            .or(origin)
-            .ok_or_else(|| "no exact GitHub repository remote is available".to_owned())?;
-        validate_github_app_git_repository(&repository, request)?;
-        validate_github_app_git_configuration(&runner)?;
+        let repository = explicit.or(origin).ok_or_else(|| {
+            GithubAppRefusal::configuration(
+                GithubAppRefusalStage::RepositoryResolution,
+                "no exact GitHub repository remote is available",
+            )
+        })?;
+        validate_github_app_git_repository(&repository, request).map_err(transport)?;
+        validate_github_app_git_configuration(&runner).map_err(transport)?;
         match resolve_github_auth_for_repository(&runner, &repository) {
             Some(GithubAuthSelection::AppInstallation(credential)) => Ok(Some(GithubAppGitAuth {
                 credential,
                 repository,
             })),
-            Some(GithubAuthSelection::Refused(message)) => Err(message),
-            _ => Err("App mode did not resolve an installation credential".to_owned()),
+            Some(GithubAuthSelection::Refused(refusal)) => Err(refusal),
+            _ => Err(transport(
+                "App mode did not resolve an installation credential".to_owned(),
+            )),
         }
     }
 
@@ -887,7 +1146,12 @@ impl ProcessRunner {
                         Some(credential.expires_unix_secs);
                     "github_app_installation".to_owned()
                 }
-                Some(GithubAuthSelection::Refused(_)) => "github_app_refused".to_owned(),
+                Some(GithubAuthSelection::Refused(refusal)) => {
+                    telemetry.github_app_refusal_stage = Some(refusal.stage.as_str().to_owned());
+                    telemetry.github_app_refusal_category =
+                        Some(refusal.category.as_str().to_owned());
+                    "github_app_refused".to_owned()
+                }
                 // Never claim an auth verdict Cara did not reach. A checkout
                 // whose origin is not GitHub cannot name a repository to probe
                 // against, and reporting that as `unauthenticated` misdirects
@@ -999,9 +1263,31 @@ fn invalidate_github_app_auth_cache() {
     }
 }
 
-fn auth_probe_runner(cwd: &Path, operation_deadline: Option<Instant>) -> ProcessRunner {
+/// Hard deadline for one authentication probe child.
+///
+/// Explicit App mode has exactly one credential path, so its broker and
+/// exact-repository probe honour the caller's configured command timeout
+/// (`command_timeout_secs`, itself bounded by config validation) and any shared
+/// operation deadline. A fixed 5 s bound refused a 5.5 s provider response even
+/// under `command_timeout_secs=10` and dead-lettered completions (bd-096b1e).
+/// Ambient account discovery may probe several logins in turn, so it keeps the
+/// smaller historical bound per child.
+fn github_auth_probe_timeout(caller_timeout: Duration, app_mode: bool) -> Duration {
+    if app_mode {
+        caller_timeout
+    } else {
+        caller_timeout.min(GITHUB_ACCOUNT_PROBE_TIMEOUT)
+    }
+}
+
+fn auth_probe_runner(
+    cwd: &Path,
+    caller_timeout: Duration,
+    operation_deadline: Option<Instant>,
+) -> ProcessRunner {
+    let app_mode = matches!(github_app_mode(), Ok(Some(_)));
     let runner = ProcessRunner::in_directory(cwd)
-        .with_timeout(GITHUB_AUTH_PROBE_TIMEOUT)
+        .with_timeout(github_auth_probe_timeout(caller_timeout, app_mode))
         .without_github_auth_inference();
     operation_deadline.map_or(runner.clone(), |deadline| {
         runner.with_operation_deadline(deadline)
@@ -1034,7 +1320,7 @@ fn resolve_github_auth(
     operation_deadline: Option<Instant>,
 ) -> Option<GithubAuthSelection> {
     let cwd = cwd?;
-    let runner = auth_probe_runner(cwd, operation_deadline);
+    let runner = auth_probe_runner(cwd, DEFAULT_COMMAND_TIMEOUT, operation_deadline);
     let repository = discover_github_repository(&runner, cwd)?;
     resolve_github_auth_for_repository(&runner, &repository)
 }
@@ -1074,12 +1360,16 @@ fn resolve_github_auth_uncached(
     repository: &GithubRepository,
 ) -> Option<GithubAuthSelection> {
     match github_app_mode() {
-        Err(message) => return Some(GithubAuthSelection::Refused(message)),
+        Err(message) => {
+            return Some(GithubAuthSelection::Refused(
+                GithubAppRefusal::configuration(GithubAppRefusalStage::Configuration, message),
+            ));
+        }
         Ok(Some(mode)) => {
             return Some(
                 match resolve_github_app_credential(runner, repository, &mode) {
                     Ok(credential) => GithubAuthSelection::AppInstallation(credential),
-                    Err(message) => GithubAuthSelection::Refused(message),
+                    Err(refusal) => GithubAuthSelection::Refused(refusal),
                 },
             );
         }
@@ -1184,33 +1474,145 @@ fn github_app_mode() -> Result<Option<GithubAppMode>, String> {
     )
 }
 
+/// Bounded in-deadline retry for transient App broker/probe failures.
+struct GithubAppProbeRetry {
+    attempts: u32,
+    backoff: &'static [Duration],
+    operation_deadline: Option<Instant>,
+    sleep: fn(Duration),
+}
+
+impl GithubAppProbeRetry {
+    fn production(operation_deadline: Option<Instant>) -> Self {
+        Self {
+            attempts: GITHUB_APP_PROBE_ATTEMPTS,
+            backoff: &GITHUB_APP_PROBE_BACKOFF,
+            operation_deadline,
+            sleep: thread::sleep,
+        }
+    }
+
+    /// Wait before attempt `attempt + 1`, or refuse when another attempt could
+    /// not fit inside the operation deadline. Retrying into a guaranteed
+    /// deadline refusal would only replace a real category with a worse one.
+    fn wait_before_retry(&self, attempt: u32, refusal: &GithubAppRefusal) -> bool {
+        if !refusal.category.retryable()
+            || matches!(
+                refusal.category,
+                GithubAppRefusalCategory::DeadlineExhausted
+                    | GithubAppRefusalCategory::RequestBudget
+            )
+            || attempt >= self.attempts
+        {
+            return false;
+        }
+        let index = usize::try_from(attempt.saturating_sub(1)).unwrap_or(usize::MAX);
+        let delay = self
+            .backoff
+            .get(index)
+            .or_else(|| self.backoff.last())
+            .copied()
+            .unwrap_or_default();
+        if let Some(deadline) = self.operation_deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining < delay.saturating_add(MINIMUM_COMMAND_BUDGET) {
+                return false;
+            }
+        }
+        if !delay.is_zero() {
+            (self.sleep)(delay);
+        }
+        true
+    }
+}
+
 fn resolve_github_app_credential(
     runner: &ProcessRunner,
     repository: &GithubRepository,
     mode: &GithubAppMode,
-) -> Result<GithubAppCredential, String> {
+) -> Result<GithubAppCredential, GithubAppRefusal> {
+    resolve_github_app_credential_with(
+        runner,
+        repository,
+        mode,
+        &GithubAppProbeRetry::production(runner.operation_deadline),
+    )
+}
+
+fn resolve_github_app_credential_with<R: CommandRunner>(
+    runner: &R,
+    repository: &GithubRepository,
+    mode: &GithubAppMode,
+    retry: &GithubAppProbeRetry,
+) -> Result<GithubAppCredential, GithubAppRefusal> {
+    use GithubAppRefusalCategory as Category;
+    use GithubAppRefusalStage as Stage;
     let expected_repository = format!("{}/{}", repository.owner, repository.name);
-    let output = runner
-        .run(
-            &CommandSpec::new(&mode.credential_command)
-                .env("CARA_GITHUB_APP_REPOSITORY", &expected_repository)
-                .env("CARA_GITHUB_APP_HOST", &repository.host),
-        )
-        .map_err(|_| "credential broker could not be executed".to_owned())?;
+    let broker = CommandSpec::new(&mode.credential_command)
+        .env("CARA_GITHUB_APP_REPOSITORY", &expected_repository)
+        .env("CARA_GITHUB_APP_HOST", &repository.host);
+    let mut attempt = 1;
+    let output = loop {
+        match runner.run(&broker) {
+            Ok(output) => break output,
+            Err(error) => {
+                let refusal = GithubAppRefusal::from_runner_error(Stage::CredentialBroker, &error)
+                    .with_attempts(attempt);
+                if retry.wait_before_retry(attempt, &refusal) {
+                    attempt += 1;
+                    continue;
+                }
+                return Err(refusal);
+            }
+        }
+    };
+    let broker_attempts = attempt;
     if !output.is_success() {
-        return Err("credential broker returned a nonzero exit status".to_owned());
+        return Err(GithubAppRefusal::new(
+            Stage::CredentialBroker,
+            Category::NonzeroExit,
+            "credential broker returned a nonzero exit status",
+        )
+        .with_attempts(broker_attempts));
     }
-    let response: GithubAppCredentialResponse = serde_json::from_str(&output.stdout)
-        .map_err(|_| "credential broker returned invalid JSON".to_owned())?;
-    let credential = validate_github_app_credential(response, repository)?;
+    let response: GithubAppCredentialResponse =
+        serde_json::from_str(&output.stdout).map_err(|_| {
+            GithubAppRefusal::new(
+                Stage::CredentialBroker,
+                Category::InvalidJson,
+                "credential broker returned invalid JSON",
+            )
+            .with_attempts(broker_attempts)
+        })?;
+    let credential = validate_github_app_credential(response, repository).map_err(|message| {
+        GithubAppRefusal::new(
+            Stage::CredentialValidation,
+            if message.contains("different repository") {
+                Category::IdentityMismatch
+            } else {
+                Category::InvalidCredential
+            },
+            message,
+        )
+    })?;
     if credential.app_slug != mode.expected_slug {
-        return Err("credential broker response names a different App slug".to_owned());
+        return Err(GithubAppRefusal::new(
+            Stage::CredentialValidation,
+            Category::IdentityMismatch,
+            "credential broker response names a different App slug",
+        ));
     }
     if credential.installation_id != mode.expected_installation_id {
-        return Err("credential broker response names a different installation".to_owned());
+        return Err(GithubAppRefusal::new(
+            Stage::CredentialValidation,
+            Category::IdentityMismatch,
+            "credential broker response names a different installation",
+        ));
     }
-    bind_github_app_principal(repository, &credential)?;
-    github_app_token_repository_access(runner, repository, &credential.token)?;
+    bind_github_app_principal(repository, &credential).map_err(|message| {
+        GithubAppRefusal::new(Stage::PrincipalBinding, Category::IdentityMismatch, message)
+    })?;
+    github_app_token_repository_access(runner, repository, &credential.token, retry)?;
     Ok(credential)
 }
 
@@ -1297,39 +1699,79 @@ fn github_repository_access_command(repository: &GithubRepository, token: &str) 
         .env("GH_TOKEN", token)
 }
 
-fn classify_github_app_repository_access(output: &CommandOutput) -> Result<(), String> {
+fn classify_github_app_repository_access(output: &CommandOutput) -> Result<(), GithubAppRefusal> {
+    use GithubAppRefusalCategory as Category;
     if output.is_success() {
         return Ok(());
     }
+    let refuse = |category, message: &str| {
+        Err(GithubAppRefusal::new(
+            GithubAppRefusalStage::RepositoryProbe,
+            category,
+            message,
+        ))
+    };
     let diagnostic = output.stderr.to_ascii_lowercase();
     if diagnostic.contains("http 404") || diagnostic.contains("not found") {
-        return Err("exact repository is absent, renamed, or no longer granted to the selected GitHub App installation".to_owned());
-    }
-    if diagnostic.contains("http 403") || diagnostic.contains("forbidden") {
-        return Err("selected GitHub App installation lacks an exact repository grant or required metadata permission".to_owned());
-    }
-    if diagnostic.contains("http 401") || diagnostic.contains("bad credentials") {
-        return Err(
-            "selected GitHub App installation token was rejected by the provider".to_owned(),
+        return refuse(
+            Category::RepositoryNotFound,
+            "exact repository is absent, renamed, or no longer granted to the selected GitHub App installation",
         );
     }
-    Err(
-        "GitHub App exact-repository access probe failed with an unclassified provider response"
-            .to_owned(),
+    if diagnostic.contains("http 403") || diagnostic.contains("forbidden") {
+        return refuse(
+            Category::RepositoryForbidden,
+            "selected GitHub App installation lacks an exact repository grant or required metadata permission",
+        );
+    }
+    if diagnostic.contains("http 401") || diagnostic.contains("bad credentials") {
+        return refuse(
+            Category::TokenRejected,
+            "selected GitHub App installation token was rejected by the provider",
+        );
+    }
+    if crate::github::transient_provider_read_failure(&output.stderr) {
+        return refuse(
+            Category::ProviderUnavailable,
+            "GitHub App exact-repository access probe hit a transient provider failure",
+        );
+    }
+    refuse(
+        Category::ProviderUnclassified,
+        "GitHub App exact-repository access probe failed with an unclassified provider response",
     )
 }
 
-fn github_app_token_repository_access(
-    runner: &ProcessRunner,
+/// Probe exact-repository access with the minted installation token.
+///
+/// The probe is a read. Only a timeout or a transient provider gateway failure
+/// is retried, inside the operation deadline; a grant, rename or token verdict
+/// is returned at once because waiting cannot change it (bd-096b1e).
+fn github_app_token_repository_access<R: CommandRunner>(
+    runner: &R,
     repository: &GithubRepository,
     token: &str,
-) -> Result<(), String> {
-    let output = runner
-        .run(&github_repository_access_command(repository, token))
-        .map_err(|_| {
-            "GitHub App exact-repository access probe hit a transport failure".to_owned()
-        })?;
-    classify_github_app_repository_access(&output)
+    retry: &GithubAppProbeRetry,
+) -> Result<(), GithubAppRefusal> {
+    let command = github_repository_access_command(repository, token);
+    let mut attempt = 1;
+    loop {
+        let refusal = match runner.run(&command) {
+            Ok(output) => match classify_github_app_repository_access(&output) {
+                Ok(()) => return Ok(()),
+                Err(refusal) => refusal,
+            },
+            Err(error) => {
+                GithubAppRefusal::from_runner_error(GithubAppRefusalStage::RepositoryProbe, &error)
+            }
+        }
+        .with_attempts(attempt);
+        if retry.wait_before_retry(attempt, &refusal) {
+            attempt += 1;
+            continue;
+        }
+        return Err(refusal);
+    }
 }
 
 fn github_token_can_access(
@@ -1676,16 +2118,16 @@ impl CommandRunner for ProcessRunner {
         let github_auth = self.inferred_github_auth(request);
         let github_app_git_auth =
             self.inferred_github_app_git_auth(request)
-                .map_err(|message| CommandRunError::GithubAppGitTransportRefused {
+                .map_err(|refusal| CommandRunError::GithubAppGitTransportRefused {
                     command: request.clone(),
-                    message,
+                    refusal,
                 })?;
         self.record_github_request(request, github_auth.as_ref());
         self.record_github_app_git_transport(github_app_git_auth.as_ref());
-        if let Some(GithubAuthSelection::Refused(message)) = &github_auth {
+        if let Some(GithubAuthSelection::Refused(refusal)) = &github_auth {
             return Err(CommandRunError::GithubAppAuthRefused {
                 command: request.clone(),
-                message: message.clone(),
+                refusal: refusal.clone(),
             });
         }
         let mut command = Command::new(&request.program);
@@ -2068,21 +2510,39 @@ mod tests {
             stderr: "gh: Bad credentials (HTTP 401)".to_owned(),
         };
 
-        assert!(
-            classify_github_app_repository_access(&not_found)
-                .unwrap_err()
-                .contains("absent, renamed")
+        let not_found = classify_github_app_repository_access(&not_found).unwrap_err();
+        assert!(not_found.message.contains("absent, renamed"));
+        assert_eq!(
+            not_found.category,
+            GithubAppRefusalCategory::RepositoryNotFound
         );
+        assert!(!not_found.retryable);
+        let forbidden = classify_github_app_repository_access(&forbidden).unwrap_err();
         assert!(
-            classify_github_app_repository_access(&forbidden)
-                .unwrap_err()
+            forbidden
+                .message
                 .contains("lacks an exact repository grant")
         );
-        assert!(
-            classify_github_app_repository_access(&unauthorized)
-                .unwrap_err()
-                .contains("token was rejected")
+        assert_eq!(
+            forbidden.category,
+            GithubAppRefusalCategory::RepositoryForbidden
         );
+        let unauthorized = classify_github_app_repository_access(&unauthorized).unwrap_err();
+        assert!(unauthorized.message.contains("token was rejected"));
+        assert_eq!(
+            unauthorized.category,
+            GithubAppRefusalCategory::TokenRejected
+        );
+        let gateway = classify_github_app_repository_access(&CommandOutput::failure(
+            1,
+            "gh: HTTP 502: Bad Gateway",
+        ))
+        .unwrap_err();
+        assert_eq!(
+            gateway.category,
+            GithubAppRefusalCategory::ProviderUnavailable
+        );
+        assert!(gateway.retryable);
     }
 
     #[test]
@@ -2683,17 +3143,430 @@ mod tests {
         assert!(!should_refresh_github_app_git_auth(None, &failed, true));
     }
 
+    /// Scripted runner for hermetic App broker/probe tests. Broker and probe
+    /// answers are consumed in order; every request is recorded.
+    #[derive(Clone)]
+    struct ScriptedAppRunner {
+        broker: Arc<Mutex<Vec<Result<CommandOutput, CommandRunError>>>>,
+        probe: Arc<Mutex<Vec<Result<CommandOutput, CommandRunError>>>>,
+        broker_calls: Arc<std::sync::atomic::AtomicUsize>,
+        probe_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ScriptedAppRunner {
+        fn new(
+            broker: Vec<Result<CommandOutput, CommandRunError>>,
+            probe: Vec<Result<CommandOutput, CommandRunError>>,
+        ) -> Self {
+            Self {
+                broker: Arc::new(Mutex::new(broker.into_iter().rev().collect())),
+                probe: Arc::new(Mutex::new(probe.into_iter().rev().collect())),
+                broker_calls: Arc::default(),
+                probe_calls: Arc::default(),
+            }
+        }
+
+        fn calls(&self) -> (usize, usize) {
+            (
+                self.broker_calls.load(Ordering::SeqCst),
+                self.probe_calls.load(Ordering::SeqCst),
+            )
+        }
+    }
+
+    impl CommandRunner for ScriptedAppRunner {
+        fn run(&self, request: &CommandSpec) -> Result<CommandOutput, CommandRunError> {
+            let (queue, calls) = if request.program == "gh" {
+                (&self.probe, &self.probe_calls)
+            } else {
+                (&self.broker, &self.broker_calls)
+            };
+            calls.fetch_add(1, Ordering::SeqCst);
+            queue
+                .lock()
+                .unwrap()
+                .pop()
+                .expect("scripted App runner has no answer left")
+        }
+    }
+
+    const APP_LEAK_CANARY: &str = "ghs_LEAK_CANARY_never_render";
+
+    fn app_test_mode() -> GithubAppMode {
+        GithubAppMode {
+            credential_command: format!("/secure/broker-{APP_LEAK_CANARY}"),
+            expected_slug: "caravan".to_owned(),
+            expected_installation_id: 42,
+        }
+    }
+
+    fn app_test_repository(name: &str) -> GithubRepository {
+        parse_github_remote(&format!("https://github.com/caravan-probe-test/{name}.git")).unwrap()
+    }
+
+    fn app_broker_success(repository: &GithubRepository) -> CommandOutput {
+        CommandOutput::success(
+            serde_json::json!({
+                "token": APP_LEAK_CANARY,
+                "app_slug": "caravan",
+                "installation_id": 42,
+                "repository": format!("{}/{}", repository.owner, repository.name),
+                "expires_unix_secs": current_unix_secs() + 3_600,
+            })
+            .to_string(),
+        )
+    }
+
+    fn no_wait_retry() -> GithubAppProbeRetry {
+        GithubAppProbeRetry {
+            attempts: GITHUB_APP_PROBE_ATTEMPTS,
+            backoff: &[Duration::ZERO],
+            operation_deadline: None,
+            sleep: |_| panic!("zero backoff never sleeps"),
+        }
+    }
+
+    fn started_timeout(command: CommandSpec, timeout_ms: u64) -> CommandRunError {
+        CommandRunError::Timeout {
+            command,
+            process_group_id: Some(4242),
+            timeout_ms,
+            stdout: format!("partial {APP_LEAK_CANARY}"),
+            stderr: format!("stderr {APP_LEAK_CANARY}"),
+        }
+    }
+
+    fn assert_refusal_is_secret_free(refusal: &GithubAppRefusal) {
+        let rendered = format!(
+            "{refusal} {}",
+            serde_json::to_string(refusal).expect("refusal serializes")
+        );
+        assert!(!rendered.contains(APP_LEAK_CANARY), "{rendered}");
+        assert!(!rendered.contains("/secure/broker"), "{rendered}");
+        let error = CommandRunError::GithubAppAuthRefused {
+            command: CommandSpec::new("gh").args(["api", "repos/owner/repo"]),
+            refusal: refusal.clone(),
+        };
+        assert!(!error.to_string().contains(APP_LEAK_CANARY));
+    }
+
+    #[test]
+    fn app_probe_honours_configured_command_timeout_not_a_fixed_five_seconds() {
+        // Deterministic reproduction (bd-096b1e): a 5.5 s exact-repository
+        // response failed at about 5.4 s under `command_timeout_secs=10`.
+        let configured = Duration::from_secs(10);
+        assert_eq!(github_auth_probe_timeout(configured, true), configured);
+        assert!(github_auth_probe_timeout(configured, true) > Duration::from_millis(5_500));
+        // Ambient multi-account discovery keeps its smaller per-child bound and
+        // never widens a caller that asked for less.
+        assert_eq!(
+            github_auth_probe_timeout(configured, false),
+            GITHUB_ACCOUNT_PROBE_TIMEOUT
+        );
+        assert_eq!(
+            github_auth_probe_timeout(Duration::from_secs(2), true),
+            Duration::from_secs(2)
+        );
+    }
+
+    #[test]
+    fn app_runner_error_categories_are_typed_and_secret_free() {
+        let broker = CommandSpec::new(format!("/secure/broker-{APP_LEAK_CANARY}"))
+            .env("CARA_GITHUB_APP_REPOSITORY", APP_LEAK_CANARY);
+        let evidence = || {
+            Box::new(StreamCaptureEvidence {
+                limit_bytes: 1,
+                total_bytes: 2,
+                truncated: true,
+                prefix: APP_LEAK_CANARY.to_owned(),
+                suffix: APP_LEAK_CANARY.to_owned(),
+            })
+        };
+        let cases = [
+            (
+                CommandRunError::Spawn {
+                    command: broker.clone(),
+                    message: format!("No such file or directory {APP_LEAK_CANARY}"),
+                },
+                GithubAppRefusalCategory::SpawnOrIo,
+                false,
+            ),
+            (
+                started_timeout(broker.clone(), 10_000),
+                GithubAppRefusalCategory::Timeout,
+                true,
+            ),
+            (
+                CommandRunError::Timeout {
+                    command: broker.clone(),
+                    process_group_id: None,
+                    timeout_ms: 12,
+                    stdout: String::new(),
+                    stderr: APP_LEAK_CANARY.to_owned(),
+                },
+                GithubAppRefusalCategory::DeadlineExhausted,
+                true,
+            ),
+            (
+                CommandRunError::OutputLimit {
+                    command: broker.clone(),
+                    code: Some(0),
+                    stdout: evidence(),
+                    stderr: evidence(),
+                },
+                GithubAppRefusalCategory::OutputLimit,
+                false,
+            ),
+            (
+                CommandRunError::InvalidUtf8 {
+                    command: broker.clone(),
+                    stream: "stdout",
+                    message: APP_LEAK_CANARY.to_owned(),
+                },
+                GithubAppRefusalCategory::InvalidUtf8,
+                false,
+            ),
+            (
+                CommandRunError::GithubRequestBudgetExceeded {
+                    command: broker.clone(),
+                    limit: 3,
+                    used: 3,
+                },
+                GithubAppRefusalCategory::RequestBudget,
+                true,
+            ),
+        ];
+        for (error, category, retryable) in cases {
+            for stage in [
+                GithubAppRefusalStage::CredentialBroker,
+                GithubAppRefusalStage::RepositoryProbe,
+            ] {
+                let refusal = GithubAppRefusal::from_runner_error(stage, &error);
+                assert_eq!(refusal.stage, stage);
+                assert_eq!(refusal.category, category, "{error:?}");
+                assert_eq!(refusal.retryable, retryable, "{category:?}");
+                assert_refusal_is_secret_free(&refusal);
+            }
+        }
+        let timeout = GithubAppRefusal::from_runner_error(
+            GithubAppRefusalStage::RepositoryProbe,
+            &started_timeout(broker, 10_000),
+        );
+        assert_eq!(timeout.timeout_ms, Some(10_000));
+        assert!(timeout.to_string().contains("category=timeout"));
+        assert!(timeout.to_string().contains("stage=repository_probe"));
+    }
+
+    #[test]
+    fn app_broker_timeout_retries_inside_deadline_then_succeeds() {
+        let repository = app_test_repository("broker-timeout-retry");
+        let runner = ScriptedAppRunner::new(
+            vec![
+                Err(started_timeout(CommandSpec::new("/secure/broker"), 10_000)),
+                Ok(app_broker_success(&repository)),
+            ],
+            vec![Ok(CommandOutput::success(""))],
+        );
+        let credential = resolve_github_app_credential_with(
+            &runner,
+            &repository,
+            &app_test_mode(),
+            &no_wait_retry(),
+        )
+        .unwrap();
+        assert_eq!(credential.installation_id, 42);
+        assert_eq!(runner.calls(), (2, 1));
+    }
+
+    #[test]
+    fn app_probe_timeout_and_gateway_retry_then_succeed() {
+        let repository = app_test_repository("probe-transient-retry");
+        let runner = ScriptedAppRunner::new(
+            vec![Ok(app_broker_success(&repository))],
+            vec![
+                Err(started_timeout(CommandSpec::new("gh"), 10_000)),
+                Ok(CommandOutput::failure(
+                    1,
+                    "gh: HTTP 503: Service Unavailable",
+                )),
+                Ok(CommandOutput::success("")),
+            ],
+        );
+        resolve_github_app_credential_with(
+            &runner,
+            &repository,
+            &app_test_mode(),
+            &no_wait_retry(),
+        )
+        .unwrap();
+        assert_eq!(runner.calls(), (1, 3));
+    }
+
+    #[test]
+    fn app_probe_exhausted_timeout_is_typed_retryable_and_bounded() {
+        let repository = app_test_repository("probe-timeout-exhausted");
+        let runner = ScriptedAppRunner::new(
+            vec![Ok(app_broker_success(&repository))],
+            (0..GITHUB_APP_PROBE_ATTEMPTS)
+                .map(|_| Err(started_timeout(CommandSpec::new("gh"), 10_000)))
+                .collect(),
+        );
+        let refusal = resolve_github_app_credential_with(
+            &runner,
+            &repository,
+            &app_test_mode(),
+            &no_wait_retry(),
+        )
+        .err()
+        .expect("exhausted timeout refuses");
+        assert_eq!(refusal.stage, GithubAppRefusalStage::RepositoryProbe);
+        assert_eq!(refusal.category, GithubAppRefusalCategory::Timeout);
+        assert!(refusal.retryable);
+        assert_eq!(refusal.attempts, GITHUB_APP_PROBE_ATTEMPTS);
+        assert_eq!(refusal.timeout_ms, Some(10_000));
+        assert_eq!(runner.calls(), (1, GITHUB_APP_PROBE_ATTEMPTS as usize));
+        assert_refusal_is_secret_free(&refusal);
+    }
+
+    #[test]
+    fn app_verdicts_and_misconfiguration_are_never_retried() {
+        let cases: [(
+            &str,
+            Vec<_>,
+            Vec<_>,
+            GithubAppRefusalStage,
+            GithubAppRefusalCategory,
+        ); 5] = [
+            (
+                "spawn",
+                vec![Err(CommandRunError::Spawn {
+                    command: CommandSpec::new("/secure/broker"),
+                    message: format!("ENOENT {APP_LEAK_CANARY}"),
+                })],
+                vec![],
+                GithubAppRefusalStage::CredentialBroker,
+                GithubAppRefusalCategory::SpawnOrIo,
+            ),
+            (
+                "nonzero",
+                vec![Ok(CommandOutput {
+                    code: Some(3),
+                    stdout: APP_LEAK_CANARY.to_owned(),
+                    stderr: APP_LEAK_CANARY.to_owned(),
+                })],
+                vec![],
+                GithubAppRefusalStage::CredentialBroker,
+                GithubAppRefusalCategory::NonzeroExit,
+            ),
+            (
+                "invalid-json",
+                vec![Ok(CommandOutput::success(format!(
+                    "{{\"token\":\"{APP_LEAK_CANARY}\""
+                )))],
+                vec![],
+                GithubAppRefusalStage::CredentialBroker,
+                GithubAppRefusalCategory::InvalidJson,
+            ),
+            (
+                "forbidden",
+                vec![],
+                vec![Ok(CommandOutput::failure(1, "gh: Forbidden (HTTP 403)"))],
+                GithubAppRefusalStage::RepositoryProbe,
+                GithubAppRefusalCategory::RepositoryForbidden,
+            ),
+            (
+                "deadline",
+                vec![],
+                vec![Err(CommandRunError::Timeout {
+                    command: CommandSpec::new("gh"),
+                    process_group_id: None,
+                    timeout_ms: 3,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })],
+                GithubAppRefusalStage::RepositoryProbe,
+                GithubAppRefusalCategory::DeadlineExhausted,
+            ),
+        ];
+        for (name, mut broker, probe, stage, category) in cases {
+            let repository = app_test_repository(&format!("no-retry-{name}"));
+            if broker.is_empty() {
+                broker.push(Ok(app_broker_success(&repository)));
+            }
+            let expected_calls = (1, probe.len());
+            let runner = ScriptedAppRunner::new(broker, probe);
+            let refusal = resolve_github_app_credential_with(
+                &runner,
+                &repository,
+                &app_test_mode(),
+                &no_wait_retry(),
+            )
+            .err()
+            .expect("verdict refuses");
+            assert_eq!(refusal.stage, stage, "{name}");
+            assert_eq!(refusal.category, category, "{name}");
+            assert_eq!(refusal.attempts, 1, "{name}");
+            assert_eq!(runner.calls(), expected_calls, "{name}");
+            assert_refusal_is_secret_free(&refusal);
+        }
+        // The broker's historical spawn wording is preserved for log readers.
+        let spawn = GithubAppRefusal::from_runner_error(
+            GithubAppRefusalStage::CredentialBroker,
+            &CommandRunError::Spawn {
+                command: CommandSpec::new("/secure/broker"),
+                message: "ENOENT".to_owned(),
+            },
+        );
+        assert_eq!(spawn.message, "credential broker could not be executed");
+    }
+
+    #[test]
+    fn app_retry_never_outlives_the_operation_deadline() {
+        let refusal = GithubAppRefusal::new(
+            GithubAppRefusalStage::RepositoryProbe,
+            GithubAppRefusalCategory::Timeout,
+            "probe timed out",
+        );
+        let tight = GithubAppProbeRetry {
+            attempts: GITHUB_APP_PROBE_ATTEMPTS,
+            backoff: &GITHUB_APP_PROBE_BACKOFF,
+            operation_deadline: Some(Instant::now() + Duration::from_millis(900)),
+            sleep: |_| panic!("a retry that cannot fit must not sleep"),
+        };
+        assert!(!tight.wait_before_retry(1, &refusal));
+        let roomy = GithubAppProbeRetry {
+            attempts: GITHUB_APP_PROBE_ATTEMPTS,
+            backoff: &GITHUB_APP_PROBE_BACKOFF,
+            operation_deadline: Some(Instant::now() + Duration::from_secs(60)),
+            sleep: |delay| assert_eq!(delay, GITHUB_APP_PROBE_BACKOFF[0]),
+        };
+        assert!(roomy.wait_before_retry(1, &refusal));
+        assert!(!roomy.wait_before_retry(GITHUB_APP_PROBE_ATTEMPTS, &refusal));
+    }
+
     #[test]
     fn refused_app_auth_is_never_reported_as_authenticated() {
         let runner = ProcessRunner::new();
         let request = CommandSpec::new("gh").args(["api", "repos/owner/repo"]);
         runner.record_github_request(
             &request,
-            Some(&GithubAuthSelection::Refused("broker failed".to_owned())),
+            Some(&GithubAuthSelection::Refused(GithubAppRefusal::new(
+                GithubAppRefusalStage::CredentialBroker,
+                GithubAppRefusalCategory::Timeout,
+                "credential broker exceeded its deadline and was terminated",
+            ))),
         );
         let telemetry = runner.github_api_telemetry();
         assert_eq!(telemetry.authenticated, Some(false));
         assert_eq!(telemetry.auth_source.as_deref(), Some("github_app_refused"));
+        assert_eq!(
+            telemetry.github_app_refusal_stage.as_deref(),
+            Some("credential_broker")
+        );
+        assert_eq!(
+            telemetry.github_app_refusal_category.as_deref(),
+            Some("timeout")
+        );
     }
 
     #[test]
