@@ -2891,8 +2891,13 @@ fn invalid_open_page(command: &CommandSpec, message: impl Into<String>) -> Disco
     }
 }
 
-fn transient_provider_read_failure(stderr: &str) -> bool {
+/// Narrow provider transport/gateway failures for which one bounded read retry
+/// is useful. GitHub's generic GraphQL internal error (\"Something went wrong
+/// while executing your query\") is included: it is a provider-side failure, not
+/// a verdict on the request, and it failed whole completions on 2026-10-20.
+pub(crate) fn transient_provider_read_failure(stderr: &str) -> bool {
     let diagnostic = stderr.to_ascii_lowercase();
+    let graphql_internal = diagnostic.contains("something went wrong while executing your query");
     let gateway = [
         "http 502",
         "http 503",
@@ -2909,7 +2914,7 @@ fn transient_provider_read_failure(stderr: &str) -> bool {
     let reset_before_response = diagnostic.contains("connection reset by peer")
         || diagnostic.contains("connection reset before response")
         || diagnostic.contains("connection was reset before a response");
-    gateway || http2_cancel || reset_before_response
+    gateway || http2_cancel || reset_before_response || graphql_internal
 }
 
 /// Name one skipped provider record by PR number where the payload supplied one.
@@ -4151,6 +4156,12 @@ mod tests {
         ));
         assert!(transient_provider_read_failure(
             "connection reset before response"
+        ));
+        assert!(transient_provider_read_failure(
+            "gh: Something went wrong while executing your query. Please include `ABCD:1234` when reporting this issue."
+        ));
+        assert!(!transient_provider_read_failure(
+            "GraphQL: Could not resolve to a PullRequest with the number of 9."
         ));
         assert!(!transient_provider_read_failure(
             "HTTP 403: Resource not accessible by integration"

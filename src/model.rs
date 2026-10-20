@@ -551,6 +551,13 @@ pub struct GitHubApiTelemetry {
     pub github_app_git_transport: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_app_git_repository: Option<String>,
+    /// Allowlisted stage of an explicit App credential refusal (bd-096b1e).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_app_refusal_stage: Option<String>,
+    /// Allowlisted category of an explicit App credential refusal, such as
+    /// `timeout` or `repository_forbidden`. Never subprocess output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_app_refusal_category: Option<String>,
     pub calls: u64,
     pub graphql_calls: u64,
     pub rest_calls: u64,
@@ -585,6 +592,12 @@ impl GitHubApiTelemetry {
         }
         if other.github_app_git_repository.is_some() {
             self.github_app_git_repository = other.github_app_git_repository;
+        }
+        if other.github_app_refusal_stage.is_some() {
+            self.github_app_refusal_stage = other.github_app_refusal_stage;
+        }
+        if other.github_app_refusal_category.is_some() {
+            self.github_app_refusal_category = other.github_app_refusal_category;
         }
         self.calls = self.calls.saturating_add(other.calls);
         self.graphql_calls = self.graphql_calls.saturating_add(other.graphql_calls);
