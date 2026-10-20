@@ -262,9 +262,11 @@ For an authorized source owner under a no-force constraint, use
 history in an exact merge and publishes only by fast-forward. It does not grant
 queue custody or resolve earlier uncertain operations. Explicit native rebase
 and legacy repair still use force-with-lease; `rebase_on_join: false` does not
-disable those explicitly requested paths. Ordinary sync no longer calls native
-source rebasing automatically; native drift preserves source heads for owner
-repair rather than silently forcing another history. See the [owner continuation contract](../.agents/skills/cara-operator/references/history-preserving-repair.md).
+disable those explicitly requested paths. Ordinary sync repairs routine native
+Stack drift only through its one gated drift-repair entry (bd-7ff76d), under the
+reviewed Stack mutation opt-in and unless `stack_rollout.manual_drift_repair:
+true`; drift it cannot repair without writing stays quarantined for owner
+repair. See the [owner continuation contract](../.agents/skills/cara-operator/references/history-preserving-repair.md).
 
 ---
 

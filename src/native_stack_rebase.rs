@@ -499,6 +499,148 @@ fn owner_continuation_refusal(
     )
 }
 
+/// Mark a refusal raised while preparing local rewrites, before any branch or
+/// provider write, so a caller can tell it from a partial publication.
+fn before_publication(error: AppError) -> AppError {
+    let mut details = error.details().unwrap_or_else(|| json!({}));
+    let Some(object) = details.as_object_mut() else {
+        return error;
+    };
+    object.insert("publication_started".to_owned(), json!(false));
+    object
+        .entry("mutated".to_owned())
+        .or_insert_with(|| json!(false));
+    AppError::structured(
+        error.category(),
+        error.code(),
+        error.message(),
+        Some(details),
+    )
+}
+
+/// Audited identity of queue-owned drift repair.
+pub(crate) const SYNC_DRIFT_REPAIR_ACTOR: &str = "caravan-scheduler";
+const SYNC_DRIFT_REPAIR_REASON: &str =
+    "routine native Stack drift repaired by the queue (bd-7ff76d)";
+
+/// Outcome of one sync-owned drift repair attempt.
+pub(crate) struct SyncDriftRepair {
+    pub output: NativeStackRebaseOutput,
+    pub status: StatusOutput,
+}
+
+/// Sealed queue-owned repair plans for every eligible drifted Stack, in
+/// canonical caravan order. Pure: no provider, Git or filesystem access.
+pub(crate) fn drift_repair_plans<'a>(
+    context: &AppContext,
+    status: &'a StatusOutput,
+) -> Vec<(&'a NativeStackStatus, NativeStackRebasePlan)> {
+    if context.config.stack_type != crate::config::StackType::Github
+        || !context.config.stack_rollout.mutations_opt_in
+        || context.config.stack_rollout.manual_drift_repair
+        || status.stack_backend.provider_stacks_truncated
+    {
+        return Vec::new();
+    }
+    let held = crate::stack_policy::held_caravan_members(status);
+    let mut candidates = status
+        .stack_backend
+        .native_stacks
+        .iter()
+        .filter(|native| read::native_stack_quarantinable(native))
+        .filter(|native| {
+            native
+                .problems
+                .iter()
+                .any(|problem| problem.code != "github_stack_member_order_drift")
+        })
+        .filter(|native| {
+            native.caravan_id.is_some_and(|id| {
+                !held.contains(&id)
+                    && status
+                        .analysis
+                        .fleet
+                        .caravans
+                        .iter()
+                        .any(|caravan| caravan.id == id && !caravan.parked)
+            })
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|native| native.caravan_id);
+    candidates
+        .into_iter()
+        .filter_map(|native| {
+            plan_from_native(
+                context,
+                status,
+                native,
+                SYNC_DRIFT_REPAIR_ACTOR,
+                SYNC_DRIFT_REPAIR_REASON,
+            )
+            .ok()
+            .map(|plan| (native, plan))
+        })
+        .collect()
+}
+
+/// Repair one caravan-local drifted native Stack as ordinary queue behaviour
+/// (bd-7ff76d).
+///
+/// On 2026-10-20 Cacophony Stack #4567 (child PR4566 no longer containing
+/// root PR4565) could only be repaired by an operator-approved
+/// `rebase-apply`, so the queue stalled until both PRs were merged by hand.
+/// Under the repository's reviewed Stack mutation opt-in, sync now plans the
+/// same sealed rebase from the same exact provider facts and applies it under
+/// its writer guard: every rewritten head is force-with-lease guarded against
+/// its observed generation, the Stack is rebuilt exactly, rewritten heads need
+/// fresh CI, and the receipt is checkpointed. A root merged out of band is
+/// covered too: the suffix is replayed onto the default branch.
+///
+/// Only caravan-local drift on an open mapped Stack is eligible, never one
+/// that is paused, parked, unknown, truncated or membership-only (that is
+/// automatic recovery's job). A planning or local-preparation refusal (for
+/// example a real conflict) writes nothing and leaves the caravan quarantined
+/// for its owner; any later failure is returned for reconciliation.
+pub(crate) fn repair_drift_for_sync(
+    context: &AppContext,
+    status: &StatusOutput,
+    writer: &crate::writer_guard::WriterOperationGuard,
+    deadline: std::time::Instant,
+    github_budget: Option<&crate::command::GithubRequestBudget>,
+) -> Result<Option<SyncDriftRepair>, AppError> {
+    for (native, plan) in drift_repair_plans(context, status) {
+        let key = receipt_key(&plan.plan_hash)?;
+        if crate::stack_checkpoint::load::<NativeStackRebaseOutput>(&context.repository_path, &key)?
+            .is_some_and(|done| done.plan.plan_hash == plan.plan_hash)
+        {
+            // This exact plan already completed; never rewrite the same
+            // generation twice. Fresh provider truth must change first.
+            continue;
+        }
+        match apply_plan(
+            context,
+            status,
+            plan,
+            native.stack.number,
+            &key,
+            writer,
+            deadline,
+            github_budget,
+        ) {
+            Ok((output, status)) => return Ok(Some(SyncDriftRepair { output, status })),
+            // Nothing was written: leave this caravan quarantined for its
+            // owner and try the next eligible Stack.
+            Err(error)
+                if error
+                    .details()
+                    .and_then(|details| details.get("publication_started").cloned())
+                    == Some(json!(false)) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(None)
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn apply_plan(
     context: &AppContext,
@@ -547,7 +689,7 @@ fn apply_plan(
                     },
                 )),
         )
-        .map_err(|error| owner_continuation_refusal(error, &plan, member))?;
+        .map_err(|error| before_publication(owner_continuation_refusal(error, &plan, member)))?;
         target = Some(crate::physical_rebase::PlannedBase::Simulated(
             BranchSnapshot {
                 repository: plan.repository.clone(),
@@ -1013,30 +1155,59 @@ mod tests {
         assert!(!proven_retained_closed_rows(&native));
     }
 
+    /// bd-7ff76d replaced "ordinary sync never rewrites" with one audited,
+    /// gated entry. Sync reaches the publisher only through
+    /// `repair_drift_for_sync`, which plans with the same sealed planner as the
+    /// explicit command and is gated by the reviewed Stack opt-in and the
+    /// repository's `manual_drift_repair` choice.
     #[test]
-    fn ordinary_native_sync_has_no_rebase_publisher_entry() {
+    fn sync_reaches_the_rebase_publisher_only_through_gated_drift_repair() {
         let sync = include_str!("sync.rs")
             .split("\n#[cfg(test)]\nmod tests")
             .next()
             .unwrap();
-        assert!(!sync.contains("native_stack_rebase::"));
-        assert!(!sync.contains("NativeStackRebaseOutput"));
-        assert!(!sync.contains("native Stack reconstruction requires exact-generation CI"));
+        assert_eq!(sync.matches("native_stack_rebase::").count(), 3);
+        assert!(sync.contains("crate::native_stack_rebase::repair_drift_for_sync("));
+        assert!(sync.contains("crate::native_stack_rebase::SyncDriftRepair"));
         assert!(sync.contains("require_native_stack_backend_healthy(&status)?"));
         let explicit = include_str!("native_stack_rebase.rs")
             .split("\n#[cfg(test)]\nmod tests")
             .next()
             .unwrap();
         assert!(!explicit.contains("auto_apply_from_status"));
-        assert!(!explicit.contains("caravan-scheduler"));
-        // One private definition and one call from the explicitly requested
-        // apply command. Ordinary sync cannot select or invoke this publisher.
+        // One private definition; one call from the explicit apply command and
+        // one from the gated sync repair.
         assert_eq!(explicit.matches("fn apply_plan(").count(), 1);
+        assert_eq!(explicit.matches("        match apply_plan(\n").count(), 1);
         assert_eq!(explicit.matches("    apply_plan(\n").count(), 1);
         assert!(
             explicit.contains("context.acquire_writer_operation(\"native-stack-rebase-apply\")")
         );
         assert!(explicit.contains("plan.plan_hash != input.expected_plan_hash || !plan.verify()"));
+        assert!(explicit.contains("|| !context.config.stack_rollout.mutations_opt_in"));
+        assert!(explicit.contains("|| context.config.stack_rollout.manual_drift_repair"));
+    }
+
+    #[test]
+    fn preparation_refusals_are_marked_before_publication() {
+        let marked = before_publication(AppError::structured(
+            ErrorCategory::Validation,
+            "rebase_merge_tree_conflict",
+            "conflict",
+            Some(json!({"conflicting_paths": ["src/a.rs"]})),
+        ));
+        let details = marked.details().unwrap();
+        assert_eq!(details["publication_started"], false);
+        assert_eq!(details["mutated"], false);
+        assert_eq!(details["conflicting_paths"][0], "src/a.rs");
+        // An explicit mutation verdict is never overwritten.
+        let mutated = before_publication(AppError::structured(
+            ErrorCategory::ExecutionFailure,
+            "x",
+            "y",
+            Some(json!({"mutated": true})),
+        ));
+        assert_eq!(mutated.details().unwrap()["mutated"], true);
     }
 
     fn sample_plan() -> NativeStackRebasePlan {

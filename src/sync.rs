@@ -4833,6 +4833,98 @@ fn sync_without_hooks(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn native_drift_repair_output(
+    context: &AppContext,
+    input: &SyncInput,
+    started: Instant,
+    operation_deadline: Instant,
+    initial_status_elapsed: Duration,
+    repair: crate::native_stack_rebase::SyncDriftRepair,
+    lock_recovery: Option<OperationLockRecovery>,
+    lock: &mut WriterOperationGuard,
+) -> Result<SyncOutput, AppError> {
+    let crate::native_stack_rebase::SyncDriftRepair { output, status } = repair;
+    lock.checkpoint(
+        "native_drift_repair_complete",
+        json!({"repair": &output, "status": &status.stack_backend}),
+        false,
+    )?;
+    let root = output.plan.root_pr;
+    let rebase_receipts = output
+        .physical
+        .as_ref()
+        .map_or_else(Vec::new, |physical| physical.receipts.clone());
+    let receipt = OperationReceipt {
+        operation_id: OperationId::new(),
+        operation: "sync-native-drift-repair".to_owned(),
+        completed_steps: vec![MutationStep {
+            kind: MutationKind::RebaseBranch,
+            state: MutationStepState::Completed,
+            pr: Some(root),
+            summary: format!(
+                "queue-owned native Stack drift repair: Stack #{} plan {} rewrote {} head(s) under exact leases and rebuilt the Stack; fresh CI required={}",
+                output.plan.stack,
+                output.plan.plan_hash,
+                rebase_receipts
+                    .iter()
+                    .filter(|receipt| !receipt.already_satisfied)
+                    .count(),
+                output.fresh_ci_required,
+            ),
+        }],
+        changed: true,
+    };
+    let mut scheduler_status =
+        successful_scheduler_status(&status, &[], &[], context.config.rebase_on_join, &[], &[]);
+    scheduler_status.wake_class = SchedulerWakeClass::RetryTick;
+    scheduler_status.disposition = SchedulerDisposition::RetryTick;
+    "native Stack drift repaired by the queue; rewritten heads wait for fresh CI, then the next tick lands them"
+        .clone_into(&mut scheduler_status.reason);
+    Ok(SyncOutput {
+        tick: SyncTickReceipt {
+            schema_version: 1,
+            verb: "sync".to_owned(),
+            caravans: status.analysis.fleet.caravans.len(),
+            unqueued: status.analysis.fleet.unqueued.len(),
+            synchronized: 1,
+            joins: 0,
+            changed: true,
+        },
+        receipt,
+        auto_admission: AutoAdmissionOutput::disabled(context, input.all),
+        scheduler_status,
+        timing: Some(SyncTiming {
+            deadline_ms: duration_millis(operation_deadline.saturating_duration_since(started)),
+            total_ms: duration_millis(started.elapsed()),
+            initial_status_ms: duration_millis(initial_status_elapsed),
+            provider_convergence_ms: duration_millis(started.elapsed()),
+            final_status_ms: 0,
+        }),
+        lock_recovery,
+        provider_receipts: Vec::new(),
+        closed_lifecycle_transitions: Vec::new(),
+        root_auto_merge: Vec::new(),
+        root_promotion: Vec::new(),
+        root_merge: Vec::new(),
+        ci_generation_dispatches: Vec::new(),
+        native_stack_land: Vec::new(),
+        native_membership_recovery: Vec::new(),
+        native_append_membership_recovery: Vec::new(),
+        required_runs: Vec::new(),
+        rebase_plans: Vec::new(),
+        rebase_receipts,
+        historical_predecessor: read::historical_predecessor(&status),
+        synchronized_caravans: vec![root],
+        paused_caravans: Vec::new(),
+        head_advancements: Vec::new(),
+        ci: Vec::new(),
+        events: Vec::new(),
+        hook_deliveries: Vec::new(),
+        status,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn native_membership_recovery_output(
     context: &AppContext,
     input: &SyncInput,
@@ -5237,10 +5329,30 @@ fn sync_with_lock(
         );
     }
 
-    // Ordinary native sync never invokes a source-history rewriter. Preserve
-    // divergent source heads and route their existing typed backend diagnosis
-    // to the source owner; a fresh snapshot or scheduler tick is not authority
-    // to run the explicitly requested native-rebase command.
+    // bd-7ff76d: routine caravan-local Stack drift is ordinary queue work.
+    // Under the reviewed Stack mutation opt-in, repair one drifted Stack with
+    // the same sealed, lease-guarded native rebase an owner would review, then
+    // let fresh CI and the next tick continue. Drift it cannot repair without
+    // writing anything stays quarantined for its owner (bd-4d4621); every
+    // other problem still fails the backend closed below.
+    if let Some(repair) = crate::native_stack_rebase::repair_drift_for_sync(
+        context,
+        &status,
+        &lock,
+        operation_deadline,
+        Some(&github_budget),
+    )? {
+        return native_drift_repair_output(
+            context,
+            input,
+            started,
+            operation_deadline,
+            initial_status_elapsed,
+            repair,
+            lock_recovery,
+            &mut lock,
+        );
+    }
     require_native_stack_backend_healthy(&status)?;
 
     // Root landing is the first active-fleet provider convergence action for
