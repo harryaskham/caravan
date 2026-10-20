@@ -1696,14 +1696,26 @@ and native add postconditions are all revalidated; the provider add is an
 idempotent already-satisfied write. Multiple/foreign extras, moved heads,
 noncanonical candidates, unrelated backend problems, or incomplete inventory
 never gain this authority. The resulting membership receipt is returned as
-`native_append_membership_recovery`. Adjacent ancestry divergence, whether on
-one Stack or several, remains a source-owner repair decision. Ordinary sync
-must not invoke a native source-rebase publisher or synthesize owner rewrite
-intent from a status snapshot. It preserves current heads, returns the existing
-native-backend diagnosis, and creates no post-rewrite CI work. The former
-`auto_apply_from_status` path is removed rather than hidden behind a new receipt,
-flag or approval gate. Normal landing and membership recovery retain their
-existing controls; historical operation receipts remain untouched.
+`native_append_membership_recovery`. Routine adjacent ancestry divergence is
+queue work (bd-7ff76d, operator direction 2026-10-20). Under the repository's
+reviewed `stack_rollout.mutations_opt_in`, and unless the repository sets
+`stack_rollout.manual_drift_repair: true`, sync repairs at most one
+caravan-local drifted Stack per tick: an open, mapped, unpaused, unparked Stack
+whose problems are only ancestry or PR base/head representation drift. It plans
+with the same sealed planner as `native-stack rebase-preview` (actor
+`caravan-scheduler`), never replans a plan hash already applied, publishes every
+rewritten head under force-with-lease against its exact observed generation,
+rebuilds the Stack exactly, checkpoints the receipt, and returns. It dispatches
+no CI itself: the rewritten heads' own push events start fresh CI and the next
+tick lands them. A root merged out of band is covered too: the suffix is
+replayed onto the exact default branch. Unknown ancestry, truncated inventory,
+membership-only drift and held caravans never gain this authority. A planning
+or local-preparation refusal (for example a real conflict) writes nothing and
+leaves the caravan quarantined with its exact owner recovery command; any later
+failure fails the tick for reconciliation. The former `auto_apply_from_status`
+path stays removed: this is one gated entry, not a status-snapshot rewrite
+selector. Normal landing and membership recovery retain their existing
+controls; historical operation receipts remain untouched.
 
 Explicit `native-stack rebase-apply` is still forceful even when
 `rebase_on_join` is false. It is not a non-force fallback. A parent-cardinality

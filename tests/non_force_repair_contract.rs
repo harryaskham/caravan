@@ -99,8 +99,12 @@ fn non_force_operator_contract_states_real_force_and_uncertainty_boundaries() {
     assert!(native.contains("pub fn apply("));
     assert!(native.contains("apply_prepared_atomically"));
     let sync = include_str!("../src/sync.rs");
-    assert!(!sync.contains("native_stack_rebase::"));
+    // bd-7ff76d: sync's only route to the native publisher is the gated
+    // drift repair, and it never synthesizes post-rewrite CI work.
+    assert!(!sync.contains("auto_apply_from_status"));
+    assert!(sync.contains("crate::native_stack_rebase::repair_drift_for_sync("));
     assert!(!sync.contains("native Stack reconstruction requires exact-generation CI"));
+    assert!(native.contains("context.config.stack_rollout.manual_drift_repair"));
     let physical = include_str!("../src/physical_rebase.rs");
     assert!(physical.contains("--force-with-lease=refs/heads/"));
 }

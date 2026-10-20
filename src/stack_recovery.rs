@@ -1937,6 +1937,7 @@ mod tests {
             stack_rollout: StackRolloutConfig {
                 mutations_opt_in: true,
                 reviewed_by: "reviewed-change".to_owned(),
+                manual_drift_repair: false,
             },
             ..CaravanConfig::default()
         };

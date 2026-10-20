@@ -87,12 +87,17 @@ force-with-lease.** `rebase_on_join: false` is not a global no-force switch for
 those explicit paths. They are not a non-force fallback; first-party names do
 not change their effect.
 
-Ordinary sync no longer invokes `auto_apply_from_status`: the automatic native
-source-rebase publisher was removed, not wrapped in another receipt or approval
-gate. Native ancestry drift preserves source heads and returns the existing
-backend diagnosis to the source owner. This source correction does not prove an
-older installed runtime has changed, erase earlier effects, or authorize replay
-of a historical operation. Normal landing and membership recovery remain separate.
+Ordinary sync no longer invokes `auto_apply_from_status`. Since bd-7ff76d it has
+exactly one gated drift-repair entry instead: under the reviewed Stack mutation
+opt-in, and unless `stack_rollout.manual_drift_repair: true`, sync repairs one
+caravan-local drifted Stack per tick with the sealed native rebase planner
+(actor `caravan-scheduler`), force-with-lease against each exact observed head,
+then waits for the rewritten heads' own fresh CI. That is still a force-with-lease
+path, never a non-force fallback. Drift it cannot plan or prepare without
+writing stays quarantined for the source owner with the exact recovery command.
+This does not prove an older installed runtime has changed, erase earlier
+effects, or authorize replay of a historical operation. Normal landing and
+membership recovery remain separate.
 
 **There is no standalone sealed tail-eviction preview CLI.** `cara plan` exposes
 sync/concat, not an eviction preview, and `cara evict` has no dry-run flag. Some

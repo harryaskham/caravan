@@ -568,7 +568,9 @@ intent before push, and refuses unresolved retries or cleanup. It never resumes
 sync, changes queue topology, or transfers source ownership. Existing legacy
 sessions cannot be relabelled non-force. Explicit native rebase and legacy
 repair remain force-with-lease paths, even with `rebase_on_join: false`.
-Ordinary sync does not invoke native source rebasing automatically.
+Ordinary sync repairs routine native Stack drift itself only through its one
+gated, audited drift-repair entry (see native Stacks below), which is also
+force-with-lease; `stack_rollout.manual_drift_repair: true` turns it off.
 See the [owner continuation and refusal contract](.agents/skills/cara-operator/references/history-preserving-repair.md).
 
 A semantic grant is distinct from a mechanical conflict: it is bounded, expiring,
@@ -871,12 +873,18 @@ one canonical candidate already visible as the provider Stack's extra tail,
 sync temporarily projects the proven provider prefix and reruns ordinary
 membership. Every candidate/base/label/compatibility lease remains intact and
 the Stack add resolves idempotently; foreign/multiple extras remain a decision.
-The receipt is exposed as `native_append_membership_recovery`. Known adjacent
-ancestry divergence remains a source-owner repair decision. Ordinary sync never
-invokes the explicit native-rebase publisher, selects source rewrite intent on
-an owner's behalf, or dispatches CI for a source generation it rewrote that way.
-It preserves every current source head and returns the existing typed backend
-diagnosis. Normal landing and membership recovery remain separate paths.
+The receipt is exposed as `native_append_membership_recovery`. Routine adjacent
+ancestry divergence is queue work (bd-7ff76d): under the reviewed Stack mutation
+opt-in, and unless `stack_rollout.manual_drift_repair: true`, sync repairs at
+most one caravan-local drifted Stack per tick with the sealed native rebase
+planner (actor `caravan-scheduler`), force-with-lease against each exact
+observed head, rebuilds the Stack, checkpoints the receipt and returns. It
+dispatches no CI; the rewritten heads' own pushes start fresh CI and the next
+tick lands them. A root merged out of band is covered by replaying the suffix
+onto the default branch. Drift it cannot plan or prepare without writing stays
+quarantined with the owner's exact recovery command, and the rest of the queue
+keeps moving (bd-4d4621). Normal landing and membership recovery remain
+separate paths.
 
 `cara native-stack recovery-preview` followed by `recovery-apply` remains the
 explicit path for partial, ambiguous, or independently reviewed recovery shapes
