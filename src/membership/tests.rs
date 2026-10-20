@@ -11,6 +11,7 @@ use crate::model::{
 mod batch_capacity;
 mod expected_admission;
 mod native_projection;
+mod receipt_contract;
 
 #[derive(Default)]
 struct FakeProvider {

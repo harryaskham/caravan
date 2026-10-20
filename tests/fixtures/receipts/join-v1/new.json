@@ -1,0 +1,537 @@
+{
+  "receipt": {
+    "operation_id": "01a158d4-d0f8-7c73-80f2-4f6ac36d47df",
+    "operation": "new",
+    "completed_steps": [
+      {
+        "kind": "set_base",
+        "state": "already_satisfied",
+        "pr": 2,
+        "summary": "PR already targets the required base"
+      },
+      {
+        "kind": "remove_label",
+        "state": "already_satisfied",
+        "pr": 2,
+        "summary": "label `caravan-join-skipped` already absent"
+      },
+      {
+        "kind": "add_label",
+        "state": "completed",
+        "pr": 2,
+        "summary": "added label `caravan`"
+      },
+      {
+        "kind": "enable_auto_merge",
+        "state": "completed",
+        "pr": 2,
+        "summary": "enabled squash auto-merge"
+      },
+      {
+        "kind": "comment",
+        "state": "completed",
+        "pr": 2,
+        "summary": "posted durable control-label audit comment"
+      }
+    ],
+    "changed": true
+  },
+  "provider_api": {
+    "calls": 0,
+    "graphql_calls": 0,
+    "rest_calls": 0,
+    "gh_cli_calls": 0,
+    "cache_hits": 0
+  },
+  "provider_receipts": [
+    {
+      "kind": "add_label",
+      "before": {
+        "number": 2,
+        "title": "PR 2",
+        "url": "https://example.invalid/2",
+        "state": "open",
+        "draft": false,
+        "head": {
+          "repository": {
+            "owner": "harryaskham",
+            "name": "caravan"
+          },
+          "name": "candidate",
+          "oid": "1111111111111111111111111111111111111111"
+        },
+        "base": {
+          "repository": {
+            "owner": "harryaskham",
+            "name": "caravan"
+          },
+          "name": "main",
+          "oid": "2222222222222222222222222222222222222222"
+        },
+        "cross_repository": false,
+        "labels": [],
+        "auto_merge": {
+          "enabled": false
+        },
+        "checks": [],
+        "created_at": "2026-01-01T00:00:02Z"
+      },
+      "after": {
+        "number": 2,
+        "title": "PR 2",
+        "url": "https://example.invalid/2",
+        "state": "open",
+        "draft": false,
+        "head": {
+          "repository": {
+            "owner": "harryaskham",
+            "name": "caravan"
+          },
+          "name": "candidate",
+          "oid": "1111111111111111111111111111111111111111"
+        },
+        "base": {
+          "repository": {
+            "owner": "harryaskham",
+            "name": "caravan"
+          },
+          "name": "main",
+          "oid": "2222222222222222222222222222222222222222"
+        },
+        "cross_repository": false,
+        "labels": [
+          "caravan"
+        ],
+        "auto_merge": {
+          "enabled": false
+        },
+        "checks": [],
+        "created_at": "2026-01-01T00:00:02Z"
+      }
+    },
+    {
+      "kind": "enable_auto_merge",
+      "before": {
+        "number": 2,
+        "title": "PR 2",
+        "url": "https://example.invalid/2",
+        "state": "open",
+        "draft": false,
+        "head": {
+          "repository": {
+            "owner": "harryaskham",
+            "name": "caravan"
+          },
+          "name": "candidate",
+          "oid": "1111111111111111111111111111111111111111"
+        },
+        "base": {
+          "repository": {
+            "owner": "harryaskham",
+            "name": "caravan"
+          },
+          "name": "main",
+          "oid": "2222222222222222222222222222222222222222"
+        },
+        "cross_repository": false,
+        "labels": [
+          "caravan"
+        ],
+        "auto_merge": {
+          "enabled": false
+        },
+        "checks": [],
+        "created_at": "2026-01-01T00:00:02Z"
+      },
+      "after": {
+        "number": 2,
+        "title": "PR 2",
+        "url": "https://example.invalid/2",
+        "state": "open",
+        "draft": false,
+        "head": {
+          "repository": {
+            "owner": "harryaskham",
+            "name": "caravan"
+          },
+          "name": "candidate",
+          "oid": "1111111111111111111111111111111111111111"
+        },
+        "base": {
+          "repository": {
+            "owner": "harryaskham",
+            "name": "caravan"
+          },
+          "name": "main",
+          "oid": "2222222222222222222222222222222222222222"
+        },
+        "cross_repository": false,
+        "labels": [
+          "caravan"
+        ],
+        "auto_merge": {
+          "enabled": true,
+          "merge_method": "squash"
+        },
+        "checks": [],
+        "created_at": "2026-01-01T00:00:02Z"
+      }
+    },
+    {
+      "kind": "comment",
+      "before": {
+        "number": 2,
+        "title": "PR 2",
+        "url": "https://example.invalid/2",
+        "state": "open",
+        "draft": false,
+        "head": {
+          "repository": {
+            "owner": "harryaskham",
+            "name": "caravan"
+          },
+          "name": "candidate",
+          "oid": "1111111111111111111111111111111111111111"
+        },
+        "base": {
+          "repository": {
+            "owner": "harryaskham",
+            "name": "caravan"
+          },
+          "name": "main",
+          "oid": "2222222222222222222222222222222222222222"
+        },
+        "cross_repository": false,
+        "labels": [
+          "caravan"
+        ],
+        "auto_merge": {
+          "enabled": true,
+          "merge_method": "squash"
+        },
+        "checks": [],
+        "created_at": "2026-01-01T00:00:02Z"
+      },
+      "after": {
+        "number": 2,
+        "title": "PR 2",
+        "url": "https://example.invalid/2",
+        "state": "open",
+        "draft": false,
+        "head": {
+          "repository": {
+            "owner": "harryaskham",
+            "name": "caravan"
+          },
+          "name": "candidate",
+          "oid": "1111111111111111111111111111111111111111"
+        },
+        "base": {
+          "repository": {
+            "owner": "harryaskham",
+            "name": "caravan"
+          },
+          "name": "main",
+          "oid": "2222222222222222222222222222222222222222"
+        },
+        "cross_repository": false,
+        "labels": [
+          "caravan"
+        ],
+        "auto_merge": {
+          "enabled": true,
+          "merge_method": "squash"
+        },
+        "checks": [],
+        "created_at": "2026-01-01T00:00:02Z"
+      }
+    }
+  ],
+  "join_receipt": {
+    "schema_version": 1,
+    "operation_id": "01a158d4-d0f8-7c73-80f2-4f6ac36d47df",
+    "repository": {
+      "owner": "harryaskham",
+      "name": "caravan"
+    },
+    "caravan_id": 2,
+    "candidate_pr": 2,
+    "candidate_source_head_oid": "1111111111111111111111111111111111111111",
+    "predecessor": {
+      "pr": 0,
+      "branch": "main",
+      "head_oid": "2222222222222222222222222222222222222222"
+    },
+    "default_branch_oid": "2222222222222222222222222222222222222222",
+    "result": {
+      "head_oid": "1111111111111111111111111111111111111111",
+      "base_ref": "main",
+      "base_oid": "2222222222222222222222222222222222222222",
+      "state": "open"
+    },
+    "rebase_on_join": false,
+    "ancestry_verified": false,
+    "membership_durable": true,
+    "force_intent": "none",
+    "config_fingerprint": "fnv1a64:033b422cd7368ef1",
+    "provider_receipts": [
+      {
+        "kind": "add_label",
+        "before": {
+          "number": 2,
+          "title": "PR 2",
+          "url": "https://example.invalid/2",
+          "state": "open",
+          "draft": false,
+          "head": {
+            "repository": {
+              "owner": "harryaskham",
+              "name": "caravan"
+            },
+            "name": "candidate",
+            "oid": "1111111111111111111111111111111111111111"
+          },
+          "base": {
+            "repository": {
+              "owner": "harryaskham",
+              "name": "caravan"
+            },
+            "name": "main",
+            "oid": "2222222222222222222222222222222222222222"
+          },
+          "cross_repository": false,
+          "labels": [],
+          "auto_merge": {
+            "enabled": false
+          },
+          "checks": [],
+          "created_at": "2026-01-01T00:00:02Z"
+        },
+        "after": {
+          "number": 2,
+          "title": "PR 2",
+          "url": "https://example.invalid/2",
+          "state": "open",
+          "draft": false,
+          "head": {
+            "repository": {
+              "owner": "harryaskham",
+              "name": "caravan"
+            },
+            "name": "candidate",
+            "oid": "1111111111111111111111111111111111111111"
+          },
+          "base": {
+            "repository": {
+              "owner": "harryaskham",
+              "name": "caravan"
+            },
+            "name": "main",
+            "oid": "2222222222222222222222222222222222222222"
+          },
+          "cross_repository": false,
+          "labels": [
+            "caravan"
+          ],
+          "auto_merge": {
+            "enabled": false
+          },
+          "checks": [],
+          "created_at": "2026-01-01T00:00:02Z"
+        }
+      },
+      {
+        "kind": "enable_auto_merge",
+        "before": {
+          "number": 2,
+          "title": "PR 2",
+          "url": "https://example.invalid/2",
+          "state": "open",
+          "draft": false,
+          "head": {
+            "repository": {
+              "owner": "harryaskham",
+              "name": "caravan"
+            },
+            "name": "candidate",
+            "oid": "1111111111111111111111111111111111111111"
+          },
+          "base": {
+            "repository": {
+              "owner": "harryaskham",
+              "name": "caravan"
+            },
+            "name": "main",
+            "oid": "2222222222222222222222222222222222222222"
+          },
+          "cross_repository": false,
+          "labels": [
+            "caravan"
+          ],
+          "auto_merge": {
+            "enabled": false
+          },
+          "checks": [],
+          "created_at": "2026-01-01T00:00:02Z"
+        },
+        "after": {
+          "number": 2,
+          "title": "PR 2",
+          "url": "https://example.invalid/2",
+          "state": "open",
+          "draft": false,
+          "head": {
+            "repository": {
+              "owner": "harryaskham",
+              "name": "caravan"
+            },
+            "name": "candidate",
+            "oid": "1111111111111111111111111111111111111111"
+          },
+          "base": {
+            "repository": {
+              "owner": "harryaskham",
+              "name": "caravan"
+            },
+            "name": "main",
+            "oid": "2222222222222222222222222222222222222222"
+          },
+          "cross_repository": false,
+          "labels": [
+            "caravan"
+          ],
+          "auto_merge": {
+            "enabled": true,
+            "merge_method": "squash"
+          },
+          "checks": [],
+          "created_at": "2026-01-01T00:00:02Z"
+        }
+      },
+      {
+        "kind": "comment",
+        "before": {
+          "number": 2,
+          "title": "PR 2",
+          "url": "https://example.invalid/2",
+          "state": "open",
+          "draft": false,
+          "head": {
+            "repository": {
+              "owner": "harryaskham",
+              "name": "caravan"
+            },
+            "name": "candidate",
+            "oid": "1111111111111111111111111111111111111111"
+          },
+          "base": {
+            "repository": {
+              "owner": "harryaskham",
+              "name": "caravan"
+            },
+            "name": "main",
+            "oid": "2222222222222222222222222222222222222222"
+          },
+          "cross_repository": false,
+          "labels": [
+            "caravan"
+          ],
+          "auto_merge": {
+            "enabled": true,
+            "merge_method": "squash"
+          },
+          "checks": [],
+          "created_at": "2026-01-01T00:00:02Z"
+        },
+        "after": {
+          "number": 2,
+          "title": "PR 2",
+          "url": "https://example.invalid/2",
+          "state": "open",
+          "draft": false,
+          "head": {
+            "repository": {
+              "owner": "harryaskham",
+              "name": "caravan"
+            },
+            "name": "candidate",
+            "oid": "1111111111111111111111111111111111111111"
+          },
+          "base": {
+            "repository": {
+              "owner": "harryaskham",
+              "name": "caravan"
+            },
+            "name": "main",
+            "oid": "2222222222222222222222222222222222222222"
+          },
+          "cross_repository": false,
+          "labels": [
+            "caravan"
+          ],
+          "auto_merge": {
+            "enabled": true,
+            "merge_method": "squash"
+          },
+          "checks": [],
+          "created_at": "2026-01-01T00:00:02Z"
+        }
+      }
+    ],
+    "receipt_hash": "fnv1a64:c0188a9e2b92ce88"
+  },
+  "pull_request": {
+    "number": 2,
+    "title": "PR 2",
+    "url": "https://example.invalid/2",
+    "state": "open",
+    "draft": false,
+    "head": {
+      "repository": {
+        "owner": "harryaskham",
+        "name": "caravan"
+      },
+      "name": "candidate",
+      "oid": "1111111111111111111111111111111111111111"
+    },
+    "base": {
+      "repository": {
+        "owner": "harryaskham",
+        "name": "caravan"
+      },
+      "name": "main",
+      "oid": "2222222222222222222222222222222222222222"
+    },
+    "cross_repository": false,
+    "labels": [
+      "caravan"
+    ],
+    "auto_merge": {
+      "enabled": true,
+      "merge_method": "squash"
+    },
+    "checks": [],
+    "created_at": "2026-01-01T00:00:02Z"
+  },
+  "caravan_id": 2,
+  "admission_intent": {
+    "schema_version": 1,
+    "intent": "new",
+    "selection": "checked_out",
+    "outcome": "canonical",
+    "candidate_pr": 2,
+    "canonical_candidate_pr": 2,
+    "ordered_rows_ahead": [],
+    "bypassed_unjoined_prs": [],
+    "blocking_prs": [],
+    "dependency_prs": [],
+    "compatibility_clean": true,
+    "preflight_clean": true,
+    "provider_mutated": true,
+    "idempotent": false,
+    "reason": "candidate is the canonical first ordered new admission attempt",
+    "policy": "Priority/FIFO order binds automatic admission selection for both `new` and `join` intent, without exception. Explicit owner intent — an operator or agent naming one exact remote candidate with `cara check --pr N`, optionally `--tail-pr`/`--head-pr` — is resolved before FIFO canonical-candidate rejection for both `new` and `join`, and may attach ahead of earlier rows only while every bypassed row is an unrelated unjoined first-admission attempt; a joined row, a base-chain dependency of the candidate, a rank-indeterminate row, a candidate that is not itself a current ordered admission attempt, or an unresolved/ambiguous join target fails closed on canonical order. An owner operating on their own checked-out PR (local check, membership, renew/rejoin) reports canonical position as evidence only, exactly as before. Ordering never substitutes for compatibility, dependency, policy, freshness, generation integrity, or provider preflight."
+  },
+  "events": [],
+  "hook_deliveries": []
+}

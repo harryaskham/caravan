@@ -3312,6 +3312,9 @@ pub(crate) struct AdmissionMembership {
     pub repository: RepositoryId,
     pub candidate: PullRequestSnapshot,
     pub enrolled: bool,
+    /// Containing active caravan and one-based position, when enrolled.
+    pub caravan: Option<(PrNumber, u32)>,
+    pub default_branch: crate::model::BranchSnapshot,
     pub default_head: crate::model::CommitOid,
     pub provider_api: crate::model::GitHubApiTelemetry,
 }
@@ -3348,10 +3351,20 @@ pub(crate) fn admission_membership(
                 format!("PR #{number} is absent from admission membership discovery"),
             )
         })?;
+    let caravan = analysis.fleet.containing(number).map(|caravan| {
+        let position = caravan
+            .members
+            .iter()
+            .position(|member| *member == number)
+            .map_or(0, |index| u32::try_from(index + 1).unwrap_or(u32::MAX));
+        (caravan.id, position)
+    });
     Ok(AdmissionMembership {
         repository: snapshot.repository,
-        enrolled: analysis.fleet.containing(number).is_some(),
-        default_head: snapshot.default_branch.oid,
+        enrolled: caravan.is_some(),
+        caravan,
+        default_head: snapshot.default_branch.oid.clone(),
+        default_branch: snapshot.default_branch,
         candidate,
         provider_api: runner.github_api_telemetry(),
     })
