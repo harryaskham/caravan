@@ -1,0 +1,1 @@
+{"status":"error","meta":{"schema_version":1},"error":{"category":"validation","code":"rebase_merge_tree_conflict","message":"candidate conflicts with the caravan tail","details":{"conflicting_paths":["src/sync.rs"],"mutated":false}}}

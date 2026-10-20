@@ -16,6 +16,7 @@ pub mod command;
 pub mod compatibility;
 pub mod concat;
 pub mod expected_admission;
+pub mod failure_outcome;
 pub mod force;
 pub mod force_intent;
 pub mod generation;
@@ -1594,6 +1595,20 @@ pub fn build_router() -> ToolRouter<AppContext> {
         "Provider-truth verdict for one exact PR generation: enrolled, merged, unjoined, closed_unmerged or inconsistent, with `succeeded` true only when the exact expected head is enrolled without force intent or merged. Read-only, four light provider reads, no receipts consulted. Use this, not receipt fields, to decide whether publication, join, admission or merge happened.",
         |context: &AppContext, input: membership_proof::MembershipProofInput| {
             membership_proof::prove(context, &input)
+        },
+    );
+    router.add_typed_tool_with_output_schema(
+        "failures",
+        "Typed counts and recent examples of journalled sync/join/admission/eviction/CI failures: provider_error, budget_refusal, timeout, conflict_or_test_failure, process_refusal or unknown, with the exact refusing field/step and a linked bug. Local journal only; zero provider cost. `cara status` adds process_only from its own provider facts.",
+        |context: &AppContext, input: failure_outcome::FailuresInput| {
+            failure_outcome::failures(context, &input)
+        },
+    );
+    router.add_typed_tool_with_output_schema(
+        "failure_classify",
+        "Classify one external JSON error envelope (Cara --json error or a Caco reintegration/dead-letter record) into the same typed outcome. With --pr/--expected-head, provider truth (membership_proof) sets process_only for receipt/process refusals. Never echoes messages or secrets.",
+        |context: &AppContext, input: failure_outcome::FailureClassifyInput| {
+            failure_outcome::classify_file(context, &input)
         },
     );
     router.add_typed_tool_with_output_schema(
@@ -3201,6 +3216,8 @@ mod tests {
             "queue",
             "check",
             "membership_proof",
+            "failures",
+            "failure_classify",
             "new",
             "renew",
             "join",

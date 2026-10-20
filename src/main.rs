@@ -100,6 +100,10 @@ enum Command {
     /// Read-only and receipt-free. `succeeded` is true only when the exact
     /// expected head is an enrolled member without force intent, or merged.
     MembershipProof(caravan::membership_proof::MembershipProofInput),
+    /// Typed counts and recent examples of journalled failures (no provider reads).
+    Failures(caravan::failure_outcome::FailuresInput),
+    /// Classify one external JSON error envelope; `--pr` proves process-only.
+    FailureClassify(caravan::failure_outcome::FailureClassifyInput),
     /// Create a one-PR caravan from the current branch.
     New(CreateInput),
     /// Reevaluate an evicted PR as a new caravan.
@@ -487,6 +491,8 @@ fn run(cli: &Cli) -> Result<(), i32> {
         Command::CiAdmissionGate(input) => run_ci_admission_gate(cli, input),
         Command::Check(input) => run_check(cli, input),
         Command::MembershipProof(input) => run_membership_proof(cli, input),
+        Command::Failures(input) => run_failures(cli, input),
+        Command::FailureClassify(input) => run_failure_classify(cli, input),
         Command::New(input) => run_with_log_flush(cli, "new", || run_create_membership(cli, input)),
         Command::Renew(input) => {
             run_membership(cli, |context| caravan::membership::renew(context, input))
@@ -837,6 +843,13 @@ fn emit_status_result(
     match result {
         Ok(receipt) => {
             print!("{}", render_status(&receipt.output));
+            if let Some(summary) = receipt
+                .failure_outcomes
+                .as_ref()
+                .filter(|summary| summary.failures > 0)
+            {
+                print!("{}", render_failure_summary(summary));
+            }
             if let Some(partial) = receipt.status_partial {
                 eprintln!(
                     "status partial: phase={} cursor={} elapsed={}ms remaining={}ms; {}",
@@ -1491,6 +1504,85 @@ fn run_ci_gate(cli: &Cli, input: &caravan::CiGateInput) -> Result<(), i32> {
         }
         Err(error) => emit_human_error(error),
     }
+}
+
+fn run_failures(cli: &Cli, input: &caravan::failure_outcome::FailuresInput) -> Result<(), i32> {
+    let context = load_context(cli)?;
+    let result = caravan::failure_outcome::failures(&context, input);
+    if cli.json {
+        return emit_result(true, result);
+    }
+    match result {
+        Ok(summary) => {
+            print!("{}", render_failure_summary(&summary));
+            Ok(())
+        }
+        Err(error) => emit_human_error(error),
+    }
+}
+
+fn run_failure_classify(
+    cli: &Cli,
+    input: &caravan::failure_outcome::FailureClassifyInput,
+) -> Result<(), i32> {
+    let context = load_context(cli)?;
+    let result = caravan::failure_outcome::classify_file(&context, input);
+    if cli.json {
+        return emit_result(true, result);
+    }
+    match result {
+        Ok(outcome) => {
+            println!(
+                "{} {} code={} step={} retryable={} process_only={} bug={}",
+                serde_json::to_value(outcome.surface)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .unwrap_or_default(),
+                outcome.class.code(),
+                outcome.code,
+                outcome.refusing_step.as_deref().unwrap_or("-"),
+                outcome.retryable,
+                outcome
+                    .process_only
+                    .map_or_else(|| "unproven".to_owned(), |value| value.to_string()),
+                outcome.bug.as_deref().unwrap_or("-"),
+            );
+            Ok(())
+        }
+        Err(error) => emit_human_error(error),
+    }
+}
+
+fn render_failure_summary(summary: &caravan::failure_outcome::FailureSummary) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Failures: {} in {} journal records; process-only {}; needing a bug {}",
+        summary.failures, summary.scanned_records, summary.process_only, summary.needs_bug
+    );
+    for (class, count) in &summary.by_class {
+        let _ = writeln!(out, "  {class}: {count}");
+    }
+    for example in summary.recent.iter().take(5) {
+        let _ = writeln!(
+            out,
+            "  recent {} {} {}{}{}",
+            example.timestamp,
+            example.outcome.class.code(),
+            example.outcome.code,
+            example
+                .outcome
+                .refusing_step
+                .as_deref()
+                .map_or_else(String::new, |step| format!(" step={step}")),
+            match example.outcome.process_only {
+                Some(true) => " PROCESS-ONLY (provider shows success)",
+                _ => "",
+            }
+        );
+    }
+    out
 }
 
 fn run_membership_proof(

@@ -1,0 +1,1 @@
+{"status":"error","meta":{"schema_version":1},"error":{"category":"execution_failure","code":"github_stack_recovery_backend_unhealthy","message":"native Stack recovery permits only the expected missing-Stack backend problem","details":{"retryable":true,"mutated":false,"scheduler_status":{"disposition":"retry_tick"}}}}

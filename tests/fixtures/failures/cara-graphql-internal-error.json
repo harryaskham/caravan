@@ -1,0 +1,1 @@
+{"status":"error","meta":{"schema_version":1},"error":{"category":"execution_failure","code":"github_discovery_failed","message":"`gh api graphql` failed with exit code 1: gh: Something went wrong while executing your query. Please include `ABCD:1234:5678` when reporting this issue.","details":{"error":"CommandFailed"}}}
