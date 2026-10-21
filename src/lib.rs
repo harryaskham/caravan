@@ -391,7 +391,12 @@ GITHUB NATIVE STACKS (EXPLICIT OPT-IN)
   command, while independent caravans and admission keep moving. A zero-write
   automatic recovery refusal for such a caravan is contained the same way.
   Provider-unknown ancestry or inventory problems still fail the whole backend
-  closed.
+  closed. Under the reviewed Stack mutation opt-in (unless
+  `stack_rollout.manual_drift_repair: true`) sync itself repairs routine drift
+  and rebuilds a Stack whose retained closed rows defeat merged-prefix
+  recovery (closed rows pruned, never rewritten); a member it cannot replay
+  linearly is evicted with its descendants and a typed `sync_failed`
+  `metadata.repair_request` instead of holding its slot.
   Under no-force authority use the authorized owner's `repair start --non-force`
   and `repair continue --no-sync`, not either native rebase path. Every changed
   generation must pass fresh CI. Sync lands the longest contiguous ready prefix under a

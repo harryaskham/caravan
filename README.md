@@ -568,9 +568,10 @@ intent before push, and refuses unresolved retries or cleanup. It never resumes
 sync, changes queue topology, or transfers source ownership. Existing legacy
 sessions cannot be relabelled non-force. Explicit native rebase and legacy
 repair remain force-with-lease paths, even with `rebase_on_join: false`.
-Ordinary sync repairs routine native Stack drift itself only through its one
-gated, audited drift-repair entry (see native Stacks below), which is also
-force-with-lease; `stack_rollout.manual_drift_repair: true` turns it off.
+Ordinary sync repairs routine native Stack drift and Stacks holding closed
+history itself only through its one gated, audited drift-repair entry (see
+native Stacks below), which is also force-with-lease and evicts a member it
+cannot replay linearly; `stack_rollout.manual_drift_repair: true` turns it off.
 See the [owner continuation and refusal contract](.agents/skills/cara-operator/references/history-preserving-repair.md).
 
 A semantic grant is distinct from a mechanical conflict: it is bounded, expiring,
@@ -885,6 +886,27 @@ onto the default branch. Drift it cannot plan or prepare without writing stays
 quarantined with the owner's exact recovery command, and the rest of the queue
 keeps moving (bd-4d4621). Normal landing and membership recovery remain
 separate paths.
+
+A Stack that still holds closed history is queue work as well (bd-7efe6a).
+Where merged rows, a closed-unmerged row, interleaved history or non-linear
+ancestry defeat automatic merged-prefix recovery (previously every tick failed
+with `github_stack_closed_history_requires_owner`), sync rebuilds the Stack
+itself before that recovery runs, under the same gate: it replays every active
+member linearly from the default branch with force-with-lease, clears the
+drifted Stack, points each survivor's base at its predecessor, and rebuilds only
+the survivors. Closed rows are pruned from the representation, never rewritten;
+the raw generation stays in the sealed plan and checkpointed receipt.
+
+Neither repair lets a real conflict hold a slot any more. A member it cannot
+replay linearly is evicted together with its descendants, tail-first and
+labels-only (heads and bases preserved), with a typed reason; the members
+before it keep their rebase and the next candidate can be admitted. The tick
+emits `evicted` and the existing `sync_failed` hook with
+`metadata.repair_request` naming the exact PR, head, base, attempted target,
+refusal, conflicting paths, evicted PRs and the suggested
+`cara repair start --pr N --non-force …` then `cara rejoin --pr N`. Fetch,
+timeout, lease or push-preflight failures never evict. `cara sync --dry-run`
+previews the same sealed plan hash as a `native_stack_repair` action.
 
 `cara native-stack recovery-preview` followed by `recovery-apply` remains the
 explicit path for partial, ambiguous, or independently reviewed recovery shapes

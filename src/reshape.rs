@@ -690,6 +690,100 @@ fn execute(
     })
 }
 
+/// Provider receipts for a queue-owned suffix eviction (bd-7efe6a).
+pub(crate) struct QueueSuffixEviction {
+    pub receipt: OperationReceipt,
+    pub provider_receipts: Vec<GitHubMutationReceipt>,
+}
+
+/// Release a contiguous caravan suffix the queue's own native Stack repair
+/// could not replay linearly (bd-7efe6a).
+///
+/// `members` is in caravan order and runs to the caravan tail; it is released
+/// tail-first, exactly like `cara evict --cascade`, so no surviving edge is
+/// ever re-linked across a removed member. The caller has already cleared the
+/// drifted provider Stack and rebuilds only the survivors, so this is a pure
+/// label transition: every source head and PR base is preserved
+/// byte-for-byte, auto-merge is disabled, `caravan`, `caravan-force` and
+/// `caravan-parked` are removed, `caravan-evicted` is added, and the
+/// deterministic audit comment records the typed reason. Each step is
+/// idempotent against the provider's current labels.
+pub(crate) fn queue_evict_suffix(
+    provider: &impl MembershipProvider,
+    status: &StatusOutput,
+    members: &[PrNumber],
+    actor: &str,
+    reason: &str,
+    evidence: &str,
+) -> Result<QueueSuffixEviction, AppError> {
+    let mut state = ReshapeState::new(
+        ReshapeOperation::Evict,
+        status.analysis.pull_requests.clone(),
+    );
+    for number in members.iter().rev().copied() {
+        let observed = status
+            .analysis
+            .pull_requests
+            .get(&number)
+            .ok_or_else(|| missing_pr(number))?;
+        // Labels, base OID or auto-merge may have moved since discovery; the
+        // source head may not: the eviction evidence names that generation.
+        let current = provider
+            .refetch_pull_request(&status.repository, number)
+            .map_err(|error| provider_error(&error, Some(&state)))?;
+        if current.head != observed.head || current.state != PullRequestState::Open {
+            return Err(AppError::structured(
+                ErrorCategory::Validation,
+                "queue_eviction_generation_moved",
+                format!(
+                    "PR #{number} moved away from the exact generation the queue could not replay"
+                ),
+                Some(json!({
+                    "pr": number,
+                    "observed_head": observed.head,
+                    "current_head": current.head,
+                    "current_state": current.state,
+                    "completed_steps": state.steps,
+                    "provider_receipts": state.provider_receipts,
+                    "resumable": true,
+                })),
+            ));
+        }
+        state.pull_requests.insert(number, current);
+        let before_labels = state.current(number).labels.clone();
+        state.ensure_auto_merge_disabled(provider, &status.repository, number)?;
+        state.ensure_label_absent(provider, &status.repository, number, FORCE_LABEL)?;
+        state.ensure_label_absent(provider, &status.repository, number, PARKED_LABEL)?;
+        state.ensure_label_absent(provider, &status.repository, number, ACTIVE_LABEL)?;
+        state.ensure_label_present(provider, &status.repository, number, EVICTED_LABEL)?;
+        let after = state.current(number);
+        let audit = ControlLabelAudit {
+            operation: ReshapeOperation::Evict.name().to_owned(),
+            marker: control_label_marker(
+                ReshapeOperation::Evict.name(),
+                number,
+                &after.head.oid,
+                &before_labels,
+                &after.labels,
+            ),
+            before_labels,
+            after_labels: after.labels.clone(),
+            actor: actor.to_owned(),
+            reason: reason.to_owned(),
+            reason_source: "queue-owned native Stack repair under the reviewed Stack mutation opt-in (bd-7efe6a)".to_owned(),
+            compatibility_evidence: evidence.to_owned(),
+            clean_squash_evidence: "no replacement head: the released suffix keeps its exact source heads with auto-merge disabled".to_owned(),
+            admission_priority_basis:
+                "not applicable: eviction preserves relative queue priority".to_owned(),
+        };
+        state.ensure_control_label_comment(provider, &status.repository, number, &audit)?;
+    }
+    Ok(QueueSuffixEviction {
+        receipt: state.receipt(),
+        provider_receipts: state.provider_receipts,
+    })
+}
+
 /// A one-member caravan intentionally has no provider Stack: GitHub Stacks
 /// begin at two PRs. Evicting that exact singleton opens no topology edge and
 /// therefore needs only the ordinary receipt-gated membership transition. Any
@@ -2013,6 +2107,104 @@ mod tests {
             .expect_err("provider uncertainty never authorizes a label-only reshape");
 
         assert_eq!(error.code(), "github_stack_singleton_inventory_unproven");
+    }
+
+    /// bd-7efe6a: the queue releases an unreplayable suffix tail-first as a
+    /// pure label transition, preserving every head and base, idempotently.
+    #[test]
+    fn queue_suffix_eviction_releases_tail_first_and_preserves_sources() {
+        let mut pulls = vec![
+            pull_request(1, "main"),
+            pull_request(2, "pr-1"),
+            pull_request(3, "pr-2"),
+        ];
+        pulls[2].labels.insert(FORCE_LABEL.to_owned());
+        pulls[1].auto_merge = AutoMergeState::squash();
+        let provider = FakeProvider::new(&pulls);
+        let observed = status(pulls.clone());
+        let released = queue_evict_suffix(
+            &provider,
+            &observed,
+            &[PrNumber(2), PrNumber(3)],
+            "caravan-scheduler",
+            "rebase_conflict: queue-owned native Stack #42 repair could not replay PR #2",
+            "rebase_conflict preparing PR #2 onto pr-1",
+        )
+        .unwrap();
+        let state = provider.pull_requests.borrow();
+        for number in [2, 3] {
+            let pull = &state[&PrNumber(number)];
+            assert!(pull.has_label(EVICTED_LABEL), "#{number}");
+            assert!(!pull.has_label(ACTIVE_LABEL), "#{number}");
+            assert!(!pull.has_label(FORCE_LABEL), "#{number}");
+            assert!(!pull.auto_merge.enabled, "#{number}");
+            let before = &pulls[usize::try_from(number - 1).unwrap()];
+            assert_eq!(pull.head, before.head, "#{number} source head preserved");
+            assert_eq!(pull.base, before.base, "#{number} base preserved");
+        }
+        // The survivor is untouched.
+        assert_eq!(state[&PrNumber(1)], pulls[0]);
+        // Tail-first: every step for #3 precedes every step for #2.
+        let order = released
+            .receipt
+            .completed_steps
+            .iter()
+            .filter_map(|step| step.pr)
+            .collect::<Vec<_>>();
+        let last_three = order.iter().rposition(|pr| *pr == PrNumber(3)).unwrap();
+        let first_two = order.iter().position(|pr| *pr == PrNumber(2)).unwrap();
+        assert!(last_three < first_two, "{order:?}");
+        assert!(released.receipt.changed);
+        assert!(
+            released
+                .provider_receipts
+                .iter()
+                .any(|receipt| receipt.kind == MutationKind::Comment)
+        );
+        drop(state);
+
+        // A member whose source moved is never evicted on stale evidence.
+        let moved_provider = FakeProvider::new(&pulls);
+        moved_provider
+            .pull_requests
+            .borrow_mut()
+            .get_mut(&PrNumber(3))
+            .unwrap()
+            .head
+            .oid = CommitOid("f".repeat(40));
+        let Err(error) = queue_evict_suffix(
+            &moved_provider,
+            &observed,
+            &[PrNumber(2), PrNumber(3)],
+            "caravan-scheduler",
+            "stale",
+            "stale",
+        ) else {
+            panic!("a moved generation is never evicted");
+        };
+        assert_eq!(error.code(), "queue_eviction_generation_moved");
+        assert!(
+            moved_provider.pull_requests.borrow()[&PrNumber(3)].has_label(ACTIVE_LABEL),
+            "nothing was written for the moved generation"
+        );
+
+        // Replaying against the evicted provider truth writes no labels again.
+        let after = status(provider.pull_requests.borrow().values().cloned().collect());
+        let replay = queue_evict_suffix(
+            &provider,
+            &after,
+            &[PrNumber(2), PrNumber(3)],
+            "caravan-scheduler",
+            "same",
+            "same",
+        )
+        .unwrap();
+        assert!(
+            replay
+                .provider_receipts
+                .iter()
+                .all(|receipt| receipt.kind == MutationKind::Comment)
+        );
     }
 
     #[test]

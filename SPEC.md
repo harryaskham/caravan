@@ -367,12 +367,16 @@ Before recovery append, every accepted open child must provably contain its
 predecessor head. Divergent, behind, or unknown ancestry refuses before the
 provider write rather than allowing an implicit source rebase. Ordinary append
 rules are unchanged. Unmerged, reopened, interleaved, unknown, or non-linear
-retained history is not silently filtered into an automatic mutation:
-`github_stack_closed_history_requires_owner` preserves it and identifies the
+retained history is not silently filtered into an automatic membership append.
+Under the reviewed Stack mutation opt-in, and unless
+`stack_rollout.manual_drift_repair: true`, sync's queue-owned closed-history
+rebuild (bd-7efe6a, below) owns exactly those Stacks before recovery would
+refuse them. Otherwise `github_stack_closed_history_requires_owner` preserves the
+history, names the mapped `recovery_caravan_id`, and identifies the
 source-preserving recovery boundary. Closed rows remain excluded from active
-membership even when provider reformation refuses. This is not authority for
-native force-with-lease rebase, historical operation replay, or destructive
-history removal. Explicit `native-stack recovery-preview` / `recovery-apply`
+membership even when provider reformation refuses. Recovery append itself is not
+authority for native force-with-lease rebase, historical operation replay, or
+destructive history removal. Explicit `native-stack recovery-preview` / `recovery-apply`
 retain their own fresh-proof contract; there is no new tail-eviction preview verb.
 
 For intentionally scoped cleanup,  `cara sync --closed-pr
@@ -1709,13 +1713,64 @@ rebuilds the Stack exactly, checkpoints the receipt, and returns. It dispatches
 no CI itself: the rewritten heads' own push events start fresh CI and the next
 tick lands them. A root merged out of band is covered too: the suffix is
 replayed onto the exact default branch. Unknown ancestry, truncated inventory,
-membership-only drift and held caravans never gain this authority. A planning
-or local-preparation refusal (for example a real conflict) writes nothing and
-leaves the caravan quarantined with its exact owner recovery command; any later
-failure fails the tick for reconciliation. The former `auto_apply_from_status`
-path stays removed: this is one gated entry, not a status-snapshot rewrite
-selector. Normal landing and membership recovery retain their existing
-controls; historical operation receipts remain untouched.
+membership-only drift and held caravans never gain this authority. A member the
+repair cannot replay linearly is evicted (below); any other planning or
+local-preparation refusal writes nothing and leaves the caravan quarantined
+with its exact owner recovery command; any later failure fails the tick for
+reconciliation. The former `auto_apply_from_status` path stays removed: this is
+one gated entry, not a status-snapshot rewrite selector. Normal landing and
+membership recovery retain their existing controls; historical operation
+receipts remain untouched.
+
+Closed history is queue work too (bd-7efe6a, operator direction 2026-10-21).
+On 2026-10-21 Cacophony Stack #4597 kept four merged PRs and a closed stale
+flake bump ahead of its only open member, so every tick refused with
+`github_stack_closed_history_requires_owner` while that member, which also
+conflicted with main, held the only `max_caravans` slot. Under the same opt-in
+and `manual_drift_repair` gate, before automatic membership recovery, sync
+rebuilds at most one such Stack per tick. Eligible is an open, drifted Stack
+mapped to one unpaused, unparked caravan that retains closed rows recovery
+cannot use (not one clean merged prefix ahead of a linear open suffix: a closed
+unmerged row, history interleaved after the open suffix began, or non-linear
+open ancestry). Every retained row must be provider-closed, every open row an
+active member of that caravan, and every problem one of ancestry, PR base/head,
+member-order, missing-closed-row, merged-prefix or state-order drift. Unknown
+ancestry, Stack base drift, orphaned or terminal Stacks never qualify. The
+rebuild uses the same sealed planner and publisher as routine drift: every
+active member is replayed linearly from the exact default branch (a root still
+based on a closed row binds that row's immutable `refs/pull/N/head`), each
+rewritten head is published under force-with-lease against its exact observed
+generation, the drifted Stack is cleared, each survivor's PR base is pointed at
+its linear predecessor (the root at the default branch), and only the survivors
+are rebuilt. Closed rows are pruned from the representation, never rewritten:
+the raw provider generation stays byte-for-byte in the sealed plan, the
+checkpointed receipt, the tick output, and the journalled `evicted` event when
+members are released. An applied plan hash is never replayed.
+
+When either queue-owned repair cannot replay a member linearly — a content
+conflict (`rebase_conflict`, `rebase_merge_replay_conflict`,
+`rebase_merge_tree_conflict`, `rebase_resolution_conflict`) or an unreplayable
+history shape (`rebase_topology_changed`, `rebase_cousin_history`,
+`rebase_external_merge_parents`, `rebase_unsupported_octopus`) — it no longer
+leaves the caravan holding its slot. The members before it keep their rebase;
+that member and its descendants, which carry its patch, are evicted tail-first
+exactly like `cara evict --cascade`: auto-merge disabled, `caravan`,
+`caravan-force` and `caravan-parked` removed, `caravan-evicted` added, the
+deterministic audit comment posted with a typed reason, and every evicted source
+head and base preserved byte-for-byte. Environment failures (fetch, timeout,
+lease, missing objects, push preflight) never evict anybody. The tick emits
+`evicted` for the released members and the existing `sync_failed` event with
+`metadata.error_code: native_stack_member_unreplayable`,
+`metadata.queue_continues: true`, `metadata.pull_request` (number, head, base),
+and a typed `metadata.repair_request`: repository, Stack, plan hash, caravan,
+PR, exact head, base and attempted target generations, refusal code and
+message, bounded conflicting paths, every evicted PR, and suggested
+`cara repair start --pr N [--target-pr P] --non-force --actor <actor> --reason
+<reason>` then `cara rejoin --pr N` commands. The events grant no mutation
+authority. `cara sync --dry-run` previews the same sealed plan hash, Stack,
+members and pruned rows as a `native_stack_repair` action and stops there,
+because the tick returns after the repair; it does not replay locally, so a
+member that would conflict is reported only by the applying tick.
 
 Explicit `native-stack rebase-apply` is still forceful even when
 `rebase_on_join` is false. It is not a non-force fallback. A parent-cardinality

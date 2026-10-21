@@ -31,28 +31,36 @@ fn merged_prefix_len(stack: &GitHubStackSnapshot) -> Option<usize> {
     (open_seen && stack.open).then_some(prefix)
 }
 
+/// Whether one mapped Stack retains closed rows that automatic merged-prefix
+/// recovery cannot use: they are not one clean merged prefix ahead of a linear
+/// open suffix. Sync's queue-owned closed-history rebuild (bd-7efe6a) owns
+/// exactly these Stacks under the reviewed opt-in; otherwise they need their
+/// owner.
+pub(super) fn unsupported_history(native: &crate::read::NativeStackStatus) -> bool {
+    native.caravan_id.is_some()
+        && native
+            .stack
+            .pull_requests
+            .iter()
+            .any(|row| row.state.eq_ignore_ascii_case("closed") || row.merged_at.is_some())
+        && (merged_prefix_len(&native.stack).is_none()
+            || native.ancestry.iter().any(|edge| !edge.linear))
+}
+
 /// Refuse unsupported history before the ordinary native rebase path can turn
-/// closure reconciliation into source publication. Lifecycle labels run first.
+/// closure reconciliation into source publication. Lifecycle labels run first,
+/// and under the reviewed opt-in sync's queue-owned closed-history rebuild
+/// (bd-7efe6a) runs before this refusal can be reached.
 pub(super) fn require_supported_history(facts: &RecoveryFacts<'_>) -> Result<(), AppError> {
     for native in &facts.backend.native_stacks {
-        if native.caravan_id.is_none()
-            || !native
-                .stack
-                .pull_requests
-                .iter()
-                .any(|row| row.state.eq_ignore_ascii_case("closed") || row.merged_at.is_some())
-        {
-            continue;
-        }
-        if merged_prefix_len(&native.stack).is_none()
-            || native.ancestry.iter().any(|edge| !edge.linear)
-        {
+        if unsupported_history(native) {
             return Err(refusal(
                 "github_stack_closed_history_requires_owner",
                 "closed members are not active, but this retained topology cannot use automatic merged-prefix append or source rebase",
                 json!({"stack": native.stack, "ancestry": native.ancestry,
                     "mutated": false, "source_heads_unchanged": true,
-                    "safe_next_action": "preserve the raw history and resolve the exact unmerged/interleaved or non-linear generation through source-preserving owner recovery; no automatic force/rebase is authorized"}),
+                    "recovery_caravan_id": native.caravan_id,
+                    "safe_next_action": "preserve the raw history and resolve the exact unmerged/interleaved or non-linear generation through source-preserving owner recovery, or let sync rebuild it under the reviewed Stack mutation opt-in without stack_rollout.manual_drift_repair (bd-7efe6a)"}),
             ));
         }
     }
