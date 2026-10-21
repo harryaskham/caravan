@@ -1001,7 +1001,6 @@ pub(crate) mod tests {
     mod readiness_step {
         use super::*;
         use serde_json::json;
-        use std::os::unix::fs::PermissionsExt;
 
         const SCRIPT: &str = include_str!("../examples/workflows/cara-readiness-membership.sh");
         const HEAD: &str = "1111111111111111111111111111111111111111";
@@ -1044,8 +1043,6 @@ pub(crate) mod tests {
             provider_head: &str,
         ) -> Outcome {
             let root = tempfile::tempdir().unwrap();
-            let bin = root.path().join("bin");
-            std::fs::create_dir_all(&bin).unwrap();
             let pull_request = |draft: bool, head: &str| {
                 json!({
                     "number": 4575,
@@ -1085,14 +1082,21 @@ pub(crate) mod tests {
             )
             .unwrap();
             let fixtures = root.path().display().to_string();
+            let gh_fixture = root.path().join("gh.bash");
+            // Bash reads this function through BASH_ENV instead of execing a
+            // freshly written fixture (Linux ETXTBSY under parallel CI).
             std::fs::write(
-                bin.join("gh"),
+                &gh_fixture,
                 format!(
-                    "#!/bin/sh\ncase \"$4\" in\n  repos/{REPO}/pulls/4575) cat '{fixtures}/provider.json' ;;\n  repos/{REPO}/actions/runs/{RUN_ID}/jobs*) cat '{fixtures}/jobs.json' ;;\n  repos/{REPO}/check-runs/{CHECK_ID}) cat '{fixtures}/check.json' ;;\n  *) echo \"unexpected gh $*\" >&2; exit 9 ;;\nesac\n"
+                    "gh() {{\ncase \"$4\" in\n  repos/{REPO}/pulls/4575) cat '{fixtures}/provider.json' ;;\n  repos/{REPO}/actions/runs/{RUN_ID}/jobs*) cat '{fixtures}/jobs.json' ;;\n  repos/{REPO}/check-runs/{CHECK_ID}) cat '{fixtures}/check.json' ;;\n  *) echo \"unexpected gh $*\" >&2; exit 9 ;;\nesac\n}}\n"
                 ),
             )
             .unwrap();
-            std::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755))
+            // Hold a writable descriptor throughout the run: an accidental
+            // return to execing this file would deterministically fail.
+            let _gh_write_guard = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&gh_fixture)
                 .unwrap();
             let script = root.path().join("step.sh");
             std::fs::write(&script, SCRIPT).unwrap();
@@ -1101,14 +1105,11 @@ pub(crate) mod tests {
                 Observation::Deferred => ("deferred", "deferred_unjoined", "false", "true"),
                 Observation::Unknown => ("unknown", "run_unproven", "true", "false"),
             };
-            let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
-                &std::env::var_os("PATH").unwrap_or_default(),
-            )))
-            .unwrap();
             let output = std::process::Command::new("bash")
                 .arg(&script)
                 .env_clear()
-                .env("PATH", path)
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                .env("BASH_ENV", &gh_fixture)
                 .env("GITHUB_EVENT_NAME", "pull_request")
                 .env("GITHUB_EVENT_PATH", &event_path)
                 .env("GITHUB_REPOSITORY", REPO)
