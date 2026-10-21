@@ -112,6 +112,14 @@ pub struct NativeStackRebaseOutput {
     pub drift_clear: Option<GitHubStackDriftClearReceipt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replacement: Option<GitHubStackMutationReceipt>,
+    /// bd-7efe6a: members a queue-owned repair released because they could not
+    /// be replayed linearly, with their typed repair request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eviction: Option<NativeStackConflictEviction>,
+    /// bd-7efe6a: survivor PR bases pointed at their linear predecessor (the
+    /// root at the default branch) before the exact rebuild.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retargets: Vec<crate::github::GitHubMutationReceipt>,
     pub fresh_ci_required: bool,
     pub next: String,
 }
@@ -259,8 +267,36 @@ pub(crate) fn plan_from_status(
                 "requested provider Stack is absent from complete status",
             )
         })?;
-    plan_from_native(context, status, native, actor, reason)
+    plan_from_native(context, status, native, actor, reason, PlanScope::Ordinary)
 }
+
+/// Which facts a sealed native Stack rebase plan may repair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlanScope {
+    /// Explicit owner preview/apply and bd-7ff76d routine drift: only a proven
+    /// merged prefix (or same-head duplicate) may be retained history.
+    Ordinary,
+    /// bd-7efe6a: queue-owned rebuild of a mapped Stack whose retained closed
+    /// rows (merged or closed unmerged, possibly interleaved with the open
+    /// suffix) defeat automatic merged-prefix recovery. Closed rows are pruned
+    /// from the replacement representation, never rewritten, and every active
+    /// member is replayed linearly from the root.
+    ClosedHistory,
+}
+
+/// Problems a queue-owned closed-history rebuild resolves by construction:
+/// representation and ancestry drift of the active members plus the closed
+/// rows it prunes. Unknown ancestry, orphaned/terminal Stacks, Stack base drift
+/// and inventory problems are never in this set.
+const CLOSED_HISTORY_REPAIRABLE_PROBLEMS: [&str; 7] = [
+    "native_stack_rebase_required",
+    "github_stack_pr_base_drift",
+    "github_stack_head_drift",
+    "github_stack_member_order_drift",
+    "github_stack_pr_missing",
+    "github_stack_merged_prefix_invalid",
+    "github_stack_state_order_invalid",
+];
 
 #[allow(clippy::too_many_lines)]
 fn plan_from_native(
@@ -269,6 +305,7 @@ fn plan_from_native(
     native: &NativeStackStatus,
     actor: &str,
     reason: &str,
+    scope: PlanScope,
 ) -> Result<NativeStackRebasePlan, AppError> {
     if status.stack_backend.provider_stacks_truncated
         || matches!(
@@ -283,9 +320,11 @@ fn plan_from_native(
             Some(json!({"stack": native, "mutated": false})),
         ));
     }
+    let closed_history = scope == PlanScope::ClosedHistory;
     let retained_closed_rows = proven_retained_closed_rows(native);
     let active_prefix = proven_active_fleet_prefix(status, native);
-    let representation_only_membership_repair = !native.problems.is_empty()
+    let representation_only_membership_repair = !closed_history
+        && !native.problems.is_empty()
         && native
             .problems
             .iter()
@@ -294,6 +333,9 @@ fn plan_from_native(
         .problems
         .iter()
         .filter(|problem| {
+            if closed_history {
+                return !CLOSED_HISTORY_REPAIRABLE_PROBLEMS.contains(&problem.code.as_str());
+            }
             !(repairable_problem(problem, retained_closed_rows, active_prefix)
                 || (representation_only_membership_repair
                     && problem.code == "github_stack_member_order_drift"))
@@ -337,17 +379,20 @@ fn plan_from_native(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let representation_drift = native.problems.iter().any(|problem| {
-        matches!(
-            problem.code.as_str(),
-            "github_stack_pr_base_drift" | "github_stack_head_drift"
-        ) || (retained_closed_rows
-            && matches!(
+    // A closed-history rebuild always replaces the whole representation, so
+    // every active member is replayed linearly from the exact default branch.
+    let representation_drift = closed_history
+        || native.problems.iter().any(|problem| {
+            matches!(
                 problem.code.as_str(),
-                "github_stack_pr_missing" | "github_stack_merged_prefix_invalid"
-            ))
-            || (active_prefix && problem.code == "github_stack_member_order_drift")
-    });
+                "github_stack_pr_base_drift" | "github_stack_head_drift"
+            ) || (retained_closed_rows
+                && matches!(
+                    problem.code.as_str(),
+                    "github_stack_pr_missing" | "github_stack_merged_prefix_invalid"
+                ))
+                || (active_prefix && problem.code == "github_stack_member_order_drift")
+        });
     let root_candidate_stale = status
         .merge_candidates
         .iter()
@@ -442,7 +487,7 @@ fn plan_from_native(
 }
 
 #[allow(clippy::too_many_lines)]
-fn receipt_key(plan_hash: &str) -> Result<String, AppError> {
+pub(crate) fn receipt_key(plan_hash: &str) -> Result<String, AppError> {
     if plan_hash.is_empty()
         || plan_hash.len() > 96
         || !plan_hash
@@ -493,7 +538,7 @@ fn owner_continuation_refusal(
                 "scope": "one authorized same-repository source owner; no source takeover or queue mutation",
                 "next": "reconcile previous uncertainty and establish custody first; start from fresh provider facts, preserve the old head in a merge, then rediscover the child after its parent changes. This handoff is not an apply lease",
             },
-            "force_boundary": "explicit native rebase and legacy repair use force-with-lease; neither is a non-force fallback, and ordinary sync never invokes native rebase automatically",
+            "force_boundary": "explicit native rebase and legacy repair use force-with-lease; neither is a non-force fallback, and ordinary sync rewrites only through its one gated queue-owned drift repair, which evicts rather than forces an unreplayable member",
             "queue_only_boundary": "there is no standalone sealed tail-eviction preview CLI; typed evict is a separate authorized mutation with its own preflight, not a command to inspect or a generic retry",
         })),
     )
@@ -522,11 +567,50 @@ fn before_publication(error: AppError) -> AppError {
 pub(crate) const SYNC_DRIFT_REPAIR_ACTOR: &str = "caravan-scheduler";
 const SYNC_DRIFT_REPAIR_REASON: &str =
     "routine native Stack drift repaired by the queue (bd-7ff76d)";
+const SYNC_CLOSED_HISTORY_REPAIR_REASON: &str =
+    "native Stack holding closed history rebuilt by the queue (bd-7efe6a)";
 
 /// Outcome of one sync-owned drift repair attempt.
 pub(crate) struct SyncDriftRepair {
     pub output: NativeStackRebaseOutput,
     pub status: StatusOutput,
+}
+
+/// Which queue-owned repair a sync tick is attempting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SyncRepairKind {
+    /// bd-7ff76d: ancestry or PR base/head drift of a quarantinable Stack.
+    RoutineDrift,
+    /// bd-7efe6a: a Stack whose retained closed rows defeat automatic
+    /// merged-prefix recovery.
+    ClosedHistory,
+}
+
+/// Whether the repository authorizes any queue-owned native Stack rewrite.
+fn queue_repair_authorized(context: &AppContext, status: &StatusOutput) -> bool {
+    context.config.stack_type == crate::config::StackType::Github
+        && context.config.stack_rollout.mutations_opt_in
+        && !context.config.stack_rollout.manual_drift_repair
+        && !status.stack_backend.provider_stacks_truncated
+}
+
+/// The mapped caravan a queue-owned repair may act on: present, unparked and
+/// not held by an explicit pause.
+fn repairable_caravan<'a>(
+    status: &'a StatusOutput,
+    native: &NativeStackStatus,
+    held: &std::collections::BTreeSet<PrNumber>,
+) -> Option<&'a crate::model::Caravan> {
+    let id = native.caravan_id?;
+    if held.contains(&id) {
+        return None;
+    }
+    status
+        .analysis
+        .fleet
+        .caravans
+        .iter()
+        .find(|caravan| caravan.id == id && !caravan.parked)
 }
 
 /// Sealed queue-owned repair plans for every eligible drifted Stack, in
@@ -535,11 +619,7 @@ pub(crate) fn drift_repair_plans<'a>(
     context: &AppContext,
     status: &'a StatusOutput,
 ) -> Vec<(&'a NativeStackStatus, NativeStackRebasePlan)> {
-    if context.config.stack_type != crate::config::StackType::Github
-        || !context.config.stack_rollout.mutations_opt_in
-        || context.config.stack_rollout.manual_drift_repair
-        || status.stack_backend.provider_stacks_truncated
-    {
+    if !queue_repair_authorized(context, status) {
         return Vec::new();
     }
     let held = crate::stack_policy::held_caravan_members(status);
@@ -554,17 +634,7 @@ pub(crate) fn drift_repair_plans<'a>(
                 .iter()
                 .any(|problem| problem.code != "github_stack_member_order_drift")
         })
-        .filter(|native| {
-            native.caravan_id.is_some_and(|id| {
-                !held.contains(&id)
-                    && status
-                        .analysis
-                        .fleet
-                        .caravans
-                        .iter()
-                        .any(|caravan| caravan.id == id && !caravan.parked)
-            })
-        })
+        .filter(|native| repairable_caravan(status, native, &held).is_some())
         .collect::<Vec<_>>();
     candidates.sort_by_key(|native| native.caravan_id);
     candidates
@@ -576,6 +646,7 @@ pub(crate) fn drift_repair_plans<'a>(
                 native,
                 SYNC_DRIFT_REPAIR_ACTOR,
                 SYNC_DRIFT_REPAIR_REASON,
+                PlanScope::Ordinary,
             )
             .ok()
             .map(|plan| (native, plan))
@@ -583,32 +654,94 @@ pub(crate) fn drift_repair_plans<'a>(
         .collect()
 }
 
-/// Repair one caravan-local drifted native Stack as ordinary queue behaviour
-/// (bd-7ff76d).
+/// Whether one mapped Stack holds closed history the queue may prune itself.
 ///
-/// On 2026-10-20 Cacophony Stack #4567 (child PR4566 no longer containing
-/// root PR4565) could only be repaired by an operator-approved
-/// `rebase-apply`, so the queue stalled until both PRs were merged by hand.
-/// Under the repository's reviewed Stack mutation opt-in, sync now plans the
-/// same sealed rebase from the same exact provider facts and applies it under
-/// its writer guard: every rewritten head is force-with-lease guarded against
-/// its observed generation, the Stack is rebuilt exactly, rewritten heads need
-/// fresh CI, and the receipt is checkpointed. A root merged out of band is
-/// covered too: the suffix is replayed onto the default branch.
-///
-/// Only caravan-local drift on an open mapped Stack is eligible, never one
-/// that is paused, parked, unknown, truncated or membership-only (that is
-/// automatic recovery's job). A planning or local-preparation refusal (for
-/// example a real conflict) writes nothing and leaves the caravan quarantined
-/// for its owner; any later failure is returned for reconciliation.
-pub(crate) fn repair_drift_for_sync(
-    context: &AppContext,
+/// Exactly the Stacks automatic merged-prefix recovery refuses with
+/// `github_stack_closed_history_requires_owner` (bd-7efe6a): an open, drifted
+/// Stack mapped to one repairable caravan that still holds closed rows, where
+/// those rows are not one clean merged prefix ahead of a linear open suffix.
+/// Every retained row must be provider-closed (merged or not), every open row
+/// must be an active member of that same caravan, and every reported problem
+/// must be one the rebuild resolves by construction.
+fn closed_history_repairable(
     status: &StatusOutput,
-    writer: &crate::writer_guard::WriterOperationGuard,
-    deadline: std::time::Instant,
-    github_budget: Option<&crate::command::GithubRequestBudget>,
-) -> Result<Option<SyncDriftRepair>, AppError> {
-    for (native, plan) in drift_repair_plans(context, status) {
+    native: &NativeStackStatus,
+    held: &std::collections::BTreeSet<PrNumber>,
+) -> bool {
+    let Some(caravan) = repairable_caravan(status, native, held) else {
+        return false;
+    };
+    native.stack.open
+        && native.consistency == StackConsistency::Drifted
+        && !native.problems.is_empty()
+        && native
+            .problems
+            .iter()
+            .all(|problem| CLOSED_HISTORY_REPAIRABLE_PROBLEMS.contains(&problem.code.as_str()))
+        && native
+            .stack
+            .pull_requests
+            .iter()
+            .any(|row| !row.state.eq_ignore_ascii_case("open"))
+        && native.stack.pull_requests.iter().all(|row| {
+            if row.state.eq_ignore_ascii_case("open") {
+                row.merged_at.is_none() && caravan.members.contains(&PrNumber(row.number))
+            } else {
+                row.state.eq_ignore_ascii_case("closed") || row.state.eq_ignore_ascii_case("merged")
+            }
+        })
+        && crate::stack_recovery::closed_history_requires_rebuild(native)
+}
+
+/// Sealed queue-owned rebuild plans for every Stack whose closed history
+/// automatic recovery cannot use, in canonical caravan order (bd-7efe6a).
+/// Pure: no provider, Git or filesystem access.
+pub(crate) fn closed_history_repair_plans<'a>(
+    context: &AppContext,
+    status: &'a StatusOutput,
+) -> Vec<(&'a NativeStackStatus, NativeStackRebasePlan)> {
+    if !queue_repair_authorized(context, status) {
+        return Vec::new();
+    }
+    let held = crate::stack_policy::held_caravan_members(status);
+    let mut candidates = status
+        .stack_backend
+        .native_stacks
+        .iter()
+        .filter(|native| closed_history_repairable(status, native, &held))
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|native| native.caravan_id);
+    candidates
+        .into_iter()
+        .filter_map(|native| {
+            plan_from_native(
+                context,
+                status,
+                native,
+                SYNC_DRIFT_REPAIR_ACTOR,
+                SYNC_CLOSED_HISTORY_REPAIR_REASON,
+                PlanScope::ClosedHistory,
+            )
+            .ok()
+            .map(|plan| (native, plan))
+        })
+        .collect()
+}
+
+/// The sealed plans one sync tick would apply for `kind`, in order, with every
+/// already-applied plan hash removed. Sync and its dry-run share this exact
+/// selection, so a preview names the same plan hash the tick applies.
+pub(crate) fn pending_sync_repair_plans<'a>(
+    context: &AppContext,
+    status: &'a StatusOutput,
+    kind: SyncRepairKind,
+) -> Result<Vec<(&'a NativeStackStatus, NativeStackRebasePlan)>, AppError> {
+    let plans = match kind {
+        SyncRepairKind::RoutineDrift => drift_repair_plans(context, status),
+        SyncRepairKind::ClosedHistory => closed_history_repair_plans(context, status),
+    };
+    let mut pending = Vec::with_capacity(plans.len());
+    for (native, plan) in plans {
         let key = receipt_key(&plan.plan_hash)?;
         if crate::stack_checkpoint::load::<NativeStackRebaseOutput>(&context.repository_path, &key)?
             .is_some_and(|done| done.plan.plan_hash == plan.plan_hash)
@@ -617,19 +750,61 @@ pub(crate) fn repair_drift_for_sync(
             // generation twice. Fresh provider truth must change first.
             continue;
         }
+        pending.push((native, plan));
+    }
+    Ok(pending)
+}
+
+/// Repair one caravan-local drifted native Stack as ordinary queue behaviour
+/// (bd-7ff76d, bd-7efe6a).
+///
+/// On 2026-10-20 Cacophony Stack #4567 (child PR4566 no longer containing
+/// root PR4565) could only be repaired by an operator-approved
+/// `rebase-apply`, so the queue stalled until both PRs were merged by hand.
+/// On 2026-10-21 Stack #4597 kept four merged PRs and a closed stale flake
+/// bump ahead of its only open member, so every tick refused with
+/// `github_stack_closed_history_requires_owner` while that member, which also
+/// conflicted with main, held the only `max_caravans` slot.
+///
+/// Under the repository's reviewed Stack mutation opt-in, sync plans the same
+/// sealed rebase from the same exact provider facts and applies it under its
+/// writer guard: every rewritten head is force-with-lease guarded against its
+/// observed generation, closed rows are pruned from the rebuilt Stack (the raw
+/// generation stays in the sealed plan and checkpointed receipt), rewritten
+/// heads need fresh CI, and an applied plan hash is never replayed.
+///
+/// A member that cannot be replayed linearly (a content conflict or an
+/// unreplayable history shape) is evicted together with its descendants,
+/// tail-first, with a typed reason and a machine-actionable repair request;
+/// the members before it keep their rebase and the slot is freed. Only an
+/// open mapped Stack of an unpaused, unparked caravan is eligible, never one
+/// that is unknown, truncated or membership-only (that is automatic
+/// recovery's job). Any other zero-write refusal leaves the caravan for its
+/// owner; any later failure is returned for reconciliation.
+pub(crate) fn repair_drift_for_sync(
+    context: &AppContext,
+    status: &StatusOutput,
+    kind: SyncRepairKind,
+    writer: &crate::writer_guard::WriterOperationGuard,
+    deadline: std::time::Instant,
+    github_budget: Option<&crate::command::GithubRequestBudget>,
+) -> Result<Option<SyncDriftRepair>, AppError> {
+    for (native, plan) in pending_sync_repair_plans(context, status, kind)? {
+        let key = receipt_key(&plan.plan_hash)?;
         match apply_plan(
             context,
             status,
             plan,
             native.stack.number,
             &key,
+            ConflictPolicy::EvictSuffix,
             writer,
             deadline,
             github_budget,
         ) {
             Ok((output, status)) => return Ok(Some(SyncDriftRepair { output, status })),
-            // Nothing was written: leave this caravan quarantined for its
-            // owner and try the next eligible Stack.
+            // Nothing was written: leave this caravan for its owner and try
+            // the next eligible Stack.
             Err(error)
                 if error
                     .details()
@@ -641,6 +816,180 @@ pub(crate) fn repair_drift_for_sync(
     Ok(None)
 }
 
+/// What a rebase does with a member it cannot replay linearly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConflictPolicy {
+    /// Explicit owner apply: refuse before any write.
+    Refuse,
+    /// Queue-owned repair: evict that member and its descendants (bd-7efe6a).
+    EvictSuffix,
+}
+
+/// Preparation refusals that are deterministic facts about one exact member
+/// generation rather than about the environment: its patch conflicts with the
+/// target, or its history cannot be replayed linearly. Retrying the same
+/// generation reproduces them; fetch, timeout, lease and object failures are
+/// deliberately absent and never evict anybody.
+const EVICTABLE_PREPARATION_REFUSALS: [&str; 8] = [
+    "rebase_conflict",
+    "rebase_merge_replay_conflict",
+    "rebase_merge_tree_conflict",
+    "rebase_resolution_conflict",
+    "rebase_topology_changed",
+    "rebase_cousin_history",
+    "rebase_external_merge_parents",
+    "rebase_unsupported_octopus",
+];
+
+fn evictable_preparation_refusal(error: &AppError) -> bool {
+    EVICTABLE_PREPARATION_REFUSALS.contains(&error.code().as_str())
+}
+
+/// Machine-actionable repair request for one member the queue evicted because
+/// it could not be replayed linearly (bd-7efe6a). Secret-free; it grants no
+/// mutation authority and is delivered through the existing `sync_failed` hook.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct NativeStackRepairRequest {
+    pub schema_version: u32,
+    pub kind: String,
+    pub repository: RepositoryId,
+    pub stack: u64,
+    pub plan_hash: String,
+    pub caravan_id: PrNumber,
+    pub pr: PrNumber,
+    /// Exact source generation the queue observed and preserved.
+    pub head: BranchSnapshot,
+    /// Exact provider base the PR targeted when it was evicted.
+    pub base: BranchSnapshot,
+    /// Exact generation it could not be replayed onto.
+    pub target: BranchSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_pr: Option<PrNumber>,
+    pub refusal_code: String,
+    pub refusal: String,
+    #[serde(default)]
+    pub conflicting_paths: Vec<String>,
+    /// Every member released, in caravan order: this one, then descendants.
+    pub evicted: Vec<PrNumber>,
+    pub suggested_commands: Vec<String>,
+}
+
+/// Members a queue-owned repair evicted, and the typed request to repair them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct NativeStackConflictEviction {
+    pub evicted: Vec<PrNumber>,
+    pub reason: String,
+    pub repair_request: NativeStackRepairRequest,
+    pub receipt: crate::model::OperationReceipt,
+    #[serde(default)]
+    pub provider_receipts: Vec<crate::github::GitHubMutationReceipt>,
+}
+
+/// Build the typed repair request for the first member that could not be
+/// replayed, naming exactly which suffix the queue releases. Pure.
+fn conflict_repair_request(
+    plan: &NativeStackRebasePlan,
+    index: usize,
+    target: &BranchSnapshot,
+    error: &AppError,
+) -> NativeStackRepairRequest {
+    let member = &plan.members[index];
+    let details = error.details().unwrap_or_else(|| json!({}));
+    let conflicting_paths = details
+        .get("conflicting_paths")
+        .and_then(serde_json::Value::as_array)
+        .map(|paths| {
+            paths
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let evicted = plan.members[index..]
+        .iter()
+        .map(|member| member.pr)
+        .collect::<Vec<_>>();
+    let target_flag = member
+        .parent_pr
+        .map_or_else(String::new, |parent| format!(" --target-pr {parent}"));
+    NativeStackRepairRequest {
+        schema_version: 1,
+        kind: "native_stack_member_unreplayable".to_owned(),
+        repository: plan.repository.clone(),
+        stack: plan.stack,
+        plan_hash: plan.plan_hash.clone(),
+        caravan_id: plan.root_pr,
+        pr: member.pr,
+        head: BranchSnapshot {
+            repository: plan.repository.clone(),
+            name: member.branch.clone(),
+            oid: member.old_head.clone(),
+        },
+        base: member.old_base.clone(),
+        target: target.clone(),
+        target_pr: member.parent_pr,
+        refusal_code: error.code(),
+        refusal: error.message(),
+        conflicting_paths,
+        suggested_commands: vec![
+            format!(
+                "cara repair start --pr {}{target_flag} --non-force --actor <actor> --reason \"resolve {} against {}@{}\"",
+                member.pr,
+                error.code(),
+                target.name,
+                target.oid,
+            ),
+            format!("cara rejoin --pr {}", member.pr),
+        ],
+        evicted,
+    }
+}
+
+/// Typed, bounded eviction reason recorded on every released member.
+fn conflict_eviction_reason(request: &NativeStackRepairRequest) -> String {
+    let paths = if request.conflicting_paths.is_empty() {
+        String::new()
+    } else {
+        let shown = request
+            .conflicting_paths
+            .iter()
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = request.conflicting_paths.len().saturating_sub(5);
+        if more == 0 {
+            format!(" in {shown}")
+        } else {
+            format!(" in {shown} (+{more} more)")
+        }
+    };
+    let descendants = if request.evicted.len() > 1 {
+        format!(
+            "; descendant(s) {} carry its patch and were released with it",
+            request.evicted[1..]
+                .iter()
+                .map(|pr| format!("#{pr}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "{}: queue-owned native Stack #{} repair could not replay PR #{} {} onto {}@{}{paths}{descendants}; repair with `{}`, then `{}` (bd-7efe6a)",
+        request.refusal_code,
+        request.stack,
+        request.pr,
+        request.head.oid,
+        request.target.name,
+        request.target.oid,
+        request.suggested_commands[0],
+        request.suggested_commands[1],
+    )
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn apply_plan(
     context: &AppContext,
@@ -648,6 +997,7 @@ fn apply_plan(
     plan: NativeStackRebasePlan,
     _stack: u64,
     key: &str,
+    conflicts: ConflictPolicy,
     writer: &crate::writer_guard::WriterOperationGuard,
     deadline: std::time::Instant,
     github_budget: Option<&crate::command::GithubRequestBudget>,
@@ -661,7 +1011,8 @@ fn apply_plan(
             oid: member.parent_head.clone(),
         })
     });
-    for member in &plan.members {
+    let mut unreplayable = None;
+    for (index, member) in plan.members.iter().enumerate() {
         let candidate = status
             .analysis
             .pull_requests
@@ -672,12 +1023,13 @@ fn apply_plan(
             name: member.parent_branch.clone(),
             oid: member.parent_head.clone(),
         };
-        let item = crate::physical_rebase::prepare_candidate(
+        let planned_target = target.clone().expect("non-empty rebase plan has a target");
+        let item = match crate::physical_rebase::prepare_candidate(
             &context.repository_path,
             &plan.repository,
             candidate,
-            crate::physical_rebase::range_base_for_rewritten_parent(candidate, &parent),
-            target.expect("non-empty rebase plan has a target"),
+            member_range_source(&plan, member, candidate, &parent),
+            planned_target.clone(),
             &status.analysis.fleet.default_branch,
             crate::physical_rebase::RebaseExecutionBudget::new(timeout)
                 .with_deadline(deadline)
@@ -688,8 +1040,25 @@ fn apply_plan(
                         parent_pr,
                     },
                 )),
-        )
-        .map_err(|error| before_publication(owner_continuation_refusal(error, &plan, member)))?;
+        ) {
+            Ok(item) => item,
+            // bd-7efe6a: a member the queue cannot replay linearly is released
+            // with its descendants; the members before it keep their rebase.
+            Err(error)
+                if conflicts == ConflictPolicy::EvictSuffix
+                    && evictable_preparation_refusal(&error) =>
+            {
+                let (crate::physical_rebase::PlannedBase::Remote(branch)
+                | crate::physical_rebase::PlannedBase::Simulated(branch)) = &planned_target;
+                unreplayable = Some(conflict_repair_request(&plan, index, branch, &error));
+                break;
+            }
+            Err(error) => {
+                return Err(before_publication(owner_continuation_refusal(
+                    error, &plan, member,
+                )));
+            }
+        };
         target = Some(crate::physical_rebase::PlannedBase::Simulated(
             BranchSnapshot {
                 repository: plan.repository.clone(),
@@ -739,34 +1108,59 @@ fn apply_plan(
                 Some(json!({"plan": plan, "physical": physical, "mutated": true})),
             )
         })?;
-    let pulls = caravan
+    let evicted = unreplayable
+        .as_ref()
+        .map_or_else(Vec::new, |request| request.evicted.clone());
+    // Before the first provider Stack write, a refusal with no physical
+    // publication is still zero-write.
+    let unpublished = |error: AppError| {
+        if physical.is_none() {
+            before_publication(error)
+        } else {
+            error
+        }
+    };
+    if evicted
+        .iter()
+        .any(|number| !caravan.members.contains(number))
+    {
+        return Err(unpublished(AppError::structured(
+            ErrorCategory::ExecutionFailure,
+            "native_stack_repair_eviction_scope_changed",
+            "the unreplayable suffix is no longer part of the rewritten active caravan",
+            Some(json!({
+                "plan": plan,
+                "physical": physical,
+                "repair_request": unreplayable,
+                "caravan": caravan,
+                "mutated": physical.is_some(),
+                "resumable": true,
+            })),
+        )));
+    }
+    let survivors = caravan
         .members
         .iter()
-        .map(|number| {
-            rewritten_status
-                .analysis
-                .pull_requests
-                .get(number)
-                .ok_or_else(|| {
-                    AppError::validation(
-                        "native_stack_rebase_postcondition_member_missing",
-                        "rewritten active member is absent before provider Stack replacement",
-                    )
-                })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let desired = crate::stack_membership::topology_from_members(
-        &rewritten_status.analysis.fleet.default_branch,
-        pulls.iter().copied(),
-    )
-    .map_err(|error| {
-        AppError::structured(
-            ErrorCategory::ExecutionFailure,
-            "native_stack_rebase_replacement_topology_invalid",
-            error.to_string(),
-            Some(json!({"plan": plan, "physical": physical, "mutated": true})),
+        .copied()
+        .filter(|number| !evicted.contains(number))
+        .collect::<Vec<_>>();
+    // Validate the linear replacement shape before the first provider Stack
+    // write: each survivor as it will be once retargeted onto its predecessor.
+    let projected = project_linear_bases(&rewritten_status, &survivors).map_err(&unpublished)?;
+    if !projected.is_empty() {
+        crate::stack_membership::topology_from_members(
+            &rewritten_status.analysis.fleet.default_branch,
+            projected.iter(),
         )
-    })?;
+        .map_err(|error| {
+            unpublished(AppError::structured(
+                ErrorCategory::ExecutionFailure,
+                "native_stack_rebase_replacement_topology_invalid",
+                error.to_string(),
+                Some(json!({"plan": plan, "physical": physical, "mutated": physical.is_some()})),
+            ))
+        })?;
+    }
     let provider_runner = ProcessRunner::in_directory(&context.repository_path)
         .with_timeout(timeout)
         .with_operation_deadline(deadline);
@@ -795,7 +1189,108 @@ fn apply_plan(
             "safe_next_action": "rerun rebase-preview against fresh provider truth; never unstack or force-push manually",
         })),
     ))?;
-    let replacement = if caravan.members.len() >= 2 {
+    // The drifted representation is gone, so releasing the unreplayable
+    // suffix re-links no surviving edge: it is a tail-first label transition
+    // that preserves every evicted source head byte-for-byte.
+    let eviction = match unreplayable {
+        Some(repair_request) => {
+            let reason = conflict_eviction_reason(&repair_request);
+            let released = crate::reshape::queue_evict_suffix(
+                &provider,
+                &rewritten_status,
+                &repair_request.evicted,
+                &plan.actor,
+                &reason,
+                &format!(
+                    "{} preparing PR #{} onto {}@{}; no source head was rewritten for the released suffix",
+                    repair_request.refusal_code,
+                    repair_request.pr,
+                    repair_request.target.name,
+                    repair_request.target.oid,
+                ),
+            )
+            .map_err(|error| AppError::structured(
+                ErrorCategory::ExecutionFailure,
+                "native_stack_repair_eviction_failed",
+                "the drifted Stack was cleared but releasing its unreplayable suffix failed",
+                Some(json!({
+                    "plan": plan,
+                    "physical": physical,
+                    "drift_clear": drift_clear,
+                    "repair_request": repair_request,
+                    "source": error.details(),
+                    "source_code": error.code(),
+                    "mutated": true,
+                    "resumable": true,
+                    "safe_next_action": "rerun cara sync: fresh provider truth re-plans the remaining eviction and rebuild; never force-push or unstack manually",
+                })),
+            ))?;
+            Some(NativeStackConflictEviction {
+                evicted: repair_request.evicted.clone(),
+                reason,
+                repair_request,
+                receipt: released.receipt,
+                provider_receipts: released.provider_receipts,
+            })
+        }
+        None => None,
+    };
+    // A survivor whose predecessor closed without merging still targets that
+    // closed branch; point every survivor at its linear predecessor before the
+    // exact rebuild (the root at the exact default branch).
+    let retargets = retarget_survivors(
+        &provider,
+        &plan.repository,
+        &rewritten_status.analysis.fleet.default_branch.name,
+        &survivors,
+    )
+    .map_err(|error| AppError::structured(
+        ErrorCategory::ExecutionFailure,
+        "native_stack_rebase_retarget_failed",
+        format!("drifted Stack was cleared but linear survivor retargeting failed: {error}"),
+        Some(json!({
+            "plan": plan,
+            "physical": physical,
+            "drift_clear": drift_clear,
+            "eviction": eviction,
+            "mutated": true,
+            "resumable": true,
+            "safe_next_action": "rerun cara sync: fresh provider truth re-plans the remaining retarget and rebuild; never force-push or unstack manually",
+        })),
+    ))?;
+    let replacement = if survivors.len() >= 2 {
+        let rebuild_status = if retargets.is_empty() {
+            rewritten_status
+        } else {
+            read_postcondition(context, deadline, github_budget)?
+        };
+        let pulls = survivors
+            .iter()
+            .map(|number| {
+                rebuild_status
+                    .analysis
+                    .pull_requests
+                    .get(number)
+                    .ok_or_else(|| {
+                        AppError::validation(
+                            "native_stack_rebase_postcondition_member_missing",
+                            "rewritten active member is absent before provider Stack replacement",
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let desired = crate::stack_membership::topology_from_members(
+            &rebuild_status.analysis.fleet.default_branch,
+            pulls.iter().copied(),
+        )
+        .map_err(|error| {
+            AppError::structured(
+                ErrorCategory::ExecutionFailure,
+                "native_stack_rebase_replacement_topology_invalid",
+                error.to_string(),
+                Some(json!({"plan": plan, "physical": physical, "retargets": retargets, "mutated": true})),
+            )
+        })?;
         Some(provider
             .native_stack_create(
                 &plan.repository,
@@ -813,6 +1308,8 @@ fn apply_plan(
                     "plan": plan,
                     "physical": physical,
                     "drift_clear": drift_clear,
+                    "eviction": eviction,
+                    "retargets": retargets,
                     "source": error.to_string(),
                     "mutated": true,
                     "resumable": true,
@@ -828,12 +1325,12 @@ fn apply_plan(
         .native_stacks
         .iter()
         .find(|native| native.caravan_id == Some(plan.root_pr));
-    if caravan.members.len() >= 2 {
+    if survivors.len() >= 2 {
         let final_native = final_native.ok_or_else(|| AppError::structured(
             ErrorCategory::ExecutionFailure,
             "native_stack_rebase_postcondition_stack_missing",
             "replacement Stack creation returned but exact active-fleet mapping is absent",
-            Some(json!({"plan": plan, "physical": physical, "replacement": replacement, "mutated": true})),
+            Some(json!({"plan": plan, "physical": physical, "replacement": replacement, "eviction": eviction, "mutated": true})),
         ))?;
         if final_native.consistency != StackConsistency::Exact
             || final_native.ancestry.iter().any(|edge| !edge.linear)
@@ -847,6 +1344,7 @@ fn apply_plan(
                     "physical": physical,
                     "drift_clear": drift_clear,
                     "replacement": replacement,
+                    "eviction": eviction,
                     "native": final_native,
                     "mutated": true,
                 })),
@@ -857,7 +1355,9 @@ fn apply_plan(
             ErrorCategory::ExecutionFailure,
             "native_stack_rebase_singleton_still_stacked",
             "terminal drift clearance left the singleton root in a provider Stack",
-            Some(json!({"plan": plan, "physical": physical, "mutated": true})),
+            Some(
+                json!({"plan": plan, "physical": physical, "eviction": eviction, "mutated": true}),
+            ),
         ));
     }
     let fresh_ci_required = physical.as_ref().is_some_and(|physical| {
@@ -866,10 +1366,17 @@ fn apply_plan(
             .iter()
             .any(|receipt| !receipt.already_satisfied)
     });
-    let next = if fresh_ci_required {
-        "wait for fresh CI only on rewritten heads, then rerun cara sync"
-    } else {
-        "provider representation repaired without a source rewrite; rerun cara sync"
+    let next = match (&eviction, fresh_ci_required) {
+        (Some(_), true) => {
+            "unreplayable members were evicted with a repair request; wait for fresh CI only on rewritten heads, then rerun cara sync"
+        }
+        (Some(_), false) => {
+            "unreplayable members were evicted with a repair request and their slot is free; rerun cara sync"
+        }
+        (None, true) => "wait for fresh CI only on rewritten heads, then rerun cara sync",
+        (None, false) => {
+            "provider representation repaired without a source rewrite; rerun cara sync"
+        }
     };
     let output = NativeStackRebaseOutput {
         plan,
@@ -877,11 +1384,95 @@ fn apply_plan(
         physical,
         drift_clear: Some(drift_clear),
         replacement,
+        eviction,
+        retargets,
         fresh_ci_required,
         next: next.to_owned(),
     };
     crate::stack_checkpoint::write(&context.repository_path, key, &output)?;
     Ok((output, final_status))
+}
+
+/// Exact lower range boundary for one planned member.
+///
+/// A root still based on a retained closed row's branch (a predecessor merged
+/// or closed out of band) binds that row's immutable `refs/pull/N/head`, the
+/// same boundary ordinary sync uses after a merged predecessor, rather than a
+/// branch its owner may delete at any moment (bd-7efe6a).
+fn member_range_source(
+    plan: &NativeStackRebasePlan,
+    member: &NativeStackRebaseMemberPlan,
+    candidate: &crate::model::PullRequestSnapshot,
+    parent: &BranchSnapshot,
+) -> crate::physical_rebase::PlannedRangeBase {
+    if member.parent_pr.is_none()
+        && candidate.base.name != parent.name
+        && let Some(row) = plan.provider_before.pull_requests.iter().find(|row| {
+            !row.state.eq_ignore_ascii_case("open")
+                && row.head.ref_name == candidate.base.name
+                && row.head.sha == candidate.base.oid
+        })
+    {
+        return crate::physical_rebase::PlannedRangeBase::PullRequestHead {
+            pr: PrNumber(row.number),
+            branch: candidate.base.clone(),
+        };
+    }
+    crate::physical_rebase::range_base_for_rewritten_parent(candidate, parent)
+}
+
+/// Survivors as they will be once each targets its linear predecessor (the
+/// root the exact default branch). Pure projection used to validate the
+/// replacement shape before any provider Stack write.
+pub(crate) fn project_linear_bases(
+    status: &StatusOutput,
+    survivors: &[PrNumber],
+) -> Result<Vec<crate::model::PullRequestSnapshot>, AppError> {
+    let mut projected: Vec<crate::model::PullRequestSnapshot> = Vec::with_capacity(survivors.len());
+    for number in survivors {
+        let mut pull = status
+            .analysis
+            .pull_requests
+            .get(number)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::validation(
+                    "native_stack_rebase_postcondition_member_missing",
+                    "rewritten active member is absent before provider Stack replacement",
+                )
+            })?;
+        pull.base = projected.last().map_or_else(
+            || status.analysis.fleet.default_branch.clone(),
+            |parent| parent.head.clone(),
+        );
+        projected.push(pull);
+    }
+    Ok(projected)
+}
+
+/// Point each survivor's PR base at its linear predecessor's branch (the root
+/// at the default branch) from fresh provider facts. Already-linear bases are
+/// left untouched, so a replay writes nothing.
+fn retarget_survivors<R: crate::command::CommandRunner>(
+    provider: &GitHubMutationAdapter<R>,
+    repository: &RepositoryId,
+    default_branch: &str,
+    survivors: &[PrNumber],
+) -> Result<Vec<crate::github::GitHubMutationReceipt>, crate::github::MutationError> {
+    let mut receipts = Vec::new();
+    let mut expected = default_branch.to_owned();
+    for number in survivors {
+        let current = provider.refetch_pull_request(repository, *number)?;
+        if current.base.name != expected {
+            receipts.push(provider.set_base(
+                repository,
+                &crate::model::PullRequestPrecondition::from(&current),
+                &expected,
+            )?);
+        }
+        expected = current.head.name;
+    }
+    Ok(receipts)
 }
 
 fn proven_active_fleet_prefix(status: &StatusOutput, native: &NativeStackStatus) -> bool {
@@ -1022,6 +1613,7 @@ pub fn apply(
         plan,
         input.stack,
         &key,
+        ConflictPolicy::Refuse,
         &writer,
         deadline,
         None,
@@ -1166,8 +1758,15 @@ mod tests {
             .split("\n#[cfg(test)]\nmod tests")
             .next()
             .unwrap();
-        assert_eq!(sync.matches("native_stack_rebase::").count(), 3);
-        assert!(sync.contains("crate::native_stack_rebase::repair_drift_for_sync("));
+        // bd-7efe6a: one gated entry, called once for closed-history rebuild
+        // and once for routine drift.
+        assert_eq!(
+            sync.matches("crate::native_stack_rebase::repair_drift_for_sync(")
+                .count(),
+            2
+        );
+        assert!(sync.contains("crate::native_stack_rebase::SyncRepairKind::ClosedHistory"));
+        assert!(sync.contains("crate::native_stack_rebase::SyncRepairKind::RoutineDrift"));
         assert!(sync.contains("crate::native_stack_rebase::SyncDriftRepair"));
         assert!(sync.contains("require_native_stack_backend_healthy(&status)?"));
         let explicit = include_str!("native_stack_rebase.rs")
@@ -1175,17 +1774,27 @@ mod tests {
             .next()
             .unwrap();
         assert!(!explicit.contains("auto_apply_from_status"));
-        // One private definition; one call from the explicit apply command and
-        // one from the gated sync repair.
+        // One private definition; one call from the explicit apply command,
+        // which refuses unreplayable members, and one from the gated sync
+        // repair, which evicts them.
         assert_eq!(explicit.matches("fn apply_plan(").count(), 1);
         assert_eq!(explicit.matches("        match apply_plan(\n").count(), 1);
         assert_eq!(explicit.matches("    apply_plan(\n").count(), 1);
+        assert_eq!(explicit.matches("ConflictPolicy::Refuse,").count(), 1);
+        assert_eq!(explicit.matches("ConflictPolicy::EvictSuffix,").count(), 1);
         assert!(
             explicit.contains("context.acquire_writer_operation(\"native-stack-rebase-apply\")")
         );
         assert!(explicit.contains("plan.plan_hash != input.expected_plan_hash || !plan.verify()"));
         assert!(explicit.contains("|| !context.config.stack_rollout.mutations_opt_in"));
-        assert!(explicit.contains("|| context.config.stack_rollout.manual_drift_repair"));
+        assert!(explicit.contains("&& !context.config.stack_rollout.manual_drift_repair"));
+        // Routine drift and closed-history rebuild share that single gate.
+        assert_eq!(
+            explicit
+                .matches("if !queue_repair_authorized(context, status) {")
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -1234,6 +1843,220 @@ mod tests {
             plan_hash: String::new(),
         }
         .seal()
+    }
+
+    fn three_member_plan() -> NativeStackRebasePlan {
+        let member = |position: u32, pr: u64, parent: Option<u64>| NativeStackRebaseMemberPlan {
+            position,
+            pr: PrNumber(pr),
+            branch: format!("pr-{pr}"),
+            old_head: CommitOid(format!("{pr:0>40}")),
+            old_base: branch(
+                &parent.map_or_else(|| "main".to_owned(), |parent| format!("pr-{parent}")),
+                "1111111111111111111111111111111111111111",
+            ),
+            parent_pr: parent.map(PrNumber),
+            parent_branch: parent
+                .map_or_else(|| "main".to_owned(), |parent| format!("pr-{parent}")),
+            parent_head: CommitOid(
+                parent.map_or_else(|| "d".repeat(40), |parent| format!("{parent:0>40}")),
+            ),
+        };
+        NativeStackRebasePlan {
+            schema_version: 1,
+            repository: repository(),
+            stack: 4597,
+            root_pr: PrNumber(4600),
+            stack_base_ref: "main".to_owned(),
+            provider_before: divergent_stack(4597).stack,
+            members: vec![
+                member(0, 4600, None),
+                member(1, 4603, Some(4600)),
+                member(2, 4604, Some(4603)),
+            ],
+            actor: SYNC_DRIFT_REPAIR_ACTOR.to_owned(),
+            reason: SYNC_CLOSED_HISTORY_REPAIR_REASON.to_owned(),
+            config_fingerprint: "fnv1a64:config".to_owned(),
+            plan_hash: String::new(),
+        }
+        .seal()
+    }
+
+    /// bd-7efe6a: only deterministic facts about one exact member generation
+    /// may evict it; the environment failing never evicts anybody.
+    #[test]
+    fn only_deterministic_replay_refusals_are_evictable() {
+        for code in EVICTABLE_PREPARATION_REFUSALS {
+            assert!(evictable_preparation_refusal(&AppError::validation(
+                code, "x"
+            )));
+        }
+        for code in [
+            "rebase_push_preflight_failed",
+            "rebase_metadata_unavailable",
+            "rebase_simulated_parent_missing",
+            "rebase_repository_not_owned",
+            "rebase_range_ambiguous",
+            "git_fetch_failed",
+            "command_timeout",
+            "operation_deadline_exceeded",
+            "remote_lease_lost",
+        ] {
+            assert!(
+                !evictable_preparation_refusal(&AppError::validation(code, "x")),
+                "{code}"
+            );
+        }
+    }
+
+    /// bd-7efe6a: a conflicting member and its descendants are released with
+    /// one exact, machine-actionable repair request naming its real conflict.
+    #[test]
+    fn conflicting_member_repair_request_releases_exactly_its_suffix() {
+        let plan = three_member_plan();
+        let target = branch("pr-4600", &"e".repeat(40));
+        let error = AppError::structured(
+            ErrorCategory::Validation,
+            "rebase_conflict",
+            "replaying PR #4603 conflicts",
+            Some(json!({"conflicting_paths": ["flake.lock", "src/a.rs", "src/b.rs"]})),
+        );
+        let request = conflict_repair_request(&plan, 1, &target, &error);
+        assert_eq!(request.schema_version, 1);
+        assert_eq!(request.kind, "native_stack_member_unreplayable");
+        assert_eq!(request.pr, PrNumber(4603));
+        assert_eq!(request.caravan_id, PrNumber(4600));
+        assert_eq!(request.stack, 4597);
+        assert_eq!(request.plan_hash, plan.plan_hash);
+        assert_eq!(request.head.name, "pr-4603");
+        assert_eq!(request.head.oid, plan.members[1].old_head);
+        assert_eq!(request.base, plan.members[1].old_base);
+        assert_eq!(request.target, target);
+        assert_eq!(request.target_pr, Some(PrNumber(4600)));
+        assert_eq!(request.refusal_code, "rebase_conflict");
+        assert_eq!(
+            request.conflicting_paths,
+            vec!["flake.lock", "src/a.rs", "src/b.rs"]
+        );
+        assert_eq!(request.evicted, vec![PrNumber(4603), PrNumber(4604)]);
+        assert!(request.suggested_commands[0].starts_with(
+            "cara repair start --pr 4603 --target-pr 4600 --non-force --actor <actor> --reason"
+        ));
+        assert_eq!(request.suggested_commands[1], "cara rejoin --pr 4603");
+
+        let reason = conflict_eviction_reason(&request);
+        assert!(reason.starts_with("rebase_conflict: queue-owned native Stack #4597"));
+        assert!(reason.contains("in flake.lock, src/a.rs, src/b.rs"));
+        assert!(reason.contains("descendant(s) #4604 carry its patch"));
+        assert!(reason.contains("cara rejoin --pr 4603"));
+
+        // A root that conflicts with the default branch releases the whole
+        // caravan and suggests merging the current default branch.
+        let root = conflict_repair_request(&plan, 0, &branch("main", &"d".repeat(40)), &error);
+        assert_eq!(
+            root.evicted,
+            vec![PrNumber(4600), PrNumber(4603), PrNumber(4604)]
+        );
+        assert_eq!(root.target_pr, None);
+        assert!(
+            root.suggested_commands[0]
+                .starts_with("cara repair start --pr 4600 --non-force --actor <actor>")
+        );
+        let tail = conflict_repair_request(&plan, 2, &target, &error);
+        assert_eq!(tail.evicted, vec![PrNumber(4604)]);
+        assert!(!conflict_eviction_reason(&tail).contains("descendant"));
+    }
+
+    fn snapshot(
+        number: u64,
+        head: BranchSnapshot,
+        base: BranchSnapshot,
+    ) -> crate::model::PullRequestSnapshot {
+        crate::model::PullRequestSnapshot {
+            merge_state_status: None,
+            number: PrNumber(number),
+            title: format!("PR {number}"),
+            url: format!("https://example.invalid/{number}"),
+            state: crate::model::PullRequestState::Open,
+            draft: false,
+            head,
+            base,
+            cross_repository: false,
+            labels: std::collections::BTreeSet::from(["caravan".to_owned()]),
+            auto_merge: crate::model::AutoMergeState::disabled(),
+            checks: Vec::new(),
+            created_at: None,
+            merged_at: None,
+            updated_at: None,
+        }
+    }
+
+    /// A root still based on a closed row's branch binds that row's immutable
+    /// pull-request head, never a branch its owner may delete.
+    #[test]
+    fn root_based_on_a_closed_row_binds_its_immutable_pull_request_head() {
+        let mut plan = three_member_plan();
+        plan.provider_before.pull_requests = vec![crate::github::GitHubStackPullRequest {
+            number: 4600,
+            state: "closed".to_owned(),
+            draft: false,
+            merged_at: None,
+            head: crate::github::GitHubStackPullRequestHead {
+                ref_name: "update-flake".to_owned(),
+                sha: CommitOid("6".repeat(40)),
+            },
+        }];
+        let main = branch("main", &"d".repeat(40));
+        let stale = branch("update-flake", &"6".repeat(40));
+        let root = snapshot(4603, branch("pr-4603", &"c".repeat(40)), stale.clone());
+        let mut member = plan.members[0].clone();
+        member.pr = PrNumber(4603);
+        assert_eq!(
+            member_range_source(&plan, &member, &root, &main),
+            crate::physical_rebase::PlannedRangeBase::PullRequestHead {
+                pr: PrNumber(4600),
+                branch: stale,
+            }
+        );
+        // A different generation of that branch is not the closed row.
+        let moved = snapshot(
+            4603,
+            branch("pr-4603", &"c".repeat(40)),
+            branch("update-flake", &"7".repeat(40)),
+        );
+        assert!(matches!(
+            member_range_source(&plan, &member, &moved, &main),
+            crate::physical_rebase::PlannedRangeBase::RemoteBranch { .. }
+        ));
+        // Children keep the ordinary rewritten-parent boundary.
+        let child = snapshot(
+            4604,
+            branch("pr-4604", &"4".repeat(40)),
+            branch("pr-4603", &"c".repeat(40)),
+        );
+        assert!(matches!(
+            member_range_source(
+                &plan,
+                &plan.members[1],
+                &child,
+                &branch("pr-4603", &"c".repeat(40))
+            ),
+            crate::physical_rebase::PlannedRangeBase::RemoteBranch { .. }
+        ));
+    }
+
+    #[test]
+    fn closed_history_eviction_output_round_trips_and_stays_optional() {
+        let plan = three_member_plan();
+        let legacy = json!({
+            "plan": plan,
+            "mutated": true,
+            "fresh_ci_required": false,
+            "next": "rerun cara sync",
+        });
+        let decoded: NativeStackRebaseOutput = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(decoded.eviction.is_none());
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), legacy);
     }
 
     #[test]

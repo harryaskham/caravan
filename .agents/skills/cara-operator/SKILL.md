@@ -47,10 +47,10 @@ Use the existing designated writer; a monitoring loop must not start a competing
   `repair start --non-force`, then the same actor's `repair continue --no-sync`.
   Explicit native rebase and legacy repair still use force-with-lease; never
   select them as a non-force fallback or synthesize a different suffix.
-  Ordinary sync repairs routine caravan-local Stack drift itself through one
-  gated force-with-lease entry (bd-7ff76d; off with
-  `stack_rollout.manual_drift_repair: true`); anything it cannot repair is
-  quarantined with the exact owner command.
+  Sync repairs Stack drift and closed history itself through one gated entry
+  (bd-7ff76d, bd-7efe6a; off with `stack_rollout.manual_drift_repair: true`); an
+  unreplayable member is evicted with a `sync_failed` `metadata.repair_request`
+  for its owner, and anything else is quarantined with the exact owner command.
 - timeout/transport failure: reread provider/main before retry. A failed caller
   receipt can follow a successful provider mutation.
 - terminal red: follow effective `terminal_red` policy and provenance. Never

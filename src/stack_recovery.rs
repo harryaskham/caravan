@@ -836,6 +836,12 @@ fn needs_auto_recovery(backend: &StackBackendStatus, caravan: &Caravan) -> bool 
     true
 }
 
+/// Whether a mapped Stack holds closed history automatic merged-prefix
+/// recovery refuses (`github_stack_closed_history_requires_owner`).
+pub(crate) fn closed_history_requires_rebuild(native: &crate::read::NativeStackStatus) -> bool {
+    closed_prefix::unsupported_history(native)
+}
+
 pub(crate) fn auto_recover_missing(
     context: &AppContext,
     status: &StatusOutput,

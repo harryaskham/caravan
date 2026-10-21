@@ -263,10 +263,12 @@ history in an exact merge and publishes only by fast-forward. It does not grant
 queue custody or resolve earlier uncertain operations. Explicit native rebase
 and legacy repair still use force-with-lease; `rebase_on_join: false` does not
 disable those explicitly requested paths. Ordinary sync repairs routine native
-Stack drift only through its one gated drift-repair entry (bd-7ff76d), under the
-reviewed Stack mutation opt-in and unless `stack_rollout.manual_drift_repair:
-true`; drift it cannot repair without writing stays quarantined for owner
-repair. See the [owner continuation contract](../.agents/skills/cara-operator/references/history-preserving-repair.md).
+Stack drift and Stacks holding closed history only through its one gated
+drift-repair entry (bd-7ff76d, bd-7efe6a), under the reviewed Stack mutation
+opt-in and unless `stack_rollout.manual_drift_repair: true`. A member it cannot
+replay linearly is evicted with its descendants and a typed `sync_failed`
+repair request; any other drift it cannot repair without writing stays
+quarantined for owner repair. See the [owner continuation contract](../.agents/skills/cara-operator/references/history-preserving-repair.md).
 
 ---
 

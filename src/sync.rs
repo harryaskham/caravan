@@ -4832,7 +4832,73 @@ fn sync_without_hooks(
     .map_err(|error| attach_lock_recovery(error, lock_recovery.as_ref()))
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Canonical events for a queue-owned native Stack repair (bd-7efe6a).
+///
+/// A repair that released an unreplayable suffix emits `evicted` for the
+/// released members and `sync_failed` carrying the typed, machine-actionable
+/// repair request, so an existing `sync_failed` coordinator can route the real
+/// conflict to an on-demand repair agent while the queue keeps moving. The
+/// events grant no mutation authority. A prune/rebase without eviction emits
+/// nothing new; its raw provider history lives in the sealed plan, the
+/// checkpointed receipt and this tick's output.
+fn native_drift_repair_events(
+    operation_id: &OperationId,
+    output: &crate::native_stack_rebase::NativeStackRebaseOutput,
+    fleet: &crate::model::CaravanFleet,
+) -> Vec<CaravanEvent> {
+    let Some(eviction) = output.eviction.as_ref() else {
+        return Vec::new();
+    };
+    let request = &eviction.repair_request;
+    let shared = |phase: &str| {
+        BTreeMap::from([
+            ("phase".to_owned(), json!(phase)),
+            ("repair_request".to_owned(), json!(request)),
+            ("plan_hash".to_owned(), json!(output.plan.plan_hash)),
+            ("stack".to_owned(), json!(output.plan.stack)),
+            (
+                "pull_request".to_owned(),
+                json!({"number": request.pr, "head": request.head, "base": request.base}),
+            ),
+        ])
+    };
+    let mut evicted = shared("native_stack_repair_eviction");
+    evicted.insert("receipt".to_owned(), json!(eviction.receipt));
+    evicted.insert(
+        "provider_before".to_owned(),
+        json!(output.plan.provider_before),
+    );
+    let mut failed = shared("native_stack_repair_eviction");
+    failed.insert(
+        "error_code".to_owned(),
+        json!("native_stack_member_unreplayable"),
+    );
+    failed.insert("queue_continues".to_owned(), json!(true));
+    vec![
+        hooks::event(
+            EventKind::Evicted,
+            operation_id.clone(),
+            output.plan.repository.clone(),
+            Some(output.plan.root_pr),
+            eviction.evicted.clone(),
+            Some(fleet.clone()),
+            Some(eviction.reason.clone()),
+            evicted,
+        ),
+        hooks::event(
+            EventKind::SyncFailed,
+            operation_id.clone(),
+            output.plan.repository.clone(),
+            Some(output.plan.root_pr),
+            eviction.evicted.clone(),
+            None,
+            Some(eviction.reason.clone()),
+            failed,
+        ),
+    ]
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn native_drift_repair_output(
     context: &AppContext,
     input: &SyncInput,
@@ -4854,32 +4920,80 @@ fn native_drift_repair_output(
         .physical
         .as_ref()
         .map_or_else(Vec::new, |physical| physical.receipts.clone());
+    let pruned = output
+        .plan
+        .provider_before
+        .pull_requests
+        .iter()
+        .filter(|row| !row.state.eq_ignore_ascii_case("open"))
+        .count();
+    let evicted = output
+        .eviction
+        .as_ref()
+        .map_or_else(Vec::new, |eviction| eviction.evicted.clone());
+    let mut completed_steps = vec![MutationStep {
+        kind: MutationKind::RebaseBranch,
+        state: MutationStepState::Completed,
+        pr: Some(root),
+        summary: format!(
+            "queue-owned native Stack repair: Stack #{} plan {} rewrote {} head(s) under exact leases, pruned {} closed row(s), evicted [{}] and rebuilt the survivors; fresh CI required={}",
+            output.plan.stack,
+            output.plan.plan_hash,
+            rebase_receipts
+                .iter()
+                .filter(|receipt| !receipt.already_satisfied)
+                .count(),
+            pruned,
+            evicted
+                .iter()
+                .map(|pr| format!("#{pr}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            output.fresh_ci_required,
+        ),
+    }];
+    let mut provider_receipts = Vec::new();
+    if let Some(eviction) = output.eviction.as_ref() {
+        completed_steps.extend(eviction.receipt.completed_steps.iter().cloned());
+        provider_receipts.extend(eviction.provider_receipts.iter().cloned());
+    }
+    for retarget in &output.retargets {
+        completed_steps.push(MutationStep {
+            kind: retarget.kind,
+            state: MutationStepState::Completed,
+            pr: Some(retarget.after.number),
+            summary: format!(
+                "retargeted the surviving member onto its linear predecessor `{}`",
+                retarget.after.base.name
+            ),
+        });
+        provider_receipts.push(retarget.clone());
+    }
     let receipt = OperationReceipt {
         operation_id: OperationId::new(),
         operation: "sync-native-drift-repair".to_owned(),
-        completed_steps: vec![MutationStep {
-            kind: MutationKind::RebaseBranch,
-            state: MutationStepState::Completed,
-            pr: Some(root),
-            summary: format!(
-                "queue-owned native Stack drift repair: Stack #{} plan {} rewrote {} head(s) under exact leases and rebuilt the Stack; fresh CI required={}",
-                output.plan.stack,
-                output.plan.plan_hash,
-                rebase_receipts
-                    .iter()
-                    .filter(|receipt| !receipt.already_satisfied)
-                    .count(),
-                output.fresh_ci_required,
-            ),
-        }],
+        completed_steps,
         changed: true,
     };
+    let events = native_drift_repair_events(&receipt.operation_id, &output, &status.analysis.fleet);
+    let hook_deliveries = hooks::dispatch_events_before(context, &events, operation_deadline)?;
     let mut scheduler_status =
         successful_scheduler_status(&status, &[], &[], context.config.rebase_on_join, &[], &[]);
     scheduler_status.wake_class = SchedulerWakeClass::RetryTick;
     scheduler_status.disposition = SchedulerDisposition::RetryTick;
-    "native Stack drift repaired by the queue; rewritten heads wait for fresh CI, then the next tick lands them"
-        .clone_into(&mut scheduler_status.reason);
+    if evicted.is_empty() {
+        "native Stack drift repaired by the queue; rewritten heads wait for fresh CI, then the next tick lands them"
+            .clone_into(&mut scheduler_status.reason);
+    } else {
+        scheduler_status.reason = format!(
+            "native Stack repaired by the queue; unreplayable {} evicted with a typed repair request so the slot is free; the next tick continues",
+            evicted
+                .iter()
+                .map(|pr| format!("#{pr}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     Ok(SyncOutput {
         tick: SyncTickReceipt {
             schema_version: 1,
@@ -4901,7 +5015,7 @@ fn native_drift_repair_output(
             final_status_ms: 0,
         }),
         lock_recovery,
-        provider_receipts: Vec::new(),
+        provider_receipts,
         closed_lifecycle_transitions: Vec::new(),
         root_auto_merge: Vec::new(),
         root_promotion: Vec::new(),
@@ -4918,8 +5032,8 @@ fn native_drift_repair_output(
         paused_caravans: Vec::new(),
         head_advancements: Vec::new(),
         ci: Vec::new(),
-        events: Vec::new(),
-        hook_deliveries: Vec::new(),
+        events,
+        hook_deliveries,
         status,
     })
 }
@@ -5293,6 +5407,31 @@ fn sync_with_lock(
         );
     }
 
+    // bd-7efe6a: a drifted Stack that still holds closed history automatic
+    // merged-prefix recovery cannot use is rebuilt by the queue itself, before
+    // that recovery would refuse it for every caravan: closed rows are pruned,
+    // active members are replayed linearly, and a member that cannot be
+    // replayed is evicted with its descendants and a typed repair request.
+    if let Some(repair) = crate::native_stack_rebase::repair_drift_for_sync(
+        context,
+        &status,
+        crate::native_stack_rebase::SyncRepairKind::ClosedHistory,
+        &lock,
+        operation_deadline,
+        Some(&github_budget),
+    )? {
+        return native_drift_repair_output(
+            context,
+            input,
+            started,
+            operation_deadline,
+            initial_status_elapsed,
+            repair,
+            lock_recovery,
+            &mut lock,
+        );
+    }
+
     // Complete provider inventory is authority for missing native membership.
     // A local checkpoint may strengthen/replay the plan but is never required.
     let recovered = match crate::stack_recovery::auto_recover_missing(context, &status, &provider) {
@@ -5332,12 +5471,14 @@ fn sync_with_lock(
     // bd-7ff76d: routine caravan-local Stack drift is ordinary queue work.
     // Under the reviewed Stack mutation opt-in, repair one drifted Stack with
     // the same sealed, lease-guarded native rebase an owner would review, then
-    // let fresh CI and the next tick continue. Drift it cannot repair without
-    // writing anything stays quarantined for its owner (bd-4d4621); every
+    // let fresh CI and the next tick continue. A member that cannot be
+    // replayed is evicted with its descendants (bd-7efe6a); any other
+    // zero-write refusal stays quarantined for its owner (bd-4d4621); every
     // other problem still fails the backend closed below.
     if let Some(repair) = crate::native_stack_rebase::repair_drift_for_sync(
         context,
         &status,
+        crate::native_stack_rebase::SyncRepairKind::RoutineDrift,
         &lock,
         operation_deadline,
         Some(&github_budget),

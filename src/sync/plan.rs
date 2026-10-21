@@ -79,6 +79,14 @@ fn plan_sync_inner(
                 .map(|error| error.to_string()),
         );
     }
+    // bd-7efe6a: a tick that would repair a native Stack itself returns after
+    // that repair, so its dry-run names the same sealed plan and stops there.
+    if let Some(output) = native_repair_plan(context, &status, input, github_budget.used())? {
+        if let Some(authority) = authority {
+            authority.revalidate()?;
+        }
+        return Ok(output);
+    }
     super::require_native_stack_backend_healthy(&status)?;
     if let Some(authority) = authority {
         authority.revalidate()?;
@@ -294,6 +302,127 @@ fn plan_sync_inner(
         status,
     };
     Ok(output.finalize_hash())
+}
+
+/// The queue-owned native Stack repair the next tick would apply, if any
+/// (bd-7efe6a). Shares [`crate::native_stack_rebase::pending_sync_repair_plans`]
+/// with sync, so the previewed plan hash is exactly the one the tick applies;
+/// closed-history rebuild precedes routine drift exactly as in sync. Local
+/// replay is not attempted here: a member the tick cannot replay linearly is
+/// evicted with its descendants and a typed repair request.
+#[allow(clippy::too_many_lines)]
+pub(super) fn native_repair_plan(
+    context: &AppContext,
+    status: &StatusOutput,
+    input: &SyncInput,
+    requests: u32,
+) -> Result<Option<SyncPlanOutput>, AppError> {
+    let mut selected = None;
+    for kind in [
+        crate::native_stack_rebase::SyncRepairKind::ClosedHistory,
+        crate::native_stack_rebase::SyncRepairKind::RoutineDrift,
+    ] {
+        if let Some((_, plan)) =
+            crate::native_stack_rebase::pending_sync_repair_plans(context, status, kind)?
+                .into_iter()
+                .next()
+        {
+            selected = Some((kind, plan));
+            break;
+        }
+    }
+    let Some((kind, plan)) = selected else {
+        return Ok(None);
+    };
+    let pruned = plan
+        .provider_before
+        .pull_requests
+        .iter()
+        .filter(|row| !row.state.eq_ignore_ascii_case("open"))
+        .map(|row| row.number)
+        .collect::<Vec<_>>();
+    let mut actions = Vec::new();
+    push_plan_action(
+        &mut actions,
+        SyncPlanAction {
+            order: 0,
+            phase: SyncPlanPhase::PhysicalPreflight,
+            state: super::SyncPlanActionState::WouldMutate,
+            kind: "native_stack_repair".to_owned(),
+            pr: Some(plan.root_pr),
+            caravan_id: Some(plan.root_pr),
+            expected: status
+                .analysis
+                .pull_requests
+                .get(&plan.root_pr)
+                .map(PullRequestPrecondition::from),
+            target: Some(json!({
+                "repair": match kind {
+                    crate::native_stack_rebase::SyncRepairKind::ClosedHistory => "closed_history",
+                    crate::native_stack_rebase::SyncRepairKind::RoutineDrift => "routine_drift",
+                },
+                "stack": plan.stack,
+                "plan_hash": plan.plan_hash,
+                "members": plan.members,
+                "pruned_closed_rows": pruned,
+                "unreplayable_member": "evict it and its descendants tail-first with a typed repair request",
+            })),
+            reason: "the queue replays every listed member linearly under exact force-with-lease, prunes closed rows and rebuilds the provider Stack before any other convergence".to_owned(),
+        },
+    )?;
+    push_plan_action(
+        &mut actions,
+        SyncPlanAction {
+            order: 0,
+            phase: SyncPlanPhase::Rediscovery,
+            state: super::SyncPlanActionState::DeferredUntilRediscovery,
+            kind: "rediscover_after_native_stack_repair".to_owned(),
+            pr: None,
+            caravan_id: Some(plan.root_pr),
+            expected: None,
+            target: None,
+            reason:
+                "convergence and admission are planned from fresh provider truth after the repair"
+                    .to_owned(),
+        },
+    )?;
+    Ok(Some(
+        SyncPlanOutput {
+            schema_version: 1,
+            tick_refusal: context
+                .config
+                .validate_tick_bounds()
+                .err()
+                .map(|error| error.to_string()),
+            mutated: false,
+            provider_writes: 0,
+            local_ephemeral_preflight: false,
+            repository: status.repository.clone(),
+            default_branch: status.analysis.fleet.default_branch.clone(),
+            all: input.all,
+            plan_hash: String::new(),
+            selected_caravans: vec![plan.root_pr],
+            physical_rebase_plans: Vec::new(),
+            physical_apply_admission: super::SyncApplyAdmissionPlan::default(),
+            ci: Vec::new(),
+            actions,
+            auto_admission: SyncAutoAdmissionPlan {
+                enabled: context.config.sync.actions.join_unlabelled_prs,
+                heuristic_version: AUTO_ADMISSION_HEURISTIC_VERSION.to_owned(),
+                continuation: "replan_after_native_stack_repair".to_owned(),
+                fleet_capacity_refusal: None,
+                candidate_pr: None,
+                target_tail: None,
+                tested_tails: Vec::new(),
+                compatibility_reasons: Vec::new(),
+            },
+            decisions: Vec::new(),
+            would_emit_events: Vec::new(),
+            github_requests_used: requests,
+            status: status.clone(),
+        }
+        .finalize_hash(),
+    ))
 }
 
 fn push_plan_action(

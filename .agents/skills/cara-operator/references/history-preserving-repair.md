@@ -92,9 +92,18 @@ exactly one gated drift-repair entry instead: under the reviewed Stack mutation
 opt-in, and unless `stack_rollout.manual_drift_repair: true`, sync repairs one
 caravan-local drifted Stack per tick with the sealed native rebase planner
 (actor `caravan-scheduler`), force-with-lease against each exact observed head,
-then waits for the rewritten heads' own fresh CI. That is still a force-with-lease
-path, never a non-force fallback. Drift it cannot plan or prepare without
-writing stays quarantined for the source owner with the exact recovery command.
+then waits for the rewritten heads' own fresh CI. Since bd-7efe6a the same entry
+also rebuilds a Stack whose retained closed rows defeat merged-prefix recovery
+(closed-unmerged, interleaved or non-linear history): it prunes the closed rows
+from the representation, never rewrites them, and replays every active member
+linearly from the default branch. That is still a force-with-lease path, never a
+non-force fallback. A member it cannot replay linearly (a content conflict or an
+unreplayable history shape) is evicted with its descendants, labels-only, with
+its exact head and base preserved and a typed `sync_failed`
+`metadata.repair_request`; that request is the owner's handoff into this
+non-force route, followed by `cara rejoin`. Other drift it cannot plan or
+prepare without writing stays quarantined for the source owner with the exact
+recovery command.
 This does not prove an older installed runtime has changed, erase earlier
 effects, or authorize replay of a historical operation. Normal landing and
 membership recovery remain separate.
