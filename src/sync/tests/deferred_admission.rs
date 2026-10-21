@@ -102,6 +102,30 @@ pub(super) fn prove_deferred(provider: &FakeProvider, candidate: &PullRequestSna
     provider.serve_lineage(candidate.number, lineage);
 }
 
+fn fixture_with_reason(
+    reason: Option<&str>,
+) -> (
+    PullRequestSnapshot,
+    WorkflowFailureDiagnostics,
+    HeadRunLineage,
+) {
+    let (candidate, diagnostics, lineage) = fixture();
+    let Some(reason) = reason else {
+        return (candidate, diagnostics, lineage);
+    };
+    let receipt = format!(
+        "cara-admission-unevaluated pr={} head={} base={} reason={reason} exit=78",
+        candidate.number, candidate.head.oid.0, candidate.base.oid.0
+    );
+    let log = LOG.replace(
+        "Caravan admission deferred until exact PR membership (decision=deferred_unjoined)",
+        &receipt,
+    );
+    let diagnostics =
+        crate::ci::tests::deferred_fixture(&PullRequestPrecondition::from(&candidate), &log);
+    (candidate, diagnostics, lineage)
+}
+
 fn setup(
     candidate: &PullRequestSnapshot,
     diagnostics: WorkflowFailureDiagnostics,
@@ -289,7 +313,7 @@ fn production_deferred_admission_is_unevaluated_not_source_failure() {
 
 #[test]
 fn deferred_admission_negative_evidence_never_grants_admission() {
-    for case in [
+    for (case, reason) in [
         "source",
         "other_workflow",
         "truncated_jobs",
@@ -306,8 +330,14 @@ fn deferred_admission_negative_evidence_never_grants_admission() {
         "superseded",
         "unknown",
         "wrong_failure_step",
-    ] {
-        let (mut candidate, mut diagnostics, mut lineage) = fixture();
+        "wrong_job",
+        "wrong_pr",
+    ]
+    .into_iter()
+    .flat_map(|case| {
+        [None, Some("run_unproven"), Some("unknown_membership")].map(|reason| (case, reason))
+    }) {
+        let (mut candidate, mut diagnostics, mut lineage) = fixture_with_reason(reason);
         match case {
             "source" => candidate.checks.push(check(
                 "independent source test",
@@ -345,6 +375,8 @@ fn deferred_admission_negative_evidence_never_grants_admission() {
                 diagnostics.runs[0].failed_jobs[0].failed_steps[0].name =
                     "Compile source".to_owned();
             }
+            "wrong_job" => diagnostics.runs[0].failed_jobs[0].name = "foreign job".to_owned(),
+            "wrong_pr" => diagnostics.runs[0].expected_pr = PrNumber(candidate.number.0 + 1),
             _ => unreachable!(),
         }
         let provider = setup(&candidate, diagnostics, lineage);
@@ -384,15 +416,20 @@ fn deferred_admission_negative_evidence_never_grants_admission() {
 #[test]
 fn effective_policy_deferred_gate_cannot_waive_a_foreign_app_or_borrow_its_proof() {
     use crate::required_runs::RequiredCheck;
-    for case in [
+    for (case, reason) in [
         "exact",
         "missing-heavy",
         "missing-heavy-no-clock",
         "two-apps",
         "borrowed-proof",
         "missing-suite",
-    ] {
-        let (mut candidate, diagnostics, mut lineage) = fixture();
+        "foreign-suite-app",
+    ]
+    .into_iter()
+    .flat_map(|case| {
+        [None, Some("run_unproven"), Some("unknown_membership")].map(|reason| (case, reason))
+    }) {
+        let (mut candidate, diagnostics, mut lineage) = fixture_with_reason(reason);
         let suite_id = lineage.workflow_runs[0].check_suite_id;
         for check in &mut candidate.checks {
             check.app_id = Some(77);
@@ -426,6 +463,8 @@ fn effective_policy_deferred_gate_cannot_waive_a_foreign_app_or_borrow_its_proof
                 .find(|check| check.name == gate().context)
                 .unwrap()
                 .check_suite_id = None;
+        } else if case == "foreign-suite-app" {
+            lineage.check_suites[0].app_slug = "foreign-app".to_owned();
         }
         let provider = setup(&candidate, diagnostics, lineage);
         let mut policy = provider.required_contexts.borrow()["main"].clone();
@@ -568,31 +607,105 @@ fn deferred_admission_log_parser_requires_complete_actual_output() {
     }
 }
 
+#[test]
+fn unproven_membership_bad_logs_remain_source_failures_not_admission_exemptions() {
+    for reason in ["run_unproven", "unknown_membership"] {
+        let (candidate, _, lineage) = fixture();
+        let marker = format!(
+            "cara-admission-unevaluated pr={} head={} base={} reason={reason} exit=78",
+            candidate.number, candidate.head.oid.0, candidate.base.oid.0
+        );
+        let log = LOG.replace(
+            "Caravan admission deferred until exact PR membership (decision=deferred_unjoined)",
+            &marker,
+        );
+        for (case, bad_log) in [
+            ("truncated_range", log.replace("/1024", "/99999")),
+            (
+                "unbounded_response",
+                log.replace("206 Partial Content", "200 OK"),
+            ),
+            ("exit1", log.replace("exit code 78", "exit code 1")),
+            (
+                "duplicate_marker",
+                log.replace(&marker, &format!("{marker}\n{marker}")),
+            ),
+            ("malformed_marker", log.replace("reason=", "reason:")),
+            ("truncated_marker", log.replace("exit=78", "exit=")),
+        ] {
+            let mut diagnostics = crate::ci::tests::deferred_fixture(
+                &PullRequestPrecondition::from(&candidate),
+                &bad_log,
+            );
+            // A current provider association independently proves generation,
+            // so absent log proof must retain the real failing step verdict.
+            // The historical fixture omits associations; without this row it
+            // correctly falls back to StaleGeneration, not source failure.
+            diagnostics.runs[0].pull_requests =
+                vec![crate::ci::WorkflowRunPullRequestAssociation {
+                    pr: candidate.number,
+                    head_oid: Some(candidate.head.oid.clone()),
+                    base_oid: Some(candidate.base.oid.clone()),
+                }];
+            assert!(
+                diagnostics.runs[0].failed_jobs[0]
+                    .deferred_admission
+                    .is_none(),
+                "{reason}: {case}"
+            );
+            let provider = setup(&candidate, diagnostics, lineage.clone());
+            let observed = status(vec![candidate.clone()], Some(candidate.number), &clean);
+            let mut progress = SyncProgress::new(&observed, Vec::new(), u32::MAX);
+            let ci = progress
+                .observe_ci(&provider, &repository(), candidate.number)
+                .unwrap();
+            assert_eq!(ci.disposition, CiDisposition::Failed, "{reason}: {case}");
+            assert_eq!(
+                ci.failure_diagnostics[0].classification,
+                WorkflowFailureClass::SourceOrTestFailure,
+                "{reason}: {case}"
+            );
+            assert!(
+                !observation_has_proven_deferred_gate(&gate(), &ci),
+                "{reason}: {case}"
+            );
+            assert!(
+                candidate_local_admission_refusal(
+                    &provider,
+                    &mut progress,
+                    &repository(),
+                    candidate.number,
+                    Some(&gate())
+                )
+                .unwrap()
+                .is_some(),
+                "{reason}: {case}"
+            );
+            assert!(provider.workflow_reruns.borrow().is_empty());
+        }
+    }
+}
+
 /// bd-06e059: the gate's membership observation said "deferred", but by the
 /// time its strict fresh provider read ran the member label was present (Cara
 /// joined the PR mid-run). The gate refuses to report either state and emits a
 /// typed unevaluated receipt instead of a bare exit 1. Cara must treat that run
 /// as unevaluated, never red, and rerun the exact gate once for the member;
 /// before membership it is an ordinary deferral. The same holds for a draft
-/// generation that later became ready.
+/// generation that later became ready. bd-0d5e4b extends the same treatment to
+/// `run_unproven`/`unknown_membership` without inventing a membership race or success.
 #[test]
 fn unevaluated_gate_receipts_converge_instead_of_leaving_a_red_member() {
     for (reason, labelled) in [
-        ("membership_changed", true),
-        ("membership_changed", false),
-        ("draft", false),
-    ] {
-        let (mut candidate, _, lineage) = fixture();
-        let receipt = format!(
-            "cara-admission-unevaluated pr={} head={} base={} reason={reason} exit=78",
-            candidate.number, candidate.head.oid.0, candidate.base.oid.0
-        );
-        let log = LOG.replace(
-            "Caravan admission deferred until exact PR membership (decision=deferred_unjoined)",
-            &receipt,
-        );
-        let diagnostics =
-            crate::ci::tests::deferred_fixture(&PullRequestPrecondition::from(&candidate), &log);
+        "membership_changed",
+        "draft",
+        "run_unproven",
+        "unknown_membership",
+    ]
+    .into_iter()
+    .flat_map(|reason| [false, true].map(|labelled| (reason, labelled)))
+    {
+        let (mut candidate, diagnostics, lineage) = fixture_with_reason(Some(reason));
         let job = crate::ci::proven_deferred_job(&diagnostics.runs[0])
             .expect("a typed unevaluated receipt proves an unevaluated gate run");
         assert_eq!(
@@ -602,7 +715,7 @@ fn unevaluated_gate_receipts_converge_instead_of_leaving_a_red_member() {
         if labelled {
             candidate.labels.insert("caravan".to_owned());
         }
-        let provider = setup(&candidate, diagnostics, lineage);
+        let provider = setup(&candidate, diagnostics, lineage.clone());
         let observed = status(vec![candidate.clone()], Some(candidate.number), &clean);
         let mut progress = SyncProgress::new(&observed, Vec::new(), u32::MAX);
         let ci = progress
@@ -613,6 +726,13 @@ fn unevaluated_gate_receipts_converge_instead_of_leaving_a_red_member() {
             CiDisposition::Waiting,
             "{reason}: never red"
         );
+        assert!(
+            ci.effective_checks
+                .iter()
+                .all(|check| check.state == CheckState::InProgress),
+            "{reason}: unevaluated is never green"
+        );
+        assert!(!root_checks_passing(&candidate), "{reason}");
         assert_eq!(
             ci.failure_diagnostics[0].classification,
             WorkflowFailureClass::DeferredAdmission,
@@ -639,6 +759,27 @@ fn unevaluated_gate_receipts_converge_instead_of_leaving_a_red_member() {
                 [(candidate.number, RUN)]
             );
             assert!(provider.rerequests.borrow().is_empty());
+            assert_eq!(
+                provider.calls.borrow().as_slice(),
+                [MutationKind::RerunChecks],
+                "no membership or topology write"
+            );
+            let mut active = lineage;
+            active.workflow_runs[0].status = "in_progress".to_owned();
+            provider.head_lineage.borrow_mut().remove(&candidate.number);
+            provider.serve_lineage(candidate.number, active);
+            let reuse =
+                admission_gate_retrigger(&provider, &repository(), &candidate, &gate()).unwrap();
+            assert_eq!(reuse, AdmissionGateRetrigger::ReuseRun { run_id: RUN });
+            perform_admission_gate_retrigger(
+                &provider,
+                &mut progress,
+                &repository(),
+                candidate.number,
+                reuse,
+            )
+            .unwrap();
+            assert_eq!(provider.workflow_reruns.borrow().len(), 1, "{reason}");
         } else {
             // Unjoined: an unevaluated gate never refuses admission.
             assert!(

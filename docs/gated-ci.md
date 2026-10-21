@@ -105,6 +105,30 @@ Caravan's checked-in `.github/workflows/ci.yml` is the canonical executable
 example and `tests/ci_workflow_contract.rs` prevents broad label triggers or
 loss of the fail-closed aggregate.
 
+### Unevaluated readiness receipts
+
+A separate protected readiness reporter can emit this exact output line when
+it cannot evaluate membership for the event's generation:
+
+```text
+cara-admission-unevaluated pr=N head=H base=B reason=R exit=78
+```
+
+The reason allowlist is `membership_changed`, `draft`, `run_unproven`, and
+`unknown_membership` (the last two require Cara 0.0.145 or newer). Preserve the
+actual reason: an unproven observation does not establish a membership race,
+positive unjoined evidence, or membership success. This receipt classifies only
+that gate run as unevaluated; it does not change `ci-admission-gate`'s
+`run_unproven` instruction to run heavy CI.
+
+The reader still requires the exact PR/head/base tuple, native reporting App
+and job binding, a complete bounded job log, and the runner's actual exit-78
+line. A claimed `exit=78` or process exit 78 alone is not proof. Wrong generation
+or App, exit 1, duplicate/malformed markers, truncated logs, and independent
+source failures cannot acquire the admission exemption. A proven unevaluated
+run waits rather than turning green; after independently verified enrollment,
+the existing exact-gate recovery path refreshes it once and reuses active work.
+
 ### Refresh the observation as well as the gate
 
 In a separate admission-only workflow, an observer can finish successfully with

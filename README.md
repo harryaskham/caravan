@@ -1147,7 +1147,12 @@ race or a draft generation with exit 78 and one
 `cara-admission-unevaluated pr=N head=H base=B reason=membership_changed|draft exit=78`
 line. Cara parses it like the deferral receipt: the run is unevaluated, never a
 source verdict or a red member, and an enrolled member's exact gate is rerun
-once. Identity, provider and reporting failures still exit 1 with
+once. Starting with 0.0.145, the reader also accepts distinct `run_unproven`
+and `unknown_membership` reasons in the same unevaluated marker. Neither is
+membership success, positive unjoined evidence, or proof that membership
+changed. The exact PR/head/base, native reporting App/job, complete bounded log,
+and actual process exit 78 must still be proven; exit 78 alone is insufficient.
+Identity, provider and reporting failures still exit 1 with
 `cara-readiness-refused predicate=<name>`.
 
 If the same immutable parked head later becomes green but no normal sync tick can

@@ -91,6 +91,12 @@ pub enum DeferredAdmissionReason {
     MembershipChanged,
     /// The exact generation was a draft; readiness reruns the gate.
     Draft,
+    /// The membership observation returned `run_unproven`. It established
+    /// neither membership nor a membership race.
+    RunUnproven,
+    /// The reporter could not establish membership for the exact generation.
+    /// This is not evidence that the member label changed.
+    UnknownMembership,
 }
 
 impl DeferredAdmissionReason {
@@ -103,6 +109,8 @@ impl DeferredAdmissionReason {
         match value {
             "membership_changed" => Some(Self::MembershipChanged),
             "draft" => Some(Self::Draft),
+            "run_unproven" => Some(Self::RunUnproven),
+            "unknown_membership" => Some(Self::UnknownMembership),
             _ => None,
         }
     }
@@ -876,10 +884,25 @@ pub(crate) mod tests {
                 DeferredAdmissionReason::MembershipChanged,
             ),
             ("draft", DeferredAdmissionReason::Draft),
+            ("run_unproven", DeferredAdmissionReason::RunUnproven),
+            (
+                "unknown_membership",
+                DeferredAdmissionReason::UnknownMembership,
+            ),
         ] {
             let receipt = parse_deferred_admission_receipt(&body(&line(reason))).unwrap();
             assert_eq!(receipt.pr, PrNumber(4575));
+            assert_eq!(receipt.head_oid.0, "a".repeat(40));
+            assert_eq!(receipt.base_oid.0, "b".repeat(40));
             assert_eq!(receipt.reason, expected);
+            assert_eq!(
+                serde_json::from_value::<DeferredAdmissionReceipt>(
+                    serde_json::to_value(&receipt).unwrap()
+                )
+                .unwrap(),
+                receipt,
+                "the distinct reason survives a wire round trip"
+            );
             assert_eq!(
                 serde_json::to_value(&receipt).unwrap()["reason"],
                 reason,
@@ -924,12 +947,60 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn unproven_membership_receipts_require_complete_unambiguous_exit_78_logs() {
+        for reason in ["run_unproven", "unknown_membership"] {
+            let line = format!(
+                "cara-admission-unevaluated pr=12 head={} base={} reason={reason} exit=78",
+                "a".repeat(40),
+                "b".repeat(40)
+            );
+            let body = format!("{line}\n##[error]Process completed with exit code 78.\n");
+            for (case, log) in [
+                ("exit1", body.replace("exit code 78", "exit code 1")),
+                ("missing_exit", format!("{line}\n")),
+                ("wrong_claimed_exit", body.replace("exit=78", "exit=1")),
+                ("duplicate", format!("{line}\n{body}")),
+                (
+                    "mixed_kinds",
+                    format!(
+                        "{}\n{body}",
+                        line.replace("cara-admission-unevaluated", "cara-deferred-admission")
+                            .replace(&format!("reason={reason}"), "decision=deferred_unjoined")
+                    ),
+                ),
+                ("echoed_source", format!("echo {body}")),
+                ("malformed_pr", body.replace("pr=12", "pr=invalid")),
+                ("malformed_head", body.replace(&"a".repeat(40), "bad-head")),
+                ("malformed_base", body.replace(&"b".repeat(40), "bad-base")),
+                (
+                    "missing_base",
+                    body.replace(&format!("base={} ", "b".repeat(40)), ""),
+                ),
+                ("duplicate_field", body.replace("pr=12", "pr=12 pr=12")),
+                ("malformed_marker", body.replace("reason=", "reason:")),
+                (
+                    "truncated_marker",
+                    format!(
+                        "{}\n##[error]Process completed with exit code 78.\n",
+                        line.trim_end_matches("78")
+                    ),
+                ),
+                ("unknown_reason", body.replace(reason, "label_absent")),
+            ] {
+                assert!(
+                    parse_deferred_admission_receipt(&log).is_none(),
+                    "{reason}: {case}"
+                );
+            }
+        }
+    }
+
     /// Hermetic harness for the reference readiness membership step.
     #[cfg(unix)]
     mod readiness_step {
         use super::*;
         use serde_json::json;
-        use std::os::unix::fs::PermissionsExt;
 
         const SCRIPT: &str = include_str!("../examples/workflows/cara-readiness-membership.sh");
         const HEAD: &str = "1111111111111111111111111111111111111111";
@@ -972,8 +1043,6 @@ pub(crate) mod tests {
             provider_head: &str,
         ) -> Outcome {
             let root = tempfile::tempdir().unwrap();
-            let bin = root.path().join("bin");
-            std::fs::create_dir_all(&bin).unwrap();
             let pull_request = |draft: bool, head: &str| {
                 json!({
                     "number": 4575,
@@ -1013,14 +1082,21 @@ pub(crate) mod tests {
             )
             .unwrap();
             let fixtures = root.path().display().to_string();
+            let gh_fixture = root.path().join("gh.bash");
+            // Bash reads this function through BASH_ENV instead of execing a
+            // freshly written fixture (Linux ETXTBSY under parallel CI).
             std::fs::write(
-                bin.join("gh"),
+                &gh_fixture,
                 format!(
-                    "#!/bin/sh\ncase \"$4\" in\n  repos/{REPO}/pulls/4575) cat '{fixtures}/provider.json' ;;\n  repos/{REPO}/actions/runs/{RUN_ID}/jobs*) cat '{fixtures}/jobs.json' ;;\n  repos/{REPO}/check-runs/{CHECK_ID}) cat '{fixtures}/check.json' ;;\n  *) echo \"unexpected gh $*\" >&2; exit 9 ;;\nesac\n"
+                    "gh() {{\ncase \"$4\" in\n  repos/{REPO}/pulls/4575) cat '{fixtures}/provider.json' ;;\n  repos/{REPO}/actions/runs/{RUN_ID}/jobs*) cat '{fixtures}/jobs.json' ;;\n  repos/{REPO}/check-runs/{CHECK_ID}) cat '{fixtures}/check.json' ;;\n  *) echo \"unexpected gh $*\" >&2; exit 9 ;;\nesac\n}}\n"
                 ),
             )
             .unwrap();
-            std::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755))
+            // Hold a writable descriptor throughout the run: an accidental
+            // return to execing this file would deterministically fail.
+            let _gh_write_guard = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&gh_fixture)
                 .unwrap();
             let script = root.path().join("step.sh");
             std::fs::write(&script, SCRIPT).unwrap();
@@ -1029,14 +1105,11 @@ pub(crate) mod tests {
                 Observation::Deferred => ("deferred", "deferred_unjoined", "false", "true"),
                 Observation::Unknown => ("unknown", "run_unproven", "true", "false"),
             };
-            let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
-                &std::env::var_os("PATH").unwrap_or_default(),
-            )))
-            .unwrap();
             let output = std::process::Command::new("bash")
                 .arg(&script)
                 .env_clear()
-                .env("PATH", path)
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                .env("BASH_ENV", &gh_fixture)
                 .env("GITHUB_EVENT_NAME", "pull_request")
                 .env("GITHUB_EVENT_PATH", &event_path)
                 .env("GITHUB_REPOSITORY", REPO)
