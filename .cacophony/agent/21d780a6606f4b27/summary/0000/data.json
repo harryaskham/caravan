@@ -1,0 +1,34 @@
+{
+  "bead": "bd-97e694",
+  "release": {
+    "tag": "v0.0.145",
+    "commit": "2b2a7e5dc63ac8efd0d0af78152361d1cb48bb22",
+    "tree": "19bcd7c07064fb5af9a98884c8cb13a408707a6e",
+    "url": "https://github.com/harryaskham/caravan/releases/tag/v0.0.145",
+    "workflow_run": 39548289690,
+    "workflow_conclusion": "success",
+    "verified_assets": 6,
+    "verified_platforms": 3,
+    "allow_partial": false
+  },
+  "platforms": {
+    "x86_64-linux": {
+      "archive_sha256": "ca254f588f35d54c716e8740bc25d31554fbf9622e45eccb70047e8c0a5143bd",
+      "binary_sha256": "20a65836d4b8e750810141db80c9b639a17148c36488675b767ac6e3a7fc2f55"
+    },
+    "aarch64-linux": {
+      "archive_sha256": "3f19c534f9cc6ad7f21aa459c0dff5a6059fa1a97d2181f849d10476e6584d4e",
+      "binary_sha256": "2d6c8b93893d342b3d7f87bfee0cd93c361406c6e75204afd15533e145e54ddb"
+    },
+    "aarch64-darwin": {
+      "archive_sha256": "533113cc079696ffb89c393a85b5203178632409b3711b47b08039e5f6f6039e",
+      "binary_sha256": "912b1940ef1f4b83a4aa7c15b058a6098daa5afc3da1b6b4bb9709057d9c342f"
+    }
+  },
+  "content_commit": "93b6b912e33ad01f20bf3d70d7e2953b74b2b52b",
+  "receipt_path": "docs/release/v0.0.145-rollout.md",
+  "handoff_message": "msg-idem-ada9466f447b38775525d558f448bc28f12cb0c5cc8f92297130f57d42b46823",
+  "reflection_draft": "bd-370f56",
+  "related_shim_issue": "bd-9a7492",
+  "consumer_configuration_changed": false
+}
