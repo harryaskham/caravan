@@ -129,6 +129,7 @@ mod closed_history_repair;
 mod closed_reformation;
 mod deferred_admission;
 mod effective_policy;
+mod merged_predecessor_discovery;
 mod native_quarantine;
 use deferred_admission::prove_deferred;
 
