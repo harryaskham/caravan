@@ -1,11 +1,54 @@
 //! bd-c299b8: healthy native topology must not strand a stale-base root.
-use super::native_quarantine::{drift_repair_context, drifted_stack};
 use super::*;
 use crate::generation::CommitRelation;
 use crate::native_stack_rebase::{
     NativeStackRebaseOutput, SyncDriftRepair, SyncRepairKind, pending_sync_repair_plans,
     stale_base_repair_plans,
 };
+
+fn drift_repair_context(manual: bool, opt_in: bool) -> AppContext {
+    let mut context = AppContext::default();
+    context.config.stack_type = crate::config::StackType::Github;
+    context.config.stack_rollout.mutations_opt_in = opt_in;
+    context.config.stack_rollout.reviewed_by = "operator".to_owned();
+    context.config.stack_rollout.manual_drift_repair = manual;
+    context
+}
+
+fn exact_stack(status: &StatusOutput) -> crate::read::NativeStackStatus {
+    let generation = native_generation(status, 42, &[PrNumber(1), PrNumber(2)]);
+    crate::read::NativeStackStatus {
+        stack: crate::github::GitHubStackSnapshot {
+            id: generation.id,
+            number: generation.number,
+            node_id: generation.node_id,
+            open: true,
+            created_at: generation.created_at,
+            base: crate::github::GitHubStackBase {
+                ref_name: "main".to_owned(),
+            },
+            pull_requests: generation
+                .topology
+                .entries
+                .iter()
+                .map(|entry| crate::github::GitHubStackPullRequest {
+                    number: entry.pr.0,
+                    state: "open".to_owned(),
+                    draft: false,
+                    merged_at: None,
+                    head: crate::github::GitHubStackPullRequestHead {
+                        ref_name: entry.head.name.clone(),
+                        sha: entry.head.oid.clone(),
+                    },
+                })
+                .collect(),
+        },
+        caravan_id: Some(PrNumber(1)),
+        consistency: crate::read::StackConsistency::Exact,
+        ancestry: Vec::new(),
+        problems: Vec::new(),
+    }
+}
 
 fn stale_status() -> StatusOutput {
     let pulls = vec![
@@ -14,8 +57,7 @@ fn stale_status() -> StatusOutput {
     ];
     let mut status = caravan_status_with_containment(pulls, Some(PrNumber(1)), false, false);
     enable_native_backend(&mut status);
-    let mut native = drifted_stack(&status, &[]);
-    native.consistency = crate::read::StackConsistency::Exact;
+    let mut native = exact_stack(&status);
     native.ancestry = vec![crate::read::NativeStackAncestryEdge {
         parent_pr: PrNumber(1),
         parent_head: status.analysis.pull_requests[&PrNumber(1)].head.oid.clone(),
