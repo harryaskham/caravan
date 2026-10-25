@@ -579,6 +579,7 @@ const SYNC_CLOSED_HISTORY_REPAIR_REASON: &str =
 pub(crate) struct SyncDriftRepair {
     pub output: NativeStackRebaseOutput,
     pub status: StatusOutput,
+    pub kind: SyncRepairKind,
 }
 
 /// Which queue-owned repair a sync tick is attempting.
@@ -586,6 +587,8 @@ pub(crate) struct SyncDriftRepair {
 pub(crate) enum SyncRepairKind {
     /// bd-7ff76d: ancestry or PR base/head drift of a quarantinable Stack.
     RoutineDrift,
+    /// bd-c299b8: an otherwise exact Stack whose root missed default-branch content.
+    StaleBase,
     /// bd-7efe6a: a Stack whose retained closed rows defeat automatic
     /// merged-prefix recovery.
     ClosedHistory,
@@ -652,6 +655,91 @@ pub(crate) fn drift_repair_plans<'a>(
                 native,
                 SYNC_DRIFT_REPAIR_ACTOR,
                 SYNC_DRIFT_REPAIR_REASON,
+                PlanScope::Ordinary,
+            )
+            .ok()
+            .map(|plan| (native, plan))
+        })
+        .collect()
+}
+
+/// Whether an otherwise exact Stack needs a physical root refresh. A stale PR
+/// base projection alone is not enough: GitHub can retain it after a successful
+/// rewrite. Require exact evidence that current default adds unvalidated content
+/// (or conflicts), never an absent/unknown comparison. Identical-tree divergence
+/// stays with the retained-patch-set safety gate, not automatic replay.
+fn stale_base_refresh_required(status: &StatusOutput, native: &NativeStackStatus) -> bool {
+    if !native.stack.open
+        || native.consistency != StackConsistency::Exact
+        || !native.problems.is_empty()
+    {
+        return false;
+    }
+    let Some(root) = native
+        .caravan_id
+        .and_then(|id| status.analysis.pull_requests.get(&id))
+    else {
+        return false;
+    };
+    let default = &status.analysis.fleet.default_branch;
+    if root.state != crate::model::PullRequestState::Open
+        || root.draft
+        || root.base.repository != default.repository
+        || root.base.name != default.name
+    {
+        return false;
+    }
+    let stale = root.base.oid != default.oid
+        || status.merge_candidates.iter().any(|candidate| {
+            candidate.pr == root.number
+                && candidate.base == root.base
+                && candidate.head == root.head
+                && candidate.compared_base.as_ref() == Some(default)
+                && candidate.freshness == crate::model::MergeCandidateFreshness::StaleBase
+                && candidate.stale_base
+                && !candidate.stale_head
+        });
+    stale
+        && (status.analysis.cumulative_trees.iter().any(|proof| {
+            proof.candidate == root.head
+                && proof.target == *default
+                && !proof.identical
+                && !proof.target_reachable_from_candidate
+        }) || status.analysis.compatibility.iter().any(|report| {
+            report.candidate == root.head
+                && report.target == *default
+                && report.outcome == crate::model::CompatibilityOutcome::Conflict
+        }))
+}
+
+/// bd-c299b8: stale-base refresh uses the same sealed whole-chain replay,
+/// atomic head leases, conflict handoff and fresh-CI boundary as drift repair.
+/// A healthy provider representation must not make a stale root invisible.
+pub(crate) fn stale_base_repair_plans<'a>(
+    context: &AppContext,
+    status: &'a StatusOutput,
+) -> Vec<(&'a NativeStackStatus, NativeStackRebasePlan)> {
+    if !queue_repair_authorized(context, status) {
+        return Vec::new();
+    }
+    let held = crate::stack_policy::held_caravan_members(status);
+    let mut candidates = status
+        .stack_backend
+        .native_stacks
+        .iter()
+        .filter(|native| repairable_caravan(status, native, &held).is_some())
+        .filter(|native| stale_base_refresh_required(status, native))
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|native| native.caravan_id);
+    candidates
+        .into_iter()
+        .filter_map(|native| {
+            plan_from_native(
+                context,
+                status,
+                native,
+                SYNC_DRIFT_REPAIR_ACTOR,
+                "refreshing stale base: replay the root and descendants onto current default (bd-c299b8)",
                 PlanScope::Ordinary,
             )
             .ok()
@@ -744,6 +832,7 @@ pub(crate) fn pending_sync_repair_plans<'a>(
 ) -> Result<Vec<(&'a NativeStackStatus, NativeStackRebasePlan)>, AppError> {
     let plans = match kind {
         SyncRepairKind::RoutineDrift => drift_repair_plans(context, status),
+        SyncRepairKind::StaleBase => stale_base_repair_plans(context, status),
         SyncRepairKind::ClosedHistory => closed_history_repair_plans(context, status),
     };
     let mut pending = Vec::with_capacity(plans.len());
@@ -761,8 +850,8 @@ pub(crate) fn pending_sync_repair_plans<'a>(
     Ok(pending)
 }
 
-/// Repair one caravan-local drifted native Stack as ordinary queue behaviour
-/// (bd-7ff76d, bd-7efe6a).
+/// Repair one caravan-local drifted or stale-base native Stack as ordinary
+/// queue behaviour (bd-7ff76d, bd-7efe6a, bd-c299b8).
 ///
 /// On 2026-10-20 Cacophony Stack #4567 (child PR4566 no longer containing
 /// root PR4565) could only be repaired by an operator-approved
@@ -810,7 +899,13 @@ pub(crate) fn repair_drift_for_sync(
             deadline,
             github_budget,
         ) {
-            Ok((output, status)) => return Ok(Some(SyncDriftRepair { output, status })),
+            Ok((output, status)) => {
+                return Ok(Some(SyncDriftRepair {
+                    output,
+                    status,
+                    kind,
+                }));
+            }
             // Nothing was written: leave this caravan for its owner and try
             // the next eligible Stack.
             Err(error)
@@ -1766,13 +1861,14 @@ mod tests {
             .split("\n#[cfg(test)]\nmod tests")
             .next()
             .unwrap();
-        // bd-7efe6a: one gated entry, called once for closed-history rebuild
-        // and once for routine drift.
+        // One gated publisher, selected for closed-history, routine drift or
+        // an otherwise healthy Stack with a stale base.
         assert_eq!(
             sync.matches("crate::native_stack_rebase::repair_drift_for_sync(")
                 .count(),
-            2
+            3
         );
+        assert!(sync.contains("crate::native_stack_rebase::SyncRepairKind::StaleBase"));
         assert!(sync.contains("crate::native_stack_rebase::SyncRepairKind::ClosedHistory"));
         assert!(sync.contains("crate::native_stack_rebase::SyncRepairKind::RoutineDrift"));
         assert!(sync.contains("crate::native_stack_rebase::SyncDriftRepair"));
@@ -1796,12 +1892,12 @@ mod tests {
         assert!(explicit.contains("plan.plan_hash != input.expected_plan_hash || !plan.verify()"));
         assert!(explicit.contains("|| !context.config.stack_rollout.mutations_opt_in"));
         assert!(explicit.contains("&& !context.config.stack_rollout.manual_drift_repair"));
-        // Routine drift and closed-history rebuild share that single gate.
+        // All three repair selections share that single authorization gate.
         assert_eq!(
             explicit
                 .matches("if !queue_repair_authorized(context, status) {")
                 .count(),
-            2
+            3
         );
     }
 

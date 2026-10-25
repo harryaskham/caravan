@@ -307,8 +307,8 @@ fn plan_sync_inner(
 /// The queue-owned native Stack repair the next tick would apply, if any
 /// (bd-7efe6a). Shares [`crate::native_stack_rebase::pending_sync_repair_plans`]
 /// with sync, so the previewed plan hash is exactly the one the tick applies;
-/// closed-history rebuild precedes routine drift exactly as in sync. Local
-/// replay is not attempted here: a member the tick cannot replay linearly is
+/// closed-history rebuild precedes routine drift and stale-base refresh exactly
+/// as in sync. Local replay is not attempted here: an unreplayable member is
 /// evicted with its descendants and a typed repair request.
 #[allow(clippy::too_many_lines)]
 pub(super) fn native_repair_plan(
@@ -321,12 +321,16 @@ pub(super) fn native_repair_plan(
     for kind in [
         crate::native_stack_rebase::SyncRepairKind::ClosedHistory,
         crate::native_stack_rebase::SyncRepairKind::RoutineDrift,
+        crate::native_stack_rebase::SyncRepairKind::StaleBase,
     ] {
         if let Some((_, plan)) =
             crate::native_stack_rebase::pending_sync_repair_plans(context, status, kind)?
                 .into_iter()
                 .next()
         {
+            if kind == crate::native_stack_rebase::SyncRepairKind::StaleBase {
+                super::require_native_stack_backend_healthy(status)?;
+            }
             selected = Some((kind, plan));
             break;
         }
@@ -360,6 +364,7 @@ pub(super) fn native_repair_plan(
                 "repair": match kind {
                     crate::native_stack_rebase::SyncRepairKind::ClosedHistory => "closed_history",
                     crate::native_stack_rebase::SyncRepairKind::RoutineDrift => "routine_drift",
+                    crate::native_stack_rebase::SyncRepairKind::StaleBase => "stale_base",
                 },
                 "stack": plan.stack,
                 "plan_hash": plan.plan_hash,
@@ -367,7 +372,10 @@ pub(super) fn native_repair_plan(
                 "pruned_closed_rows": pruned,
                 "unreplayable_member": "evict it and its descendants tail-first with a typed repair request",
             })),
-            reason: "the queue replays every listed member linearly under exact force-with-lease, prunes closed rows and rebuilds the provider Stack before any other convergence".to_owned(),
+            reason: format!(
+                "{}; the queue replays every listed member under exact force-with-lease, rebuilds the provider Stack and waits for fresh CI before landing",
+                plan.reason,
+            ),
         },
     )?;
     push_plan_action(
