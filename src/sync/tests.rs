@@ -130,6 +130,7 @@ mod closed_reformation;
 mod deferred_admission;
 mod effective_policy;
 mod native_quarantine;
+mod stale_base_refresh;
 use deferred_admission::prove_deferred;
 
 impl FakeProvider {

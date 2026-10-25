@@ -887,6 +887,17 @@ quarantined with the owner's exact recovery command, and the rest of the queue
 keeps moving (bd-4d4621). Normal landing and membership recovery remain
 separate paths.
 
+An otherwise healthy Stack with a stale-base root is also refreshed by the
+queue (bd-c299b8). Under the same mutation opt-in and manual-repair policy,
+exact comparison evidence must show that current default adds content the root
+has not validated, or conflicts with it. Sync reports `refreshing stale base`,
+replays the root onto current default and propagates through every descendant
+under the existing atomic head leases, then returns to wait for fresh CI. A
+historical PR base alone never triggers a rewrite: already-current heads,
+identical-tree divergence, unknown comparisons, holds and parked caravans stay
+untouched. Dry-run identifies this as `native_stack_repair` with
+`repair: stale_base`; conflicts use the same typed repair handoff below.
+
 A Stack that still holds closed history is queue work as well (bd-7efe6a).
 Where merged rows, a closed-unmerged row, interleaved history or non-linear
 ancestry defeat automatic merged-prefix recovery (previously every tick failed
@@ -897,7 +908,7 @@ drifted Stack, points each survivor's base at its predecessor, and rebuilds only
 the survivors. Closed rows are pruned from the representation, never rewritten;
 the raw generation stays in the sealed plan and checkpointed receipt.
 
-Neither repair lets a real conflict hold a slot any more. A member it cannot
+These repairs do not let a real conflict hold a slot any more. A member it cannot
 replay linearly is evicted together with its descendants, tail-first and
 labels-only (heads and bases preserved), with a typed reason; the members
 before it keep their rebase and the next candidate can be admitted. The tick
@@ -920,7 +931,7 @@ native-stack rebase-preview --stack N --actor A --reason R` followed by
 `rebase-apply` with the reviewed plan hash, only under explicit authority for
 force-with-lease source publication. This is not a non-force fallback; use the
 history-preserving owner repair path above under a no-force constraint. Ordinary
-sync does not call native rebase, even for one unambiguous divergent Stack.
+sync reaches native rebase only through the gated queue-owned repairs above.
 Native membership recovery independently revalidates ordered membership, immutable
 heads/bases, current CLEAN/green evidence, rollout capability, and complete
 mapping truth. A legacy first-child gap permits zero mappings; a checkpointed

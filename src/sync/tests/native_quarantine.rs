@@ -6,7 +6,10 @@
 
 use super::*;
 
-fn drifted_stack(status: &StatusOutput, codes: &[&str]) -> crate::read::NativeStackStatus {
+pub(super) fn drifted_stack(
+    status: &StatusOutput,
+    codes: &[&str],
+) -> crate::read::NativeStackStatus {
     let generation = native_generation(status, 42, &[PrNumber(1), PrNumber(2)]);
     crate::read::NativeStackStatus {
         stack: crate::github::GitHubStackSnapshot {
@@ -256,7 +259,7 @@ fn status_derives_quarantine_and_recovery_command_from_provider_truth() {
     assert!(crate::read::quarantined_caravan(&closed).is_none());
 }
 
-fn drift_repair_context(manual: bool, opt_in: bool) -> AppContext {
+pub(super) fn drift_repair_context(manual: bool, opt_in: bool) -> AppContext {
     let mut context = AppContext::default();
     context.config.stack_type = crate::config::StackType::Github;
     context.config.stack_rollout.mutations_opt_in = opt_in;

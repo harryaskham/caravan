@@ -4909,7 +4909,16 @@ fn native_drift_repair_output(
     lock_recovery: Option<OperationLockRecovery>,
     lock: &mut WriterOperationGuard,
 ) -> Result<SyncOutput, AppError> {
-    let crate::native_stack_rebase::SyncDriftRepair { output, status } = repair;
+    let crate::native_stack_rebase::SyncDriftRepair {
+        output,
+        status,
+        kind,
+    } = repair;
+    let repair_label = if kind == crate::native_stack_rebase::SyncRepairKind::StaleBase {
+        "refreshing stale base"
+    } else {
+        "queue-owned native Stack repair"
+    };
     lock.checkpoint(
         "native_drift_repair_complete",
         json!({"repair": &output, "status": &status.stack_backend}),
@@ -4936,7 +4945,7 @@ fn native_drift_repair_output(
         state: MutationStepState::Completed,
         pr: Some(root),
         summary: format!(
-            "queue-owned native Stack repair: Stack #{} plan {} rewrote {} head(s) under exact leases, pruned {} closed row(s), evicted [{}] and rebuilt the survivors; fresh CI required={}",
+            "{repair_label}: Stack #{} plan {} rewrote {} head(s) under exact leases, pruned {} closed row(s), evicted [{}] and rebuilt the survivors; fresh CI required={}",
             output.plan.stack,
             output.plan.plan_hash,
             rebase_receipts
@@ -4982,8 +4991,9 @@ fn native_drift_repair_output(
     scheduler_status.wake_class = SchedulerWakeClass::RetryTick;
     scheduler_status.disposition = SchedulerDisposition::RetryTick;
     if evicted.is_empty() {
-        "native Stack drift repaired by the queue; rewritten heads wait for fresh CI, then the next tick lands them"
-            .clone_into(&mut scheduler_status.reason);
+        scheduler_status.reason = format!(
+            "{repair_label}: rewritten heads wait for fresh CI, then the next tick reevaluates landing"
+        );
     } else {
         scheduler_status.reason = format!(
             "native Stack repaired by the queue; unreplayable {} evicted with a typed repair request so the slot is free; the next tick continues",
@@ -5495,6 +5505,29 @@ fn sync_with_lock(
         );
     }
     require_native_stack_backend_healthy(&status)?;
+
+    // bd-c299b8: advancing default need not drift the provider topology. Refresh
+    // one proven stale root and propagate through its chain under the same
+    // sealed repair transaction; never attempt landing with the old CI here.
+    if let Some(repair) = crate::native_stack_rebase::repair_drift_for_sync(
+        context,
+        &status,
+        crate::native_stack_rebase::SyncRepairKind::StaleBase,
+        &lock,
+        operation_deadline,
+        Some(&github_budget),
+    )? {
+        return native_drift_repair_output(
+            context,
+            input,
+            started,
+            operation_deadline,
+            initial_status_elapsed,
+            repair,
+            lock_recovery,
+            &mut lock,
+        );
+    }
 
     // Root landing is the first active-fleet provider convergence action for
     // the Caravan-owned backend. Native mode must first perform the complete
