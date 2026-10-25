@@ -21,6 +21,13 @@ stack_rollout:
 # Exact owner/name this policy governs (bd-ff639b): a managed agent checkout
 # whose origin is a local daemon mirror cannot otherwise infer its repository.
 repository: "harryaskham/caravan"
+# Provider API and Git writes use the reviewed Caravan GitHub App installation
+# that Cacophony's queue already uses (bd-412e70), not the operator's personal
+# account. The scheduler must request exactly this mode, slug and installation.
+github_auth:
+  mode: app_installation
+  app_slug: caravan-agentic-merge-queue
+  installation_id: 150598516
 # Under stack_type: github, GitHub Stack mode owns physical branch rewriting
 # (gh stack rebase/retarget); cara must not be a second physical branch writer,
 # so rebase_on_join MUST be false here (enforced by `cara config check`).
