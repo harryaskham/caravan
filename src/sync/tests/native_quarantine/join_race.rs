@@ -194,7 +194,7 @@ fn native_join_strict_prefix_repair_keeps_policy_and_identity_gates() {
             "head_drift" => {
                 refused.stack_backend.native_stacks[0].stack.pull_requests[0]
                     .head
-                    .sha = CommitOid("f".repeat(40))
+                    .sha = CommitOid("f".repeat(40));
             }
             "draft" => {
                 refused
@@ -202,7 +202,7 @@ fn native_join_strict_prefix_repair_keeps_policy_and_identity_gates() {
                     .pull_requests
                     .get_mut(&PrNumber(2))
                     .unwrap()
-                    .draft = true
+                    .draft = true;
             }
             _ => unreachable!(),
         }

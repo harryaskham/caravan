@@ -176,8 +176,10 @@ fn native_join_behind_active_head_is_repaired_linearly_without_quarantining_slot
             &repository(),
             &observed.analysis,
         );
-        let mut context = AppContext::default();
-        context.repository_path = work.clone();
+        let mut context = AppContext {
+            repository_path: work.clone(),
+            ..AppContext::default()
+        };
         context.config.stack_type = crate::config::StackType::Github;
         context.config.rebase_on_join = false;
         context.config.sync.max_caravans = 1;
