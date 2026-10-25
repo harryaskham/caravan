@@ -4910,16 +4910,13 @@ fn native_drift_repair_output(
     lock_recovery: Option<OperationLockRecovery>,
     lock: &mut WriterOperationGuard,
 ) -> Result<SyncOutput, AppError> {
-    let crate::native_stack_rebase::SyncDriftRepair {
-        output,
-        status,
-        kind,
-    } = repair;
-    let repair_label = if kind == crate::native_stack_rebase::SyncRepairKind::StaleBase {
-        "refreshing stale base"
-    } else {
-        "queue-owned native Stack repair"
-    };
+    let crate::native_stack_rebase::SyncDriftRepair { output, status } = repair;
+    let repair_label =
+        if output.plan.reason == crate::native_stack_rebase::SYNC_STALE_BASE_REPAIR_REASON {
+            "refreshing stale base"
+        } else {
+            "queue-owned native Stack repair"
+        };
     lock.checkpoint(
         "native_drift_repair_complete",
         json!({"repair": &output, "status": &status.stack_backend}),

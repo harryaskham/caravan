@@ -574,12 +574,14 @@ const SYNC_DRIFT_REPAIR_REASON: &str =
     "routine native Stack drift repaired by the queue (bd-7ff76d)";
 const SYNC_CLOSED_HISTORY_REPAIR_REASON: &str =
     "native Stack holding closed history rebuilt by the queue (bd-7efe6a)";
+/// Descriptive identity sealed into the plan; used only for refresh reporting.
+pub(crate) const SYNC_STALE_BASE_REPAIR_REASON: &str =
+    "refreshing stale base: replay the root and descendants onto current default (bd-c299b8)";
 
 /// Outcome of one sync-owned drift repair attempt.
 pub(crate) struct SyncDriftRepair {
     pub output: NativeStackRebaseOutput,
     pub status: StatusOutput,
-    pub kind: SyncRepairKind,
 }
 
 /// Which queue-owned repair a sync tick is attempting.
@@ -739,7 +741,7 @@ pub(crate) fn stale_base_repair_plans<'a>(
                 status,
                 native,
                 SYNC_DRIFT_REPAIR_ACTOR,
-                "refreshing stale base: replay the root and descendants onto current default (bd-c299b8)",
+                SYNC_STALE_BASE_REPAIR_REASON,
                 PlanScope::Ordinary,
             )
             .ok()
@@ -899,13 +901,7 @@ pub(crate) fn repair_drift_for_sync(
             deadline,
             github_budget,
         ) {
-            Ok((output, status)) => {
-                return Ok(Some(SyncDriftRepair {
-                    output,
-                    status,
-                    kind,
-                }));
-            }
+            Ok((output, status)) => return Ok(Some(SyncDriftRepair { output, status })),
             // Nothing was written: leave this caravan for its owner and try
             // the next eligible Stack.
             Err(error)

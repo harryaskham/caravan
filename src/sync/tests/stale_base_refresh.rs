@@ -418,7 +418,6 @@ fn stale_base_tick_reports_refresh_and_returns_before_landing_or_ci_dispatch() {
     let repair = SyncDriftRepair {
         output: repair_output(&status),
         status,
-        kind: SyncRepairKind::StaleBase,
     };
     let mut writer = context.acquire_writer_operation("stale-base-test").unwrap();
     let started = Instant::now();
