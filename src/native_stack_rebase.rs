@@ -323,7 +323,12 @@ fn plan_from_native(
     let closed_history = scope == PlanScope::ClosedHistory;
     let retained_closed_rows = proven_retained_closed_rows(native);
     let active_prefix = proven_active_fleet_prefix(status, native);
+    // A provider-visible strict prefix can lag an ordinary join. Rebuilding
+    // that representation must also replay the newly joined suffix; it is not
+    // a membership-only repair merely because the absent rows have no
+    // provider ancestry edges yet (bd-28ae57).
     let representation_only_membership_repair = !closed_history
+        && !active_prefix
         && !native.problems.is_empty()
         && native
             .problems
@@ -633,6 +638,7 @@ pub(crate) fn drift_repair_plans<'a>(
                 .problems
                 .iter()
                 .any(|problem| problem.code != "github_stack_member_order_drift")
+                || proven_active_fleet_prefix(status, native)
         })
         .filter(|native| repairable_caravan(status, native, &held).is_some())
         .collect::<Vec<_>>();
@@ -778,8 +784,10 @@ pub(crate) fn pending_sync_repair_plans<'a>(
 /// tail-first, with a typed reason and a machine-actionable repair request;
 /// the members before it keep their rebase and the slot is freed. Only an
 /// open mapped Stack of an unpaused, unparked caravan is eligible, never one
-/// that is unknown, truncated or membership-only (that is automatic
-/// recovery's job). Any other zero-write refusal leaves the caravan for its
+/// that is unknown or truncated. Membership-only drift belongs to automatic
+/// recovery unless the provider rows are a proven strict active-fleet prefix
+/// after a join; that suffix needs replay too (bd-28ae57). Any other zero-write
+/// refusal leaves the caravan for its
 /// owner; any later failure is returned for reconciliation.
 pub(crate) fn repair_drift_for_sync(
     context: &AppContext,

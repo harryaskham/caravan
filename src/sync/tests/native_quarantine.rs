@@ -6,6 +6,8 @@
 
 use super::*;
 
+mod join_race;
+
 fn drifted_stack(status: &StatusOutput, codes: &[&str]) -> crate::read::NativeStackStatus {
     let generation = native_generation(status, 42, &[PrNumber(1), PrNumber(2)]);
     crate::read::NativeStackStatus {

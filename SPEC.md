@@ -1712,7 +1712,8 @@ queue work (bd-7ff76d, operator direction 2026-10-20). Under the repository's
 reviewed `stack_rollout.mutations_opt_in`, and unless the repository sets
 `stack_rollout.manual_drift_repair: true`, sync repairs at most one
 caravan-local drifted Stack per tick: an open, mapped, unpaused, unparked Stack
-whose problems are only ancestry or PR base/head representation drift. It plans
+whose problems are only ancestry or PR base/head representation drift, or whose
+provider rows are an exact strict prefix of the active fleet after a join. It plans
 with the same sealed planner as `native-stack rebase-preview` (actor
 `caravan-scheduler`), never replans a plan hash already applied, publishes every
 rewritten head under force-with-lease against its exact observed generation,
@@ -1720,7 +1721,7 @@ rebuilds the Stack exactly, checkpoints the receipt, and returns. It dispatches
 no CI itself: the rewritten heads' own push events start fresh CI and the next
 tick lands them. A root merged out of band is covered too: the suffix is
 replayed onto the exact default branch. Unknown ancestry, truncated inventory,
-membership-only drift and held caravans never gain this authority. A member the
+other membership-only drift and held caravans never gain this authority. A member the
 repair cannot replay linearly is evicted (below); any other planning or
 local-preparation refusal writes nothing and leaves the caravan quarantined
 with its exact owner recovery command; any later failure fails the tick for
@@ -1728,6 +1729,19 @@ reconciliation. The former `auto_apply_from_status` path stays removed: this is
 one gated entry, not a status-snapshot rewrite selector. Normal landing and
 membership recovery retain their existing controls; historical operation
 receipts remain untouched.
+
+A join becoming visible during a tick is covered by the same repair lane
+(bd-28ae57). A zero-write `github_stack_generation_drifted` refusal in native
+prefix routing permits exactly one fresh fleet discovery, policy revalidation,
+and ordinary repair selection before routing is retried. A repeated mismatch,
+an ambiguous mapping, or an unknown/partial write is still refused. After
+in-tick auto-admission, sync selects repair again before ordinary convergence;
+a successful repair ends the tick with the prior admission/parking receipts
+and events preserved, awaiting fresh CI rather than issuing an external repair
+request. Native join itself still leaves source heads unchanged. A provider
+inventory retaining only the exact active prefix cannot hide the new suffix
+behind a membership-only diagnosis: the sealed repair replays all active
+members and rebuilds the representation under the existing leases.
 
 Closed history is queue work too (bd-7efe6a, operator direction 2026-10-21).
 On 2026-10-21 Cacophony Stack #4597 kept four merged PRs and a closed stale

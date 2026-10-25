@@ -302,7 +302,7 @@ impl Default for StackBackendStatus {
     }
 }
 
-trait NativeStackInventoryProvider {
+pub(crate) trait NativeStackInventoryProvider {
     fn native_stack_inventory(
         &self,
         repository: &RepositoryId,
@@ -669,7 +669,7 @@ fn assess_native_stack_ancestry(
     ancestry
 }
 
-fn stack_backend_status(
+pub(crate) fn stack_backend_status(
     configured: crate::config::StackType,
     provider: &impl NativeStackInventoryProvider,
     repository: &RepositoryId,

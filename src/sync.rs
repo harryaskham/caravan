@@ -51,6 +51,7 @@ use crate::{AdmitInput, AppContext, AppError, CheckInput, SyncInput};
 mod budget;
 mod closed;
 mod decision;
+mod native_repair;
 mod plan;
 pub mod progress;
 pub use budget::{CapacityDefect, CaravanBudgetProjection, SyncBudgetStatus, project_status};
@@ -5559,19 +5560,74 @@ fn sync_with_lock(
             "native_prefix_first",
             "evaluating one exact green native Stack prefix before descendant replay",
         );
-        if let Some(progress) = execute_native_stack_prefix_first(
-            &status,
-            &provider,
-            input.all,
-            context.config.force_merge,
-            context
-                .config
-                .sync
-                .max_mutations_per_tick
-                .saturating_sub(parking_mutations),
-            RequiredRunsPolicy::from_config(&context.config.sync),
-            NativeSyncContext::from_context(context),
-        )? {
+        let prefix = native_repair::native_prefix_with_rediscovery(
+            &mut status,
+            |status| {
+                execute_native_stack_prefix_first(
+                    status,
+                    &provider,
+                    input.all,
+                    context.config.force_merge,
+                    context
+                        .config
+                        .sync
+                        .max_mutations_per_tick
+                        .saturating_sub(parking_mutations),
+                    RequiredRunsPolicy::from_config(&context.config.sync),
+                    NativeSyncContext::from_context(context),
+                )
+            },
+            || {
+                let mut fresh =
+                    read::fleet_status_for_sync(context, operation_deadline, Some(&github_budget))?;
+                crate::initialization::require_ready(&fresh.initialization)?;
+                require_current_policy(context, &fresh)?;
+                if let Some(authority) = authority {
+                    authority.bind_invocation(&mut fresh)?;
+                    authority.revalidate()?;
+                }
+                Ok(fresh)
+            },
+            |fresh| {
+                native_repair::repair_after_join(
+                    context,
+                    fresh,
+                    &lock,
+                    operation_deadline,
+                    &github_budget,
+                )
+            },
+        )?;
+        let prefix = match prefix {
+            native_repair::NativeConvergence::Converged(progress) => progress,
+            native_repair::NativeConvergence::Repaired(repair) => {
+                let mut output = native_drift_repair_output(
+                    context,
+                    input,
+                    started,
+                    operation_deadline,
+                    initial_status_elapsed,
+                    *repair,
+                    lock_recovery,
+                    &mut lock,
+                )?;
+                let mut prior = SyncProgress::new(
+                    &status,
+                    Vec::new(),
+                    context.config.sync.max_mutations_per_tick,
+                );
+                prior.steps = parking.steps;
+                prior.provider_receipts = parking.provider_receipts;
+                prior.events = parking.events;
+                native_repair::retain_prior_progress(
+                    &mut output,
+                    prior,
+                    AutoAdmissionOutput::disabled(context, input.all),
+                );
+                return Ok(output);
+            }
+        };
+        if let Some(progress) = prefix {
             progress::emit(
                 "native_prefix_first",
                 "advanced a native Stack prefix; deferring descendant replay to the next tick",
@@ -5941,6 +5997,37 @@ fn sync_with_lock(
         // convergence pass owns CI observation and rolling-head invariants for
         // newly admitted members under the same lock and deadline.
         if !auto_admission.joins.is_empty() {
+            // Joining in native mode deliberately does not introduce another
+            // physical writer. The queue must repair the newly admitted
+            // suffix now, not quarantine the Stack until an owner wakes.
+            if let Some(repair) = native_repair::repair_after_join(
+                context,
+                &final_status,
+                &lock,
+                operation_deadline,
+                &github_budget,
+            )
+            .map_err(|error| {
+                attach_auto_admission_progress(&error, context, &progress, &github_budget)
+            })? {
+                auto_admission.github_requests_used = github_budget.used();
+                auto_admission.mutations_used = completed_mutation_count(&progress);
+                let mut output = native_drift_repair_output(
+                    context,
+                    input,
+                    started,
+                    operation_deadline,
+                    initial_status_elapsed,
+                    repair,
+                    lock_recovery,
+                    &mut lock,
+                )
+                .map_err(|error| {
+                    attach_auto_admission_progress(&error, context, &progress, &github_budget)
+                })?;
+                native_repair::retain_prior_progress(&mut output, progress, auto_admission);
+                return Ok(output);
+            }
             let post_admission = execute_bounded_with_native(
                 &final_status,
                 &provider,

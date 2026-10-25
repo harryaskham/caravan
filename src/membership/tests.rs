@@ -10,6 +10,7 @@ use crate::model::{
 
 mod batch_capacity;
 mod expected_admission;
+mod native_join_repair;
 mod native_projection;
 mod receipt_contract;
 
