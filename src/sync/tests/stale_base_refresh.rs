@@ -193,7 +193,7 @@ fn stale_base_refresh_preserves_policy_holds_and_exact_evidence() {
             "orphan" => other.stack_backend.native_stacks[0].caravan_id = None,
             "unknown" => {
                 other.stack_backend.native_stacks[0].consistency =
-                    crate::read::StackConsistency::Unknown
+                    crate::read::StackConsistency::Unknown;
             }
             "problem" => other.stack_backend.native_stacks[0].problems.push(
                 crate::read::StackBackendProblem {
@@ -213,7 +213,7 @@ fn stale_base_refresh_preserves_policy_holds_and_exact_evidence() {
                     .pull_requests
                     .get_mut(&PrNumber(1))
                     .unwrap()
-                    .draft = true
+                    .draft = true;
             }
             "root-closed" => {
                 other
@@ -221,7 +221,7 @@ fn stale_base_refresh_preserves_policy_holds_and_exact_evidence() {
                     .pull_requests
                     .get_mut(&PrNumber(1))
                     .unwrap()
-                    .state = PullRequestState::Closed
+                    .state = PullRequestState::Closed;
             }
             "other-base" => {
                 other
@@ -230,18 +230,18 @@ fn stale_base_refresh_preserves_policy_holds_and_exact_evidence() {
                     .get_mut(&PrNumber(1))
                     .unwrap()
                     .base
-                    .name = "unmerged-parent".to_owned()
+                    .name = "unmerged-parent".to_owned();
             }
             "missing-proof" => other.analysis.cumulative_trees.clear(),
             "old-head-proof" => {
-                other.analysis.cumulative_trees[0].candidate.oid = CommitOid("old-head".to_owned())
+                other.analysis.cumulative_trees[0].candidate.oid = CommitOid("old-head".to_owned());
             }
             "old-default-proof" => {
-                other.analysis.cumulative_trees[0].target.oid = CommitOid("old-main".to_owned())
+                other.analysis.cumulative_trees[0].target.oid = CommitOid("old-main".to_owned());
             }
             "identical-tree" => other.analysis.cumulative_trees[0].identical = true,
             "already-contains-default" => {
-                other.analysis.cumulative_trees[0].target_reachable_from_candidate = true
+                other.analysis.cumulative_trees[0].target_reachable_from_candidate = true;
             }
             _ => unreachable!(),
         }
