@@ -1404,9 +1404,14 @@ not a Caco board-bead count. Human `status` intentionally includes open PRs,
 recently merged Caravan rows, and closed active/parked/terminal lifecycle rows;
 three closed-label scans can therefore make this number far larger than GitHub's
 open-PR count. Mutating `sync` and `plan sync` now use a hot discovery mode:
-they retain all open PRs and lightweight merged generation facts, but defer
-merged/closed lifecycle snapshots and their expensive check-rollup scans to
-human status and cold cleanup.
+they retain all open PRs, lightweight merged generation facts, and bounded
+merged predecessors still referenced by open PR bases. Focused `check --pr`
+retains the same predecessor evidence, so all three paths recognize pending
+head advancement rather than a non-member base. Unrelated merged history and
+closed-label scans remain deferred to human status and cold cleanup; retaining
+referenced predecessors adds no provider requests or historical check rollups.
+Unknown or ambiguous predecessors still fail closed, and sync retains its exact
+provider preconditions and compatibility checks before advancing a successor.
 
 Status propagates one absolute deadline through discovery, label inventory,
 compatibility, and provider identity; every child receives only the remaining

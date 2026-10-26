@@ -2144,9 +2144,10 @@ pub(crate) fn fleet_status(
     )
 }
 
-/// Mutating sync hot discovery excludes merged/closed lifecycle snapshots.
-/// Their cleanup remains a later cold phase; active open PRs and lightweight
-/// merged generation facts retain every mutation precondition needed now.
+/// Mutating sync hot discovery excludes unrelated merged/closed lifecycle rows.
+/// Merged predecessors referenced by open PR bases remain in the active topology
+/// so check and sync can recognize the same pending advancement as status.
+/// Lightweight merged generation facts are retained; cleanup remains a cold phase.
 pub(crate) fn fleet_status_for_sync(
     context: &AppContext,
     operation_deadline: std::time::Instant,
@@ -2189,6 +2190,7 @@ pub(crate) fn status_for_pr_creation(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DiscoverySnapshotScope {
     FullLifecycle,
+    /// Open PRs and the merged predecessors still referenced by their bases.
     ActiveOnly,
 }
 

@@ -70,9 +70,10 @@ pub struct DiscoveryOptions {
     /// Explicit repair target, fetched even when unlabelled. Requires `focus_pr`;
     /// the two exact reads must agree with any active-member observations.
     pub repair_target_pr: Option<PrNumber>,
-    /// Include merged/closed lifecycle snapshots in the returned graph. Human
-    /// status and cleanup reads need them; a mutating sync hot pass defers them
-    /// so historical rows cannot starve known active work (bd-488224).
+    /// Include unrelated merged/closed lifecycle snapshots in the returned graph.
+    /// Human status and cleanup reads need them; hot sync and focused checks
+    /// retain only merged rows referenced by an open PR's base. Those rows are
+    /// active topology evidence, not optional history (bd-63294d).
     pub include_historical_pull_requests: bool,
     /// Exact `owner/name` from configuration. Managed checkouts point at a local
     /// daemon mirror, so git-remote inference cannot name the repository and
@@ -2168,16 +2169,28 @@ impl<R: CommandRunner> GitHubDiscovery<R> {
             .chain(merged_generation_facts)
             .collect::<Vec<_>>();
 
-        let historical_pull_requests = self
-            .options
-            .include_historical_pull_requests
-            .then(|| {
-                recently_merged_labeled_prs
-                    .into_iter()
-                    .chain(closed_lifecycle_prs)
+        // A merged predecessor is still active topology while an open PR uses
+        // its branch as a base. Dropping it made status request advancement but
+        // check/sync report a non-member wedge (bd-63294d). Retain every matching
+        // row, including ambiguous reused branches, so existing graph and sync
+        // guards see the same evidence. This uses the already-bounded history
+        // read: no extra provider queries, rollups, or unrelated lifecycle scans.
+        let open_bases = all_open_prs
+            .iter()
+            .filter(|pull_request| {
+                pull_request.state == PullRequestState::Open
+                    && pull_request.base.name != default_branch.name
             })
+            .map(|pull_request| pull_request.base.name.as_str())
+            .collect::<BTreeSet<_>>();
+        let historical_pull_requests = recently_merged_labeled_prs
             .into_iter()
-            .flatten();
+            .filter(|pull_request| {
+                self.options.include_historical_pull_requests
+                    || open_bases.contains(pull_request.head.name.as_str())
+            })
+            .chain(closed_lifecycle_prs)
+            .collect::<Vec<_>>();
         let mut pull_requests = BTreeMap::new();
         for pull_request in all_open_prs
             .into_iter()
@@ -3912,7 +3925,7 @@ mod tests {
     }
 
     #[test]
-    fn sync_hot_discovery_defers_closed_and_merged_snapshots() {
+    fn sync_hot_discovery_defers_closed_and_unreferenced_merged_snapshots() {
         let open = pr_list_json(1, "feature/widget", "acme/widgets", false);
         let mut calls = successful_discovery_calls(&open);
         calls.truncate(calls.len().saturating_sub(3));

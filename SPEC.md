@@ -407,9 +407,16 @@ one ordinary authenticated request/deadline unit. One transient read-only
 cursors, an unfinished page after `open_limit`, more than 100 labels, or more
 than 100 check contexts is typed incomplete provider evidence and refuses before
 mutation. Mutating `sync`/`plan sync` use a separate hot discovery snapshot: all
-open PRs plus lightweight merged generation facts, with merged/closed lifecycle
-snapshots deferred to later human/cold cleanup. Stale historical rows remain unavailable for mutation authority and are excluded
-from current generation-integrity comparison/comment fan-out. Human `status`
+open PRs plus lightweight merged generation facts and bounded merged rows whose
+head branches are still referenced by open PR bases. Focused `check --pr` retains
+the same predecessor rows, including all ambiguous branch-name matches. Status,
+check, and sync must identify the same pending advancement; sync may retarget
+only through its existing compatibility and exact provider preconditions, never
+by assuming a missing predecessor or selecting an ambiguous generation.
+Unrelated merged/closed lifecycle snapshots remain deferred to human/cold cleanup;
+no additional provider requests or historical check rollups are needed. Stale
+historical rows remain unavailable for mutation authority and are excluded from
+current generation-integrity comparison/comment fan-out. Human `status`
 with 30 or more lifecycle candidates defers exact Git compatibility explicitly
 and returns current bounded provider/structural evidence before the outer
 watchdog. Mutation-capable `plan sync` and `sync` never consume that relaxation:
