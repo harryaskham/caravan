@@ -374,6 +374,7 @@ mod tests {
                     },
                     caravans: Vec::new(),
                     waiting_prs: Vec::new(),
+                    native_stack_waits: Vec::new(),
                     held_caravans: Vec::new(),
                     missing_required_runs: Vec::new(),
                     head_of_line: Vec::new(),

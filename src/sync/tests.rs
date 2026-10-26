@@ -131,6 +131,7 @@ mod deferred_admission;
 mod effective_policy;
 mod merged_predecessor_discovery;
 mod native_quarantine;
+mod native_root_wait;
 mod stale_base_refresh;
 use deferred_admission::prove_deferred;
 
@@ -11454,6 +11455,7 @@ fn ordinary_native_sync_drift_preserves_sources_without_writes_or_ci_dispatch() 
             &provider,
             true,
             false,
+            false,
             64,
             RequiredRunsPolicy::from_config(&config.sync),
             Some(native.clone()),
@@ -11492,9 +11494,8 @@ fn ordinary_native_sync_drift_preserves_sources_without_writes_or_ci_dispatch() 
     }
 }
 
-/// bd-3eae33: the executable sync seam reads one exact mapped Stack and feeds
-/// it through Cara readiness. A non-ready bottom entry waits without acquiring
-/// a ruleset or writing a durable landing checkpoint.
+/// bd-3eae33 / bd-4eccb7: a non-ready bottom entry waits without
+/// rereading the Stack, acquiring a ruleset or writing a landing checkpoint.
 #[test]
 fn native_sync_waits_before_lock_when_the_ready_prefix_is_empty() {
     let pulls = linear_chain(2);
@@ -11561,7 +11562,7 @@ fn native_sync_waits_before_lock_when_the_ready_prefix_is_empty() {
         .drain_native_stack(&provider, &status, &caravan, 42, &native)
         .expect("an empty ready prefix is an ordinary wait");
 
-    assert_eq!(*provider.native_stack_reads.borrow(), 1);
+    assert_eq!(*provider.native_stack_reads.borrow(), 0);
     assert!(progress.native_stack_land.is_empty());
     assert!(
         progress
@@ -12090,7 +12091,7 @@ fn exact_singleton_and_multi_entry_stacks_never_call_synchronous_merge() {
         assert!(progress.root_merge.is_empty());
         assert!(progress.native_stack_land.is_empty());
         assert_eq!(*provider.native_stack_intersection_reads.borrow(), 1);
-        assert_eq!(*provider.native_stack_reads.borrow(), 1);
+        assert_eq!(*provider.native_stack_reads.borrow(), 0);
         assert!(
             !provider.calls.borrow().contains(&MutationKind::SquashMerge),
             "{member_count}-member provider Stack reached synchronous merge"
@@ -12169,7 +12170,7 @@ fn merged_predecessor_frontier_remains_on_native_route() {
     assert!(progress.root_merge.is_empty());
     assert!(progress.native_stack_land.is_empty());
     assert_eq!(*provider.native_stack_intersection_reads.borrow(), 1);
-    assert_eq!(*provider.native_stack_reads.borrow(), 1);
+    assert_eq!(*provider.native_stack_reads.borrow(), 0);
     assert!(!provider.calls.borrow().contains(&MutationKind::SquashMerge));
 }
 

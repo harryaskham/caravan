@@ -76,6 +76,7 @@ fn native_join_visible_at_routing_is_rediscovered_and_repaired_in_tick() {
                 &provider,
                 true,
                 false,
+                false,
                 64,
                 RequiredRunsPolicy::from_config(&config.sync),
                 Some(native.clone()),
