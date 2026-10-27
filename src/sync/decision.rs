@@ -439,6 +439,7 @@ pub(super) fn successful_scheduler_status(
         default_branch: status.analysis.fleet.default_branch.clone(),
         caravans,
         waiting_prs,
+        native_stack_waits: Vec::new(),
         held_caravans,
         missing_required_runs: missing_required_runs.to_vec(),
         head_of_line,

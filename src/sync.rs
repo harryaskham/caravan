@@ -389,6 +389,17 @@ pub struct HeadOfLineStall {
     pub fingerprint: String,
 }
 
+/// Exact native prefix that cannot progress this tick. Descendant CI and
+/// admission are deferred, not declared green or replayed to refresh the root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct NativeStackWait {
+    pub stack_number: u64,
+    pub caravan_id: PrNumber,
+    pub blocking_pr: PrNumber,
+    pub blockers: Vec<crate::github::GitHubStackMergeBlocker>,
+    pub deferred_members: Vec<PrNumber>,
+}
+
 /// Stable status consumed by deterministic external tick schedulers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SyncSchedulerStatus {
@@ -401,6 +412,8 @@ pub struct SyncSchedulerStatus {
     pub caravans: Vec<SyncCaravanGeneration>,
     #[serde(default)]
     pub waiting_prs: Vec<PrNumber>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub native_stack_waits: Vec<NativeStackWait>,
     #[serde(default)]
     pub held_caravans: Vec<PrNumber>,
     /// Members whose required contexts have no reporting run lineage on their
@@ -453,8 +466,8 @@ pub enum AutoAdmissionContinuation {
     /// Forming another caravan would exceed `sync.max_caravans`. Existing
     /// excess remains untouched and parked caravans do not consume capacity.
     MaxCaravansReached,
-    /// The existing fleet is mid-rebuild after a bounded prefix apply, so no
-    /// candidate is admitted until a tick converges it.
+    /// The existing fleet is mid-rebuild or its native prefix is waiting, so
+    /// admission is deferred rather than replaying a blocked chain this tick.
     RequiresConvergedFleet,
 }
 
@@ -4664,17 +4677,40 @@ fn root_first_output(
         &progress.required_runs,
         &progress.missing_required_runs,
     );
-    scheduler_status.disposition = SchedulerDisposition::RetryTick;
-    scheduler_status.wake_class = SchedulerWakeClass::RetryTick;
-    scheduler_status.reason = if native_prefix {
-        "advanced native Stack prefix convergence before descendant replay; rerun the next bounded tick from the durable provider cursor".to_owned()
+    scheduler_status
+        .native_stack_waits
+        .clone_from(&progress.native_stack_waits);
+    let waiting_only = native_prefix
+        && !progress.operation_receipt().changed
+        && progress.native_stack_land.is_empty();
+    if waiting_only {
+        // A zero-write wait is a terminal tick result, not progress and not an
+        // invitation to retry the same reads/admission within this tick.
+        if scheduler_status.disposition == SchedulerDisposition::Healthy {
+            scheduler_status.disposition = SchedulerDisposition::RetryTick;
+            scheduler_status.wake_class = SchedulerWakeClass::RetryTick;
+        }
+        scheduler_status.reason = format!(
+            "native Stack prefix waiting; descendant CI and admission deferred: {}",
+            scheduler_status.reason
+        );
     } else {
-        format!(
-            "landed {} exact green Cara-owned root(s) before whole-fleet analysis; rerun the next bounded tick from the durable provider cursor",
-            progress.root_merge.len()
-        )
-    };
+        scheduler_status.disposition = SchedulerDisposition::RetryTick;
+        scheduler_status.wake_class = SchedulerWakeClass::RetryTick;
+        scheduler_status.reason = if native_prefix {
+            "advanced native Stack prefix convergence before descendant replay; rerun the next bounded tick from the durable provider cursor".to_owned()
+        } else {
+            format!(
+                "landed {} exact green Cara-owned root(s) before whole-fleet analysis; rerun the next bounded tick from the durable provider cursor",
+                progress.root_merge.len()
+            )
+        };
+    }
     let receipt = progress.operation_receipt();
+    let mut auto_admission = AutoAdmissionOutput::disabled(context, input.all);
+    if waiting_only && auto_admission.enabled && input.all {
+        auto_admission.continuation = AutoAdmissionContinuation::RequiresConvergedFleet;
+    }
     Ok(SyncOutput {
         tick: SyncTickReceipt {
             schema_version: 1,
@@ -4686,7 +4722,7 @@ fn root_first_output(
             changed: receipt.changed,
         },
         receipt,
-        auto_admission: AutoAdmissionOutput::disabled(context, input.all),
+        auto_admission,
         scheduler_status,
         timing: Some(SyncTiming {
             deadline_ms: duration_millis(operation_deadline.saturating_duration_since(started)),
@@ -5597,6 +5633,7 @@ fn sync_with_lock(
                     status,
                     &provider,
                     input.all,
+                    input.rerun_failed,
                     context.config.force_merge,
                     context
                         .config
@@ -5657,10 +5694,15 @@ fn sync_with_lock(
                 return Ok(output);
             }
         };
-        if let Some(progress) = prefix {
+        if let Some(mut progress) = prefix {
+            progress.steps.splice(0..0, parking.steps);
+            progress
+                .provider_receipts
+                .splice(0..0, parking.provider_receipts);
+            progress.events.splice(0..0, parking.events);
             progress::emit(
                 "native_prefix_first",
-                "advanced a native Stack prefix; deferring descendant replay to the next tick",
+                "completed the bounded native prefix pass; deferring descendant analysis and admission",
             );
             return root_first_output(
                 context,
@@ -6264,6 +6306,11 @@ fn merge_sync_progress(target: &mut SyncProgress, mut source: SyncProgress) {
     target
         .native_stack_land
         .append(&mut source.native_stack_land);
+    target
+        .native_stack_waits
+        .append(&mut source.native_stack_waits);
+    target.root_merge.append(&mut source.root_merge);
+    target.root_promotion.append(&mut source.root_promotion);
     target
         .ci_generation_dispatches
         .append(&mut source.ci_generation_dispatches);
@@ -8239,6 +8286,7 @@ fn execute_native_stack_prefix_first(
     status: &StatusOutput,
     provider: &impl SyncProvider,
     all: bool,
+    rerun_failed: bool,
     force_merge: bool,
     mutation_limit: u32,
     required_runs: RequiredRunsPolicy,
@@ -8257,17 +8305,15 @@ fn execute_native_stack_prefix_first(
                 .any(|pause| pause.state.is_effective() && pause.record.caravan_head == caravan.id)
     });
 
+    let mut waiting: Option<SyncProgress> = None;
     for caravan in caravans {
-        if !matches!(
-            native_route_for_caravan(status, provider, &caravan, Some(&native_stack))?,
-            NativeCaravanRoute::NativeStack(_)
-        ) {
-            continue;
-        }
+        // Reconcile also routes proven stackless singletons. A waiting Stack
+        // must not starve an independent ready caravan, or cause a second
+        // Stack-intersection read merely to choose the same route again.
         let mut progress = SyncProgress::new(status, vec![caravan.id], mutation_limit);
         progress.native_stack = Some(native_stack.clone());
         progress.required_runs_grace_secs = required_runs.grace_secs;
-        progress.required_runs_retrigger_enabled = false;
+        progress.required_runs_retrigger_enabled = required_runs.retrigger;
         preflight_repository(provider, status, &progress)?;
         validate_graph(
             status,
@@ -8279,7 +8325,7 @@ fn execute_native_stack_prefix_first(
             status,
             provider,
             &caravan,
-            false,
+            rerun_failed,
             force_merge,
             &BTreeMap::new(),
             &mut progress,
@@ -8287,11 +8333,21 @@ fn execute_native_stack_prefix_first(
         // Promotion/disarm writes performed while proving readiness are also
         // durable progress. Return them instead of discarding their receipts
         // and entering physical replay in the same tick.
-        if !progress.native_stack_land.is_empty() || progress.operation_receipt().changed {
-            return Ok(Some(progress));
+        let advanced =
+            !progress.native_stack_land.is_empty() || progress.operation_receipt().changed;
+        if let Some(previous) = waiting.as_mut() {
+            merge_sync_progress(previous, progress);
+        } else {
+            waiting = Some(progress);
+        }
+        if advanced {
+            return Ok(waiting);
         }
     }
-    Ok(None)
+    // Waiting is a completed native pass too. Discarding its evidence used to
+    // repeat all member reads in ordinary convergence, then attempt admission
+    // with too little request budget left to finish or roll back membership.
+    Ok(waiting)
 }
 
 fn root_first_eligible(status: &StatusOutput, caravan: &Caravan) -> bool {
@@ -8580,8 +8636,9 @@ fn reconcile_caravan(
         let observation = progress.observe_ci(provider, &status.repository, number)?;
         let disposition = observation.disposition;
         progress.upsert_ci_observation(observation.clone());
-        // Verify every member against the actual landing target before any CI
-        // stop, so one failed or stalled member never suppresses another.
+        // Verify against the actual landing target. Native prefixes cannot
+        // pass the first unqualified member, so no descendant CI read can help
+        // this tick; other caravans still receive their own bounded pass.
         if verify_required_runs_and_recover_gate(
             provider,
             progress,
@@ -8593,15 +8650,20 @@ fn reconcile_caravan(
             // A fresh tick owns CI, parking, and merge after the exact rerun.
             return Ok(());
         }
+        if disposition == CiDisposition::Failed && rerun_failed {
+            progress.rerun_exact_failed_runs(
+                provider,
+                &status.repository,
+                number,
+                &observation.rerunnable_run_ids,
+            )?;
+        }
+        if matches!(native_route, NativeCaravanRoute::NativeStack(_))
+            && !progress.native_member_required_ready(number)
+        {
+            break;
+        }
         if disposition == CiDisposition::Failed {
-            if rerun_failed {
-                progress.rerun_exact_failed_runs(
-                    provider,
-                    &status.repository,
-                    number,
-                    &observation.rerunnable_run_ids,
-                )?;
-            }
             // Required-run discovery and an optional exact rerun are provider
             // boundaries where a newer same-head generation may appear. Only a
             // fresh observation immediately before the ci_failed decision has
@@ -9115,6 +9177,9 @@ fn sync_checkpoint_evidence(progress: &SyncProgress) -> Value {
                 "terminal_status": checkpoint.terminal_status,
                 "evidence_hash": checkpoint.evidence_hash,
             })).collect()
+        ),
+        "native_stack_waits": bounded_checkpoint_sequence(
+            progress.native_stack_waits.iter().map(|wait| json!(wait)).collect()
         ),
         "events": checkpoint_events(&progress.events),
         "recovery": "rediscover provider state and replay the same idempotent sync; hashes bind complete omitted evidence",
@@ -10816,6 +10881,7 @@ struct SyncProgress {
     /// Durable proof of each caravan-owned squash merge and where it landed.
     root_merge: Vec<RootMergeReceipt>,
     native_stack_land: Vec<crate::github::GitHubStackLandCheckpoint>,
+    native_stack_waits: Vec<NativeStackWait>,
     ci_generation_dispatches: Vec<CiGenerationDispatchReceipt>,
     /// Configured merge actor for this tick.
     head_merge_actor: HeadMergeActor,
@@ -10899,6 +10965,7 @@ impl SyncProgress {
             root_promotion: Vec::new(),
             root_merge: Vec::new(),
             native_stack_land: Vec::new(),
+            native_stack_waits: Vec::new(),
             ci_generation_dispatches: Vec::new(),
             // Exactly one fact decides who merges: the configured policy
             // projected onto status. Every surface reads the same value.
@@ -11864,6 +11931,56 @@ impl SyncProgress {
         Ok(after.complete && after == policy)
     }
 
+    fn native_member_required_ready(&self, pr: PrNumber) -> bool {
+        self.required_runs
+            .iter()
+            .rev()
+            .find(|receipt| receipt.pr == pr)
+            .is_some_and(|receipt| {
+                self.current.get(&pr).is_some_and(|current| {
+                    current.head == receipt.assessment.head
+                        && current.base == receipt.assessment.base
+                }) && receipt
+                    .assessment
+                    .required_policy
+                    .as_ref()
+                    .is_some_and(|policy| policy.complete && policy.branch == self.default_branch)
+                    && matches!(
+                        receipt.assessment.status,
+                        RequiredRunsStatus::Satisfied | RequiredRunsStatus::NotRequired
+                    )
+            })
+    }
+
+    fn record_native_stack_wait(
+        &mut self,
+        caravan: &Caravan,
+        stack_number: u64,
+        blocking_pr: PrNumber,
+        blockers: Vec<crate::github::GitHubStackMergeBlocker>,
+    ) {
+        self.record_merge_wait(
+            caravan.id,
+            RootMergeBlock::ChecksNotPassing,
+            Some(format!(
+                "native Stack prefix waits at PR #{blocking_pr}: {blockers:?}"
+            )),
+        );
+        self.native_stack_waits.push(NativeStackWait {
+            stack_number,
+            caravan_id: caravan.id,
+            blocking_pr,
+            blockers,
+            deferred_members: caravan
+                .members
+                .iter()
+                .copied()
+                .skip_while(|pr| *pr != blocking_pr)
+                .skip(1)
+                .collect(),
+        });
+    }
+
     /// Land one fully ready native Stack under a complete-generation source-ref
     /// lock. The readiness planner still identifies a maximal prefix, but a
     /// blocked suffix requires typed reshape before submission because GitHub
@@ -11896,6 +12013,20 @@ impl SyncProgress {
             }
             checkpoint
         } else {
+            let root = caravan.head().expect("caravans are non-empty");
+            if !self.native_member_required_ready(root) {
+                // Routing already proved the provider Stack. With no existing
+                // landing checkpoint and an unqualified root, rereading every
+                // member's generation cannot authorize anything. In-flight
+                // checkpoints above must still reconcile even when CI changes.
+                self.record_native_stack_wait(
+                    caravan,
+                    stack_number,
+                    root,
+                    vec![crate::github::GitHubStackMergeBlocker::RequiredChecksNotReady],
+                );
+                return Ok(());
+            }
             let stack = provider
                 .native_stack_generation_for_sync(repository, stack_number)?
                 .ok_or_else(|| {
@@ -11912,24 +12043,7 @@ impl SyncProgress {
                 held_members: &held,
             };
             let evidence = crate::stack_policy::stack_merge_evidence(facts, &stack, &|pr| {
-                let required =
-                    self.required_runs
-                        .iter()
-                        .rev()
-                        .find(|receipt| receipt.pr == pr)
-                        .is_some_and(|receipt| {
-                            self.current.get(&pr).is_some_and(|current| {
-                                current.head == receipt.assessment.head
-                                    && current.base == receipt.assessment.base
-                            }) && receipt.assessment.required_policy.as_ref().is_some_and(
-                                |policy| policy.complete && policy.branch == self.default_branch,
-                            ) && matches!(
-                                receipt.assessment.status,
-                                crate::required_runs::RequiredRunsStatus::Satisfied
-                                    | crate::required_runs::RequiredRunsStatus::NotRequired
-                            )
-                        });
-                if required {
+                if self.native_member_required_ready(pr) {
                     crate::stack_policy::StackEntryCi::Ready
                 } else {
                     crate::stack_policy::StackEntryCi::NotReady
@@ -11938,17 +12052,14 @@ impl SyncProgress {
             let prefix = crate::github::plan_github_stack_ready_prefix(&stack, &evidence)
                 .map_err(native_sync_error)?;
             if prefix.selected.is_empty() {
-                let detail = prefix.first_blocked.map(|blocked| {
-                    format!(
-                        "native Stack prefix waits at PR #{}: {:?}",
-                        blocked.pr, blocked.blockers
-                    )
-                });
-                self.record_merge_wait(
-                    caravan.head().expect("caravan has a head"),
-                    RootMergeBlock::ChecksNotPassing,
-                    detail,
-                );
+                if let Some(blocked) = prefix.first_blocked {
+                    self.record_native_stack_wait(
+                        caravan,
+                        stack_number,
+                        blocked.pr,
+                        blocked.blockers,
+                    );
+                }
                 return Ok(());
             }
             let current_open = stack

@@ -62,7 +62,10 @@ today.
   are non-retryable external decisions with a stable evidence fingerprint and
   explicit repair/reshape/strategy continuations. Stale synthetic generations
   require a fresh candidate trigger; raw logs and unrelated log text are never
-  retained or exposed.
+  retained or exposed. A [native root CI wait](docs/native-root-ci-wait.md)
+  ends the bounded prefix pass without repeating descendant reads or entering
+  admission; `scheduler_status.native_stack_waits` names its blocking member
+  and deferred suffix, while independent ready caravans can still progress.
 - `caravan-force` is durable PR-scoped operator intent: when that PR reaches
   caravan root, if it is mechanically mergeable, Cara ignores every CI state
   (successful, pending, running, failed, mixed, unknown, or empty) and performs
