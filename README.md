@@ -890,6 +890,16 @@ quarantined with the owner's exact recovery command, and the rest of the queue
 keeps moving (bd-4d4621). Normal landing and membership recovery remain
 separate paths.
 
+Queue-owned replay proves each member's cumulative three-way tree against its
+exact new predecessor rather than replaying merge-synced commit history
+(bd-93b5ba). Main-side release bumps therefore cannot manufacture intermediate
+conflicts on files outside the member's net change. The prepared merge retains
+both input heads and records the unique merge base and source/target/result
+trees in `cumulative_tree`; exact-generation atomic leases are unchanged. If
+head already contains the new predecessor, it is retained byte-for-byte, with
+no source push or fresh-CI requirement. Real final-tree conflicts still fail
+closed. Explicit owner rebase and non-force repair policies are unchanged.
+
 An otherwise healthy Stack with a stale-base root is also refreshed by the
 queue (bd-c299b8). Under the same mutation opt-in and manual-repair policy,
 exact comparison evidence must show that current default adds content the root
@@ -911,8 +921,8 @@ drifted Stack, points each survivor's base at its predecessor, and rebuilds only
 the survivors. Closed rows are pruned from the representation, never rewritten;
 the raw generation stays in the sealed plan and checkpointed receipt.
 
-These repairs do not let a real conflict hold a slot any more. A member it cannot
-replay linearly is evicted together with its descendants, tail-first and
+These repairs do not let a real conflict hold a slot any more. A member whose
+cumulative tree cannot merge cleanly is evicted with its descendants, tail-first and
 labels-only (heads and bases preserved), with a typed reason; the members
 before it keep their rebase and the next candidate can be admitted. The tick
 emits `evicted` and the existing `sync_failed` hook with

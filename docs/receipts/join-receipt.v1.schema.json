@@ -415,6 +415,30 @@
         "unknown"
       ]
     },
+    "CumulativeTreeReplay": {
+      "description": "The exact three-way tree inputs, retained alongside head/base generations in\nthe plan and receipt. This is content evidence, not publication authority.",
+      "type": "object",
+      "properties": {
+        "merge_base_oid": {
+          "$ref": "#/$defs/CommitOid"
+        },
+        "result_tree_oid": {
+          "$ref": "#/$defs/CommitOid"
+        },
+        "source_tree_oid": {
+          "$ref": "#/$defs/CommitOid"
+        },
+        "target_tree_oid": {
+          "$ref": "#/$defs/CommitOid"
+        }
+      },
+      "required": [
+        "merge_base_oid",
+        "source_tree_oid",
+        "target_tree_oid",
+        "result_tree_oid"
+      ]
+    },
     "ExpectedAdmission": {
       "description": "Version-one Cacophony caller ABI. Keep the original strings, including OID\ncase, for exact JSON value equality in both check and mutation receipts.",
       "type": "object",
@@ -894,6 +918,17 @@
           "type": "integer",
           "format": "uint",
           "minimum": 0
+        },
+        "cumulative_tree": {
+          "description": "Exact three-way tree proof for queue-owned cumulative replay.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CumulativeTreeReplay"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "lease": {
           "description": "The exact optimistic lease passed to Git.",

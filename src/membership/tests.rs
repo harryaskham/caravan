@@ -715,6 +715,7 @@ fn rebase_receipt(
         new_tree_oid: CommitOid("tree-oid".to_owned()),
         commit_count: 1,
         merge_topology: None,
+        cumulative_tree: None,
         squash_reconciliation: None,
         ci_trigger_workflows: vec![".github/workflows/ci.yml".to_owned()],
         lease: format!(
@@ -853,6 +854,7 @@ fn rewrite_required_join_rediscovery_and_membership_share_one_operation_budget()
         new_tree_oid: CommitOid("rewritten-result-tree".to_owned()),
         commit_count: 1,
         merge_topology: None,
+        cumulative_tree: None,
         squash_reconciliation: None,
         ci_trigger_workflows: vec![".github/workflows/ci.yml".to_owned()],
         lease: format!(
@@ -1726,6 +1728,7 @@ fn atomic_join_rejects_live_tail_drift_after_physical_rebase() {
         new_tree_oid: crate::model::CommitOid("e".repeat(40)),
         commit_count: 1,
         merge_topology: None,
+        cumulative_tree: None,
         squash_reconciliation: None,
         ci_trigger_workflows: vec![".github/workflows/ci.yml".to_owned()],
         lease: format!(
@@ -1758,6 +1761,16 @@ fn atomic_join_rejects_live_tail_drift_after_physical_rebase() {
     assert_eq!(error.code(), "join_target_moved_after_rebase");
     assert_eq!(provider.pull_requests.borrow()[&PrNumber(2)], candidate);
     assert_eq!(error.details().unwrap()["mutated_membership"], false);
+}
+
+fn assert_join_receipt_hash(receipt: &JoinReceipt) {
+    let mut unhashed = receipt.clone();
+    let expected_hash = unhashed.receipt_hash.clone();
+    unhashed.receipt_hash.clear();
+    assert_eq!(
+        fnv1a64(&serde_json::to_vec(&unhashed).unwrap()),
+        expected_hash
+    );
 }
 
 #[test]
@@ -1793,6 +1806,7 @@ fn join_receipt_proves_exact_tail_ancestry_and_durable_force_preservation() {
         new_tree_oid: crate::model::CommitOid("e".repeat(40)),
         commit_count: 1,
         merge_topology: None,
+        cumulative_tree: None,
         squash_reconciliation: None,
         ci_trigger_workflows: vec![".github/workflows/ci.yml".to_owned()],
         lease: format!(
@@ -1848,13 +1862,7 @@ fn join_receipt_proves_exact_tail_ancestry_and_durable_force_preservation() {
     assert_eq!(receipt.result.base_oid, head.head.oid);
     assert!(receipt.config_fingerprint.starts_with("fnv1a64:"));
     assert!(receipt.receipt_hash.starts_with("fnv1a64:"));
-    let mut unhashed = receipt.clone();
-    let expected_hash = unhashed.receipt_hash.clone();
-    unhashed.receipt_hash.clear();
-    assert_eq!(
-        fnv1a64(&serde_json::to_vec(&unhashed).unwrap()),
-        expected_hash
-    );
+    assert_join_receipt_hash(&receipt);
     assert!(output.pull_request.has_label(FORCE_LABEL));
     assert!(!receipt.provider_receipts.iter().any(|provider| {
         provider.kind == MutationKind::RemoveLabel
@@ -1949,6 +1957,7 @@ fn root_new_receipt_uses_default_branch_predecessor_bd_d15ba3() {
         new_tree_oid: crate::model::CommitOid("e".repeat(40)),
         commit_count: 1,
         merge_topology: None,
+        cumulative_tree: None,
         squash_reconciliation: None,
         ci_trigger_workflows: vec![".github/workflows/ci.yml".to_owned()],
         lease: format!(

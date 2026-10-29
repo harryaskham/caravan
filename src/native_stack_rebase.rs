@@ -865,8 +865,11 @@ pub(crate) fn pending_sync_repair_plans<'a>(
 ///
 /// Under the repository's reviewed Stack mutation opt-in, sync plans the same
 /// sealed rebase from the same exact provider facts and applies it under its
-/// writer guard: every rewritten head is force-with-lease guarded against its
-/// observed generation, closed rows are pruned from the rebuilt Stack (the raw
+/// writer guard: each member's final three-way tree is proven without replaying
+/// its commit sequence, and an exact predecessor already in head ancestry needs
+/// no rewrite. A new merge retains both the source head and predecessor; every
+/// publication remains force-with-lease guarded against its observed generation.
+/// Closed rows are pruned from the rebuilt Stack (the raw
 /// generation stays in the sealed plan and checkpointed receipt), rewritten
 /// heads need fresh CI, and an applied plan hash is never replayed.
 ///
@@ -1131,6 +1134,7 @@ fn apply_plan(
             planned_target.clone(),
             &status.analysis.fleet.default_branch,
             crate::physical_rebase::RebaseExecutionBudget::new(timeout)
+                .with_cumulative_tree_replay(conflicts == ConflictPolicy::EvictSuffix)
                 .with_deadline(deadline)
                 .with_writer_fence(writer.remote_fence())
                 .because(member.parent_pr.map_or(
@@ -1882,6 +1886,10 @@ mod tests {
         assert_eq!(explicit.matches("    apply_plan(\n").count(), 1);
         assert_eq!(explicit.matches("ConflictPolicy::Refuse,").count(), 1);
         assert_eq!(explicit.matches("ConflictPolicy::EvictSuffix,").count(), 1);
+        assert!(
+            explicit
+                .contains(".with_cumulative_tree_replay(conflicts == ConflictPolicy::EvictSuffix)")
+        );
         assert!(
             explicit.contains("context.acquire_writer_operation(\"native-stack-rebase-apply\")")
         );
