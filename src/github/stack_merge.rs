@@ -556,6 +556,24 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
         ))
     }
 
+    /// Read a previously released UUID. The completed release is established by
+    /// the landing checkpoint caller, so re-requiring that deleted lock would
+    /// force every later terminal result back to indeterminate (bd-6a588d).
+    pub(crate) fn native_stack_merge_reobserve_released(
+        &self,
+        repository: &RepositoryId,
+        checkpoint: &GitHubStackLockedMergeCheckpoint,
+    ) -> Result<GitHubStackLockedMergeReceipt, GitHubStackMergeError> {
+        validate_locked_checkpoint(repository, checkpoint)?;
+        let merge = self.native_stack_merge_poll_unlocked(repository, &checkpoint.merge)?;
+        Ok(locked_merge_receipt(
+            repository,
+            merge,
+            checkpoint.branch_lock.clone(),
+            false,
+        ))
+    }
+
     /// Internal transport after the provider-enforced branch lock is proven.
     fn native_stack_merge_submit_unlocked(
         &self,
@@ -774,6 +792,31 @@ impl<R: CommandRunner> GitHubMutationAdapter<R> {
                 observation: None,
             })),
         }
+    }
+
+    /// Reconcile a lost submission response without issuing another PUT. Open
+    /// PRs cannot prove non-application while an unidentified request may still
+    /// be running; only exact terminal merge provenance can resolve it.
+    pub(crate) fn native_stack_merge_reobserve_unidentified(
+        &self,
+        repository: &RepositoryId,
+        plan: &GitHubStackAsyncMergePlan,
+        branch_lock: &GitHubStackBranchLockGeneration,
+    ) -> GitHubStackLockedMergeReceipt {
+        let merge = self.terminal_stack_merge_receipt(StackMergeReceiptInput {
+            repository,
+            plan,
+            request: merge_request_identity(repository, plan),
+            checkpoint: None,
+            status: GitHubStackMergeStatus::Indeterminate,
+            provider_status: None,
+            provider_message: Some(
+                "submission response lost; read-only exact-generation reconciliation".to_owned(),
+            ),
+            provider_sha: None,
+            observation: None,
+        });
+        locked_merge_receipt(repository, merge, branch_lock.clone(), false)
     }
 
     fn terminal_stack_merge_receipt(
@@ -1183,7 +1226,7 @@ fn invalid_plan(code: &str, message: &str) -> GitHubStackMergeError {
     }
 }
 
-fn merge_request_identity(
+pub(crate) fn merge_request_identity(
     repository: &RepositoryId,
     plan: &GitHubStackAsyncMergePlan,
 ) -> GitHubStackMergeRequestIdentity {
@@ -2075,6 +2118,136 @@ mod tests {
         assert_eq!(receipt.observation.as_ref().unwrap().selected_merged, 0);
         assert!(receipt.verify());
         adapter.runner.assert_exhausted();
+    }
+
+    #[test]
+    fn durable_released_receipt_reconciles_terminal_uuid_without_requiring_deleted_lock() {
+        for (provider_status, expected, outcome) in [
+            ("merged", GitHubStackMergeStatus::Merged, "applied"),
+            ("failed", GitHubStackMergeStatus::Failed, "not_applied"),
+            ("pending", GitHubStackMergeStatus::Indeterminate, "unknown"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            assert!(
+                std::process::Command::new("git")
+                    .args(["init", "--quiet"])
+                    .current_dir(directory.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let before = generation();
+            let plan = direct_plan(&before);
+            let lock = branch_lock(&plan);
+            let merge_checkpoint = checkpoint(plan.clone());
+            let merge = stack_merge_receipt(StackMergeReceiptInput {
+                repository: &repository(),
+                plan: &plan,
+                request: merge_checkpoint.request.clone(),
+                checkpoint: Some(merge_checkpoint.clone()),
+                status: GitHubStackMergeStatus::Indeterminate,
+                provider_status: None,
+                provider_message: None,
+                provider_sha: None,
+                observation: None,
+            });
+            let locked = locked_merge_receipt(&repository(), merge, lock.clone(), true);
+            let begin =
+                GitHubMutationAdapter::<FakeRunner>::native_stack_land_begin(&repository(), &plan);
+            let mut released = super::super::advance(&begin, &locked);
+            released.phase = super::super::GitHubStackLandPhase::Released;
+            released.lock_release = Some(super::super::GitHubStackBranchLockReceipt {
+                schema_version: 1,
+                operation_id: plan.operation_id.clone(),
+                actor: "fixture".to_owned(),
+                repository: repository(),
+                operation: super::super::GitHubStackBranchLockOperation::Release,
+                disposition: super::super::GitHubStackBranchLockDisposition::Completed,
+                request_method: "DELETE".to_owned(),
+                request_path: "repos/owner/repo/rulesets/42".to_owned(),
+                github_request_id: None,
+                lock: Some(lock),
+                evidence_hash: String::new(),
+            });
+            let released = released.reseal();
+            assert!(released.verify());
+            crate::sync::receipt::save_native(directory.path(), "land-42", &released).unwrap();
+            let mut calls = vec![(
+                native_stack_merge_poll_command(&repository(), &merge_checkpoint),
+                CommandOutput::success(format!(
+                    "HTTP/2 200 OK\n\n{{\"uuid\":\"merge-uuid\",\"status\":\"{provider_status}\"}}"
+                )),
+            )];
+            if provider_status != "pending" {
+                let (after, head) = if provider_status == "merged" {
+                    (terminal_stack(before, 2), "merge999")
+                } else {
+                    (before, "base000")
+                };
+                calls.extend(merge_observation_calls(&after, head));
+            }
+            // No lock GET/PUT/DELETE or merge PUT appears in this script.
+            let adapter = GitHubMutationAdapter::new(FakeRunner::new(calls));
+            let observed = adapter
+                .native_stack_land_reobserve_released(&repository(), &released)
+                .unwrap();
+            assert_eq!(observed.terminal_status, Some(expected));
+            assert_eq!(observed.lock_release, released.lock_release);
+            assert!(observed.verify());
+            crate::sync::receipt::save_native(directory.path(), "land-42", &observed).unwrap();
+            let read = crate::sync::receipt::inspect(
+                directory.path(),
+                &crate::sync::receipt::ReceiptInput {
+                    operation_id: Some(plan.operation_id),
+                },
+            )
+            .unwrap();
+            assert_eq!(read.native_merges[0].outcome, outcome);
+            assert_eq!(read.native_merges[0].checkpoint, observed);
+            if provider_status != "pending" {
+                assert!(
+                    read.native_merges[0]
+                        .checkpoint
+                        .terminal_receipt
+                        .as_ref()
+                        .unwrap()
+                        .merge
+                        .observation
+                        .is_some()
+                );
+            }
+            adapter.runner.assert_exhausted();
+        }
+    }
+
+    #[test]
+    fn unidentified_submission_only_resolves_on_exact_merge_provenance() {
+        for merged in [false, true] {
+            let before = generation();
+            let plan = direct_plan(&before);
+            let lock = branch_lock(&plan);
+            let (after, head) = if merged {
+                (terminal_stack(before, 2), "merge999")
+            } else {
+                (before, "base000")
+            };
+            let adapter =
+                GitHubMutationAdapter::new(FakeRunner::new(merge_observation_calls(&after, head)));
+            let receipt =
+                adapter.native_stack_merge_reobserve_unidentified(&repository(), &plan, &lock);
+            assert_eq!(
+                receipt.merge.status,
+                if merged {
+                    GitHubStackMergeStatus::Merged
+                } else {
+                    GitHubStackMergeStatus::Indeterminate
+                }
+            );
+            assert!(receipt.merge.observation.is_some());
+            assert!(receipt.checkpoint.is_none());
+            assert!(receipt.verify());
+            adapter.runner.assert_exhausted();
+        }
     }
 
     #[test]

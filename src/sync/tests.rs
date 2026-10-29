@@ -129,6 +129,7 @@ mod closed_history_repair;
 mod closed_reformation;
 mod deferred_admission;
 mod effective_policy;
+mod interrupted_receipt;
 mod merged_predecessor_discovery;
 mod native_quarantine;
 mod native_root_wait;

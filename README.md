@@ -979,6 +979,14 @@ non-native lanes remain fail-closed. Provider regeneration rather than scheduler
 checkpoints, and exactly releases the complete lock. The ruleset path requires
 the explicit, conditional Administration(write) App permission documented
 below; default Caravan mode never needs it.
+
+Interrupted syncs retain a write-ahead operation ID and exact native merge receipt.
+Use `cara operation --operation-id <id> --json` (or omit the ID to list receipts)
+without taking a writer lock or contacting GitHub. The original operation is
+reconciled by the existing scheduler, never by blindly resubmitting its merge.
+See [native sync receipts](docs/native-sync-receipts.md) for startup/cron identity,
+unknown outcomes, and read-only inspection after a killed process.
+
 GitHub exposes no arbitrary Stack remove/reorder, so evict and split are a
 phased unstack/rebuild transaction whose sealed checkpoints record
 `preflighted`, `unstacked`, `reshape_applied`, `rebuilding`, `rebuilt`, and

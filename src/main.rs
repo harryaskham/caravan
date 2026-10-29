@@ -147,6 +147,8 @@ enum Command {
     /// Pass `--dry-run` to preview the exact tick without any provider
     /// mutation; it is identical to `cara plan sync`.
     Sync(SyncInput),
+    /// Read durable sync and native merge receipts locally, without provider access.
+    Operation(caravan::sync::receipt::ReceiptInput),
     /// Preview exact domain operations without provider mutation.
     #[command(subcommand)]
     Plan(PlanCommand),
@@ -520,6 +522,13 @@ fn run(cli: &Cli) -> Result<(), i32> {
         Command::Unpark(input) => run_unpark(cli, input),
         Command::RestoreParked(input) => run_restore_parked(cli, input),
         Command::NativeStack(command) => run_native_stack(cli, command),
+        Command::Operation(input) => {
+            let context = load_sync_context(cli)?;
+            emit_result(
+                cli.json,
+                caravan::sync::receipt::inspect(&context.repository_path, input),
+            )
+        }
         Command::PauseRecovery(command) => run_pause_recovery(cli, command),
         Command::Admit(input) => run_admit(cli, input),
         Command::Sync(input) => run_with_log_flush(cli, "sync", || run_sync(cli, input)),
@@ -3356,13 +3365,25 @@ fn one_line_summary_message(message: &str) -> String {
 
 fn sync_error_summary(error: &impl StructuredError) -> String {
     let message = one_line_summary_message(&error.message());
-    if message.is_empty() {
+    let mut summary = if message.is_empty() {
         "Cara sync failed.".to_owned()
     } else if message.ends_with(['.', '!', '?', '…']) {
         format!("Cara sync failed: {message}")
     } else {
         format!("Cara sync failed: {message}.")
+    };
+    if let Some(details) = error.details() {
+        if let Some(id) = details
+            .get("operation_id")
+            .and_then(serde_json::Value::as_str)
+        {
+            let _ = write!(
+                summary,
+                " operation_id={id}; receipt=cara operation --operation-id {id} --json"
+            );
+        }
     }
+    summary
 }
 
 /// Emit the normal mcp-cli envelope plus one additive scheduler-facing field.
@@ -3389,6 +3410,17 @@ where
         .as_object_mut()
         .expect("mcp-cli envelopes serialize as JSON objects")
         .insert("summary".to_owned(), serde_json::Value::String(summary));
+    let operation_id = envelope
+        .pointer("/error/details/operation_id")
+        .or_else(|| envelope.pointer("/data/receipt/operation_id"))
+        .cloned();
+    if let Some(id) = operation_id {
+        envelope["receipt_command"] = serde_json::json!(format!(
+            "cara operation --operation-id {} --json",
+            id.as_str().unwrap_or_default()
+        ));
+        envelope["operation_id"] = id;
+    }
     Ok((envelope, failed))
 }
 
@@ -4962,6 +4994,41 @@ provider.wait()
         assert_eq!(envelope["status"], "success");
         assert_eq!(envelope["data"]["receipt"], "typed");
         assert_eq!(envelope["summary"], "Cara sync succeeded: merged 1 PR.");
+    }
+
+    #[test]
+    fn sync_failure_summary_and_envelope_name_durable_receipt() {
+        let error = AppError::execution(
+            "github_stack_merge_indeterminate",
+            "native merge uncertain",
+            Some(serde_json::json!({
+                "operation_id": "durable-sync-id",
+                "receipt_command": "cara operation --operation-id durable-sync-id --json",
+            })),
+        );
+        let (envelope, failed) =
+            sync_json_envelope::<serde_json::Value, _>(Err(error), |_| unreachable!()).unwrap();
+        assert!(failed);
+        assert_eq!(envelope["operation_id"], "durable-sync-id");
+        assert!(
+            envelope["summary"]
+                .as_str()
+                .unwrap()
+                .contains("operation_id=durable-sync-id")
+        );
+        assert!(
+            envelope["summary"]
+                .as_str()
+                .unwrap()
+                .contains("cara operation --operation-id durable-sync-id --json")
+        );
+        assert!(!envelope.to_string().contains("operation_id=unknown"));
+        let success: Result<serde_json::Value, AppError> =
+            Ok(serde_json::json!({"receipt": {"operation_id": "durable-sync-id"}}));
+        let (envelope, failed) =
+            sync_json_envelope(success, |_| "Cara sync succeeded.".to_owned()).unwrap();
+        assert!(!failed);
+        assert_eq!(envelope["operation_id"], "durable-sync-id");
     }
 
     #[test]
