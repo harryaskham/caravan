@@ -1763,6 +1763,16 @@ fn atomic_join_rejects_live_tail_drift_after_physical_rebase() {
     assert_eq!(error.details().unwrap()["mutated_membership"], false);
 }
 
+fn assert_join_receipt_hash(receipt: &JoinReceipt) {
+    let mut unhashed = receipt.clone();
+    let expected_hash = unhashed.receipt_hash.clone();
+    unhashed.receipt_hash.clear();
+    assert_eq!(
+        fnv1a64(&serde_json::to_vec(&unhashed).unwrap()),
+        expected_hash
+    );
+}
+
 #[test]
 fn join_receipt_proves_exact_tail_ancestry_and_durable_force_preservation() {
     let head = pull_request(1, "one", "main", &[ACTIVE_LABEL]);
@@ -1852,13 +1862,7 @@ fn join_receipt_proves_exact_tail_ancestry_and_durable_force_preservation() {
     assert_eq!(receipt.result.base_oid, head.head.oid);
     assert!(receipt.config_fingerprint.starts_with("fnv1a64:"));
     assert!(receipt.receipt_hash.starts_with("fnv1a64:"));
-    let mut unhashed = receipt.clone();
-    let expected_hash = unhashed.receipt_hash.clone();
-    unhashed.receipt_hash.clear();
-    assert_eq!(
-        fnv1a64(&serde_json::to_vec(&unhashed).unwrap()),
-        expected_hash
-    );
+    assert_join_receipt_hash(&receipt);
     assert!(output.pull_request.has_label(FORCE_LABEL));
     assert!(!receipt.provider_receipts.iter().any(|provider| {
         provider.kind == MutationKind::RemoveLabel
