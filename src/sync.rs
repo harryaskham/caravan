@@ -54,6 +54,7 @@ mod decision;
 mod native_repair;
 mod plan;
 pub mod progress;
+pub mod receipt;
 pub use budget::{CapacityDefect, CaravanBudgetProjection, SyncBudgetStatus, project_status};
 use budget::{
     CapacityGate, ChainCost, MemberCost, PhysicalApplyAdmission, PhysicalCommitBudget,
@@ -2398,6 +2399,21 @@ fn sync_with_optional_writer_guard(
     writer_guard: Option<WriterOperationGuard>,
     authority: Option<&crate::sync_authority::DefaultBranchAuthority>,
 ) -> Result<SyncOutput, AppError> {
+    let scope = receipt::Scope::begin(&context.repository_path)?;
+    scope.finish(
+        sync_recorded(context, input, writer_guard, authority).map(|mut output| {
+            output.receipt.operation_id = receipt::operation_id();
+            output
+        }),
+    )
+}
+
+fn sync_recorded(
+    context: &AppContext,
+    input: &SyncInput,
+    writer_guard: Option<WriterOperationGuard>,
+    authority: Option<&crate::sync_authority::DefaultBranchAuthority>,
+) -> Result<SyncOutput, AppError> {
     let started = Instant::now();
     let budget = sync_operation_budget(context);
     let operation_deadline = started + budget;
@@ -2637,15 +2653,23 @@ fn reconcile_pending_native_stack_landing_checkpoints(
             if !checkpoint.verify() || checkpoint.repository != *repository {
                 continue;
             }
+            // Link resumed (including pre-upgrade) evidence to this tick before
+            // even a poll can fail. The active cursor is not the archive.
+            receipt::save_native(&context.repository_path, &key, &checkpoint)?;
             if matches!(
                 checkpoint.phase,
-                crate::github::GitHubStackLandPhase::Submitted
+                crate::github::GitHubStackLandPhase::Submitting
+                    | crate::github::GitHubStackLandPhase::Submitted
                     | crate::github::GitHubStackLandPhase::Terminal
             ) {
                 // Poll and finalize
                 for _ in 0..5 {
                     let before_phase = checkpoint.phase;
                     checkpoint = match checkpoint.phase {
+                        crate::github::GitHubStackLandPhase::Submitting => {
+                            GitHubMutationAdapter::<crate::command::ProcessRunner>::native_stack_land_abandon_uncertain_submission(repository, &checkpoint)
+                                .map_err(native_sync_error)?
+                        }
                         crate::github::GitHubStackLandPhase::Submitted => {
                             provider.native_stack_land_poll_for_sync(repository, &checkpoint)?
                         }
@@ -2654,7 +2678,7 @@ fn reconcile_pending_native_stack_landing_checkpoints(
                         }
                         _ => break,
                     };
-                    crate::stack_checkpoint::write(&context.repository_path, &key, &checkpoint)?;
+                    receipt::save_native(&context.repository_path, &key, &checkpoint)?;
                     if checkpoint.phase == before_phase
                         || checkpoint.phase == crate::github::GitHubStackLandPhase::Released
                     {
@@ -2665,17 +2689,12 @@ fn reconcile_pending_native_stack_landing_checkpoints(
             if checkpoint.phase == crate::github::GitHubStackLandPhase::Released {
                 if checkpoint.terminal_status
                     == Some(crate::github::GitHubStackMergeStatus::Indeterminate)
-                    && checkpoint.merge.is_some()
                 {
                     let observed = provider
                         .native_stack_land_reobserve_released_for_sync(repository, &checkpoint)?;
                     if observed != checkpoint {
                         checkpoint = observed;
-                        crate::stack_checkpoint::write(
-                            &context.repository_path,
-                            &key,
-                            &checkpoint,
-                        )?;
+                        receipt::save_native(&context.repository_path, &key, &checkpoint)?;
                         changed = true;
                     }
                 }
@@ -2687,18 +2706,14 @@ fn reconcile_pending_native_stack_landing_checkpoints(
                         "retired-{key}-{}",
                         checkpoint.evidence_hash.replace(':', "-")
                     );
-                    crate::stack_checkpoint::write(
-                        &context.repository_path,
-                        &archive_key,
-                        &checkpoint,
-                    )?;
+                    receipt::save_native(&context.repository_path, &archive_key, &checkpoint)?;
                     crate::stack_checkpoint::remove(&context.repository_path, &key)?;
                     changed = true;
                 } else {
                     checkpoint = checkpoint.observe_convergence_pending(
                         "fresh provider status has not yet proven merged prefix, promoted linear suffix, and exact Stack membership",
                     );
-                    crate::stack_checkpoint::write(&context.repository_path, &key, &checkpoint)?;
+                    receipt::save_native(&context.repository_path, &key, &checkpoint)?;
                     // A released checkpoint is an exact quarantine for this one
                     // terminal provider merge, not a global queue lock. Provider
                     // projections can retain merged prefix rows or stale Stack
@@ -4771,7 +4786,7 @@ fn closed_lifecycle_output(
     lock_recovery: Option<OperationLockRecovery>,
     lock: &mut WriterOperationGuard,
 ) -> Result<SyncOutput, AppError> {
-    let operation_id = OperationId::new();
+    let operation_id = receipt::operation_id();
     let receipt = OperationReceipt {
         operation_id,
         operation: "sync".to_owned(),
@@ -5013,7 +5028,7 @@ fn native_drift_repair_output(
         provider_receipts.push(retarget.clone());
     }
     let receipt = OperationReceipt {
-        operation_id: OperationId::new(),
+        operation_id: receipt::operation_id(),
         operation: "sync-native-drift-repair".to_owned(),
         completed_steps,
         changed: true,
@@ -10925,7 +10940,7 @@ impl SyncProgress {
         synchronized_caravans: Vec<PrNumber>,
         mutation_limit: u32,
     ) -> Self {
-        let operation_id = OperationId::new();
+        let operation_id = receipt::operation_id();
         let events = conflict_detected_events(status, &operation_id);
         let steps = status
             .stack_backend
@@ -12096,7 +12111,7 @@ impl SyncProgress {
                     repository, &plan,
                 );
             // Durable before lock acquisition, the first provider write.
-            crate::stack_checkpoint::write(&native.repository_path, &key, &checkpoint)?;
+            receipt::save_native(&native.repository_path, &key, &checkpoint)?;
             checkpoint
         };
 
@@ -12172,7 +12187,7 @@ impl SyncProgress {
                 }
                 crate::github::GitHubStackLandPhase::Released => break,
             };
-            crate::stack_checkpoint::write(&native.repository_path, &key, &checkpoint)?;
+            receipt::save_native(&native.repository_path, &key, &checkpoint)?;
             if checkpoint.phase == before_phase {
                 break;
             }

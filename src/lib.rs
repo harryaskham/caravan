@@ -343,6 +343,13 @@ GITHUB NATIVE STACKS (EXPLICIT OPT-IN)
   idempotent response-loss retry—never singleton, truncated, uncheckpointed
   partial, drifted, or multiple mappings—and never independently rewrites source
   heads or mutates PR bases/labels/comments.
+- Every mutating sync persists an operation ID and emits a complete JSON startup
+  receipt to stderr before provider writes. Keep stderr in scheduler spools.
+  `cara operation --operation-id ID --json` reads its durable local receipt;
+  omit the ID to list operations. No provider access or writer lock is needed.
+  An unfinished invocation or unknown merge is not permission to retry: the
+  existing writer reconciles the original checkpoint, never a second merge PUT.
+  See docs/native-sync-receipts.md for interrupted-run recovery.
 - The installed `gh stack` CLI does not merge Stacks. It creates, links,
   submits, rebases, and synchronizes branch/PR topology; GitHub's web merge uses
   the same asynchronous REST endpoint that accepts only the selected top SHA.
@@ -1822,6 +1829,11 @@ pub fn build_router() -> ToolRouter<AppContext> {
         "sync",
         "Idempotently synchronize one or all caravans under optimistic preconditions. With strict config opt-in, sync-all greedily admits canonical unlabelled candidates after the existing fleet converges, persisting generation-bound skip receipts under exact wall/GitHub/candidate/mutation bounds.",
         |context: &AppContext, input: SyncInput| sync::sync(context, &input),
+    );
+    router.add_typed_tool_with_output_schema(
+        "operation",
+        "Read durable sync identities and exact native merge receipts locally. No provider access, lock recovery, or mutation; unfinished means reconcile evidence, never blindly retry.",
+        |context: &AppContext, input: sync::receipt::ReceiptInput| sync::receipt::inspect(&context.repository_path, &input),
     );
     router.add_typed_tool_with_output_schema(
         "plan_sync",

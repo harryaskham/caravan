@@ -2169,10 +2169,19 @@ impl CommandRunner for ProcessRunner {
             command.process_group(0);
         }
 
-        let mut child = command.spawn().map_err(|error| CommandRunError::Spawn {
-            command: request.clone(),
-            message: error.to_string(),
-        })?;
+        let receipt_attempt = crate::sync::receipt::before_spawn(request)?;
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                if let Some(attempt) = &receipt_attempt {
+                    attempt.finish(request, "not_started", None)?;
+                }
+                return Err(CommandRunError::Spawn {
+                    command: request.clone(),
+                    message: error.to_string(),
+                });
+            }
+        };
         let child_process_group = child.id();
         let stdin_writer = request
             .io
@@ -2272,6 +2281,9 @@ impl CommandRunner for ProcessRunner {
             stdout,
             stderr,
         };
+        if let Some(attempt) = &receipt_attempt {
+            attempt.finish(request, "returned", output.code)?;
+        }
         if should_refresh_github_app_auth(github_auth.as_ref(), &output, self.github_app_auth_retry)
             || should_refresh_github_app_git_auth(
                 github_app_git_auth.as_ref(),

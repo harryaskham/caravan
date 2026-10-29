@@ -28,6 +28,61 @@ fn cara_in(directory: &std::path::Path, arguments: &[&str]) -> Output {
 }
 
 #[test]
+fn operation_receipt_is_readable_without_provider_or_valid_policy() {
+    let directory = tempfile::tempdir().unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(directory.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let root = directory.path().join(".git/caravan/native-stack");
+    std::fs::create_dir_all(&root).unwrap();
+    let id = "019a0000-0000-7000-8000-000000000001";
+    std::fs::write(
+        root.join(format!("sync-{id}.json")),
+        serde_json::json!({
+            "schema_version": 1, "operation_id": id, "state": "unfinished", "writes": [],
+            "native_operations": [], "error_code": null,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::create_dir_all(directory.path().join(".caravan")).unwrap();
+    std::fs::write(
+        directory.path().join(".caravan/config.yaml"),
+        "not-valid: [\n",
+    )
+    .unwrap();
+    std::fs::write(
+        directory.path().join(".git/caravan/operation.lock"),
+        "unreadable dead writer lock",
+    )
+    .unwrap();
+    let output = cara_in(
+        directory.path(),
+        &["operation", "--operation-id", id, "--json"],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["data"]["operations"][0]["operation_id"], id);
+    assert_eq!(envelope["data"]["operations"][0]["state"], "unfinished");
+    let missing = cara_in(
+        directory.path(),
+        &["operation", "--operation-id", "../../escape", "--json"],
+    );
+    assert!(!missing.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&missing.stdout).unwrap();
+    assert_eq!(envelope["error"]["code"], "sync_receipt_not_found");
+}
+
+#[test]
 fn concat_plan_and_execute_are_distinct_receipt_backed_commands() {
     let plan = cara(&["plan", "concat", "--help"]);
     assert!(plan.status.success());

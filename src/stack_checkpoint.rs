@@ -5,6 +5,7 @@
 //! worktrees, but never enter source control. They contain no credentials.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Serialize, de::DeserializeOwned};
@@ -74,21 +75,25 @@ pub(crate) fn write<T: Serialize>(repository: &Path, key: &str, value: &T) -> Re
         )
     })?;
     let temporary = path.with_extension(format!("json.tmp-{}", std::process::id()));
-    fs::write(&temporary, bytes).map_err(|error| {
-        storage_error(
-            "native_stack_checkpoint_write_failed",
-            &error.to_string(),
-            &temporary,
-        )
-    })?;
-    fs::rename(&temporary, &path).map_err(|error| {
-        let _ = fs::remove_file(&temporary);
-        storage_error(
-            "native_stack_checkpoint_write_failed",
-            &error.to_string(),
-            &path,
-        )
-    })
+    fs::File::create(&temporary)
+        .and_then(|mut file| file.write_all(&bytes).and_then(|()| file.sync_all()))
+        .map_err(|error| {
+            storage_error(
+                "native_stack_checkpoint_write_failed",
+                &error.to_string(),
+                &temporary,
+            )
+        })?;
+    fs::rename(&temporary, &path)
+        .and_then(|()| fs::File::open(path.parent().expect("checkpoint parent"))?.sync_all())
+        .map_err(|error| {
+            let _ = fs::remove_file(&temporary);
+            storage_error(
+                "native_stack_checkpoint_write_failed",
+                &error.to_string(),
+                &path,
+            )
+        })
 }
 
 pub(crate) fn remove(repository: &Path, key: &str) -> Result<(), AppError> {
