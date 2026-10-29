@@ -22,6 +22,9 @@ use crate::remote_lease::RemoteLeaseGuard;
 use crate::squash_equivalence::{self, SquashEquivalenceReport};
 use crate::writer_guard::WriterCommandRunner;
 
+mod cumulative;
+pub use cumulative::CumulativeTreeReplay;
+
 const MAX_MERGE_PRESERVING_COMMITS: usize = 256;
 static WORKTREE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -120,6 +123,9 @@ pub struct RebaseExecutionBudget {
     /// default so a child, whose ancestry must physically follow the chain, is
     /// never flattened.
     pub flatten_squashed_root: bool,
+    /// Queue-owned native Stack repair proves the final tree instead of
+    /// replaying history imported by source-owner merge syncs (bd-93b5ba).
+    pub(crate) cumulative_tree_replay: bool,
     /// Replay only commits after this exact boundary (bd-cef612).
     ///
     /// The sequencer normally uses the target as its upstream, so it replays
@@ -144,6 +150,7 @@ impl RebaseExecutionBudget {
             operation_deadline: None,
             reconcile_squash_equivalent: false,
             flatten_squashed_root: false,
+            cumulative_tree_replay: false,
             replay_upstream: None,
             rewrite_reason: BranchRewriteReason::Unspecified,
             writer_fence: None,
@@ -179,6 +186,11 @@ impl RebaseExecutionBudget {
     #[must_use]
     pub fn replaying_after(mut self, boundary: CommitOid) -> Self {
         self.replay_upstream = Some(boundary);
+        self
+    }
+
+    pub(crate) fn with_cumulative_tree_replay(mut self, enabled: bool) -> Self {
+        self.cumulative_tree_replay = enabled;
         self
     }
 
@@ -399,6 +411,9 @@ pub struct RebasePlan {
     pub commit_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_topology: Option<MergePreservingTopology>,
+    /// Exact three-way tree proof for queue-owned cumulative replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cumulative_tree: Option<CumulativeTreeReplay>,
     /// Exact proof for any stacked history this plan reconciled away because
     /// the target already holds its cumulative content byte-for-byte.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -430,6 +445,9 @@ pub struct RebaseReceipt {
     pub commit_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_topology: Option<MergePreservingTopology>,
+    /// Exact three-way tree proof for queue-owned cumulative replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cumulative_tree: Option<CumulativeTreeReplay>,
     /// Exact proof for any stacked history this rewrite reconciled away.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub squash_reconciliation: Option<SquashEquivalenceReport>,
@@ -700,6 +718,17 @@ fn prepare_candidate_inner(
     }
     let range_base = CommitOid(boundaries[0].to_owned());
     validate_oid(&range_base)?;
+    if budget.cumulative_tree_replay {
+        return cumulative::prepare(
+            repository_path,
+            candidate,
+            range_source,
+            new_base,
+            range_base,
+            ci_trigger_workflows,
+            &budget,
+        );
+    }
     let old_topology = collect_range_topology(
         &runner,
         &[&range_base, &target.oid],
@@ -941,6 +970,7 @@ fn prepare_candidate_inner(
         new_tree_oid: new_tree,
         commit_count,
         merge_topology,
+        cumulative_tree: None,
         squash_reconciliation: reconciliation,
         ci_trigger_workflows,
         lease,
@@ -1757,6 +1787,12 @@ pub(crate) fn verify_prepared_before(
             fetch_exact_pull_request_head(&runner, "origin", *pr, branch)?;
         }
     }
+    // Atomic callers do not pass through the single-head apply guard. Bind
+    // their live target too; retained historical ancestry alone cannot prove
+    // that the remote predecessor/default has not advanced since preparation.
+    if let PlannedBase::Remote(target) = &prepared.plan.new_base {
+        verify_remote_head(&runner, "origin", &target.name, &target.oid)?;
+    }
     let destination = format!("HEAD:refs/heads/{}", prepared.plan.branch);
     require_success(
         &runner,
@@ -2049,6 +2085,7 @@ fn receipt_from_plan(plan: &RebasePlan) -> RebaseReceipt {
         new_tree_oid: plan.new_tree_oid.clone(),
         commit_count: plan.commit_count,
         merge_topology: plan.merge_topology.clone(),
+        cumulative_tree: plan.cumulative_tree.clone(),
         squash_reconciliation: plan.squash_reconciliation.clone(),
         ci_trigger_workflows: plan.ci_trigger_workflows.clone(),
         lease: plan.lease.clone(),
@@ -2171,6 +2208,7 @@ fn push_prepared_with_runner(
         new_tree_oid: prepared.plan.new_tree_oid.clone(),
         commit_count: prepared.plan.commit_count,
         merge_topology: prepared.plan.merge_topology.clone(),
+        cumulative_tree: prepared.plan.cumulative_tree.clone(),
         squash_reconciliation: prepared.plan.squash_reconciliation.clone(),
         ci_trigger_workflows: prepared.plan.ci_trigger_workflows.clone(),
         lease: prepared.plan.lease.clone(),
@@ -2651,6 +2689,8 @@ impl Drop for TemporaryWorktree {
 
 #[cfg(test)]
 mod tests {
+    mod cumulative;
+
     use std::collections::BTreeSet;
     use std::process::Command;
     use std::sync::Mutex;
@@ -2800,6 +2840,7 @@ mod tests {
             new_tree_oid: CommitOid("e".repeat(40)),
             commit_count: 1,
             merge_topology: None,
+            cumulative_tree: None,
             squash_reconciliation: None,
             ci_trigger_workflows: Vec::new(),
             lease: "exact".to_owned(),

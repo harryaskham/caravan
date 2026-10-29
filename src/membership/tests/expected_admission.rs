@@ -454,6 +454,7 @@ fn expected_admission_only_own_exact_rewrite_can_advance_source_binding() {
         new_tree_oid: CommitOid("e".repeat(40)),
         commit_count: 1,
         merge_topology: None,
+        cumulative_tree: None,
         squash_reconciliation: None,
         ci_trigger_workflows: vec![],
         lease: "exact-source-lease".to_owned(),
