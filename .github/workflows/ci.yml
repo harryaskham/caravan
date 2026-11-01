@@ -27,7 +27,7 @@ jobs:
       checks: read
       contents: read
       pull-requests: read
-    runs-on: [self-hosted, nix, x86_64-linux]
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
       run-ci: ${{ steps.gate.outputs.run_ci }}
@@ -39,6 +39,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.base.sha || github.sha }}
+      - uses: DeterminateSystems/determinate-nix-action@v3
       - id: gate
         name: Evaluate live Caravan membership
         shell: bash
@@ -54,52 +55,44 @@ jobs:
   format:
     needs: admission-gate
     if: needs.admission-gate.outputs.run-ci == 'true'
-    runs-on: [self-hosted, nix, x86_64-linux]
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - name: Use anonymous HTTPS for public ecosystem crates
-        shell: bash
-        run: git config --global --unset-all url."ssh://git@github.com/".insteadOf 2>/dev/null || true
+      - uses: DeterminateSystems/determinate-nix-action@v3
       - name: Check formatting
         run: nix develop --command cargo fmt --all --check
 
   clippy:
     needs: admission-gate
     if: needs.admission-gate.outputs.run-ci == 'true'
-    runs-on: [self-hosted, nix, x86_64-linux]
+    runs-on: ubuntu-latest
     timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
-      - name: Use anonymous HTTPS for public ecosystem crates
-        shell: bash
-        run: git config --global --unset-all url."ssh://git@github.com/".insteadOf 2>/dev/null || true
+      - uses: DeterminateSystems/determinate-nix-action@v3
       - name: Run strict Clippy
         run: nix develop --command cargo clippy --all-targets -- -D warnings
 
   tests:
     needs: admission-gate
     if: needs.admission-gate.outputs.run-ci == 'true'
-    runs-on: [self-hosted, nix, x86_64-linux]
+    runs-on: ubuntu-latest
     timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
-      - name: Use anonymous HTTPS for public ecosystem crates
-        shell: bash
-        run: git config --global --unset-all url."ssh://git@github.com/".insteadOf 2>/dev/null || true
+      - uses: DeterminateSystems/determinate-nix-action@v3
       - name: Run complete test suite
         run: nix develop --command cargo test --all
 
   agent-surface:
     needs: admission-gate
     if: needs.admission-gate.outputs.run-ci == 'true'
-    runs-on: [self-hosted, nix, x86_64-linux]
+    runs-on: ubuntu-latest
     timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
-      - name: Use anonymous HTTPS for public ecosystem crates
-        shell: bash
-        run: git config --global --unset-all url."ssh://git@github.com/".insteadOf 2>/dev/null || true
+      - uses: DeterminateSystems/determinate-nix-action@v3
       - name: Verify help and MCP surfaces
         shell: bash
         run: |
@@ -115,7 +108,7 @@ jobs:
   build-test:
     if: ${{ always() }}
     needs: [admission-gate, format, clippy, tests, agent-surface]
-    runs-on: [self-hosted, nix, x86_64-linux]
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Defer unjoined PR or require every pinned gate

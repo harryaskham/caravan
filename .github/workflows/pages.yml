@@ -1,6 +1,6 @@
 name: Pages
 
-# Shared self-hosted gh-pages publisher (harryaskham.github.io publish-pages.yml).
+# Shared gh-pages publisher (harryaskham.github.io publish-pages.yml).
 on:
   push:
     branches: [main]
@@ -18,5 +18,7 @@ jobs:
   pages:
     uses: harryaskham/harryaskham.github.io/.github/workflows/publish-pages.yml@main
     with:
+      # Public repository: GitHub-hosted (free); fleet runners never serve public repos.
+      runs-on: '["ubuntu-latest"]'
       path: site
       build: nix develop --command python3 scripts/check-site.py

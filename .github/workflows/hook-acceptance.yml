@@ -24,7 +24,7 @@ concurrency:
 jobs:
   hook-acceptance:
     name: hook process and dispatch acceptance
-    runs-on: [self-hosted, nix, x86_64-linux]
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
       FEEDBACK_WEBHOOK_URL: ${{ secrets.CARAVAN_FEEDBACK_WEBHOOK_URL }}
@@ -32,15 +32,12 @@ jobs:
       CARAVAN_FEEDBACK_WEBHOOK_TOKEN: ${{ secrets.CARAVAN_FEEDBACK_WEBHOOK_TOKEN }}
       FEEDBACK_COMPONENT: hook-acceptance
       FEEDBACK_PROJECT: caravan
-      CARA_HOOK_ACCEPTANCE_ENVIRONMENT_CLASS: self-hosted:nix:x86_64-linux
+      CARA_HOOK_ACCEPTANCE_ENVIRONMENT_CLASS: github-hosted:nix:ubuntu-latest
       CARA_HOOK_ACCEPTANCE_FORCE_FAILURE: ${{ github.event_name == 'workflow_dispatch' && inputs.force_failure || false }}
     steps:
       - uses: actions/checkout@v4
+      - uses: DeterminateSystems/determinate-nix-action@v3
 
-      - name: Use anonymous HTTPS for public ecosystem crates
-        shell: bash
-        run: |
-          git config --global --unset-all url."ssh://git@github.com/".insteadOf 2>/dev/null || true
 
       - name: Run environmental hook acceptance and report bounded failures
         shell: bash

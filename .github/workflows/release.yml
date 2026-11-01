@@ -36,7 +36,7 @@ permissions:
 jobs:
   resolve:
     name: resolve release context
-    runs-on: [self-hosted, nix, x86_64-linux]
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
       tag: ${{ steps.context.outputs.tag }}
@@ -91,10 +91,10 @@ jobs:
           }
           case "$target" in
             all)
-              matrix='{"include":[{"target":"x86_64-linux","runner":["self-hosted","nix","x86_64-linux"],"timeout_minutes":120},{"target":"aarch64-linux","runner":"ubuntu-24.04-arm","timeout_minutes":180},{"target":"aarch64-darwin","runner":"macos-14","timeout_minutes":90}]}'
+              matrix='{"include":[{"target":"x86_64-linux","runner":"ubuntu-latest","timeout_minutes":120},{"target":"aarch64-linux","runner":"ubuntu-24.04-arm","timeout_minutes":180},{"target":"aarch64-darwin","runner":"macos-14","timeout_minutes":90}]}'
               ;;
             x86_64-linux)
-              matrix='{"include":[{"target":"x86_64-linux","runner":["self-hosted","nix","x86_64-linux"],"timeout_minutes":120}]}'
+              matrix='{"include":[{"target":"x86_64-linux","runner":"ubuntu-latest","timeout_minutes":120}]}'
               ;;
             aarch64-linux)
               matrix='{"include":[{"target":"aarch64-linux","runner":"ubuntu-24.04-arm","timeout_minutes":180}]}'
@@ -117,7 +117,7 @@ jobs:
   test:
     name: release contract
     needs: resolve
-    runs-on: [self-hosted, nix, x86_64-linux]
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Configure isolated anonymous Git
@@ -139,6 +139,7 @@ jobs:
         with:
           ref: ${{ needs.resolve.outputs.tag }}
           fetch-depth: 0
+      - uses: DeterminateSystems/determinate-nix-action@v3
       - name: Run the deterministic release suite in the pinned development shell
         # The process/load-sensitive hook target is feature-gated and owned by
         # the scheduled/manual environmental acceptance workflow.
